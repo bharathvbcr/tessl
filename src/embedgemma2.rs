@@ -127,6 +127,11 @@ pub const MAX_BATCH: usize = 256;
 /// [`EmbedGemma2Model::encode`] splits a batch into as many forwards as
 /// this needs, so it bounds memory, not what a caller may pass.
 pub const MAX_BATCH_TOKENS: usize = 32_768;
+/// The largest frame time, in seconds, that
+/// [`EmbedGemma2Config::video_sequence_with_timestamps`] labels (about 31
+/// years): past it the `mm:ss` text is a minutes count no video has, and a
+/// label that long is a caller's error, not a layout.
+pub const MAX_TIMESTAMP_SECONDS: f64 = 1.0e9;
 
 // ---------------------------------------------------------------------------
 // Kernels
@@ -922,10 +927,54 @@ impl EmbedGemma2Config {
     /// tokenizer's `<bos>` and `<eos>`. Refused as [`Self::image_sequence`] is,
     /// and for a video of no frames or a frame of no soft tokens.
     pub fn video_sequence(&self, soft_per_frame: &[usize]) -> Result<Vec<u32>, String> {
-        const WHAT: &str = "video_sequence";
+        self.video_layout("video_sequence", soft_per_frame, None)
+    }
+
+    /// [`Self::video_sequence`] under `add_timestamps = true`
+    /// (`replace_video_token`, processing:255-268): every frame's block is
+    /// preceded by its `mm:ss` text, and the blocks are joined by single
+    /// spaces,
+    ///
+    /// ```text
+    /// 00:00 <boi><video> x n_0<eoi> 00:01 <boi><video> x n_1<eoi> ...
+    /// ```
+    ///
+    /// then the tokenizer wraps the whole in `<bos>` and `<eos>`. The text
+    /// between two added tokens is tokenized on its own (the added tokens
+    /// split the text before the model runs), so the ids are `[<bos>`, then
+    /// for the first frame the ids of `"mm:ss "`, for every later frame the
+    /// ids of `" mm:ss "`, each followed by the frame's block, `<eos>]`; the
+    /// label's ids come from `tokenizer` ([`Tokenizer::encode_raw`] without
+    /// special tokens), so a space is whatever the tokenizer makes of it (a
+    /// `▁` in the snapshot's). `timestamps[f]` is frame `f`'s time in seconds
+    /// (`PreparedVideo::timestamps`), formatted by
+    /// [`crate::embedgemma2_pre::timestamp_label`]; each must be finite, not
+    /// negative, and below [`MAX_TIMESTAMP_SECONDS`]. One timestamp per frame
+    /// is required. Otherwise refused as [`Self::video_sequence`] is.
+    pub fn video_sequence_with_timestamps(
+        &self,
+        tokenizer: &Tokenizer,
+        timestamps: &[f64],
+        soft_per_frame: &[usize],
+    ) -> Result<Vec<u32>, String> {
+        self.video_layout(
+            "video_sequence_with_timestamps",
+            soft_per_frame,
+            Some((tokenizer, timestamps)),
+        )
+    }
+
+    /// The one builder of a video's ids, with or without the timestamps'
+    /// labels in front of the blocks.
+    fn video_layout(
+        &self,
+        what: &str,
+        soft_per_frame: &[usize],
+        labels: Option<(&Tokenizer, &[f64])>,
+    ) -> Result<Vec<u32>, String> {
         let t = &self.special_tokens;
         let [bos, boi, video, eoi, eos] = SpecialTokens::all(
-            WHAT,
+            what,
             [
                 ("text_config.bos_token_id", t.bos),
                 ("boi_token_id", t.boi),
@@ -935,24 +984,55 @@ impl EmbedGemma2Config {
             ],
         )?;
         if soft_per_frame.is_empty() {
-            return Err(format!("{WHAT}: the video has no frames"));
+            return Err(format!("{what}: the video has no frames"));
         }
         if let Some(f) = soft_per_frame.iter().position(|&n| n == 0) {
-            return Err(format!("{WHAT}: frame {f} has no soft tokens"));
+            return Err(format!("{what}: frame {f} has no soft tokens"));
         }
         let len = soft_per_frame
             .iter()
             .try_fold(2usize, |acc, &n| acc.checked_add(n)?.checked_add(2))
-            .ok_or_else(|| format!("{WHAT}: the sequence length overflows"))?;
+            .ok_or_else(|| format!("{what}: the sequence length overflows"))?;
+        if let Some((_, stamps)) = labels {
+            if stamps.len() != soft_per_frame.len() {
+                return Err(format!(
+                    "{what}: {} timestamps for {} frames; one per frame",
+                    stamps.len(),
+                    soft_per_frame.len()
+                ));
+            }
+            if let Some(f) = stamps
+                .iter()
+                .position(|s| !(s.is_finite() && (0.0..=MAX_TIMESTAMP_SECONDS).contains(s)))
+            {
+                return Err(format!(
+                    "{what}: frame {f}'s timestamp {} is not a time in 0..={MAX_TIMESTAMP_SECONDS} seconds",
+                    stamps[f]
+                ));
+            }
+        }
         let mut ids = Vec::with_capacity(len);
         ids.push(bos);
-        for &n in soft_per_frame {
+        for (f, &n) in soft_per_frame.iter().enumerate() {
+            if let Some((tokenizer, stamps)) = labels {
+                // The text between two added tokens: the label and the
+                // spaces that join it to the neighbouring blocks.
+                let label = crate::embedgemma2_pre::timestamp_label(stamps[f]);
+                let stretch = if f == 0 {
+                    format!("{label} ")
+                } else {
+                    format!(" {label} ")
+                };
+                ids.extend(tokenizer.encode_raw(&stretch, false));
+            }
             ids.push(boi);
             ids.resize(ids.len() + n, video);
             ids.push(eoi);
         }
         ids.push(eos);
-        debug_assert_eq!(ids.len(), len);
+        if labels.is_none() {
+            debug_assert_eq!(ids.len(), len);
+        }
         Ok(ids)
     }
 

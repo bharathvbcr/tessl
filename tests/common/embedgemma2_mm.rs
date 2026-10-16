@@ -405,3 +405,63 @@ pub fn clip(cfg: &AudioConfig, frames: usize, seed: u64, valid: impl Fn(usize) -
         mask: (0..frames).map(valid).collect(),
     }
 }
+
+/// A `tokenizer.json` in the snapshot's shape (`Replace` of a space with
+/// `U+2581`, a BPE with a merge list, `<bos> $A <eos>`) whose ids fit the tiny
+/// text encoder: the digits are ids 4 to 13, `:` is 14, `▁` is 15, `00` is 16
+/// and `▁0` is 17 (merges `0 0` then `▁ 0`, so a space glues to a digit that
+/// follows it), all below the tiny vocabulary of 48. The added tokens are the
+/// config's markers `<|image>` (40, `boi_token_id`), `<image|>` (41,
+/// `eoi_token_id`) and `<|video|>` (62, `video_token_id`) beside `<pad>`,
+/// `<eos>`, `<bos>` and `<unk>`; the other ids are filler entries.
+pub fn timestamp_tokenizer_json() -> String {
+    let added = [
+        (0, "<pad>"),
+        (1, "<eos>"),
+        (2, "<bos>"),
+        (3, "<unk>"),
+        (40, "<|image>"),
+        (41, "<image|>"),
+        (62, "<|video|>"),
+    ];
+    let added_json: Vec<String> = added
+        .iter()
+        .map(|(id, text)| {
+            format!(
+                r#"{{"id": {id}, "content": "{text}", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}}"#
+            )
+        })
+        .collect();
+    let mut vocab: Vec<String> = (0..63).map(|i| format!("<u{i}>")).collect();
+    for (id, text) in added {
+        vocab[id] = text.to_string();
+    }
+    for d in 0..10 {
+        vocab[4 + d] = d.to_string();
+    }
+    vocab[14] = ":".into();
+    vocab[15] = "\u{2581}".into();
+    vocab[16] = "00".into();
+    vocab[17] = "\u{2581}0".into();
+    let vocab_json: Vec<String> = vocab
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!(r#""{t}": {i}"#))
+        .collect();
+    format!(
+        r#"{{
+ "version": "1.0", "truncation": null, "padding": null,
+ "added_tokens": [{added}],
+ "normalizer": {{"type": "Replace", "pattern": {{"String": " "}}, "content": "▁"}},
+ "pre_tokenizer": {{"type": "Split", "pattern": {{"String": " "}}, "behavior": "MergedWithPrevious", "invert": false}},
+ "post_processor": {{"type": "TemplateProcessing", "single": [{{"SpecialToken": {{"id": "<bos>", "type_id": 0}}}}, {{"Sequence": {{"id": "A", "type_id": 0}}}}, {{"SpecialToken": {{"id": "<eos>", "type_id": 0}}}}], "pair": [{{"SpecialToken": {{"id": "<bos>", "type_id": 0}}}}, {{"Sequence": {{"id": "A", "type_id": 0}}}}, {{"SpecialToken": {{"id": "<eos>", "type_id": 0}}}}, {{"SpecialToken": {{"id": "<bos>", "type_id": 1}}}}, {{"Sequence": {{"id": "B", "type_id": 1}}}}, {{"SpecialToken": {{"id": "<eos>", "type_id": 1}}}}], "special_tokens": {{"<bos>": {{"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}}, "<eos>": {{"id": "<eos>", "ids": [1], "tokens": ["<eos>"]}}}}}},
+ "decoder": {{"type": "Sequence", "decoders": [{{"type": "Replace", "pattern": {{"String": "▁"}}, "content": " "}}, {{"type": "ByteFallback"}}, {{"type": "Fuse"}}]}},
+ "model": {{"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+  "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": false, "ignore_merges": false,
+  "vocab": {{{vocab}}},
+  "merges": [["0", "0"], ["▁", "0"]]}}
+}}"#,
+        added = added_json.join(", "),
+        vocab = vocab_json.join(", "),
+    )
+}

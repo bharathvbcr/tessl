@@ -1418,6 +1418,9 @@ frame (that is the config `fps: null`, or `do_sample_frames: false` for no sampl
 at all). Each sampled frame goes through the image path at `max_soft_tokens` 140
 (1260 patches). `PreparedVideo` carries the frames, their source indices and the
 timestamps `index / source_fps`; `timestamp_label` is the processor's `mm:ss`.
+`add_timestamps` (`VideoConfig::add_timestamps`, `false` in the snapshot) is read
+like any other setting and changes nothing here: the frames are preprocessed the
+same either way, and the flag is the sequence layout's (see [Video](#video)).
 Placing the video in a sequence, and the frames through the tower, are the
 multimodal model's.
 
@@ -2165,7 +2168,25 @@ verified by reading them and against the `ids.npy` of the reference run):
 
   `EmbedGemma2Config::video_sequence(&[S; F])` builds it from `config.json`'s ids
   (`boi_token_id` 255999, `eoi_token_id` 258882, `video_token_id` 258884); `S` may
-  differ per frame there, `MmItem::Video` requires the processor's one `S`. The
+  differ per frame there, `MmItem::Video` requires the processor's one `S`.
+
+  Under `add_timestamps` the processor's string is `"00:00 <boi><video>*S<eoi>
+  00:01 <boi>..."`: `f"{int(s // 60):02d}:{int(s % 60):02d}"` per frame (the
+  existing `timestamp_label`; truncation, not rounding, so 59.9 s is `00:59`, and a
+  minutes count past 99 has three digits), then the blocks joined by one space.
+  The added tokens split that text, so the stretches between them are tokenized on
+  their own: `"mm:ss "` before the first block and `" mm:ss "` before each later
+  one, which the snapshot's tokenizer makes `00:00` as five single-digit and colon
+  tokens and a `▁` (six ids), and `▁`, five, `▁` (seven) for the others.
+  `EmbedGemma2Config::video_sequence_with_timestamps(&tokenizer, &timestamps, &[S; F])`
+  builds `[<bos>, label ids, block, label ids, block, ..., <eos>]` that way, through
+  `Tokenizer::encode_raw(stretch, false)` and not by building the string, and
+  refuses (naming the frame) a timestamp count other than the frame count and a time
+  that is not finite, is negative or is past `MAX_TIMESTAMP_SECONDS` (10^9, about 31
+  years). The tiny test holds it to `encode_raw` of the whole processor string on a
+  tokenizer with merges, so the equivalence of "tokenize the stretches" with
+  "tokenize the string" is checked on that tokenizer and, for the real one, by the
+  ids below. The
   placeholder is its own id, not the image's. (The processor adds `<|video|>` to the
   tokenizer itself, processing:88-89, with a FIXME to put it in the config; the
   generator asserts that its id is the config's `video_token_id`, which is the one
@@ -2202,14 +2223,19 @@ verified by reading them and against the `ids.npy` of the reference run):
   one per frame; inferred, the dispatches were not counted).
 * `MmItem::Media { ids, images, audio, videos }`: `videos` is one frame list per
   video; the video placeholders of `ids` take the frames of all the videos laid end
-  to end, as image placeholders take the images'. This is the entry for the
-  `add_timestamps` layout: this crate has no tokenizer, so the caller tokenizes
-  `mm:ss ` text and puts it between the blocks (the golden of that layout is below).
-  `PreConfig` refuses `add_timestamps: true` by name, as it refuses every setting it
-  does not implement, so a config asking for timestamps is not read as asking for
-  none. A video placeholder with no frames, or frames with no placeholder, is
-  refused as a count mismatch (before, any video placeholder was refused: there was
-  no tower).
+  to end, as image placeholders take the images'. This is the entry for ids of your
+  own (a prompt, other text between the blocks, several videos in a row). A video
+  placeholder with no frames, or frames with no placeholder, is refused as a count
+  mismatch (before, any video placeholder was refused: there was no tower).
+* `MmItem::TimestampedVideo { frames, timestamps, tokenizer }`: the same video under
+  `add_timestamps = true`. The item carries each frame's time in seconds
+  (`PreparedVideo::timestamps`) and the snapshot's `&Tokenizer`, and the facade builds
+  the ids with `video_sequence_with_timestamps`; the frames are numbered, counted and
+  limited as `Video`'s are, and the one-count rule holds. A wrong timestamp count or
+  time is refused with 0 allocations and 0 waits, as every refusal is. `PreConfig`
+  now reads `video.add_timestamps` (it refused `true` by name while this crate had
+  no tokenizer), so a caller picks the item by the flag: `TimestampedVideo` when it
+  is on, `Video` when it is off. `MmItem::Video(&[ImageInput])` is unchanged.
 * Limits: the vision tower's batch limit, 256 pictures, counts the frames of all the
   call's videos with its images (a call of nine 32-frame videos is refused naming it).
   Frames are numbered with the images in the tower's messages. The text limit
@@ -2252,9 +2278,11 @@ first measurement:
 | Native preprocessing: every frame's pixels and positions vs the processor's | bit for bit | 0 of 5,806,080 and 0 of 30,965,760 values differ |
 | `video_sequence` vs `ids.npy` | equal | equal (782 and 4098 ids) |
 | `video0t`: ids = the golden's labels + the plain blocks | equal | equal |
+| `video0t`: `video_sequence_with_timestamps` (snapshot tokenizer; this crate's timestamps, and the golden's) vs `ids.npy` | equal | equal (823 ids, both) |
 | Tower soft tokens per frame vs captured (`video1`: 32 frames, 3 tower forwards) | 1e-4 of the largest magnitude | 1.25e-5 and 1.51e-5 |
 | Raw frames to embedding, both videos in one call, ExactF32 | max abs `1e-4`, cosine `>= 0.99999` | max abs 3.7e-7 and 1.5e-7, cosine 1.000000000 |
 | `video0t` through `Media` with the golden's ids | same | max abs 2.1e-7, cosine 1.000000000 |
+| `video0t` through `MmItem::TimestampedVideo` (a config with `add_timestamps` on, native frames and timestamps, the snapshot's tokenizer) | same | max abs 2.1e-7, cosine 1.000000000; vs the `Media` item 0 (bit for bit) |
 | Each video alone vs in the call | `1e-5` | 0 (bit for bit) |
 | Mixed call: 2 videos, an image, a clip, ExactF32 | same | 1.5e-7 to 3.7e-7, cosine 1.000000000, alone vs in the call 0 |
 | Bf16 video vs fp32 | cosine `>= 0.99997` | 0.9999930 and 0.9999968 |
@@ -2276,9 +2304,19 @@ activations change nothing) and agrees within 1e-5 across several text forwards;
 wait per call; every refusal (no frames, frames of different sizes, a placeholder
 count that is not the frames' soft tokens, 257 frames, a bad frame after good ones, a
 sequence past the limit) is raised with 0 allocations and 0 waits and leaves the
-facade usable. Mutation checks, each failing the tests that should: frames taken in
+facade usable. Timestamps: `PreConfig` reads `add_timestamps` (on, off, absent, not
+a boolean); on a tiny tokenizer with merges (`0 0`, then a space glued to a following
+`0`, built by `tests/common/embedgemma2_mm.rs::timestamp_tokenizer_json`)
+`video_sequence_with_timestamps` equals the tokenizer's ids of the processor's whole
+string for stamps crossing every `mm:ss` carry (59.9, 60, 3725.5, three-digit minutes)
+and a 32-frame video, and is written out for two cases; `MmItem::TimestampedVideo`
+equals the by-hand composition and the `Media` item with those ids bit for bit in both
+modes, in one wait, and its labels, times and frame order are observable; its
+refusals (wrong timestamp count, NaN, negative, no frames, frames of different sizes,
+a bad item after a good one, a sequence past the limit) make 0 allocations and 0
+waits. Mutation checks, each failing the tests that should: frames taken in
 reverse in the segment walk (4 of 8 tests), no `<eoi>` in the builder (5 of 8), and
-`PreConfig` not refusing `add_timestamps` (its test).
+no leading space before the later frames' labels (3 of 12 tests of the file).
 
 ### Speed
 
@@ -2302,8 +2340,6 @@ tokens); in bf16 the runs are too disturbed to say.
 
 ### Not done
 
-* Timestamps are the caller's: no tokenizer here, so `add_timestamps` is reached
-  through `MmItem::Media` (tested against `video0t`), not by a flag.
 * No `Video` entry in the C ABI or Python (`capi*.rs` and `python/` are another
   piece of work); `MmItem::Video` is Rust-only for now.
 * Pictures per call are capped at the tower's 256 (images and frames together); the

@@ -40,6 +40,12 @@
 //!   [`crate::embedgemma2::EmbedGemma2Config::video_sequence`] of the frames'
 //!   soft-token counts, which must be equal, as the processor's single
 //!   `num_soft_tokens_per_video` has it.
+//! * [`MmItem::TimestampedVideo`]: the same frames laid out under the
+//!   processor's `add_timestamps = true`: each block is preceded by its
+//!   `mm:ss` time, tokenized by the [`Tokenizer`] the item carries
+//!   ([`crate::embedgemma2::EmbedGemma2Config::video_sequence_with_timestamps`]).
+//!   `PreConfig`'s `video.add_timestamps` says which of the two items a
+//!   processor configured like the snapshot's wants.
 //! * [`MmItem::Media`]: ids a caller built (a prompt around an image, an
 //!   image and a clip in one sequence, timestamps between a video's frames)
 //!   with the media their placeholders stand for. The `j`-th image placeholder
@@ -114,6 +120,7 @@ use crate::embedgemma2::{
     EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, MmTokens, Seq, SoftSegment, SoftSource, MAX_BATCH,
 };
 use crate::embedgemma2_audio::{AudioConfig, AudioInput, EmbedGemma2Audio, PendingAudio};
+use crate::embedgemma2_tok::Tokenizer;
 use crate::embedgemma2_vision::{EmbedGemma2VisionModel, ImageInput, PendingImages, VisionConfig};
 use crate::gemm::GemmOperands;
 use crate::runtime::GpuRuntime;
@@ -161,6 +168,21 @@ pub enum MmItem<'a> {
     /// must make the same number of soft tokens, as the processor's single
     /// `num_soft_tokens_per_video` has it.
     Video(&'a [ImageInput<'a>]),
+    /// One video laid out as the processor does under `add_timestamps = true`
+    /// ([`crate::embedgemma2::EmbedGemma2Config::video_sequence_with_timestamps`]):
+    /// every frame's block is preceded by its `mm:ss` time, tokenized by
+    /// `tokenizer`, the blocks joined by a space. `timestamps[f]` is frame
+    /// `f`'s time in seconds (`PreparedVideo::timestamps`); there is one per
+    /// frame. The frames go through the vision tower as [`MmItem::Video`]'s
+    /// do, and must make the same number of soft tokens.
+    TimestampedVideo {
+        /// The sampled frames, in order.
+        frames: &'a [ImageInput<'a>],
+        /// Each frame's time in seconds.
+        timestamps: &'a [f64],
+        /// The snapshot's tokenizer, for the labels' ids.
+        tokenizer: &'a Tokenizer,
+    },
     /// Caller-built ids and the media their placeholders stand for.
     Media {
         /// The ids, placeholders included.
@@ -329,7 +351,7 @@ impl EmbedGemma2Multimodal {
                     clips.push(*clip);
                     i0
                 }
-                MmItem::Video(frames) => {
+                MmItem::Video(frames) | MmItem::TimestampedVideo { frames, .. } => {
                     images.extend_from_slice(frames);
                     i0
                 }
@@ -374,7 +396,7 @@ impl EmbedGemma2Multimodal {
                 MmItem::Media { ids, .. } => Cow::Borrowed(*ids),
                 MmItem::Image(_) => Cow::Owned(cfg.image_sequence(image_tokens[span.images.start]).map_err(at)?),
                 MmItem::Audio(_) => Cow::Owned(cfg.audio_sequence(clip_tokens[span.clips.start]).map_err(at)?),
-                MmItem::Video(_) => {
+                MmItem::Video(_) | MmItem::TimestampedVideo { .. } => {
                     let per_frame = &image_tokens[span.frames.clone()];
                     // The processor has one soft-token count per video.
                     if let Some(j) = per_frame.iter().position(|&n| n != per_frame[0]) {
@@ -385,7 +407,15 @@ impl EmbedGemma2Multimodal {
                             per_frame[j], per_frame[0]
                         ));
                     }
-                    Cow::Owned(cfg.video_sequence(per_frame).map_err(at)?)
+                    match item {
+                        MmItem::TimestampedVideo {
+                            timestamps, tokenizer, ..
+                        } => Cow::Owned(
+                            cfg.video_sequence_with_timestamps(tokenizer, timestamps, per_frame)
+                                .map_err(at)?,
+                        ),
+                        _ => Cow::Owned(cfg.video_sequence(per_frame).map_err(at)?),
+                    }
                 }
             });
         }

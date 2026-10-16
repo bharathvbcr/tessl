@@ -382,6 +382,7 @@ sequenceDiagram
     GPU-->>Evt: Signal event completion value
     Evt-->>RT: Flush pending_cold_recycle &amp; pending_retirement
     RT-->>Host: Return control to caller
+    Note over Host,RT: A buffer dropped after this wait is released by the next allocation (no command buffer open, lifetime event caught up), not only by the next commit
     end
 ```
 

@@ -76,9 +76,12 @@ the byte on the tiny model), and consecutive `encode`s hold one set, not two:
 `encode` hands its activations and each forward's uploaded inputs back to the
 runtime before its one wait, and the runtime keeps them alive until that wait
 has finished and then returns them to the pool, where the next call's
-allocations find them. (The pool recycles a dropped buffer at the first commit
-after the drop; dropped after the wait, the buffers were recycled only at the
-next call's wait, which comes after that call has allocated.) The `q|k|v`
+allocations find them. (The pool used to recycle a dropped buffer only at the
+first commit after the drop; dropped after the wait, the buffers were recycled
+at the next call's wait, which comes after that call has allocated. It now
+also recycles at allocation time, see "Pool recycle at allocation" below, so
+this hand-back is no longer needed for the memory bound; it still lets the
+wait itself return the set.) The `q|k|v`
 GEMM's output and the MLP's `gate | up` are one buffer: the q/k-norm-RoPE kernel
 is the last reader of the first, and the second is written after the attention,
 so their lifetimes within a layer never overlap, in either `GemmOperands`
@@ -2306,3 +2309,45 @@ tokens); in bf16 the runs are too disturbed to say.
 * Pictures per call are capped at the tower's 256 (images and frames together); the
   facade does not split a larger call into several tower batches.
 * x86 / AVX2 behaviour of the native resize is as unverified as [Preprocessing](#preprocessing) says.
+
+## Pool recycle at allocation
+
+The pool used to return a dropped buffer to its freelist only at a commit. A
+buffer dropped after a wait therefore stayed out of the pool until the next
+call's wait, and the next call's allocations (which come first) missed it and
+made fresh ones: two activation sets live across consecutive calls. `encode`
+and the towers worked around it by handing their buffers back before their
+wait. The class fix is in the runtime, so it covers every caller (Qwen3.5, user
+code, a model that drops after its wait): `alloc_buffer_kind` first runs
+`recycle_if_idle`, which releases what has been dropped when
+
+* no command buffer is open (`active_m4` holds none; if the lock is held, this
+  call is inside a commit or an encode step on this thread and it skips, as
+  `flush_residency` does), and
+* the private lifetime event, read through `checked_lifetime_value`, has
+  reached the value of the last commit submitted.
+
+Neither is a wait: an allocation while work is queued or running allocates
+fresh memory, as before, and the at-commit drains are unchanged. A buffer
+dropped while a command buffer is open, or while one it was bound in is still
+running, is not reused until its lifetime event passes. The hand-back in
+`encode` and the towers stays: it lets the wait itself return the set, so the
+buffers are in the freelist before the call returns, whatever the caller does
+next.
+
+Measured on the real checkpoint (`profile_embedgemma2`, `PROFILE_MODE=memory-table`,
+the same harness binary source on the base `7c7a61f` and with the change, fresh
+process per cell, deterministic): the device peak above the model of one
+encode, four back to back and three with `synchronize` between is unchanged in
+the single and sync-between columns (400.47 / 400.33 / 400.28 MiB f32, 392.50 /
+392.33 / 392.28 bf16 at 32x256 / 8x1024 / 2x4096). The back-to-back column
+falls to the single figure in every cell: the previous call's small output
+buffer, which was recycled one call late, is reused (400.59 to 400.47 at
+32x256, 112.88 to 112.62 at 64x32 f32; 110.94 to 110.69 bf16). Every embedding
+hash of `PROFILE_MODE=hash` (6 workloads x 2 modes x full and truncated) is
+equal between the two builds. `tests/pool_recycle_at_alloc.rs` is the check
+that does not go through the hand-back: a set dropped after the wait is served
+to the next allocation with no commit between, with the same buffers and the
+same device bytes, and the in-flight cases above hold. The decision logic
+under a hand-set lifetime event and under a held `active_m4` lock is in
+`runtime::alloc_recycle_tests`.

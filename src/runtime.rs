@@ -585,7 +585,10 @@ type PendingRelease = (Retained<ProtocolObject<dyn MTLAllocation>>, bool);
 /// A release held until the GPU passes a shared-event value: the value of the
 /// commit that closes the command buffer open when the owner dropped. Every
 /// command buffer that could have bound the item precedes that commit, and
-/// with no owner left no later one can.
+/// with no owner left no later one can. The value is the next commit's even
+/// when no command buffer is open at the drop, so such an item is taken by
+/// that commit, or earlier by an allocation that finds the GPU idle
+/// ([`GpuRuntime::recycle_if_idle`]).
 type Deferred<T> = (u64, T);
 
 /// Take the items of `queue` whose release point the GPU has passed.
@@ -1433,7 +1436,10 @@ impl GpuRuntime {
     /// return to the freelist; retired Hot allocs leave residency without
     /// recycling. A waiting commit passes `u64::MAX` (nothing in flight, no
     /// command buffer open); a non-waiting one passes the event value the GPU
-    /// has reached, so a run that never waits still recycles.
+    /// has reached, so a run that never waits still recycles. An allocation
+    /// passes `u64::MAX` when it finds the same state
+    /// ([`Self::recycle_if_idle`]), so what was dropped after a wait is
+    /// reusable at once rather than at the next commit.
     fn drain_cold_recycles(&self, completed: u64) {
         let cold = take_completed(&self.pending_cold_recycle, completed);
         let retired = take_completed(&self.pending_retirement, completed);
@@ -1475,6 +1481,60 @@ impl GpuRuntime {
         }
         drop(retired);
         drop(other);
+    }
+
+    /// Whether any deferred release is waiting on the GPU.
+    fn deferred_pending(&self) -> bool {
+        fn waiting<T>(queue: &Mutex<Vec<Deferred<T>>>) -> bool {
+            !queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
+        }
+        waiting(&self.pending_cold_recycle)
+            || waiting(&self.pending_retirement)
+            || waiting(&self.pending_external_release)
+            || waiting(&self.pending_release)
+    }
+
+    /// Recycle at allocation time: release everything deferred when the GPU
+    /// has nothing left that could read it, so a buffer dropped after a wait
+    /// serves the next allocation instead of waiting for the next commit.
+    ///
+    /// A release point is the next commit's value ([`Self::release_point`]),
+    /// because a drop cannot tell whether a command buffer is open. That is
+    /// right while one is: it may bind the dropped buffer. It is needlessly
+    /// late once none is open and every submitted command buffer has
+    /// completed: the buffer has no owner left, so no later command can bind
+    /// it, and none that could have is still running. That is the state a
+    /// waiting commit with no batch drains in ([`Self::commit_m4`]), and this
+    /// drains under the same two conditions, checked here:
+    ///
+    /// - no command buffer is open. A held `active_m4` lock (this call is
+    ///   inside a commit or an encode step on this thread) is read as "may be
+    ///   open" and skips, as [`Self::flush_residency`] skips under it;
+    /// - the lifetime event, read through [`Self::checked_lifetime_value`] so
+    ///   a signal the queue never made poisons instead of counting, has
+    ///   reached everything submitted.
+    ///
+    /// Otherwise it does nothing and never waits: an allocation while work
+    /// is queued or running allocates fresh memory, as before. Errors only
+    /// where that check does (a dishonest lifetime event).
+    fn recycle_if_idle(&self) -> Result<(), String> {
+        if !self.deferred_pending() {
+            return Ok(());
+        }
+        {
+            let Ok(batch) = self.active_m4.try_lock() else {
+                return Ok(());
+            };
+            if batch.as_ref().is_some_and(|b| b.cb_open) {
+                return Ok(());
+            }
+        }
+        let completed = self.checked_lifetime_value()?;
+        if completed < self.metal4.event_value.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.drain_cold_recycles(u64::MAX);
+        Ok(())
     }
 
     /// Lazily create and return the persistent params workspace.
@@ -1779,6 +1839,8 @@ impl GpuRuntime {
         if kind == BufferKind::Cold {
             crate::infer_trace::on_cold_alloc();
         }
+        // Before the pool lock: the drain recycles into the pool.
+        self.recycle_if_idle()?;
         let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
         let (buffer, from_pool) = BufferPool::alloc(&mut pool, &self.device, nbytes, kind)?;
         if !from_pool {
@@ -3573,5 +3635,157 @@ mod lifetime_event_tests {
         assert_eq!(rt.last_completed_value(), submitted);
         rt.synchronize().unwrap();
         assert!(!rt.is_poisoned());
+    }
+}
+
+/// [`GpuRuntime::recycle_if_idle`]: a dropped buffer is taken by an
+/// allocation only when no command buffer is open and the lifetime event has
+/// reached everything submitted. The event is set by hand where a test needs
+/// work "in flight" that no real command buffer could hold still.
+#[cfg(test)]
+mod alloc_recycle_tests {
+    use super::*;
+
+    const N: usize = 1 << 20;
+
+    fn addr(b: &crate::tensor::GpuBuffer) -> usize {
+        b.metal().contents().as_ptr() as usize
+    }
+
+    /// A commit is "submitted" (the event counter is past what the lifetime
+    /// event has reached) and not finished.
+    fn pretend_in_flight(rt: &GpuRuntime) -> u64 {
+        rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[test]
+    fn a_buffer_dropped_after_a_wait_is_reused_by_the_next_allocation() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.synchronize().unwrap();
+        let first = rt.alloc_buffer(N).unwrap();
+        let at = addr(&first);
+        drop(first);
+        assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
+        let again = rt.alloc_buffer(N).unwrap();
+        assert_eq!(addr(&again), at, "nothing committed, nothing in flight: it is free");
+        assert!(rt.pending_cold_recycle.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_buffer_dropped_while_a_commit_is_in_flight_waits_for_the_lifetime_event() {
+        let rt = GpuRuntime::new().unwrap();
+        let submitted = pretend_in_flight(&rt);
+        let first = rt.alloc_buffer(N).unwrap();
+        let at = addr(&first);
+        drop(first);
+
+        let during = rt.alloc_buffer(N).unwrap();
+        assert_ne!(addr(&during), at, "reused while the commit it may belong to is running");
+        assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1, "released early");
+        drop(during);
+        let still = rt.alloc_buffer(N).unwrap();
+        assert_ne!(addr(&still), at, "reused while the commit it may belong to is running");
+        drop(still);
+
+        // The GPU reaches the commit: the next allocation takes a dropped one.
+        rt.metal4.lifetime_event.setSignaledValue(submitted);
+        let after: Vec<_> = (0..3).map(|_| rt.alloc_buffer(N).unwrap()).collect();
+        assert!(rt.pending_cold_recycle.lock().unwrap().is_empty());
+        let seen: Vec<usize> = after.iter().map(addr).collect();
+        assert!(
+            seen.contains(&at),
+            "the first buffer never came back: {seen:x?} (want {at:x})"
+        );
+    }
+
+    /// A drop while the GPU has completed only part of what was submitted
+    /// is not released by an allocation: the lifetime event has not caught up.
+    #[test]
+    fn a_partly_complete_event_releases_nothing_at_allocation() {
+        let rt = GpuRuntime::new().unwrap();
+        let first_commit = pretend_in_flight(&rt);
+        let second_commit = pretend_in_flight(&rt);
+        let first = rt.alloc_buffer(N).unwrap();
+        drop(first);
+        rt.metal4.lifetime_event.setSignaledValue(first_commit);
+        let _during = rt.alloc_buffer(N).unwrap();
+        assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
+        rt.metal4.lifetime_event.setSignaledValue(second_commit);
+        let _after = rt.alloc_buffer(N).unwrap();
+        assert!(rt.pending_cold_recycle.lock().unwrap().is_empty());
+    }
+
+    /// Dropping and allocating under `active_m4` (the lock a commit or an
+    /// encode step holds on this thread) neither deadlocks nor recycles.
+    #[test]
+    fn an_allocation_under_the_batch_lock_neither_blocks_nor_recycles() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.synchronize().unwrap();
+        let first = rt.alloc_buffer(N).unwrap();
+        let at = addr(&first);
+        let held = {
+            let _batch = rt.active_m4.lock().unwrap();
+            drop(first);
+            let held = rt.alloc_buffer(N).unwrap();
+            assert_ne!(addr(&held), at, "recycled under the batch lock");
+            assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
+            held
+        };
+        let free = rt.alloc_buffer(N).unwrap();
+        assert_eq!(addr(&free), at, "not recycled once the lock is released");
+        drop(held);
+    }
+
+    /// An open command buffer may bind the dropped buffer, even when the
+    /// lifetime event has reached everything committed so far.
+    #[test]
+    fn an_open_command_buffer_blocks_the_recycle() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_async_encode(true).unwrap();
+        let first = rt.alloc_buffer(N).unwrap();
+        let at = addr(&first);
+        rt.with_binder(|_| Ok(())).unwrap();
+        assert!(rt.active_m4.lock().unwrap().as_ref().is_some_and(|b| b.cb_open));
+        drop(first);
+        let during = rt.alloc_buffer(N).unwrap();
+        assert_ne!(addr(&during), at, "reused while a command buffer is open");
+        drop(during);
+        rt.synchronize().unwrap();
+        assert!(rt.pending_cold_recycle.lock().unwrap().is_empty());
+        rt.set_async_encode(false).unwrap();
+    }
+
+    /// Hot storage retires at allocation too: its memory goes back to the
+    /// device, not only after the next commit.
+    #[test]
+    fn a_dropped_hot_buffer_is_released_by_the_next_allocation() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.synchronize().unwrap();
+        let hot = rt.alloc_buffer_hot(64 << 20).unwrap();
+        let held = rt.current_allocated_bytes();
+        drop(hot);
+        assert_eq!(rt.pending_retirement.lock().unwrap().len(), 1);
+        let _small = rt.alloc_buffer(256).unwrap();
+        assert!(rt.pending_retirement.lock().unwrap().is_empty());
+        assert!(
+            rt.current_allocated_bytes() + (64 << 20) <= held + (1 << 20),
+            "the 64 MiB Hot buffer is still allocated"
+        );
+    }
+
+    /// The recycle reads the lifetime event only through the checked read: a
+    /// value the queue never signaled poisons the runtime and fails the
+    /// allocation, rather than being taken as completion.
+    #[test]
+    fn a_dishonest_lifetime_event_fails_the_allocation_instead_of_releasing() {
+        let rt = GpuRuntime::new().unwrap();
+        let first = rt.alloc_buffer(N).unwrap();
+        drop(first);
+        let submitted = rt.last_signaled_value();
+        rt.metal4.lifetime_event.setSignaledValue(submitted + 5);
+        let error = rt.alloc_buffer(N).map(|_| ()).unwrap_err();
+        assert!(error.contains("lifetime event is at"), "{error}");
+        assert!(rt.is_poisoned());
+        assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
     }
 }

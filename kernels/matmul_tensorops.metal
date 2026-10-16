@@ -217,39 +217,6 @@ kernel void matmul2d_tensorops_nn_splitk_par_f32(
     op.run(tA, tB, tS);
 }
 
-/// The bf16 form of `matmul2d_tensorops_nn_splitk_par_f32`: threadgroup
-/// `p · tiles + t` computes tile `t` of partition `p` on the cooperative
-/// destination (gemm_coop.h's `mm_coop_nn_partition`, 64×64 on four
-/// simdgroups) and stores it into slice `p` of a scratch `S`; the store writes
-/// every in-bounds element, so `S` needs no zeroing, and
-/// `reduce_partitions_f32` sums the slices in partition order.
-#define NN_SPLITK_PAR_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                 \
-    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
-                     device ELEM *B [[buffer(1)]],                             \
-                     device float *S [[buffer(2)]],                            \
-                     constant uint &M [[buffer(3)]],                           \
-                     constant uint &N [[buffer(4)]],                           \
-                     constant uint &K [[buffer(5)]],                           \
-                     constant uint &k_tile [[buffer(6)]],                      \
-                     constant uint &tiles_n [[buffer(7)]],                     \
-                     constant uint &tiles_m [[buffer(8)]],                     \
-                     constant uint &partitions [[buffer(9)]],                  \
-                     constant uint &slice [[buffer(10)]],                      \
-                     uint tgpig [[threadgroup_position_in_grid]]) {            \
-        const uint tiles = tiles_n * tiles_m;                                  \
-        if (tiles == 0u) return;                                               \
-        const uint p = tgpig / tiles;                                          \
-        if (p >= partitions) return;                                           \
-        const ulong k0 = (ulong)p * k_tile;                                    \
-        if (k0 >= K) return;                                                   \
-        const uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);            \
-        mm_coop_nn_partition<ELEM, SM, SN, NSG, RELAXED>(                      \
-            A + k0, B + k0 * N, S + (ulong)p * slice, M, N, k_len, K,          \
-            tiles_n, tiles_m, tgpig - p * tiles);                              \
-    }
-
-NN_SPLITK_PAR_KERNEL(matmul2d_tensorops_nn_splitk_par_bf16_f32, bfloat, 64, 64, 4, false)
-
 /// Split-K NN accumulate for one K-partition: C[M,N] += A[M, k0:k0+len] @
 /// B[k0:k0+len, N], with C zeroed by the host first. For a long K the host
 /// cuts K into partitions whose slice of B fits in cache. One dispatch over

@@ -370,44 +370,6 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
     }
 }
 
-/// One tile of an NN K-partition on the cooperative destination: `mm_coop`'s
-/// body for a partition of K whose A columns start `k0` into rows of `lda`
-/// elements. `A` and `B` are already at the partition's origin (`A + k0`,
-/// `B + k0 * N`) and `K` is the partition's length, so the A views take their
-/// row stride from `lda` and not from `K` (`mm_coop` ties the two, and a
-/// partition of a row-major A is the one operand where they differ). The
-/// store writes every in-bounds element of `C`. Production's use is the
-/// small-M split-K, where `C` is a slice of its scratch.
-template <typename ElemT, int SM, int SN, int NSG, bool RELAXED>
-inline void mm_coop_nn_partition(device ElemT *A, device ElemT *B, device float *C,
-                                 uint M, uint N, uint K, uint lda,
-                                 uint tiles_n, uint tiles_m, uint tile_linear) {
-    constexpr auto d = matmul2d_descriptor(
-        SM, SN, dynamic_length_v<int>, false, false, RELAXED,
-        matmul2d_descriptor::mode::multiply);
-    matmul2d<d, execution_simdgroups<NSG>> op;
-
-    uint2 tile = tile_from_linear(tile_linear, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = tensor(A + (ulong)ty * lda, dextents<int, 2>{(int)K, SM}, array<int, 2>{1, (int)lda});
-        auto tB = gemm_b<false>::template interior<SN>(B, (int)N, (int)K, tx);
-        auto tC = gemm_c_interior<SM, SN>(C, (int)N, tx, ty, (int)N);
-        coop_tile<false, false, true, SM, SN>(op, tA, tB, tC, nullptr, tx, ty, (int)M,
-                                              (int)N, 1.0f, 0.0f, 0u);
-    } else {
-        auto tA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)lda}).slice(0, ty);
-        auto tB = gemm_b<false>::edge(B, (int)N, (int)K, tx);
-        auto tC = gemm_c_edge(C, (int)M, (int)N, tx, ty, (int)N);
-        coop_tile<false, false, false, SM, SN>(op, tA, tB, tC, nullptr, tx, ty, (int)M,
-                                               (int)N, 1.0f, 0.0f, 0u);
-    }
-}
-
 // =============================================================================
 // Exact f32 — execution_simdgroup, SM=SN=32 (golden-safe): `mode::multiply`
 // into a C the host zeroed first, or `multiply_accumulate` into C.

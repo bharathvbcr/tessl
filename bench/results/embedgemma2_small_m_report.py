@@ -3,11 +3,11 @@
     python embedgemma2_small_m_report.py <results dir> <raw dir> <lane-before> <lane-after> <lane-control>
 
 <raw dir> holds, from `bench_paired` (one run per precision and workload group):
-    paired_lat_f32.json  paired_lat_bf16.json   (1x16, 1x64)
-    paired_thr64_f32.json paired_thr64_bf16.json  (64x32)
-    paired_thr8_f32.json  paired_thr8_bf16.json   (8x1024)
+    paired_lat_f32.json    (1x16, 1x64)
+    paired_thr64_f32.json  (64x32)
+    paired_thr8_f32.json   (8x1024)
 and, from `bench_gemm_routes` (BENCH_LANES=nnsmall), the stdout of
-    nnsmall_f32.txt  nnsmall_bf16.txt
+    nnsmall_f32.txt
 It writes embedgemma2_small_m_m5pro.json into <results dir> and prints the
 tables the .txt quotes.
 
@@ -88,7 +88,7 @@ doc = {
     "encode": {},
     "stats": {},
 }
-for prec in ("f32", "bf16"):
+for prec in ("f32",):
     rows = []
     for grp in ("lat", "thr64", "thr8"):
         d = load(f"paired_{grp}_{prec}.json")
@@ -100,7 +100,7 @@ for prec in ("f32", "bf16"):
         doc["workloads"] = [r["workload"] for r in rows]
 
 gemm = {}
-for prec in ("f32", "bf16"):
+for prec in ("f32",):
     cases = parse_nnsmall(raw / f"nnsmall_{prec}.txt")
     gemm[prec] = cases
 doc["gemm"] = gemm

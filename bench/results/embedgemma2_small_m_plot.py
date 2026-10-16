@@ -3,7 +3,7 @@
 Reads embedgemma2_small_m_m5pro.json and writes embedgemma2_small_m_m5pro.png:
 left, the whole-encode time after the small-M GEMM lane against before it (the
 ratio of every interleaved round, with the median and the control lane's
-spread as the noise band), exact f32 and bf16; right, the per-GEMM time at 16
+spread as the noise band), exact f32; right, the per-GEMM time at 16
 rows (`bench_gemm_routes` lane `nnsmall`: plain single dispatch against the
 split-K lane, interleaved).
 
@@ -30,7 +30,7 @@ fig, (ax, bx) = plt.subplots(1, 2, figsize=(13, 5), gridspec_kw={"width_ratios":
 
 # Left: after / before per round, per workload.
 width = 0.36
-for j, prec in enumerate(["f32", "bf16"]):
+for j, prec in enumerate(doc["encode"]):
     paired = doc["encode"][prec]
     xs, meds = [], []
     for i, w in enumerate(WORKLOADS):
@@ -58,7 +58,7 @@ ax.legend(loc="lower right", fontsize=8)
 g = doc["gemm_16_rows"]
 names = [r["name"] for r in g["f32"]]
 pos = range(len(names))
-for j, prec in enumerate(["f32", "bf16"]):
+for j, prec in enumerate(doc["encode"]):
     plain = [r["plain_us"] for r in g[prec]]
     prod = [r["production_us"] for r in g[prec]]
     off = (j - 0.5) * 0.36
@@ -66,7 +66,7 @@ for j, prec in enumerate(["f32", "bf16"]):
     bx.bar([p + off + 0.08 for p in pos], prod, 0.16, color=COLORS[prec], label=f"{prec}: split-K lane")
 bx.set_xticks(list(pos), names, rotation=30, ha="right", fontsize=8)
 bx.set_ylabel("us per GEMM (median of interleaved rounds)")
-bx.set_title("One GEMM at 16 rows (GPU shared, absolute us inflated)")
+bx.set_title("One GEMM at 16 rows (median of interleaved rounds)")
 bx.legend(fontsize=8)
 
 fig.tight_layout()

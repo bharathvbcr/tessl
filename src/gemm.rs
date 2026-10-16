@@ -457,16 +457,6 @@ fn gemm_dispatch(
         // Cooperative-destination NN kernels (bf16, f16 and relaxed f32):
         // register accumulator, C written exactly once — no zero pre-pass.
         GemmBackend::TensorOps if coop => {
-            // A skinny bf16 A over a C of few tiles: parallel K-partitions
-            // (the exact-f32 lane's reason; `nn_small_par_k_tile`). A forced
-            // tile is a measurement of that tile, so it keeps the single dispatch.
-            let split = match (tile, elem) {
-                (None, CoopElem::Bf16) => nn_small_par_k_tile(m, n, k, SplitKPar::NnBf16),
-                _ => None,
-            };
-            if let Some(k_tile) = split {
-                return splitk_par(a, b, c, (m, n, k), k_tile, SplitKPar::NnBf16, false, "gemm");
-            }
             let (kernel, geom) = match tile {
                 Some(forced) => nn_coop_kernel_for(elem, forced),
                 None => nn_coop_kernel(m, n, k, elem),
@@ -1643,18 +1633,17 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
     (k.div_ceil(k_tile) >= 2).then_some(k_tile)
 }
 
-/// NN of a skinny A over a C of few tiles, exact f32 ([`SplitKPar::NnF32`]) or
-/// bf16 operands ([`SplitKPar::NnBf16`]): the K-partition width of the
-/// parallel split-K, or `None` for the single dispatch (and for the TN
-/// lanes, which have their own gates).
+/// NN of a skinny A over a C of few tiles, exact f32: the K-partition width of
+/// the parallel split-K ([`SplitKPar::NnF32`]), or `None` for the single
+/// dispatch.
 ///
 /// One dispatch gives a C of `tiles` tiles only `tiles` threadgroups, each
 /// walking all of K, so the GEMM runs at the latency of that walk and not at
 /// the weights' bandwidth: at 16 rows the exact-f32 down GEMM (K 2048, N 512,
 /// 16 tiles of 32×32) took 86-98 µs for 4 MiB, 45 GB/s of the ~220 GB/s a
 /// copy reaches, while the gate|up GEMM (128 tiles over K 512) ran at
-/// 185 GB/s. Cutting K into about `target_tgs / tiles_n` partitions (`tiles_n`:
-/// the tiles across one row of C) restores the threadgroups, at the cost of a
+/// 185 GB/s. Cutting K into about 128 / `tiles_n` partitions (`tiles_n`: the
+/// tiles across one row of C) restores the threadgroups, at the cost of a
 /// scratch of one `M × N` slice per partition and the reduce dispatch.
 /// The width is sized from one tile row and not from the whole grid so that it
 /// does not move with M: inside the gate a row sums K in the same partitions,
@@ -1662,54 +1651,58 @@ fn tn_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
 /// dispatch above it) the order differs, the one place a row's bits depend
 /// on M.
 ///
-/// Per lane (tile, `max_tiles`, `target_tgs`, `step`), measured on the M5 Pro
-/// by `bench_gemm_routes` lane `nnsmall` (bench/results/embedgemma2_small_m_m5pro.txt):
-/// * exact f32, 32×32 tiles: from 64 tiles up the single dispatch already
+/// The gate, measured on the M5 Pro by `bench_gemm_routes` lane `nnsmall`
+/// (bench/results/embedgemma2_small_m_m5pro.txt):
+/// * under 64 tiles of 32×32: from 64 tiles up the single dispatch already
 ///   fills the GPU (qkv at 64-192 tiles and gate|up at 128-256 measured the
-///   split at 0.8-1.1x of it, a loss as often as a gain), so `max_tiles` is
-///   64: an M of up to 96 against N 512. About 128 threadgroups were best
-///   (width 256 at K 2048, 128 at K 1024 and 512), within noise of 64 and
-///   512 either side.
-/// * bf16, 64×64 tiles on four simdgroups: `max_tiles` 16 (M up to 64 at
-///   N 512; qkv at 32-48 tiles and gate|up at 64 measured 0.7-1.0x of the
-///   single dispatch) and about 64 threadgroups (width 256 at K 2048, 128 at
-///   K 1024 and 512), each threadgroup being four simdgroups.
-///
-/// The width is rounded up to `step`, a K under [`NN_SMALL_PAR_MIN_K`] keeps
-/// the single dispatch, and so is a K that gives fewer than two
-/// partitions.
-fn nn_small_par_k_tile(m: usize, n: usize, k: usize, lane: SplitKPar) -> Option<usize> {
-    let (tile, max_tiles, target_tgs, step) = match lane {
-        SplitKPar::NnF32 => (TILE_F32, 64, 128, 128),
-        SplitKPar::NnBf16 => (TILE_COOP_SPLITK, NN_BF16_MAX_TILES, NN_BF16_TARGET_TGS, 128),
-        SplitKPar::F32 | SplitKPar::Bf16 => return None,
-    };
-    if m == 0 || n == 0 || k < NN_SMALL_PAR_MIN_K {
+///   split at 0.8-1.1x of it, a loss as often as a gain): an M of up to 96
+///   against N 512;
+/// * N of at most [`NN_SMALL_PAR_MAX_N`] and K of at least
+///   [`NN_SMALL_PAR_MIN_K`]: the measured range (see the constants);
+/// * about 128 threadgroups, which were best (width 256 at K 2048, 128 at
+///   K 1024 and 512), within noise of 64 and 512 either side; the width is
+///   rounded up to 128, and a K that gives fewer than two partitions keeps
+///   the single dispatch.
+fn nn_small_par_k_tile(m: usize, n: usize, k: usize) -> Option<usize> {
+    const TARGET_TGS: usize = 128;
+    const MAX_TILES: usize = 64;
+    const STEP: usize = 128;
+    let tile = TILE_F32;
+    if m == 0 || n == 0 || n > NN_SMALL_PAR_MAX_N || k < NN_SMALL_PAR_MIN_K {
         return None;
     }
     let tiles_n = n.div_ceil(tile.sn);
-    if m.div_ceil(tile.sm) * tiles_n >= max_tiles {
+    if m.div_ceil(tile.sm) * tiles_n >= MAX_TILES {
         return None;
     }
     // The width is sized from one tile row, not the whole grid: a row's K
     // partitions (hence its summation order) must not depend on how many
     // other rows share the dispatch.
-    let want = (target_tgs / tiles_n).max(2);
-    let k_tile = k.div_ceil(want).div_ceil(step).max(1) * step;
+    let want = (TARGET_TGS / tiles_n).max(2);
+    let k_tile = k.div_ceil(want).div_ceil(STEP).max(1) * STEP;
     // A shape the binder would refuse (K·max(M, N) past a `u32`) keeps the
     // single dispatch it always had, rather than gaining an error.
     (k.div_ceil(k_tile) >= 2 && par_shape("gate", (m, n, k), k_tile, tile).is_ok()).then_some(k_tile)
 }
 
-/// The shortest K the lane takes. Below it the partitions are two or three
-/// of 128 and the lane measured 1.1-1.3x on GEMMs of 17-20 µs (the audio
-/// tower's K 256, `bench_gemm_routes` lane `nnsmall`, shapes `audio *`), a
-/// few µs and near the run-to-run spread, while K 512 and up gains 1.2-3x. A K
-/// under it also keeps one dispatch, so such a GEMM's rows do not change
-/// bits with the rows beside them.
+/// The shortest K the lane takes: the measured range starts at K 512 (the
+/// forward's smallest). Below it the lane measured 1.15-1.45x on the audio
+/// tower's K 256 GEMMs of 11-16 µs (`bench_gemm_routes` lane `nnsmall`,
+/// shapes `audio *`), a saving of 3-5 µs each, against 1.8-3x and 15-60 µs
+/// from K 512; those shapes are left on the one route, which also keeps the
+/// tiny audio configurations' clips bit for bit alone and batched (their
+/// GEMMs are K 256 and under).
 const NN_SMALL_PAR_MIN_K: usize = 512;
-const NN_BF16_MAX_TILES: usize = 16;
-const NN_BF16_TARGET_TGS: usize = 64;
+
+/// The widest N the lane takes: 16 tile columns, the range measured (every
+/// GEMM it speeds up has N 512). A row's bits depend on M across the gate (the
+/// single dispatch sums K in one pass, the lane in partitions), so the lane is
+/// kept to what was measured rather than reaching every few-tile GEMM. Known
+/// cost: the audio tower's soft-token projection (K 1536, N 512) is in range,
+/// and `tests/embedgemma2_audio_model.rs` pins each clip's soft tokens bit
+/// for bit alone (about 25 rows, the lane) against batched (over 96 rows, one
+/// dispatch); it drifts by 1e-5.
+const NN_SMALL_PAR_MAX_N: usize = 512;
 
 /// The path an exact-f32 NN takes: [`gemm`]'s one routing decision for the
 /// non-cooperative lane.
@@ -1732,25 +1725,11 @@ enum NnF32Route {
 fn nn_f32_route(m: usize, n: usize, k: usize) -> NnF32Route {
     if let Some(k_tile) = nn_splitk_k_tile(m, n, k) {
         NnF32Route::SequentialSplit(k_tile)
-    } else if let Some(k_tile) = nn_small_par_k_tile(m, n, k, SplitKPar::NnF32) {
+    } else if let Some(k_tile) = nn_small_par_k_tile(m, n, k) {
         NnF32Route::SmallPar(k_tile)
     } else {
         NnF32Route::Single
     }
-}
-
-/// [`gemm_nn_splitk_par_f32`] on bf16 operands (f32 ones rounded first) with
-/// f32 accumulation: each K-partition is one cooperative 64×64 tile
-/// (`matmul2d_tensorops_nn_splitk_par_bf16_f32`) stored into its scratch
-/// slice, then `reduce_partitions_f32`. [`gemm_bf16`] routes the small-M
-/// shapes here by [`nn_small_par_k_tile`]; this entry takes the width, so a
-/// bench can sweep it and a test can force the lane at any shape.
-pub fn gemm_nn_splitk_par_bf16(a: &Tensor, b: &Tensor, c: &Tensor, k_tile: usize) -> Result<(), String> {
-    const WHAT: &str = "gemm_nn_splitk_par_bf16";
-    let dims = validate_gemm(a, b, c, Layout::NN, true, WHAT)?;
-    check_bf16_lane(a.runtime(), c, WHAT)?;
-    let (a, b) = (ensure_bf16(a)?, ensure_bf16(b)?);
-    splitk_par(&a, &b, c, dims, k_tile, SplitKPar::NnBf16, false, WHAT)
 }
 
 /// `C [M, N] = A · B` for `A [M, K]` and `B [K, N]`, exact f32, as
@@ -1807,9 +1786,6 @@ enum SplitKPar {
     /// `matmul2d_tensorops_nn_splitk_par_f32`: the NN layout on 32×32 tiles
     /// of one simdgroup, the small-M lane ([`nn_small_par_k_tile`]).
     NnF32,
-    /// `matmul2d_tensorops_nn_splitk_par_bf16_f32`: the NN layout on 64×64
-    /// cooperative tiles, the bf16 small-M lane.
-    NnBf16,
 }
 
 impl SplitKPar {
@@ -1818,7 +1794,6 @@ impl SplitKPar {
             Self::F32 => ("matmul2d_tensorops_tn_splitk_par_f32", TILE_F32),
             Self::Bf16 => ("matmul2d_tensorops_tn_splitk_par_bf16_f32", TILE_COOP_SPLITK),
             Self::NnF32 => ("matmul2d_tensorops_nn_splitk_par_f32", TILE_F32),
-            Self::NnBf16 => ("matmul2d_tensorops_nn_splitk_par_bf16_f32", TILE_COOP_SPLITK),
         }
     }
 }
@@ -1935,7 +1910,7 @@ fn splitk_par(
     // show it) and the reduce reads nothing else, so it takes the unzeroed
     // allocation: no host pass over the scratch ahead of a latency-bound GEMM.
     let scratch = match lane {
-        SplitKPar::NnF32 | SplitKPar::NnBf16 => rt.alloc_tensor_unzeroed(&[scratch_len], DType::F32)?,
+        SplitKPar::NnF32 => rt.alloc_tensor_unzeroed(&[scratch_len], DType::F32)?,
         SplitKPar::F32 | SplitKPar::Bf16 => rt.alloc_temp_f32(&[scratch_len])?,
     };
     let gemm_p = rt.pipeline(kernel)?;
@@ -4413,13 +4388,10 @@ mod alignment_probe {
 }
 
 /// Which GEMMs take the small-M parallel split-K, asked without a device: the
-/// gates and the exact-f32 route are pure functions of the shape.
+/// gate and the exact-f32 route are pure functions of the shape.
 #[cfg(test)]
 mod small_m_select {
     use super::*;
-
-    const F32: SplitKPar = SplitKPar::NnF32;
-    const BF16: SplitKPar = SplitKPar::NnBf16;
 
     /// EmbeddingGemma 2's GEMMs as (name, K, N), at the row counts of a
     /// 1x16 forward (16) and the edges of the lane (1, 64), then past it.
@@ -4462,10 +4434,14 @@ mod small_m_select {
             (16, 512, 128, Single),
             (16, 512, 511, Single),
             (16, 64, 256, Single),
-            (10, 256, 1024, SmallPar(128)),
-            (16, 512, 1, Single),
             (0, 512, 2048, Single),
             (16, 0, 2048, Single),
+            // N past 512 is outside the measured range and keeps one route at
+            // every M (the audio tower's wide GEMMs, pinned bit for bit alone and batched).
+            (16, 1024, 4096, Single),
+            (25, 1024, 1024, Single),
+            (16, 513, 2048, Single),
+            (10, 256, 1024, SmallPar(128)),
             // The long-K lane is asked first and keeps its shapes, though
             // the first two also have few tiles.
             (40, 520, 16_200, SequentialSplit(3840)),
@@ -4482,58 +4458,24 @@ mod small_m_select {
         }
     }
 
-    #[test]
-    fn bf16_takes_the_lane_for_the_few_tile_shapes() {
-        for (m, n, k, want) in [
-            // 8 tiles of 64x64 for N = 512 and M <= 64: about 64 threadgroups.
-            (16usize, 512usize, 2048usize, Some(256usize)),
-            (1, 512, 2048, Some(256)),
-            (64, 512, 2048, Some(256)),
-            (16, 512, 1024, Some(128)),
-            (16, 512, 512, Some(128)),
-            // 16 tiles and up: qkv sliding (32), qkv global (48), gate|up (64).
-            (65, 512, 2048, None),
-            (16, 1024, 2048, None),
-            (16, 2048, 512, None),
-            (16, 3072, 512, None),
-            (16, 4096, 512, None),
-            (2048, 512, 2048, None),
-            (16, 512, 128, None),
-            (0, 512, 2048, None),
-        ] {
-            assert_eq!(nn_small_par_k_tile(m, n, k, BF16), want, "{m}x{n}x{k}");
-        }
-    }
-
     /// Inside the gate the width does not move with M: a row's K partitions,
     /// and so its summation order, are the same alone and in a batch (the
     /// tiny-model batch tests hold rows to that).
     #[test]
     fn the_width_inside_the_gate_does_not_depend_on_m() {
-        for lane in [F32, BF16] {
-            let name = lane.kernel().0;
-            for (n, k) in [
-                (512usize, 2048usize),
-                (512, 1024),
-                (512, 512),
-                (256, 640),
-                (64, 600),
-                (128, 2048),
-            ] {
-                let widths: Vec<(usize, usize)> = (1..=2048)
-                    .filter_map(|m| nn_small_par_k_tile(m, n, k, lane).map(|w| (m, w)))
-                    .collect();
-                let first = widths.first().expect("the shape is never in the gate").1;
-                assert!(widths.iter().all(|&(_, w)| w == first), "{name} {n}x{k}: {widths:?}");
-            }
-        }
-    }
-
-    /// The TN lanes keep their own gates.
-    #[test]
-    fn the_tn_lanes_are_not_this_gate() {
-        for lane in [SplitKPar::F32, SplitKPar::Bf16] {
-            assert_eq!(nn_small_par_k_tile(16, 512, 2048, lane), None);
+        for (n, k) in [
+            (512usize, 2048usize),
+            (512, 1024),
+            (512, 512),
+            (256, 640),
+            (64, 600),
+            (128, 2048),
+        ] {
+            let widths: Vec<(usize, usize)> = (1..=2048)
+                .filter_map(|m| nn_small_par_k_tile(m, n, k).map(|w| (m, w)))
+                .collect();
+            let first = widths.first().expect("the shape is never in the gate").1;
+            assert!(widths.iter().all(|&(_, w)| w == first), "{n}x{k}: {widths:?}");
         }
     }
 
@@ -4545,47 +4487,43 @@ mod small_m_select {
     #[test]
     fn a_width_the_gate_returns_is_one_the_binder_takes() {
         let mut taken = 0usize;
-        for lane in [F32, BF16] {
-            let tile = lane.kernel().1;
-            for m in [1usize, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 1000] {
-                for n in [1usize, 31, 32, 33, 255, 512, 513, 1000, 1024, 4096, 1 << 20] {
-                    for k in [
-                        1usize,
-                        127,
-                        128,
-                        129,
-                        255,
-                        256,
-                        257,
-                        512,
-                        1000,
-                        1024,
-                        2048,
-                        2051,
-                        65_536,
-                        1 << 22,
-                        1 << 24,
-                        1 << 30,
-                    ] {
-                        let Some(k_tile) = nn_small_par_k_tile(m, n, k, lane) else {
-                            continue;
-                        };
-                        taken += 1;
-                        assert!(k_tile % 128 == 0 && k_tile >= 128, "{m}x{n}x{k}: width {k_tile}");
-                        assert!(k.div_ceil(k_tile) >= 2, "{m}x{n}x{k}: one partition");
-                        let shape = par_shape("test", (m, n, k), k_tile, tile).unwrap_or_else(|e| {
-                            panic!("{m}x{n}x{k} width {k_tile}: gate took it, binder refuses: {e}")
-                        });
-                        assert!(shape.scratch_len <= TN_PAR_MAX_SCRATCH, "{m}x{n}x{k}");
-                    }
+        let tile = SplitKPar::NnF32.kernel().1;
+        for m in [1usize, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 1000] {
+            for n in [1usize, 31, 32, 33, 255, 512, 513, 1000, 1024, 4096, 1 << 20] {
+                for k in [
+                    1usize,
+                    127,
+                    128,
+                    129,
+                    255,
+                    256,
+                    257,
+                    512,
+                    1000,
+                    1024,
+                    2048,
+                    2051,
+                    65_536,
+                    1 << 22,
+                    1 << 24,
+                    1 << 30,
+                ] {
+                    let Some(k_tile) = nn_small_par_k_tile(m, n, k) else {
+                        continue;
+                    };
+                    taken += 1;
+                    assert!(k_tile % 128 == 0 && k_tile >= 128, "{m}x{n}x{k}: width {k_tile}");
+                    assert!(k.div_ceil(k_tile) >= 2, "{m}x{n}x{k}: one partition");
+                    let shape = par_shape("test", (m, n, k), k_tile, tile)
+                        .unwrap_or_else(|e| panic!("{m}x{n}x{k} width {k_tile}: gate took it, binder refuses: {e}"));
+                    assert!(shape.scratch_len <= TN_PAR_MAX_SCRATCH, "{m}x{n}x{k}");
                 }
             }
         }
-        assert!(taken > 100, "the grid reached the gate only {taken} times");
+        assert!(taken > 50, "the grid reached the gate only {taken} times");
         // A K whose offsets would overflow the kernels' u32 is not taken.
-        assert_eq!(nn_small_par_k_tile(1, 512, 1 << 24, F32), None);
-        assert_eq!(nn_small_par_k_tile(1, 512, 1 << 24, BF16), None);
-        assert!(nn_small_par_k_tile(1, 512, 1 << 22, F32).is_some());
+        assert_eq!(nn_small_par_k_tile(1, 512, 1 << 24), None);
+        assert!(nn_small_par_k_tile(1, 512, 1 << 22).is_some());
     }
 
     /// The binder refuses a width that is not a positive multiple of 4, and

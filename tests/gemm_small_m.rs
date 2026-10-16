@@ -275,6 +275,10 @@ fn routing_by_shape() {
                 (8192, 512, 2048, plain, "down at 8x1024"),
                 (128, 512, 2048, plain, "down at 128 rows: 64 tiles"),
                 (16, 512, 128, plain, "K within one partition"),
+                (16, 512, 256, plain, "K under the lane's floor: the audio tower's"),
+                (25, 1024, 1024, plain, "N past 512: outside the measured range"),
+                (25, 4096, 1024, plain, "N past 512: the audio tower's feed-forward"),
+                (10, 256, 1024, lane, "N 256, K 1024: inside the gate"),
                 (
                     40,
                     520,

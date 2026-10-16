@@ -29,8 +29,8 @@
 //!   bench/results/splitk_par_bf16_m5pro.txt.)
 //! - `smallm`: plain bf16 NN at M = 16..1024, the 128x64 and 64x64 tiles
 //!   (`gemm_tiled`) against production's choice.
-//! - `nnsmall`: the small-M NN lane, exact f32 (`BENCH_DTYPE=f32`, default) or
-//!   bf16 (`bf16`), at EmbeddingGemma 2's GEMM shapes and `BENCH_ROWS` rows
+//! - `nnsmall`: the small-M exact-f32 NN lane, at EmbeddingGemma 2's GEMM shapes
+//!   (`BENCH_SHAPES`: names, default the forward's; the `audio *` ones are the small-B shapes) and `BENCH_ROWS` rows
 //!   (default 1,16,32,64), weights cycled over 24 copies as in a forward.
 //!   Arms: the plain single dispatch (raw), production (`gemm`, whatever it
 //!   routes to), and the parallel split-K at `BENCH_WIDTHS` (default
@@ -51,9 +51,8 @@ mod common;
 use objc2_metal::MTLComputePipelineState;
 use std::sync::Arc;
 use tessl::gemm::{
-    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_bf16,
-    gemm_nn_splitk_par_f32, gemm_tiled, gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue,
-    GemmBackend, GemmOperands,
+    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_f32, gemm_tiled,
+    gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
 };
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
@@ -562,23 +561,19 @@ fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     Ok(())
 }
 
-/// The NN as it ran before the small-M lane. Exact f32: C zeroed, then one
+/// The exact-f32 NN as it ran before the small-M lane: C zeroed, then one
 /// `matmul2d_tensorops_f32` dispatch (32x32 tiles, one simdgroup each) over
-/// all of K. bf16: one `matmul2d_tensorops_bf16_f32_64x64_sg4` dispatch
-/// (what `gemm` picks for N <= 512), C written once. Raw, so the comparison
-/// does not depend on what `gemm` routes to.
+/// all of K. Raw, so the comparison does not depend on what `gemm` routes to.
 fn plain_nn(
     rt: &Arc<GpuRuntime>,
-    bf16: bool,
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
     (m, n, k): (usize, usize, usize),
 ) -> Result<(), String> {
-    // Each kernel and the tile it is compiled for, together.
+    // The kernel and the tile it is compiled for, together.
     const PLAIN_F32: (&str, usize, usize) = ("matmul2d_tensorops_f32", 32, 1);
-    const PLAIN_BF16: (&str, usize, usize) = ("matmul2d_tensorops_bf16_f32_64x64_sg4", 64, 4);
-    let (kernel, tile, simdgroups) = if bf16 { PLAIN_BF16 } else { PLAIN_F32 };
+    let (kernel, tile, simdgroups) = PLAIN_F32;
     let z = rt.pipeline("zero_f32")?;
     let p = rt.pipeline(kernel)?;
     let numel = c.numel();
@@ -586,14 +581,12 @@ fn plain_nn(
     let (tiles_n, tiles_m) = (n.div_ceil(tile), m.div_ceil(tile));
     let tpt = p.threadExecutionWidth() * simdgroups;
     rt.with_binder(|bnd| {
-        if !bf16 {
-            bnd.set_pipeline(&z);
-            bnd.bind_tensor(c, 0);
-            bnd.bind_u32(numel as u32, 1);
-            bnd.dispatch(mtl_size(numel.div_ceil(z_tpt), 1, 1), mtl_size(z_tpt, 1, 1));
-            if bnd.needs_explicit_barriers() {
-                bnd.barrier();
-            }
+        bnd.set_pipeline(&z);
+        bnd.bind_tensor(c, 0);
+        bnd.bind_u32(numel as u32, 1);
+        bnd.dispatch(mtl_size(numel.div_ceil(z_tpt), 1, 1), mtl_size(z_tpt, 1, 1));
+        if bnd.needs_explicit_barriers() {
+            bnd.barrier();
         }
         bnd.set_pipeline(&p);
         bnd.bind_tensor(a, 0);
@@ -609,27 +602,13 @@ fn plain_nn(
     })
 }
 
-/// The small-M NN (`gemm_nn_splitk_par_f32`, or `_bf16` with `BENCH_DTYPE=bf16`)
-/// at the EmbeddingGemma 2 forward's shapes and row counts: the plain single
-/// dispatch, production (`gemm`, whatever it routes to), and the parallel
-/// split-K at forced widths.
+/// The small-M exact-f32 NN (`gemm_nn_splitk_par_f32`) at the EmbeddingGemma 2
+/// forward's shapes and row counts: the plain single dispatch, production
+/// (`gemm`, whatever it routes to), and the parallel split-K at forced widths.
 /// A layer's weight is one of 24 distinct copies cycled, as in a forward, so
 /// the weights stream from memory rather than sit in cache.
 fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
-    let bf16 = match std::env::var("BENCH_DTYPE").as_deref() {
-        Ok("bf16") => true,
-        Ok("f32") | Err(_) => false,
-        Ok(other) => return Err(format!("BENCH_DTYPE={other:?}: expected f32 or bf16")),
-    };
-    let operand = |t: Tensor| if bf16 { cast_f32_to_bf16(&t) } else { Ok(t) };
-    let forced = |a: &Tensor, b: &Tensor, c: &Tensor, w: usize| {
-        if bf16 {
-            gemm_nn_splitk_par_bf16(a, b, c, w)
-        } else {
-            gemm_nn_splitk_par_f32(a, b, c, w)
-        }
-    };
-    let tile = if bf16 { 64 } else { 32 };
+    let tile = 32;
     // (name, K, N): the forward's GEMMs.
     const SHAPES: &[(&str, usize, usize)] = &[
         ("down", 2048, 512),
@@ -677,12 +656,11 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
         for &m in &ms {
             let a = rt.alloc_tensor_f32(&[m, k])?;
             a.buffer.write_f32(&common::fill(m * k, 0x7a1 ^ (m * n + k) as u64));
-            let a = operand(a)?;
             let ws: Vec<Tensor> = (0..LAYERS)
                 .map(|l| {
                     let w = rt.alloc_tensor_f32(&[k, n])?;
                     w.buffer.write_f32(&common::fill(k * n, 0x7b2 ^ l as u64));
-                    operand(w)
+                    Ok(w)
                 })
                 .collect::<Result<_, String>>()?;
             let live: Vec<usize> = widths.iter().copied().filter(|&w| w < k).collect();
@@ -690,10 +668,10 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
                 .map(|_| rt.alloc_tensor_f32(&[m, n]))
                 .collect::<Result<_, _>>()?;
             // Every arm computes the same product, up to the summation order.
-            plain_nn(rt, bf16, &a, &ws[0], &cs[0], (m, n, k))?;
+            plain_nn(rt, &a, &ws[0], &cs[0], (m, n, k))?;
             gemm(&a, &ws[0], &cs[1], GemmBackend::TensorOps)?;
             for (i, &w) in live.iter().enumerate() {
-                forced(&a, &ws[0], &cs[2 + i], w)?;
+                gemm_nn_splitk_par_f32(&a, &ws[0], &cs[2 + i], w)?;
             }
             rt.synchronize()?;
             let base = cs[0].buffer.read_f32()[..m * n].to_vec();
@@ -701,7 +679,7 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
                 .iter()
                 .map(|c| rel_diff(&base, &c.buffer.read_f32()[..m * n]))
                 .fold(0.0, f64::max);
-            if worst.is_nan() || worst >= if bf16 { 1e-2 } else { 1e-5 } {
+            if worst.is_nan() || worst >= 1e-5 {
                 return Err(format!(
                     "{name} M={m} N={n} K={k}: arms disagree by {worst:.2e} of the output's scale"
                 ));
@@ -713,7 +691,7 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let c_plain = &cs[0];
             arms.push(arm("plain", rt, reps, move || {
                 i += 1;
-                plain_nn(rt, bf16, a_ref, &ws_ref[i % LAYERS], c_plain, (m, n, k))
+                plain_nn(rt, a_ref, &ws_ref[i % LAYERS], c_plain, (m, n, k))
             }));
             let mut i = 0usize;
             let c_prod = &cs[1];
@@ -726,14 +704,13 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
                 let c = &cs[2 + j];
                 arms.push(arm(&format!("par_splitk_{w}"), rt, reps, move || {
                     i += 1;
-                    forced(a_ref, &ws_ref[i % LAYERS], c, w)
+                    gemm_nn_splitk_par_f32(a_ref, &ws_ref[i % LAYERS], c, w)
                 }));
             }
             let tiles = m.div_ceil(tile) * n.div_ceil(tile);
             report(
                 &format!(
-                    "nnsmall {} {name} M={m} N={n} K={k}  ({tiles} tiles of {tile}x{tile}; arms agree within {worst:.1e})",
-                    if bf16 { "bf16" } else { "f32" }
+                    "nnsmall f32 {name} M={m} N={n} K={k}  ({tiles} tiles of {tile}x{tile}; arms agree within {worst:.1e})",
                 ),
                 &mut arms,
                 run,

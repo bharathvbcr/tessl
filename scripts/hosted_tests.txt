@@ -34,6 +34,7 @@ bin npy_hardening 4
 bin parser_mutation 13
 bin qwen35_config 5
 bin relaxed_predicate 1
+bin release_check 14
 bin safetensors 12
 bin shader_index_arithmetic 23
 bin icb_flag_env 4

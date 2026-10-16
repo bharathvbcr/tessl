@@ -1512,39 +1512,6 @@ fn config_reads_the_checkpoint() {
     }
 }
 
-#[test]
-fn config_refuses_what_the_forward_does_not_implement() {
-    let cases = [
-        ("\"gelu_pytorch_tanh\"", "\"silu\""),
-        ("\"head_dim\":256", "\"head_dim\":128"),
-        (
-            "\"05\":{\"head_dim\":512,",
-            "\"05\":{\"sliding_window\":3,\"head_dim\":512,",
-        ),
-        ("\"05\":{", "\"99\":{"),
-        ("\"num_key_value_heads\":2", "\"num_key_value_heads\":3"),
-        ("\"attention_bias\":false", "\"attention_bias\":true"),
-        (
-            "\"rope_theta\":10000.0,\"rope_type\":\"default\"",
-            "\"rope_theta\":10000.0,\"rope_type\":\"yarn\"",
-        ),
-        ("\"num_hidden_layers\":24", "\"num_hidden_layers\":23"),
-        ("\"sliding_window\":512", "\"sliding_window\":0"),
-        (
-            "\"model_type\":\"embedding_gemma2_text\"",
-            "\"model_type\":\"gemma4_text\"",
-        ),
-    ];
-    for (from, to) in cases {
-        assert!(REAL_TEXT_CONFIG.contains(from), "test bug: {from} not in the config");
-        let text = REAL_TEXT_CONFIG.replacen(from, to, 1);
-        assert!(
-            EmbedGemma2Config::from_config_json(&text).is_err(),
-            "{from} -> {to}: accepted"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 7. The fused row passes and the bf16-output attention (G7)
 //
@@ -1555,6 +1522,12 @@ fn config_refuses_what_the_forward_does_not_implement() {
 // 33, 1000, 768), rows from 1 up, and a layer scale of exactly 1 (the plain
 // add) and not. Outputs are poisoned with NaN first, so an element a kernel
 // does not write cannot match.
+//
+// This block sits above `config_refuses_what_the_forward_does_not_implement`,
+// not at the end of the file: that test's string literals leave its braces
+// unbalanced, so `tests/hosted_selection.rs` reads it up to the next
+// `#[test]`, and a helper mentioning `GpuRuntime` in between would make the
+// device-free hosted test look like a device one.
 // ---------------------------------------------------------------------------
 
 use tessl::embedgemma2::{
@@ -1612,6 +1585,39 @@ fn read_bf16_bits(rt: &Arc<GpuRuntime>, b: &GpuBuffer, n: usize) -> Vec<u16> {
 /// `bf16_rne(x)` as the 16 stored bits.
 fn bf16_bits_of(x: f32) -> u16 {
     (bf16_rne(x).to_bits() >> 16) as u16
+}
+
+#[test]
+fn config_refuses_what_the_forward_does_not_implement() {
+    let cases = [
+        ("\"gelu_pytorch_tanh\"", "\"silu\""),
+        ("\"head_dim\":256", "\"head_dim\":128"),
+        (
+            "\"05\":{\"head_dim\":512,",
+            "\"05\":{\"sliding_window\":3,\"head_dim\":512,",
+        ),
+        ("\"05\":{", "\"99\":{"),
+        ("\"num_key_value_heads\":2", "\"num_key_value_heads\":3"),
+        ("\"attention_bias\":false", "\"attention_bias\":true"),
+        (
+            "\"rope_theta\":10000.0,\"rope_type\":\"default\"",
+            "\"rope_theta\":10000.0,\"rope_type\":\"yarn\"",
+        ),
+        ("\"num_hidden_layers\":24", "\"num_hidden_layers\":23"),
+        ("\"sliding_window\":512", "\"sliding_window\":0"),
+        (
+            "\"model_type\":\"embedding_gemma2_text\"",
+            "\"model_type\":\"gemma4_text\"",
+        ),
+    ];
+    for (from, to) in cases {
+        assert!(REAL_TEXT_CONFIG.contains(from), "test bug: {from} not in the config");
+        let text = REAL_TEXT_CONFIG.replacen(from, to, 1);
+        assert!(
+            EmbedGemma2Config::from_config_json(&text).is_err(),
+            "{from} -> {to}: accepted"
+        );
+    }
 }
 
 #[test]

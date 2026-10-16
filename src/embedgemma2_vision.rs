@@ -79,7 +79,7 @@
 //! attention runs on bf16 tiles. The residual stream, the norms' arithmetic,
 //! the rotation, the pooling and the soft tokens stay f32. A runtime with
 //! relaxed f32 GEMMs on is accepted: no GEMM here is an f32 one. The audio tower
-//! has no such mode ([`crate::embedgemma2_audio`] stays exact f32).
+//! has the same mode ([`crate::embedgemma2_audio`]).
 //!
 //! # Kernels
 //!

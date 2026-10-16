@@ -27,7 +27,7 @@ or torch tensors, recognised by their methods and never imported) and
 ``embed_images`` / ``embed_audio`` call a processor you pass in, as
 ``encode_texts`` calls a tokenizer. ``transformers`` is not a dependency.
 ``operands="bf16"`` (multimodal loads) is the GEMM operands of the text encoder
-and the vision tower; the audio tower is exact f32.
+and both towers.
 
 The model belongs to the thread that made it, like every tessl handle, and
 each call returns after tessl's queue is idle. It reads no torch tensor and
@@ -399,8 +399,8 @@ class EmbedGemma2(_Owned):
         is downloaded). With ``multimodal=True`` the vision and audio towers
         are loaded too (about 1.7 GB on the device against 0.8 GB), which
         :meth:`encode_images` and :meth:`encode_audio` need; ``operands`` is
-        then the GEMM operands of the *text encoder and the vision tower*, ``"f32"``
-        (exact) or ``"bf16"``. The audio tower is exact f32 under either."""
+        then the GEMM operands of the *text encoder and both towers*, ``"f32"``
+        (exact) or ``"bf16"``."""
         return cls(snapshot_dir, multimodal=multimodal, operands=operands)
 
     def _check(self, status: int, err) -> None:

@@ -920,10 +920,24 @@ pub struct EncodeOutput {
 
 /// Bytes of per-layer inputs one GEMM forms: every layer's at once would be
 /// `rows * n_layers * ple_dim` floats, 1.5 GiB at [`MAX_BATCH_TOKENS`] with
-/// the checkpoint's 24 layers of 512. Under this bound a forward of up to
-/// 5461 rows forms all 24 in one GEMM; at 32768 rows it takes 6 (4 layers
-/// each), against 24 one-layer GEMMs before.
-pub const PLE_RUN_BYTES: usize = 256 << 20;
+/// the checkpoint's 24 layers of 512. A layer's inputs are 2 KiB a row, so
+/// under this bound a forward of up to 341 rows forms all 24 in one GEMM,
+/// one of 2048 rows 4 layers per GEMM, and one of 8192 rows or more one layer
+/// per GEMM (the buffer is never smaller than one layer's: 16 MiB at 8192
+/// rows, 64 MiB at 32768).
+///
+/// It is 16 MiB, not the 256 MiB it was: the buffer is part of every
+/// forward's activation set, and at 8192 rows 256 MiB of the set's 736 MiB
+/// was this one (240 MiB more than a layer needs). The bound moves no output
+/// bit and no measurable time (`bench/results/embedgemma2_memory_m5pro.txt`).
+pub const PLE_RUN_BYTES: usize = 16 << 20;
+
+/// Elements of the per-layer-input buffer for a forward of `rows` padded
+/// rows: as many layers' worth as fit in `run_bytes`, at least one layer's,
+/// at most every layer's.
+fn ple_run_elements(run_bytes: usize, rows: usize, ple_dim: usize, n_layers: usize) -> usize {
+    (run_bytes / 4).max(rows * ple_dim).min(rows * ple_dim * n_layers)
+}
 
 /// A forward's fixed cost in padded rows, for [`pack_forwards`], measured as
 /// the intercept over the slope of `encode` time against padded rows (short
@@ -1010,6 +1024,15 @@ struct Acts {
     embeds: Tensor,
     resid: Tensor,
     x: Tensor,
+    /// The `q|k|v` GEMM's output, `[rows, qkv_width]`. The same buffer as
+    /// `gate_up` (this is a clone of it, [`Self::gate_up`]'s width or wider):
+    /// the q/k-norm-RoPE kernel is the last reader of `qkv` in a layer, and
+    /// the MLP's `gate | up` GEMM is the next writer of that storage, after
+    /// the attention and the output projection; the next layer's `q|k|v`
+    /// GEMM writes it again only after the gated activation has read
+    /// `gate | up`. Each dispatch is barriered against the one before it, so
+    /// the two live ranges never overlap, in either [`GemmOperands`] mode
+    /// (both outputs are f32 in both).
     qkv: Tensor,
     q: Tensor,
     /// K and normed V, `[batch, capacity, kv_heads, head_dim]`, sized for
@@ -1026,7 +1049,9 @@ struct Acts {
     /// [`Bf16Acts::wide`] and this is the attention output's width only.
     attn: Tensor,
     y: Tensor,
-    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM.
+    /// The MLP's `gate | up`, `[rows, 2 * intermediate]`, from one GEMM; sized
+    /// for the wider of that and the `q|k|v` row it shares its storage with
+    /// ([`Self::qkv`]).
     gate_up: Tensor,
     /// The normed per-layer inputs of a run of layers, `[rows, run * ple_dim]`
     /// (see [`PLE_RUN_BYTES`]).
@@ -1081,8 +1106,10 @@ fn queue_forwards<Io>(
 
 /// What one forward alone owns, because the host writes it before the forward
 /// runs and reads it after: a later forward must not rewrite it while the GPU
-/// may still be reading it, so each gets its own (small) set, and
-/// [`EmbedGemma2Model::encode`] keeps it alive until its one wait.
+/// may still be reading it, so each gets its own (small) set.
+/// [`EmbedGemma2Model::encode`] keeps all of it until the forwards are
+/// queued, then releases everything but `out` to the runtime's deferred
+/// queue, which holds it until its one wait has finished; `out` it reads after.
 struct ForwardIo {
     /// The ids as the embedding gather reads them: padding is id 0, and under
     /// [`EmbedGemma2Model::encode_multimodal`] each placeholder is `pad_token_id`.
@@ -1548,17 +1575,29 @@ impl EmbedGemma2Model {
                 Ok(())
             },
         );
-        // Wait even when queuing failed: the buffers in `pending` (the failed
-        // forward's included, which `queue_forwards` registers before running
-        // it) and `acts` must outlive every command already queued on them (Metal 4 command
-        // buffers do not retain what they bind).
+        // Hand everything the GPU only reads back to the runtime *before* the
+        // wait: `acts` and each forward's uploaded inputs. A dropped pooled
+        // buffer is parked in the runtime's deferred-release queue, which holds
+        // it (the buffer outlives every queued command, though Metal 4 command
+        // buffers do not retain what they bind) until a waiting commit has seen
+        // the GPU finish, and that same wait then returns it to the pool's
+        // freelist. Dropped after the wait instead, the buffers reach the
+        // freelist only at the *next* commit, which the next `encode` comes
+        // after its `acts()` allocation: two sets of activations were live
+        // across consecutive calls (1472 MiB at 8192 rows, 736 with a wait in
+        // between). Only the output of each forward stays, to be read below.
+        let outs: Vec<(Vec<usize>, Tensor)> = pending.into_iter().map(|(chunk, io)| (chunk, io.out)).collect();
+        drop(acts);
+        // Wait even when queuing failed: the failed forward's io (which
+        // `queue_forwards` registers before running it) and `acts` are held by
+        // the runtime as above until the wait ends or the runtime is dropped.
         let waited = self.rt.synchronize();
         drop(scope);
         queued?;
         waited?;
-        for (chunk, io) in &pending {
+        for (chunk, out) in &outs {
             // Read the prefix columns straight from the mapping: one copy.
-            let out = io.out.buffer.try_contents_f32()?;
+            let out = out.buffer.try_contents_f32()?;
             for (n, &i) in chunk.iter().enumerate() {
                 embeddings[i * dim..(i + 1) * dim].copy_from_slice(&out[n * full..n * full + dim]);
             }
@@ -1979,13 +2018,14 @@ impl EmbedGemma2Model {
         let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32);
         let bf16 = self.operands == GemmOperands::Bf16;
         let bf16s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::BF16);
+        let gate_up = f32s(&[r, qkv_w.max(2 * inter)])?;
         Ok(Acts {
             rows: r,
             nb,
             embeds: f32s(&[r, h])?,
             resid: f32s(&[r, h])?,
             x: f32s(&[r, h])?,
-            qkv: f32s(&[r, qkv_w])?,
+            qkv: gate_up.clone(),
             // The attention's operands: bf16 under `Bf16`, written so by the
             // q/k-norm-RoPE kernel (no cast pass, and half the bytes read
             // back by the attention).
@@ -1995,10 +2035,10 @@ impl EmbedGemma2Model {
             // Under `Bf16` the MLP's activation lives in `Bf16Acts::wide`.
             attn: f32s(&[r, if bf16 { q_w } else { q_w.max(inter) }])?,
             y: f32s(&[r, h])?,
-            gate_up: f32s(&[r, 2 * inter])?,
+            gate_up,
             // A run of per-layer inputs: within `ple_run_bytes`, or one layer's
             // when even that is larger, and never more than every layer's.
-            ple: f32s(&[(self.ple_run_bytes / 4).max(r * ple).min(r * ple * cfg.layers.len())])?,
+            ple: f32s(&[ple_run_elements(self.ple_run_bytes, r, ple, cfg.layers.len())])?,
             ple_gate: f32s(&[r, ple])?,
             ple_mid: if bf16 { bf16s(&[r, ple])? } else { f32s(&[r, ple])? },
             pooled: f32s(&[nb, h])?,
@@ -2268,6 +2308,37 @@ mod tests {
         );
         assert_eq!(r, Err("alloc".to_string()));
         assert_eq!(pending.len(), 1);
+    }
+
+    /// The per-layer-input buffer at the checkpoint's shape (24 layers of
+    /// 512) under the default bound: one layer's 16 MiB at 8192 rows, never
+    /// more than one layer's from there up, every layer's at a few hundred
+    /// rows. The default was 256 MiB, which at 8192 rows was 256 of the
+    /// activation set's 736 MiB.
+    #[test]
+    fn the_per_layer_input_run_is_bounded_at_the_default() {
+        use super::{ple_run_elements, PLE_RUN_BYTES};
+        const MIB: usize = 1 << 20;
+        let at = |rows: usize| ple_run_elements(PLE_RUN_BYTES, rows, 512, 24) * 4;
+        assert_eq!(PLE_RUN_BYTES, 16 * MIB);
+        assert_eq!(at(8192), 16 * MIB, "one layer at the largest single forward");
+        assert_eq!(at(2048), 16 * MIB, "4 layers of 4 MiB");
+        assert_eq!(at(341), 341 * 2048 * 24, "every layer fits");
+        assert_eq!(at(342), 16 * MIB, "one row more and the 24th layer no longer does");
+        assert_eq!(at(16), 16 * 2048 * 24, "a short query holds all 24 layers' inputs");
+        assert_eq!(at(32768), 64 * MIB, "the floor is one layer, however many rows");
+        // The old default, for contrast: this is what the bound removed.
+        assert_eq!(ple_run_elements(256 * MIB, 8192, 512, 24) * 4, 256 * MIB);
+        // Whatever the bound, one layer at least and every layer at most.
+        for bound in [1usize, 4, 1 << 20, usize::MAX / 8] {
+            for rows in [1usize, 7, 8192] {
+                let n = ple_run_elements(bound, rows, 512, 24);
+                assert!(
+                    (rows * 512..=rows * 512 * 24).contains(&n),
+                    "bound {bound} rows {rows}: {n}"
+                );
+            }
+        }
     }
 
     /// Each tiled entry's name spells the geometry the host builds its grid

@@ -20,6 +20,7 @@ bin check_kernel_ir_planted 6
 bin dialect_lint_script 5
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
+bin embedgemma2_pre 5
 bin gdn_fixtures 11
 bin gdn_gates 22
 bin gdn_state 10
@@ -74,6 +75,7 @@ lib ab_flags::tests:: 10
 lib embedgemma2::tests:: 14
 lib embedgemma2_vision::tests:: 4
 lib embedgemma2_audio::tests:: 9
+lib embedgemma2_pre::tests:: 16
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib json::tests:: 4

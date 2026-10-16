@@ -1,0 +1,45 @@
+EmbeddingGemma 2 preprocessing: tessl::embedgemma2_pre against transformers 5.19's processors (Apple M5 Pro, CPU)
+
+lanes   tessl = target/release/bench_embedgemma2_pre (src/bin/bench_embedgemma2_pre.rs), BENCH_ITERS=15 BENCH_WARMUP=3
+        hf    = bench/embedgemma2_pre_hf.py (AutoProcessor of snapshot 914f7f89: the torchvision Gemma4ImageProcessor on a
+                PIL image, Gemma4AudioFeatureExtractor on a float32 clip, EmbeddingGemma2VideoProcessor on decoded frames
+                with fps and duration), same env; torch 2.14.1, torchvision 0.29.1, numpy 2.5.3, 6 torch threads
+run     bench_paired --format workloads --rounds 8 --clean-env --out bench/results/embedgemma2_pre_m5pro.json tessl=... hf=...
+        every lane a fresh process (min of 15 timed calls in it), order reversed on odd rounds. No --evidence: the drift gate
+        was not used (no provenance block; every round's stdout, stderr and load are in the .lanes directory, not committed).
+inputs  identical in both lanes: integer formulas (pixel(f, y, x, c), sample(i)); each row's input_crc (CRC-32 of the input
+        bytes) is equal in the two lanes for every workload (checked in the lane outputs). Not timed: input construction.
+        image_WxH is one RGB image; audio_Ns N seconds of 16 kHz PCM; video_40f_WxH 40 decoded frames at 1 fps, which both
+        sample to 32 and process at 140 soft tokens per frame (the per-frame figures below divide by 32).
+threads each lane uses its own default: tessl up to 8 scoped threads on the resize and the FFT front end (one per 24 audio
+        frames), transformers torch's intra-op pool and numpy
+
+CAVEAT  the host was shared the whole time: 1-minute load average 72 to 146 on 18 cores while this ran (the 16 lane runs'
+        own readings). Min-of-15 inside a process and interleaving of the lanes are what keep the ratios usable; the spread
+        of single rounds is the measure of how much, and is printed. Both lanes were hit alike but not equally in every round.
+
+RESULT  tessl is faster in every workload by its median round ratio. The one range that includes 1 is audio_1s: 0.14x to
+        2.34x over the rounds (one tessl round was 1.54 ms against its usual 0.15 to 0.28 ms), so a 1 s clip, where both
+        take about 0.2 ms, is not distinguished by this run. Elsewhere the lowest round is above 1: 1.4x to 7.4x.
+
+                workload               tessl ms                  hf ms   hf / tessl, median [lowest, highest round]
+           image_224x224                  0.746                  2.258   3.32x [2.02, 4.52]
+           image_640x480                  1.153                  3.098   2.72x [1.72, 4.94]
+         image_1920x1080                  2.643                  6.528   2.68x [1.43, 3.63]
+         image_4000x3000                  4.767                 21.722   4.62x [2.70, 7.19]
+                audio_1s                  0.169                  0.226   1.38x [0.14, 2.34]   (inconclusive)
+               audio_10s                  0.853                  2.592   3.02x [2.09, 3.56]
+               audio_30s                  2.374                  7.976   3.16x [2.28, 4.97]
+       video_40f_640x360                 29.201                 80.869   2.38x [1.64, 6.35]
+      video_40f_1280x720                 54.984                193.295   3.97x [1.37, 7.38]
+
+(median over 8 rounds of each round's min of 15; the ratio column is the median of the 8 per-round ratios.)
+
+Per unit, tessl, median of round minima: 0.75 to 4.8 ms per image (224x224 to 4000x3000); 0.085 ms per second of audio for
+a 10 s clip (0.079 for 30 s); 0.91 ms per sampled frame at 640x360 and 1.7 ms at 1280x720 (29.2 / 32 and 55.0 / 32).
+
+What this does not show: single-thread speed (both lanes are multi-threaded; neither was pinned), anything on x86, or the
+processors' cost with other kernels running on the same cores in a serving process. A speedup over transformers is the
+claim, bounded by the spread above; no absolute number should be quoted from a shared host.
+
+Plot: embedgemma2_pre_m5pro.png (bench/results/embedgemma2_pre_plot.py, uv run --no-project --with matplotlib).

@@ -1730,7 +1730,10 @@ fn a_head_inside_the_tower_prefix_is_refused_as_unread() {
             .collect::<Vec<_>>(),
     );
     let e = load_err(&both, P, Precision::F32);
-    assert!(e.contains(&format!("{P}{HEAD}")) && e.contains("not part of the model"), "{e}");
+    assert!(
+        e.contains(&format!("{P}{HEAD}")) && e.contains("not part of the model"),
+        "{e}"
+    );
 }
 
 struct Scratch(PathBuf);

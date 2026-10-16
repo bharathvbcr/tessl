@@ -856,6 +856,7 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- `embedgemma2_vision::axial_qkv_norm_rope` (and the new `_bf16`) refuse a head dim over 512 (the shared rope table holds 8 pairs per lane); the config parser already limited `vision_config.head_dim` to 32, 64, 256 or 512, so no config loads differently.
 - README and the crate docs count 283 kernel entry points (the vision tower's bf16 rope kernel is the new one).
 - **GDN training reads q/k/v where the model keeps them.**
   `gdn_train_forward_windowed` / `gdn_train_backward_windowed` take `(ld, off)`

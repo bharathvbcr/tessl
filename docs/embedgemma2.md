@@ -810,9 +810,10 @@ the attention): process footprint 1029 to 685 MiB at one image, 2996 to 2329 MiB
 at eight; device peak 302 to 254 and 2192 to 1820 MiB (`bench_embedgemma2_vision`).
 
 `load_with(.., Bf16)` refuses what it cannot run, naming it: a device without
-TensorOps, a head dim `encoder_attn_bf16` is not compiled for (only 64), a head
-dim over 512 (the rope kernel's table), and a checkpoint with any projection
+TensorOps, a head dim `encoder_attn_bf16` is not compiled for (only 64), and a checkpoint with any projection
 stored in another dtype than bf16 (an f32 checkpoint is not rounded at load).
+The rope kernel entry points (`axial_qkv_norm_rope`, `_bf16`) now refuse a head dim over 512 in either mode (its table holds 8 pairs per lane; before they took any multiple of 4). No config loads differently: the config parser only admits head dims 32, 64, 256 and 512, so `load` accepts what it accepted, and "bit for bit" holds for every config that loads.
+
 `ExactF32` keeps refusing relaxed-f32 GEMM selections (`TESSL_*`); `Bf16`'s
 GEMM is the one the text encoder runs, so the exactness check does not apply.
 

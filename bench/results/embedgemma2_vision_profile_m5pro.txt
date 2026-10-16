@@ -27,7 +27,14 @@ What this does not show: one pass per label means the "pass range" column is deg
 max); the spread of a repeated measurement is in embedgemma2_vision_speed_m5pro.txt, whose
 paired interleaved rounds are the speed evidence. The before-f32 and after-f32 passes ran at
 different moments on a shared GPU: the stage deltas below that are not the rope are inside
-that noise (the f32 GEMMs read 5.8 to 6.8 TFLOP/s in every pass).
+that noise (the f32 GEMMs read 5.8 to 6.8 TFLOP/s in every pass). The harness's quiet gate sees
+only other tessl GPU processes: "samples beside another tessl GPU process: 0" does not mean the
+machine was idle (other work, such as compiler load, is invisible to it; a first bf16 profile
+taken earlier in the session read 0 flagged samples yet ran every stage about 2x slower than the
+pass below, 165.6 ms against 57.5 ms for the 1-image forward, and is not used). The rope
+magnitudes (8.4 -> 3.1 ms, 85.9 -> 24.8 ms) are therefore inferred from single passes at
+different moments; the direction is not in doubt, the size is +-noise. ROPE_HEADS_PER_UNIT = 6
+was not tuned (3 and 12 untried).
 
 Reading it
   Ranking (1 image, ExactF32 before -> after):  gate|up GEMM 31% -> 33%, attention 26% -> 27%,

@@ -885,7 +885,6 @@ kernel void gdn_train_c_bwd_a(
     threadgroup float T5[C * BV];  // D
     threadgroup float T6[C * BV];  // dO, then exp(G) dO
     threadgroup float T7[C * BV];  // Q S0, then K dS, then dR, then -exp(G) beta dR
-    threadgroup float tmp[4 * 64];
     threadgroup float Es[C];
     threadgroup float Bs[C];
     threadgroup float Ws[C];

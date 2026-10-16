@@ -50,6 +50,8 @@ pub const GDN_TRAIN_BV: u32 = 16;
 /// Tokens between saved states.
 pub const GDN_TRAIN_CKPT: u32 = 64;
 const THREADS: usize = GDN_TRAIN_DK as usize;
+/// Threads of `gdn_train_c_prep`: a quad of lanes per column of its solve.
+const PREP_THREADS: usize = 2 * THREADS;
 
 /// Problem shape. `heads` is the value-head count (after any repeat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,12 @@ impl GdnTrainDims {
         self.seq.div_ceil(GDN_TRAIN_CKPT)
     }
 
+    /// `seq` rounded up to whole chunks: the row count of the chunked
+    /// kernels' head-major buffers.
+    fn padded_seq(&self) -> usize {
+        self.checkpoints() as usize * GDN_TRAIN_CKPT as usize
+    }
+
     fn slices(&self) -> u32 {
         self.v_dim / GDN_TRAIN_BV
     }
@@ -110,40 +118,152 @@ impl GdnTrainDims {
     }
 }
 
-/// Scratch for [`gdn_train_backward`]: one chunk of recomputed states per
-/// threadgroup, and the per-slice partial gradients. Sized for exactly one
+/// Which implementation of the gated delta rule a call runs. Both read and
+/// write the same layouts and the same checkpoints (the state at every
+/// [`GDN_TRAIN_CKPT`] tokens), so a forward of one composes with a backward of
+/// the other.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnTrainKernel {
+    /// One dependent step per token (`gdn_train_fwd`, `gdn_train_bwd`): the
+    /// parity oracle for the chunked form.
+    Sequential,
+    /// The chunked (WY) form (`gdn_train_c_*`): matrix products per 64-token
+    /// chunk, only the state sequential across chunks.
+    Chunked,
+}
+
+/// What [`gdn_train_forward`] and [`gdn_train_backward`] run.
+/// See `bench/results/gdn_train_chunked_m5pro.txt` for the paired measurement
+/// this routing rests on. The sequential kernel stays reachable (see
+/// [`GdnTrainKernel`]) as the oracle the parity tests hold the chunked one to:
+/// its callers are those tests and the benchmark.
+#[doc(hidden)]
+pub const GDN_TRAIN_PRODUCTION: GdnTrainKernel = GdnTrainKernel::Chunked;
+
+/// Scratch for [`gdn_train_backward`], sized for exactly one
 /// [`GdnTrainDims`] and reusable across layers and steps of that same shape;
 /// [`gdn_train_backward`] returns an error for any other dims, smaller ones
-/// included.
+/// included. [`GdnTrainWorkspace::new`] makes the one the production kernel
+/// needs.
 pub struct GdnTrainWorkspace {
     dims: GdnTrainDims,
-    scratch: Tensor,
-    dq_part: Tensor,
-    dk_part: Tensor,
-    dg_part: Tensor,
-    dbeta_part: Tensor,
+    bufs: WsBufs,
+}
+
+enum WsBufs {
+    /// One chunk of recomputed states per threadgroup, and the per-slice
+    /// partial gradients.
+    /// `scratch`, `dq_part`, `dk_part`, `dg_part`, `dbeta_part`.
+    Sequential(Box<[Tensor; 5]>),
+    Chunked(Box<ChunkedWs>),
+}
+
+/// The chunked backward's buffers (layouts in `kernels/gdn_train.metal`).
+struct ChunkedWs {
+    prep: ChunkPrep,
+    dsbuf: Tensor,
+    dbuf: Tensor,
+    drbuf: Tensor,
+    dop: Tensor,
+    dscore: Tensor,
+    das: Tensor,
+    gtot: Tensor,
+    dbs: Tensor,
+    dgpart: Tensor,
+    dbpart: Tensor,
+    dqh: Tensor,
+    dkh: Tensor,
+}
+
+/// What the chunked kernels derive from q, k, g and beta alone: the
+/// normalized operands (once per key head), the chunk-local decay and beta,
+/// and the two C x C products. The forward makes one per call; the backward
+/// rebuilds it into its workspace.
+struct ChunkPrep {
+    kh: Tensor,
+    qh: Tensor,
+    gc: Tensor,
+    bt: Tensor,
+    wm: Tensor,
+    aq: Tensor,
+}
+
+/// Elements of [`ChunkPrep`]'s buffers, sized for `heads` key heads (the most
+/// there can be): `kh`, `qh`, `gc`, `bt`, `wm`, `aq`.
+fn prep_lens(dims: GdnTrainDims) -> [usize; 6] {
+    let bh = dims.batch as usize * dims.heads as usize;
+    let tp = dims.padded_seq();
+    let mats = bh * dims.checkpoints() as usize * (GDN_TRAIN_CKPT * GDN_TRAIN_CKPT) as usize;
+    let rows = bh * tp * GDN_TRAIN_DK as usize;
+    [rows, rows, bh * tp, bh * tp, mats, mats]
+}
+
+impl ChunkPrep {
+    fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
+        let [kh, qh, gc, bt, wm, aq] = prep_lens(dims);
+        // Not zeroed: gdn_train_c_norm writes every element (zero past T),
+        // and the later stages read only what the earlier ones wrote.
+        let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
+        Ok(Self {
+            kh: f32s(kh)?,
+            qh: f32s(qh)?,
+            gc: f32s(gc)?,
+            bt: f32s(bt)?,
+            wm: f32s(wm)?,
+            aq: f32s(aq)?,
+        })
+    }
 }
 
 impl GdnTrainWorkspace {
+    /// The workspace for [`GDN_TRAIN_PRODUCTION`].
     pub fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
-        dims.validate("GdnTrainWorkspace")?;
-        let [scratch, dq_part, dk_part, dg_part, dbeta_part] = Self::lens(dims);
-        // Not zeroed: the backward writes each chunk's states into `scratch`
-        // before reading them back, and every slice's partial for every row
-        // before the reduction reads it.
-        let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
-        Ok(Self {
-            dims,
-            scratch: f32s(scratch)?,
-            dq_part: f32s(dq_part)?,
-            dk_part: f32s(dk_part)?,
-            dg_part: f32s(dg_part)?,
-            dbeta_part: f32s(dbeta_part)?,
-        })
+        Self::new_for(rt, dims, GDN_TRAIN_PRODUCTION)
     }
 
-    /// Elements of `scratch`, `dq_part`, `dk_part`, `dg_part`, `dbeta_part`.
-    fn lens(dims: GdnTrainDims) -> [usize; 5] {
+    /// The workspace `kernel`'s backward needs.
+    #[doc(hidden)]
+    pub fn new_for(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, kernel: GdnTrainKernel) -> Result<Self, String> {
+        dims.validate("GdnTrainWorkspace")?;
+        // Not zeroed: each backward writes every element it later reads.
+        let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
+        let bufs = match kernel {
+            GdnTrainKernel::Sequential => {
+                let [scratch, dq_part, dk_part, dg_part, dbeta_part] = Self::seq_lens(dims);
+                WsBufs::Sequential(Box::new([
+                    f32s(scratch)?,
+                    f32s(dq_part)?,
+                    f32s(dk_part)?,
+                    f32s(dg_part)?,
+                    f32s(dbeta_part)?,
+                ]))
+            }
+            GdnTrainKernel::Chunked => {
+                let [dsbuf, dbuf, dop_drbuf, mats, parts, dqh] = Self::chunked_lens(dims);
+                WsBufs::Chunked(Box::new(ChunkedWs {
+                    prep: ChunkPrep::new(rt, dims)?,
+                    dsbuf: f32s(dsbuf)?,
+                    dbuf: f32s(dbuf)?,
+                    drbuf: f32s(dop_drbuf)?,
+                    dop: f32s(dop_drbuf)?,
+                    dscore: f32s(mats)?,
+                    das: f32s(mats)?,
+                    gtot: f32s(mats)?,
+                    dbs: f32s(mats)?,
+                    dgpart: f32s(parts)?,
+                    dbpart: f32s(parts)?,
+                    dqh: f32s(dqh)?,
+                    dkh: f32s(dqh)?,
+                }))
+            }
+        };
+        Ok(Self { dims, bufs })
+    }
+
+    /// Elements of the sequential kernel's `scratch`, `dq_part`, `dk_part`,
+    /// `dg_part`, `dbeta_part`.
+    fn seq_lens(dims: GdnTrainDims) -> [usize; 5] {
         let (bh, ns, rows) = (
             dims.batch as usize * dims.heads as usize,
             (dims.v_dim / GDN_TRAIN_BV) as usize,
@@ -158,6 +278,41 @@ impl GdnTrainWorkspace {
             ns * rows,
             ns * rows,
         ]
+    }
+
+    /// Elements of the chunked backward's buffers beyond [`ChunkPrep`]'s:
+    /// `dsbuf`, `dbuf`, each of `drbuf` and `dop`, each of the four C x C
+    /// matrices, each of the two slice partials, each of `dqh` and `dkh`.
+    fn chunked_lens(dims: GdnTrainDims) -> [usize; 6] {
+        let bh = dims.batch as usize * dims.heads as usize;
+        let tp = dims.padded_seq();
+        let dv = dims.v_dim as usize;
+        let ck = dims.checkpoints() as usize;
+        let mats = bh * ck * (GDN_TRAIN_CKPT * GDN_TRAIN_CKPT) as usize;
+        [
+            bh * ck * GDN_TRAIN_DK as usize * dv,
+            bh * tp * dv,
+            bh * tp * dv,
+            mats,
+            dims.slices() as usize * bh * tp,
+            dims.rows() * GDN_TRAIN_DK as usize,
+        ]
+    }
+
+    /// Elements of every buffer the production kernel's backward holds.
+    fn lens(dims: GdnTrainDims) -> Vec<usize> {
+        match GDN_TRAIN_PRODUCTION {
+            GdnTrainKernel::Sequential => Self::seq_lens(dims).to_vec(),
+            GdnTrainKernel::Chunked => {
+                let [dsbuf, dbuf, drop_, mats, parts, dqh] = Self::chunked_lens(dims);
+                let mut v = prep_lens(dims).to_vec();
+                v.extend([dsbuf, dbuf, drop_, drop_]);
+                v.extend([mats; 4]);
+                v.extend([parts; 2]);
+                v.extend([dqh; 2]);
+                v
+            }
+        }
     }
 
     /// Device bytes the workspace holds for `dims`.
@@ -210,14 +365,15 @@ fn disjoint(what: &str, outs: &[(&str, &Tensor)], ins: &[(&str, &Tensor)]) -> Re
     Ok(())
 }
 
-fn pipeline_128(
+fn pipeline_threads(
     rt: &Arc<GpuRuntime>,
     name: &str,
+    threads: usize,
 ) -> Result<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLComputePipelineState>>, String> {
     let p = rt.pipeline(name)?;
-    if p.maxTotalThreadsPerThreadgroup() < THREADS {
+    if p.maxTotalThreadsPerThreadgroup() < threads {
         return Err(format!(
-            "{name}: the pipeline allows {} threads per threadgroup; the kernel needs {THREADS}",
+            "{name}: the pipeline allows {} threads per threadgroup; the kernel needs {threads}",
             p.maxTotalThreadsPerThreadgroup()
         ));
     }
@@ -412,14 +568,42 @@ pub fn gdn_train_forward(
     s_fin: Option<&Tensor>,
     ckpt: &Tensor,
 ) -> Result<(), String> {
+    gdn_train_forward_with(GDN_TRAIN_PRODUCTION, rt, dims, x, o, s_fin, ckpt)
+}
+
+/// [`gdn_train_forward`] on a chosen kernel.
+#[doc(hidden)]
+pub fn gdn_train_forward_with(
+    kernel: GdnTrainKernel,
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: GdnTrainInputs<'_>,
+    o: &Tensor,
+    s_fin: Option<&Tensor>,
+    ckpt: &Tensor,
+) -> Result<(), String> {
     dims.validate("gdn_train_forward")?;
     x.check(rt, &dims, "gdn_train_forward")?;
-    gdn_train_forward_windowed(rt, dims, x.windowed(&dims), o, s_fin, ckpt)
+    gdn_train_forward_windowed_with(kernel, rt, dims, x.windowed(&dims), o, s_fin, ckpt)
 }
 
 /// [`gdn_train_forward`] with `q`, `k`, `v` read through column windows and
 /// key heads shared by value heads.
 pub fn gdn_train_forward_windowed(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: GdnTrainWindowedInputs<'_>,
+    o: &Tensor,
+    s_fin: Option<&Tensor>,
+    ckpt: &Tensor,
+) -> Result<(), String> {
+    gdn_train_forward_windowed_with(GDN_TRAIN_PRODUCTION, rt, dims, x, o, s_fin, ckpt)
+}
+
+/// [`gdn_train_forward_windowed`] on a chosen kernel.
+#[doc(hidden)]
+pub fn gdn_train_forward_windowed_with(
+    kernel: GdnTrainKernel,
     rt: &Arc<GpuRuntime>,
     dims: GdnTrainDims,
     x: GdnTrainWindowedInputs<'_>,
@@ -446,7 +630,27 @@ pub fn gdn_train_forward_windowed(
     }
     disjoint(WHAT, &outs, &x.named())?;
     let flags = u32::from(x.s0.is_some()) | (u32::from(s_fin.is_some()) << 1);
-    let p = pipeline_128(rt, "gdn_train_fwd")?;
+    match kernel {
+        GdnTrainKernel::Sequential => forward_sequential(rt, dims, &x, o, s_fin, ckpt, flags),
+        GdnTrainKernel::Chunked => {
+            let prep = ChunkPrep::new(rt, dims)?;
+            chunk_prep(rt, dims, &x, &prep)?;
+            forward_chunked(rt, dims, &x, &prep, o, s_fin, ckpt, flags)
+        }
+    }
+}
+
+fn forward_sequential(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    o: &Tensor,
+    s_fin: Option<&Tensor>,
+    ckpt: &Tensor,
+    flags: u32,
+) -> Result<(), String> {
+    let (b, h) = (dims.batch as usize, dims.heads as usize);
+    let p = pipeline_threads(rt, "gdn_train_fwd", THREADS)?;
     dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
         set_tensor(bnd, x.q.tensor, 0);
         set_tensor(bnd, x.k.tensor, 1);
@@ -470,6 +674,89 @@ pub fn gdn_train_forward_windowed(
         set_u32(bnd, x.v.ld, 18);
         set_u32(bnd, x.v.off, 19);
         set_u32(bnd, x.key_heads, 20);
+    })
+}
+
+/// The chunked kernels' first two stages: q and k normalized once per key
+/// head (`gdn_train_c_norm`, grid = chunks x batch x *key* heads), then the
+/// per-value-head decay, beta, solve and C x C product (`gdn_train_c_prep`).
+fn chunk_prep(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    prep: &ChunkPrep,
+) -> Result<(), String> {
+    let (b, h, hk, nc) = (
+        dims.batch as usize,
+        dims.heads as usize,
+        x.key_heads as usize,
+        dims.checkpoints() as usize,
+    );
+    let norm = pipeline_threads(rt, "gdn_train_c_norm", THREADS)?;
+    dispatch_2d_tg(rt, &norm, nc, b * hk, THREADS, |bnd| {
+        set_tensor(bnd, x.q.tensor, 0);
+        set_tensor(bnd, x.k.tensor, 1);
+        set_tensor(bnd, &prep.kh, 2);
+        set_tensor(bnd, &prep.qh, 3);
+        set_u32(bnd, dims.batch, 4);
+        set_u32(bnd, dims.seq, 5);
+        set_u32(bnd, x.key_heads, 6);
+        set_u32(bnd, x.q.ld, 7);
+        set_u32(bnd, x.q.off, 8);
+        set_u32(bnd, x.k.ld, 9);
+        set_u32(bnd, x.k.off, 10);
+    })?;
+    let p = pipeline_threads(rt, "gdn_train_c_prep", PREP_THREADS)?;
+    dispatch_2d_tg(rt, &p, nc, b * h, PREP_THREADS, |bnd| {
+        set_tensor(bnd, &prep.kh, 0);
+        set_tensor(bnd, &prep.qh, 1);
+        set_tensor(bnd, x.g, 2);
+        set_tensor(bnd, x.beta, 3);
+        set_tensor(bnd, &prep.gc, 4);
+        set_tensor(bnd, &prep.bt, 5);
+        set_tensor(bnd, &prep.wm, 6);
+        set_tensor(bnd, &prep.aq, 7);
+        set_u32(bnd, dims.batch, 8);
+        set_u32(bnd, dims.seq, 9);
+        set_u32(bnd, dims.heads, 10);
+        set_u32(bnd, x.key_heads, 11);
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_chunked(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    prep: &ChunkPrep,
+    o: &Tensor,
+    s_fin: Option<&Tensor>,
+    ckpt: &Tensor,
+    flags: u32,
+) -> Result<(), String> {
+    let (b, h) = (dims.batch as usize, dims.heads as usize);
+    let p = pipeline_threads(rt, "gdn_train_c_fwd", THREADS)?;
+    dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
+        set_tensor(bnd, x.v.tensor, 0);
+        set_tensor(bnd, &prep.kh, 1);
+        set_tensor(bnd, &prep.qh, 2);
+        set_tensor(bnd, &prep.gc, 3);
+        set_tensor(bnd, &prep.bt, 4);
+        set_tensor(bnd, &prep.wm, 5);
+        set_tensor(bnd, &prep.aq, 6);
+        // Unused slots get a live buffer the kernel never touches.
+        set_tensor(bnd, x.s0.unwrap_or(&prep.kh), 7);
+        set_tensor(bnd, o, 8);
+        set_tensor(bnd, s_fin.unwrap_or(ckpt), 9);
+        set_tensor(bnd, ckpt, 10);
+        set_u32(bnd, dims.batch, 11);
+        set_u32(bnd, dims.seq, 12);
+        set_u32(bnd, dims.heads, 13);
+        set_u32(bnd, dims.v_dim, 14);
+        set_u32(bnd, flags, 15);
+        set_u32(bnd, x.v.ld, 16);
+        set_u32(bnd, x.v.off, 17);
+        set_u32(bnd, x.key_heads, 18);
     })
 }
 
@@ -659,7 +946,6 @@ pub fn gdn_train_backward_windowed(
 ) -> Result<(), String> {
     const WHAT: &str = "gdn_train_backward";
     validate_windowed_backward(rt, dims, &x, ckpt, d_o, d_fin, &grads)?;
-    let (b, h) = (dims.batch as usize, dims.heads as usize);
     if ws.dims != dims {
         return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
     }
@@ -673,22 +959,79 @@ pub fn gdn_train_backward_windowed(
     if let Some(ds0) = grads.ds0 {
         outs.push(("ds0", ds0));
     }
+    let ws_bufs: Vec<(&str, &Tensor)> = match &ws.bufs {
+        WsBufs::Sequential(t) => {
+            let [scratch, dq_part, dk_part, dg_part, dbeta_part] = &**t;
+            vec![
+                ("scratch", scratch),
+                ("dq_part", dq_part),
+                ("dk_part", dk_part),
+                ("dg_part", dg_part),
+                ("dbeta_part", dbeta_part),
+            ]
+        }
+        WsBufs::Chunked(c) => vec![
+            ("kh", &c.prep.kh),
+            ("qh", &c.prep.qh),
+            ("gc", &c.prep.gc),
+            ("bt", &c.prep.bt),
+            ("wm", &c.prep.wm),
+            ("aq", &c.prep.aq),
+            ("dsbuf", &c.dsbuf),
+            ("dbuf", &c.dbuf),
+            ("drbuf", &c.drbuf),
+            ("dop", &c.dop),
+            ("dscore", &c.dscore),
+            ("das", &c.das),
+            ("gtot", &c.gtot),
+            ("dbs", &c.dbs),
+            ("dgpart", &c.dgpart),
+            ("dbpart", &c.dbpart),
+            ("dqh", &c.dqh),
+            ("dkh", &c.dkh),
+        ],
+    };
     for (name, o) in &outs {
-        for (wname, w) in [
-            ("scratch", &ws.scratch),
-            ("dq_part", &ws.dq_part),
-            ("dk_part", &ws.dk_part),
-            ("dg_part", &ws.dg_part),
-            ("dbeta_part", &ws.dbeta_part),
-        ] {
+        for (wname, w) in &ws_bufs {
             if o.buffer.aliases(&w.buffer) {
                 return Err(format!("{WHAT}: {name} aliases the workspace's {wname}"));
             }
         }
     }
-
     let flags = u32::from(x.s0.is_some()) | (u32::from(d_fin.is_some()) << 1);
-    let p = pipeline_128(rt, "gdn_train_bwd")?;
+    match &ws.bufs {
+        WsBufs::Sequential(t) => {
+            let [scratch, dq_part, dk_part, dg_part, dbeta_part] = &**t;
+            backward_sequential(
+                rt,
+                dims,
+                &x,
+                ckpt,
+                d_o,
+                d_fin,
+                [scratch, dq_part, dk_part, dg_part, dbeta_part],
+                &grads,
+                flags,
+            )
+        }
+        WsBufs::Chunked(c) => backward_chunked(rt, dims, &x, ckpt, d_o, d_fin, c, &grads, flags),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backward_sequential(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    ckpt: &Tensor,
+    d_o: &Tensor,
+    d_fin: Option<&Tensor>,
+    [scratch, dq_part, dk_part, dg_part, dbeta_part]: [&Tensor; 5],
+    grads: &GdnTrainWindowedGrads<'_>,
+    flags: u32,
+) -> Result<(), String> {
+    let (b, h) = (dims.batch as usize, dims.heads as usize);
+    let p = pipeline_threads(rt, "gdn_train_bwd", THREADS)?;
     dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
         set_tensor(bnd, x.q.tensor, 0);
         set_tensor(bnd, x.k.tensor, 1);
@@ -698,12 +1041,12 @@ pub fn gdn_train_backward_windowed(
         set_tensor(bnd, d_o, 5);
         set_tensor(bnd, d_fin.unwrap_or(d_o), 6);
         set_tensor(bnd, ckpt, 7);
-        set_gpu_buf(bnd, &ws.scratch.buffer, 8);
+        set_gpu_buf(bnd, &scratch.buffer, 8);
         set_tensor(bnd, grads.dv.tensor, 9);
-        set_gpu_buf(bnd, &ws.dq_part.buffer, 10);
-        set_gpu_buf(bnd, &ws.dk_part.buffer, 11);
-        set_gpu_buf(bnd, &ws.dg_part.buffer, 12);
-        set_gpu_buf(bnd, &ws.dbeta_part.buffer, 13);
+        set_gpu_buf(bnd, &dq_part.buffer, 10);
+        set_gpu_buf(bnd, &dk_part.buffer, 11);
+        set_gpu_buf(bnd, &dg_part.buffer, 12);
+        set_gpu_buf(bnd, &dbeta_part.buffer, 13);
         set_tensor(bnd, grads.ds0.unwrap_or(grads.dv.tensor), 14);
         set_u32(bnd, dims.batch, 15);
         set_u32(bnd, dims.seq, 16);
@@ -720,15 +1063,15 @@ pub fn gdn_train_backward_windowed(
         set_u32(bnd, grads.dv.ld, 27);
         set_u32(bnd, grads.dv.off, 28);
     })?;
-    let fin = pipeline_128(rt, "gdn_train_bwd_finish")?;
+    let fin = pipeline_threads(rt, "gdn_train_bwd_finish", THREADS)?;
     let toks = dims.batch * dims.seq;
     dispatch_tg_1d(rt, &fin, toks as usize * x.key_heads as usize, THREADS, None, |bnd| {
         set_tensor(bnd, x.q.tensor, 0);
         set_tensor(bnd, x.k.tensor, 1);
-        set_gpu_buf(bnd, &ws.dq_part.buffer, 2);
-        set_gpu_buf(bnd, &ws.dk_part.buffer, 3);
-        set_gpu_buf(bnd, &ws.dg_part.buffer, 4);
-        set_gpu_buf(bnd, &ws.dbeta_part.buffer, 5);
+        set_gpu_buf(bnd, &dq_part.buffer, 2);
+        set_gpu_buf(bnd, &dk_part.buffer, 3);
+        set_gpu_buf(bnd, &dg_part.buffer, 4);
+        set_gpu_buf(bnd, &dbeta_part.buffer, 5);
         set_tensor(bnd, grads.dq.tensor, 6);
         set_tensor(bnd, grads.dk.tensor, 7);
         set_tensor(bnd, grads.dg, 8);
@@ -746,5 +1089,130 @@ pub fn gdn_train_backward_windowed(
         set_u32(bnd, toks, 20);
         set_u32(bnd, dims.heads, 21);
         set_u32(bnd, x.key_heads, 22);
+    })
+}
+
+/// The chunked backward: the prep rebuilt into the workspace, the reverse
+/// state pass, the full-width C x C stage, the gate gradients, dq and dk per
+/// value head, and the l2norm backward. Seven dispatches, one writer per
+/// element, no atomics.
+#[allow(clippy::too_many_arguments)]
+fn backward_chunked(
+    rt: &Arc<GpuRuntime>,
+    dims: GdnTrainDims,
+    x: &GdnTrainWindowedInputs<'_>,
+    ckpt: &Tensor,
+    d_o: &Tensor,
+    d_fin: Option<&Tensor>,
+    c: &ChunkedWs,
+    grads: &GdnTrainWindowedGrads<'_>,
+    flags: u32,
+) -> Result<(), String> {
+    let (b, h, nc) = (dims.batch as usize, dims.heads as usize, dims.checkpoints() as usize);
+    chunk_prep(rt, dims, x, &c.prep)?;
+    let p = pipeline_threads(rt, "gdn_train_c_bwd_a", THREADS)?;
+    dispatch_2d_tg(rt, &p, dims.slices() as usize, b * h, THREADS, |bnd| {
+        set_tensor(bnd, x.v.tensor, 0);
+        set_tensor(bnd, &c.prep.kh, 1);
+        set_tensor(bnd, &c.prep.qh, 2);
+        set_tensor(bnd, &c.prep.gc, 3);
+        set_tensor(bnd, &c.prep.bt, 4);
+        set_tensor(bnd, &c.prep.wm, 5);
+        set_tensor(bnd, &c.prep.aq, 6);
+        set_tensor(bnd, d_o, 7);
+        set_tensor(bnd, d_fin.unwrap_or(d_o), 8);
+        set_tensor(bnd, ckpt, 9);
+        set_tensor(bnd, &c.dsbuf, 10);
+        set_tensor(bnd, &c.dbuf, 11);
+        set_tensor(bnd, &c.drbuf, 12);
+        set_tensor(bnd, &c.dop, 13);
+        set_tensor(bnd, grads.dv.tensor, 14);
+        set_tensor(bnd, &c.dgpart, 15);
+        set_tensor(bnd, &c.dbpart, 16);
+        set_tensor(bnd, grads.ds0.unwrap_or(grads.dv.tensor), 17);
+        set_u32(bnd, dims.batch, 18);
+        set_u32(bnd, dims.seq, 19);
+        set_u32(bnd, dims.heads, 20);
+        set_u32(bnd, dims.v_dim, 21);
+        set_u32(bnd, flags, 22);
+        set_u32(bnd, x.v.ld, 23);
+        set_u32(bnd, x.v.off, 24);
+        set_u32(bnd, x.key_heads, 25);
+        set_u32(bnd, grads.dv.ld, 26);
+        set_u32(bnd, grads.dv.off, 27);
+    })?;
+    let mats = pipeline_threads(rt, "gdn_train_c_mats", THREADS)?;
+    dispatch_2d_tg(rt, &mats, nc, b * h, THREADS, |bnd| {
+        set_tensor(bnd, &c.dop, 0);
+        set_tensor(bnd, &c.dbuf, 1);
+        set_tensor(bnd, &c.drbuf, 2);
+        set_tensor(bnd, &c.prep.kh, 3);
+        set_tensor(bnd, &c.prep.gc, 4);
+        set_tensor(bnd, &c.prep.bt, 5);
+        set_tensor(bnd, &c.prep.aq, 6);
+        set_tensor(bnd, &c.dscore, 7);
+        set_tensor(bnd, &c.das, 8);
+        set_tensor(bnd, &c.gtot, 9);
+        set_tensor(bnd, &c.dbs, 10);
+        set_u32(bnd, dims.batch, 11);
+        set_u32(bnd, dims.seq, 12);
+        set_u32(bnd, dims.heads, 13);
+        set_u32(bnd, dims.v_dim, 14);
+        set_u32(bnd, x.key_heads, 15);
+    })?;
+    let gates = pipeline_threads(rt, "gdn_train_c_gates", THREADS)?;
+    dispatch_2d_tg(rt, &gates, nc, b * h, THREADS, |bnd| {
+        set_tensor(bnd, &c.gtot, 0);
+        set_tensor(bnd, &c.dbs, 1);
+        set_tensor(bnd, &c.dgpart, 2);
+        set_tensor(bnd, &c.dbpart, 3);
+        set_tensor(bnd, grads.dg, 4);
+        set_tensor(bnd, grads.dbeta, 5);
+        set_u32(bnd, dims.batch, 6);
+        set_u32(bnd, dims.seq, 7);
+        set_u32(bnd, dims.heads, 8);
+        set_u32(bnd, dims.slices(), 9);
+    })?;
+    let dqk = pipeline_threads(rt, "gdn_train_c_dqk", THREADS)?;
+    dispatch_2d_tg(rt, &dqk, nc, b * h, THREADS, |bnd| {
+        set_tensor(bnd, &c.prep.kh, 0);
+        set_tensor(bnd, &c.prep.qh, 1);
+        set_tensor(bnd, &c.prep.gc, 2);
+        set_tensor(bnd, &c.prep.bt, 3);
+        set_tensor(bnd, &c.dop, 4);
+        set_tensor(bnd, &c.dbuf, 5);
+        set_tensor(bnd, &c.drbuf, 6);
+        set_tensor(bnd, ckpt, 7);
+        set_tensor(bnd, &c.dsbuf, 8);
+        set_tensor(bnd, &c.dscore, 9);
+        set_tensor(bnd, &c.das, 10);
+        set_tensor(bnd, &c.dqh, 11);
+        set_tensor(bnd, &c.dkh, 12);
+        set_u32(bnd, dims.batch, 13);
+        set_u32(bnd, dims.seq, 14);
+        set_u32(bnd, dims.heads, 15);
+        set_u32(bnd, dims.v_dim, 16);
+        set_u32(bnd, x.key_heads, 17);
+    })?;
+    let fin = pipeline_threads(rt, "gdn_train_c_finish", THREADS)?;
+    let toks = dims.batch * dims.seq;
+    dispatch_tg_1d(rt, &fin, toks as usize * x.key_heads as usize, THREADS, None, |bnd| {
+        set_tensor(bnd, x.q.tensor, 0);
+        set_tensor(bnd, x.k.tensor, 1);
+        set_tensor(bnd, &c.dqh, 2);
+        set_tensor(bnd, &c.dkh, 3);
+        set_tensor(bnd, grads.dq.tensor, 4);
+        set_tensor(bnd, grads.dk.tensor, 5);
+        set_u32(bnd, x.q.ld, 6);
+        set_u32(bnd, x.q.off, 7);
+        set_u32(bnd, x.k.ld, 8);
+        set_u32(bnd, x.k.off, 9);
+        set_u32(bnd, grads.dq.ld, 10);
+        set_u32(bnd, grads.dq.off, 11);
+        set_u32(bnd, grads.dk.ld, 12);
+        set_u32(bnd, grads.dk.off, 13);
+        set_u32(bnd, toks, 14);
+        set_u32(bnd, dims.heads, 15);
+        set_u32(bnd, x.key_heads, 16);
     })
 }

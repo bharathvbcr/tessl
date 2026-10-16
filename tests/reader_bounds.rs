@@ -178,7 +178,7 @@ fn npy_headers_follow_the_format_spec_in_every_version() {
             vec![1],
             "v{v}"
         );
-        // Aligned to 16 only (NumPy before 1.14 wrote that): it reads.
+        // Aligned to 16 only (NumPy 1.x before 1.9 wrote that): it reads.
         let prefix = if v == 1 { 10 } else { 12 };
         assert_eq!(
             npy_result(&s, &npy(v, DICT, 16, true, &PAYLOAD)).unwrap(),
@@ -346,4 +346,33 @@ fn tensor_info_gives_dtype_and_shape_across_shards() {
     let c = v.tensor_info("c").unwrap();
     assert_eq!((c.dtype, c.shape.as_slice()), (Dtype::BF16, &[2usize, 3][..]));
     assert!(v.tensor_info("nope").is_none());
+}
+
+#[test]
+fn a_reads_own_allocation_is_budgeted_not_just_the_declared_bytes() {
+    let s = Scratch::new("widen");
+    let p = s.path("bf16.safetensors");
+    let header = r#"{"w":{"dtype":"BF16","shape":[1000],"data_offsets":[0,2000]}}"#;
+    let mut b = (header.len() as u64).to_le_bytes().to_vec();
+    b.extend_from_slice(header.as_bytes());
+    b.extend_from_slice(&[0u8; 2000]);
+    std::fs::write(&p, b).unwrap();
+    // 2000 declared bytes pass a 3000-byte limit at open, and the bf16 read
+    // (2000 bytes) fits; the f32 widening needs 4000 and is refused before
+    // the allocation, on the file and through a view.
+    let st = SafeTensors::open_with_limit(&p, Some(3000)).unwrap();
+    assert_eq!(st.read_bf16_bits("w").unwrap().1.len(), 1000);
+    let e = st.read_f32("w").unwrap_err();
+    assert!(
+        e.contains("read allocation") && e.contains("declares 4000") && e.contains("limit of 3000"),
+        "{e}"
+    );
+    let e = st.read_raw("w").map(|(_, v)| v.len());
+    assert_eq!(e.unwrap(), 2000);
+    let view = CheckpointView::open_with_limit(&p, Some(3000)).unwrap();
+    let e = tessl::safetensors::TensorSource::read_f32(&view, "w").unwrap_err();
+    assert!(e.contains("read allocation"), "{e}");
+    // With room, the same read succeeds.
+    let st = SafeTensors::open_with_limit(&p, Some(4000)).unwrap();
+    assert_eq!(st.read_f32("w").unwrap().1.len(), 1000);
 }

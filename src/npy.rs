@@ -68,9 +68,12 @@ impl NpyArray {
 pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
 
 /// The alignment the reader requires of the data start (magic, version, length
-/// field and header together are a multiple of this many bytes). The spec says
-/// 64 and the writer writes 64, but NumPy before 1.14 wrote 16 and NumPy's own
-/// reader checks neither, so the reader accepts every multiple of 16 (64 is one).
+/// field and header together are a multiple of this many bytes).
+///
+/// Accepted deviation from the checkpoint-reader ruling (64-byte alignment): the
+/// spec says 64 and the writer writes 64, but NumPy 1.x before 1.9 wrote 16-byte
+/// aligned headers and NumPy's own reader does not check alignment, so the
+/// reader accepts every multiple of 16 (64 is one).
 const NPY_ALIGN: u64 = 16;
 
 /// [`read_npy_with_limit`] with the default budget (physical memory).

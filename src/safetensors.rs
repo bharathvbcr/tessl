@@ -144,10 +144,15 @@ impl TensorInfo {
 /// on the same handle (`fstat`, so no path swap matters), and a mismatch is a
 /// "changed since it was opened" error. A file rewritten in place after `open`
 /// would otherwise be read with the old header's offsets and yield plausible
-/// wrong weights. Limits, stated plainly: a rewrite that restores the mtime
-/// (`utimes`) or that finishes between the stamp and the read it guards is not
-/// seen; the stamp is checked both before and after each read, which narrows
-/// the second case to a rewrite entirely inside one nanosecond tick.
+/// wrong weights. Limits and consequences, by design:
+///
+/// * a rename-replace at the path is not detected: the handle still names the
+///   old inode, so reads keep serving that file's own consistent bytes;
+/// * a metadata-only change (`touch`) changes the mtime and so refuses the next
+///   read: it fails closed rather than guessing the contents are unchanged;
+/// * a rewrite that restores the mtime (`utimes`) is not detected;
+/// * the stamp is checked both before and after each read, which narrows a
+///   rewrite racing a read to one entirely inside one nanosecond tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
@@ -201,6 +206,9 @@ pub struct SafeTensors {
     data_start: u64,
     /// Bytes after the header: exactly the tensors' total, as they tile it.
     data_len: u64,
+    /// The caller's payload limit (`None`: physical memory), applied again to
+    /// each read's own allocation.
+    limit: Option<u64>,
     tensors: BTreeMap<String, TensorInfo>,
     metadata: BTreeMap<String, String>,
 }
@@ -235,8 +243,14 @@ impl SafeTensors {
     /// declared tensor bytes exceed `limit`, or physical memory when `None`.
     pub fn open_with_limit(path: &Path, limit: Option<u64>) -> Result<Self, String> {
         let what = path.display().to_string();
-        let (mut f, file_len) = plain::open_regular_file(path)?;
+        // `open_regular_file` checks the handle is a regular file; its length
+        // is not used. The stamp's single fstat is the one source of both the
+        // length the header is validated against and the identity every read
+        // rechecks, so a rewrite between two fstats cannot leave them
+        // disagreeing.
+        let (mut f, _) = plain::open_regular_file(path)?;
         let stamp = FileStamp::of(&f).map_err(|e| format!("{what}: {e}"))?;
+        let file_len = stamp.len;
         let mut len8 = [0u8; 8];
         f.read_exact(&mut len8)
             .map_err(|e| format!("{what}: header length: {e}"))?;
@@ -252,6 +266,7 @@ impl SafeTensors {
             source: Source::File(f, stamp),
             data_start,
             data_len,
+            limit,
             tensors,
             metadata,
         })
@@ -278,6 +293,7 @@ impl SafeTensors {
             source: Source::Bytes(bytes),
             data_start,
             data_len: total - data_start,
+            limit: None,
             tensors,
             metadata,
         })
@@ -297,6 +313,16 @@ impl SafeTensors {
         self.tensors
             .get(name)
             .ok_or_else(|| format!("{}: no tensor {name:?}", self.what))
+    }
+
+    /// Refuse, before it is made, an allocation of `elems` elements of
+    /// `elem_size` bytes that exceeds the payload budget. `open` bounds the
+    /// file's declared bytes; a read can allocate more than that (a 16-bit
+    /// tensor widened to f32 takes twice the file's bytes), so each read
+    /// checks its own allocation through the same owner.
+    fn check_alloc(&self, name: &str, elems: usize, elem_size: usize) -> Result<(), String> {
+        let bytes = (elems as u64).saturating_mul(elem_size as u64);
+        plain::check_payload_budget(&format!("{}: {name}: read allocation", self.what), bytes, self.limit)
     }
 
     /// Fill `dst` with `info`'s bytes from one positioned read into `dst`'s
@@ -341,6 +367,7 @@ impl SafeTensors {
         if info.dtype != want {
             return Err(format!("{name}: expected {want:?}, found {:?}", info.dtype));
         }
+        self.check_alloc(name, info.numel(), std::mem::size_of::<T>())?;
         let mut data = vec![T::default(); info.numel()];
         self.read_into(name, info, &mut data)?;
         Ok((info.shape.clone(), data))
@@ -353,6 +380,7 @@ impl SafeTensors {
         let info = self.info(name)?;
         let len =
             usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
+        self.check_alloc(name, len, 1)?;
         let mut bytes = vec![0u8; len];
         self.read_into(name, info, &mut bytes)?;
         Ok((info.clone(), bytes))
@@ -403,6 +431,7 @@ impl SafeTensors {
     /// every `i < n`, so no write lands on a value not yet read.
     pub fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         let info = self.info(name)?;
+        self.check_alloc(name, info.numel(), 4)?;
         let mut data = vec![0f32; info.numel()];
         self.read_f32_into(name, &info.shape, &mut data)?;
         Ok((info.shape.clone(), data))

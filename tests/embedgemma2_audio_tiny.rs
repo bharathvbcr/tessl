@@ -32,6 +32,7 @@ use common::{with_gpu, SplitMix};
 use tessl::embedgemma2_audio::{
     sub_rows, AudioConfig, AudioInput, AudioOutput, EmbedGemma2Audio, MAX_FRAMES_PER_FORWARD,
 };
+use tessl::gemm::GemmOperands;
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16};
 
@@ -174,8 +175,19 @@ fn reference_weights(w: &[Weight]) -> Weights {
 
 /// safetensors bytes of every weight (bf16), plus `extra` tensors (f32 zeros).
 fn safetensors_bytes(w: &[Weight], extra: &[(&str, &[usize])]) -> Vec<u8> {
+    safetensors_bytes_with_f32(w, extra, &[])
+}
+
+/// [`safetensors_bytes`] with the tensors named in `f32_names` stored as F32
+/// (the same values, already bf16-representable).
+fn safetensors_bytes_with_f32(w: &[Weight], extra: &[(&str, &[usize])], f32_names: &[&str]) -> Vec<u8> {
     let mut entries: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
     for t in w {
+        if f32_names.contains(&t.name.as_str()) {
+            let bytes = t.data.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect();
+            entries.push((t.name.clone(), "F32", t.shape.clone(), bytes));
+            continue;
+        }
         let bits = f32_slice_to_bf16(&t.data.iter().map(|&v| v as f32).collect::<Vec<_>>());
         let bytes = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
         entries.push((t.name.clone(), "BF16", t.shape.clone(), bytes));
@@ -265,7 +277,28 @@ fn assert_bit_equal(what: &str, a: &AudioOutput, ia: usize, b: &AudioOutput, ib:
     }
 }
 
+/// How close a run must be to the f64 forward: each stage within `layer_rel` of
+/// its largest magnitude, the soft tokens within `soft_abs`.
+#[derive(Clone, Copy)]
+struct Tol {
+    layer_rel: f64,
+    soft_abs: f64,
+}
+
+/// What `ExactF32` is held to (the bounds above, fixed before any run).
+const EXACT: Tol = Tol {
+    layer_rel: LAYER_REL,
+    soft_abs: SOFT_ABS,
+};
+
 fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: usize) {
+    check_with(name, cfg, w, scale, GemmOperands::ExactF32, EXACT);
+}
+
+/// [`check_against_reference`] at `operands`, within `tol`. Every property of
+/// the exact run (a clip alone is bit for bit the clip in a batch, reordering
+/// and repeating clips, tracing, poisoned activations) holds for `Bf16` too.
+fn check_with(name: &str, cfg: &AudioConfig, w: &[Weight], scale: usize, operands: GemmOperands, tol: Tol) {
     let st = open(name, safetensors_bytes(w, &[("vision_tower.unused.weight", &[3])]));
     let rw = reference_weights(w);
     let batch = clips(cfg, scale);
@@ -291,7 +324,10 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
     );
 
     with_gpu(|rt| {
-        let model = EmbedGemma2Audio::load(rt, &st, "", cfg.clone()).unwrap();
+        if operands == GemmOperands::Bf16 && !rt.has_tensorops() {
+            return;
+        }
+        let model = EmbedGemma2Audio::load_with(rt, &st, "", cfg.clone(), operands).unwrap();
         let out = model.encode_audio(&batch, true).unwrap();
         assert_eq!(out.forwards, 1, "the tiny batch must share one forward");
         let (h, od, ed) = (cfg.hidden as usize, cfg.out_dims as usize, cfg.embed_dim as usize);
@@ -315,8 +351,9 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
                     c.mask.len()
                 );
                 assert!(
-                    err <= LAYER_REL * scale,
-                    "{name} clip {i} {stage}: max abs {err:.3e} > {LAYER_REL:.0e} * {scale:.3e}"
+                    err <= tol.layer_rel * scale,
+                    "{name} {operands:?} clip {i} {stage}: max abs {err:.3e} > {:.0e} * {scale:.3e}",
+                    tol.layer_rel
                 );
             }
             assert_eq!(out.soft_tokens[i].len(), want.soft.len(), "{name} clip {i}: soft rows");
@@ -324,8 +361,9 @@ fn check_against_reference(name: &str, cfg: &AudioConfig, w: &[Weight], scale: u
             let err = max_abs(&out.soft_tokens[i], &want.soft);
             eprintln!("{name} clip {i}: soft max abs {err:.3e}");
             assert!(
-                err <= SOFT_ABS,
-                "{name} clip {i}: soft tokens max abs {err:.3e} > {SOFT_ABS:.0e}"
+                err <= tol.soft_abs,
+                "{name} {operands:?} clip {i}: soft tokens max abs {err:.3e} > {:.0e}",
+                tol.soft_abs
             );
         }
 
@@ -384,6 +422,30 @@ fn wide_audio_tower_has_the_checkpoints_attention_geometry() {
     check_against_reference("wide", &cfg, &random_weights(&cfg, 7), 1);
 }
 
+/// What `Bf16` operands are held to against the f64 forward. Measured on these
+/// towers (`--nocapture` prints every stage): the worst stage is 1.05e-2 of its
+/// largest magnitude (tiny, clip 0, layer 1), the worst soft token 1.9e-2 max
+/// abs; a bf16 rounding of a GEMM operand is 3.9e-3 relative, so a stage after
+/// a few of them sits at a few times that. The bounds are twice the worst
+/// measured. They are 200 times the exact path's, so a `Bf16` run that was
+/// exact would also pass them: `bf16_mode_is_not_the_exact_forward` is what
+/// shows it is not.
+const BF16: Tol = Tol {
+    layer_rel: 2e-2,
+    soft_abs: 4e-2,
+};
+
+/// The tiny and wide towers with `Bf16` operands against the f64 forward: the
+/// split q|k|v path (random bounds), every mask pattern, a clip alone equal to
+/// the clip in a batch, bit for bit, and the poisoned-activation run.
+#[test]
+fn bf16_tiny_audio_tower_matches_the_f64_forward() {
+    let cfg = AudioConfig::from_config_json(TINY).unwrap();
+    check_with("tiny", &cfg, &random_weights(&cfg, 2026), 1, GemmOperands::Bf16, BF16);
+    let cfg = AudioConfig::from_config_json(WIDE).unwrap();
+    check_with("wide", &cfg, &random_weights(&cfg, 7), 1, GemmOperands::Bf16, BF16);
+}
+
 /// Gives layer `li`'s k and v projections q's four bounds, so the model fuses
 /// that layer's q, k and v into one GEMM on one clamped input.
 fn share_qkv_bounds(w: &mut [Weight], li: usize) {
@@ -438,6 +500,129 @@ fn shared_qkv_clamps_run_as_one_fused_projection() {
     share_qkv_bounds(&mut w, 0);
     assert_eq!(fused_layers(&wide, &w), 1);
     check_against_reference("wide, fused q|k|v", &wide, &w, 1);
+}
+
+/// The fused q|k|v projection and a mix of fused and split layers, at `Bf16`:
+/// the clamped attention input is one bf16 buffer for q, k and v, or three.
+#[test]
+fn bf16_runs_the_fused_and_the_split_qkv_projection() {
+    let cfg = AudioConfig::from_config_json(TINY).unwrap();
+    let mut all = random_weights(&cfg, 2026);
+    for li in 0..cfg.layers as usize {
+        share_qkv_bounds(&mut all, li);
+    }
+    assert_eq!(fused_layers(&cfg, &all), cfg.layers as usize);
+    check_with("tiny, fused q|k|v", &cfg, &all, 1, GemmOperands::Bf16, BF16);
+
+    let mut mixed = random_weights(&cfg, 2026);
+    share_qkv_bounds(&mut mixed, 0);
+    assert_eq!(fused_layers(&cfg, &mixed), 1);
+    check_with("tiny, one fused layer", &cfg, &mixed, 1, GemmOperands::Bf16, BF16);
+
+    let wide = AudioConfig::from_config_json(WIDE).unwrap();
+    let mut w = random_weights(&wide, 7);
+    share_qkv_bounds(&mut w, 0);
+    assert_eq!(fused_layers(&wide, &w), 1);
+    check_with("wide, fused q|k|v", &wide, &w, 1, GemmOperands::Bf16, BF16);
+}
+
+/// Elements of every projection the tower holds, from its config.
+fn projection_elements(cfg: &AudioConfig) -> usize {
+    let (h, layers) = (cfg.hidden as usize, cfg.layers as usize);
+    let per_layer = 2 * (h * 4 * h + 4 * h * h) // two feed-forwards
+        + 3 * h * h + h * h // q|k|v, attention output
+        + 2 * h * h + h * h; // light conv: linear_start, linear_end
+    cfg.proj_in() as usize * h
+        + layers * per_layer
+        + h * cfg.out_dims as usize
+        + cfg.out_dims as usize * cfg.embed_dim as usize
+}
+
+/// `Bf16` is a different forward, not the exact one under another name: the
+/// weights are bf16 on the device (2 bytes fewer per projection element than the
+/// f32 widening), the soft tokens differ from the exact ones by far more than
+/// the exact path's bound against the reference (and are not the reference's
+/// rounded either: they are what bf16 operands give), a runtime with relaxed f32
+/// GEMMs on is accepted (no GEMM of this forward is an f32 one) where the exact
+/// forward refuses it, and a projection stored in f32 is refused by name rather
+/// than rounded.
+#[test]
+fn bf16_mode_is_not_the_exact_forward() {
+    let cfg = AudioConfig::from_config_json(TINY).unwrap();
+    let w = random_weights(&cfg, 2026);
+    let st = open("modes", safetensors_bytes(&w, &[("vision_tower.unused.weight", &[3])]));
+    let batch = clips(&cfg, 1);
+    let want = audio_forward(
+        &cfg,
+        &reference_weights(&w),
+        &to_f64(&batch[0].input_features),
+        &batch[0].mask,
+    );
+    with_gpu(|rt| {
+        let exact = EmbedGemma2Audio::load(rt, &st, "", cfg.clone()).unwrap();
+        assert_eq!(exact.operands(), GemmOperands::ExactF32);
+        let e = exact.encode_audio(&batch, false).unwrap();
+        if !rt.has_tensorops() {
+            let err = EmbedGemma2Audio::load_with(rt, &st, "", cfg.clone(), GemmOperands::Bf16)
+                .err()
+                .expect("bf16 needs TensorOps");
+            assert!(err.contains("TensorOps"), "{err}");
+            return;
+        }
+        let bf = EmbedGemma2Audio::load_with(rt, &st, "", cfg.clone(), GemmOperands::Bf16).unwrap();
+        assert_eq!(bf.operands(), GemmOperands::Bf16);
+        let b = bf.encode_audio(&batch, false).unwrap();
+
+        // Weights: every projection two bytes an element instead of four.
+        let saved = exact.weight_bytes() - bf.weight_bytes();
+        assert_eq!(
+            saved,
+            2 * projection_elements(&cfg),
+            "bytes saved by holding the projections bf16"
+        );
+
+        // Not the exact forward: the soft tokens move by more than the exact
+        // path is allowed to be off the f64 forward, and bound by the bf16 bound.
+        let moved = max_abs(&b.soft_tokens[0], &to_f64(&e.soft_tokens[0]));
+        let off_exact_bound = max_abs(&e.soft_tokens[0], &want.soft);
+        let off_bf16 = max_abs(&b.soft_tokens[0], &want.soft);
+        eprintln!(
+            "bf16 vs exact soft max abs {moved:.3e}; exact vs f64 {off_exact_bound:.3e}; bf16 vs f64 {off_bf16:.3e}"
+        );
+        assert!(off_exact_bound <= SOFT_ABS);
+        assert!(
+            moved > 10.0 * SOFT_ABS,
+            "bf16 soft tokens differ from the exact ones by only {moved:.3e}"
+        );
+        assert!(off_bf16 <= BF16.soft_abs);
+        assert_ne!(bits(&b.soft_tokens[0]), bits(&e.soft_tokens[0]));
+
+        // Relaxed f32 GEMMs: refused by the exact forward, irrelevant to bf16.
+        rt.set_relaxed_precision(true);
+        let refused = exact.encode_audio(&batch, false);
+        let accepted = bf.encode_audio(&batch, false);
+        rt.set_relaxed_precision(false);
+        assert!(refused.expect_err("exact accepted relaxed").contains("exact-f32"));
+        let a = accepted.unwrap();
+        assert_eq!(
+            bits(&a.soft_tokens[0]),
+            bits(&b.soft_tokens[0]),
+            "the relaxed switch changed a bf16 forward"
+        );
+
+        // A projection stored as f32: refused at load by name, not rounded.
+        let name = "audio_tower.layers.1.feed_forward2.ffw_layer_1.linear.weight";
+        let st32 = open(
+            "f32 projection",
+            safetensors_bytes_with_f32(&w, &[("vision_tower.unused.weight", &[3])], &[name]),
+        );
+        let err = EmbedGemma2Audio::load_with(rt, &st32, "", cfg.clone(), GemmOperands::Bf16)
+            .err()
+            .expect("an f32 projection accepted under bf16");
+        assert!(err.contains(name), "{err}");
+        // The exact load widens whatever the dtype.
+        assert!(EmbedGemma2Audio::load(rt, &st32, "", cfg.clone()).is_ok());
+    });
 }
 
 /// The clamps, the gradient clip and the softcap are not decoration: with each

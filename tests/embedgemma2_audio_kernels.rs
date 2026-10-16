@@ -23,10 +23,11 @@ use common::embedgemma2_audio::{
 };
 use common::{buf, buf_u32, seeded, with_gpu, SplitMix};
 use tessl::embedgemma2_audio::{
-    attention, ew, lconv, rms_norm, rms_norm_then, sub_conv0_ln_relu, sub_conv1_ln_relu, AttentionSpec, Clamp,
-    ClipTable, Ew, Lconv, NormThen, RmsNorm,
+    attention, attention_store, ew, ew_store, lconv, lconv_store, rms_norm, rms_norm_store, rms_norm_then,
+    rms_norm_then_store, sub_conv0_ln_relu, sub_conv1_ln_relu, ActStore, AttentionSpec, Clamp, ClipTable, Ew, Lconv,
+    NormThen, RmsNorm,
 };
-use tessl::tensor::GpuBuffer;
+use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, GpuBuffer};
 use tessl::GpuRuntime;
 
 const KERNEL_REL: f64 = 2e-5;
@@ -631,6 +632,15 @@ fn first_stage<'a>(
     s
 }
 
+/// A residual stage (clamped, scaled) and the weighted norm after it.
+fn two_stages<'a>(w1: &'a GpuBuffer, w2: &'a GpuBuffer, resid: &'a GpuBuffer) -> (RmsNorm<'a>, RmsNorm<'a>) {
+    let mut first = RmsNorm::new(1e-6, Some(w1));
+    first.pre = [Clamp::new(-2.0, 2.5).unwrap(), Clamp::symmetric(9.0)];
+    first.scale = 0.5;
+    first.resid = Some(resid);
+    (first, second_stage(w2))
+}
+
 /// A weighted norm after a `Clamp::symmetric(1.5)`.
 fn second_stage(w: &GpuBuffer) -> RmsNorm<'_> {
     let mut s = RmsNorm::new(1e-6, Some(w));
@@ -1025,6 +1035,378 @@ fn attention_matches_the_f64_reference() {
             cap: 8.0,
         };
         attn_case(rt, &wide, &[30, 7], 4);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bf16 outputs (`ActStore::Bf16`)
+// ---------------------------------------------------------------------------
+//
+// A pass that feeds a bf16 GEMM stores its result as bf16. The arithmetic is
+// the f32 pass's, so the contract is exact, not a tolerance: every bf16 output
+// element is the f32 pass's element rounded to nearest even the way the GPU's
+// own cast rounds it, and an output left in f32 beside it is bit for bit what
+// the f32 pass wrote.
+
+/// A bf16 buffer of `n` elements holding the bits of `UNWRITTEN`.
+fn bf16_seeded(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(n.max(1) * 2).expect("alloc");
+    b.write_bf16_bits(&vec![f32_to_bf16_bits_gpu(UNWRITTEN); n.max(1)]);
+    b
+}
+
+fn read_bf16(rt: &Arc<GpuRuntime>, b: &GpuBuffer, n: usize) -> Vec<u16> {
+    rt.synchronize().unwrap();
+    b.try_contents_u16().unwrap()[..n].to_vec()
+}
+
+fn read_f32_bits(rt: &Arc<GpuRuntime>, b: &GpuBuffer, n: usize) -> Vec<f32> {
+    rt.synchronize().unwrap();
+    b.read_f32()[..n].to_vec()
+}
+
+/// `got` (bf16 bits) is `want` (the f32 pass's output) rounded, element by element.
+fn assert_rounded(what: &str, rt: &Arc<GpuRuntime>, got: &GpuBuffer, want: &GpuBuffer, n: usize) {
+    let want = read_f32_bits(rt, want, n);
+    let got = read_bf16(rt, got, n);
+    let moved = want
+        .iter()
+        .filter(|&&v| bf16_bits_to_f32(f32_to_bf16_bits_gpu(v)) != v)
+        .count();
+    assert!(
+        moved > n / 4,
+        "{what}: test bug: only {moved} of {n} values change when rounded"
+    );
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g, f32_to_bf16_bits_gpu(w), "{what}: element {i} (f32 pass wrote {w})");
+    }
+}
+
+#[test]
+fn row_passes_store_their_outputs_as_bf16_rounded() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
+    with_gpu(|rt| {
+        for (rows, dim) in [(5usize, 37usize), (7, 1024), (3, 1536)] {
+            let n = rows * dim;
+            let mut r = SplitMix::new(31 + dim as u64);
+            let (y, x) = (rand(&mut r, n, 3.0, 0.0), rand(&mut r, n, 2.0, 0.0));
+            let (w1, w2) = (rand(&mut r, dim, 0.3, 1.0), rand(&mut r, dim, 0.3, 1.0));
+            let (yb, xb, w1b, w2b) = (buf(rt, &y), buf(rt, &x), buf(rt, &w1), buf(rt, &w2));
+            let (rows_u, dim_u) = (rows as u32, dim as u32);
+
+            // A lone stage (the feed-forward's pre-norm into its first GEMM),
+            // with a weight, a clamp, SiLU and the next linear's clamp.
+            let mut lone = RmsNorm::new(1e-6, Some(&w1b));
+            lone.pre = [c(-2.0, 2.5), Clamp::symmetric(9.0)];
+            lone.silu = true;
+            lone.post = c(-0.2, 1.4);
+            let f = seeded(rt, n, UNWRITTEN);
+            rms_norm(rt, &yb, &f, rows_u, dim_u, &lone).unwrap();
+            let b = bf16_seeded(rt, n);
+            rms_norm_store(rt, &yb, &b, rows_u, dim_u, &lone, ActStore::Bf16).unwrap();
+            assert_rounded(&format!("lone stage {rows}x{dim}"), rt, &b, &f, n);
+            // F32 through the same entry is the f32 pass, bit for bit.
+            let f2 = seeded(rt, n, UNWRITTEN);
+            rms_norm_store(rt, &yb, &f2, rows_u, dim_u, &lone, ActStore::F32).unwrap();
+            assert_eq!(read_f32_bits(rt, &f2, n), read_f32_bits(rt, &f, n));
+
+            // Two stages, three outputs: each output's type is its own, and the
+            // first stage's output (read back as f32) is untouched.
+            let posts = [c(-1.1, 1.3), c(-0.7, 0.9), c(-2.0, 0.4)];
+            let stages = |resid| two_stages(&w1b, &w2b, resid);
+            let (mid_f, outs_f) = (
+                seeded(rt, n, UNWRITTEN),
+                (0..3).map(|_| seeded(rt, n, UNWRITTEN)).collect::<Vec<_>>(),
+            );
+            let (first, second) = stages(&xb);
+            rms_norm_then(
+                rt,
+                &yb,
+                &mid_f,
+                rows_u,
+                dim_u,
+                &first,
+                &NormThen {
+                    spec: second,
+                    outs: outs_f.iter().zip(&posts).map(|(o, &p)| (o, p)).collect(),
+                },
+            )
+            .unwrap();
+            for stores in [
+                [ActStore::Bf16, ActStore::Bf16, ActStore::Bf16],
+                [ActStore::F32, ActStore::Bf16, ActStore::F32],
+                [ActStore::Bf16, ActStore::F32, ActStore::Bf16],
+            ] {
+                let mid = seeded(rt, n, UNWRITTEN);
+                let outs: Vec<GpuBuffer> = stores
+                    .iter()
+                    .map(|s| match s {
+                        ActStore::F32 => seeded(rt, n, UNWRITTEN),
+                        ActStore::Bf16 => bf16_seeded(rt, n),
+                    })
+                    .collect();
+                let (first, second) = stages(&xb);
+                rms_norm_then_store(
+                    rt,
+                    &yb,
+                    &mid,
+                    rows_u,
+                    dim_u,
+                    &first,
+                    &NormThen {
+                        spec: second,
+                        outs: outs.iter().zip(&posts).map(|(o, &p)| (o, p)).collect(),
+                    },
+                    stores,
+                )
+                .unwrap();
+                assert_eq!(
+                    read_f32_bits(rt, &mid, n),
+                    read_f32_bits(rt, &mid_f, n),
+                    "{stores:?}: first stage"
+                );
+                for (k, s) in stores.iter().enumerate() {
+                    let what = format!("{rows}x{dim} output {k} of {stores:?}");
+                    match s {
+                        ActStore::Bf16 => assert_rounded(&what, rt, &outs[k], &outs_f[k], n),
+                        ActStore::F32 => assert_eq!(
+                            read_f32_bits(rt, &outs[k], n),
+                            read_f32_bits(rt, &outs_f[k], n),
+                            "{what}"
+                        ),
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn bf16_outputs_are_never_in_place_and_the_first_stage_stays_f32() {
+    with_gpu(|rt| {
+        let (rows, dim) = (4usize, 64usize);
+        let n = rows * dim;
+        let mut r = SplitMix::new(8);
+        let (xb, rb) = (buf(rt, &rand(&mut r, n, 2.0, 0.0)), buf(rt, &rand(&mut r, n, 2.0, 0.0)));
+        let w = buf(rt, &rand(&mut r, dim, 0.3, 1.0));
+        let (rows_u, dim_u) = (rows as u32, dim as u32);
+        let err = |r: Result<(), String>| r.expect_err("accepted");
+        let spec = RmsNorm::new(1e-6, Some(&w));
+        // An f32 buffer is big enough to hold the bf16 elements, but two bf16
+        // elements share a word: storing over the input would race.
+        let e = err(rms_norm_store(rt, &xb, &xb, rows_u, dim_u, &spec, ActStore::Bf16));
+        assert!(e.contains("overlaps"), "{e}");
+        let with_resid = RmsNorm {
+            resid: Some(&rb),
+            ..RmsNorm::new(1e-6, Some(&w))
+        };
+        let e = err(rms_norm_store(rt, &xb, &rb, rows_u, dim_u, &with_resid, ActStore::Bf16));
+        assert!(e.contains("overlaps"), "{e}");
+        // The same aliasing is allowed for f32 (each thread reads then writes its element).
+        rms_norm_store(rt, &xb, &rb, rows_u, dim_u, &with_resid, ActStore::F32).unwrap();
+        // A bf16 buffer one element short.
+        let short = bf16_seeded(rt, n - 1);
+        let e = err(rms_norm_store(rt, &xb, &short, rows_u, dim_u, &spec, ActStore::Bf16));
+        assert!(e.contains("rms_norm out"), "{e}");
+        // A chained launch's first output is read by the second stage as f32.
+        let (mid, o0) = (bf16_seeded(rt, n), bf16_seeded(rt, n));
+        let then = NormThen {
+            spec: second_stage(&w),
+            outs: vec![(&o0, Clamp::NONE)],
+        };
+        let e = err(rms_norm_then(rt, &xb, &mid, rows_u, dim_u, &spec, &then));
+        assert!(e.contains("rms_norm"), "an f32 entry with bf16 buffers: {e}");
+        // A bf16 second-stage output that is one of the launch's own inputs.
+        let mid = seeded(rt, n, UNWRITTEN);
+        let then_x = NormThen {
+            spec: second_stage(&w),
+            outs: vec![(&xb, Clamp::NONE)],
+        };
+        let e = err(rms_norm_then_store(
+            rt,
+            &xb,
+            &mid,
+            rows_u,
+            dim_u,
+            &spec,
+            &then_x,
+            [ActStore::Bf16; 3],
+        ));
+        assert!(e.contains("overlaps"), "{e}");
+        let then_mid = NormThen {
+            spec: second_stage(&w),
+            outs: vec![(&mid, Clamp::NONE)],
+        };
+        let e = err(rms_norm_then_store(
+            rt,
+            &xb,
+            &mid,
+            rows_u,
+            dim_u,
+            &spec,
+            &then_mid,
+            [ActStore::Bf16; 3],
+        ));
+        assert!(e.contains("overlaps"), "{e}");
+    });
+}
+
+#[test]
+fn ew_stores_its_output_as_bf16_rounded_and_never_in_place() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
+    with_gpu(|rt| {
+        for n in [37usize, 7 * 4096] {
+            let mut r = SplitMix::new(3);
+            let xb = buf(rt, &rand(&mut r, n, 4.0, 0.0));
+            let spec = Ew {
+                pre: c(-2.5, 3.0),
+                silu: true,
+                post: c(-1.0, 4.0),
+            };
+            let f = seeded(rt, n, UNWRITTEN);
+            ew(rt, &xb, &f, n as u32, &spec).unwrap();
+            let b = bf16_seeded(rt, n);
+            ew_store(rt, &xb, &b, n as u32, &spec, ActStore::Bf16).unwrap();
+            assert_rounded(&format!("ew n {n}"), rt, &b, &f, n);
+        }
+        let xb = buf(rt, &[1.0; 64]);
+        let spec = Ew {
+            pre: Clamp::NONE,
+            silu: false,
+            post: Clamp::NONE,
+        };
+        let e = ew_store(rt, &xb, &xb, 64, &spec, ActStore::Bf16).expect_err("in place");
+        assert!(e.contains("overlaps"), "{e}");
+        let e = ew_store(rt, &xb, &bf16_seeded(rt, 63), 64, &spec, ActStore::Bf16).expect_err("short");
+        assert!(e.contains("ew out"), "{e}");
+    });
+}
+
+#[test]
+fn lconv_and_attention_store_their_outputs_as_bf16_rounded() {
+    let c = |lo: f32, hi: f32| Clamp::new(lo, hi).unwrap();
+    with_gpu(|rt| {
+        // The light conv's middle.
+        let (frames, hidden, taps) = ([9usize, 20, 3], 64usize, 5usize);
+        let table = ClipTable::new(rt, &frames).unwrap();
+        let mut r = SplitMix::new(12);
+        let x = buf(rt, &rand(&mut r, table.rows * 2 * hidden, 6.0, 0.0));
+        let w = buf(rt, &rand(&mut r, hidden * taps, 0.7, 0.0));
+        let nw = buf(rt, &rand(&mut r, hidden, 0.3, 1.0));
+        let n = table.rows * hidden;
+        let spec = Lconv {
+            eps: 1e-6,
+            norm_weight: &nw,
+            glu: c(-3.0, 4.0),
+            pre: c(-1.5, 2.0),
+            post: c(-0.5, 0.9),
+        };
+        let f = seeded(rt, n, UNWRITTEN);
+        lconv(rt, &x, &w, &f, &table, hidden as u32, taps as u32, &spec).unwrap();
+        let b = bf16_seeded(rt, n);
+        lconv_store(
+            rt,
+            &x,
+            &w,
+            &b,
+            &table,
+            hidden as u32,
+            taps as u32,
+            &spec,
+            ActStore::Bf16,
+        )
+        .unwrap();
+        assert_rounded("lconv", rt, &b, &f, n);
+        let e = lconv_store(
+            rt,
+            &x,
+            &w,
+            &x,
+            &table,
+            hidden as u32,
+            taps as u32,
+            &spec,
+            ActStore::Bf16,
+        )
+        .expect_err("in place");
+        assert!(e.contains("overlaps"), "{e}");
+
+        // The attention, three heads of 10, q|k|v in one projection's output.
+        let (nh, hd, chunk, left) = (3usize, 10usize, 4usize, 5usize);
+        let hidden = nh * hd;
+        let past = left - 1;
+        let ctx = chunk + past;
+        let frames = [14usize, 40, 3];
+        let table = ClipTable::new(rt, &frames).unwrap();
+        let oms = masks(&table.clips.iter().map(|c| c.rows).collect::<Vec<_>>());
+        let rows = table.rows;
+        let packed = rand(&mut r, rows * 3 * hidden, 2.0, 0.0);
+        let rel_w = rand(&mut r, hidden * hidden, 1.5 / (hidden as f64).sqrt(), 0.0);
+        let rel: Vec<f32> = relative_keys(hidden, ctx, &f64s(&rel_w))
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        let qm: Vec<f32> = q_mult(&f64s(&rand(&mut r, hd, 0.6, 0.0)))
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        let spec = AttentionSpec {
+            heads: nh as u32,
+            head_dim: hd as u32,
+            chunk: chunk as u32,
+            past: past as u32,
+            k_scale: ((1.0f64 + 1f64.exp()).ln() / 2f64.ln()) as f32,
+            cap: 3.0,
+            invalid: -1e9,
+            q: c(-1.2, 1.5),
+            k: c(-1.4, 1.1),
+            v: c(-1.3, 1.6),
+            out: c(-0.4, 0.5),
+            stride: 3 * hidden as u32,
+            q_off: 0,
+            k_off: hidden as u32,
+            v_off: 2 * hidden as u32,
+        };
+        let (pb, rel_b, qm_b, om_b) = (
+            buf(rt, &packed),
+            buf(rt, &rel),
+            buf(rt, &qm),
+            buf_u32(rt, &mask_u32(&oms)),
+        );
+        let n = rows * hidden;
+        let f = seeded(rt, n, UNWRITTEN);
+        attention(rt, &pb, &pb, &pb, &rel_b, &qm_b, &om_b, &f, &table, &spec).unwrap();
+        let b = bf16_seeded(rt, n);
+        attention_store(
+            rt,
+            &pb,
+            &pb,
+            &pb,
+            &rel_b,
+            &qm_b,
+            &om_b,
+            &b,
+            &table,
+            &spec,
+            ActStore::Bf16,
+        )
+        .unwrap();
+        assert_rounded("attention", rt, &b, &f, n);
+        let e = attention_store(
+            rt,
+            &pb,
+            &pb,
+            &pb,
+            &rel_b,
+            &qm_b,
+            &om_b,
+            &pb,
+            &table,
+            &spec,
+            ActStore::Bf16,
+        )
+        .expect_err("in place");
+        assert!(e.contains("overlaps"), "{e}");
     });
 }
 

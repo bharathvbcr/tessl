@@ -1,6 +1,8 @@
 // EmbeddingGemma 2's audio tower (transformers 5.19 `Gemma4AudioModel`), the
 // kernels that no other tessl kernel covers. `src/embedgemma2_audio.rs` is
-// the host side and holds the contract of each; the activations are f32.
+// the host side and holds the contract of each; the activations are f32, except
+// the operands of a bf16 GEMM: each pass that feeds one stores its output as
+// f32 or bf16 as the host asks (`ega_store`).
 //
 // Row spaces. A batch is several clips laid end to end in each of three row
 // spaces (frames, the first conv's output rows, the tower rows), described to
@@ -244,6 +246,19 @@ kernel void eg2a_sub_conv1_ln_relu(
 
 // --- Row passes and elementwise passes with the clamps folded in ---------------
 
+/// Stores `v` as element `i` of `p`: an f32, or a bf16 (the GPU's round to
+/// nearest even, which is what a bf16 GEMM operand is). Every pass that feeds
+/// a GEMM takes its output type from the host, so the exact-f32 forward and the
+/// bf16-operand one share one body per pass.
+inline void ega_store(device void *p, ulong i, float v, bool bf16)
+{
+    if (bf16) {
+        ((device bfloat *)p)[i] = bfloat(v);
+    } else {
+        ((device float *)p)[i] = v;
+    }
+}
+
 /// One row stage's constants: words of `EgaRowStage`, all 4 bytes (the host
 /// packs them in this order).
 struct EgaRowStage {
@@ -262,7 +277,8 @@ struct EgaRowStage {
     float scale;
     /// bit 0: multiply by `weight`; bit 1: SiLU; bit 2: add `resid[row, d]`;
     /// bit 3: no norm (the pre-clamped value goes on as it is); bit 4: add
-    /// `resid[d]` (a per-column bias) instead of bit 2's residual.
+    /// `resid[d]` (a per-column bias) instead of bit 2's residual; bits 5, 6
+    /// and 7: output 0, 1 or 2 is stored bf16 instead of f32.
     uint flags;
 };
 
@@ -287,9 +303,9 @@ inline void ega_row_stage(
     device const float *src,
     device const float *weight,
     device const float *resid,
-    device float *o0,
-    device float *o1,
-    device float *o2,
+    device void *o0,
+    device void *o1,
+    device void *o2,
     uint n_out,
     constant EgaRowStage &s,
     ulong base,
@@ -316,9 +332,9 @@ inline void ega_row_stage(
         float r = clamp(v, s.post_lo[0], s.post_hi[0]) * s.scale;
         if ((s.flags & 4u) != 0u) r += resid[base + d];
         if ((s.flags & 16u) != 0u) r += resid[d];
-        if (n_out > 1u) o1[base + d] = clamp(v, s.post_lo[1], s.post_hi[1]) * s.scale;
-        if (n_out > 2u) o2[base + d] = clamp(v, s.post_lo[2], s.post_hi[2]) * s.scale;
-        o0[base + d] = r;
+        if (n_out > 1u) ega_store(o1, base + d, clamp(v, s.post_lo[1], s.post_hi[1]) * s.scale, (s.flags & 64u) != 0u);
+        if (n_out > 2u) ega_store(o2, base + d, clamp(v, s.post_lo[2], s.post_hi[2]) * s.scale, (s.flags & 128u) != 0u);
+        ega_store(o0, base + d, r, (s.flags & 32u) != 0u);
     }
 }
 
@@ -329,17 +345,20 @@ inline void ega_row_stage(
 /// get their own clamped copy from one pass). Two stages in one launch is
 /// the residual add and the norm that follows it, which are both per-row: the
 /// row is read once and the second stage reads the first's output while it is
-/// still cached. `out` may be `x`; `resid` may be `out`; `out_b0` may be `out`.
+/// still cached. `out` may be `x`; `resid` may be `out`; `out_b0` may be `out`
+/// (all f32 then). Each output is f32 or bf16 as its flag says (the host
+/// allows a bf16 `out` only for a lone stage `a`, since stage `b` reads `out`
+/// as f32, and a bf16 output is never one of the f32 buffers it is read from).
 kernel void eg2a_rms_norm(
     device const float *x [[buffer(0)]],
     device const float *weight [[buffer(1)]],
     device const float *resid [[buffer(2)]],
-    device float *out [[buffer(3)]],
+    device void *out [[buffer(3)]],
     constant EgaNormParams &p [[buffer(4)]],
     device const float *weight_b [[buffer(5)]],
-    device float *out_b0 [[buffer(6)]],
-    device float *out_b1 [[buffer(7)]],
-    device float *out_b2 [[buffer(8)]],
+    device void *out_b0 [[buffer(6)]],
+    device void *out_b1 [[buffer(7)]],
+    device void *out_b2 [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
@@ -351,8 +370,9 @@ kernel void eg2a_rms_norm(
     const ulong base = (ulong)row * p.dim;
     ega_row_stage(x, weight, resid, out, out, out, 1u, p.a, base, p.dim, scratch, sgid, lane, lid, tptg);
     if (p.outs != 0u) {
+        device const float *out_f32 = (device const float *)out;
         ega_row_stage(
-            out, weight_b, out, out_b0, out_b1, out_b2, p.outs, p.b, base, p.dim,
+            out_f32, weight_b, out_f32, out_b0, out_b1, out_b2, p.outs, p.b, base, p.dim,
             scratch + REDUCE_MAX_SIMDGROUPS, sgid, lane, lid, tptg);
     }
 }
@@ -364,22 +384,23 @@ struct EgaEwParams {
     float hi1;
     float lo2;
     float hi2;
-    /// bit 1: SiLU between the clamps.
+    /// bit 1: SiLU between the clamps; bit 2: `out` is bf16 (then it is never
+    /// `x`: element `i` of a bf16 buffer shares its word with element `i ^ 1`).
     uint flags;
 };
 
 /// `out[i] = clamp2(act(clamp1(x[i])))`: the pass between two clipped linears
-/// (output clamp, SiLU, input clamp). `out` may be `x`.
+/// (output clamp, SiLU, input clamp). `out` may be `x` (both f32).
 kernel void eg2a_ew(
     device const float *x [[buffer(0)]],
-    device float *out [[buffer(1)]],
+    device void *out [[buffer(1)]],
     constant EgaEwParams &p [[buffer(2)]],
     uint i [[thread_position_in_grid]])
 {
     if (i >= p.n) return;
     float v = clamp(x[i], p.lo1, p.hi1);
     if ((p.flags & 2u) != 0u) v = tessl_silu(v);
-    out[i] = clamp(v, p.lo2, p.hi2);
+    ega_store(out, i, clamp(v, p.lo2, p.hi2), (p.flags & 4u) != 0u);
 }
 
 /// Hidden width the light conv's threadgroup holds (host-checked).
@@ -399,6 +420,8 @@ struct EgaLconvParams {
     /// The next clipped linear's input clamp.
     float post_lo;
     float post_hi;
+    /// bit 0: `out` is bf16 instead of f32.
+    uint flags;
 };
 
 /// The middle of `Gemma4AudioLightConv1d` in one pass per row: the GLU, the
@@ -415,13 +438,14 @@ struct EgaLconvParams {
 /// each back. Clips never read each other's rows.
 ///
 /// x [R, 2 * hidden] (the linear_start GEMM's output); w [hidden, taps] (the
-/// checkpoint's `[hidden, 1, taps]`); norm_w [hidden]; out [R, hidden].
+/// checkpoint's `[hidden, 1, taps]`); norm_w [hidden]; out [R, hidden] (f32,
+/// or bf16 when the params say so).
 /// Grid: x = max over clips of `rows`, y = clip.
 kernel void eg2a_lconv(
     device const float *x [[buffer(0)]],
     device const float *w [[buffer(1)]],
     device const float *norm_w [[buffer(2)]],
-    device float *out [[buffer(3)]],
+    device void *out [[buffer(3)]],
     device const uint *clips [[buffer(4)]],
     constant EgaLconvParams &p [[buffer(5)]],
     uint2 tg [[threadgroup_position_in_grid]],
@@ -456,9 +480,10 @@ kernel void eg2a_lconv(
         ss += v * v;
     }
     const float inv = rsqrt(reduce_row_add(ss, scratch, sgid, lane, tptg) / (float)hidden + p.eps);
-    device float *o = out + (ulong)(row0 + t) * hidden;
+    const ulong o = (ulong)(row0 + t) * hidden;
+    const bool bf16 = (p.flags & 1u) != 0u;
     for (uint ch = lid; ch < hidden; ch += tptg) {
-        o[ch] = clamp(tessl_silu(vals[ch] * inv * norm_w[ch]), p.post_lo, p.post_hi);
+        ega_store(out, o + ch, clamp(tessl_silu(vals[ch] * inv * norm_w[ch]), p.post_lo, p.post_hi), bf16);
     }
 }
 
@@ -503,6 +528,8 @@ struct EgaAttnParams {
     uint q_off;
     uint k_off;
     uint v_off;
+    /// bit 0: `out` is bf16 instead of f32.
+    uint flags;
 };
 
 /// Sums each of 16 per-lane values across the 32 lanes of a simdgroup, and
@@ -569,7 +596,8 @@ inline float ega_scatter_sum16(thread float *v, uint lane) {
 /// q, k, v are read at `row * stride + off + column` (`stride`, `*_off` in
 /// the params); out [R, heads * head_dim]; rel [rel_rows, heads * head_dim];
 /// q_mult [head_dim]; omask [R] (0/1). Grid: x = max rows * heads, y = clip;
-/// 32 threads.
+/// 32 threads. q, k and v are f32 whatever `out` is: `out` is bf16 when the
+/// params say so, the output projection's GEMM operand.
 kernel void eg2a_attn(
     device const float *q [[buffer(0)]],
     device const float *k [[buffer(1)]],
@@ -578,7 +606,7 @@ kernel void eg2a_attn(
     device const float *q_mult [[buffer(4)]],
     device const uint *omask [[buffer(5)]],
     device const uint *clips [[buffer(6)]],
-    device float *out [[buffer(7)]],
+    device void *out [[buffer(7)]],
     constant EgaAttnParams &p [[buffer(8)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
@@ -665,9 +693,10 @@ kernel void eg2a_attn(
             }
         }
     }
-    device float *o = out + (ulong)(row0 + t) * hidden + col0;
+    const ulong o = (ulong)(row0 + t) * hidden + col0;
+    const bool bf16 = (p.flags & 1u) != 0u;
     for (uint e = 0u; e < EGA_MAX_E; ++e) {
         const uint d = lane + 32u * e;
-        if (d < p.head_dim) o[d] = clamp(acc[e], p.o_lo, p.o_hi);
+        if (d < p.head_dim) ega_store(out, o + d, clamp(acc[e], p.o_lo, p.o_hi), bf16);
     }
 }

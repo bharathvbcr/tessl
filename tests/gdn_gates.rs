@@ -1,14 +1,28 @@
-//! **K7 — gate production.** The CPU oracle for `alpha` / `beta`, and the traps
-//! around it.
+//! **The nanolab sigmoid-gate operator's gate production** (the plan's K7). The CPU
+//! oracle for `alpha` / `beta` as nanolab's published gated delta rule produces
+//! them, and the traps around it.
+//!
+//! **Scope: this is not Qwen3.5's gate.** The operator pinned here is
+//! `alpha = sigmoid(a_gate + decay_bias)`, clamped, with `beta = sigmoid(b_gate)`
+//! (`nanolab/mixers.py:803-804`). Qwen3.5 computes a different gate: `g =
+//! -exp(A_log) * softplus(a + dt_bias)` with `beta = sigmoid(b)`, inline in
+//! `Qwen3_5GatedDeltaNet.forward`, and the `qwen35_gdn_gates_f32` kernel
+//! (`kernels/qwen35_gdn.metal`) implements that one. Its golden is
+//! `qwen35_gates_*` in `tests/fixtures/qwen35/`, captured from transformers'
+//! module, and `gdn_gates_kernel_matches_the_transformers_module_golden` in
+//! `tests/qwen35_kernels.rs` asserts the kernel against it. Nothing in this file
+//! is evidence about that kernel, and where the text below calls the
+//! `A_log`/softplus form "refuted" it means refuted *as the nanolab operator's
+//! gate*: it is the Qwen3.5 one.
 //!
 //! The published fixture corpus stores *post*-gate `alpha` and `beta`, so it
 //! cannot test gate production at all: every case in `gdn_fixtures.rs` consumes
-//! gates that were already computed somewhere else. K7 is the kernel that
-//! computes them, which makes it the one kernel in the set with no golden. This
-//! file is that golden.
+//! gates that were already computed somewhere else. This file is the golden for
+//! producing them in the nanolab form.
 //!
 //! It runs no GPU code — no `with_gpu` — so it runs on any host, and it compares
-//! no kernel to anything. It pins the reference a kernel will later be judged by.
+//! no kernel to anything. It pins the reference a nanolab-form kernel would be
+//! judged by.
 //!
 //! **Why this reference exists at all.** The build plan specifies K7 as
 //!
@@ -17,10 +31,10 @@
 //! ```
 //!
 //! which is the Mamba2 / SSD decay from a *different* mixer in the same source
-//! file. The gated delta rule's gate is a plain sigmoid of a per-head-biased
+//! file (and the form Qwen3.5's GDN layer uses, which is why it is not nanolab's). The gated delta rule's gate is a plain sigmoid of a per-head-biased
 //! logit (`nanolab/mixers.py:803-804`, recorded in
 //! `Lappi-decision/AUDIT/gdn-reference-and-contracts.md` §4.2). `A_log` and
-//! `dt_bias` are not GDN parameters; `decay_bias` is.
+//! `dt_bias` are not nanolab's GDN parameters (they are Qwen3.5's); `decay_bias` is.
 //!
 //! The audit calls this the most dangerous single error in the plan, and the
 //! tests below show why it earns that. With the zero-initialised parameters

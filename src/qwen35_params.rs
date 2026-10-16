@@ -15,7 +15,10 @@
 //!   transpose of transformers' `[out, in]` ([`ParamInfo::transposed`]).
 //! - The tied embedding is one `[vocab, hidden]` table, read by the gather,
 //!   the training step's cross-entropy and the inference forward's head
-//!   alike, so a write moves all three.
+//!   alike, so a write moves all three. An untied model (`tie_word_embeddings:
+//!   false`) has the head as a table of its own, the last entry
+//!   (`lm_head.weight`, which transformers names at the root, not below the
+//!   tower), so the embedding's write moves the gather alone.
 //!
 //! The matrices (the embedding and the packed projections) are stored in the
 //! model's [`Precision`]; everything else is f32 at either precision. The
@@ -447,6 +450,23 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
         param: Src::Raw(&m.final_norm),
         grad: grads.map(|g| Src::Raw(&g.final_norm)),
     });
+    // An untied model's head is the last entry, so the tied table's indices
+    // are the untied one's.
+    if let Some(head) = &m.lm_head {
+        let grad = match grads {
+            None => None,
+            Some(g) => Some(Src::Dense(g.lm_head.as_ref().ok_or(
+                "the model has an untied lm_head but the gradients carry none (Qwen35Grads::zeros_like of this model)",
+            )?)),
+        };
+        out.push(Slot {
+            info: info(crate::qwen35_model::LM_HEAD_NAME.into(), &[vocab, h], false),
+            param: Src::Dense(head),
+            grad,
+        });
+    } else if grads.is_some_and(|g| g.lm_head.is_some()) {
+        return Err("the gradients carry an lm_head gradient but the model is tied".into());
+    }
     // `Qwen35Grads`' fields are public, and an `AdamW` made for another model
     // carries that model's runtime: refuse either before anything reads or
     // writes through them.

@@ -1,0 +1,169 @@
+{
+  "rounds": 4,
+  "format": "Metrics",
+  "lanes": [
+    {
+      "name": "sync",
+      "argv": [
+        "target/release/bench_capi",
+        "--model=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc/model.safetensors-00001-of-00001.safetensors",
+        "--tokens=512"
+      ],
+      "env": {}
+    },
+    {
+      "name": "async",
+      "argv": [
+        "target/release/bench_capi",
+        "--async",
+        "--model=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc/model.safetensors-00001-of-00001.safetensors",
+        "--tokens=512"
+      ],
+      "env": {}
+    }
+  ],
+  "env": {},
+  "summary": [
+    {
+      "workload": "capi_idle_sync_us",
+      "sync": {
+        "value_median": 0.083,
+        "value_min": 0.083,
+        "value_max": 0.083,
+        "value_all": [
+          0.083,
+          0.083,
+          0.083,
+          0.083
+        ]
+      },
+      "async": {
+        "value_median": 0.0835,
+        "value_min": 0.083,
+        "value_max": 0.125,
+        "value_all": [
+          0.084,
+          0.083,
+          0.083,
+          0.125
+        ],
+        "vs_base": {
+          "median": 1.0060240963855422,
+          "lo": 1,
+          "hi": 1.506024096385542
+        }
+      }
+    },
+    {
+      "workload": "capi_forward_us_t512",
+      "sync": {
+        "value_median": 769529.396,
+        "value_min": 691196.042,
+        "value_max": 795630.375,
+        "value_all": [
+          746045.917,
+          793012.875,
+          691196.042,
+          795630.375
+        ]
+      },
+      "async": {
+        "value_median": 680692.1875,
+        "value_min": 671768.291,
+        "value_max": 747873.75,
+        "value_all": [
+          671768.291,
+          688634.583,
+          672749.792,
+          747873.75
+        ],
+        "vs_base": {
+          "median": 0.9202073163213011,
+          "lo": 0.8683775569217587,
+          "hi": 0.9733125641943419
+        }
+      }
+    },
+    {
+      "workload": "capi_train_step_ms_t512",
+      "sync": {
+        "value_median": 1659.70905,
+        "value_min": 1624.0978,
+        "value_max": 1727.3959,
+        "value_all": [
+          1670.1661,
+          1649.252,
+          1624.0978,
+          1727.3959
+        ]
+      },
+      "async": {
+        "value_median": 1506.6367500000001,
+        "value_min": 1493.6977,
+        "value_max": 1639.4931,
+        "value_all": [
+          1501.9185,
+          1493.6977,
+          1639.4931,
+          1511.355
+        ],
+        "vs_base": {
+          "median": 0.9024724313395478,
+          "lo": 0.8749326080952259,
+          "hi": 1.009479293673078
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 746045.917,
+        "capi_train_step_ms_t512": 1670.1661
+      },
+      "async": {
+        "capi_idle_sync_us": 0.084,
+        "capi_forward_us_t512": 671768.291,
+        "capi_train_step_ms_t512": 1501.9185
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 793012.875,
+        "capi_train_step_ms_t512": 1649.252
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 688634.583,
+        "capi_train_step_ms_t512": 1493.6977
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 691196.042,
+        "capi_train_step_ms_t512": 1624.0978
+      },
+      "async": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 672749.792,
+        "capi_train_step_ms_t512": 1639.4931
+      }
+    },
+    {
+      "sync": {
+        "capi_idle_sync_us": 0.083,
+        "capi_forward_us_t512": 795630.375,
+        "capi_train_step_ms_t512": 1727.3959
+      },
+      "async": {
+        "capi_idle_sync_us": 0.125,
+        "capi_forward_us_t512": 747873.75,
+        "capi_train_step_ms_t512": 1511.355
+      }
+    }
+  ],
+  "lane_archive": "bench/results/capi_train_step_2b_m5pro.json.lanes"
+}

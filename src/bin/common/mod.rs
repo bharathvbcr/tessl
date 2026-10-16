@@ -415,6 +415,27 @@ pub fn emit_kernel_trace() {
     }
 }
 
+/// The stdout line a `METRIC` lane ends with when it fails after it may have
+/// printed metrics: `METRIC_INCOMPLETE reason`. A consumer that reads stdout
+/// alone (a pipe, a saved log) must not take the `METRIC` lines before it as a
+/// finished run. It does not start with `METRIC ` (with the space), so
+/// `bench_paired`'s parser skips it; `bench_paired` itself refuses any lane
+/// with a non-zero exit before it parses a line, so this adds nothing there.
+pub fn incomplete_line(reason: &dyn std::fmt::Display) -> String {
+    let one_line = reason.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("METRIC_INCOMPLETE {one_line}")
+}
+
+/// Pass `result` through; on an error print [`incomplete_line`] to stdout.
+/// Wrap only the part of a run that starts after every argument and
+/// environment value has been validated.
+pub fn mark_incomplete_on_error<T, E: std::fmt::Display>(result: Result<T, E>) -> Result<T, E> {
+    if let Err(e) = &result {
+        println!("{}", incomplete_line(e));
+    }
+    result
+}
+
 /// Exit 3 when any shape's baseline broke [`SELF_SPREAD_LIMIT`]. Its lines
 /// were printed with the `EXCEEDS 10%` flag; the status keeps a script from
 /// reading the run as clean.
@@ -432,7 +453,16 @@ pub fn exit_if_unstable(bin: &str, unstable: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill, fill_affine, median, parse_count, ratio_stats, round_order, run_paired, self_spread, Arm};
+    use super::{
+        fill, fill_affine, incomplete_line, median, parse_count, ratio_stats, round_order, run_paired, self_spread, Arm,
+    };
+
+    #[test]
+    fn incomplete_marker_is_one_line_and_not_a_metric() {
+        let l = incomplete_line(&"gpu failed\nsecond line");
+        assert_eq!(l, "METRIC_INCOMPLETE gpu failed second line");
+        assert!(!l.starts_with("METRIC "));
+    }
 
     #[test]
     fn median_rejects_empty_and_non_finite_samples() {

@@ -1,0 +1,1658 @@
+{
+ "date": "2026-10-15",
+ "device": "Apple M5 Pro",
+ "rule": "paired, interleaved (bench_paired: lanes alternate round by round, order reversed on odd rounds), repeated; per lane the median, min, max and every round are kept. No --evidence: its 1.10 drift gate publishes nothing when a series is wider, so the noise band is stated here instead.",
+ "noise_band_definition": "per lane, max/min of its per-round values across the order-swapped rounds (noise_band_max_over_min). A ratio whose [lo,hi] straddles 1.0, or whose distance from 1 is under the larger lane band, is neither a regression nor a win",
+ "revisions": "/Users/bharath/Code/research/tessl-w9-attn 7f6880f5c6e2c9fc9ec86fc0b4dd69248aec8363\n/Users/bharath/Code/research/tessl-w9-attn-before-overlay 07c58c69c99d3543247829979ac37931f04c0872\n/Users/bharath/Code/research/tessl-w9-attn-before-70ae3bc 70ae3bcb57622f071d4e9afffe4af0100083b548\n/Users/bharath/Code/research/tessl-w9-attn-before-f7c7f66 f7c7f6690b5c3c0059643d9dad3b606de49b8672\n/Users/bharath/Code/research/tessl-w9-attn-before-8a117fe 8a117fec3ae51f5c26e43fc872bc0a4e8d9fc7b2\n",
+ "binary_sha256": "442e2ff8f66eac610138698f8c401e3b654648643c173da80672313eeafc422e  /Users/bharath/Code/research/tessl-w9-attn/target/release/bench_qwen35_layers\nac7f08329c134bdf42bad0648f4c3a7a1591690b26554fcdd52a4c1f455f467d  /Users/bharath/Code/research/tessl-w9-attn-before-overlay/target/release/bench_qwen35_layers\na741d40ccc1f49ccc3202d58e3661d99ea58a3a75c4357a82d1bbc96fc0989df  /Users/bharath/Code/research/tessl-w9-attn-before-70ae3bc/target/release/bench_qwen35_layers\nba0489d788a7758f42f8e7dcc1b8227502be38e7ee7c8560ffe5d2fedb7d1874  /Users/bharath/Code/research/tessl-w9-attn/target/release/bench_qwen35_train\nf3b96ee62737950b9ca8aaf641bd2db618f465b1607528dad81b621f45a24cff  /Users/bharath/Code/research/tessl-w9-attn-before-overlay/target/release/bench_qwen35_train\n5032544b9bdc757e8c8de3bdf97c736d166b4ba270ff77aebf279d78b8dcde14  /Users/bharath/Code/research/tessl-w9-attn/target/release/bench_embedgemma2\n7e9983816f85437f9b4079402f10771a669513ff334a374f2ceb645562785607  /Users/bharath/Code/research/tessl-w9-attn-before-f7c7f66/target/release/bench_embedgemma2\n5db2208d1d92fe7a65e66c1f2583c5f551d3ec80bf97789935c73d6982acdc63  /Users/bharath/Code/research/tessl-w9-attn-before-8a117fe/target/release/bench_embedgemma2\n",
+ "builds": {
+  "before_qwen_kernel": "detached worktree at the harness commit with kernels/qwen35_attn_tiled.metal replaced by its 70ae3bc content (the parent of 4e5faac; detached overlay commit); own CARGO_TARGET_DIR",
+  "native_70ae3bc": "detached worktree at 70ae3bc, its own bench_qwen35_layers --paired-attn (default tile only)",
+  "before_encoder": "detached worktrees at f7c7f66 (8a117fe^, the rows kernel) and 8a117fe, own target dirs",
+  "after": "gp/w9-attn harness commit on main 60a6240; kernel files identical to main"
+ },
+ "old_cli_refusal": "--- old CLI refuses the new flag (pre-change evidence for the CLI test)\nError: \"expected a token count, --check-only, --paired-attn, --attn-rows, --attn-tile=LABEL, --mlp-unfused or --gdn-scan16, got \\\"--attn-tiles\\\"\"\nexit 1\n",
+ "runs": [
+  {
+   "name": "A_tiles",
+   "rounds": 12,
+   "format": "Metrics",
+   "lanes": [
+    {
+     "name": "before_70ae3bc_kernel",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn-before-overlay/target/release/bench_qwen35_layers",
+      "--attn-tiles",
+      "2048"
+     ],
+     "env": {}
+    },
+    {
+     "name": "after_main",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_qwen35_layers",
+      "--attn-tiles",
+      "2048"
+     ],
+     "env": {}
+    }
+   ],
+   "conditions": {
+    "before": "label=A_tiles_before\n2026-10-15T18:58:08Z\n13:58  up 4 days, 12 mins, 1 user, load averages: 5.14 5.79 11.44\n{ 5.14 5.79 11.44 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 114.1 235008 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n13261  13.6  67536 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n53224  12.9 167104 /Applications/GitPulse.app/Contents/MacOS/gitpulse\n 1966   6.8  14784 /System/Library/PrivateFrameworks/XprotectFramework.framework/Versions/A/XPCServices/XprotectService.xpc/Contents/MacOS/XprotectService\n  376   4.9  59184 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds\n  503   4.4  27392 /usr/libexec/syspolicyd\n  561   3.7 234160 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores\n",
+    "after": "label=A_tiles_after\n2026-10-15T18:59:03Z\n13:59  up 4 days, 13 mins, 1 user, load averages: 4.78 5.59 11.01\n{ 4.78 5.59 11.01 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.4 235008 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n13261  14.9  67536 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n50886   6.1 302848 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n  566   3.6  43424 /usr/sbin/coreaudiod\n63813   3.1 674000 /Users/bharath/.local/share/claude/versions/2.1.300\n  418   2.8  52896 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n57316   1.9 164624 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n"
+   },
+   "summary": [
+    {
+     "workload": "attn_prefill_q32_k32_sg4_ms_t2048",
+     "lanes": [
+      {
+       "lane": "before_70ae3bc_kernel",
+       "median": 2.883,
+       "min": 2.8664,
+       "max": 2.9162,
+       "noise_band_max_over_min": 1.0173737091822495,
+       "n": 12,
+       "all": [
+        2.8827,
+        2.8664,
+        2.8833,
+        2.8721,
+        2.8809,
+        2.872,
+        2.8895,
+        2.9134,
+        2.9162,
+        2.9138,
+        2.8976,
+        2.872
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 2.9063,
+       "min": 2.8828,
+       "max": 2.9382,
+       "noise_band_max_over_min": 1.0192174275010406,
+       "n": 12,
+       "all": [
+        2.9007,
+        2.8828,
+        2.8932,
+        2.8927,
+        2.8904,
+        2.8981,
+        2.928,
+        2.9382,
+        2.9313,
+        2.9264,
+        2.9119,
+        2.9182
+       ],
+       "vs_base": {
+        "median": 1.0059828042873218,
+        "lo": 1.0032975806171682,
+        "hi": 1.0160863509749305
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "attn_prefill_q32_k64_sg4_ms_t2048",
+     "lanes": [
+      {
+       "lane": "before_70ae3bc_kernel",
+       "median": 2.75085,
+       "min": 2.7345,
+       "max": 2.7897,
+       "noise_band_max_over_min": 1.0201865057597366,
+       "n": 12,
+       "all": [
+        2.7412,
+        2.7392,
+        2.7382,
+        2.735,
+        2.7345,
+        2.7505,
+        2.7651,
+        2.78,
+        2.7897,
+        2.7769,
+        2.7706,
+        2.7512
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 2.7431,
+       "min": 2.728,
+       "max": 2.7778,
+       "noise_band_max_over_min": 1.0182551319648094,
+       "n": 12,
+       "all": [
+        2.7334,
+        2.7303,
+        2.7294,
+        2.7343,
+        2.7312,
+        2.728,
+        2.7759,
+        2.7777,
+        2.7778,
+        2.7605,
+        2.7519,
+        2.7585
+       ],
+       "vs_base": {
+        "median": 0.9969703703906605,
+        "lo": 0.9918196691510635,
+        "hi": 1.0039058261907345
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "attn_prefill_q64_k32_sg8_ms_t2048",
+     "lanes": [
+      {
+       "lane": "before_70ae3bc_kernel",
+       "median": 3.0067000000000004,
+       "min": 2.9883,
+       "max": 3.049,
+       "noise_band_max_over_min": 1.0203125522872536,
+       "n": 12,
+       "all": [
+        2.9934,
+        3.0013,
+        3.0001,
+        2.9937,
+        2.9883,
+        2.9954,
+        3.0257,
+        3.049,
+        3.0408,
+        3.0385,
+        3.0239,
+        3.0121
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 3.00145,
+       "min": 2.9862,
+       "max": 3.0414,
+       "noise_band_max_over_min": 1.018485031143259,
+       "n": 12,
+       "all": [
+        2.9862,
+        2.9888,
+        2.9865,
+        2.9926,
+        2.9902,
+        2.9871,
+        3.0366,
+        3.0414,
+        3.0388,
+        3.0292,
+        3.0195,
+        3.0103
+       ],
+       "vs_base": {
+        "median": 0.9980698168929083,
+        "lo": 0.9954668177727408,
+        "hi": 1.0036024721552037
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "attn_prefill_q64_k64_sg8_ms_t2048",
+     "lanes": [
+      {
+       "lane": "before_70ae3bc_kernel",
+       "median": 2.859,
+       "min": 2.8396,
+       "max": 2.9035,
+       "noise_band_max_over_min": 1.0225031694604876,
+       "n": 12,
+       "all": [
+        2.8578,
+        2.8505,
+        2.8589,
+        2.8396,
+        2.8575,
+        2.8511,
+        2.8668,
+        2.8801,
+        2.9035,
+        2.8683,
+        2.8602,
+        2.8591
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 2.8523500000000004,
+       "min": 2.8311,
+       "max": 2.8715,
+       "noise_band_max_over_min": 1.0142700717035782,
+       "n": 12,
+       "all": [
+        2.8311,
+        2.8442,
+        2.8496,
+        2.8436,
+        2.8427,
+        2.8445,
+        2.8687,
+        2.8714,
+        2.8715,
+        2.8657,
+        2.8571,
+        2.8551
+       ],
+       "vs_base": {
+        "median": 0.9977374827113845,
+        "lo": 0.9889788186671259,
+        "hi": 1.0014086491055079
+       },
+       "vs_prev": null
+      }
+     ]
+    }
+   ],
+   "measured": true,
+   "command_lines_in": "bench/attn_lane.sh (header comment)"
+  },
+  {
+   "name": "B_default_tile",
+   "rounds": 12,
+   "format": "Metrics",
+   "lanes": [
+    {
+     "name": "native_70ae3bc",
+     "argv": [
+      "bash",
+      "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/attn_lane.sh",
+      "native",
+      "/Users/bharath/Code/research/tessl-w9-attn-before-70ae3bc/target/release/bench_qwen35_layers",
+      "2048"
+     ],
+     "env": {}
+    },
+    {
+     "name": "overlay_70ae3bc_kernel",
+     "argv": [
+      "bash",
+      "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/attn_lane.sh",
+      "tiles",
+      "/Users/bharath/Code/research/tessl-w9-attn-before-overlay/target/release/bench_qwen35_layers",
+      "2048"
+     ],
+     "env": {}
+    },
+    {
+     "name": "after_main",
+     "argv": [
+      "bash",
+      "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/attn_lane.sh",
+      "tiles",
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_qwen35_layers",
+      "2048"
+     ],
+     "env": {}
+    }
+   ],
+   "conditions": {
+    "before": "label=B_default_tile_before\n2026-10-15T18:59:03Z\n13:59  up 4 days, 13 mins, 1 user, load averages: 4.78 5.59 11.01\n{ 4.78 5.59 11.01 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.4 235008 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n13261  14.9  67536 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n50886   6.1 302848 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n  566   3.6  43424 /usr/sbin/coreaudiod\n63813   3.1 674000 /Users/bharath/.local/share/claude/versions/2.1.300\n  418   2.8  52896 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n57316   1.9 164624 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n",
+    "after": "label=B_default_tile_after\n2026-10-15T19:00:27Z\n14:00  up 4 days, 14 mins, 1 user, load averages: 3.41 4.92 10.26\n{ 3.41 4.92 10.26 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.0 235536 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n13261  14.6  67488 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n  566   3.6  43424 /usr/sbin/coreaudiod\n  418   2.8  53008 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n 8505   1.8  10256 /usr/libexec/historicalaudiod\n64820   1.5  85440 /usr/libexec/signpost_reporter\n39508   1.3  76736 /Applications/Google Drive.app/Contents/MacOS/Google Drive\n"
+   },
+   "summary": [
+    {
+     "workload": "attn_prefill_q32_k32_sg4_ms_t2048",
+     "lanes": [
+      {
+       "lane": "native_70ae3bc",
+       "median": 3.0998,
+       "min": 2.9295,
+       "max": 3.4716,
+       "noise_band_max_over_min": 1.1850486431131593,
+       "n": 12,
+       "all": [
+        2.9796,
+        2.9295,
+        2.9311,
+        3.0592,
+        3.0776,
+        3.1225,
+        3.1117,
+        3.1915,
+        3.2306,
+        3.4716,
+        3.1285,
+        3.0879
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "overlay_70ae3bc_kernel",
+       "median": 2.8832,
+       "min": 2.8692,
+       "max": 3.2214,
+       "noise_band_max_over_min": 1.1227519866164783,
+       "n": 12,
+       "all": [
+        2.872,
+        2.8745,
+        2.8692,
+        2.8745,
+        2.8789,
+        2.9463,
+        2.8832,
+        2.9327,
+        2.9669,
+        3.2214,
+        2.8832,
+        2.8886
+       ],
+       "vs_base": {
+        "median": 0.9354472291930485,
+        "lo": 0.9183742957964465,
+        "hi": 0.9812254650964328
+       },
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 2.90685,
+       "min": 2.8888,
+       "max": 3.0748,
+       "noise_band_max_over_min": 1.064386596510662,
+       "n": 12,
+       "all": [
+        2.903,
+        2.8979,
+        2.8929,
+        2.8888,
+        2.9023,
+        2.9238,
+        2.9044,
+        2.9093,
+        3.0748,
+        2.9499,
+        2.9493,
+        2.9357
+       ],
+       "vs_base": {
+        "median": 0.9436695971865269,
+        "lo": 0.8497234704459039,
+        "hi": 0.9892131763099504
+       },
+       "vs_prev": {
+        "median": 1.0081343253331483,
+        "lo": 0.915719873346992,
+        "hi": 1.0363679261181706
+       }
+      }
+     ]
+    }
+   ],
+   "measured": true,
+   "command_lines_in": "bench/attn_lane.sh (header comment)"
+  },
+  {
+   "name": "C_train_lse",
+   "rounds": 8,
+   "format": "Metrics",
+   "lanes": [
+    {
+     "name": "before_70ae3bc_kernel",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn-before-overlay/target/release/bench_qwen35_train",
+      "2048",
+      "--op=attn_train_forward"
+     ],
+     "env": {}
+    },
+    {
+     "name": "after_main",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_qwen35_train",
+      "2048",
+      "--op=attn_train_forward"
+     ],
+     "env": {}
+    }
+   ],
+   "conditions": {
+    "before": "label=C_train_lse_before\n2026-10-15T19:00:28Z\n14:00  up 4 days, 14 mins, 1 user, load averages: 3.46 4.90 10.23\n{ 3.46 4.90 10.23 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.0 235536 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n13261  14.6  67488 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n  566   3.6  43424 /usr/sbin/coreaudiod\n  418   2.8  53008 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n 8505   1.8  10256 /usr/libexec/historicalaudiod\n64820   1.5  85440 /usr/libexec/signpost_reporter\n39508   1.3  76736 /Applications/Google Drive.app/Contents/MacOS/Google Drive\n",
+    "after": "label=C_train_lse_after\n2026-10-15T19:01:16Z\n14:01  up 4 days, 15 mins, 1 user, load averages: 4.00 4.86 9.94\n{ 4.00 4.86 9.94 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.6 239728 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n53224  25.0 168304 /Applications/GitPulse.app/Contents/MacOS/gitpulse\n13261  14.1  67536 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n  566   3.9  43424 /usr/sbin/coreaudiod\n21579   3.4 416544 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n13689   2.8 761568 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/155.0.8059.40/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)\n  418   2.7  53008 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n"
+   },
+   "summary": [
+    {
+     "workload": "op_attn_train_forward_ms_t2048",
+     "lanes": [
+      {
+       "lane": "before_70ae3bc_kernel",
+       "median": 2.9762500000000003,
+       "min": 2.9546,
+       "max": 2.9878,
+       "noise_band_max_over_min": 1.0112367156298652,
+       "n": 8,
+       "all": [
+        2.9627,
+        2.9771,
+        2.9729,
+        2.9878,
+        2.9774,
+        2.9796,
+        2.9754,
+        2.9546
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "after_main",
+       "median": 3.0014000000000003,
+       "min": 2.9711,
+       "max": 3.0049,
+       "noise_band_max_over_min": 1.0113762579516006,
+       "n": 8,
+       "all": [
+        2.9992,
+        2.9864,
+        3.0049,
+        2.9952,
+        3.0041,
+        3.0036,
+        2.9711,
+        3.0046
+       ],
+       "vs_base": {
+        "median": 1.0085111640190443,
+        "lo": 0.9985548161591719,
+        "hi": 1.0169227645028092
+       },
+       "vs_prev": null
+      }
+     ]
+    }
+   ],
+   "measured": true,
+   "command_lines_in": "bench/attn_lane.sh (header comment)"
+  },
+  {
+   "name": "D_encoder_kernel",
+   "rounds": 12,
+   "format": "Metrics",
+   "lanes": [
+    {
+     "name": "rows_current_kernel_after_tree",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_embedgemma2",
+      "--attn-kernel=rows"
+     ],
+     "env": {
+      "EMBEDGEMMA2_SNAPSHOT": "/Users/bharath/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b"
+     },
+     "label": "current rows kernel (after tree)"
+    },
+    {
+     "name": "tiled",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_embedgemma2",
+      "--attn-kernel=tiled"
+     ],
+     "env": {
+      "EMBEDGEMMA2_SNAPSHOT": "/Users/bharath/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b"
+     }
+    }
+   ],
+   "conditions": {
+    "before": "label=D_encoder_kernel_before\n2026-10-15T19:01:17Z\n14:01  up 4 days, 15 mins, 1 user, load averages: 4.00 4.86 9.94\n{ 4.00 4.86 9.94 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n26957 118.6 239728 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd\n53224  23.7 168304 /Applications/GitPulse.app/Contents/MacOS/gitpulse\n13261  14.1  67536 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n  566   3.7  43424 /usr/sbin/coreaudiod\n21579   3.4 416544 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n  418   2.8  53008 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n13689   2.8 761568 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/155.0.8059.40/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)\n",
+    "after": "label=D_encoder_kernel_after\n2026-10-15T19:19:55Z\n14:19  up 4 days, 33 mins, 1 user, load averages: 35.55 16.42 10.73\n{ 35.55 16.42 10.73 }\nlock owner:\nlabel=tessl-w9-attn\npid=58839\nstart=2026-10-15T18:56:01Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n54047 162.4 246880 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1040/evidence.test\n54045 117.9 782448 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1029/docgen.test\n54036 105.0 217136 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1021/api.test\n54152  99.8 173456 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1068/rag.test\n54043  99.2 747712 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1025/archguard.test\n54199  97.1 403632 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1079/safego.test\n54255  96.6  47168 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build4162163721/b1087/storage.test\n"
+   },
+   "summary": [
+    {
+     "workload": "encoder_attn_sliding_h256_b64_t32_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 0.30345,
+       "min": 0.2939,
+       "max": 2.6727,
+       "noise_band_max_over_min": 9.093909493024839,
+       "n": 12,
+       "all": [
+        0.2939,
+        0.3042,
+        0.2987,
+        0.2984,
+        2.6727,
+        0.2997,
+        0.4253,
+        0.3027,
+        0.3058,
+        0.3046,
+        0.297,
+        1.4322
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 0.2599,
+       "min": 0.2516,
+       "max": 1.4109,
+       "noise_band_max_over_min": 5.607710651828299,
+       "n": 12,
+       "all": [
+        0.2603,
+        0.2583,
+        0.2608,
+        0.2576,
+        0.2604,
+        0.5882,
+        0.2573,
+        0.2595,
+        0.2573,
+        0.2516,
+        1.4109,
+        0.4929
+       ],
+       "vs_base": {
+        "median": 0.853198433037573,
+        "lo": 0.09742956560781234,
+        "hi": 4.750505050505051
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_global_h512_b64_t32_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 0.435,
+       "min": 0.424,
+       "max": 2.2092,
+       "noise_band_max_over_min": 5.210377358490566,
+       "n": 12,
+       "all": [
+        0.424,
+        0.4307,
+        0.4375,
+        0.4329,
+        2.2092,
+        0.4319,
+        0.6521,
+        0.4373,
+        0.4371,
+        0.4307,
+        0.4243,
+        0.7417
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 0.35214999999999996,
+       "min": 0.3445,
+       "max": 1.5411,
+       "noise_band_max_over_min": 4.47343976777939,
+       "n": 12,
+       "all": [
+        0.3474,
+        0.3481,
+        0.3445,
+        0.3528,
+        0.3473,
+        0.8912,
+        0.3515,
+        0.3556,
+        0.3625,
+        0.348,
+        1.5411,
+        0.4442
+       ],
+       "vs_base": {
+        "median": 0.8106954568663874,
+        "lo": 0.15720622849900415,
+        "hi": 3.63209992929531
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_sliding_h256_b32_t256_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 4.22215,
+       "min": 4.0333,
+       "max": 4.7017,
+       "noise_band_max_over_min": 1.1657203778543626,
+       "n": 12,
+       "all": [
+        4.0333,
+        4.117,
+        4.3393,
+        4.0638,
+        4.2058,
+        4.2639,
+        4.2091,
+        4.2352,
+        4.302,
+        4.1737,
+        4.267,
+        4.7017
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 1.5824,
+       "min": 1.5649,
+       "max": 4.9459,
+       "noise_band_max_over_min": 3.1605214390695893,
+       "n": 12,
+       "all": [
+        1.5851,
+        1.5797,
+        1.5752,
+        1.5649,
+        1.5743,
+        2.0747,
+        1.5961,
+        1.5682,
+        1.586,
+        1.5793,
+        4.9459,
+        1.5937
+       ],
+       "vs_base": {
+        "median": 0.3787977384517288,
+        "lo": 0.3389625029244741,
+        "hi": 1.1591047574408249
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_global_h512_b32_t256_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 10.26985,
+       "min": 9.6639,
+       "max": 11.6239,
+       "noise_band_max_over_min": 1.202816668218835,
+       "n": 12,
+       "all": [
+        9.7847,
+        10.1952,
+        10.4229,
+        9.6639,
+        9.9647,
+        10.1924,
+        10.2997,
+        10.4313,
+        10.4667,
+        10.24,
+        10.4403,
+        11.6239
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 3.2249499999999998,
+       "min": 3.1945,
+       "max": 6.2479,
+       "noise_band_max_over_min": 1.955830333385506,
+       "n": 12,
+       "all": [
+        3.2163,
+        3.2048,
+        3.1945,
+        3.1988,
+        3.2155,
+        4.4894,
+        3.2398,
+        3.2336,
+        3.2528,
+        3.2078,
+        6.2479,
+        3.701
+       ],
+       "vs_base": {
+        "median": 0.31647428510936915,
+        "lo": 0.30648859722342153,
+        "hi": 0.5984406578355027
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_sliding_h256_b8_t1024_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 14.472449999999998,
+       "min": 13.9359,
+       "max": 16.7043,
+       "noise_band_max_over_min": 1.198652401351904,
+       "n": 12,
+       "all": [
+        14.7531,
+        14.9275,
+        13.9359,
+        14.4286,
+        15.1582,
+        14.1968,
+        14.498,
+        14.3611,
+        14.4469,
+        14.5506,
+        14.3269,
+        16.7043
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 4.3919999999999995,
+       "min": 4.2643,
+       "max": 5.9881,
+       "noise_band_max_over_min": 1.4042398517927912,
+       "n": 12,
+       "all": [
+        4.5013,
+        4.2644,
+        4.3602,
+        4.2643,
+        4.3773,
+        5.9881,
+        4.4067,
+        4.3068,
+        4.4774,
+        4.2696,
+        4.9939,
+        4.5067
+       ],
+       "vs_base": {
+        "median": 0.301922865739246,
+        "lo": 0.2697928078398975,
+        "hi": 0.42179223486982986
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_global_h512_b8_t1024_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 47.9338,
+       "min": 47.1773,
+       "max": 50.1387,
+       "noise_band_max_over_min": 1.0627717143626276,
+       "n": 12,
+       "all": [
+        47.3943,
+        47.6084,
+        47.203,
+        47.1773,
+        48.9591,
+        48.8952,
+        48.5633,
+        48.4593,
+        47.9212,
+        47.7167,
+        47.9464,
+        50.1387
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 12.412749999999999,
+       "min": 11.7526,
+       "max": 14.9961,
+       "noise_band_max_over_min": 1.2759814849480116,
+       "n": 12,
+       "all": [
+        12.3945,
+        12,
+        12.431,
+        11.7702,
+        12.3505,
+        14.9961,
+        12.479,
+        12.3548,
+        12.5588,
+        11.7526,
+        13.0094,
+        13.782
+       ],
+       "vs_base": {
+        "median": 0.2592411910412169,
+        "lo": 0.2462995135874861,
+        "hi": 0.30669881706179747
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_sliding_h256_b2_t4096_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 17.41535,
+       "min": 17.0678,
+       "max": 19.8162,
+       "noise_band_max_over_min": 1.161028369209857,
+       "n": 12,
+       "all": [
+        17.0678,
+        17.8472,
+        17.2179,
+        17.2577,
+        17.8436,
+        17.1948,
+        17.3282,
+        17.584,
+        17.567,
+        17.4884,
+        17.3423,
+        19.8162
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 5.4619,
+       "min": 5.1521,
+       "max": 6.3037,
+       "noise_band_max_over_min": 1.2235205062013548,
+       "n": 12,
+       "all": [
+        5.3596,
+        5.351,
+        5.462,
+        5.2214,
+        5.3213,
+        6.3037,
+        5.4652,
+        5.4876,
+        5.4618,
+        5.1521,
+        6.0411,
+        5.8271
+       ],
+       "vs_base": {
+        "median": 0.3114958346396971,
+        "lo": 0.29405738739011517,
+        "hi": 0.36660502012236257
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_global_h512_b2_t4096_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 281.339,
+       "min": 262.7055,
+       "max": 286.4293,
+       "noise_band_max_over_min": 1.0903056845022279,
+       "n": 12,
+       "all": [
+        277.592,
+        283.2554,
+        283.2416,
+        286.4293,
+        282.0099,
+        284.9201,
+        280.7879,
+        279.6897,
+        278.3516,
+        281.8901,
+        276.9115,
+        262.7055
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 45.37105,
+       "min": 44.0609,
+       "max": 49.9633,
+       "noise_band_max_over_min": 1.1339600416695983,
+       "n": 12,
+       "all": [
+        45.28,
+        44.7601,
+        45.0015,
+        44.0609,
+        44.8816,
+        49.9633,
+        45.6786,
+        45.8011,
+        45.4621,
+        44.7417,
+        48.9071,
+        45.9089
+       ],
+       "vs_base": {
+        "median": 0.1628985898548282,
+        "lo": 0.15382818726994757,
+        "hi": 0.17661635576709528
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_sliding_h256_b1_t6147_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 13.79495,
+       "min": 12.8282,
+       "max": 14.0844,
+       "noise_band_max_over_min": 1.09792488423941,
+       "n": 12,
+       "all": [
+        13.691,
+        13.8656,
+        13.935,
+        13.8485,
+        13.6761,
+        14.0844,
+        12.8282,
+        13.9484,
+        13.6359,
+        13.7414,
+        13.5213,
+        13.8667
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 4.04175,
+       "min": 3.8858,
+       "max": 4.4454,
+       "noise_band_max_over_min": 1.144011529157445,
+       "n": 12,
+       "all": [
+        3.9588,
+        4.0972,
+        3.8858,
+        3.9738,
+        3.9169,
+        4.3446,
+        4.1471,
+        4.0854,
+        4.037,
+        3.97,
+        4.4454,
+        4.0465
+       ],
+       "vs_base": {
+        "median": 0.29235400548928925,
+        "lo": 0.27885181198421244,
+        "hi": 0.3287701626322913
+       },
+       "vs_prev": null
+      }
+     ]
+    },
+    {
+     "workload": "encoder_attn_global_h512_b1_t6147_ms",
+     "lanes": [
+      {
+       "lane": "rows_current_kernel_after_tree",
+       "median": 359.11895000000004,
+       "min": 350.3764,
+       "max": 371.7269,
+       "noise_band_max_over_min": 1.0609358963674493,
+       "n": 12,
+       "all": [
+        359.8353,
+        350.6324,
+        350.3764,
+        366.7063,
+        351.5657,
+        362.0166,
+        360.2882,
+        358.4026,
+        371.7269,
+        352.7137,
+        367.8639,
+        353.6498
+       ],
+       "vs_base": null,
+       "vs_prev": null
+      },
+      {
+       "lane": "tiled",
+       "median": 50.3784,
+       "min": 49.7405,
+       "max": 54.3845,
+       "noise_band_max_over_min": 1.0933645620771806,
+       "n": 12,
+       "all": [
+        50.044,
+        49.9704,
+        50.1738,
+        49.7405,
+        50.0641,
+        52.6128,
+        51.1489,
+        50.583,
+        50.8615,
+        49.8455,
+        54.3845,
+        52.4641
+       ],
+       "vs_base": {
+        "median": 0.14218494026599215,
+        "lo": 0.13564124750515602,
+        "hi": 0.1483504302844226
+       },
+       "vs_prev": null
+      }
+     ]
+    }
+   ],
+   "measured": true,
+   "lane_labels": {
+    "rows_current_kernel_after_tree": "current rows kernel (after tree): --attn-kernel=rows of the harness commit, not the 8a117fe^ binary",
+    "tiled": "tiled kernel of the same binary"
+   },
+   "rows_equivalence_to_8a117fe_parent": {
+    "claim": "The rows lane runs the rows kernel as it is on 60a6240 (kernel files identical on the harness commit). Whether that is the rows kernel of 8a117fe^ (f7c7f66) was checked by diff, not by timing.",
+    "commands": [
+     "git diff --exit-code f7c7f66 60a6240 -- kernels/attn_rows.h",
+     "git diff f7c7f66 60a6240 -- kernels/encoder_attn.metal",
+     "git diff --quiet 60a6240 4b38a85 -- kernels"
+    ],
+    "results": {
+     "attn_rows.h": "identical (exit 0, empty diff)",
+     "encoder_attn.metal": "differs by more than out_bf16: the out_bf16 buffer(10) argument is removed and kv_capacity moves from buffer(11) to buffer(10); the rows body's store takes a literal 0u where it took out_bf16 (f32 store either way); `#include \"attn_tiled.h\"`, a header comment, and the two encoder_attn_tiled_* kernels are added. The rows kernels' loop and store code is otherwise unchanged.",
+     "kernels_60a6240_vs_4b38a85": "identical"
+    },
+    "caveat": "Same source for the rows body does not make the timing identical (a changed buffer index table and a larger metallib are not measured)."
+   },
+   "no_pairing_against_8a117fe_parent": "No lane pairs the tiled kernel with a binary built at 8a117fe^ (f7c7f66): that commit has no --attn-kernel lane, and run E, which would have paired its encode end to end, did not run. The \"before\" of this run is the rows kernel of the harness tree.",
+   "command_lines_in": "bench/attn_lane.sh (header comment)"
+  },
+  {
+   "name": "E_encoder_e2e",
+   "rounds": 6,
+   "format": "Workloads",
+   "lanes": [
+    {
+     "name": "before_f7c7f66_rows",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn-before-f7c7f66/target/release/bench_embedgemma2"
+     ],
+     "env": {
+      "EMBEDGEMMA2_SNAPSHOT": "/Users/bharath/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b",
+      "BENCH_WORKLOADS": "32x256,8x1024,2x4096,1x4096+63x32",
+      "BENCH_ITERS": "5",
+      "BENCH_WARMUP": "2"
+     }
+    },
+    {
+     "name": "tiled_8a117fe",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn-before-8a117fe/target/release/bench_embedgemma2"
+     ],
+     "env": {
+      "EMBEDGEMMA2_SNAPSHOT": "/Users/bharath/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b",
+      "BENCH_WORKLOADS": "32x256,8x1024,2x4096,1x4096+63x32",
+      "BENCH_ITERS": "5",
+      "BENCH_WARMUP": "2"
+     }
+    },
+    {
+     "name": "after_main",
+     "argv": [
+      "/Users/bharath/Code/research/tessl-w9-attn/target/release/bench_embedgemma2"
+     ],
+     "env": {
+      "EMBEDGEMMA2_SNAPSHOT": "/Users/bharath/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/914f7f89142e33e77833254d9c9b90c3cef7303b",
+      "BENCH_WORKLOADS": "32x256,8x1024,2x4096,1x4096+63x32",
+      "BENCH_ITERS": "5",
+      "BENCH_WARMUP": "2"
+     }
+    }
+   ],
+   "conditions": {
+    "before": "label=E_encoder_e2e_before\n2026-10-15T19:30:54Z\n14:30  up 4 days, 44 mins, 1 user, load averages: 6.68 7.67 8.53\n{ 6.68 7.67 8.53 }\nlock owner:\nlabel=tessl-w9-attn-e\npid=57006\nstart=2026-10-15T19:30:54Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n83140  59.8  13888 /System/Library/Frameworks/OSLog.framework/Versions/A/XPCServices/OSLogService.xpc/Contents/MacOS/OSLogService\n65603  35.8 1302576 /var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/go-build2676572201/b001/api.test\n53224  21.9 199808 /Applications/GitPulse.app/Contents/MacOS/gitpulse\n13261  10.2  67680 /Users/bharath/Code/apps/Graft/build/Graft.app/Contents/MacOS/GraftApp\n64820   8.5 217088 /usr/libexec/signpost_reporter\n21579   5.4 434864 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n98403   3.9 328864 /Users/bharath/Library/Application Support/Claude/claude-code/2.1.295/9d6405864fdc/claude.app/Contents/MacOS/claude\n",
+    "after": "label=E_encoder_e2e_after\n2026-10-15T19:44:29Z\n14:44  up 4 days, 58 mins, 1 user, load averages: 74.71 94.66 65.32\n{ 74.71 94.66 65.32 }\nlock owner:\nlabel=tessl-w9-attn-e\npid=57006\nstart=2026-10-15T19:30:54Z\ncwd=/Users/bharath/Code/research/tessl-w9-attn\nNow drawing from 'AC Power'\n -InternalBattery-0 (id=23724131)\t85%; AC attached; not charging present: true\nNote: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\ntop processes by cpu:\n  PID  %CPU    RSS COMM\n62278 121.0 858352 /opt/homebrew/Cellar/openjdk/27/libexec/openjdk.jdk/Contents/Home/bin/java\n53224  93.5 267056 /Applications/GitPulse.app/Contents/MacOS/gitpulse\n22814  76.9 3937408 /Users/bharath/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc\n69591  68.2 164096 /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend\n69331  67.6 119648 /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-test\n66108  60.4 3370432 /Users/bharath/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc\n67544  48.7   5984 /Applications/Xcode.app/Contents/Developer/usr/bin/git\n"
+   },
+   "summary": [
+    {
+     "workload": "32x256",
+     "lanes": []
+    },
+    {
+     "workload": "8x1024",
+     "lanes": []
+    },
+    {
+     "workload": "2x4096",
+     "lanes": []
+    },
+    {
+     "workload": "1x4096+63x32",
+     "lanes": []
+    }
+   ],
+   "measured": false,
+   "reason": "Not measured: this file holds no lane of run E. Attempt 1 used --format metrics with bench_embedgemma2 builds that print JSON workloads, so bench_paired stopped at the first lane (\"lane before_f7c7f66_rows printed no METRIC lines\", exit 1). Attempt 2 (--format workloads, 6 rounds) ran, but the machine load average rose from 6.68 (start) to 74.71 94.66 65.32 (end), the lanes' per-round times climbed (before_f7c7f66_rows 32x256: 561 to 1151 ms) and the per-round ratios spanned [0.29, 1.39]; the converter that wrote the other runs' summary blocks handles METRIC runs only, so the summary rows here are empty (lanes: []). Nothing from run E is a result.",
+   "builds_used": false,
+   "command_lines_in": "not applicable (no lanes ran)"
+  }
+ ],
+ "summary": {
+  "method": "Recomputed from runs[].summary[].lanes[].all (the per-round samples, in round order): ratio_i = lane_i / base_i with base the first lane of the run; median_ratio, min_ratio and max_ratio are over those per-round ratios; noise_band_max_over_min is max/min of a lane's own samples. Each recomputed median ratio was compared with the vs_base the harness stored; the largest difference is in recomputed_vs_stored_max_abs_diff.",
+  "runs": {
+   "A_tiles": {
+    "measured": true,
+    "workloads": {
+     "attn_prefill_q32_k32_sg4_ms_t2048": {
+      "before_70ae3bc_kernel": {
+       "median": 2.883,
+       "min": 2.8664,
+       "max": 2.9162,
+       "noise_band_max_over_min": 1.0174,
+       "n": 12
+      },
+      "after_main": {
+       "median": 2.9063,
+       "min": 2.8828,
+       "max": 2.9382,
+       "noise_band_max_over_min": 1.0192,
+       "n": 12,
+       "median_ratio_vs_base": 1.006,
+       "min_ratio": 1.0033,
+       "min_ratio_round": 4,
+       "max_ratio": 1.0161,
+       "max_ratio_round": 11
+      }
+     },
+     "attn_prefill_q32_k64_sg4_ms_t2048": {
+      "before_70ae3bc_kernel": {
+       "median": 2.75085,
+       "min": 2.7345,
+       "max": 2.7897,
+       "noise_band_max_over_min": 1.0202,
+       "n": 12
+      },
+      "after_main": {
+       "median": 2.7431,
+       "min": 2.728,
+       "max": 2.7778,
+       "noise_band_max_over_min": 1.0183,
+       "n": 12,
+       "median_ratio_vs_base": 0.997,
+       "min_ratio": 0.9918,
+       "min_ratio_round": 5,
+       "max_ratio": 1.0039,
+       "max_ratio_round": 6
+      }
+     },
+     "attn_prefill_q64_k32_sg8_ms_t2048": {
+      "before_70ae3bc_kernel": {
+       "median": 3.0067000000000004,
+       "min": 2.9883,
+       "max": 3.049,
+       "noise_band_max_over_min": 1.0203,
+       "n": 12
+      },
+      "after_main": {
+       "median": 3.00145,
+       "min": 2.9862,
+       "max": 3.0414,
+       "noise_band_max_over_min": 1.0185,
+       "n": 12,
+       "median_ratio_vs_base": 0.9981,
+       "min_ratio": 0.9955,
+       "min_ratio_round": 2,
+       "max_ratio": 1.0036,
+       "max_ratio_round": 6
+      }
+     },
+     "attn_prefill_q64_k64_sg8_ms_t2048": {
+      "before_70ae3bc_kernel": {
+       "median": 2.859,
+       "min": 2.8396,
+       "max": 2.9035,
+       "noise_band_max_over_min": 1.0225,
+       "n": 12
+      },
+      "after_main": {
+       "median": 2.8523500000000004,
+       "min": 2.8311,
+       "max": 2.8715,
+       "noise_band_max_over_min": 1.0143,
+       "n": 12,
+       "median_ratio_vs_base": 0.9977,
+       "min_ratio": 0.989,
+       "min_ratio_round": 8,
+       "max_ratio": 1.0014,
+       "max_ratio_round": 3
+      }
+     }
+    },
+    "lane_noise_band_range": [
+     1.0143,
+     1.0225
+    ],
+    "median_ratio_range_over_workloads": [
+     0.997,
+     1.006
+    ],
+    "lowest_per_round_ratio": 0.989,
+    "highest_per_round_ratio": 1.0161
+   },
+   "B_default_tile": {
+    "measured": true,
+    "workloads": {
+     "attn_prefill_q32_k32_sg4_ms_t2048": {
+      "native_70ae3bc": {
+       "median": 3.0998,
+       "min": 2.9295,
+       "max": 3.4716,
+       "noise_band_max_over_min": 1.185,
+       "n": 12
+      },
+      "overlay_70ae3bc_kernel": {
+       "median": 2.8832,
+       "min": 2.8692,
+       "max": 3.2214,
+       "noise_band_max_over_min": 1.1228,
+       "n": 12,
+       "median_ratio_vs_base": 0.9354,
+       "min_ratio": 0.9184,
+       "min_ratio_round": 8,
+       "max_ratio": 0.9812,
+       "max_ratio_round": 1
+      },
+      "after_main": {
+       "median": 2.90685,
+       "min": 2.8888,
+       "max": 3.0748,
+       "noise_band_max_over_min": 1.0644,
+       "n": 12,
+       "median_ratio_vs_base": 0.9437,
+       "min_ratio": 0.8497,
+       "min_ratio_round": 9,
+       "max_ratio": 0.9892,
+       "max_ratio_round": 1
+      }
+     }
+    },
+    "lane_noise_band_range": [
+     1.0644,
+     1.185
+    ],
+    "median_ratio_range_over_workloads": [
+     0.9354,
+     0.9437
+    ],
+    "lowest_per_round_ratio": 0.8497,
+    "highest_per_round_ratio": 0.9892
+   },
+   "C_train_lse": {
+    "measured": true,
+    "workloads": {
+     "op_attn_train_forward_ms_t2048": {
+      "before_70ae3bc_kernel": {
+       "median": 2.9762500000000003,
+       "min": 2.9546,
+       "max": 2.9878,
+       "noise_band_max_over_min": 1.0112,
+       "n": 8
+      },
+      "after_main": {
+       "median": 3.0014000000000003,
+       "min": 2.9711,
+       "max": 3.0049,
+       "noise_band_max_over_min": 1.0114,
+       "n": 8,
+       "median_ratio_vs_base": 1.0085,
+       "min_ratio": 0.9986,
+       "min_ratio_round": 6,
+       "max_ratio": 1.0169,
+       "max_ratio_round": 7
+      }
+     }
+    },
+    "lane_noise_band_range": [
+     1.0112,
+     1.0114
+    ],
+    "median_ratio_range_over_workloads": [
+     1.0085,
+     1.0085
+    ],
+    "lowest_per_round_ratio": 0.9986,
+    "highest_per_round_ratio": 1.0169
+   },
+   "D_encoder_kernel": {
+    "measured": true,
+    "workloads": {
+     "encoder_attn_sliding_h256_b64_t32_ms": {
+      "tiled": {
+       "median": 0.2599,
+       "min": 0.2516,
+       "max": 1.4109,
+       "noise_band_max_over_min": 5.6077,
+       "n": 12,
+       "median_ratio_vs_base": 0.8532,
+       "min_ratio": 0.0974,
+       "min_ratio_round": 4,
+       "max_ratio": 4.7505,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 0.30345,
+       "min": 0.2939,
+       "max": 2.6727,
+       "noise_band_max_over_min": 9.0939,
+       "n": 12
+      }
+     },
+     "encoder_attn_global_h512_b64_t32_ms": {
+      "tiled": {
+       "median": 0.35214999999999996,
+       "min": 0.3445,
+       "max": 1.5411,
+       "noise_band_max_over_min": 4.4734,
+       "n": 12,
+       "median_ratio_vs_base": 0.8107,
+       "min_ratio": 0.1572,
+       "min_ratio_round": 4,
+       "max_ratio": 3.6321,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 0.435,
+       "min": 0.424,
+       "max": 2.2092,
+       "noise_band_max_over_min": 5.2104,
+       "n": 12
+      }
+     },
+     "encoder_attn_sliding_h256_b32_t256_ms": {
+      "tiled": {
+       "median": 1.5824,
+       "min": 1.5649,
+       "max": 4.9459,
+       "noise_band_max_over_min": 3.1605,
+       "n": 12,
+       "median_ratio_vs_base": 0.3788,
+       "min_ratio": 0.339,
+       "min_ratio_round": 11,
+       "max_ratio": 1.1591,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 4.22215,
+       "min": 4.0333,
+       "max": 4.7017,
+       "noise_band_max_over_min": 1.1657,
+       "n": 12
+      }
+     },
+     "encoder_attn_global_h512_b32_t256_ms": {
+      "tiled": {
+       "median": 3.2249499999999998,
+       "min": 3.1945,
+       "max": 6.2479,
+       "noise_band_max_over_min": 1.9558,
+       "n": 12,
+       "median_ratio_vs_base": 0.3165,
+       "min_ratio": 0.3065,
+       "min_ratio_round": 2,
+       "max_ratio": 0.5984,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 10.26985,
+       "min": 9.6639,
+       "max": 11.6239,
+       "noise_band_max_over_min": 1.2028,
+       "n": 12
+      }
+     },
+     "encoder_attn_sliding_h256_b8_t1024_ms": {
+      "tiled": {
+       "median": 4.3919999999999995,
+       "min": 4.2643,
+       "max": 5.9881,
+       "noise_band_max_over_min": 1.4042,
+       "n": 12,
+       "median_ratio_vs_base": 0.3019,
+       "min_ratio": 0.2698,
+       "min_ratio_round": 11,
+       "max_ratio": 0.4218,
+       "max_ratio_round": 5
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 14.472449999999998,
+       "min": 13.9359,
+       "max": 16.7043,
+       "noise_band_max_over_min": 1.1987,
+       "n": 12
+      }
+     },
+     "encoder_attn_global_h512_b8_t1024_ms": {
+      "tiled": {
+       "median": 12.412749999999999,
+       "min": 11.7526,
+       "max": 14.9961,
+       "noise_band_max_over_min": 1.276,
+       "n": 12,
+       "median_ratio_vs_base": 0.2592,
+       "min_ratio": 0.2463,
+       "min_ratio_round": 9,
+       "max_ratio": 0.3067,
+       "max_ratio_round": 5
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 47.9338,
+       "min": 47.1773,
+       "max": 50.1387,
+       "noise_band_max_over_min": 1.0628,
+       "n": 12
+      }
+     },
+     "encoder_attn_sliding_h256_b2_t4096_ms": {
+      "tiled": {
+       "median": 5.4619,
+       "min": 5.1521,
+       "max": 6.3037,
+       "noise_band_max_over_min": 1.2235,
+       "n": 12,
+       "median_ratio_vs_base": 0.3115,
+       "min_ratio": 0.2941,
+       "min_ratio_round": 11,
+       "max_ratio": 0.3666,
+       "max_ratio_round": 5
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 17.41535,
+       "min": 17.0678,
+       "max": 19.8162,
+       "noise_band_max_over_min": 1.161,
+       "n": 12
+      }
+     },
+     "encoder_attn_global_h512_b2_t4096_ms": {
+      "tiled": {
+       "median": 45.37105,
+       "min": 44.0609,
+       "max": 49.9633,
+       "noise_band_max_over_min": 1.134,
+       "n": 12,
+       "median_ratio_vs_base": 0.1629,
+       "min_ratio": 0.1538,
+       "min_ratio_round": 3,
+       "max_ratio": 0.1766,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 281.339,
+       "min": 262.7055,
+       "max": 286.4293,
+       "noise_band_max_over_min": 1.0903,
+       "n": 12
+      }
+     },
+     "encoder_attn_sliding_h256_b1_t6147_ms": {
+      "tiled": {
+       "median": 4.04175,
+       "min": 3.8858,
+       "max": 4.4454,
+       "noise_band_max_over_min": 1.144,
+       "n": 12,
+       "median_ratio_vs_base": 0.2924,
+       "min_ratio": 0.2789,
+       "min_ratio_round": 2,
+       "max_ratio": 0.3288,
+       "max_ratio_round": 10
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 13.79495,
+       "min": 12.8282,
+       "max": 14.0844,
+       "noise_band_max_over_min": 1.0979,
+       "n": 12
+      }
+     },
+     "encoder_attn_global_h512_b1_t6147_ms": {
+      "tiled": {
+       "median": 50.3784,
+       "min": 49.7405,
+       "max": 54.3845,
+       "noise_band_max_over_min": 1.0934,
+       "n": 12,
+       "median_ratio_vs_base": 0.1422,
+       "min_ratio": 0.1356,
+       "min_ratio_round": 3,
+       "max_ratio": 0.1484,
+       "max_ratio_round": 11
+      },
+      "rows_current_kernel_after_tree": {
+       "median": 359.11895000000004,
+       "min": 350.3764,
+       "max": 371.7269,
+       "noise_band_max_over_min": 1.0609,
+       "n": 12
+      }
+     }
+    },
+    "lane_noise_band_range": [
+     1.0609,
+     9.0939
+    ],
+    "median_ratio_range_over_workloads": [
+     0.1422,
+     0.8532
+    ],
+    "lowest_per_round_ratio": 0.0974,
+    "highest_per_round_ratio": 4.7505
+   },
+   "E_encoder_e2e": {
+    "measured": false,
+    "workloads": {}
+   }
+  },
+  "recomputed_vs_stored_max_abs_diff": 0,
+  "headline": {
+   "A_tiles_median_ratio_after_over_before": [
+    0.997,
+    1.006
+   ],
+   "A_tiles_lane_noise_band_range": [
+    1.0143,
+    1.0225
+   ],
+   "B_default_tile": {
+    "lane_noise_bands_native_overlay_after": [
+     1.185,
+     1.1228,
+     1.0644
+    ],
+    "native_70ae3bc_to_after_median_ratio": 0.9437,
+    "native_70ae3bc_to_after_ratio_range": [
+     0.8497,
+     0.9892
+    ],
+    "overlay_to_after_median_ratio_vs_prev": 1.0081,
+    "overlay_to_after_ratio_range": [
+     0.9157,
+     1.0364
+    ],
+    "reading": "The native 70ae3bc binary's own band is 1.185, wider than its distance from the after lane (median ratio 0.9437): the native-to-after difference is inside the noise band, not a win. The overlay-to-after ratio (same harness, kernel 70ae3bc vs main) straddles 1.0."
+   },
+   "C_train_lse_median_ratio_after_over_before": [
+    1.0085,
+    1.0085
+   ],
+   "D_encoder_kernel": "tiled over current rows kernel: median ratios 0.1422 to 0.3788 at b32_t256 and every larger shape; b64_t32 (0.3 ms kernels) has lane bands of 5 to 9 and per-round ratios 0.10 to 4.75, so it is noise, not a result.",
+   "regression_beyond_noise": false,
+   "note_on_cited_figures": "A prior review cited median ratios 0.9972 to 1.0081; the recomputed Qwen prefill A_tiles medians are 0.9970 to 1.0060 and the 1.0081 is run B overlay-to-after (vs_prev). The numbers above are the recomputed ones."
+  }
+ },
+ "build_usage": {
+  "used": [
+   "after tree (gp/w9-attn harness commit): runs A, B, C, D",
+   "overlay (harness commit with qwen35_attn_tiled.metal at its 70ae3bc content): runs A, B, C",
+   "70ae3bc: run B (native lane)"
+  ],
+  "not_used": [
+   "f7c7f66 (8a117fe^) bench_embedgemma2",
+   "8a117fe bench_embedgemma2",
+   "after-tree bench_embedgemma2 as the third lane of run E"
+  ],
+  "why": "Built for run E, which produced no lanes. Their revisions and sha256 below are recorded because they were built, not because any number comes from them."
+ },
+ "no_pairing_against_8a117fe_parent": "No pairing against a binary built at 8a117fe^ exists in this file."
+}

@@ -218,26 +218,56 @@ fn the_absent_list_does_not_name_binaries_that_exist() {
     }
 }
 
-/// The README may not say "no stubs" while the public API ships one.
+/// Removed public names and env vars the README must not advertise.
 ///
-/// `tessl::IcbReplayStub` is a host-side scaffold: its `try_allocate` fails
-/// with `NotWired` for the full decode graph. The Known Gaps section said
-/// "there are no stubs" regardless, and a reader who trusts that goes looking
-/// for a full-graph ICB replay that does not exist. So the claim is pinned to
-/// the behaviour: while the stub still refuses, Known Gaps must name it.
-#[test]
-fn known_gaps_names_the_icb_scaffold_the_crate_still_exports() {
-    let mut stub = tessl::IcbReplayStub::new();
-    assert_eq!(
-        stub.try_allocate(),
-        Err(tessl::CbReplayError::NotWired),
-        "full-graph ICB allocate is wired now — retire the Known Gaps row and this test"
-    );
+/// The ICB replay stub scaffold (`IcbReplayStub`, `IcbStubPhase`,
+/// `ArgTableSlotPlan`, `ArgTableSlot`, `IcbCommandTypeHint`,
+/// `PingPongCbReplay::icb_stub{,_mut}`) and the parked freeze-binds /
+/// range-batch / coarse-range ICB flags were deleted; the `GEMMA_METAL_*` and
+/// `METAL_NATIVE_*` env aliases are no longer read. A README that still names
+/// one sends a reader looking for something that is gone.
+const REMOVED_NAMES: &[&str] = &[
+    "IcbReplayStub",
+    "IcbStubPhase",
+    "ArgTableSlotPlan",
+    "ArgTableSlot",
+    "IcbCommandTypeHint",
+    "icb_stub",
+    "PrefillAttnKernel",
+    "prefill_attn_kernel",
+    "TESSL_ICB_FREEZE_BINDS",
+    "TESSL_ICB_RANGE_BATCH",
+    "TESSL_ICB_COARSE_RANGES",
+    "icb_freeze_binds",
+    "icb_range_batch",
+    "icb_coarse_ranges",
+];
 
+/// The README names no removed type or flag, and its Known Gaps row keeps the
+/// one record of the SDK gap (`NotWired`).
+#[test]
+fn readme_names_no_removed_icb_scaffold_or_flag() {
     let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
+    for name in REMOVED_NAMES {
+        assert!(
+            !readme.contains(name),
+            "README names `{name}`, which was removed from the crate"
+        );
+    }
+    for alias in ["GEMMA_METAL_", "METAL_NATIVE_"] {
+        // The env section may say the spelling was removed; it may not offer it
+        // as an accepted variant.
+        for (i, line) in readme.lines().enumerate().filter(|(_, l)| l.contains(alias)) {
+            assert!(
+                line.contains("removed"),
+                "README:{}: mentions `{alias}*` without saying it was removed: {line}",
+                i + 1
+            );
+        }
+    }
     assert!(
         !readme.to_ascii_lowercase().contains("no stubs"),
-        "README claims there are no stubs, but `tessl::IcbReplayStub` is a NotWired scaffold"
+        "README claims there are no stubs; the NotWired gap row must stay honest"
     );
     let gaps = readme
         .split("## Known Gaps")
@@ -246,9 +276,11 @@ fn known_gaps_names_the_icb_scaffold_the_crate_still_exports() {
         .split("\n---")
         .next()
         .expect("Known Gaps section is delimited");
-    for needle in ["IcbReplayStub", "IcbStubPhase", "NotWired"] {
-        assert!(gaps.contains(needle), "Known Gaps must name `{needle}`");
-    }
+    assert!(gaps.contains("NotWired"), "Known Gaps must name `NotWired`");
+    assert!(
+        !tessl::cb_replay_api_gap_summary().is_empty(),
+        "the survey is the single record of the gap"
+    );
 }
 
 /// The kernel counts the crate docs and README quote are the build's, not a

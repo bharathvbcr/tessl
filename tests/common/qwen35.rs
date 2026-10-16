@@ -232,6 +232,10 @@ pub fn fixture_dir() -> PathBuf {
 }
 
 /// `(shape, data widened to f64)` of `qwen35_<name>.npy`.
+///
+/// `MANIFEST.json` in this directory records each file's role and `published` status;
+/// the `qwen35_gdn_*` files are `published: false` and nothing new should use them as a
+/// golden.
 pub fn load(name: &str) -> (Vec<usize>, Vec<f64>) {
     let path = fixture_dir().join(format!("qwen35_{name}.npy"));
     let a = read_npy(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));

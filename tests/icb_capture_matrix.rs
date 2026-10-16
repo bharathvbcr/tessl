@@ -1,7 +1,7 @@
 //! Capture-mode matrix: a tape captured under every combination of hazard mode
 //! (on/off) and encode mode (sync/async) replays bit-identically to the live
-//! run, 40 times, through both replay shapes (plain and freeze-binds +
-//! range-batch), for two chains:
+//! run, 40 times, through both replay shapes (direct dispatch and ICB
+//! execute), for two chains:
 //!
 //! * `softcap`: 24 in-place elementwise ops (each edge is RAW + WAR + WAW on one
 //!   buffer, with a different cap each so order matters);
@@ -34,9 +34,7 @@ impl Drop for Flags {
     fn drop(&mut self) {
         tessl::end_decode_icb_capture();
         set_icb_pipelines(false);
-        tessl::set_icb_freeze_binds(false);
-        tessl::set_icb_range_batch(false);
-        tessl::set_icb_coarse_ranges(false);
+        tessl::set_icb_execute(false);
         tessl::ab_flags::set_hazard_barriers(false);
     }
 }
@@ -45,8 +43,8 @@ impl Drop for Flags {
 struct Cell {
     hazard: bool,
     async_encode: bool,
-    /// Replay through freeze-binds + range-batch (needs ICB-capable pipelines).
-    freeze_range: bool,
+    /// Replay through `executeCommandsInBuffer` (needs ICB-capable pipelines).
+    icb_exec: bool,
 }
 
 /// Capture `ops` (the chain's encode calls), replay `REPLAYS` times, and count
@@ -55,7 +53,7 @@ struct Cell {
 fn run(cell: Cell, rt_setup: impl FnOnce(&Arc<GpuRuntime>) -> Chain) -> (Vec<bool>, usize) {
     let _f = Flags;
     tessl::ab_flags::set_hazard_barriers(cell.hazard);
-    set_icb_pipelines(cell.freeze_range);
+    set_icb_pipelines(cell.icb_exec);
     let rt = GpuRuntime::new().expect("runtime");
     rt.set_async_encode(cell.async_encode).unwrap();
     let chain = rt_setup(&rt);
@@ -69,9 +67,7 @@ fn run(cell: Cell, rt_setup: impl FnOnce(&Arc<GpuRuntime>) -> Chain) -> (Vec<boo
     let live = chain.out.read_f32();
     assert_eq!(capture.commands.len(), CHAIN);
     let marks: Vec<bool> = capture.commands.iter().map(|c| c.barrier_after).collect();
-    tessl::set_icb_freeze_binds(cell.freeze_range);
-    tessl::set_icb_range_batch(cell.freeze_range);
-    tessl::set_icb_coarse_ranges(false);
+    tessl::set_icb_execute(cell.icb_exec);
     let mut icb = DecodeIcb::from_commands(&rt, capture.commands).expect("tape");
     let mut bad = 0;
     for _ in 0..REPLAYS {
@@ -160,8 +156,8 @@ fn check(cell: Cell, chain: fn(&Arc<GpuRuntime>) -> Chain) {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (marks, bad) = run(cell, chain);
     let what = format!(
-        "hazard={} async={} freeze_range={}",
-        cell.hazard, cell.async_encode, cell.freeze_range
+        "hazard={} async={} icb_exec={}",
+        cell.hazard, cell.async_encode, cell.icb_exec
     );
     assert!(
         marks[..CHAIN - 1].iter().all(|&m| m),
@@ -178,7 +174,7 @@ macro_rules! cell {
                 Cell {
                     hazard: $h,
                     async_encode: $a,
-                    freeze_range: $f,
+                    icb_exec: $f,
                 },
                 $chain,
             );
@@ -190,15 +186,15 @@ cell!(softcap_plain_always_on_sync, softcap, false, false, false);
 cell!(softcap_plain_always_on_async, softcap, false, true, false);
 cell!(softcap_plain_hazard_sync, softcap, true, false, false);
 cell!(softcap_plain_hazard_async, softcap, true, true, false);
-cell!(softcap_freeze_always_on_sync, softcap, false, false, true);
-cell!(softcap_freeze_always_on_async, softcap, false, true, true);
-cell!(softcap_freeze_hazard_sync, softcap, true, false, true);
-cell!(softcap_freeze_hazard_async, softcap, true, true, true);
+cell!(softcap_icb_exec_always_on_sync, softcap, false, false, true);
+cell!(softcap_icb_exec_always_on_async, softcap, false, true, true);
+cell!(softcap_icb_exec_hazard_sync, softcap, true, false, true);
+cell!(softcap_icb_exec_hazard_async, softcap, true, true, true);
 cell!(rms_plain_always_on_sync, rms, false, false, false);
 cell!(rms_plain_always_on_async, rms, false, true, false);
 cell!(rms_plain_hazard_sync, rms, true, false, false);
 cell!(rms_plain_hazard_async, rms, true, true, false);
-cell!(rms_freeze_always_on_sync, rms, false, false, true);
-cell!(rms_freeze_always_on_async, rms, false, true, true);
-cell!(rms_freeze_hazard_sync, rms, true, false, true);
-cell!(rms_freeze_hazard_async, rms, true, true, true);
+cell!(rms_icb_exec_always_on_sync, rms, false, false, true);
+cell!(rms_icb_exec_always_on_async, rms, false, true, true);
+cell!(rms_icb_exec_hazard_sync, rms, true, false, true);
+cell!(rms_icb_exec_hazard_async, rms, true, true, true);

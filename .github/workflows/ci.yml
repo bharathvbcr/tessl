@@ -241,10 +241,30 @@ jobs:
   # Settings -> Secrets and variables -> Actions -> Variables once an M5-class
   # runner is registered; until then this skips, and the README's Known Gaps
   # table says so rather than implying the suite runs unattended.
+  #
+  # Fork exposure: this is a public repository, and GitHub says self-hosted
+  # runners "should almost never be used for public repositories" because anyone
+  # who can fork and open a pull request can try to compromise the runner
+  # (docs.github.com, "Secure use reference"). The `if` below is NOT a security
+  # boundary: a pull_request run executes on the PR's merge ref
+  # (refs/pull/N/merge; docs.github.com, "Events that trigger workflows"), whose
+  # workflow file the fork's author controls, so a PR can simply delete the
+  # condition. It only stops an unmodified workflow from queueing fork PRs on
+  # the runner by accident. The real controls are owner settings, which nothing
+  # here asserts are set:
+  #   1. Settings -> Actions -> General -> "Approval for running fork pull
+  #      request workflows from contributors": choose "Require approval for all
+  #      external contributors" (docs.github.com, "Managing GitHub Actions
+  #      settings for a repository").
+  #   2. Restrict the runner with a runner group limited to selected
+  #      repositories (docs.github.com, "Secure use reference").
+  # Do not register a runner on this repository without both.
+  # tests/ci_workflow_gates.rs holds every job that is not provably GitHub-hosted
+  # to this guard, so the accidental case stays closed.
   # ---------------------------------------------------------------------------
   gpu:
     name: GPU suite on bare metal
-    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -348,10 +368,13 @@ jobs:
   # of skipping. Set HAS_METAL_RUNNER to `true` under
   # Settings -> Secrets and variables -> Actions -> Variables once a runner
   # exists.
+  #
+  # Same guard as the `gpu` job. See the comment there: the guard is not a
+  # security boundary, and the owner settings listed there are the real controls.
   # ---------------------------------------------------------------------------
   bench:
     name: GEMM sweep on bare metal
-    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4

@@ -17,10 +17,14 @@ Build the library first (``cargo build --release``) or point ``TESSL_LIB`` at
 a ``libtessl.dylib``. It loads its kernels from the metallib path baked in at
 build time, so keep the build's ``target/`` directory in place.
 
-Every call synchronizes torch's MPS stream before handing buffers to tessl
-and returns only after tessl's queue has finished, so the two queues never
-touch a buffer at the same time. That is correct, not fast: each call waits
-for the GPU twice.
+Torch's MPS queue and tessl's are separate. A call that hands tessl a torch
+buffer first waits for torch's queue (``torch.mps.synchronize()``), and every
+call returns only after tessl's queue is idle, on failure as well as success,
+so the two never touch a buffer at once and a buffer torch recycles after an
+exception is never still in use. tessl's runtime batches a call's kernels
+(async encode) and waits once, at the end: one tessl wait per call instead of
+one per kernel. See README.md, "How the buffers cross", for why torch's side
+of the handoff stays a CPU wait.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 11
+_ABI_VERSION = 12
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -299,6 +303,8 @@ def _load():
         lib.tessl_runtime_free.argtypes = [ctypes.c_void_p]
         lib.tessl_runtime_poisoned.restype = ctypes.c_int32
         lib.tessl_runtime_poisoned.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_char_p, ctypes.c_size_t]
+        lib.tessl_runtime_set_async_encode.restype = ctypes.c_int32
+        lib.tessl_runtime_set_async_encode.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_synchronize.restype = ctypes.c_int32
         lib.tessl_synchronize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_mtl_buffer_length.restype = ctypes.c_uint64
@@ -347,6 +353,11 @@ def _load():
         lib.tessl_qwen35_train_backward.argtypes = [
             ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(_TensorRef), ctypes.c_uint32,
         ] + err_args
+        f32p = ctypes.POINTER(ctypes.c_float)
+        lib.tessl_qwen35_read_parameter_host.restype = ctypes.c_int32
+        lib.tessl_qwen35_read_parameter_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, f32p, ctypes.c_uint64] + err_args
+        lib.tessl_qwen35_write_parameter_host.restype = ctypes.c_int32
+        lib.tessl_qwen35_write_parameter_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, f32p, ctypes.c_uint64] + err_args
         lib.tessl_qwen35_train_discard.restype = ctypes.c_int32
         lib.tessl_qwen35_train_discard.argtypes = [ctypes.c_void_p] + err_args
         lib.tessl_qwen35_copy.restype = ctypes.c_int32
@@ -393,6 +404,16 @@ class _Runtime(_Owned):
             raise _status_error(1, err)
         self.lib = lib
         self._own(lib, ctypes.c_void_p(handle))
+        # Async encode: a call's kernels are batched into command buffers and
+        # waited for once, when the call returns (on failure too: `guarded` in
+        # src/capi.rs finishes what a refused call already submitted, so the
+        # buffers torch frees after an exception are never still in use). The
+        # library's own default is synchronous, one waited commit per kernel.
+        status = lib.tessl_runtime_set_async_encode(self.handle, 1, err, _ERR_LEN)
+        if status:
+            error = _status_error(status, err)
+            self._close_after_panic()
+            raise error
         # Models loaded on this runtime, closed with it if it is poisoned.
         self._models = weakref.WeakSet()
 
@@ -409,7 +430,17 @@ class _Runtime(_Owned):
 
     def _close_poisoned(self) -> None:
         """Close the models bound to this runtime and then the runtime, and
-        drop it as the thread's runtime so the next call builds a fresh one."""
+        drop it as the thread's runtime so the next call builds a fresh one.
+
+        This is also what keeps torch's buffers safe after a poisoned call. A
+        poisoned runtime refuses the wait a failing call otherwise ends with,
+        so tessl work for that call may still be in flight; freeing the runtime
+        waits for the GPU (bounded by the library's event-wait budget, 30 s by
+        default). The call's tensors are locals of the frames the exception is
+        still unwinding through, so they outlive this close and torch cannot
+        recycle their storage before it returns. A caller that catches the
+        exception and drops its buffers does so after the wait; one that
+        sees ``TesslPoisoned`` need keep nothing alive."""
         for model in list(self._models):
             model._close_after_panic()
         self._close_after_panic()
@@ -454,6 +485,26 @@ def _runtime() -> _Runtime:
         rt = _Runtime()
         _local.rt = rt
     return rt
+
+
+def _finish_torch_queue() -> None:
+    """Wait for torch's MPS queue before tessl reads or writes a torch buffer.
+
+    This is the torch-to-tessl half of the handoff and it stays a CPU wait.
+    tessl's side has a shared-event handoff (``GpuRuntime::shared_event()`` and
+    ``last_signaled_value()``: tessl signals it after each commit), and the
+    tessl-to-torch half is already that, enforced by the library: every call
+    returns with tessl's queue idle. The other half would need torch to signal
+    an ``MTLSharedEvent`` that tessl then waits on, and torch (2.14) exposes no
+    way to do that: ``torch.mps.Event`` wraps an event torch creates itself, with
+    no handle to share, and nothing lets Python encode a wait or signal for an
+    external one. Signalling tessl's own event from torch's side is the one
+    thing that must not be done: tessl recycles memory off its private lifetime
+    event, and the handoff event is separate so that foreign code signalling it
+    cannot free memory early. So each call that gives tessl a torch buffer
+    (cross-entropy, GDN, ``hidden``, ``train_backward`` with a ``dh``, ``copy``)
+    waits here once; the calls that give it only host arrays do not."""
+    torch.mps.synchronize()
 
 
 def _ref(t: torch.Tensor, name: str) -> _TensorRef:
@@ -586,8 +637,7 @@ def cross_entropy_rows(
     loss = ctypes.c_double()
     per_row_out = torch.empty(n, dtype=torch.float64) if per_row else None
     err = ctypes.create_string_buffer(_ERR_LEN)
-    # tessl reads buffers torch's queue may still be writing: finish it.
-    torch.mps.synchronize()
+    _finish_torch_queue()
     status = rt.lib.tessl_cross_entropy_rows(
         rt.handle,
         ctypes.byref(args),
@@ -737,7 +787,7 @@ def _gdn_args(B, T, H, Dv, **refs) -> _GdnArgs:
 def _gdn_call(fn_name: str, args: _GdnArgs):
     rt = _runtime()
     err = ctypes.create_string_buffer(_ERR_LEN)
-    torch.mps.synchronize()
+    _finish_torch_queue()
     status = getattr(rt.lib, fn_name)(rt.handle, ctypes.byref(args), err, _ERR_LEN)
     _runtime_status(rt, status, err)
 
@@ -974,7 +1024,7 @@ class Qwen35(_Owned):
     def _copy(self, direction: int, tensors: list):
         refs = (_TensorRef * len(tensors))(*[_ref(t, name) for t, (name, _, _) in zip(tensors, self._table)])
         err = ctypes.create_string_buffer(_ERR_LEN)
-        torch.mps.synchronize()
+        _finish_torch_queue()
         self._check(self._rt.lib.tessl_qwen35_copy(self._handle, direction, refs, len(tensors), err, _ERR_LEN), err)
 
     def _check_names(self, what: str, d: dict) -> None:
@@ -1042,8 +1092,68 @@ class Qwen35(_Owned):
     def load_parameters(self, params) -> None:
         """Set every parameter from ``params`` (name -> tensor of the
         parameter's shape, any dtype, device and layout). All of them are
-        required, and all are checked before any is written."""
+        required, and all are checked before any is written.
+
+        Under an AdamW state that keeps auxiliary state (``update="f32-master"``
+        or ``"bf16-kahan"``) the written weights are not what the next
+        ``adamw_step`` starts from: it rebuilds each bf16 matrix from the
+        master (or compensation), so a write that must stick needs that state
+        restored with it (``load_adamw_state`` with its ``"aux"``)."""
         self._copy(_WRITE_PARAMS, self._staged("load_parameters", params))
+
+    def _entry(self, what: str, name: str):
+        """``(index, shape, transposed)`` of the parameter ``name``."""
+        if not isinstance(name, str):
+            raise TesslError(f"{what}: the parameter name must be a str, got {type(name).__name__}")
+        for i, (n, shape, tr) in enumerate(self._table):
+            if n == name:
+                return i, shape, tr
+        raise TesslError(f"{what}: no parameter named {name!r}")
+
+    def read_parameter(self, name: str, device: str = "cpu") -> torch.Tensor:
+        """One parameter's value as a fresh f32 tensor of its shape. Only that
+        parameter is copied, on the host, with no GPU copy and no wait on
+        torch's queue: ``parameters()[name]`` copies the whole model (about
+        8 GB of f32 on the 2B) to give you the same values."""
+        i, shape, tr = self._entry("read_parameter", name)
+        host = torch.empty(tuple(reversed(shape)) if tr else shape, dtype=torch.float32)
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(
+            self._rt.lib.tessl_qwen35_read_parameter_host(
+                self._handle, i, ctypes.cast(host.data_ptr(), ctypes.POINTER(ctypes.c_float)), host.numel(),
+                err, _ERR_LEN,
+            ),
+            err,
+        )
+        return (host.t() if tr else host).to(device)
+
+    def write_parameter(self, name: str, value: torch.Tensor) -> None:
+        """Set one parameter from ``value`` (the parameter's shape; any dtype,
+        device and layout). Only that parameter is written, on the host, as
+        ``load_parameters`` would write it. Refused while a step is pending.
+
+        Also refused, before anything moves, for a bf16 matrix whose AdamW
+        state keeps auxiliary state (``update="f32-master"`` or
+        ``"bf16-kahan"``): the next ``adamw_step`` rebuilds the weight from the
+        master (or the Kahan compensation) and would silently overwrite this
+        write. There is no per-parameter write of that state: restore the
+        parameters and the state together (``load_parameters`` then
+        ``load_adamw_state``, which carries ``"aux"``), or write before
+        ``adamw_init``. f32 parameters, the other update rules and a model with
+        no AdamW state take the write as asked."""
+        i, shape, tr = self._entry("write_parameter", name)
+        if tuple(value.shape) != shape:
+            raise TesslError(f"write_parameter: {name} must be {shape}, got {tuple(value.shape)}")
+        v = value.detach().to(device="cpu", dtype=torch.float32)
+        host = (v.t() if tr else v).contiguous()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(
+            self._rt.lib.tessl_qwen35_write_parameter_host(
+                self._handle, i, ctypes.cast(host.data_ptr(), ctypes.POINTER(ctypes.c_float)), host.numel(),
+                err, _ERR_LEN,
+            ),
+            err,
+        )
 
     def describe(self) -> str:
         """One line naming the model's shapes and stored precision, then the
@@ -1265,7 +1375,7 @@ class Qwen35(_Owned):
                 raise TesslError("hidden: no step is pending; call train_forward first")
             return out
         err = ctypes.create_string_buffer(_ERR_LEN)
-        torch.mps.synchronize()
+        _finish_torch_queue()
         ref = _ref(out, "out")
         self._check(
             self._rt.lib.tessl_qwen35_hidden(self._handle, pos.ctypes_ptr, n, ctypes.byref(ref), err, _ERR_LEN),
@@ -1305,7 +1415,8 @@ class Qwen35(_Owned):
             n = pos.t.numel()
             pos_ptr = pos.ctypes_ptr if n else None
             ref = ctypes.byref(_ref(dh32, "dh")) if n else None
-        torch.mps.synchronize()
+        if ref is not None:
+            _finish_torch_queue()
         self._check(
             self._rt.lib.tessl_qwen35_train_backward(self._handle, pos_ptr, n, ref, accumulate, err, _ERR_LEN),
             err,

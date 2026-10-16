@@ -82,8 +82,13 @@ fn the_tiled_kernels_survive_scores_far_below_and_above_zero() {
                 qwen35::attn_prefill_with_tile(rt, &qb, &kb, &vb, &ob, &tkv, &zero, &zero, dims, false, tile).unwrap();
                 rt.synchronize().unwrap();
                 let got = ob.read_f32();
+                // A score is a K=256 f32 dot product at |s| ~ 160, so its absolute error is a
+                // few 1e-3, and exp amplifies that into a weight: compare against the
+                // output scale, not each element. A row that comes out as zeros misses by
+                // the whole scale.
+                let span = want.iter().fold(0.0f32, |m, w| m.max(w.abs()));
                 for (i, w) in want.iter().enumerate() {
-                    let tol = 2e-3 * w.abs().max(1e-3);
+                    let tol = 2e-3 * w.abs() + 5e-3 * span;
                     assert!(
                         got[i].is_finite() && (got[i] - w).abs() <= tol,
                         "{label}, tile {tile:?}: [{i}] got {} want {w}",

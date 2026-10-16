@@ -1,0 +1,89 @@
+EmbeddingGemma 2 vision tower speed: before, after (ExactF32) and after (Bf16), paired and interleaved
+=======================================================================================================
+Machine: Apple M5 Pro, 2026-10-15. A GPU other sessions share: the load average read 66 to 130 and
+other lanes' benchmarks ran on the same GPU during these rounds, so some rounds are contended (see
+"Contention" below). Data: embedgemma2_vision_speed_m5pro.json (bench_paired's report: every
+round of every lane, the summary, the lane argv, the env; bench_paired --out also keeps the lanes'
+stdout and stderr). embedgemma2_vision_speed_m5pro_run1.json is an earlier 6-round run of the same
+lanes at BENCH_ITERS=6, kept because it was worse (spreads 0.18 to 0.80) and the figures below do
+not rest on it. Plot: embedgemma2_vision_speed_m5pro.png (embedgemma2_vision_speed_plot.py).
+
+What is timed: one EmbedGemma2VisionModel::encode_images call on the real checkpoint, host pixels
+and positions to host soft tokens (pixel packing, upload, the forwards, readback); not the load.
+Workloads: "1img" (image 0 of the goldens, 224 x 224, 2304 real patches, 2520 padded) and "8img"
+(8 images cycling the two goldens, 2 forwards). src/bin/bench_embedgemma2_vision.rs.
+
+Lanes (each round runs every lane once as a fresh process, in lane order on one round and
+reversed on the next):
+  before-433e659   the library at 433e659 (the merge base), built in its own worktree with its own
+                   target dir; the bench source is f4a9ece's (the first version that prints HASH),
+                   copied into that tree: only src/bin differs, so the lane times 433e659's tower
+  after-f32        this branch, BENCH_PRECISION=f32 (GemmOperands::ExactF32)
+  after-bf16       this branch, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
+Command:
+  EMBEDGEMMA2_SNAPSHOT=.../914f7f89142e33e77833254d9c9b90c3cef7303b
+  EMBEDGEMMA2_MM_REF_DIR=.../tessl-eg2/target/embedgemma2_mm_ref BENCH_ITERS=20 BENCH_WARMUP=2
+  bench_paired --rounds 8 --out ... before-433e659=<bench in the before tree>
+      after-f32:BENCH_PRECISION=f32=target/release/bench_embedgemma2_vision
+      after-bf16:BENCH_PRECISION=bf16=target/release/bench_embedgemma2_vision
+No --evidence: its 1.10 drift gate cannot pass on a GPU that is shared; the spread is reported
+instead. A lane's figure is the median over rounds of its process's min-of-20.
+
+Output identity (every one of the 8 processes of a lane printed the same line):
+  before-433e659 and after-f32:  HASH 1img d9a0d85dd2f8f279   HASH 8img 4f48fd6b310f86a5
+  after-bf16:                    HASH 1img 2ebb162741c8e53d   HASH 8img f8fb97c0b608a0f5
+(FNV-1a over the bits of every soft token; the first two lines are the proof that ExactF32 is
+bit for bit what 433e659 computed.)
+
+Result (median over 8 rounds; "vs base" is the median of the per-round ratios against
+before-433e659, with the lowest and highest round; "vs prev" is bf16 against after-f32)
+
+                workload      before-433e659 ms           after-f32 ms       vs base [lo, hi]          after-bf16 ms       vs base [lo, hi]       vs prev [lo, hi]
+                    1img                261.291                187.243  0.919x [0.477, 0.992]                 63.547  0.345x [0.162, 0.455]  0.353x [0.184, 0.783]
+                    8img               1692.620               1683.481  0.960x [0.849, 1.286]                547.293  0.320x [0.249, 0.369]  0.325x [0.260, 0.366]
+
+Contention. Rounds 1 to 4 of the 1-image workload read 340 to 407 ms for the before lane in the
+rounds where it should read about 165 to 180: another process was using the GPU, unevenly across
+lanes, so the all-round medians above mix contended and clean rounds, and their spreads are
+wide. Rounds 5 to 8 are clean for 1 image (the lanes' times agree round to round). Selecting
+them is post hoc and not what the bound was fixed on; the all-round figures above are the
+reported ones, and these are shown beside them:
+                                  1img (rounds 5-8)                 8img (rounds 5-8)
+  before-433e659   median ms       173.6                            1679.2
+  after-f32        median ms       169.3  (0.974x of before; 0.960 to 0.992)   1531.9 (0.958x; 0.849 to 0.975)
+  after-bf16       median ms        58.2  (0.349x of f32; 0.342 to 0.355)      542.9  (0.354x of f32; 0.348 to 0.366)
+(The 8-image rounds are less steady than the 1-image ones even in rounds 5 to 8: the before
+lane reads 1496 to 1694 ms.)
+So: Bf16 is 2.8x to 2.9x faster than ExactF32 over the clean rounds (3.1x over all 8 rounds at 8
+images, where its spread [0.260, 0.366] does not touch 1.0), and ExactF32 is about 3 to 4% faster
+than before - consistent with the stage profile's rope saving (8.4 -> 3.1 ms of 183 ms at 1 image,
+85.9 -> 24.8 ms of 1388 at 8) but at the edge of what this run resolves: the 8-image ExactF32
+spread over all rounds [0.849, 1.286] crosses 1.0, so that one is NOT a result by itself.
+
+per-round min-of-20 ms (round 1 first; even rounds run lanes in order, odd rounds reversed in the harness's 0-based count)
+  1img
+    before-433e659      407.0    340.4    399.8    390.5    162.9    165.3    181.8    182.2   median    261.3  min    162.9
+    after-f32           194.1    198.1    349.6    343.0    156.4    159.1    180.3    179.4   median    187.2  min    156.4
+    after-bf16          148.4    155.0    154.0     63.1     55.0     55.0     64.0     61.4   median     63.5  min     55.0
+  8img
+    before-433e659     2241.7   2014.9   1871.3   1455.0   1495.7   1693.7   1666.8   1691.5   median   1692.6  min   1455.0
+    after-f32          2143.3   2165.7   1736.5   1871.6   1421.8   1438.7   1625.1   1630.5   median   1683.5  min   1421.8
+    after-bf16          557.9    577.7    525.3    536.7    519.9    514.7    565.8    570.0   median    547.3  min    514.7
+
+ratio per round (lane / before-433e659) and (after-bf16 / after-f32)
+  1img
+    after-f32 / before        0.477    0.582    0.874    0.878    0.960    0.963    0.992    0.985
+    after-bf16 / before       0.364    0.455    0.385    0.162    0.338    0.333    0.352    0.337
+    after-bf16 / after-f32    0.764    0.783    0.441    0.184    0.352    0.346    0.355    0.342
+  8img
+    after-f32 / before        0.956    1.075    0.928    1.286    0.951    0.849    0.975    0.964
+    after-bf16 / before       0.249    0.287    0.281    0.369    0.348    0.304    0.339    0.337
+    after-bf16 / after-f32    0.260    0.267    0.303    0.287    0.366    0.358    0.348    0.350
+
+memory (from the lanes' own report; max over rounds)
+  1img  before-433e659   device_peak_mib 302.3  peak_footprint_mib 1028.8
+  1img  after-f32        device_peak_mib 302.3  peak_footprint_mib 1029.4
+  1img  after-bf16       device_peak_mib 254.1  peak_footprint_mib 684.9
+  8img  before-433e659   device_peak_mib 2192  peak_footprint_mib 2995.7
+  8img  after-f32        device_peak_mib 2192  peak_footprint_mib 2997.4
+  8img  after-bf16       device_peak_mib 1819.9  peak_footprint_mib 2329

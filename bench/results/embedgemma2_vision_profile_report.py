@@ -64,7 +64,7 @@ for label, docs in passes.items():
         total = sum(w["samples_total"] for w in wls)
         print(
             f"== {label}, workload {name}: {first['forwards']} forward(s), {first['padded_rows']} padded rows, "
-            f"{len(wls)} pass(es), operands {first['operands']}"
+            f"{len(wls)} pass(es), operands {first.get('operands', 'f32 (the build before the bf16 mode)')}"
         )
         print(
             f"   full replica {min(full_min):.2f} ms (min; per-pass minima {min(full_min):.1f}..{max(full_min):.1f}); "

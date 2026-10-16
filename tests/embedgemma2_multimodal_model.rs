@@ -23,9 +23,10 @@
 //!   mixed call needs several text forwards, since one text has 6147 tokens);
 //! * host waits: the mixed call and a call of media alone make exactly 2, a
 //!   call of texts alone exactly 1;
-//! * `GemmOperands::Bf16` for the text encoder (towers unchanged): the four
-//!   media rows at cosine `0.9999` or better against the fp32 reference, the
-//!   floor `tests/embedgemma2_mm_model.rs` holds a bf16 forward to.
+//! * `GemmOperands::Bf16` for the text encoder and the vision tower (the audio
+//!   tower stays exact f32): the four media rows at cosine
+//!   `0.9999` or better against the fp32 reference, the floor
+//!   `tests/embedgemma2_mm_model.rs` holds a bf16 forward to.
 
 mod common;
 
@@ -221,7 +222,7 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         assert!(max_abs(&cut.embeddings, &want) <= BATCH_ABS, "truncate_dim 256");
     });
 
-    // The text encoder in bf16, the towers as they were.
+    // The text encoder and the vision tower in bf16, the audio tower as it was.
     with_gpu(|rt| {
         let m = EmbedGemma2Multimodal::load(rt, &snap, GemmOperands::Bf16).unwrap();
         assert_eq!(m.text().operands(), GemmOperands::Bf16);
@@ -234,7 +235,7 @@ fn one_call_over_texts_images_and_clips_matches_sentence_transformers() {
         let out = m.encode(&media, None).unwrap();
         for (k, name) in IMAGES.iter().chain(CLIPS.iter()).enumerate() {
             let cos = cosine(&out.embeddings[k * dim..(k + 1) * dim], &media_ref[k]);
-            eprintln!("{name} bf16 text encoder: cosine vs fp32 {cos:.9}");
+            eprintln!("{name} bf16 text encoder + vision tower: cosine vs fp32 {cos:.9}");
             assert!(cos >= BF16_COS, "{name}: bf16 cosine {cos:.9} (bound {BF16_COS})");
         }
     });

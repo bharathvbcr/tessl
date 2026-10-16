@@ -1,0 +1,224 @@
+{
+  "rounds": 8,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "before-433e659",
+      "argv": [
+        "target/before/target/release/bench_embedgemma2_vision"
+      ],
+      "env": {}
+    },
+    {
+      "name": "after-f32",
+      "argv": [
+        "target/release/bench_embedgemma2_vision"
+      ],
+      "env": {
+        "BENCH_PRECISION": "f32"
+      }
+    },
+    {
+      "name": "after-bf16",
+      "argv": [
+        "target/release/bench_embedgemma2_vision"
+      ],
+      "env": {
+        "BENCH_PRECISION": "bf16"
+      }
+    }
+  ],
+  "env": {
+    "BENCH_ITERS": "20",
+    "BENCH_WARMUP": "2"
+  },
+  "summary": [
+    {
+      "workload": "1img",
+      "before-433e659": {
+        "ms_min_median": 261.2913,
+        "ms_min_min": 162.9403,
+        "ms_min_max": 407.0444,
+        "ms_min_all": [
+          407.0444,
+          340.4034,
+          399.7667,
+          390.4706,
+          162.9403,
+          165.2831,
+          181.7854,
+          182.1792
+        ],
+        "device_peak_mib_max": 302.3,
+        "peak_footprint_mib_max": 1028.8,
+        "forwards_max": 1
+      },
+      "after-f32": {
+        "ms_min_median": 187.24275,
+        "ms_min_min": 156.4338,
+        "ms_min_max": 349.5545,
+        "ms_min_all": [
+          194.1356,
+          198.1179,
+          349.5545,
+          343.0002,
+          156.4338,
+          159.146,
+          180.3499,
+          179.3815
+        ],
+        "device_peak_mib_max": 302.3,
+        "peak_footprint_mib_max": 1029.4,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9192479598060865,
+          "lo": 0.47693961641531,
+          "hi": 0.9921033262297191
+        }
+      },
+      "after-bf16": {
+        "ms_min_median": 63.5467,
+        "ms_min_min": 54.994,
+        "ms_min_max": 155.0459,
+        "ms_min_all": [
+          148.3546,
+          155.0459,
+          153.9932,
+          63.1223,
+          54.994,
+          55.0337,
+          63.9711,
+          61.414
+        ],
+        "device_peak_mib_max": 254.1,
+        "peak_footprint_mib_max": 684.9,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.3447073085588989,
+          "lo": 0.1616569851865928,
+          "hi": 0.4554769429447532
+        },
+        "vs_prev": {
+          "median": 0.35312677945662574,
+          "lo": 0.18402992184844208,
+          "hi": 0.7825941017949413
+        }
+      }
+    },
+    {
+      "workload": "8img",
+      "before-433e659": {
+        "ms_min_median": 1692.61985,
+        "ms_min_min": 1455.0405,
+        "ms_min_max": 2241.7383,
+        "ms_min_all": [
+          2241.7383,
+          2014.8502,
+          1871.2577,
+          1455.0405,
+          1495.7418,
+          1693.6935,
+          1666.8325,
+          1691.5462
+        ],
+        "device_peak_mib_max": 2192,
+        "peak_footprint_mib_max": 2995.7,
+        "forwards_max": 2
+      },
+      "after-f32": {
+        "ms_min_median": 1683.48085,
+        "ms_min_min": 1421.8099,
+        "ms_min_max": 2165.7283,
+        "ms_min_all": [
+          2143.3171,
+          2165.7283,
+          1736.4504,
+          1871.6397,
+          1421.8099,
+          1438.6883,
+          1625.0993,
+          1630.5113
+        ],
+        "device_peak_mib_max": 2192,
+        "peak_footprint_mib_max": 2997.4,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.9600068608044692,
+          "lo": 0.8494384019304555,
+          "hi": 1.2863145046478086
+        }
+      },
+      "after-bf16": {
+        "ms_min_median": 547.2928999999999,
+        "ms_min_min": 514.7277,
+        "ms_min_max": 577.6679,
+        "ms_min_all": [
+          557.9063,
+          577.6679,
+          525.3329,
+          536.6795,
+          519.8932,
+          514.7277,
+          565.814,
+          569.986
+        ],
+        "device_peak_mib_max": 1819.9,
+        "peak_footprint_mib_max": 2329,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.3204349717050139,
+          "lo": 0.24887218102130831,
+          "hi": 0.36884162330876696
+        },
+        "vs_prev": {
+          "median": 0.32535229055618564,
+          "lo": 0.2603004007199868,
+          "hi": 0.36565591504180694
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":407.0444,"ms_median":421.4893,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1027.5},{"workload":"8img","backend":"tessl-f32","ms_min":2241.7383,"ms_median":3073.3514,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2993.1}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":194.1356,"ms_median":403.0793,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1029.0},{"workload":"8img","backend":"tessl-f32","ms_min":2143.3171,"ms_median":2805.5009,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2997.4}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":148.3546,"ms_median":200.1260,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":683.8},{"workload":"8img","backend":"tessl-bf16","ms_min":557.9063,"ms_median":1301.2537,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2328.4}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":340.4034,"ms_median":407.9598,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1027.9},{"workload":"8img","backend":"tessl-f32","ms_min":2014.8502,"ms_median":3056.9781,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2994.1}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":198.1179,"ms_median":412.3679,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1027.9},{"workload":"8img","backend":"tessl-f32","ms_min":2165.7283,"ms_median":2834.8995,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2993.6}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":155.0459,"ms_median":209.9791,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.1},{"workload":"8img","backend":"tessl-bf16","ms_min":577.6679,"ms_median":1300.4748,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2324.6}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":399.7667,"ms_median":424.0386,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.7},{"workload":"8img","backend":"tessl-f32","ms_min":1871.2577,"ms_median":2884.6326,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2995.7}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":349.5545,"ms_median":383.6817,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.4},{"workload":"8img","backend":"tessl-f32","ms_min":1736.4504,"ms_median":2735.9320,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2992.3}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":153.9932,"ms_median":200.6603,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.9},{"workload":"8img","backend":"tessl-bf16","ms_min":525.3329,"ms_median":1227.2975,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2327.9}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":390.4706,"ms_median":415.2516,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.2},{"workload":"8img","backend":"tessl-f32","ms_min":1455.0405,"ms_median":2567.3524,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2987.8}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":343.0002,"ms_median":391.2023,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.0},{"workload":"8img","backend":"tessl-f32","ms_min":1871.6397,"ms_median":2631.4981,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2990.3}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":63.1223,"ms_median":67.2175,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.3},{"workload":"8img","backend":"tessl-bf16","ms_min":536.6795,"ms_median":1207.4082,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2329.0}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":162.9403,"ms_median":182.2002,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.3},{"workload":"8img","backend":"tessl-f32","ms_min":1495.7418,"ms_median":1551.0930,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2987.9}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":156.4338,"ms_median":170.0566,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1027.5},{"workload":"8img","backend":"tessl-f32","ms_min":1421.8099,"ms_median":1497.4537,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2987.9}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":54.9940,"ms_median":61.1098,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.3},{"workload":"8img","backend":"tessl-bf16","ms_min":519.8932,"ms_median":539.1425,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2327.5}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":165.2831,"ms_median":238.6948,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.8},{"workload":"8img","backend":"tessl-f32","ms_min":1693.6935,"ms_median":1726.3132,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2987.8}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":159.1460,"ms_median":184.1236,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.5},{"workload":"8img","backend":"tessl-f32","ms_min":1438.6883,"ms_median":1512.4421,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2988.1}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":55.0337,"ms_median":58.7922,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.4},{"workload":"8img","backend":"tessl-bf16","ms_min":514.7277,"ms_median":532.2965,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2327.8}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":181.7854,"ms_median":202.8463,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.4},{"workload":"8img","backend":"tessl-f32","ms_min":1666.8325,"ms_median":1734.8311,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2988.0}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":180.3499,"ms_median":201.1154,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1029.1},{"workload":"8img","backend":"tessl-f32","ms_min":1625.0993,"ms_median":1652.8633,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2988.9}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":63.9711,"ms_median":71.0114,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.6},{"workload":"8img","backend":"tessl-bf16","ms_min":565.8140,"ms_median":589.7213,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2327.7}]
+    },
+    {
+      "before-433e659": [{"workload":"1img","backend":"tessl-f32","ms_min":182.1792,"ms_median":208.6724,"iters":20,"forwards":1,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1028.3},{"workload":"8img","backend":"tessl-f32","ms_min":1691.5462,"ms_median":1738.3505,"iters":20,"forwards":2,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2988.1}],
+      "after-f32": [{"workload":"1img","backend":"tessl-f32","ms_min":179.3815,"ms_median":200.6236,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":302.3,"peak_footprint_mib":1029.4},{"workload":"8img","backend":"tessl-f32","ms_min":1630.5113,"ms_median":1662.8608,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":2192.0,"peak_footprint_mib":2988.7}],
+      "after-bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":61.4140,"ms_median":67.5625,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":254.1,"peak_footprint_mib":684.5},{"workload":"8img","backend":"tessl-bf16","ms_min":569.9860,"ms_median":596.1727,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":1819.9,"peak_footprint_mib":2327.8}]
+    }
+  ],
+  "lane_archive": "target/speed_b.json.lanes"
+}

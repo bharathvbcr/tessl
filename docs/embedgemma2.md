@@ -1437,10 +1437,10 @@ lane order reversed on alternate rounds, min over 20 iterations per round, 3
 warm-up iterations) has four lanes: the commit before lane I's merge (`433e659`,
 the audio tower as it was: exact f32, no store flag), built in a detached
 worktree with the benchmark's one `load_with(.., operands)` call replaced by
-`load(..)`; a control copy of the head's own binary (the same file run as a
-fourth lane, so the machine's drift between lanes shows up as the control's
-ratio, and a control ratio over the gate refuses the series); the head at
-`ExactF32`; the head at `Bf16`. Workloads: one 1 s clip, 4 clips of 5 s, 8 clips
+`load(..)`; a control, a copy of that `433e659` binary run as the second lane
+(so against the first lane it should read 1.0, the machine's drift between lanes
+shows up as its ratio, and a control ratio over the gate refuses the series);
+the head at `ExactF32`; the head at `Bf16`. Workloads: one 1 s clip, 4 clips of 5 s, 8 clips
 of 10 s, one clip of `MAX_FRAMES_PER_FORWARD` frames (163.84 s). A ratio series
 whose per-round ratio moves by more than `1.25x` between its best and worst
 round is not reported; any refused series means the run exits with status 3 and
@@ -1458,8 +1458,11 @@ writes no result.
 The attempts were at least ten minutes apart, on an Apple M5 Pro that other
 sessions' builds, tests and benchmarks were using at the same time (the
 1-minute load average read between 41 and 119 at the start and end of the
-attempts). The control lane is the same binary as the `ExactF32` lane, so it
-should read 1.0 against it; its series are among the refused ones in five of the
+attempts). The control lane is a copy of the first lane's binary (the tower benchmark: the
+`433e659` build; the facade benchmark: the head at `ExactF32`, which is its first
+lane; the facade control was copied before the head binary was rebuilt for the
+last time; the two files differ in bytes, and that the code is the same, the
+source changes in between being comments, is inferred, not checked), so it should read 1.0 against it; its series are among the refused ones in five of the
 six attempts (spreads up to `8.3x`, tower 3, 1 s clip), which is how the gate
 shows that the machine, not the code, moved. In facade attempt 2 only the `Bf16`
 series moved (up to `1.44x`, control and `ExactF32` within the gate): a repeat

@@ -67,7 +67,23 @@ impl NpyArray {
 /// from allocating gigabytes before anything is checked.
 pub const MAX_NPY_HEADER_BYTES: usize = 1 << 20;
 
+/// The format spec's alignment of the data start (magic, version, length
+/// field and header together are a multiple of this many bytes).
+const NPY_ALIGN: u64 = 64;
+
+/// [`read_npy_with_limit`] with the default budget (physical memory).
 pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
+    read_npy_with_limit(path, None)
+}
+
+/// Read `path`, refusing before the payload allocation a file whose declared
+/// payload exceeds `limit` bytes, or physical memory when `None`.
+///
+/// The header must be as the format spec has it: for v1.0 `10 + HEADER_LEN`,
+/// for v2.0 and v3.0 `12 + HEADER_LEN`, is a multiple of 64; it ends in `\n`
+/// preceded only by space padding after the closing `}` of the dict; and it is
+/// ASCII for v1.0 and v2.0 (UTF-8 for v3.0).
+pub fn read_npy_with_limit(path: &Path, limit: Option<u64>) -> Result<NpyArray, String> {
     let what = path.display();
     let (mut f, file_len) = plain::open_regular_file(path)?;
     let mut magic = [0u8; 6];
@@ -99,15 +115,13 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
     let mut header = vec![0u8; header_len];
     f.read_exact(&mut header).map_err(|e| format!("header: {e}"))?;
     let header_str = std::str::from_utf8(&header).map_err(|e| format!("{what}: header is not UTF-8: {e}"))?;
+    check_header_framing(&what.to_string(), ver[0], prefix, header_str)?;
     let descr = parse_descr(header_str)?;
     if parse_fortran_order(header_str)? {
         return Err("fortran-order npy not supported".into());
     }
     let shape = parse_shape(header_str)?;
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("{what}: shape {shape:?} overflows usize"))?;
+    let numel = plain::checked_numel(&shape).ok_or_else(|| format!("{what}: shape {shape:?} overflows usize"))?;
     let elem_size: u64 = match descr.as_str() {
         "<f4" | "|f4" => 4,
         "<f8" | "|f8" | "<i8" | "|i8" => 8,
@@ -125,6 +139,7 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
             "{what}: shape {shape:?} x {elem_size} bytes is {payload} bytes, but {rest} follow the header"
         ));
     }
+    plain::check_payload_budget(&what.to_string(), payload, limit)?;
     match descr.as_str() {
         "<f4" | "|f4" => {
             let mut data = vec![0.0f32; numel];
@@ -158,6 +173,30 @@ pub fn read_npy(path: &Path) -> Result<NpyArray, String> {
         }
         other => Err(format!("unsupported dtype {other} in {}", path.display())),
     }
+}
+
+/// The npy format's header framing: 64-byte alignment of the data start, a
+/// trailing `\n` after space-only padding, a dict closed by `}`, and ASCII
+/// unless the version is 3.
+fn check_header_framing(what: &str, version: u8, prefix: u64, header: &str) -> Result<(), String> {
+    let total = prefix + header.len() as u64;
+    if total % NPY_ALIGN != 0 {
+        return Err(format!(
+            "{what}: header is not padded to a multiple of {NPY_ALIGN} bytes ({total} bytes before the data)"
+        ));
+    }
+    let Some(body) = header.strip_suffix('\n') else {
+        return Err(format!("{what}: header does not end with a newline"));
+    };
+    if !body.trim_end_matches(' ').ends_with('}') {
+        return Err(format!(
+            "{what}: header dict is not closed by '}}' followed only by space padding and a newline"
+        ));
+    }
+    if version != 3 && !header.is_ascii() {
+        return Err(format!("{what}: a version {version} header must be ASCII"));
+    }
+    Ok(())
 }
 
 fn parse_descr(header: &str) -> Result<String, String> {
@@ -217,10 +256,8 @@ pub fn transpose_last2(data: &mut [f32], shape: &mut [usize]) -> Result<(), Stri
     let r = shape.len();
     let rows = shape[r - 2];
     let cols = shape[r - 1];
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("transpose_last2: shape {shape:?} overflows usize"))?;
+    let numel =
+        plain::checked_numel(shape).ok_or_else(|| format!("transpose_last2: shape {shape:?} overflows usize"))?;
     if numel != data.len() {
         return Err(format!(
             "transpose_last2: shape {shape:?} holds {numel} elements, data has {}",
@@ -246,10 +283,7 @@ pub fn transpose_last2(data: &mut [f32], shape: &mut [usize]) -> Result<(), Stri
 
 /// Write a C-order float32 `.npy` (v1.0).
 pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), String> {
-    let numel = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| format!("write_npy shape {shape:?} overflows usize"))?;
+    let numel = plain::checked_numel(shape).ok_or_else(|| format!("write_npy shape {shape:?} overflows usize"))?;
     if data.len() != numel {
         return Err(format!(
             "write_npy shape {:?} expects {} elems, got {}",

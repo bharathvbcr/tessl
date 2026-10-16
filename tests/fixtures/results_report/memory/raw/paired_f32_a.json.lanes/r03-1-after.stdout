@@ -1,0 +1,3 @@
+progress line
+[{"workload": "1x16", "ms_min": 8.4882}, {"workload": "64x32", "ms_min": 262.4737}, {"workload": "32x256", "ms_min": 468.5775}, {"workload": "8x1024", "ms_min": 574.107}, {"workload": "2x4096", "ms_min": 1251.6085}, {"workload": "1x4096+63x32", "ms_min": 471.807}]
+

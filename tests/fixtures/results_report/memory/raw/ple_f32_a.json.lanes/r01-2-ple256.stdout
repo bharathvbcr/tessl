@@ -1,0 +1,3 @@
+progress line
+[{"workload": "32x32", "ms_min": 53.1}, {"workload": "64x32", "ms_min": 104.9723}, {"workload": "128x32", "ms_min": 214.7741}]
+

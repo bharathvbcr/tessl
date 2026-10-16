@@ -1,6 +1,6 @@
 """Plot bench/results/embedgemma2_text_fusion_profile_m5pro.json (analysis only; ships nothing).
 
-The JSON is `embedgemma2_text_fusion_profile_report.py`'s merge of `profile_embedgemma2`
+The JSON is `results_report text-fusion`'s merge of `profile_embedgemma2`
 stage runs of the text encoder at 1x16, 64x32 and 8x1024 on the real checkpoint, three
 passes per label (a class's time is its minimum over the passes): `f32 unfused`, `f32 fused`, `bf16 unfused`, `bf16 fused` (the replica of
 `EmbedGemma2Model::forward` with and without the fused row passes). Each bar stacks the

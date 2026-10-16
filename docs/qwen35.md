@@ -422,15 +422,16 @@ wrong factor, and the final norm missing its `+1`. So was a wrong query
 position handed to flash attention during decode. Under the fast-math noise
 model, the logits move by less than 4e-5.
 
-**Compile risk, without a compiler.** `tools/msl_emu/dialect_lint.py` lists
+**Compile risk, without a compiler.** `src/bin/dialect_lint.rs` lists
 the MSL constructs these kernels use that no other tessl kernel uses (the others
 compile on every release build). There are three: `log`, `mem_flags::mem_device`
 and `uint3`. Each is standard MSL and on a reviewed list. An unreviewed one fails
 CI, and so does a reviewed entry that is no longer new (it used to print a note and
-exit 0, and ten went stale that way). It stays Python, not Rust: it is a stdlib-only
-text lint that ships no code, `tests/dialect_lint_script.rs` holds it to failing on an
-unreviewed construct, a stale entry and an empty tree, and it runs on the Linux
-emulator job and, through that test, on the hosted macOS job.
+exit 0, and ten went stale that way). It is Rust, standard library only, a port of
+the Python script this section used to describe: the Linux emulator job compiles it
+with a bare `rustc` (the crate does not build off macOS), and
+`tests/dialect_lint_script.rs` holds it to failing on an unreviewed construct, a
+stale entry and an empty tree, on the hosted macOS job as well.
 
 The `host_contract` case parses `src/qwen35.rs` and the kernel signatures. It
 checks that every `set_*` bind has the kernel's index and kind (buffer, `uint`,

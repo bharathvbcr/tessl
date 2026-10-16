@@ -2,7 +2,7 @@
 
 Reads embedgemma2_vision_speed_m5pro.json (bench_paired's report: every round of
 every lane, the summary) and embedgemma2_vision_profile_m5pro.json (written by
-embedgemma2_vision_profile_report.py), and writes embedgemma2_vision_speed_m5pro.png.
+`results_report vision`), and writes embedgemma2_vision_speed_m5pro.png.
 
     python embedgemma2_vision_speed_plot.py <results dir>
 

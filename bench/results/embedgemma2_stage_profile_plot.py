@@ -1,7 +1,7 @@
 """Plots for bench/results/embedgemma2_stage_profile_m5pro.txt (analysis only; ships nothing).
 
 Reads embedgemma2_stage_profile_m5pro.json (written by
-embedgemma2_stage_profile_report.py) and writes embedgemma2_stage_profile_m5pro.png.
+`results_report stage`) and writes embedgemma2_stage_profile_m5pro.png.
 
     python embedgemma2_stage_profile_plot.py <results dir>
 """

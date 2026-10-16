@@ -17,7 +17,7 @@ bin bench_paired_cli 29
 bin build_artifact_contract 2
 bin capi_contract 77
 bin check_kernel_ir_planted 6
-bin dialect_lint_script 5
+bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5
@@ -34,6 +34,8 @@ bin npy_hardening 4
 bin parser_mutation 13
 bin qwen35_config 5
 bin relaxed_predicate 1
+bin results_report 17
+bin release_check 14
 bin safetensors 12
 bin shader_index_arithmetic 23
 bin icb_flag_env 4

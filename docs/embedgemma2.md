@@ -1884,7 +1884,7 @@ one, and `PROFILE_OPERANDS=f32|bf16` picks the precision (including the bf16 wei
 casts and the bf16 attention output). The replica equals `encode` bit for bit, 768 of 768
 values at 1x16 and 49152 of 49152 at 64x32, in all four modes, and the stage classes are
 renamed for the fused passes ("residual add post-attn (+ pre-ffn norm)" and so on).
-`bench/results/embedgemma2_text_fusion_profile_report.py` tabulates its output and
+`results_report text-fusion` (`src/bin/results_report/`) tabulates its output and
 `bench/results/embedgemma2_text_fusion_profile_plot.py` plots it.
 
 ### Profile (text-encoder fusion)

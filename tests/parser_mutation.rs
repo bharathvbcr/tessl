@@ -417,9 +417,9 @@ fn generated_header(r: &mut Rng) -> Vec<u8> {
             (0, _) => (num(r), num(r)),
             (1, Some(want)) => (
                 (at.saturating_sub(r.below(2) as u64)).to_string(),
-                (at + want + r.below(2) as u64).to_string(),
+                at.saturating_add(want).saturating_add(r.below(2) as u64).to_string(),
             ),
-            (_, Some(want)) => (at.to_string(), (at + want).to_string()),
+            (_, Some(want)) => (at.to_string(), at.saturating_add(want).to_string()),
             (_, None) => (at.to_string(), num(r)),
         };
         if let (Ok(bb), Ok(ee)) = (b.parse::<u64>(), e.parse::<u64>()) {

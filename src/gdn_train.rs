@@ -133,6 +133,22 @@ pub enum GdnTrainKernel {
     Chunked,
 }
 
+/// Device bytes, as the pool charges them ([`GpuRuntime::allocated_bytes_for`]),
+/// that [`gdn_train_forward_windowed`] allocates and frees inside one call on
+/// top of its operands: the chunked kernels' normalized q and k (for
+/// `key_heads` key heads), decay, beta and the two C x C products; none for
+/// the token-sequential kernels. A caller that bounds a step's allocations
+/// adds this to the forward's.
+pub fn gdn_train_forward_transient_bytes(dims: GdnTrainDims, key_heads: u32) -> u64 {
+    match GDN_TRAIN_PRODUCTION {
+        GdnTrainKernel::Sequential => 0,
+        GdnTrainKernel::Chunked => prep_lens(dims, key_heads)
+            .iter()
+            .map(|&n| GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold))
+            .fold(0, u64::saturating_add),
+    }
+}
+
 /// What [`gdn_train_forward`] and [`gdn_train_backward`] run.
 /// See `bench/results/gdn_train_chunked_m5pro.txt` for the paired measurement
 /// this routing rests on. The sequential kernel stays reachable (see
@@ -148,6 +164,7 @@ pub const GDN_TRAIN_PRODUCTION: GdnTrainKernel = GdnTrainKernel::Chunked;
 /// needs.
 pub struct GdnTrainWorkspace {
     dims: GdnTrainDims,
+    key_heads: u32,
     bufs: WsBufs,
 }
 
@@ -172,6 +189,7 @@ struct ChunkedWs {
     dbs: Tensor,
     dgpart: Tensor,
     dbpart: Tensor,
+    xpart: Tensor,
     dqh: Tensor,
     dkh: Tensor,
 }
@@ -189,19 +207,20 @@ struct ChunkPrep {
     aq: Tensor,
 }
 
-/// Elements of [`ChunkPrep`]'s buffers, sized for `heads` key heads (the most
-/// there can be): `kh`, `qh`, `gc`, `bt`, `wm`, `aq`.
-fn prep_lens(dims: GdnTrainDims) -> [usize; 6] {
+/// Elements of [`ChunkPrep`]'s buffers for `key_heads` key heads: `kh`, `qh`
+/// (one row per token and *key* head: q and k are normalized once per key head,
+/// however many value heads share it), `gc`, `bt`, `wm`, `aq` (per value head).
+fn prep_lens(dims: GdnTrainDims, key_heads: u32) -> [usize; 6] {
     let bh = dims.batch as usize * dims.heads as usize;
     let tp = dims.padded_seq();
     let mats = bh * dims.checkpoints() as usize * (GDN_TRAIN_CKPT * GDN_TRAIN_CKPT) as usize;
-    let rows = bh * tp * GDN_TRAIN_DK as usize;
+    let rows = dims.batch as usize * key_heads as usize * tp * GDN_TRAIN_DK as usize;
     [rows, rows, bh * tp, bh * tp, mats, mats]
 }
 
 impl ChunkPrep {
-    fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
-        let [kh, qh, gc, bt, wm, aq] = prep_lens(dims);
+    fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, key_heads: u32) -> Result<Self, String> {
+        let [kh, qh, gc, bt, wm, aq] = prep_lens(dims, key_heads);
         // Not zeroed: gdn_train_c_norm writes every element (zero past T),
         // and the later stages read only what the earlier ones wrote.
         let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
@@ -217,15 +236,36 @@ impl ChunkPrep {
 }
 
 impl GdnTrainWorkspace {
-    /// The workspace for [`GDN_TRAIN_PRODUCTION`].
+    /// The workspace for [`GDN_TRAIN_PRODUCTION`], for operands with one key
+    /// head per value head (`key_heads = dims.heads`, the most there can be:
+    /// any grouped call fits it too).
     pub fn new(rt: &Arc<GpuRuntime>, dims: GdnTrainDims) -> Result<Self, String> {
-        Self::new_for(rt, dims, GDN_TRAIN_PRODUCTION)
+        Self::new_grouped(rt, dims, dims.heads)
+    }
+
+    /// The workspace for [`GDN_TRAIN_PRODUCTION`], with the normalized q and k
+    /// sized for `key_heads` key heads (`dims.heads` must be a multiple): what
+    /// a grouped model ([`GdnTrainWindowedInputs::key_heads`]` < dims.heads`)
+    /// needs, `heads / key_heads` times less than [`Self::new`] holds for them.
+    /// A backward with more key heads than this is refused.
+    pub fn new_grouped(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, key_heads: u32) -> Result<Self, String> {
+        Self::build(rt, dims, GDN_TRAIN_PRODUCTION, key_heads)
     }
 
     /// The workspace `kernel`'s backward needs.
     #[doc(hidden)]
     pub fn new_for(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, kernel: GdnTrainKernel) -> Result<Self, String> {
+        Self::build(rt, dims, kernel, dims.heads)
+    }
+
+    fn build(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, kernel: GdnTrainKernel, key_heads: u32) -> Result<Self, String> {
         dims.validate("GdnTrainWorkspace")?;
+        if key_heads == 0 || dims.heads % key_heads != 0 {
+            return Err(format!(
+                "GdnTrainWorkspace: {} value heads are not a multiple of {key_heads} key heads",
+                dims.heads
+            ));
+        }
         // Not zeroed: each backward writes every element it later reads.
         let f32s = |n: usize| rt.alloc_tensor_unzeroed(&[n], DType::F32);
         let bufs = match kernel {
@@ -242,7 +282,7 @@ impl GdnTrainWorkspace {
             GdnTrainKernel::Chunked => {
                 let [dsbuf, dbuf, dop_drbuf, mats, parts, dqh] = Self::chunked_lens(dims);
                 WsBufs::Chunked(Box::new(ChunkedWs {
-                    prep: ChunkPrep::new(rt, dims)?,
+                    prep: ChunkPrep::new(rt, dims, key_heads)?,
                     dsbuf: f32s(dsbuf)?,
                     dbuf: f32s(dbuf)?,
                     drbuf: f32s(dop_drbuf)?,
@@ -253,12 +293,13 @@ impl GdnTrainWorkspace {
                     dbs: f32s(mats)?,
                     dgpart: f32s(parts)?,
                     dbpart: f32s(parts)?,
+                    xpart: f32s(parts)?,
                     dqh: f32s(dqh)?,
                     dkh: f32s(dqh)?,
                 }))
             }
         };
-        Ok(Self { dims, bufs })
+        Ok(Self { dims, key_heads, bufs })
     }
 
     /// Elements of the sequential kernel's `scratch`, `dq_part`, `dk_part`,
@@ -282,7 +323,7 @@ impl GdnTrainWorkspace {
 
     /// Elements of the chunked backward's buffers beyond [`ChunkPrep`]'s:
     /// `dsbuf`, `dbuf`, each of `drbuf` and `dop`, each of the four C x C
-    /// matrices, each of the two slice partials, each of `dqh` and `dkh`.
+    /// matrices, each of the three slice partials, each of `dqh` and `dkh`.
     fn chunked_lens(dims: GdnTrainDims) -> [usize; 6] {
         let bh = dims.batch as usize * dims.heads as usize;
         let tp = dims.padded_seq();
@@ -300,30 +341,40 @@ impl GdnTrainWorkspace {
     }
 
     /// Elements of every buffer the production kernel's backward holds.
-    fn lens(dims: GdnTrainDims) -> Vec<usize> {
+    fn lens(dims: GdnTrainDims, key_heads: u32) -> Vec<usize> {
         match GDN_TRAIN_PRODUCTION {
             GdnTrainKernel::Sequential => Self::seq_lens(dims).to_vec(),
             GdnTrainKernel::Chunked => {
                 let [dsbuf, dbuf, drop_, mats, parts, dqh] = Self::chunked_lens(dims);
-                let mut v = prep_lens(dims).to_vec();
+                let mut v = prep_lens(dims, key_heads).to_vec();
                 v.extend([dsbuf, dbuf, drop_, drop_]);
                 v.extend([mats; 4]);
-                v.extend([parts; 2]);
+                v.extend([parts; 3]);
                 v.extend([dqh; 2]);
                 v
             }
         }
     }
 
-    /// Device bytes the workspace holds for `dims`.
+    /// Device bytes [`Self::new`] holds for `dims`.
     pub fn bytes_for(dims: GdnTrainDims) -> usize {
-        4 * Self::lens(dims).iter().sum::<usize>()
+        Self::bytes_for_grouped(dims, dims.heads)
+    }
+
+    /// Device bytes [`Self::new_grouped`] holds.
+    pub fn bytes_for_grouped(dims: GdnTrainDims, key_heads: u32) -> usize {
+        4 * Self::lens(dims, key_heads).iter().sum::<usize>()
     }
 
     /// [`Self::bytes_for`] as the device charges it: each buffer at the
     /// size the pool makes it ([`GpuRuntime::allocated_bytes_for`]).
     pub fn allocated_bytes_for(dims: GdnTrainDims) -> u64 {
-        Self::lens(dims)
+        Self::allocated_bytes_for_grouped(dims, dims.heads)
+    }
+
+    /// [`Self::bytes_for_grouped`] as the device charges it.
+    pub fn allocated_bytes_for_grouped(dims: GdnTrainDims, key_heads: u32) -> u64 {
+        Self::lens(dims, key_heads)
             .iter()
             .map(|&n| GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold))
             .fold(0, u64::saturating_add)
@@ -633,7 +684,7 @@ pub fn gdn_train_forward_windowed_with(
     match kernel {
         GdnTrainKernel::Sequential => forward_sequential(rt, dims, &x, o, s_fin, ckpt, flags),
         GdnTrainKernel::Chunked => {
-            let prep = ChunkPrep::new(rt, dims)?;
+            let prep = ChunkPrep::new(rt, dims, x.key_heads)?;
             chunk_prep(rt, dims, &x, &prep)?;
             forward_chunked(rt, dims, &x, &prep, o, s_fin, ckpt, flags)
         }
@@ -949,6 +1000,12 @@ pub fn gdn_train_backward_windowed(
     if ws.dims != dims {
         return Err(format!("{WHAT}: the workspace is for {:?}, not {dims:?}", ws.dims));
     }
+    if matches!(ws.bufs, WsBufs::Chunked(_)) && x.key_heads > ws.key_heads {
+        return Err(format!(
+            "{WHAT}: the workspace holds {} key heads' normalized q and k; the call has {}",
+            ws.key_heads, x.key_heads
+        ));
+    }
     let mut outs = vec![
         ("dq", grads.dq.tensor),
         ("dk", grads.dk.tensor),
@@ -987,6 +1044,7 @@ pub fn gdn_train_backward_windowed(
             ("dbs", &c.dbs),
             ("dgpart", &c.dgpart),
             ("dbpart", &c.dbpart),
+            ("xpart", &c.xpart),
             ("dqh", &c.dqh),
             ("dkh", &c.dkh),
         ],
@@ -1129,17 +1187,18 @@ fn backward_chunked(
         set_tensor(bnd, grads.dv.tensor, 14);
         set_tensor(bnd, &c.dgpart, 15);
         set_tensor(bnd, &c.dbpart, 16);
-        set_tensor(bnd, grads.ds0.unwrap_or(grads.dv.tensor), 17);
-        set_u32(bnd, dims.batch, 18);
-        set_u32(bnd, dims.seq, 19);
-        set_u32(bnd, dims.heads, 20);
-        set_u32(bnd, dims.v_dim, 21);
-        set_u32(bnd, flags, 22);
-        set_u32(bnd, x.v.ld, 23);
-        set_u32(bnd, x.v.off, 24);
-        set_u32(bnd, x.key_heads, 25);
-        set_u32(bnd, grads.dv.ld, 26);
-        set_u32(bnd, grads.dv.off, 27);
+        set_tensor(bnd, &c.xpart, 17);
+        set_tensor(bnd, grads.ds0.unwrap_or(grads.dv.tensor), 18);
+        set_u32(bnd, dims.batch, 19);
+        set_u32(bnd, dims.seq, 20);
+        set_u32(bnd, dims.heads, 21);
+        set_u32(bnd, dims.v_dim, 22);
+        set_u32(bnd, flags, 23);
+        set_u32(bnd, x.v.ld, 24);
+        set_u32(bnd, x.v.off, 25);
+        set_u32(bnd, x.key_heads, 26);
+        set_u32(bnd, grads.dv.ld, 27);
+        set_u32(bnd, grads.dv.off, 28);
     })?;
     let mats = pipeline_threads(rt, "gdn_train_c_mats", THREADS)?;
     dispatch_2d_tg(rt, &mats, nc, b * h, THREADS, |bnd| {
@@ -1166,12 +1225,13 @@ fn backward_chunked(
         set_tensor(bnd, &c.dbs, 1);
         set_tensor(bnd, &c.dgpart, 2);
         set_tensor(bnd, &c.dbpart, 3);
-        set_tensor(bnd, grads.dg, 4);
-        set_tensor(bnd, grads.dbeta, 5);
-        set_u32(bnd, dims.batch, 6);
-        set_u32(bnd, dims.seq, 7);
-        set_u32(bnd, dims.heads, 8);
-        set_u32(bnd, dims.slices(), 9);
+        set_tensor(bnd, &c.xpart, 4);
+        set_tensor(bnd, grads.dg, 5);
+        set_tensor(bnd, grads.dbeta, 6);
+        set_u32(bnd, dims.batch, 7);
+        set_u32(bnd, dims.seq, 8);
+        set_u32(bnd, dims.heads, 9);
+        set_u32(bnd, dims.slices(), 10);
     })?;
     let dqk = pipeline_threads(rt, "gdn_train_c_dqk", THREADS)?;
     dispatch_2d_tg(rt, &dqk, nc, b * h, THREADS, |bnd| {

@@ -520,7 +520,7 @@ fn the_host_refuses_what_the_kernels_cannot_run() {
         );
         // The production (chunked) workspace for B = 1, T = 5 (one padded
         // chunk of 64 rows), H = 2, Dv = 32 (two slices): kh, qh; gc, bt; wm,
-        // aq; dsbuf; dbuf, drbuf, dop; dscore, das, gtot, dbs; dgpart, dbpart;
+        // aq; dsbuf; dbuf, drbuf, dop; dscore, das, gtot, dbs; dgpart, dbpart, xpart;
         // dqh, dkh.
         let (bh, tp, ns) = (2usize, 64usize, 2usize);
         assert_eq!(
@@ -531,7 +531,7 @@ fn the_host_refuses_what_the_kernels_cannot_run() {
                 + bh * 128 * 32
                 + 3 * bh * tp * 32
                 + 4 * bh * 64 * 64
-                + 2 * ns * bh * tp
+                + 3 * ns * bh * tp
                 + 2 * 10 * 128)
         );
     });
@@ -863,11 +863,14 @@ fn the_host_refuses_bad_windows() {
 /// same sums as 8-wide matrix products over a 64-row triangular solve. A sum
 /// of n terms in f32 is off by at most n/2 ulp (6e-8 relative to the sum of
 /// magnitudes), and the longest chain here is the solve's 63 forward
-/// substitutions of 128-term dot products, so about 1e-5 worst case and
-/// 1e-6 typically (the CPU emulator measured 1.8e-6 over every output and
-/// shape below). 1e-5 is that worst case: a defect in either kernel's algebra
-/// moves outputs by O(1e-2) of their magnitude or more, and the f64 checks
-/// above hold each kernel to 1e-4 independently.
+/// substitutions of 128-term dot products, so about 1e-5 worst case. The
+/// bound is checked, not assumed: this test prints every case's worst ratio
+/// (`chunked vs sequential worst ...`), and on the M5 Pro they were 2.7e-7 to
+/// 4.4e-6 (T = 1 to 2048, grouped heads included; the log of that run is not
+/// committed, run the test with `--nocapture` to reproduce). 1e-5 is the
+/// worst-case bound: a defect in either kernel's algebra moves outputs by
+/// O(1e-2) of their magnitude or more, and the f64 checks hold each kernel to
+/// 1e-4 independently.
 const PARITY_TOL: f64 = 1e-5;
 
 fn parity(label: &str, chunked: &[f32], oracle: &[f32]) -> f64 {
@@ -1139,15 +1142,19 @@ fn the_chunked_kernels_match_the_sequential_ones_on_grouped_windows() {
     });
 }
 
-/// q and k are l2-normalized once per (token, key head): one `gdn_train_c_norm`
-/// dispatch per forward and one per backward, over a grid of chunks x batch x
-/// *key* heads, however many value heads and 16-column slices share them. The
-/// token-sequential kernels normalize inside every one of the Dv / 16 slices'
-/// threadgroups (and the backward again in its finish pass), and never
-/// dispatch it.
+/// "Once" means once per call, per (token, key head): one `gdn_train_c_norm`
+/// dispatch in the forward and one in the backward (which rebuilds the
+/// normalized q and k into its workspace instead of keeping the forward's, to
+/// keep memory down), over a grid of chunks x batch x *key* heads, however
+/// many value heads and 16-column slices share them. The backward's final
+/// l2norm-backward pass (`gdn_train_c_finish`) re-derives each row's two
+/// norms from the raw q and k it reads, once per (token, key head) as well.
+/// The token-sequential kernels normalize inside every one of the Dv / 16
+/// slices' threadgroups, and the backward again per slice, and never dispatch
+/// the norm stage.
 #[test]
-fn q_and_k_are_normalized_once_per_key_head() {
-    common::in_traced_child("q_and_k_are_normalized_once_per_key_head", || {
+fn q_and_k_are_normalized_once_per_call_per_key_head() {
+    common::in_traced_child("q_and_k_are_normalized_once_per_call_per_key_head", || {
         let count = tessl::runtime::traced_kernel_count;
         with_gpu(|rt| {
             for (hv, dv) in [(1usize, 16usize), (4, 128), (3, 64)] {
@@ -1181,5 +1188,336 @@ fn q_and_k_are_normalized_once_per_key_head() {
                 );
             }
         });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial inputs against the f64 reference
+// ---------------------------------------------------------------------------
+
+/// One adversarial problem: B = 1 (T, H, Dv as given), gates and operand
+/// scales from closures over (flat index, a uniform draw in [-1, 1)).
+struct Adv {
+    name: String,
+    t: usize,
+    h: usize,
+    hk: usize,
+    dv: usize,
+    s0: bool,
+    dfin: bool,
+    g: Box<dyn Fn(usize, f32) -> f32>,
+    beta: Box<dyn Fn(usize, f32) -> f32>,
+    q_scale: f32,
+    k_scale: f32,
+    /// Fraction of every key that is one shared vector: 1.0 makes all keys
+    /// identical, so the chunk's (I + A) solve is as ill-conditioned as it gets.
+    k_corr: f32,
+    /// Whether the problem itself is ill-conditioned, so that the f64
+    /// reference bound is not asserted (the ratio to the sequential kernel is).
+    ill_conditioned: bool,
+}
+
+fn adv(name: &str, t: usize) -> Adv {
+    Adv {
+        name: name.into(),
+        t,
+        h: 2,
+        hk: 2,
+        dv: 32,
+        s0: true,
+        dfin: true,
+        g: Box::new(|_, x| -0.75 * (x + 1.0) - 1e-3),
+        beta: Box::new(|_, x| 0.5 + 0.45 * x),
+        q_scale: 1.0,
+        k_scale: 1.0,
+        k_corr: 0.0,
+        ill_conditioned: false,
+    }
+}
+
+const ADV_OUTPUTS: [&str; 8] = ["o", "final state", "dq", "dk", "dv", "dg", "dbeta", "ds0"];
+
+/// Each output's worst error as a fraction of that output's own largest
+/// reference magnitude, floored at 1e-30 (so an output whose reference is
+/// exactly 0 must come back as ~0, not as 1e-7 of rounding noise). The measure
+/// is per output because the outputs differ in scale by many orders at strong
+/// decay: dg of a problem with g = -50 is O(e^-50) throughout, and a kernel
+/// that is right to 1e-7 of the *largest* gradient is wrong by 1.0 relative to
+/// dg's own scale.
+fn adv_errors(rt: &Arc<GpuRuntime>, p: &Adv, kernel: GdnTrainKernel, seed: u64) -> Vec<f64> {
+    let (b, t, h, hk, dv) = (1usize, p.t, p.h, p.hk, p.dv);
+    let r = h / hk;
+    let n = b * t * h;
+    let q: Vec<f32> = random_f32(n * 128, seed).iter().map(|x| x * p.q_scale).collect();
+    let shared = random_f32(128, seed + 100);
+    let k: Vec<f32> = random_f32(n * 128, seed + 1)
+        .iter()
+        .enumerate()
+        .map(|(i, x)| p.k_scale * (p.k_corr * shared[i % 128] + (1.0 - p.k_corr) * x))
+        .collect();
+    let v = random_f32(n * dv, seed + 2);
+    let g: Vec<f32> = random_f32(n, seed + 3)
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (p.g)(i, x))
+        .collect();
+    let beta: Vec<f32> = random_f32(n, seed + 4)
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (p.beta)(i, x))
+        .collect();
+    let s0 = p.s0.then(|| random_f32(b * h * 128 * dv, seed + 5));
+    let d_o = random_f32(n * dv, seed + 6);
+    let dfin = p.dfin.then(|| random_f32(b * h * 128 * dv, seed + 7));
+    let dims = GdnTrainDims {
+        batch: 1,
+        seq: t as u32,
+        heads: h as u32,
+        v_dim: dv as u32,
+    };
+    // Grouped problems hand the kernels one key head per `r` value heads; the
+    // f64 reference gets the repeated operands, as transformers does.
+    let qk_small = |x: &[f32]| -> Vec<f32> {
+        (0..t * hk)
+            .flat_map(|row| x[(row / hk * h + row % hk * r) * 128..][..128].to_vec())
+            .collect()
+    };
+    let (q_in, k_in) = if r == 1 {
+        (q.clone(), k.clone())
+    } else {
+        (qk_small(&q), qk_small(&k))
+    };
+    let (qt, kt) = (tensor(rt, &[1, t, hk, 128], &q_in), tensor(rt, &[1, t, hk, 128], &k_in));
+    let vt = tensor(rt, &[1, t, h, dv], &v);
+    let (gt, bt) = (tensor(rt, &[b, t, h], &g), tensor(rt, &[b, t, h], &beta));
+    let s0t = s0.as_ref().map(|s| tensor(rt, &[b, h, 128, dv], s));
+    let x = tessl::gdn_train::GdnTrainWindowedInputs {
+        q: tessl::gdn_train::GdnWindow::dense(&qt, (hk * 128) as u32),
+        k: tessl::gdn_train::GdnWindow::dense(&kt, (hk * 128) as u32),
+        v: tessl::gdn_train::GdnWindow::dense(&vt, (h * dv) as u32),
+        key_heads: hk as u32,
+        g: &gt,
+        beta: &bt,
+        s0: s0t.as_ref(),
+    };
+    let (o, sfin, ckpt) = (
+        rt.alloc_tensor_f32(&[b, t, h, dv]).unwrap(),
+        rt.alloc_tensor_f32(&[b, h, 128, dv]).unwrap(),
+        rt.alloc_tensor_f32(&dims.checkpoint_shape()).unwrap(),
+    );
+    tessl::gdn_train::gdn_train_forward_windowed_with(kernel, rt, dims, x, &o, Some(&sfin), &ckpt).unwrap();
+    let dot = tensor(rt, &[b, t, h, dv], &d_o);
+    let dft = dfin.as_ref().map(|d| tensor(rt, &[b, h, 128, dv], d));
+    let ws = GdnTrainWorkspace::new_for(rt, dims, kernel).unwrap();
+    let (dq, dk, dvv) = (
+        rt.alloc_tensor_f32(&[1, t, hk, 128]).unwrap(),
+        rt.alloc_tensor_f32(&[1, t, hk, 128]).unwrap(),
+        rt.alloc_tensor_f32(&[b, t, h, dv]).unwrap(),
+    );
+    let (dg, db) = (
+        rt.alloc_tensor_f32(&[b, t, h]).unwrap(),
+        rt.alloc_tensor_f32(&[b, t, h]).unwrap(),
+    );
+    let ds0 = p.s0.then(|| rt.alloc_tensor_f32(&[b, h, 128, dv]).unwrap());
+    tessl::gdn_train::gdn_train_backward_windowed(
+        rt,
+        dims,
+        x,
+        &ckpt,
+        &dot,
+        dft.as_ref(),
+        &ws,
+        tessl::gdn_train::GdnTrainWindowedGrads {
+            dq: tessl::gdn_train::GdnWindow::dense(&dq, (hk * 128) as u32),
+            dk: tessl::gdn_train::GdnWindow::dense(&dk, (hk * 128) as u32),
+            dv: tessl::gdn_train::GdnWindow::dense(&dvv, (h * dv) as u32),
+            dg: &dg,
+            dbeta: &db,
+            ds0: ds0.as_ref(),
+        },
+    )
+    .unwrap();
+    // The f64 reference on the repeated (dense) operands.
+    let rep = |x: &[f32], w: usize| -> Vec<f32> {
+        (0..t * h)
+            .flat_map(|row| x[(row / h * hk + row % h / r) * w..][..w].to_vec())
+            .collect()
+    };
+    let (qd, kd) = (rep(&q_in, 128), rep(&k_in, 128));
+    let s = Shape { b, t, h, dk: 128, dv };
+    let (q64, k64, v64, g64, b64) = (f64s(&qd), f64s(&kd), f64s(&v), f64s(&g), f64s(&beta));
+    let s064 = s0.as_ref().map(|x| f64s(x));
+    let inp = Inputs {
+        s,
+        q: &q64,
+        k: &k64,
+        v: &v64,
+        g: &g64,
+        beta: &b64,
+        s0: s064.as_deref(),
+    };
+    let (wo, wf) = gdn_train_f64(&inp);
+    let df64 = dfin.as_ref().map(|d| f64s(d));
+    let w = gdn_train_bwd_f64(&inp, &f64s(&d_o), df64.as_deref());
+    // dq, dk of a grouped problem are the sums over each key head's value heads.
+    let fold = |x: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0; t * hk * 128];
+        for row in 0..t * h {
+            let (tok, hv) = (row / h, row % h);
+            for i in 0..128 {
+                out[(tok * hk + hv / r) * 128 + i] += x[row * 128 + i];
+            }
+        }
+        out
+    };
+    let rel = |got: &[f32], want: &[f64]| -> f64 {
+        let peak = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
+        got.iter().zip(want).fold(0.0f64, |m, (&g, &r)| {
+            if g.is_finite() {
+                m.max((f64::from(g) - r).abs())
+            } else {
+                f64::INFINITY
+            }
+        }) / peak
+    };
+    let mut errs = vec![
+        rel(&o.read_f32().unwrap(), &wo),
+        rel(&sfin.read_f32().unwrap(), &wf),
+        rel(&dq.read_f32().unwrap(), &fold(&w.dq)),
+        rel(&dk.read_f32().unwrap(), &fold(&w.dk)),
+        rel(&dvv.read_f32().unwrap(), &w.dv),
+        rel(&dg.read_f32().unwrap(), &w.dg),
+        rel(&db.read_f32().unwrap(), &w.dbeta),
+    ];
+    if let Some(d) = &ds0 {
+        errs.push(rel(&d.read_f32().unwrap(), &w.ds0));
+    }
+    errs
+}
+
+/// The bound for every output of every adversarial problem, each as a fraction
+/// of that output's own largest reference magnitude: the same 1e-4 the other
+/// f64 checks use.
+const ADV_F64_TOL: f64 = 1e-4;
+/// The chunked kernels must be no worse than the sequential ones by more than
+/// this factor on any output (plus `ADV_RATIO_FLOOR`, below which both are
+/// rounding): they reorder the same f32 sums, so a larger ratio is a
+/// cancellation the other kernel does not have.
+const ADV_RATIO: f64 = 10.0;
+const ADV_RATIO_FLOOR: f64 = 2e-6;
+
+fn run_adv(rt: &Arc<GpuRuntime>, cases: &[Adv], seed: u64) {
+    for (i, p) in cases.iter().enumerate() {
+        let seed = seed + 17 * i as u64;
+        let seq = adv_errors(rt, p, GdnTrainKernel::Sequential, seed);
+        let chk = adv_errors(rt, p, GdnTrainKernel::Chunked, seed);
+        let show = |e: &[f64]| {
+            ADV_OUTPUTS
+                .iter()
+                .zip(e)
+                .map(|(n, x)| format!("{n}={x:.1e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        eprintln!("ADV {:44} SEQ {}\nADV {:44} CHK {}", p.name, show(&seq), "", show(&chk));
+        for ((name, s), c) in ADV_OUTPUTS.iter().zip(&seq).zip(&chk) {
+            assert!(
+                *c <= ADV_RATIO * s + ADV_RATIO_FLOOR,
+                "{}: chunked {name} error {c:.2e} vs sequential {s:.2e} (allowed {ADV_RATIO}x + {ADV_RATIO_FLOOR:.0e}) of that output's max|ref|",
+                p.name
+            );
+            if !p.ill_conditioned {
+                assert!(*c <= ADV_F64_TOL, "{}: chunked {name} error {c:.2e} vs f64", p.name);
+                assert!(*s <= ADV_F64_TOL, "{}: sequential {name} error {s:.2e} vs f64", p.name);
+            }
+        }
+    }
+}
+
+/// The gate sweep that exposed a cancellation in dg: with strong decay every
+/// gradient except the within-token diagonal is below the rounding of an O(1)
+/// term, and a kernel that adds and subtracts that diagonal flushes dg to 0
+/// (error 1.0 of dg's own scale at g = -50, where dg is O(e^-50)).
+#[test]
+fn dg_survives_strong_decay() {
+    with_gpu(|rt| {
+        let cases: Vec<Adv> = [-0.5f32, -2.0, -5.0, -10.0, -20.0, -50.0, -1e4]
+            .iter()
+            .map(|&g| Adv {
+                g: Box::new(move |_, _| g),
+                ..adv(&format!("g={g} T=200"), 200)
+            })
+            .collect();
+        run_adv(rt, &cases, 3000);
+    });
+}
+
+/// Chunk-edge lengths, degenerate gates, beta at its extremes, operand scales,
+/// ill-conditioned solves and every s0 / dfin combination, against f64.
+#[test]
+fn the_kernels_survive_adversarial_inputs() {
+    with_gpu(|rt| {
+        let mut cases: Vec<Adv> = vec![];
+        for t in [1, 63, 64, 65, 127, 129, 1023, 1025, 4097] {
+            cases.push(adv(&format!("default T={t}"), t));
+        }
+        for (g, label) in [(0.0f32, "g=0"), (-1e-6, "g=-1e-6"), (-1e4, "g=-1e4")] {
+            cases.push(Adv {
+                g: Box::new(move |_, _| g),
+                ..adv(label, 200)
+            });
+        }
+        for (label, f) in [
+            ("beta=0", Box::new(|_, _| 0.0f32) as Box<dyn Fn(usize, f32) -> f32>),
+            ("beta=1", Box::new(|_, _| 1.0)),
+            ("beta alternating 0/1", Box::new(|i, _| (i % 2) as f32)),
+        ] {
+            cases.push(Adv {
+                beta: f,
+                ..adv(label, 200)
+            });
+        }
+        for (label, qs, ks) in [
+            ("q,k x1e3", 1e3f32, 1e3f32),
+            ("q,k x1e-3", 1e-3, 1e-3),
+            ("k x1e-4", 1.0, 1e-4),
+        ] {
+            cases.push(Adv {
+                q_scale: qs,
+                k_scale: ks,
+                ..adv(label, 200)
+            });
+        }
+        for corr in [0.9f32, 0.99, 1.0] {
+            cases.push(Adv {
+                g: Box::new(|_, _| 0.0),
+                beta: Box::new(|_, _| 1.0),
+                k_corr: corr,
+                ill_conditioned: true,
+                ..adv(&format!("g=0 beta=1 k correlation {corr}"), 200)
+            });
+        }
+        for (s0, dfin) in [(false, false), (true, false), (false, true), (true, true)] {
+            cases.push(Adv {
+                s0,
+                dfin,
+                ..adv(&format!("s0={s0} dfin={dfin} T=129"), 129)
+            });
+        }
+        // Several value heads per key head, against f64 on the repeated operands.
+        for (h, hk) in [(4usize, 2usize), (3, 1)] {
+            cases.push(Adv {
+                h,
+                hk,
+                ..adv(&format!("grouped hv={h} hk={hk} T=130"), 130)
+            });
+            cases.push(Adv {
+                h,
+                hk,
+                g: Box::new(|_, _| -50.0),
+                ..adv(&format!("grouped hv={h} hk={hk} g=-50 T=130"), 130)
+            });
+        }
+        run_adv(rt, &cases, 4000);
     });
 }

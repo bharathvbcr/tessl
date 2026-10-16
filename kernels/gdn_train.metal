@@ -450,8 +450,11 @@ kernel void gdn_train_bwd_finish(
 // threadgroup owns its columns of S and dS. Everything else is independent per
 // chunk:
 //
-//   gdn_train_c_norm    q, k l2-normalized ONCE per (token, key head), not once
-//                       per value slice and not once per value head
+//   gdn_train_c_norm    q, k l2-normalized once per call per (token, key head),
+//                       not once per value slice and not once per value head;
+//                       the backward rebuilds it (it keeps nothing of the
+//                       forward's) and gdn_train_c_finish re-derives the two
+//                       norms of each row it differentiates through
 //   gdn_train_c_prep    per value head and chunk: G, beta, W and M (the solve)
 //   gdn_train_c_fwd     the sequential pass over chunks; writes o, the final
 //                       state and the same checkpoints the sequential kernel does
@@ -841,7 +844,7 @@ kernel void gdn_train_c_fwd(
 /// slice it forms D (rebuilt from the chunk's checkpoint) and dR, writes dv,
 /// writes `dsbuf` (dS_C, which the full-width stages read), `dbuf`, `drbuf` and
 /// `dop` (masked dO, head-major), and this slice's share of dG and dbeta into
-/// `dgpart`, `dbpart` [NS, B, H, Tp]. flags: 1 = `s0` was given (write `ds0`);
+/// `dgpart`, `dbpart`, and of the state term E_Ci x_i into `xpart` [NS, B, H, Tp]. flags: 1 = `s0` was given (write `ds0`);
 /// 2 = `dfin` holds the final state's gradient (else zeros).
 /// 128 threads = 4 simdgroups. Grid: x = Dv / 16, y = batch x value head.
 kernel void gdn_train_c_bwd_a(
@@ -862,17 +865,18 @@ kernel void gdn_train_c_bwd_a(
     device float *dv [[buffer(14)]],
     device float *dgpart [[buffer(15)]],
     device float *dbpart [[buffer(16)]],
-    device float *ds0 [[buffer(17)]],
-    constant uint &B [[buffer(18)]],
-    constant uint &T [[buffer(19)]],
-    constant uint &H [[buffer(20)]],
-    constant uint &Dv [[buffer(21)]],
-    constant uint &flags [[buffer(22)]],
-    constant uint &ldv [[buffer(23)]],
-    constant uint &offv [[buffer(24)]],
-    constant uint &Hk [[buffer(25)]],
-    constant uint &lddv [[buffer(26)]],
-    constant uint &offdv [[buffer(27)]],
+    device float *xpart [[buffer(17)]],
+    device float *ds0 [[buffer(18)]],
+    constant uint &B [[buffer(19)]],
+    constant uint &T [[buffer(20)]],
+    constant uint &H [[buffer(21)]],
+    constant uint &Dv [[buffer(22)]],
+    constant uint &flags [[buffer(23)]],
+    constant uint &ldv [[buffer(24)]],
+    constant uint &offv [[buffer(25)]],
+    constant uint &Hk [[buffer(26)]],
+    constant uint &lddv [[buffer(27)]],
+    constant uint &offdv [[buffer(28)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -1025,14 +1029,17 @@ kernel void gdn_train_c_bwd_a(
                     dv[tok * lddv + offdv + (ulong)h * Dv + j0 + j] = Bs[i] * dr;
                 }
             }
-            float dg = dgs[i] - Es[i] * Bs[i] * xr - Ws[i] * xs[i];
+            // The state term of dG, E_Ci x_i at the chunk's last row and
+            // -E_Ci x_i at row i, is not formed here: it reaches dg_s as the
+            // prefix sum of E_Ci x_i over i < s (`xpart`, summed by
+            // gdn_train_c_gates). Formed as +x at the end and -x at row i, the
+            // two O(1) values of the last real row (E = 1) would absorb every
+            // smaller term of the other rows at strong decay.
+            float dg = dgs[i] - Es[i] * Bs[i] * xr;
             if (i == C - 1) {
-                float sw = 0.0f;
-                for (uint r = 0; r < C; ++r) {
-                    sw += Ws[r] * xs[r];
-                }
-                dg += sw + Es[C - 1] * ((red[0] + red[1]) + (red[2] + red[3]));
+                dg += Es[C - 1] * ((red[0] + red[1]) + (red[2] + red[3]));
             }
+            xpart[((ulong)tg.x * bhn + bh) * tp + t0 + i] = Ws[i] * xs[i];
             dgpart[((ulong)tg.x * bhn + bh) * tp + t0 + i] = dg;
             dbpart[((ulong)tg.x * bhn + bh) * tp + t0 + i] = dbr;
             for (uint j = 0; j < BV; ++j) {
@@ -1066,7 +1073,9 @@ kernel void gdn_train_c_bwd_a(
 /// Dv. From P = dO D^T, dA' = dR D^T and K K^T it writes, over the lower
 /// triangle (zero above the diagonal inside a diagonal tile; tiles above are
 /// never written or read): `dscore` = E P, `das` = dA beta E (dA = -dA'),
-/// `gtot` = M P + dA A (the (t, i) share of dG_t, and minus that of dG_i) and
+/// `gtot` = M P + dA A over i < t (the (t, i) share of dG_t, and minus that of
+/// dG_i; the diagonal's +M_tt P_tt and -M_tt P_tt cancel, and are not formed:
+/// at strong decay they are the only O(1) terms and would absorb the rest) and
 /// `dbs` = dA E (k_t . k_i) (the share of dbeta_t). 128 threads.
 /// Grid: x = chunk, y = batch x value head.
 kernel void gdn_train_c_mats(
@@ -1135,8 +1144,8 @@ kernel void gdn_train_c_mats(
                 if (ii <= t) {
                     const float E = precise::exp(Gs[t] - Gs[ii]);
                     sc = E * st[e];
-                    gm = aq[at] * st[e];
                     if (ii < t) {
+                        gm = aq[at] * st[e];
                         dA = -st[64 + e];
                         dAs = dA * Bs[t] * E;
                         gt = dAs * st[128 + e];
@@ -1154,24 +1163,27 @@ kernel void gdn_train_c_mats(
 }
 
 /// Per (batch x value head, chunk): dG_t and dbeta_t from the C x C matrices
-/// and the slices' partials, then dg_s = sum_{t >= s} dG_t over the chunk.
+/// and the slices' partials, then dg_s = sum_{t >= s} dG_t over the chunk plus
+/// the state term's prefix sum.
 /// 128 threads (the first 64 work). Grid: x = chunk, y = batch x value head.
 kernel void gdn_train_c_gates(
     device const float *gtot [[buffer(0)]],
     device const float *dbs [[buffer(1)]],
     device const float *dgpart [[buffer(2)]],
     device const float *dbpart [[buffer(3)]],
-    device float *dg [[buffer(4)]],
-    device float *dbeta [[buffer(5)]],
-    constant uint &B [[buffer(6)]],
-    constant uint &T [[buffer(7)]],
-    constant uint &H [[buffer(8)]],
-    constant uint &ns [[buffer(9)]],
+    device const float *xpart [[buffer(4)]],
+    device float *dg [[buffer(5)]],
+    device float *dbeta [[buffer(6)]],
+    constant uint &B [[buffer(7)]],
+    constant uint &T [[buffer(8)]],
+    constant uint &H [[buffer(9)]],
+    constant uint &ns [[buffer(10)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]])
 {
     constexpr uint C = GDNC_C;
     threadgroup float dgs[C];
+    threadgroup float xs[C];
     const uint chunk = tg.x, bh = tg.y;
     if (bh >= B * H) return;  // uniform per threadgroup
     const uint b = bh / H, h = bh % H;
@@ -1189,21 +1201,29 @@ kernel void gdn_train_c_gates(
         for (uint r = i; r < C; ++r) {
             cs += gtot[mat + (ulong)r * C + i];
         }
-        float dgp = 0.0f, dbp = 0.0f;
+        float dgp = 0.0f, dbp = 0.0f, xp = 0.0f;
         for (uint s = 0; s < ns; ++s) {
             const ulong at = (s * bhn + bh) * tp + chunk * C + i;
             dgp += dgpart[at];
             dbp += dbpart[at];
+            xp += xpart[at];
         }
         dgs[i] = (rs - cs) + dgp;
+        xs[i] = xp;
         db += dbp;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (i < C && chunk * C + i < T) {
-        float cum = 0.0f;
+        // dg_s = sum_{t >= s} dG_t + sum_{i < s} E_Ci x_i: the state term
+        // as the prefix it is, never as a pair of opposite O(1) values.
+        float cum = 0.0f, pre = 0.0f;
         for (uint t = C; t-- > i;) {
             cum += dgs[t];
         }
+        for (uint j = 0; j < i; ++j) {
+            pre += xs[j];
+        }
+        cum += pre;
         const ulong r = ((ulong)b * T + chunk * C + i) * H + h;
         dg[r] = cum;
         dbeta[r] = db;

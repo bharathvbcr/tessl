@@ -1,6 +1,6 @@
 """Plots for bench/results/embedgemma2_memory_m5pro.txt (analysis only; ships nothing).
 
-Reads embedgemma2_memory_m5pro.json (written by embedgemma2_memory_report.py) and writes
+Reads embedgemma2_memory_m5pro.json (written by `results_report memory`) and writes
 embedgemma2_memory_m5pro.png.
 
     python embedgemma2_memory_plot.py <results dir>

@@ -239,6 +239,7 @@ pub mod dispatch;
 pub mod embedgemma2;
 pub mod embedgemma2_audio;
 pub mod embedgemma2_mm;
+pub mod embedgemma2_pre;
 pub mod embedgemma2_vision;
 pub mod gdn_train;
 pub mod gemm;

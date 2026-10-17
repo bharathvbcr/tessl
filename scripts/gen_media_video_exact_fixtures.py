@@ -71,10 +71,13 @@ FIXTURES = [
     # The end-to-end file: 80 frames at 24000/1001 fps (3.337 s, 3 sampled frames at 1 fps), so
     # the source rate is not a round number and sampling is not the same as `index / 10`.
     ("e2e_video", "libx264", 96, 64, 80, "24000/1001", "bt709", "tv", 0),
+    # 10-bit HEVC: not something the exact converter handles, so it must take the system path.
+    ("hevc_main10_64x48", "libx265", 64, 48, 6, 10, "bt709", "tv", 0),
 ]
 NO_RGB24_GOLDEN = {"e2e_video"}  # decoded by the reference script, not compared frame by frame
 CRF = {"e2e_video": "24"}
-NV12_GOLDENS = {f[0] for f in FIXTURES} - NO_RGB24_GOLDEN
+PIX_FMT = {"hevc_main10_64x48": "yuv420p10le"}
+NV12_GOLDENS = {f[0] for f in FIXTURES} - NO_RGB24_GOLDEN - set(PIX_FMT)
 # Planes with random samples, outside the legal ranges too, run through the CLI as raw NV12
 # input: name, width, height, matrix tag, range. They hold the converter to libswscale for every
 # Y, Cb and Cr that natural pictures leave out, on both converters (width a multiple of 16 or not).
@@ -120,7 +123,7 @@ def encode(name, codec, w, h, n, fps, matrix, rng_, rot, seed):
     vf = "scale="
     if matrix:
         vf += f"out_color_matrix={'bt709' if matrix == 'bt709' else 'bt601'}:"
-    vf += f"out_range={'full' if rng_ == 'pc' else 'limited'},format=yuv420p"
+    vf += f"out_range={'full' if rng_ == 'pc' else 'limited'},format={PIX_FMT.get(name, 'yuv420p')}"
     cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-framerate", str(fps),
            "-i", "-", "-vf", vf, "-c:v", codec, "-crf", CRF.get(name, "12"), "-g", "5", "-bf", "2"]
     if matrix:

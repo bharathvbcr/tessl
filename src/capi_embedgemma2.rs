@@ -2312,7 +2312,7 @@ fn prepare_opened_videos(
 }
 
 /// Embed `n_images` images read from files or given as encoded bytes into `out`,
-/// `[n_images, dim]` row-major f32, each row L2-normalized: [`tessl::media`]'s
+/// `[n_images, dim]` row-major f32, each row L2-normalized: [`crate::media`]'s
 /// decoder (ImageIO: PNG, JPEG, GIF, HEIC, TIFF, BMP, ... the first image of the
 /// file; RGB samples as stored, the EXIF orientation not applied, as
 /// torchvision reads a path), then [`tessl_embedgemma2_embed_images`]'s
@@ -2386,7 +2386,7 @@ pub unsafe extern "C" fn tessl_embedgemma2_embed_image_sources(
 }
 
 /// Embed `n_clips` audio files or encoded clips into `out`, `[n_clips, dim]`
-/// row-major f32, each row L2-normalized: [`tessl::media`]'s decoder
+/// row-major f32, each row L2-normalized: [`crate::media`]'s decoder
 /// (AudioToolbox: WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, ...; mono by the mean of
 /// the channels, resampled to the extractor's 16 kHz), then
 /// [`tessl_embedgemma2_embed_audio`]'s feature extraction (a clip is cut to the
@@ -2451,7 +2451,7 @@ pub unsafe extern "C" fn tessl_embedgemma2_embed_audio_sources(
 }
 
 /// Embed `n_videos` video files or encoded videos into `out`, `[n_videos, dim]`
-/// row-major f32, each row L2-normalized: [`tessl::media`]'s decoder
+/// row-major f32, each row L2-normalized: [`crate::media`]'s decoder
 /// (AVFoundation: MP4, MOV, ... H.264, HEVC; upright frames), the processor's
 /// frame sampling (the snapshot's `fps` and `max_frames`, over the exact frame
 /// count and source rate the file reports) decoding only the sampled frames,

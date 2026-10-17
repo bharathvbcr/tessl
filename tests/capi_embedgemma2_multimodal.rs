@@ -32,9 +32,10 @@ use tessl::capi_embedgemma2::{
     tessl_embedgemma2_encode, tessl_embedgemma2_encode_audio, tessl_embedgemma2_encode_images, tessl_embedgemma2_free,
     tessl_embedgemma2_load, tessl_embedgemma2_load_multimodal, test_embedgemma2_multimodal, TesslEmbedGemma2,
 };
-use tessl::embedgemma2_audio::{AudioInput, MAX_CLIPS, MAX_FRAMES_PER_FORWARD};
+use tessl::embedgemma2::MAX_BATCH;
+use tessl::embedgemma2_audio::{AudioInput, MAX_CALL_FRAMES, MAX_CLIPS, MAX_FRAMES_PER_FORWARD};
 use tessl::embedgemma2_mm::MmItem;
-use tessl::embedgemma2_vision::{MAX_BATCH_PATCHES, MAX_IMAGES};
+use tessl::embedgemma2_vision::{MAX_BATCH_PATCHES, MAX_CALL_PATCHES, MAX_IMAGES};
 use tessl::gemm::GemmOperands;
 
 const ERR_LEN: usize = 512;
@@ -603,6 +604,77 @@ fn image_refusals_leave_the_output_alone_and_the_handle_usable() {
     let (s, _, again) = good.encode(l.model, 0);
     assert_eq!(s, TESSL_OK);
     assert_eq!(bits(&again), bits(&want));
+}
+
+/// The per-call totals (`MAX_CALL_PATCHES`, `MAX_CALL_FRAMES`) are checked from
+/// the offsets alone, before a length is compared or a buffer read: the
+/// buffers here are four elements long, the totals they declare millions.
+#[test]
+fn the_per_call_totals_are_bounded_before_anything_is_read() {
+    let _g = gpu_lock();
+    let l = Loaded::new(TESSL_OPERANDS_EXACT_F32);
+    // 65 images of the most rows one may have: 1,064,960 rows, past 2^20.
+    let n = 65usize;
+    assert!(n * MAX_BATCH_PATCHES > MAX_CALL_PATCHES && n <= MAX_BATCH);
+    let offs: Vec<u64> = (0..=n as u64).map(|i| i * MAX_BATCH_PATCHES as u64).collect();
+    let (tiny_px, tiny_pos) = ([0f32; 4], [0i32; 2]);
+    let mut out = vec![SENTINEL; n * DIM];
+    let (s, m) = images_raw(
+        l.model,
+        tiny_px.as_ptr(),
+        4,
+        tiny_pos.as_ptr(),
+        2,
+        offs.as_ptr(),
+        n as u64,
+        0,
+        out.as_mut_ptr(),
+        out.len() as u64,
+    );
+    assert_eq!(s, TESSL_ERR);
+    assert!(
+        m.contains("1064960 patch rows") && m.contains("MAX_CALL_PATCHES"),
+        "{m}"
+    );
+    assert!(out.iter().all(|&v| v == SENTINEL));
+    // One image fewer is within the bound: the offsets pass, the length check is next.
+    let offs = &offs[..n];
+    let (s, m) = images_raw(
+        l.model,
+        tiny_px.as_ptr(),
+        4,
+        tiny_pos.as_ptr(),
+        2,
+        offs.as_ptr(),
+        n as u64 - 1,
+        0,
+        out.as_mut_ptr(),
+        ((n - 1) * DIM) as u64,
+    );
+    assert_eq!(s, TESSL_ERR);
+    assert!(m.contains("pixel_values_len is 4"), "{m}");
+
+    // 129 clips of the most frames one may have: 2,113,536 frames, past 2^21.
+    let n = 129usize;
+    assert!(n * MAX_FRAMES_PER_FORWARD > MAX_CALL_FRAMES && n <= MAX_BATCH);
+    let offs: Vec<u64> = (0..=n as u64).map(|i| i * MAX_FRAMES_PER_FORWARD as u64).collect();
+    let (tiny_f, tiny_m) = ([0f32; 4], [1u8; 2]);
+    let mut out = vec![SENTINEL; n * DIM];
+    let (s, m) = audio_raw(
+        l.model,
+        tiny_f.as_ptr(),
+        4,
+        tiny_m.as_ptr(),
+        2,
+        offs.as_ptr(),
+        n as u64,
+        0,
+        out.as_mut_ptr(),
+        out.len() as u64,
+    );
+    assert_eq!(s, TESSL_ERR);
+    assert!(m.contains("2113536 frames") && m.contains("MAX_CALL_FRAMES"), "{m}");
+    assert!(out.iter().all(|&v| v == SENTINEL));
 }
 
 #[test]

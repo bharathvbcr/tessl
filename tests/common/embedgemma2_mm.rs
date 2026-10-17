@@ -465,3 +465,45 @@ pub fn timestamp_tokenizer_json() -> String {
         vocab = vocab_json.join(", "),
     )
 }
+
+/// The `tokenizer_config.json` that goes with [`timestamp_tokenizer_json`]:
+/// `<bos>` switches the sentence-transformers rule off, and the three
+/// placeholder tokens are refused in a text.
+pub const TOKENIZER_CONFIG: &str =
+    r#"{"bos_token": "<bos>", "image_token": "<|image|>", "video_token": "<|video|>", "audio_token": "<|audio|>"}"#;
+
+/// A `config_sentence_transformers.json` with two prompts (digits and a colon,
+/// which the tiny tokenizer has ids for) and `default` as its
+/// `default_prompt_name` (`null` or a quoted name).
+pub fn sentence_transformers_json(default: &str) -> String {
+    format!(r#"{{"prompts": {{"query": "00 ", "document": "1: "}}, "default_prompt_name": {default}}}"#)
+}
+
+/// A `processor_config.json` for the tiny towers: patch 4 and a 2x2 pooling
+/// cell as the tiny vision tower has them, 32 mel bins as the tiny audio
+/// tower takes, otherwise the checkpoint's settings (fps 1, at most 4 frames
+/// so a test video stays small). `max_soft_tokens` is the image and video
+/// budget (70 to 1120, `SUPPORTED_SOFT_TOKENS`).
+pub fn processor_config_json(add_timestamps: bool, max_soft_tokens: u32) -> String {
+    format!(
+        r#"{{
+      "audio_ms_per_token": 40, "audio_seq_length": 280,
+      "feature_extractor": {{"dither": 0.0, "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+        "feature_size": 32, "fft_length": 512, "fft_overdrive": false, "frame_length": 320,
+        "hop_length": 160, "input_scale_factor": 1.0, "max_frequency": 8000.0, "mel_floor": 0.001,
+        "min_frequency": 0.0, "padding_side": "right", "padding_value": 0.0, "per_bin_mean": null,
+        "per_bin_stddev": null, "preemphasis": 0.0, "preemphasis_htk_flavor": true,
+        "return_attention_mask": true, "sampling_rate": 16000}},
+      "image_processor": {{"do_convert_rgb": true, "do_normalize": false, "do_rescale": true,
+        "do_resize": true, "image_mean": [0.0, 0.0, 0.0], "image_processor_type": "Gemma4ImageProcessor",
+        "image_seq_length": 70, "image_std": [1.0, 1.0, 1.0], "max_soft_tokens": {max_soft_tokens}, "patch_size": 4,
+        "pooling_kernel_size": 2, "resample": 3, "rescale_factor": 0.00392156862745098}},
+      "video_processor": {{"add_timestamps": {add_timestamps}, "do_convert_rgb": true, "do_normalize": false,
+        "do_rescale": true, "do_resize": true, "do_sample_frames": true, "fps": 1,
+        "image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0], "max_frames": 4,
+        "max_soft_tokens": {max_soft_tokens}, "overflow_strategy": "uniform", "patch_size": 4,
+        "pooling_kernel_size": 2, "resample": 3, "rescale_factor": 0.00392156862745098,
+        "return_metadata": false, "video_processor_type": "EmbeddingGemma2VideoProcessor"}}
+    }}"#
+    )
+}

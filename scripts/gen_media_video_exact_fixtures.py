@@ -197,13 +197,15 @@ def synthetic(facts):
         rng = np.random.default_rng(seed)
         y = rng.integers(0, 256, (h, w), dtype=np.uint8)
         uv = rng.integers(0, 256, (h // 2, w), dtype=np.uint8)  # interleaved Cb, Cr
-        planes = y.tobytes() + uv.tobytes()
         with open(os.path.join(OUT, name + ".nv12"), "wb") as f:
-            f.write(planes)
+            f.write(y.tobytes() + uv.tobytes())
+        # The oracle is given planar yuv420p, the form libavcodec's H.264 and HEVC decoders
+        # produce and torchcodec converts; ffmpeg's NV12 input takes a different swscale path.
+        planes = y.tobytes() + np.ascontiguousarray(uv[:, 0::2]).tobytes() + np.ascontiguousarray(uv[:, 1::2]).tobytes()
         for suffix, cpu in ((".rgb24", []), (".portable.rgb24", ["-cpuflags", "0"])):
             # `-cpuflags 0` turns the CPU's assembly off, so libswscale runs its C table
             # converter at every width (the aarch64 NEON one needs a width multiple of 16).
-            cmd = [FFMPEG, "-v", "error", "-y", *cpu, "-f", "rawvideo", "-pix_fmt", "nv12", "-s", f"{w}x{h}"]
+            cmd = [FFMPEG, "-v", "error", "-y", *cpu, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}"]
             if matrix:
                 cmd += ["-colorspace", matrix]
             cmd += ["-color_range", rng_, "-i", "-", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
@@ -266,7 +268,7 @@ def file_table():
         elif name.endswith(".rgb24"):
             role, note = "golden", "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
         elif name.startswith("rand_") and name.endswith(".nv12"):
-            role, note = "input", "random NV12 planes the converter is given (its rgb24 golden is the ffmpeg CLI's conversion)"
+            role, note = "input", "random NV12 planes the converter is given (its rgb24 golden is the ffmpeg CLI conversion of the same samples as planar yuv420p)"
         elif name.endswith(".nv12"):
             role, note = "golden", "the ffmpeg CLI's nv12 frames for the input of the same name (as stored, not rotated)"
         else:

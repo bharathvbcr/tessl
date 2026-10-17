@@ -1,0 +1,35 @@
+[package]
+name = "tessl-go-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "Umbrella staticlib for the Go binding: Gusset plus tessl's EmbeddingGemma 2 C ABI. One archive per Go binary (R14)."
+publish = false
+
+# Not a member of any workspace of tessl's and not a package tessl depends on:
+# it is the one place gusset and tessl are linked together.
+[workspace]
+
+[lib]
+# cgo links `-lgusset`, so the archive must be libgusset.a whatever the package
+# is called (gusset docs/adoption.md step 1).
+name = "gusset"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Gusset is not on crates.io. The pin is the commit origin/main points at (the
+# one Jarvis pins), so the build is the same from any checkout or worktree; the
+# Go module requires the same commit (go/go.mod) and gusset's init() checks that
+# the two agree on the ABI.
+gusset_core = { package = "gusset", git = "https://github.com/bharathvbcr/gusset", rev = "984209b542885b10b43e3d9aaf2073fd871e9eb9" }
+tessl = { path = "../.." }
+
+[profile.release]
+codegen-units = 1
+# R2: catch_unwind cannot catch an abort; gusset's build.rs refuses `abort`.
+panic = "unwind"
+lto = "thin"
+
+[profile.dev]
+panic = "unwind"

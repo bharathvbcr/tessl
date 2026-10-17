@@ -1,0 +1,245 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1150" height="612.8" viewBox="0 0 1150 612.8" role="img">
+<title>EmbeddingGemma 2 preprocessing, tessl native vs transformers processors, same inputs, Apple M5 Pro (shared host)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">EmbeddingGemma 2 preprocessing, tessl native vs transformers processors, same inputs, Apple M5 Pro (shared host)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">Label: median per-round ratio hf / tessl [lowest, highest round]; above 1 = tessl faster. Bar and tick: median over rounds of min-of-N; dots: every round.</text>
+<rect class="key" x="14" y="54.3" width="14" height="10" fill="#eb6834"/>
+<text class="mut" x="34" y="63.3" font-size="11">tessl (embedgemma2_pre)</text>
+<rect class="key" x="183.12" y="54.3" width="14" height="10" fill="#2a78d6"/>
+<text class="mut" x="203.12" y="63.3" font-size="11">transformers 5.19 (AutoProcessor)</text>
+<g class="panel">
+<line class="grid" x1="96.26" y1="537.03" x2="1124" y2="537.03"/>
+<line class="axis" x1="92.26" y1="537.03" x2="96.26" y2="537.03"/>
+<text class="mut" x="89.26" y="540.88" font-size="11" text-anchor="end">0.1</text>
+<line class="grid" x1="96.26" y1="425.62" x2="1124" y2="425.62"/>
+<line class="axis" x1="92.26" y1="425.62" x2="96.26" y2="425.62"/>
+<text class="mut" x="89.26" y="429.47" font-size="11" text-anchor="end">1</text>
+<line class="grid" x1="96.26" y1="314.21" x2="1124" y2="314.21"/>
+<line class="axis" x1="92.26" y1="314.21" x2="96.26" y2="314.21"/>
+<text class="mut" x="89.26" y="318.06" font-size="11" text-anchor="end">10</text>
+<line class="grid" x1="96.26" y1="202.79" x2="1124" y2="202.79"/>
+<line class="axis" x1="92.26" y1="202.79" x2="96.26" y2="202.79"/>
+<text class="mut" x="89.26" y="206.64" font-size="11" text-anchor="end">100</text>
+<line class="grid" x1="96.26" y1="91.38" x2="1124" y2="91.38"/>
+<line class="axis" x1="92.26" y1="91.38" x2="96.26" y2="91.38"/>
+<text class="mut" x="89.26" y="95.23" font-size="11" text-anchor="end">1000</text>
+<line class="axis" x1="153.36" y1="537.03" x2="153.36" y2="541.03"/>
+<text class="mut" x="156.36" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 156.36 551.03)">image_224x224</text>
+<line class="axis" x1="267.55" y1="537.03" x2="267.55" y2="541.03"/>
+<text class="mut" x="270.55" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 270.55 551.03)">image_640x480</text>
+<line class="axis" x1="381.74" y1="537.03" x2="381.74" y2="541.03"/>
+<text class="mut" x="384.74" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 384.74 551.03)">image_1920x1080</text>
+<line class="axis" x1="495.94" y1="537.03" x2="495.94" y2="541.03"/>
+<text class="mut" x="498.94" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 498.94 551.03)">image_4000x3000</text>
+<line class="axis" x1="610.13" y1="537.03" x2="610.13" y2="541.03"/>
+<text class="mut" x="613.13" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 613.13 551.03)">audio_1s</text>
+<line class="axis" x1="724.32" y1="537.03" x2="724.32" y2="541.03"/>
+<text class="mut" x="727.32" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 727.32 551.03)">audio_10s</text>
+<line class="axis" x1="838.52" y1="537.03" x2="838.52" y2="541.03"/>
+<text class="mut" x="841.52" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 841.52 551.03)">audio_30s</text>
+<line class="axis" x1="952.71" y1="537.03" x2="952.71" y2="541.03"/>
+<text class="mut" x="955.71" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 955.71 551.03)">video_40f_640x360</text>
+<line class="axis" x1="1066.9" y1="537.03" x2="1066.9" y2="541.03"/>
+<text class="mut" x="1069.9" y="551.03" font-size="11" text-anchor="end" transform="rotate(-20 1069.9 551.03)">video_40f_1280x720</text>
+<line class="axis" x1="96.26" y1="537.03" x2="1124" y2="537.03"/>
+<line class="axis" x1="96.26" y1="84.8" x2="96.26" y2="537.03"/>
+<text class="mut" x="31.52" y="310.92" font-size="12" text-anchor="middle" transform="rotate(-90 31.52 310.92)">ms per call (min-of-N per round; bar = median over rounds; dots = rounds)</text>
+<rect x="111.7" y="439.77" width="39.92" height="97.26" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="111.7" y1="439.77" x2="151.62" y2="439.77" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="114.57" cy="440.74" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="119.46" cy="441.81" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="124.34" cy="453.87" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="129.22" cy="455.79" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="134.1" cy="438.82" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="138.98" cy="421.99" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="143.86" cy="434.83" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="148.75" cy="429.29" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="155.09" y="386.21" width="39.92" height="150.82" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="155.09" y1="386.21" x2="195.01" y2="386.21" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="157.97" cy="374.08" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="162.85" cy="372.63" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="167.73" cy="392.26" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="172.61" cy="382.82" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="177.49" cy="384.59" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="182.38" cy="387.88" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="187.26" cy="395.41" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="192.14" cy="389.08" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="153.36" y="353.03" font-size="10.5" text-anchor="middle"><tspan x="153.36" dy="0">3.32x</tspan><tspan x="153.36" dy="12.6">[2.02, 4.52]</tspan></text>
+<rect x="225.89" y="418.73" width="39.92" height="118.31" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="225.89" y1="418.73" x2="265.81" y2="418.73" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="228.77" cy="401.52" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="233.65" cy="418.01" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="238.53" cy="432.76" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="243.41" cy="428.32" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="248.29" cy="419.3" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="253.18" cy="415.26" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="258.06" cy="421.99" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="262.94" cy="418.16" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="269.29" y="370.91" width="39.92" height="166.12" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="269.29" y1="370.91" x2="309.21" y2="370.91" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="272.16" cy="375.34" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="277.04" cy="373.67" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="281.92" cy="371.03" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="286.81" cy="351.06" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="291.69" cy="370.79" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="296.57" cy="369.45" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="301.45" cy="372.9" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="306.33" cy="369.88" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="267.55" y="331.46" font-size="10.5" text-anchor="middle"><tspan x="267.55" dy="0">2.72x</tspan><tspan x="267.55" dy="12.6">[1.72, 4.94]</tspan></text>
+<rect x="340.09" y="378.59" width="39.92" height="158.44" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="340.09" y1="378.59" x2="380.01" y2="378.59" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="342.96" cy="375.4" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="347.84" cy="390.89" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="352.72" cy="376.21" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="357.61" cy="388.97" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="362.49" cy="356.42" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="367.37" cy="381.09" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="372.25" cy="399.69" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="377.13" cy="370.46" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="383.48" y="334.84" width="39.92" height="202.19" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="383.48" y1="334.84" x2="423.4" y2="334.84" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="386.35" cy="328.52" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="391.24" cy="336.32" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="396.12" cy="337.29" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="401" cy="333.41" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="405.88" cy="338.95" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="410.76" cy="332.44" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="415.64" cy="337.36" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="420.53" cy="331.96" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="381.74" y="308.92" font-size="10.5" text-anchor="middle"><tspan x="381.74" dy="0">2.68x</tspan><tspan x="381.74" dy="12.6">[1.43, 3.63]</tspan></text>
+<rect x="454.28" y="350.05" width="39.92" height="186.98" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="454.28" y1="350.05" x2="494.2" y2="350.05" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="457.15" cy="354.44" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="462.04" cy="350.83" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="466.92" cy="354.24" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="471.8" cy="340.04" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="476.68" cy="349.28" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="481.56" cy="327.28" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="486.44" cy="354.53" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="491.33" cy="344.89" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="497.67" y="276.67" width="39.92" height="260.36" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="497.67" y1="276.67" x2="537.59" y2="276.67" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="500.55" cy="283.58" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="505.43" cy="278.73" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="510.31" cy="280.63" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="515.19" cy="256.72" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="520.07" cy="274.7" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="524.96" cy="279.28" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="529.84" cy="259.11" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="534.72" cy="266.07" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="495.94" y="237.12" font-size="10.5" text-anchor="middle"><tspan x="495.94" dy="0">4.62x</tspan><tspan x="495.94" dy="12.6">[2.70, 7.19]</tspan></text>
+<rect x="568.47" y="511.74" width="39.92" height="25.29" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="568.47" y1="511.74" x2="608.39" y2="511.74" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="571.35" cy="512.57" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="576.23" cy="510.93" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="581.11" cy="513.84" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="585.99" cy="495.69" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="590.87" cy="516.17" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="595.76" cy="404.75" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="600.64" cy="486.82" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="605.52" cy="517.9" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="611.87" y="497.65" width="39.92" height="39.38" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="611.87" y1="497.65" x2="651.79" y2="497.65" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="614.74" cy="496.86" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="619.62" cy="480.52" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="624.5" cy="498.47" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="629.39" cy="500.29" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="634.27" cy="476.79" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="639.15" cy="500.24" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="644.03" cy="500.31" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="648.91" cy="476.69" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="610.13" y="385.15" font-size="10.5" text-anchor="middle"><tspan x="610.13" dy="0">1.38x</tspan><tspan x="610.13" dy="12.6">[0.14, 2.34]</tspan></text>
+<rect x="682.67" y="433.33" width="39.92" height="103.7" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="682.67" y1="433.33" x2="722.59" y2="433.33" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="685.54" cy="444.3" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="690.42" cy="419.19" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="695.3" cy="441.66" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="700.19" cy="432.07" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="705.07" cy="437.68" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="709.95" cy="429.44" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="714.83" cy="434.63" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="719.71" cy="422.83" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="726.06" y="379.53" width="39.92" height="157.5" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="726.06" y1="379.53" x2="765.98" y2="379.53" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="728.93" cy="391.26" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="733.82" cy="380.77" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="738.7" cy="387.84" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="743.58" cy="374.2" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="748.46" cy="376.23" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="753.34" cy="393.85" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="758.22" cy="378.32" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="763.11" cy="377.7" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="724.32" y="354.6" font-size="10.5" text-anchor="middle"><tspan x="724.32" dy="0">3.02x</tspan><tspan x="724.32" dy="12.6">[2.09, 3.56]</tspan></text>
+<rect x="796.86" y="383.78" width="39.92" height="153.25" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="796.86" y1="383.78" x2="836.78" y2="383.78" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="799.73" cy="367.05" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="804.62" cy="390.65" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="809.5" cy="402.77" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="814.38" cy="370.14" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="819.26" cy="382.99" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="824.14" cy="393.15" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="829.02" cy="384.58" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="833.91" cy="374.68" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="840.25" y="325.15" width="39.92" height="211.88" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="840.25" y1="325.15" x2="880.17" y2="325.15" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="843.13" cy="325.13" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="848.01" cy="326.44" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="852.89" cy="325.17" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="857.77" cy="320.55" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="862.65" cy="324.35" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="867.54" cy="340.58" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="872.42" cy="324.37" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="877.3" cy="334.8" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="838.52" y="300.95" font-size="10.5" text-anchor="middle"><tspan x="838.52" dy="0">3.16x</tspan><tspan x="838.52" dy="12.6">[2.28, 4.97]</tspan></text>
+<rect x="911.05" y="262.36" width="39.92" height="274.68" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="911.05" y1="262.36" x2="950.97" y2="262.36" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="913.93" cy="256.29" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="918.81" cy="267.7" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="923.69" cy="269.43" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="928.57" cy="250.09" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="933.45" cy="257.55" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="938.34" cy="274.83" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="943.22" cy="269.96" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="948.1" cy="246.23" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="954.45" y="213.07" width="39.92" height="323.96" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="954.45" y1="213.07" x2="994.37" y2="213.07" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="957.32" cy="205.53" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="962.2" cy="243.67" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="967.08" cy="180.03" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="971.97" cy="223.01" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="976.85" cy="172.53" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="981.73" cy="243.56" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="986.61" cy="198.66" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="991.49" cy="222.01" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="952.71" y="152.93" font-size="10.5" text-anchor="middle"><tspan x="952.71" dy="0">2.38x</tspan><tspan x="952.71" dy="12.6">[1.64, 6.34]</tspan></text>
+<rect x="1025.25" y="231.74" width="39.92" height="305.3" class="bar" fill="#eb6834" fill-opacity="0.28"/>
+<line x1="1025.25" y1="231.74" x2="1065.17" y2="231.74" class="median" stroke="#eb6834" stroke-width="2.5"/>
+<circle cx="1028.12" cy="249.28" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1033" cy="229.22" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1037.88" cy="234.39" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1042.77" cy="219.23" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1047.65" cy="234.98" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1052.53" cy="223.34" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1057.41" cy="246.46" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<circle cx="1062.29" cy="216.81" r="3.2" class="dot edge" fill="#eb6834" stroke-width="0.8"/>
+<rect x="1068.64" y="170.91" width="39.92" height="366.13" class="bar" fill="#2a78d6" fill-opacity="0.28"/>
+<line x1="1068.64" y1="170.91" x2="1108.56" y2="170.91" class="median" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="1071.51" cy="167.49" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1076.4" cy="213.2" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1081.28" cy="147.21" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1086.16" cy="174.58" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1091.04" cy="138.3" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1095.92" cy="208.23" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1100.8" cy="162.24" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<circle cx="1105.69" cy="185.96" r="3.2" class="dot edge" fill="#2a78d6" stroke-width="0.8"/>
+<text class="ink" x="1066.9" y="118.7" font-size="10.5" text-anchor="middle"><tspan x="1066.9" dy="0">3.97x</tspan><tspan x="1066.9" dy="12.6">[1.37, 7.38]</tspan></text>
+</g>
+</svg>

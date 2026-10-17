@@ -5,8 +5,8 @@ worktree-agent-aa4d6ba1364869275, which adds only src/bin/profile_embedgemma2.rs
 its data, and a paragraph in docs/embedgemma2.md; no library code changed). Checkpoint:
 google/embeddinggemma-2 snapshot 914f7f89142e33e77833254d9c9b90c3cef7303b. Tool:
 target/release/profile_embedgemma2 (src/bin/profile_embedgemma2.rs), analysis by
-`results_report stage` (src/bin/results_report) and bench/results/embedgemma2_stage_profile_plot.py. Data (every raw sample of every
-pass and every mode): embedgemma2_stage_profile_m5pro.json. Plot: embedgemma2_stage_profile_m5pro.png.
+`results_report stage` (src/bin/results_report) and `plot_results stage-profile` (src/bin/plot_results). Data (every raw sample of every
+pass and every mode): embedgemma2_stage_profile_m5pro.json. Plot: embedgemma2_stage_profile_m5pro.svg.
 The stage tables at the end of this file are the report tool's output (it also writes them to
 embedgemma2_stage_profile_tables.txt, not committed).
 
@@ -269,7 +269,8 @@ REPRODUCE
   cargo build --release --bin profile_embedgemma2
   EMBEDGEMMA2_SNAPSHOT=<snapshot> PROFILE_MODE=stages PROFILE_ROUNDS=9 PROFILE_JSON=p.json target/release/profile_embedgemma2
   (PROFILE_SKIP=0 for the quick form); PROFILE_MODE=gemm | memory-sweep | ledger | layout | alloc | ple.
-  Then cargo run --release --bin results_report -- stage <dir> p*.json --gemm ... and ..._plot.py.
+  Then cargo run --release --bin results_report -- stage <dir> p*.json --gemm ... and
+  cargo run --release --bin plot_results -- stage-profile bench/results/embedgemma2_stage_profile_m5pro.json.
 
 DATA: THE FORWARD'S GEMM SHAPES IN ISOLATION (mode gemm; 24 distinct weights cycled; min of 9; GPU util 0 %)
   rows = 16 / 2048 / 8192; the exact-f32 TensorOps GEMM (gemm, what the forward runs) against

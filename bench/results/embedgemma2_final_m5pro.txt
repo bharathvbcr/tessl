@@ -63,5 +63,4 @@ Reading
   * Not in this bench: the vision and audio towers and the multimodal facade (their own results:
     embedgemma2_vision_speed_m5pro, embedgemma2_audio_speed_m5pro, embedgemma2_mm_onewait_m5pro).
 
-Plot: embedgemma2_final_m5pro.png (embedgemma2_final_plot.py; matplotlib through
-`uv run --no-project --with matplotlib`, not a repository dependency).
+Plot: embedgemma2_final_m5pro.svg (`plot_results final`, src/bin/plot_results; no plotting dependency).

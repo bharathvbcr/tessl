@@ -491,6 +491,27 @@ inline float simd_max(float v) {
     });
 }
 
+/// The `uint` overload, through the float slots by bits (a plain move keeps
+/// every pattern, NaN payloads included).
+inline uint simd_max(uint v) {
+    float f;
+    std::memcpy(&f, &v, sizeof f);
+    const float r = emu::exchange(f, [](const float *slot, uint n) {
+        uint m = 0;
+        for (uint i = 0; i < n; ++i) {
+            uint b;
+            std::memcpy(&b, &slot[i], sizeof b);
+            m = std::max(m, b);
+        }
+        float out;
+        std::memcpy(&out, &m, sizeof out);
+        return out;
+    });
+    uint out;
+    std::memcpy(&out, &r, sizeof out);
+    return out;
+}
+
 inline float simd_shuffle_xor(float v, uint mask) {
     const uint lane = emu::ctx.lane;
     return emu::exchange(v, [lane, mask](const float *slot, uint n) {

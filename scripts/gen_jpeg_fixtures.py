@@ -602,11 +602,17 @@ def smoothing_cases():
                    ("440", "1x2,1x1,1x1"), ("21_12", "2x1,1x2,1x1")):
         cut_all(f"smoothing_s{tag}", cj(img, "-progressive", "-sample", s), k, f"cjpeg -sample {s}, 33x47")
     # sizes around the block and MCU edges (the picture's edge rows and columns are replicated)
-    for (h, w) in [(8, 8), (9, 9), (17, 15), (24, 40), (65, 129), (1, 9), (9, 1), (33, 200), (200, 33), (72, 40)]:
+    # (even numbers of luma block rows - 32, 48, 64, 96 - put the rows below the last iMCU row's real ones outside the picture)
+    for (h, w) in [(8, 8), (9, 9), (17, 15), (24, 40), (65, 129), (1, 9), (9, 1), (33, 200), (200, 33), (72, 40),
+                   (32, 32), (48, 24), (64, 40), (96, 17)]:
         im = photo(h, w, h * 7 + w)
         cut_all(f"smoothing_size_{h}x{w}_420", cj(im, "-progressive", "-sample", "2x2,1x1,1x1"), k, f"{h}x{w} 4:2:0", ks=(1, 2, 5))
         cut_all(f"smoothing_size_{h}x{w}_gray", cj(im, "-progressive", "-grayscale"), k, f"{h}x{w} gray", ks=(1, 2))
         cut_all(f"smoothing_size_{h}x{w}_440", cj(im, "-progressive", "-sample", "1x2,1x1,1x1"), k, f"{h}x{w} 4:4:0", ks=(1, 5))
+    # components of three and four block rows per iMCU row (the row logic is measured on two)
+    for tag, s in (("v3", "1x3,1x1,1x1"), ("v4", "1x4,1x1,1x1"), ("v4c2", "1x4,1x2,1x1"), ("h2v3", "2x3,1x1,1x1")):
+        for (h, w) in [(33, 47), (96, 24), (104, 40), (56, 17)]:
+            cut_all(f"smoothing_tall_{tag}_{h}x{w}", cj(photo(h, w, h + w), "-progressive", "-sample", s), k, f"cjpeg -sample {s}, {h}x{w}", ks=(1, 2, 5))
     # progression scripts that leave coef_bits in states the default script never does
     for tag, s in (("420", "2x2,1x1,1x1"), ("444", "1x1,1x1,1x1")):
         for name, script in SCAN_SCRIPTS.items():

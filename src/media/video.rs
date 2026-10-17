@@ -516,7 +516,7 @@ impl VideoSource {
     /// Decode the frames at `indices` to the decoder's own 8-bit 4:2:0 planes,
     /// without converting or rotating them (for checking the planes against
     /// another decoder's). They come from VideoToolbox driven directly (see
-    /// [`super::vt`] for why not from `AVAssetReader`'s decoded output).
+    /// `vt.rs` for why not from `AVAssetReader`'s decoded output).
     ///
     /// # Errors
     /// As [`VideoSource::decode_frames`], and [`MediaError::Unsupported`] when

@@ -74,6 +74,13 @@ pub const OP_PING: u32 = 20;
 /// this archive. Reachable only through the call header Go sets; no payload
 /// byte selects it.
 pub const OP_SELF_TEST_PANIC: u32 = 0x7fff_0001;
+/// Holds the worker for a given number of milliseconds (at most
+/// [`SELF_TEST_SLEEP_MAX_MS`]) with no cancellation point, as a tessl call does
+/// while it waits on the GPU. It lets the Go tests prove, without timing luck,
+/// what a context can and cannot stop. Reached the same way as the panic.
+pub const OP_SELF_TEST_SLEEP: u32 = 0x7fff_0002;
+/// The longest [`OP_SELF_TEST_SLEEP`].
+pub const SELF_TEST_SLEEP_MAX_MS: u64 = 5_000;
 
 /// Every operation that reaches tessl, registered the same way.
 const MODEL_OPS: &[u32] = &[
@@ -139,7 +146,23 @@ pub extern "C" fn tessl_go_engine_init() -> i32 {
             panic!("tessl go engine self-test panic");
         },
     );
-    failed + i32::from(ping.is_err()) + i32::from(panic.is_err())
+    let sleep = register_engine(
+        OP_SELF_TEST_SLEEP,
+        |ctx: &JobContext, input: &[u8]| -> Result<Vec<u8>, String> {
+            cancelled(ctx)?;
+            let mut r = wire::Reader::new(input);
+            let ms = r.u64("milliseconds")?;
+            r.finish("self-test sleep")?;
+            if ms > SELF_TEST_SLEEP_MAX_MS {
+                return Err(format!(
+                    "self-test sleep of {ms} ms is past the {SELF_TEST_SLEEP_MAX_MS} ms limit"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(wire::Reply::new().finish(wire::STATUS_OK, 0, ms * 1_000_000))
+        },
+    );
+    failed + i32::from(ping.is_err()) + i32::from(panic.is_err()) + i32::from(sleep.is_err())
 }
 
 /// The frame version this archive speaks ([`WIRE_VERSION`]).

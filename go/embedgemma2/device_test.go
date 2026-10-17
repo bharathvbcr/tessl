@@ -23,6 +23,10 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
+	if err := closeRealModel(); err != nil {
+		println("closing the real model:", err.Error())
+		code = 1
+	}
 	os.Exit(code)
 }
 

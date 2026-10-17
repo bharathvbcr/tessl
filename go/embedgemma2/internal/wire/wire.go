@@ -51,6 +51,7 @@ const (
 	OpEmbedSegments     uint32 = 19
 	OpPing              uint32 = 20
 	OpSelfTestPanic     uint32 = 0x7fff_0001
+	OpSelfTestSleep     uint32 = 0x7fff_0002
 )
 
 // Reply statuses.

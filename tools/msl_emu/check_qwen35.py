@@ -973,50 +973,75 @@ def case_adamw(seed):
         FAILURES.append("adamw: grad_scale too weak to test")
 
 
-def _exact_sum_f64(words, top):
-    """What Qwen35Model::grad_sq_norm makes of qwen35_sum_exact_f32's output
-    (src/qwen35_adamw.rs, exact_sum_f64)."""
+def _exact_sum_f64(words, top, etop):
+    """What sq_norm::decode_sq_norm makes of qwen35_sum_exact_f32's output
+    (src/sq_norm.rs, exact_sum_f64)."""
     import math
     if top > 0x7F800000:
         return float("nan")
     if top == 0x7F800000:
         return float("inf")
     total = sum(int(w) << (32 * i) for i, w in enumerate(words))
-    return math.ldexp(float(total), max(top >> 23, 1) - 226)
+    return math.ldexp(float(total), etop - 226)
 
 
-def _sum_exact(x):
-    """Run qwen35_sum_exact_f32 over the f32 values `x`; (f64 result, top bits)."""
+def _sum_exact(x, shift=None):
+    """Run qwen35_sum_exact_f32 over the values `x * 2^shift` (shift 0 when
+    not given); (f64 result, top bits)."""
     n = x.numel()
-    out = run("qwen35_sum_exact_f32", dict(n=n), {"x": x.float()}, {"out": ("f32", 5)})["out"]
+    if shift is None:
+        shift = torch.zeros(n, dtype=torch.int32)
+    out = run("qwen35_sum_exact_f32", dict(n=n), {"x": x.float(), "shift": shift.to(torch.int32)},
+              {"out": ("f32", 6)})["out"]
     w = [int(v) & 0xFFFFFFFF for v in out.view(torch.int32).tolist()]
-    return _exact_sum_f64(w[:4], w[4]), w[4]
+    etop = w[5] - (1 << 32) if w[5] >= 1 << 31 else w[5]
+    return _exact_sum_f64(w[:4], w[4], etop), w[4]
 
 
-def _exactly_rounded(x):
-    """The exact sum of the f32 values `x`, rounded once to f64."""
+def _exactly_rounded(x, shift=None):
+    """The exact sum of the values `x * 2^shift`, rounded once to f64."""
     from fractions import Fraction
-    return float(sum((Fraction(v) for v in x.double().tolist()), Fraction(0)))
+    sh = [0] * x.numel() if shift is None else shift.tolist()
+    return float(sum((Fraction(v) * Fraction(2) ** k for v, k in zip(x.double().tolist(), sh)), Fraction(0)))
+
+
+def _pieces(params, gf, gb, pieces, extra=3):
+    """Run qwen35_sq_sum_pieces; (sums, shifts), each with `extra` words past
+    the last piece pre-filled with a sentinel."""
+    sentinel = torch.full((pieces + extra,), -7.0)
+    shift0 = torch.full((pieces + extra,), -7, dtype=torch.int32)
+    r = run("qwen35_sq_sum_pieces", params,
+            {"g": gf, "gb": gb.view(torch.int16), "out": sentinel, "shift": shift0},
+            {"out": ("f32", pieces + extra), "shift": ("f32", pieces + extra)})
+    return r["out"], r["shift"].view(torch.int32)
 
 
 def case_sq_sum_pieces(seed):
-    """qwen35_sq_sum_pieces then qwen35_sum_exact_f32, Qwen35Model::grad_sq_norm's
-    two dispatches. The pieces: windows of an f32 and a bf16 buffer (ld > width,
+    """qwen35_sq_sum_pieces then qwen35_sum_exact_f32, sq_norm's two
+    dispatches. The pieces: windows of an f32 and a bf16 buffer (ld > width,
     off > 0, a start inside the buffer), a width of one simdgroup with idle
     lanes, rows of exactly one piece, rows of several with a short last one;
-    each piece's sum of squares against f64, written at its own index and
-    nowhere past the last. The sum: those pieces added exactly and rounded once
-    (against Python's exact rational sum), a set whose low 64-bit words carry,
-    subnormals and zeros, a value 2^-100 below the largest dropped, and an
+    each piece's `sum * 2^shift` against f64, written at its own index and
+    nowhere past the last, the shift moving the piece's largest |x| into
+    [1, 2). Pieces of huge (2^100) and tiny (2^-100) values, whose squares
+    overflow or underflow f32 unscaled, are finite and right. The sum: those
+    pieces added exactly and rounded once (against Python's exact rational
+    sum), a set whose low 64-bit words carry, subnormals and zeros, shifts
+    past f32's range, a value 2^-100 below the largest dropped, and an
     infinity and a NaN reported as such."""
     g = seeded(seed)
     gf = torch.randn(40_000, generator=g)
     gb = (torch.randn(30_000, generator=g) * 3).to(torch.bfloat16)
+    # Huge and tiny windows, f32 at 30_000.. and 35_000.., bf16 at 25_000..
+    gf[30_000:30_500] = gf[30_000:30_500] * 2.0 ** 100
+    gf[35_000:35_500] = gf[35_000:35_500] * 2.0 ** -100
+    gb[25_000:25_500] = (gb[25_000:25_500].float() * 2.0 ** 100).to(torch.bfloat16)
     # (bf16, start, rows, width, ld, off)
     windows = [(0, 5, 3, 7, 9, 1), (1, 3, 2, 4096, 4100, 2), (0, 100, 1, 9000, 9000, 0),
-               (1, 9000, 4, 300, 305, 4), (0, 20_000, 2, 4097, 4200, 3)]
+               (1, 9000, 4, 300, 305, 4), (0, 20_000, 2, 4097, 4200, 3),
+               (0, 30_000, 1, 500, 500, 0), (0, 35_000, 1, 500, 500, 0), (1, 25_000, 1, 500, 500, 0)]
     params = dict(n_slots=len(windows))
-    want = []
+    want, want_shift = [], []
     for i, (bf, start, rows, width, ld, off) in enumerate(windows):
         params.update({f"s{i}_bf16": bf, f"s{i}_start": start, f"s{i}_rows": rows, f"s{i}_width": width,
                        f"s{i}_ld": ld, f"s{i}_off": off})
@@ -1024,31 +1049,43 @@ def case_sq_sum_pieces(seed):
         for r in range(rows):
             row = src[start + r * ld + off:][:width]
             for c0 in range(0, width, 4096):
-                want.append((row[c0:c0 + 4096] ** 2).sum())
-    pieces, extra = len(want), 3
-    sentinel = torch.full((pieces + extra,), -7.0)
-    out = run("qwen35_sq_sum_pieces", params, {"g": gf, "gb": gb.view(torch.int16), "out": sentinel},
-              {"out": ("f32", pieces + extra)})["out"]
-    check("sq_sum_pieces", out[:pieces], torch.stack(want), 0.0, 4e-6)
-    ok = bool((out[pieces:] == -7.0).all())
+                piece = row[c0:c0 + 4096]
+                want.append((piece ** 2).sum())
+                k = max(-126, min(126, int(torch.frexp(piece.abs().max()).exponent) - 1))
+                want_shift.append(2 * k)
+    pieces = len(want)
+    out, shift = _pieces(params, gf, gb, pieces)
+    import math
+    got = torch.tensor([math.ldexp(float(v), int(k)) for v, k in zip(out[:pieces], shift[:pieces])], dtype=torch.float64)
+    check("sq_sum_pieces", got, torch.stack(want), 0.0, 4e-6)
+    ok = shift[:pieces].tolist() == want_shift
+    print(f"  [{'ok  ' if ok else 'FAIL'}] sq_sum_pieces: each shift brings the piece's largest into [1, 2)")
+    if not ok:
+        FAILURES.append(f"sq_sum_pieces shifts {shift[:pieces].tolist()} vs {want_shift}")
+    ok = bool(torch.isfinite(out[:pieces]).all())
+    print(f"  [{'ok  ' if ok else 'FAIL'}] sq_sum_pieces: huge and tiny pieces stay finite")
+    if not ok:
+        FAILURES.append("sq_sum_pieces non-finite piece")
+    ok = bool((out[pieces:] == -7.0).all()) and bool((shift[pieces:] == -7).all())
     print(f"  [{'ok  ' if ok else 'FAIL'}] sq_sum_pieces: nothing written past the last piece")
     if not ok:
         FAILURES.append("sq_sum_pieces past the last piece")
 
-    def exact(tag, x):
-        got, _ = _sum_exact(x)
-        want = _exactly_rounded(x)
+    def exact(tag, x, sh=None):
+        got, _ = _sum_exact(x, sh)
+        want = _exactly_rounded(x, sh)
         ok = got == want
         print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact {tag}: {got!r}" + ("" if ok else f" want {want!r}"))
         if not ok:
             FAILURES.append(f"sum_exact {tag}")
 
-    exact("of the pieces", out[:pieces])
+    exact("of the pieces", out[:pieces], shift[:pieces])
     # 1.0 sets the fixed point; each (2 - 2^-23) * 2^-37 fills the low word to
     # just under 2^64 units, so every add after the first carries.
     exact("carrying", torch.cat([torch.ones(1), torch.full((1000,), (2 - 2 ** -23) * 2 ** -36)]))
     exact("zeros and subnormals", torch.tensor([0.0, 1e-45, 3e-40, 0.0, 2e-38]))
     exact("random magnitudes", torch.rand(5000, generator=g) * torch.exp2(torch.randint(-60, 20, (5000,), generator=g)))
+    exact("shifted past f32", torch.tensor([1.5, 1.25, 1.0, 0.0]), torch.tensor([252, 250, -252, 252], dtype=torch.int32))
     dropped, _ = _sum_exact(torch.tensor([1.0, 2.0 ** -100]))
     ok = dropped == 1.0
     print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact: a value 2^-100 of the largest is dropped ({dropped!r})")
@@ -1061,6 +1098,17 @@ def case_sq_sum_pieces(seed):
         print(f"  [{'ok  ' if ok else 'FAIL'}] sum_exact {tag}: {got!r} (top {top:#x})")
         if not ok:
             FAILURES.append(f"sum_exact {tag}")
+    # A non-finite element makes its piece that value's |bits| with shift 0.
+    for tag, bad, want_bits in (("inf", float("inf"), 0x7F800000), ("nan", float("nan"), 0x7FC00000)):
+        gbad = gf.clone()
+        gbad[200] = -bad
+        o, k = _pieces(dict(n_slots=1, s0_bf16=0, s0_start=100, s0_rows=1, s0_width=9000, s0_ld=9000, s0_off=0),
+                       gbad, gb, 3, 0)
+        bits = int(o.view(torch.int32)[0]) & 0xFFFFFFFF
+        ok = bits == want_bits and int(k[0]) == 0 and bool(torch.isfinite(o[1:]).all())
+        print(f"  [{'ok  ' if ok else 'FAIL'}] sq_sum_pieces {tag}: its piece is {bits:#x}, shift {int(k[0])}")
+        if not ok:
+            FAILURES.append(f"sq_sum_pieces {tag}")
 
 
 def _expand_macros(src):

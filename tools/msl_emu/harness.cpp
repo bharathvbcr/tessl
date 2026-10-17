@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
             qwen35_adamw_f32(p, g, m, v, a, rows, width, ld, off, uint2(id.gid.x, id.gid.y));
         });
     } else if (kname == "qwen35_sq_sum_pieces") {
-        // Qwen35Model::grad_sq_norm's first dispatch: one threadgroup of 256
+        // sq_norm's first dispatch: one threadgroup of 256
         // per piece over the slot table, which the host writes as the Rust
         // host does, with this process's pointers for GPU addresses: slot i
         // is a window of `g` (f32) or `gb` (bf16) starting `s{i}_start`
@@ -462,17 +462,19 @@ int main(int argc, char **argv) {
             pieces += s.rows * s.pieces_per_row;
         }
         float *out = F("out");
+        int *shift = reinterpret_cast<int *>(U("shift"));
         launch(uint3(pieces, 1, 1), uint3(256, 1, 1), 0, [&](const Ids &id, float *) {
-            qwen35_sq_sum_pieces(slots.data(), n_slots, out, id.tg.x, id.lid, id.lane, id.sg,
+            qwen35_sq_sum_pieces(slots.data(), n_slots, out, shift, id.tg.x, id.lid, id.lane, id.sg,
                                  (id.tptg + emu::SIMD - 1) / emu::SIMD);
         });
     } else if (kname == "qwen35_sum_exact_f32") {
-        // Qwen35Model::grad_sq_norm's second dispatch: one threadgroup of 256.
+        // sq_norm's second dispatch: one threadgroup of 256.
         const uint n = P("n");
         float *x = F("x");
         uint *out = U("out");
+        const int *shift = reinterpret_cast<const int *>(U("shift"));
         launch(uint3(1, 1, 1), uint3(256, 1, 1), 0,
-               [&](const Ids &id, float *) { qwen35_sum_exact_f32(x, out, n, id.lid); });
+               [&](const Ids &id, float *) { qwen35_sum_exact_f32(x, out, n, shift, id.lid); });
     } else {
         std::fprintf(stderr, "harness: unknown kernel %s\n", kname.c_str());
         return 2;

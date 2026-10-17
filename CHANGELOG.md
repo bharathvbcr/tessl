@@ -6,6 +6,32 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`tessl::sq_norm`: the global gradient norm over any windows.** What
+  `Qwen35Model::grad_sq_norm` ran, for any set of f32 or bf16 windows of this
+  runtime's buffers: `SqNormPlan::new` checks the windows and builds the
+  table, `SqNormPlan::encode` records the two dispatches into caller buffers
+  without waiting (for a caller with its own scratch pool and wait, as
+  ojas-metal's `clip_grad_norm` now is), `decode_sq_norm` rounds the result
+  once, and `sq_norm` does all of it. `grad_sq_norm` is that over the model's
+  gradients, with no change to its signature or to the C and Python entries.
+
+### Fixed
+
+- **`grad_sq_norm` no longer overflows or underflows on extreme gradients.**
+  `qwen35_sq_sum_pieces` squared raw values, so a gradient above about 1.8e19
+  made the norm +inf and gradients near 1e-25 made it 0. Each 4096-element
+  piece is now scaled by the power of two that brings its largest |x| into
+  [1, 2) before it is squared, and `qwen35_sum_exact_f32` places each piece by
+  its own shift (a sixth result word carries the fixed point's exponent). A
+  power of two scales every product and add exactly, so in-range results keep
+  their bits; the result is finite for any finite gradients and still the
+  exact sum rounded once. `tests/qwen35_adamw.rs`
+  `grad_sq_norm_of_huge_and_tiny_gradients_is_exact` (2^±100 gradients) fails
+  on the old kernels; `tools/msl_emu` checks the shifts and the shifted
+  finish.
+
 ### Changed
 
 - **`kernel_coverage` is Rust and takes an allowlist.** `bench/kernel_coverage.py`

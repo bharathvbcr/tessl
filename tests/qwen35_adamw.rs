@@ -1255,6 +1255,48 @@ fn grad_sq_norm_is_the_exact_sum_rounded_once() {
     );
 }
 
+/// Gradients whose squares leave f32's range are still summed exactly: every
+/// gradient `m * 2^s` with `m` in `0..32` and one `s` for the whole bank, at
+/// `s = 100` (each square near 2^210, past f32's 2^128) and `s = -100` (near
+/// 2^-200, below f32's smallest subnormal), on f32 and bf16 banks. Each
+/// piece's prescale is a power of two, so the result is the exact sum
+/// `sum(m^2) * 2^(2s)` rounded once: finite and nonzero, where squaring
+/// unscaled gave +inf and 0.
+#[test]
+fn grad_sq_norm_of_huge_and_tiny_gradients_is_exact() {
+    let cfg = Qwen35Config {
+        vocab: 1000,
+        ..Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap()
+    };
+    for precision in [Precision::F32, Precision::Bf16] {
+        let rt = GpuRuntime::new().unwrap();
+        let model = Qwen35Model::random_tower(&rt, cfg.clone(), precision, 3).unwrap();
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let m = |i: usize| ((i as u64).wrapping_mul(0x9e37_79b9) >> 7) % 32;
+        for s in [100i32, -100] {
+            fill_bank(&bank, |_, i| m(i) as f32 * 2f32.powi(s));
+            // m^2 < 2^10, so the integer sum is exact in u128 and its f64
+            // rounding times 2^(2s) is the exact sum rounded once.
+            let units: u128 = host_squares(&rt, &model, &bank)
+                .iter()
+                .map(|&q| {
+                    let u = q * 2f64.powi(-2 * s);
+                    assert_eq!(u.fract(), 0.0);
+                    u as u128
+                })
+                .sum();
+            let want = units as f64 * 2f64.powi(2 * s);
+            assert!(want.is_finite() && want > 0.0);
+            let got = model.grad_sq_norm(&bank).unwrap();
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{precision:?} at 2^{s}: grad_sq_norm {got:e}, the exact sum rounded once {want:e}"
+            );
+        }
+    }
+}
+
 /// Per-entry moment copies are the whole-table copies' bits for each moment
 /// storage, a write of a read is the same state (8-bit included), a write
 /// lands in its entry alone, and a bad index or length or a busy runtime is

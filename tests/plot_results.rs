@@ -38,6 +38,9 @@ mod paired;
 #[path = "../src/bin/plot_results/registry.rs"]
 mod registry;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/resample.rs"]
+mod resample;
+#[allow(dead_code)]
 #[path = "../src/bin/plot_results/small_m.rs"]
 mod small_m;
 #[allow(dead_code)]
@@ -384,6 +387,7 @@ const ALL: &[(&str, &str)] = &[
     ("tok", "embedgemma2_tok_m5pro"),
     ("video", "embedgemma2_video_m5pro"),
     ("media-decode", "media_decode_m5pro"),
+    ("media-resample", "media_resample_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------

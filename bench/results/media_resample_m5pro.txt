@@ -1,0 +1,17 @@
+workload                         stage                            ms min  ms median  audio s
+audio_30s_44k_stereo.flac        native decode                    29.884     42.470    30.00
+audio_30s_44k_stereo.flac        swresample                       60.213     67.518    30.00
+audio_30s_44k_stereo.flac        audiotoolbox                    272.225    315.500    30.00
+audio_30s_44k_stereo.flac        swresample converter alone       10.493     18.846    30.00
+audio_30s_44k_stereo.m4a         native decode                    10.751     14.961    30.00
+audio_30s_44k_stereo.m4a         swresample                       41.845     50.897    30.00
+audio_30s_44k_stereo.m4a         audiotoolbox                    234.521    286.845    30.00
+audio_30s_44k_stereo.m4a         swresample converter alone       10.803     14.441    30.00
+audio_30s_44k_stereo.mp3         native decode                    33.387     46.797    30.00
+audio_30s_44k_stereo.mp3         swresample                       56.046     87.838    30.00
+audio_30s_44k_stereo.mp3         audiotoolbox                    170.386    188.405    30.00
+audio_30s_44k_stereo.mp3         swresample converter alone        8.324      8.779    30.00
+audio_30s_44k_stereo.wav         native decode                     1.311      1.393    30.00
+audio_30s_44k_stereo.wav         swresample                       17.146     18.207    30.00
+audio_30s_44k_stereo.wav         audiotoolbox                    144.516    221.689    30.00
+audio_30s_44k_stereo.wav         swresample converter alone       10.466     13.154    30.00

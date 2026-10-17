@@ -2716,7 +2716,7 @@ and HEVC decoders go through VideoToolbox, which opens IOKit: under the sandbox 
 never silently ("pixel data is shorter than its size", "no frame could be decoded"; verified by
 running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
 and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
-and `tests/media_leaks.rs` are on `scripts/hosted_tests.txt` together with the 13 unit tests
+and `tests/media_leaks.rs` are on `scripts/hosted_tests.txt` together with the 14 unit tests
 of `media::`; `tests/media_codecs.rs` (HEIC, H.264, HEVC: 8 tests) and
 `tests/media_codecs_leaks.rs` are local-only (`cargo test --release --test media_codecs`) and
 fail in the sandbox by construction, which is what `hosted_completeness` needs (a test that
@@ -2737,6 +2737,18 @@ bytes with a temporary file, a refused file), and asserts that no temporary file
 **`leaks --atExit` reported 0 leaks for 0 bytes** on all four test binaries: `media_decode`
 (21 tests, 12385 nodes malloced), `media_codecs` (8 tests, 13335 nodes), `media_leaks`
 (5135 nodes) and `media_codecs_leaks` (16416 nodes), run with `--test-threads=1`.
+
+### Debug builds and the Objective-C encodings
+
+`objc2` checks every `msg_send!` argument and return type against the method's runtime
+encoding in debug builds only. A debug run of `media_codecs` (not part of the release gates)
+found that `copyNextSampleBuffer` was declared as returning `*const c_void` (`^v`) while the
+runtime reports `^{opaqueCMSampleBuffer=}`: harmless in release (same ABI), a panic on every
+video decode in a debug build. Fixed with an `OpaqueCmSampleBuffer` pointee, and
+`media::video::tests::the_encodings_used_for_avfoundation_returns_are_the_runtimes` holds
+that return, `preferredTransform` and `nominalFrameRate` to the runtime's encodings in every
+profile (it fails against the old type, with `^v` against `^{opaqueCMSampleBuffer=}`). All 31
+integration tests and the unit tests pass in the debug profile too.
 
 ### End to end
 

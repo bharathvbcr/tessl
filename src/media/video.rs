@@ -32,13 +32,12 @@
 //! could not be checked here (it is not installed), so [`Rotation::Ignore`]
 //! returns the frames as stored.
 
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use block2::RcBlock;
-use objc2::encode::{Encode, Encoding};
+use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::msg_send;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
@@ -71,6 +70,22 @@ unsafe impl Encode for CmTime {
         "?",
         &[Encoding::LongLong, Encoding::Int, Encoding::UInt, Encoding::LongLong],
     );
+}
+
+/// The pointee of a `CMSampleBufferRef` (`struct opaqueCMSampleBuffer`). objc2
+/// checks a `msg_send!` return type against the method's encoding in debug
+/// builds, and the runtime spells `copyNextSampleBuffer`'s return
+/// `^{opaqueCMSampleBuffer=}`; a `*const c_void` (`^v`) passes in release (the
+/// ABI is the same) and panics in debug.
+#[repr(C)]
+struct OpaqueCmSampleBuffer {
+    _private: [u8; 0],
+}
+
+// SAFETY: a pointer to `struct opaqueCMSampleBuffer` is encoded
+// `^{opaqueCMSampleBuffer=}`, which is what the runtime reports for the method.
+unsafe impl RefEncode for OpaqueCmSampleBuffer {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("opaqueCMSampleBuffer", &[]));
 }
 
 /// `CGAffineTransform` (`CGAffineTransform.h`): six `CGFloat` (`double`).
@@ -789,8 +804,8 @@ fn next_sample(output: &Retained<AnyObject>) -> Option<CfRef> {
     // the method returns a CMSampleBufferRef the caller owns (CF_RETURNS_RETAINED)
     // or NULL, so it is taken as an owned CF reference.
     unsafe {
-        let sb: *const c_void = msg_send![&**output, copyNextSampleBuffer];
-        CfRef::take(sb)
+        let sb: *const OpaqueCmSampleBuffer = msg_send![&**output, copyNextSampleBuffer];
+        CfRef::take(sb.cast())
     }
 }
 
@@ -992,4 +1007,43 @@ fn convert_frame(
         return Ok(orient::apply(orientation, rgb, w, h, 3));
     }
     Ok((rgb, w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2::encode::Encode;
+    use objc2::runtime::{AnyClass, Sel};
+    use objc2::sel;
+
+    use super::{CgAffineTransform, OpaqueCmSampleBuffer};
+
+    /// What the Objective-C runtime says an instance method of `class` returns.
+    fn runtime_return(class: &std::ffi::CStr, sel: Sel) -> String {
+        let cls = AnyClass::get(class).unwrap_or_else(|| panic!("{class:?} is not loaded"));
+        let method = cls
+            .instance_method(sel)
+            .unwrap_or_else(|| panic!("{class:?} has no method {sel:?}"));
+        method.return_type().to_str().expect("an ASCII encoding").to_owned()
+    }
+
+    /// objc2 compares a `msg_send!` return type with the method's encoding only
+    /// in debug builds, so a wrong type passes every release test and panics in
+    /// the first debug run (`^v` for `^{opaqueCMSampleBuffer=}` did). This holds
+    /// the Rust encodings used for AVFoundation returns to the runtime's, in
+    /// every profile.
+    #[test]
+    fn the_encodings_used_for_avfoundation_returns_are_the_runtimes() {
+        assert_eq!(
+            runtime_return(c"AVAssetReaderOutput", sel!(copyNextSampleBuffer)),
+            <*const OpaqueCmSampleBuffer as Encode>::ENCODING.to_string(),
+        );
+        assert_eq!(
+            runtime_return(c"AVAssetTrack", sel!(preferredTransform)),
+            CgAffineTransform::ENCODING.to_string(),
+        );
+        assert_eq!(
+            runtime_return(c"AVAssetTrack", sel!(nominalFrameRate)),
+            f32::ENCODING.to_string()
+        );
+    }
 }

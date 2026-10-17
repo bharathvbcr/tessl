@@ -80,12 +80,10 @@ fn video_frames_match_ffmpeg_and_the_source_colours() {
             "{name}: a decoded colour is {worst_colour} from the source"
         );
         if name == "colors.mp4" {
-            // Both convert BT.709 limited-range YUV to RGB, with different
-            // rounding: 2 levels apart at most (measured), on every byte.
-            assert!(
-                worst_ffmpeg.0 <= 3 && worst_ffmpeg.1 < 2.5,
-                "{name}: vs ffmpeg {worst_ffmpeg:?}"
-            );
+            // The default path decodes the planes with VideoToolbox and converts
+            // them with libswscale's arithmetic (src/media/yuv.rs), so every
+            // byte equals the ffmpeg CLI's.
+            assert_eq!(worst_ffmpeg, (0, 0.0), "{name}: vs ffmpeg (max, mean)");
         }
     }
 }

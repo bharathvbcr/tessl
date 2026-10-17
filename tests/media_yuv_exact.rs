@@ -88,7 +88,12 @@ fn random_planes_convert_as_ffmpeg_does_on_both_converters() {
         // one flavor against the other's golden would fail rather than pass by luck.
         let a = convert(c.width, c.height, &planes, c.matrix, c.range, Flavor::Aarch64);
         let p = convert(c.width, c.height, &planes, c.matrix, c.range, Flavor::Portable);
-        assert_eq!(a == p, c.width % 16 != 0, "{}: flavors equal only off the NEON widths", c.name);
+        assert_eq!(
+            a == p,
+            c.width % 16 != 0,
+            "{}: flavors equal only off the NEON widths",
+            c.name
+        );
         neon_widths_differ |= c.width % 16 == 0 && a != p;
     }
     assert!(neon_widths_differ, "no case exercised the NEON converter");
@@ -123,7 +128,10 @@ fn a_stride_wider_than_the_row_is_skipped_not_read() {
         Flavor::Aarch64,
     )
     .unwrap();
-    assert_eq!(got, convert(c.width, c.height, &planes, c.matrix, c.range, Flavor::Aarch64));
+    assert_eq!(
+        got,
+        convert(c.width, c.height, &planes, c.matrix, c.range, Flavor::Aarch64)
+    );
 }
 
 #[test]
@@ -234,7 +242,16 @@ fn exhaustive_against_a_live_ffmpeg() {
                 if cpu {
                     cmd.args(["-cpuflags", "0"]);
                 }
-                cmd.args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "512x512", "-colorspace", tag]);
+                cmd.args([
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-s",
+                    "512x512",
+                    "-colorspace",
+                    tag,
+                ]);
                 cmd.args(["-color_range", range_tag, "-i"]).arg(&input);
                 cmd.args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]);
                 let out = cmd.output().expect("ffmpeg runs").stdout;
@@ -245,7 +262,10 @@ fn exhaustive_against_a_live_ffmpeg() {
                     let want = &out[b * 512 * 512 * 3..(b + 1) * 512 * 512 * 3];
                     bad += mine.iter().zip(want).filter(|(a, b)| a != b).count();
                 }
-                eprintln!("{tag} {range_tag} {flavor:?}: {bad} of {} bytes differ", 64 * 512 * 512 * 3);
+                eprintln!(
+                    "{tag} {range_tag} {flavor:?}: {bad} of {} bytes differ",
+                    64 * 512 * 512 * 3
+                );
                 if bad != 0 {
                     failures.push(format!("{tag} {range_tag} {flavor:?}: {bad} bytes"));
                 }

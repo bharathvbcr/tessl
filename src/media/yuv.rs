@@ -100,7 +100,7 @@ pub enum Flavor {
 
 impl Flavor {
     fn uses_neon(self, width: usize) -> bool {
-        self == Flavor::Aarch64 && width.is_multiple_of(16)
+        self == Flavor::Aarch64 && width % 16 == 0
     }
 }
 
@@ -111,7 +111,11 @@ pub enum YuvError {
     /// has even sides; libswscale filters odd ones, which this module does not).
     Size { width: usize, height: usize },
     /// A plane is shorter than its stride and height need.
-    Plane { plane: &'static str, have: usize, need: usize },
+    Plane {
+        plane: &'static str,
+        have: usize,
+        need: usize,
+    },
 }
 
 impl fmt::Display for YuvError {
@@ -283,7 +287,12 @@ impl Table {
             t.gu[c as usize] = offset(igu, c) as i32;
             t.gv[c as usize] = offset(igv, c) as i32;
         }
-        let spread = |a: &[i32; 256]| (i64::from(*a.iter().min().unwrap_or(&0)), i64::from(*a.iter().max().unwrap_or(&0)));
+        let spread = |a: &[i32; 256]| {
+            (
+                i64::from(*a.iter().min().unwrap_or(&0)),
+                i64::from(*a.iter().max().unwrap_or(&0)),
+            )
+        };
         let (rl, rh) = spread(&t.rv);
         let (bl, bh) = spread(&t.bu);
         let (ul, uh) = spread(&t.gu);
@@ -312,7 +321,7 @@ impl Table {
 }
 
 fn check(p: &Nv12<'_>) -> Result<(), YuvError> {
-    if p.width == 0 || p.height == 0 || !p.width.is_multiple_of(2) || !p.height.is_multiple_of(2) {
+    if p.width == 0 || p.height == 0 || p.width % 2 != 0 || p.height % 2 != 0 {
         return Err(YuvError::Size {
             width: p.width,
             height: p.height,
@@ -369,7 +378,11 @@ fn fill(p: &Nv12<'_>, out: &mut [u8], px: impl Fn(u8, u8, u8) -> [u8; 3]) {
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
         let chroma = &p.uv[(row / 2) * p.uv_stride..(row / 2) * p.uv_stride + w];
         let dst = &mut out[row * w * 3..(row + 1) * w * 3];
-        for ((ys, cs), d) in luma.chunks_exact(2).zip(chroma.chunks_exact(2)).zip(dst.chunks_exact_mut(6)) {
+        for ((ys, cs), d) in luma
+            .chunks_exact(2)
+            .zip(chroma.chunks_exact(2))
+            .zip(dst.chunks_exact_mut(6))
+        {
             let (u, v) = (cs[0], cs[1]);
             d[..3].copy_from_slice(&px(ys[0], u, v));
             d[3..].copy_from_slice(&px(ys[1], u, v));

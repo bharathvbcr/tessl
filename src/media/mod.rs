@@ -42,6 +42,7 @@ mod integrity;
 mod mp3;
 mod orient;
 pub mod video;
+mod vt;
 pub mod yuv;
 
 pub use audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, DecodedAudio, Downmix};

@@ -103,7 +103,11 @@ pub fn facts() -> Vec<Fact> {
         .filter(|l| l.starts_with("video "))
         .map(|l| {
             let (_, name, m) = kv(l);
-            let get = |k: &str| m.get(k).unwrap_or_else(|| panic!("{name}: facts.txt has no {k}")).as_str();
+            let get = |k: &str| {
+                m.get(k)
+                    .unwrap_or_else(|| panic!("{name}: facts.txt has no {k}"))
+                    .as_str()
+            };
             let list = |k: &str| -> Vec<&str> { get(k).split(',').filter(|s| !s.is_empty()).collect() };
             Fact {
                 width: get("w").parse().unwrap(),
@@ -122,7 +126,10 @@ pub fn facts() -> Vec<Fact> {
                     .map(|(k, v)| {
                         (
                             k.clone(),
-                            v.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().unwrap()).collect(),
+                            v.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(|x| x.parse().unwrap())
+                                .collect(),
                         )
                     })
                     .collect(),

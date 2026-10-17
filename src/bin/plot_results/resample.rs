@@ -49,7 +49,7 @@ pub fn resample(json: &Path) -> R<Output> {
         LegendItem::boxed("libswresample's algorithm, in Rust (default)", BLUE),
         LegendItem::boxed("AudioToolbox AudioConverter", ORANGE),
         LegendItem::boxed("the Rust converter alone, one channel", GREEN),
-        LegendItem::line("median", "#0b0b0b", false),
+        LegendItem::ink_line("median", false),
     ];
     let mut fig = Figure::new(
         1100.0,

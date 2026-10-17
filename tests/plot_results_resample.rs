@@ -88,7 +88,10 @@ fn it_draws_a_bar_and_a_median_per_row_and_a_key_per_stage() {
     assert_eq!(svg.matches("class=\"bar\"").count(), rows);
     assert_eq!(svg.matches("class=\"median sk\"").count(), rows);
     // Four stages and the median tick.
-    assert_eq!(svg.matches("class=\"key\"").count(), 5);
+    assert_eq!(
+        svg.matches("class=\"key\"").count() + svg.matches("class=\"key sk\"").count(),
+        5
+    );
     for stage in ["swresample", "audiotoolbox", "native decode"] {
         assert!(svg.contains(stage), "{stage}");
     }

@@ -262,6 +262,7 @@ func TestUnitClosedAndDeadModelsRefuseCallsWithoutTouchingTheEngine(t *testing.T
 		"Tokenize":   func() error { _, err := m.Tokenize(ctx, []string{"a"}, ""); return err },
 		"Decode":     func() error { _, err := m.Decode(ctx, []uint32{1}, true); return err },
 		"Prompts":    func() error { _, err := m.Prompts(ctx); return err },
+		"Ping":       func() error { return m.Ping(ctx) },
 		"SetMax":     func() error { return m.SetMaxTokens(ctx, 10) },
 		"Images":     func() error { _, err := m.EmbedImages(ctx, []Image{rgb(2, 2)}, 0); return err },
 		"Mixed":      func() error { _, err := m.EmbedMixed(ctx, [][]Segment{{Text("a")}}, 0); return err },

@@ -221,6 +221,15 @@ func (m *Model) Close() error {
 	return errors.Join(freeErr, m.h.Close())
 }
 
+// Ping makes a round trip to the Model's worker that does no work: no tessl
+// call, no model access. It reports a worker that is alive and a handle that is
+// open, and it is the floor of the boundary's cost (the overhead benchmark
+// measures it). It queues behind calls already running, like any other.
+func (m *Model) Ping(ctx context.Context) error {
+	_, err := m.call(ctx, "Ping", wire.OpPing, new(wire.Frame))
+	return err
+}
+
 // EmbeddingDim is the width of an untruncated embedding, and the largest
 // truncateDim.
 func (m *Model) EmbeddingDim() int { return m.dim }

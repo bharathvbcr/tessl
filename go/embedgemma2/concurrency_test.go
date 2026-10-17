@@ -147,9 +147,12 @@ func TestDeviceManyGoroutinesGiveTheSerialResultsOnABoundedThreadCount(t *testin
 		}
 		t.Logf("%3d goroutines, %d calls in %v: OS threads %d before, %d at the peak", goroutines, totalCalls, elapsed.Round(time.Millisecond), before, peaks[goroutines])
 	}
-	// 256 goroutines cost no more threads than 8 (within runtime noise), and
-	// stay far below one thread per goroutine.
-	if peaks[256] > peaks[8]+6 {
+	// 256 goroutines cost few more threads than 8 (the Go runtime's own: the
+	// measured growth from 8 to 256 goroutines was 3 to 7 threads over five runs
+	// on an 18-core M5 Pro under load), and stay far below one thread per
+	// goroutine. The absolute bound below carries the claim; this one only
+	// catches growth that tracks the goroutine count.
+	if peaks[256] > peaks[8]+10 {
 		t.Errorf("thread peak grew from %d (8 goroutines) to %d (256 goroutines)", peaks[8], peaks[256])
 	}
 	if peaks[256] > start+32 {

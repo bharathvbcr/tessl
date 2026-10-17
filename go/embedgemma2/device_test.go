@@ -505,6 +505,31 @@ func TestDeviceLoadFailuresAreTypedAndLeaveNothingBehind(t *testing.T) {
 	}
 }
 
+func TestDevicePingReachesTheWorkerWithoutTouchingTheModel(t *testing.T) {
+	f := loadFixtures(t)
+	var seen []embedgemma2.CallInfo
+	m := loadOwn(t, embedgemma2.Options{TextOnly: true, Observer: func(ci embedgemma2.CallInfo) { seen = append(seen, ci) }})
+	if err := m.Ping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	last := seen[len(seen)-1]
+	if last.Op != "Ping" || last.Err != nil || last.RequestBytes != 0 {
+		t.Fatalf("observed %+v", last)
+	}
+	// A ping queues behind a call in flight and leaves the model as it was.
+	if _, err := m.EmbedTexts(context.Background(), f.m.Texts[:2], "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Ping(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.Ping(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a ping under a cancelled context: %v", err)
+	}
+}
+
 func TestDeviceObserverSeesWorkInsideTessl(t *testing.T) {
 	f := loadFixtures(t)
 	var seen []embedgemma2.CallInfo

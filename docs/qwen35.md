@@ -1020,7 +1020,9 @@ scale per parameter-table entry, as torch's one param group per entry does:
 the scaled rate forms both the decoupled decay factor and the step size, and
 a scale of 0 keeps the entry's bits while its moments still update.
 Clipping is the caller's: `grad_sq_norm`
-gives the square of the global gradient norm, and `grad_scale` multiplies
+gives the square of the global gradient norm (`tessl::sq_norm` over the
+gradients: deterministic, the exact sum rounded once, finite for any finite
+gradients), and `grad_scale` multiplies
 every gradient by `clip_grad_norm_`'s coefficient inside the update, with
 no pass over the gradients and the stored ones left unscaled; the caller
 forms the coefficient so gradients outside tessl join the norm.

@@ -158,5 +158,9 @@ name = "bench_media_resample"
 path = "src/bin/bench_media_resample.rs"
 
 [[bin]]
+name = "bench_jpeg_decode"
+path = "src/bin/bench_jpeg_decode.rs"
+
+[[bin]]
 name = "bench_encoder_attn"
 path = "src/bin/bench_encoder_attn.rs"

@@ -103,6 +103,11 @@ pub const PLOTS: &[Plot] = &[
         file: "media_video_color_m5pro.json",
         render: crate::video_color::video_color,
     },
+    Plot {
+        name: "jpeg-decode",
+        file: "jpeg_decode_m5pro.json",
+        render: crate::jpeg::jpeg_decode,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Plot> {

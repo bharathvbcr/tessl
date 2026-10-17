@@ -14,6 +14,9 @@ mod chart;
 #[path = "../src/bin/plot_results/data.rs"]
 mod data;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/jpeg.rs"]
+mod jpeg;
+#[allow(dead_code)]
 #[path = "../src/json.rs"]
 mod json;
 #[allow(dead_code)]

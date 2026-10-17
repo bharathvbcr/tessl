@@ -2761,8 +2761,9 @@ the same pattern and were not measured held-back.
 
 `tessl::media` turns an image, audio or video file (or its bytes) into the raw inputs
 `tessl::embedgemma2_pre` takes, with no Python and no new crates, through the system
-frameworks: ImageIO and CoreGraphics for images, AudioToolbox for audio, AVFoundation for
-video. macOS only. The C declarations are this crate's own, written from the SDK headers;
+frameworks: ImageIO and CoreGraphics for images (JPEG excepted: a pure-Rust decoder, below),
+AudioToolbox for audio, AVFoundation for video. macOS only. The C declarations are this
+crate's own, written from the SDK headers;
 AVFoundation goes through `objc2`'s `msg_send!` and `block2`, which the crate already
 depends on.
 
@@ -2803,7 +2804,9 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
   `ImageOps.exif_transpose` and `convert("RGB")` is taken for a PIL image and by
   `transformers.image_utils.load_image`. The defaults here follow the first;
   `ExifOrientation::Apply` is the second. torchvision and PIL gave the same bytes on every
-  fixture tried, JPEG and CMYK included.
+  fixture tried, JPEG and CMYK included (and on all 162 JPEG fixtures of
+  `tests/fixtures/jpeg/` that torchvision decodes; the manifest records PIL's verdict per
+  case).
 - **Audio path string.** Read from the installed sources: the processor's
   `prepare_inputs_layout` (`transformers/processing_utils.py:739-740`) calls
   `feature_extractor.fetch_audio(path, sampling_rate=16000)`
@@ -2868,16 +2871,19 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
   first GIF frame, a Display-P3 PNG's raw samples).
 - **sRGB context** (CMYK, float, packed or unusual formats, or `ColorHandling::Srgb` on an
   image that is not sRGB): the image is drawn into an sRGB bitmap context and un-premultiplied.
-  `ImageInfo::path` says which ran. A CMYK JPEG goes this way and is close to PIL's
-  conversion, not equal to it.
+  `ImageInfo::path` says which ran. A CMYK JPEG goes this way only when `ColorHandling::Srgb`
+  is asked for; by default it takes the native JPEG path and equals PIL's and torchvision's
+  conversion (below).
 - **16-bit**: PIL takes the high byte (`v >> 8`) of 16-bit RGB, RGBA and gray+alpha; pure
   16-bit gray (`I;16`) goes through `convert("RGB")`, which clips to `min(v, 255)`. Measured
   on PIL, reproduced by default; `Gray16::HighByte` takes the high byte of gray too.
-- **JPEG** is the only lossy case with an oracle, and is *not* bit-exact: ImageIO's decoder is
-  not libjpeg-turbo. Against libjpeg-turbo: 4:2:0 `rgb.jpg` max 43, mean 0.745, 3083 of
-  9216 bytes differ; 4:4:4 max 3, mean 0.169; gray max 1, mean 0.057 (bounds fixed in
-  `jpeg_differs_from_the_oracle_by_a_measured_bound`: max 48, mean 1.0). The difference is the
-  chroma upsampling of 4:2:0. End to end it is 0.9986 cosine (below).
+- **JPEG** (with the default `ColorHandling::Native`) takes the native decoder of
+  `tessl::media::jpeg` (`DecodePath::Jpeg`, next section), which is byte for byte
+  libjpeg-turbo's. ImageIO's JPEG decoder is not libjpeg-turbo (4:2:0 `rgb.jpg`: max 43, mean
+  0.745, 3083 of 9216 bytes differ; 4:4:4 max 3, mean 0.169; gray max 1, mean 0.057, which
+  cost JPEG embeddings 0.9986 cosine); it stays reachable as
+  `decode_image_imageio`, and `jpeg_equals_the_oracle_byte_for_byte_and_imageio_does_not`
+  holds both facts (ImageIO within max 48, mean 1.0 of the oracle).
 - **HEIC** has no libheif/torchvision oracle here; it is compared with the picture it was
   made from (`sips`): mean 5.10, max 155 (bound: mean below 6), which is the codec's loss.
 - **EXIF**: all eight orientations are applied by `orient` when asked, checked against PIL's
@@ -2892,6 +2898,97 @@ formats cut at about every 1/97 of their length (`every_truncation_is_an_error_o
 plus HEIC in `media_codecs`): every cut fails, except cuts after a GIF's first frame, which
 decode that frame, and cuts that drop only a trailer. Without that check the sweep found
 zero-filled TIFF and BMP pictures (measured before it was added).
+
+### JPEG decoding
+
+`tessl::media::jpeg` (`src/media/jpeg/`, no dependency, no `unsafe`) decodes JPEG to RGB bytes
+that equal what `torchvision.io.decode_image(path, mode=RGB)` returns, so a JPEG embeds as
+sentence-transformers embeds the same file. `decode_image` routes `FF D8 FF` data with
+`ColorHandling::Native` to it; HEIC and every other format stay on ImageIO. EXIF orientation
+behaves as before: the tag is read from the first Exif APP1 segment (bounded parse), stored in
+`ImageInfo::exif_orientation`, and applied only for `ExifOrientation::Apply`.
+
+**The reference** (established by reading what torchvision's `decode_jpeg` does and probing
+it, and held by 162 fixtures; the fixture generator's docstring repeats it): libjpeg-turbo 3.1.3 (the
+library bundled in the installed torchvision 0.29.1 wheel; libjpeg API 8; NEON SIMD on this
+arm64 machine), called as `jpeg_read_header`, `out_color_space = JCS_RGB` (for CMYK and YCCK,
+`JCS_CMYK`, then torchvision's own `v = k * cmy + 128; ((v >> 8) + v) >> 8`),
+`jpeg_start_decompress`, `jpeg_read_scanlines`, with libjpeg's defaults: `JDCT_ISLOW`, fancy
+upsampling on (so the merged upsampler is never selected), block smoothing on, 8-bit samples
+only. The source manager fails when libjpeg asks for a byte past the end of the data ("Image is
+incomplete or truncated"), so a stream with no EOI is an error. `decode_image` hands data to
+the JPEG decoder only when it starts `FF D8 FF`. PIL 12.3 bundles libjpeg-turbo 3.1.4.1 and
+returns the same bytes as torchvision on all 162 fixtures both decode, so the choice between
+the two candidate paths does not matter.
+
+**What is decoded.** Baseline and extended sequential (SOF0, SOF1) and progressive (SOF2)
+Huffman, and arithmetic-coded sequential and progressive (SOF9, SOF10; the Q-coder table is
+the reference library's); restart intervals; 8-bit; any sampling factors libjpeg takes
+(1 to 4 per direction, at most 10 blocks per MCU, integral ratios between components);
+1, 3 and 4 components, JFIF and Adobe APP14 (transform 0, 1, 2, unknown values, component ids
+`R G B`); libjpeg-turbo's accurate integer IDCT as its NEON code computes it (which differs
+from the C code only on out-of-range coefficients of corrupt data; dense blocks of +-32767
+and quantizers up to 65535 are in the fixtures); fancy h2v1 and h2v2 upsampling (and h1v2,
+plain and integer replication where libjpeg picks them); the 16-bit-fixed-point YCbCr tables.
+The structure follows libjpeg's own control flow, because equality has to hold on damaged
+files too: a bad Huffman code, a marker inside entropy data (the rest of the segment decodes
+as zeros), extraneous bytes before a marker and a wrong restart marker are warnings in
+libjpeg and decode, and decode here to the same pixels.
+
+**Refused by name** (`JpegError::Unsupported`, `MediaError::Unsupported`):
+
+- *Block smoothing.* libjpeg-turbo 3.1 smooths a progressive image whose scans stop before
+  AC coefficients 1 to 5 are complete (a truncated progressive file that still has its EOI)
+  from neighbouring DC values. The estimator was not reproduced (an estimator recalled from
+  libjpeg 6 differed from the reference by 3 to 12 levels), so such a stream is refused rather
+  than decoded to something that is not the reference's. Measured by decoding the five
+  committed cases with the refusal switched off: the plain-IDCT result differs from the
+  reference by max 12 to 99 and mean 1.18 to 15.9 per byte. A complete progressive file is
+  not affected. 5 of the 194 fixtures, 2 of the 468 corpus entries and 10 of 4000 live
+  mutants hit it.
+- *Lossless JPEG (SOF3).* The reference decodes it (libjpeg-turbo 3.x); this decoder does not.
+- *12-bit.* The reference's 8-bit build refuses it too, so this is agreement, not a gap.
+
+**Own bounds** (not the format's; each is checked before anything is allocated):
+`options.max_pixels` against the header's size, a working-memory ceiling of 6 GiB for
+coefficients, planes and output together (`MAX_WORKING_BYTES`), `JPEG_MAX_DIMENSION` 65500 as in
+libjpeg (a format error), and at most 256 scans (`MAX_SCANS`, libjpeg has no bound; a scan
+costs a pass over every block, so a file spending 14 bytes per scan could otherwise cost
+minutes). Hostile input is a named error (`Truncated`, `NotJpeg`, `Invalid`, `Unsupported`,
+`Limit`), never a panic.
+
+**Evidence** (`tests/media_jpeg.rs`, 11 tests plus one ignored; fixtures and the oracle's
+bytes in `tests/fixtures/jpeg/`, made by `scripts/gen_jpeg_fixtures.py` with PIL, `cjpeg`
+3.2.0 and the generator's own coefficient-level writer):
+
+| class | cases, all agreeing with the oracle |
+|---|---|
+| the subsamplings 4:4:4, 4:2:2, 4:2:0, 4:1:1 and 4:4:0, baseline (5) and progressive (5) | 10 |
+| other sampling factors (13 cjpeg `-sample` layouts, 4 of them also progressive) | 17 |
+| sizes (1x1, 1x9, 9x1, 2x2, 3x3, 7x13, 13x7, 8x8, 9x9, 17x15, 65x129, 4097x3, 3x4097; 4:2:0, 4:4:4, progressive, gray) | 52 |
+| restart markers (baseline, progressive, arithmetic, synthetic, 1 to 7 MCUs, per row) | 11 |
+| colour (CMYK and YCCK with and without Adobe, Adobe transform 0 to 9, RGB by Adobe and by component ids, YCbCr cubes) | 22 |
+| grayscale (baseline, progressive, arithmetic) | 3 |
+| quality 1 to 100 | 10 |
+| arithmetic (sequential, progressive, 4:4:4, 4:2:0, 4:2:2) | 5 |
+| IDCT extremes, layout (non-interleaved scans, every scan order, 10-block MCU), header oddities, tables (standard tables with no DHT, 16-bit DQT) | 26 |
+| refused by both the oracle and this decoder (12-bit, no EOI, cuts, 2/5/6/10 components, bad sampling, bad tables, bad signature, ...) | 32 |
+| refused by name, decoded by the oracle (block smoothing, lossless) | 6 |
+
+All 194 fixtures agree: 156 are byte-equal, 32 are refused by both and 6 are the named
+refusals above (5 block smoothing, 1 lossless). A corpus of 468 mutated JPEGs (26 bases, deterministic mutator) holds the
+oracle's verdict and pixels: 310 byte-equal, 156 refused by both, 2 named refusals, 0
+disagreements. The ignored `live_fuzz_against_the_oracle` regenerates mutants against
+torchvision (`scripts/gen_jpeg_fixtures.py --live-fuzz DIR COUNT SEED`): 4000 fresh mutants
+(seed 777): 2285 byte-equal, 1705 refused by both, 10 named refusals, 0 disagreements.
+`mutated_inputs_never_panic` decodes 6160 in-process mutants of 154 fixtures in release and in
+the debug profile (overflow checks on); every strict prefix of seven valid files is an error.
+That the oracle is torchvision's and that PIL agrees is held by
+`the_two_candidate_oracles_agree_on_every_fixture`.
+
+**End to end**: `photo.jpg` through the towers is now 2.09e-7 max abs, cosine 1.000000000
+against sentence-transformers (was 7.25e-3, 0.998566), and holds the exact-decode bounds
+(see End to end).
 
 ### Audio
 
@@ -3180,7 +3277,8 @@ never silently ("pixel data is shorter than its size", "no frame could be decode
 running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
 and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
 and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter against the `ffmpeg`
-binary, AAC, MP3 and Opus; no device) and `tests/plot_results_resample.rs` are on
+binary, AAC, MP3 and Opus; no device), `tests/media_jpeg.rs` (11 tests; the native JPEG decoder
+needs no framework, so it runs in the sandbox) and `tests/plot_results_resample.rs` are on
 `scripts/hosted_tests.txt` together with the 14 unit tests of `media::`; `tests/media_codecs.rs`
 (HEIC, H.264, HEVC: 8 tests), `tests/media_codecs_leaks.rs` and `tests/media_video_exact.rs`
 (8 tests) are local-only (`cargo test --release --test media_codecs`) and fail in the sandbox by
@@ -3227,17 +3325,18 @@ content (fp32, sdpa, CPU):
 |---|---|---|---|
 | `photo.png` (224x224) | the path | 1.34e-7 | 1.000000000 |
 | `clip16.wav` (16 kHz mono PCM16) | scipy's array | 1.57e-7 | 1.000000000 |
-| `photo.jpg` (4:2:0, q90) | the path | 7.25e-3 | 0.998566 |
+| `photo.jpg` (4:2:0, q90) | the path | 2.09e-7 | 1.000000000 |
 | `clip44.wav` (44.1 kHz stereo) | FFmpeg's 16 kHz decode, `-ac 1` (torchcodec's mix and resampler) | 1.74e-7 | 1.000000000 |
 | `clip44.m4a` (AAC) | the same | 7.07e-4 | 0.999987957 |
 | `clip44.mp3` (MP3, libmp3lame 128 kb/s) | the same | 9.69e-6 | 0.999999996 |
 
 (Before the Rust resampler `clip44.wav` was 1.29e-2 / 0.993142 and `clip44.m4a` 1.09e-2 /
 0.995248, against FFmpeg's channel *mean*; the reference script now gives sentence-transformers
-FFmpeg's default decode, which is what torchcodec returns.) Three decodes are exact and hold the
+FFmpeg's default decode, which is what torchcodec returns.) Four decodes are exact and hold the
 bounds of `tests/embedgemma2_e2e_model.rs` (1e-4, 0.99999) with three orders of magnitude to
-spare, `clip44.wav` among them: the 44.1 kHz stereo file is mixed and resampled to the bit as
-FFmpeg does. The JPEG differs by the IDCT and chroma upsampler (bounds 1e-2 / 0.998). The
+spare: `photo.jpg` through the native decoder (it was 7.25e-3 and 0.998566 through ImageIO,
+bound 1e-2 / 0.998, which no longer exists), and `clip44.wav`, the 44.1 kHz stereo file mixed
+and resampled to the bit as FFmpeg does. The
 AAC clip differs by AudioToolbox's decoder against FFmpeg's (first and last frame, above);
 its bounds are 1e-3 / 0.99998 and the MP3's 2e-5 / 0.9999999, from the measurements. Natural
 speech has little energy near 8 kHz, where the earlier resamplers differed.
@@ -3282,7 +3381,7 @@ indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
 | workload | ms (min) | per unit |
 |---|---|---|
 | 1920x1080 PNG | 19.8 | 9.6 ms per Mpixel |
-| 1920x1080 JPEG | 8.9 | 4.3 |
+| 1920x1080 JPEG (ImageIO, measured before the native decoder; see below) | 8.9 | 4.3 |
 | 1920x1080 TIFF | 5.0 | 2.4 |
 | 30 s 16 kHz mono WAV | 0.22 | 0.007 ms per audio s |
 | 30 s 44.1 kHz stereo WAV (resampled) | 158 | 5.3 |
@@ -3343,8 +3442,37 @@ comparison lane (torchvision, librosa) is timed: librosa and torchcodec are not 
 timing against subprocess FFmpeg would measure process start. Not compared: the `ffmpeg` binary's
 own speed (it is the same algorithm in C with NEON).
 
+**JPEG, native against ImageIO.** `bench_jpeg_decode` (inputs from
+`bench/make_jpeg_bench_inputs.py`) times `decode_image` (the native path) and
+`decode_image_imageio` on the same bytes, one call of each in turn per iteration, minimum of 40
+after 3 warm-ups. **Indicative only: the machine was shared with other agents and the medians
+move by tens of percent between runs** (`bench/results/jpeg_decode_m5pro.{txt,json,svg}`, plotted
+by `plot_results jpeg-decode`, whose own tests are in `tests/plot_results.rs`). The two paths do not
+return the same pixels (the native one is the reference's):
+
+| file | MP | native ms (min) | ImageIO ms (min) | native / ImageIO |
+|---|---|---|---|---|
+| 1080p 4:2:0 baseline | 2.07 | 11.6 | 10.4 | 1.12 |
+| 1080p 4:2:0 progressive | 2.07 | 19.9 | 19.1 | 1.04 |
+| 1080p 4:2:2 baseline | 2.07 | 12.8 | 10.6 | 1.21 |
+| 1080p 4:4:4 baseline | 2.07 | 18.8 | 13.3 | 1.41 |
+| 1080p gray | 2.07 | 7.3 | 6.4 | 1.13 |
+| 2160p 4:2:0 baseline | 8.29 | 49.4 | 38.0 | 1.30 |
+| 224x224 4:2:0 baseline | 0.05 | 0.30 | 0.29 | 1.03 |
+
+So the exact decoder costs 4 to 41 % more wall time than ImageIO on one thread (the 4:4:4 file,
+which has no chroma upsampling to hide behind, is the slowest relative to ImageIO). A sampled
+profile of the 1080p files put most native time in the output stage (chroma upsampling and
+colour conversion), then the IDCT, then Huffman decoding; the upsampling and colour loops were
+rewritten as slice iterations after it. A lane-parallel IDCT is the next candidate and was not
+tried.
+
 ### What is left
 
+- JPEG: libjpeg-turbo's block smoothing (progressive streams cut short before AC coefficients 1
+  to 5 are complete) and lossless SOF3 are refused by name, not decoded; see JPEG decoding. The
+  smoothing estimator would need to be derived from the reference's behaviour (the fixtures
+  `smoothing_*` hold its output) or from the library source, which was not on this machine.
 - torchcodec itself is not in the environment: the video reference is the `ffmpeg` CLI and
   torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
   the last inferred step. What it does with a rotation flag is unverified (the default here

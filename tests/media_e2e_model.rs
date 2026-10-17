@@ -1,5 +1,5 @@
 //! Media files on the real checkpoint: a file path through `tessl::media`
-//! (ImageIO / AudioToolbox decoding), `tessl::embedgemma2_pre` and the towers to
+//! (native JPEG, ImageIO and AudioToolbox decoding), `tessl::embedgemma2_pre` and the towers to
 //! the embedding, against sentence-transformers' (transformers 5.x, fp32, sdpa,
 //! CPU). Opt-in:
 //!
@@ -16,15 +16,16 @@
 //!
 //! The five inputs and what the reference was given are listed in
 //! `make_media_reference.py`. Three of them decode to exactly what the reference
-//! decoded (`photo.png`: lossless, same bytes; `clip16.wav`: 16 kHz mono PCM16,
-//! same floats; `clip44.wav`: 44.1 kHz stereo PCM16, which `tessl::media::resample`
-//! mixes and resamples to the bit as the `ffmpeg` binary does, measured max abs
-//! 1.8e-7, cosine 1.000000000), and hold to the bounds of
+//! decoded (`photo.png`: lossless, same bytes; `photo.jpg`: the native
+//! libjpeg-turbo-exact decoder, `tessl::media::jpeg`, same bytes; `clip16.wav`:
+//! 16 kHz mono PCM16, same floats; `clip44.wav`: 44.1 kHz stereo PCM16, which
+//! `tessl::media::resample` mixes and resamples to the bit as the `ffmpeg` binary
+//! does, measured max abs 1.8e-7, cosine 1.000000000), and hold to the bounds of
 //! `tests/embedgemma2_e2e_model.rs`: `1e-4` max abs and cosine `0.99999` per
-//! row. The other two differ in the decode by a measured amount (a JPEG IDCT and
-//! chroma upsampler; AudioToolbox's AAC decoder against FFmpeg's, 7.1e-4 max abs
-//! and cosine 0.999988; the MP3 clip: 9.7e-6 and 0.999999996), and their bounds are the measurements printed by this
-//! test, rounded up.
+//! row. The other two differ in the decode by a measured amount (AudioToolbox's
+//! AAC decoder against FFmpeg's, 7.1e-4 max abs and cosine 0.999988; the MP3
+//! clip: 9.7e-6 and 0.999999996), and their bounds are the measurements printed
+//! by this test, rounded up.
 
 mod common;
 
@@ -43,7 +44,7 @@ use tessl::npy::read_npy;
 const CASES: [(&str, f64, f64); 6] = [
     ("photo.png", 1e-4, 0.99999),
     ("clip16.wav", 1e-4, 0.99999),
-    ("photo.jpg", 1e-2, 0.998),
+    ("photo.jpg", 1e-4, 0.99999),
     ("clip44.wav", 1e-4, 0.99999),
     ("clip44.m4a", 1e-3, 0.99998),
     ("clip44.mp3", 2e-5, 0.9999999),

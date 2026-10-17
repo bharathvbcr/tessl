@@ -512,6 +512,8 @@ TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tnnt_tune
 | `bench_embedgemma2` | EmbeddingGemma 2 benchmark over ragged workloads, measuring peak device allocation and RSS. |
 | `bench_embedgemma2_{vision,audio,video,mm,pre,tok}` | EmbeddingGemma 2 per-tower, mixed-call, preprocessing and tokenizer benchmarks; `profile_embedgemma2{,_vision,_audio}` time each stage class alone. |
 | `bench_media_decode` | Native image, audio and video decode time per format (`tessl::media`). |
+| `bench_media_resample`, `bench_jpeg_decode` | The Rust sample-rate converter against `AudioConverter`, and the native JPEG decoder against ImageIO, on the same files. |
+| `bench_encoder_attn` | Encoder attention (EmbeddingGemma 2, BERT, vision towers), kernel against kernel, including the tune geometries (`TESSL_GEMM_TUNE=1`). |
 | `plot_results` | Draws the benchmark figures in `bench/results/*.svg` from their JSON, with no plotting dependency. |
 | `results_report` | Rebuilds the tables in `bench/results/*.txt` from raw profile and benchmark output. |
 | `release_check`, `dialect_lint` | Release gates (README, CHANGELOG, Cargo.lock) and the Metal dialect lint; each builds with a bare `rustc` for CI runners that cannot build tessl. |
@@ -618,3 +620,6 @@ Dual-licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+The JPEG decoder (`src/media/jpeg/`) is based in part on the work of the Independent JPEG
+Group; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

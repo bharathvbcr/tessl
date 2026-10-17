@@ -39,6 +39,7 @@ pub mod cf;
 mod containers;
 pub mod image;
 mod integrity;
+pub mod jpeg;
 mod mp3;
 mod orient;
 pub mod resample;

@@ -112,8 +112,8 @@ cargo test --release --test audit_gemm_tiles
 
 ```bash
 # Runtime: the fixed 160-case seeded fuzz. It validates every sampled result but
-# does not claim per-kernel coverage; use `bench/kernel_coverage.py --check` for
-# the separate dispatch-coverage census.
+# does not claim per-kernel coverage; use `cargo run --release --bin kernel_coverage -- --check`
+# for the separate dispatch-coverage census.
 # from the tessl root
 cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
 ```
@@ -136,8 +136,11 @@ STRESS_SEED=0xdeadbeef \
 # The driver walks one label at a time (dump -> score -> delete). The ladder at
 # eight draws is ~12 GB of .npy if dumped at once; streaming caps peak disk at
 # one shape, ~3.5 GB at the widest.
-# from the tessl root
-python3 bench/parity_ladder.py --dists all --seeds 4 \
+# from the tessl root; the ladder runs the bench_gemm_sweep next to itself, and
+# runs MLX and torch through bench/gemm_sweep_mlx.py (--python PATH picks the
+# interpreter that has them; --external none scores without them, loudly)
+cargo build --release --bin bench_gemm_sweep --bin gemm_parity
+target/release/gemm_parity ladder --dists all --seeds 4 \
     --out bench/results/gemm_parity_grid_m5pro.json
 ```
 
@@ -145,18 +148,19 @@ python3 bench/parity_ladder.py --dists all --seeds 4 \
 # One shape, if that is all you need. The driver above is this, in a loop.
 BENCH_PARITY_SHAPE=mlp_down BENCH_PARITY_DIST=heavy_tail BENCH_PARITY_SEEDS=8 \
   cargo run --release --bin bench_gemm_sweep -- --dump-parity /tmp/parity
-python3 bench/gemm_sweep_mlx.py --parity-dir /tmp/parity
+python3 bench/gemm_sweep_mlx.py --external-lanes /tmp/parity   # MLX / torch, if installed
+cargo run --release --bin gemm_parity -- score /tmp/parity
 ```
 
 ```bash
-# Host-only harness: fabricated adversarial dumps, grid-merge cases, budget
-# verdicts and static contracts. GPU-backed CLI sections are visibly skipped.
-python3 bench/test_parity_harness.py --pure
+# Host-only, no device: the scorer (fabricated adversarial dumps, the external-lane
+# file contract, budget verdicts, grid merge, a Python-scored golden dump) and the
+# CLI contract of the dumper. Both run in the hosted CI job.
+cargo test --release --test gemm_parity --test bench_gemm_sweep_cli
 
-# Physical-GPU gate: either CLI section being unavailable is a failing exit.
-python3 bench/test_parity_harness.py --require-gpu
-# Both modes emit a machine-readable HARNESS_SUMMARY. A non-required skip is
-# `PASS WITH SKIPS`, never the same verdict as complete coverage.
+# The Python comparison lanes (attention masking rule, external-lane writer);
+# needs numpy only.
+python3 -I bench/test_comparator_lanes.py
 ```
 
 Measured on M5 Pro over an **8 shape x 5 distribution x 4 seed grid**
@@ -257,10 +261,11 @@ and exiting 0.
 | `bench_gemm_tile_tune` | Broad tile/BK ladder, interleaved the same way since 2026-10-10. |
 | `bench_gemm_sweep` | Cross-runtime timing lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_gemm_sweep --dump-parity DIR` | Separate job, no timing: every lane x `BENCH_PARITY_SEEDS` draws at `BENCH_PARITY_SHAPE`, plus the manifest the scorer validates against. |
-| `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
-| `bench/test_parity_harness.py` | Adversarial cases for every harness, with machine-readable ran/skipped/failed accounting. Use `--pure` on host-only lanes and `--require-gpu` on physical Metal. |
+| `gemm_parity score DIR` | The numeric scorer: every dumped lane (and, if `bench/gemm_sweep_mlx.py --external-lanes DIR` ran, MLX and torch) on every seed against one f64 reference, the per-element error budget, and the verdict. |
+| `gemm_parity ladder` | Drives the above across the whole ladder, one shape and distribution at a time, and merges. Use this for the accuracy numbers. |
+| `tests/gemm_parity.rs`, `tests/bench_gemm_sweep_cli.rs` | Adversarial cases for the scorer, the external-lane file contract, the grid merge and the dumper's argument contract. No device; the hosted CI job runs them. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
-| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the metallib bytes the release binary embeds (`bench_gemm_sweep --dump-metallib`). `--check` gates on 100%; `--metallib` selects an explicit artifact. |
+| `kernel_coverage` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the metallib bytes the release binary embeds (`bench_gemm_sweep --dump-metallib`). `--check` gates on 100%; `--metallib` selects an explicit artifact. |
 | `bench_flash_attn` + `bench_paired` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
 | `bench_paired --format rows:...` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder (`--keys`); `--evidence --out` writes the artifact. Recipes in docs/benchmarking.md. |
 

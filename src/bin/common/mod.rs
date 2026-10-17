@@ -412,7 +412,7 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
 }
 
 /// Print the kernels this process dispatched as one `KERNEL_TRACE a,b,...`
-/// line on stderr, for `bench/kernel_coverage.py`. Prints nothing when
+/// line on stderr, for the `kernel_coverage` bin. Prints nothing when
 /// `TESSL_KERNEL_TRACE` is unset, so normal runs are unchanged.
 pub fn emit_kernel_trace() {
     if tessl::runtime::kernel_trace_enabled() {

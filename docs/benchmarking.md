@@ -14,6 +14,7 @@ you changed in the kernel.**
 | `bench_gemm_coop_tile` | Paired, interleaved GEMM tile A/B (128×64 vs 64×64). `--family plain` (default) is the GDN fused in-projection through `gemm_tiled`; `--family epilogue` is the output projection's residual-add through `gemm_epilogue_tiled`, which also checks the two tiles agree. |
 | `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths, and the opt-in small-M exact-f32 NN split-K (`gemm_small_m`) against the single dispatch at EmbeddingGemma 2's shapes (`BENCH_LANES=splitk,smallm,nnsmall,batched,epi`). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
+| `attn_tune` | Attention knob sweeps through `bench_flash_attn` (`--knob rows\|rows-g\|decode\|decode-r\|decode-sgs\|reduce-w\|batched`), values interleaved round-robin, winner per config. `--knob batched` prints the kernel share of the wall clock instead of a winner. `--out PATH` writes the JSON. |
 | `bench_qwen35_layers` | `Qwen35Model` prefill and decode timings at the 2B's shapes (random bf16 weights, or `--weights=DIR` for a real checkpoint; library-default GDN scan, `--gdn-scan32` for the other): tower, `forward_rows`, `prefill`, and per-layer and per-part tables through `Staged::encode_part`. `--decode[=P]` times `prefill` then `Decode::step` per token with its waits and allocations per token, `--model-forward` the tower as `METRIC` lines. `--paired-attn` times paired prefill attention, `--attn-tiles` one `METRIC` per `attn_prefill_with_tile` geometry (for `bench_paired --format metrics`), `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence and `--paired-gate-up` two gate/up GEMMs vs one packed (async and sync encode). |
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
@@ -220,15 +221,17 @@ What each script did, and where it went:
 | `--out` published atomically, an `.attempt.json` marker that makes an older output stale | Same; the marker is written before any other option is validated. |
 | Non-finite numbers cannot reach the artifact | The renderer refuses them. |
 | Artifact fields `peak_gflops`, `schema_version: 2` compatibility keys (`geomean`, `geomean_tessl_over_other`) | Not emitted. Per-key medians of each variant are under `per_key[].a_value` and `b_value`, the canonical aggregate is `paired_geomean`. Old result files keep their old schema. |
-| `bench/attn_tune.py` knob sweeps | Unchanged, not replaced: it sweeps knobs through `bench_flash_attn`, it does not pair runtimes. |
+| Knob sweeps (`attn_tune`, which replaced a Python script of that name) | Not folded into `bench_paired`; ported to its own Rust bin, `attn_tune`. `bench_paired` compares *variants* (the `runtime` column) across lane processes. `attn_tune` sweeps one variant's compile-time constant across processes of the same `bench_flash_attn`, picks the argmin per config, and for `--knob batched` reports a decomposition (kernel share) with no winner. Same table, same `--out` JSON. |
 
 The old Python evidence module is gone. Its last helper, `embedded_metallib_path`,
-scanned binaries for a path none carries; `bench/kernel_coverage.py` now has
-`bench_gemm_sweep --dump-metallib PATH` write the embedded bytes and reads those.
+scanned binaries for a path none carries; the `kernel_coverage` bin (Rust, which
+replaced a Python script of that name) has `bench_gemm_sweep --dump-metallib PATH`
+write the embedded bytes and reads those.
 
-### `kernel_coverage.py` exit status
+### `kernel_coverage` exit status
 
-`python3 bench/kernel_coverage.py --check` (the same table is in `--help`):
+`cargo run --release --bin kernel_coverage -- --check` (the same table is in `--help`;
+run it after `cargo build --release --bins`, it measures the binaries in `target/release`):
 
 | Exit | Meaning |
 |---|---|
@@ -771,7 +774,8 @@ re-run on this tree with `bench_paired` (recipe under "Paired rounds").
 ![Attention tuning knobs](img/attention_tuning.svg)
 
 `attn_tune_*.json` and `attn_dispatch_split_m5pro.json` (imported: knob sweeps
-on the MLSystemsLab copy). The best value of each
+on the MLSystemsLab copy, written by the Python tuner that the `attn_tune` bin
+replaced; the bin writes the same document, key for key). The best value of each
 knob differs by configuration, which is why they are selected per shape rather
 than fixed. Batching 32 calls per command buffer cuts per-call decode time by
 up to 11×, while prefill gets slower per call.
@@ -810,7 +814,8 @@ tf32-relaxed lane sits between at 1.5e-3.
 
 - `gemm_align_probe_m5pro.txt` (264 pass/fail runs, all bit-identical),
   `kernel_coverage_m5pro.json` (regenerated 2026-10-14 by
-  `bench/kernel_coverage.py --check` against the metallib the binaries embed:
+  `kernel_coverage --check` (then a Python script of the same name, whose report the
+  Rust bin reproduces byte for byte) against the metallib the binaries embed:
   266 entry points, 116 dispatched, 150 never dispatched, so `--check` exits
   non-zero; the old "147 covered, none missing" predated most kernels) and
   `fp_contract.txt` (single-shot, "noise, not a speedup") are correctness

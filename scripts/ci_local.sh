@@ -74,10 +74,9 @@ else
   MSL_EMU_OUT="$EMU_OUT/fast" "$ORACLE_PY" tools/msl_emu/check_qwen35.py --fast-math
 fi
 
-echo "==> parity harness, host-only (adversarial scorer, ladder and evidence contracts)"
-# Needs numpy, which the oracle environment carries. A non-zero exit (any assertion failure,
-# or a required section that did not run) stops the script; GPU sections are skipped visibly.
-"$ORACLE_PY" -I bench/test_parity_harness.py --pure
+echo "==> comparator lanes, host-only (masking rule and external-lane files; the scorer, ladder, census and tuner are cargo tests)"
+# Needs numpy, which the oracle environment carries. A non-zero exit stops the script.
+"$ORACLE_PY" -I bench/test_comparator_lanes.py
 
 echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"
 # The same oracle python as above: a missing torch already stopped the script, so this

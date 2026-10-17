@@ -1,4 +1,4 @@
-//! `bench_gemm_sweep --dump-metallib PATH`: how `bench/kernel_coverage.py`
+//! `bench_gemm_sweep --dump-metallib PATH`: how the `kernel_coverage` bin
 //! gets the metallib the benchmarks run. The runtime embeds the library's bytes
 //! (`include_bytes!`), so no binary carries a path to find. The dump must be
 //! the build artifact's bytes and must not need a GPU.

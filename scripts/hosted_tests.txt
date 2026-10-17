@@ -44,6 +44,11 @@ bin shader_index_arithmetic 23
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
+bin bench_gemm_sweep_cli 5
+bin gemm_parity 45
+bin kernel_coverage 41
+bin attn_tune 27
+bin bench_flash_attn_cli 6
 
 # Device-free tests inside mixed files (the rest of each file needs a device).
 exact checkpoint_view a_directory_without_index_or_model_file_is_a_named_error a_fifo_or_directory_shard_is_refused_without_blocking a_huge_index_is_refused_quickly a_symlinked_shard_outside_the_directory_loads a_weight_map_file_that_is_missing_is_refused_at_open awkward_but_bare_shard_names_load_literally directory_with_both_an_index_and_a_model_file_follows_the_index duplicate_and_inconsistent_names_are_refused_at_open hostile_index_shapes_are_named_errors many_distinct_shards_that_exhaust_fds_fail_named_and_release one_file_under_two_spellings_is_refused_not_double_counted shard_names_that_are_not_bare_file_names_are_refused
@@ -77,7 +82,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 248
+bins 256
 
 # Library tests.
 lib ab_flags::tests:: 10

@@ -602,7 +602,7 @@ fn run() -> Result<(), String> {
                 return Err(format!(
                     "{var} is set alongside --dump-parity. A parity dump must \
                      describe the shipping configuration; sweep tuning values \
-                     with bench/attn_tune.py instead."
+                     with the `attn_tune` bin instead."
                 ));
             }
         }
@@ -622,7 +622,9 @@ fn run() -> Result<(), String> {
         Err(e) => return Err(format!("BENCH_ATTN_CFGS: {e}")),
     };
 
-    let rt = GpuRuntime::new()?;
+    // Every argument and environment rejection happens before the device is
+    // opened, so the CLI contract is checkable (and checked, by
+    // `tests/bench_flash_attn_cli.rs`) on a host with no GPU.
     let cfgs: Vec<&Cfg> = match &only {
         None => CFGS.iter().collect(),
         Some(want) => {
@@ -637,6 +639,7 @@ fn run() -> Result<(), String> {
             CFGS.iter().filter(|c| want.contains(&c.label.to_string())).collect()
         }
     };
+    let rt = GpuRuntime::new()?;
 
     if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {dir}: {e}"))?;

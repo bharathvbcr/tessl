@@ -192,21 +192,17 @@ jobs:
         # sandbox-exec does not nest.
         run: scripts/hosted_tests.sh --outside
 
-      - name: Parity harness, host-only sections
-        # Needs numpy only. The pin is the one tools/msl_emu/requirements.txt
-        # already carries for the oracle, so there is a single place to bump it.
-        # A non-zero exit (an assertion failure, or a required section that did
-        # not run) fails the job; the GPU sections are skipped visibly under
-        # --pure and say so.
-        #
-        # TESSL_HOSTED=1: this runner has Xcode and has just built the release
-        # binaries, so a skipped metallib cross-check (no metal-nm, no binary)
-        # is a misconfiguration and fails here instead of reading as a pass.
-        env:
-          TESSL_HOSTED: "1"
+      - name: Comparator lanes, host-only tests
+        # The MLX/torch comparison lanes are the only parity tooling still in
+        # Python (the scorer, the ladder, the kernel census and the attention
+        # tuner are Rust bins with cargo tests). These tests need numpy only,
+        # never MLX or torch: they check the lanes' masking rule and the
+        # external-lane files they write. The pin is the one
+        # tools/msl_emu/requirements.txt already carries for the oracle, so
+        # there is a single place to bump it. A non-zero exit fails the job.
         run: |
           python3 -m pip install "$(grep -E '^numpy==' tools/msl_emu/requirements.txt)"
-          python3 -I bench/test_parity_harness.py --pure
+          python3 -I bench/test_comparator_lanes.py
 
       - name: Kernel IR fast-math scan (tune rigs included)
         # Compiles every kernels/*.metal, tune included (TESSL_GEMM_TUNE adds

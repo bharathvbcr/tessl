@@ -1375,7 +1375,7 @@ fn sample_loop(
 
 /// The loop under [`sample_loop`], with no runtime in it. The token every read
 /// must agree on is seeded by the first read, warmup or not: `BENCH_WARMUP=0`
-/// (what `bench/kernel_coverage.py` passes) has no warmup read to seed it.
+/// (what the `kernel_coverage` bin passes) has no warmup read to seed it.
 fn timed_token_loop(
     warmup: usize,
     iters: usize,

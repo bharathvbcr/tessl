@@ -40,12 +40,20 @@ const OWN_RECORD: [(&str, &str); 3] = [
 
 /// Directories with no generator to record. Nothing that has a generator belongs
 /// here; each entry says why it is not generator-backed.
-const EXEMPT: [(&str, &str); 1] = [(
-    "results_report",
-    "goldens written by the five stdlib report scripts retired in 1b42066 \
-     (bench/results/embedgemma2_*_report.py); src/bin/results_report is held to them byte for byte, \
-     and no generator remains to record",
-)];
+const EXEMPT: [(&str, &str); 2] = [
+    (
+        "gemm_parity",
+        "a captured GPU dump (bench_gemm_sweep --dump-parity lanes and the MLX/torch comparison \
+         lanes, 2 seeds of 24x20x48) scored once by bench/gemm_sweep_mlx.py's parity() at b219aff; \
+         the device outputs are captures, so no generator run reproduces them",
+    ),
+    (
+        "results_report",
+        "goldens written by the five stdlib report scripts retired in 1b42066 \
+         (bench/results/embedgemma2_*_report.py); src/bin/results_report is held to them byte for byte, \
+         and no generator remains to record",
+    ),
+];
 
 const ROLES: [&str; 4] = ["input", "golden", "model", "config"];
 

@@ -104,7 +104,7 @@ def signal(kind, n, rate, nch):
     return np.stack(cols, axis=1)
 
 
-LAYOUT_CHANNELS = {"mono": 1, "stereo": 2, "51": 6}
+LAYOUT_CHANNELS = {"mono": 1, "stereo": 2, "c3": 3, "c4": 4, "c5": 5, "51": 6, "c7": 7, "c8": 8}
 
 
 def ffmpeg(args):
@@ -196,6 +196,9 @@ def main():
         add_wav(f"sweep_{rate}_stereo", "sweep", rate // 5, rate, "stereo", mean=True)
     for rate in (44100, 48000):
         add_wav(f"sweep_{rate}_51", "sweep", rate // 8, rate, "51")
+    # The other default layouts libswresample knows (3: FL FR LFE; 4: 4.0; 5: 5.0; 7: 6.1; 8: 7.1).
+    for ch in (3, 4, 5, 7, 8):
+        add_wav(f"sweep_48000_c{ch}", "sweep", 4800, 48000, f"c{ch}")
     # Impulses and a step.
     for rate in (8000, 44100, 48000):
         add_wav(f"impulse_{rate}_mono", "impulse", rate // 10, rate, "mono")

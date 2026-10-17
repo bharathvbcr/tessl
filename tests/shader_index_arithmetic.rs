@@ -37,6 +37,7 @@ const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
+const ATTN_FA2_H: &str = include_str!("../kernels/attn_fa2.h");
 const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 /// The matrix-unit encoder entry points `encoder_attn.metal` and the tune rig instantiate.
 const ENCODER_ATTN_TILED_H: &str = include_str!("../kernels/encoder_attn_tiled.h");
@@ -352,12 +353,20 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
     assert_eq!(batch.wrapping_mul(per_batch), 0);
     assert_eq!(u64::from(batch) * u64::from(per_batch), 1u64 << 32);
 
+    // The three tiled kernels share one body (`attn_fa2.h`); each entry file
+    // must still delegate to it, or the body's checks would say nothing of it.
     for (label, source) in [
-        ("decode attention", ATTN_DECODE),
-        ("rows attention", ATTN_ROWS),
         ("sliding-window h128", ATTN_SWA_128),
         ("sliding-window h256", ATTN_SWA_256),
         ("global h512", ATTN_GLOBAL),
+    ] {
+        require(source, "#include \"attn_fa2.h\"", label);
+        require(source, "flash_attn_fa2_tiled<HEAD_DIM, BR, BC,", label);
+    }
+    for (label, source) in [
+        ("decode attention", ATTN_DECODE),
+        ("rows attention", ATTN_ROWS),
+        ("tiled FA-2 body (attn_fa2.h)", ATTN_FA2_H),
     ] {
         require(source, "(ulong)b * kv_capacity * kv_pos_stride", label);
         forbid(source, "b * kv_capacity * kv_pos_stride + hkv", label);
@@ -366,9 +375,7 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
     // `Tq`-strided query base to widen; the other four do.
     for (label, source) in [
         ("rows attention", ATTN_ROWS),
-        ("sliding-window h128", ATTN_SWA_128),
-        ("sliding-window h256", ATTN_SWA_256),
-        ("global h512", ATTN_GLOBAL),
+        ("tiled FA-2 body (attn_fa2.h)", ATTN_FA2_H),
     ] {
         require(source, "(ulong)b * Tq * q_pos_stride", label);
         forbid(source, "b * Tq * q_pos_stride + h *", label);

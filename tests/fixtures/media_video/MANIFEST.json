@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_media_video_exact_fixtures.py",
- "generator_commit": "719cf6e5d316173858b3cb0e8ff354da18fcac4b",
+ "generator_commit": "c433eae9caefa2717d94a35f322d0f80a4eef299",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",
@@ -34,7 +34,7 @@
   "h264_601_pc_50x34.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "h264_601_tv_66x38.mp4": {
    "role": "input",
@@ -49,7 +49,12 @@
   "h264_601_tv_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
+  },
+  "h264_601_tv_66x38_rot270.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "h264_601_tv_66x38_rot270.mp4": {
    "role": "input",
@@ -64,7 +69,7 @@
   "h264_601_tv_66x38_rot270.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "h264_709_pc_80x48.mp4": {
    "role": "input",
@@ -79,7 +84,7 @@
   "h264_709_pc_80x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "h264_709_tv_64x48.mp4": {
    "role": "input",
@@ -94,7 +99,12 @@
   "h264_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
+  },
+  "h264_709_tv_64x48_rot90.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "h264_709_tv_64x48_rot90.mp4": {
    "role": "input",
@@ -109,7 +119,7 @@
   "h264_709_tv_64x48_rot90.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "h264_untagged_64x48.mp4": {
    "role": "input",
@@ -124,7 +134,7 @@
   "h264_untagged_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_240m_pc_66x38.mp4": {
    "role": "input",
@@ -139,7 +149,7 @@
   "hevc_240m_pc_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_240m_tv_64x48.mp4": {
    "role": "input",
@@ -154,7 +164,12 @@
   "hevc_240m_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
+  },
+  "hevc_420_709_tv_48x40_hflip.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_420_709_tv_48x40_hflip.mp4": {
    "role": "input",
@@ -169,7 +184,12 @@
   "hevc_420_709_tv_48x40_hflip.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
+  },
+  "hevc_420_709_tv_48x40_rot90.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_420_709_tv_48x40_rot90.mp4": {
    "role": "input",
@@ -184,7 +204,7 @@
   "hevc_420_709_tv_48x40_rot90.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_422_240m_pc_50x17.mp4": {
    "role": "input",
@@ -199,7 +219,7 @@
   "hevc_422_240m_pc_50x17.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_422_601_pc_66x38.mp4": {
    "role": "input",
@@ -214,7 +234,7 @@
   "hevc_422_601_pc_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_422_709_tv_48x40_rot90.mp4": {
    "role": "input",
@@ -229,7 +249,7 @@
   "hevc_422_709_tv_48x40_rot90.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_422_709_tv_64x33.mp4": {
    "role": "input",
@@ -244,7 +264,7 @@
   "hevc_422_709_tv_64x33.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_422_709_tv_64x48.mp4": {
    "role": "input",
@@ -259,7 +279,7 @@
   "hevc_422_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_444_601_pc_50x34.mp4": {
    "role": "input",
@@ -274,7 +294,7 @@
   "hevc_444_601_pc_50x34.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_444_709_tv_48x40_rot90.mp4": {
    "role": "input",
@@ -289,7 +309,7 @@
   "hevc_444_709_tv_48x40_rot90.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_444_709_tv_64x48.mp4": {
    "role": "input",
@@ -304,7 +324,7 @@
   "hevc_444_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_444_fcc_pc_33x17.mp4": {
    "role": "input",
@@ -319,7 +339,7 @@
   "hevc_444_fcc_pc_33x17.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_601_pc_34x26.mp4": {
    "role": "input",
@@ -334,7 +354,7 @@
   "hevc_601_pc_34x26.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_709_pc_96x64.mp4": {
    "role": "input",
@@ -349,7 +369,7 @@
   "hevc_709_pc_96x64.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_709_tv_64x48.mp4": {
    "role": "input",
@@ -364,7 +384,7 @@
   "hevc_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_fcc_pc_64x48.mp4": {
    "role": "input",
@@ -379,7 +399,7 @@
   "hevc_fcc_pc_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_fcc_tv_66x38.mp4": {
    "role": "input",
@@ -394,7 +414,7 @@
   "hevc_fcc_tv_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_main10_64x48.bilinear.rgb24": {
    "role": "golden",
@@ -414,7 +434,7 @@
   "hevc_main10_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_2020_tv_64x32.bilinear.rgb24": {
    "role": "golden",
@@ -434,12 +454,17 @@
   "hevc_p10_2020_tv_64x32.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_601_pc_40x48_rot270.bilinear.rgb24": {
    "role": "golden",
    "published": true,
    "note": "the ffmpeg CLI's rgb24 conversion with `-sws_flags bilinear` (10-bit 4:2:0 depends on the flag)"
+  },
+  "hevc_p10_601_pc_40x48_rot270.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_p10_601_pc_40x48_rot270.mp4": {
    "role": "input",
@@ -454,7 +479,7 @@
   "hevc_p10_601_pc_40x48_rot270.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_601_pc_66x38.bilinear.rgb24": {
    "role": "golden",
@@ -474,12 +499,17 @@
   "hevc_p10_601_pc_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_709_tv_48x40_rot180.bilinear.rgb24": {
    "role": "golden",
    "published": true,
    "note": "the ffmpeg CLI's rgb24 conversion with `-sws_flags bilinear` (10-bit 4:2:0 depends on the flag)"
+  },
+  "hevc_p10_709_tv_48x40_rot180.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_p10_709_tv_48x40_rot180.mp4": {
    "role": "input",
@@ -494,12 +524,17 @@
   "hevc_p10_709_tv_48x40_rot180.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_709_tv_48x40_rot90.bilinear.rgb24": {
    "role": "golden",
    "published": true,
    "note": "the ffmpeg CLI's rgb24 conversion with `-sws_flags bilinear` (10-bit 4:2:0 depends on the flag)"
+  },
+  "hevc_p10_709_tv_48x40_rot90.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_p10_709_tv_48x40_rot90.mp4": {
    "role": "input",
@@ -514,12 +549,17 @@
   "hevc_p10_709_tv_48x40_rot90.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_709_tv_48x40_vflip.bilinear.rgb24": {
    "role": "golden",
    "published": true,
    "note": "the ffmpeg CLI's rgb24 conversion with `-sws_flags bilinear` (10-bit 4:2:0 depends on the flag)"
+  },
+  "hevc_p10_709_tv_48x40_vflip.cli_autorotate.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
   },
   "hevc_p10_709_tv_48x40_vflip.mp4": {
    "role": "input",
@@ -534,7 +574,7 @@
   "hevc_p10_709_tv_48x40_vflip.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p10_fcc_pc_50x34.bilinear.rgb24": {
    "role": "golden",
@@ -554,7 +594,7 @@
   "hevc_p10_fcc_pc_50x34.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p210_2020_tv_48x33.mp4": {
    "role": "input",
@@ -569,7 +609,7 @@
   "hevc_p210_2020_tv_48x33.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p210_601_pc_66x38.mp4": {
    "role": "input",
@@ -584,7 +624,7 @@
   "hevc_p210_601_pc_66x38.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p210_709_tv_48x40_rot270.mp4": {
    "role": "input",
@@ -599,7 +639,7 @@
   "hevc_p210_709_tv_48x40_rot270.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p210_709_tv_64x48.mp4": {
    "role": "input",
@@ -614,7 +654,7 @@
   "hevc_p210_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p410_2020_pc_50x34.mp4": {
    "role": "input",
@@ -629,7 +669,7 @@
   "hevc_p410_2020_pc_50x34.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p410_240m_tv_33x17.mp4": {
    "role": "input",
@@ -644,7 +684,7 @@
   "hevc_p410_240m_tv_33x17.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p410_709_tv_48x40_rot270.mp4": {
    "role": "input",
@@ -659,7 +699,7 @@
   "hevc_p410_709_tv_48x40_rot270.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "hevc_p410_709_tv_64x48.mp4": {
    "role": "input",
@@ -674,7 +714,7 @@
   "hevc_p410_709_tv_64x48.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_2020_pc_18x12.nv12": {
    "role": "input",
@@ -689,7 +729,7 @@
   "rand_2020_pc_18x12.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_2020_tv_16x16.nv12": {
    "role": "input",
@@ -704,7 +744,7 @@
   "rand_2020_tv_16x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_601_pc_48x8.nv12": {
    "role": "input",
@@ -719,7 +759,7 @@
   "rand_601_pc_48x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_601_pc_50x8.nv12": {
    "role": "input",
@@ -734,7 +774,7 @@
   "rand_601_pc_50x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_709_tv_32x16.nv12": {
    "role": "input",
@@ -749,7 +789,7 @@
   "rand_709_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_709_tv_34x16.nv12": {
    "role": "input",
@@ -764,7 +804,7 @@
   "rand_709_tv_34x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_untagged_16x8.nv12": {
    "role": "input",
@@ -779,7 +819,7 @@
   "rand_untagged_16x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "rand_untagged_30x6.nv12": {
    "role": "input",
@@ -794,7 +834,7 @@
   "rand_untagged_30x6.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "refuse_hevc_12bit_709_tv_64x48.mp4": {
    "role": "input",
@@ -834,7 +874,7 @@
   "syn_yuv420p10le_bt2020nc_tv_16x24.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_bt709_pc_16x100.bilinear.rgb24": {
    "role": "golden",
@@ -849,7 +889,7 @@
   "syn_yuv420p10le_bt709_pc_16x100.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_bt709_tv_32x16.bilinear.rgb24": {
    "role": "golden",
@@ -864,7 +904,7 @@
   "syn_yuv420p10le_bt709_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_fcc_pc_48x34.bilinear.rgb24": {
    "role": "golden",
@@ -879,7 +919,7 @@
   "syn_yuv420p10le_fcc_pc_48x34.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_smpte170m_pc_34x14.bilinear.rgb24": {
    "role": "golden",
@@ -894,7 +934,7 @@
   "syn_yuv420p10le_smpte170m_pc_34x14.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_smpte170m_tv_8x2.bilinear.rgb24": {
    "role": "golden",
@@ -909,7 +949,7 @@
   "syn_yuv420p10le_smpte170m_tv_8x2.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p10le_smpte240m_tv_50x18.bilinear.rgb24": {
    "role": "golden",
@@ -924,7 +964,7 @@
   "syn_yuv420p10le_smpte240m_tv_50x18.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p_fcc_pc_48x8.planar": {
    "role": "input",
@@ -939,7 +979,7 @@
   "syn_yuv420p_fcc_pc_48x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p_fcc_tv_32x16.planar": {
    "role": "input",
@@ -954,7 +994,7 @@
   "syn_yuv420p_fcc_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p_smpte240m_pc_50x8.planar": {
    "role": "input",
@@ -969,7 +1009,7 @@
   "syn_yuv420p_smpte240m_pc_50x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv420p_smpte240m_tv_34x16.planar": {
    "role": "input",
@@ -984,7 +1024,7 @@
   "syn_yuv420p_smpte240m_tv_34x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p10le_bt2020nc_pc_16x16.planar": {
    "role": "input",
@@ -994,7 +1034,7 @@
   "syn_yuv422p10le_bt2020nc_pc_16x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p10le_bt709_tv_32x16.planar": {
    "role": "input",
@@ -1004,7 +1044,7 @@
   "syn_yuv422p10le_bt709_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p10le_fcc_tv_50x7.planar": {
    "role": "input",
@@ -1014,7 +1054,7 @@
   "syn_yuv422p10le_fcc_tv_50x7.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p10le_smpte170m_pc_34x9.planar": {
    "role": "input",
@@ -1024,7 +1064,7 @@
   "syn_yuv422p10le_smpte170m_pc_34x9.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p10le_smpte240m_pc_6x5.planar": {
    "role": "input",
@@ -1034,7 +1074,7 @@
   "syn_yuv422p10le_smpte240m_pc_6x5.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_bt2020nc_tv_16x8.planar": {
    "role": "input",
@@ -1049,7 +1089,7 @@
   "syn_yuv422p_bt2020nc_tv_16x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_bt709_pc_2x1.planar": {
    "role": "input",
@@ -1064,7 +1104,7 @@
   "syn_yuv422p_bt709_pc_2x1.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_bt709_tv_32x16.planar": {
    "role": "input",
@@ -1079,7 +1119,7 @@
   "syn_yuv422p_bt709_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_fcc_pc_48x9.planar": {
    "role": "input",
@@ -1094,7 +1134,7 @@
   "syn_yuv422p_fcc_pc_48x9.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_smpte170m_pc_34x16.planar": {
    "role": "input",
@@ -1109,7 +1149,7 @@
   "syn_yuv422p_smpte170m_pc_34x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv422p_smpte240m_tv_50x7.planar": {
    "role": "input",
@@ -1124,7 +1164,7 @@
   "syn_yuv422p_smpte240m_tv_50x7.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_bt2020nc_tv_33x17.planar": {
    "role": "input",
@@ -1134,7 +1174,7 @@
   "syn_yuv444p10le_bt2020nc_tv_33x17.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_bt709_pc_1x1.planar": {
    "role": "input",
@@ -1144,7 +1184,7 @@
   "syn_yuv444p10le_bt709_pc_1x1.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_bt709_tv_16x8.planar": {
    "role": "input",
@@ -1154,7 +1194,7 @@
   "syn_yuv444p10le_bt709_tv_16x8.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_fcc_pc_32x3.planar": {
    "role": "input",
@@ -1164,7 +1204,7 @@
   "syn_yuv444p10le_fcc_pc_32x3.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_smpte170m_pc_17x9.planar": {
    "role": "input",
@@ -1174,7 +1214,7 @@
   "syn_yuv444p10le_smpte170m_pc_17x9.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p10le_smpte240m_pc_5x5.planar": {
    "role": "input",
@@ -1184,7 +1224,7 @@
   "syn_yuv444p10le_smpte240m_pc_5x5.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_bt2020nc_pc_16x16.planar": {
    "role": "input",
@@ -1194,7 +1234,7 @@
   "syn_yuv444p_bt2020nc_pc_16x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_bt709_pc_1x1.planar": {
    "role": "input",
@@ -1204,7 +1244,7 @@
   "syn_yuv444p_bt709_pc_1x1.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_bt709_tv_32x16.planar": {
    "role": "input",
@@ -1214,7 +1254,7 @@
   "syn_yuv444p_bt709_tv_32x16.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_fcc_pc_5x3.planar": {
    "role": "input",
@@ -1224,7 +1264,7 @@
   "syn_yuv444p_fcc_pc_5x3.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_smpte170m_pc_17x9.planar": {
    "role": "input",
@@ -1234,7 +1274,7 @@
   "syn_yuv444p_smpte170m_pc_17x9.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   },
   "syn_yuv444p_smpte240m_tv_33x17.planar": {
    "role": "input",
@@ -1244,7 +1284,7 @@
   "syn_yuv444p_smpte240m_tv_33x17.rgb24": {
    "role": "golden",
    "published": true,
-   "note": "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+   "note": "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
   }
  }
 }

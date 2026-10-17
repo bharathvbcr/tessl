@@ -44,8 +44,8 @@ docs/embedgemma2.md "Media decoding"):
       Conversion Order]): **convert to RGB at the stored size, then rotate the RGB**, for
       every layout.
 
-  Black-box checks through the public libswscale/libavfilter API (`target/v2/graph_probe.c`
-  in the lane, not committed; 34 random-plane classes of every format here, odd sizes
+  Black-box checks through the public libswscale/libavfilter API
+  (`scripts/ffmpeg_graph_probe.py`; 34 random-plane classes of every format here, odd sizes
   included): a `format=rgb24` graph fed a frame carrying its own colorspace and range gives
   the same bytes as `sws_scale` with flags 0 and as the CLI's `-pix_fmt rgb24` (0 differing
   bytes in all), and the graph `format=rgb24,transpose=...` equals the CLI's conversion

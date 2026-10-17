@@ -38,7 +38,7 @@
 //! and the matrix and range the stream is tagged with (untagged means BT.601
 //! limited, as libswscale does). One class depends on a scaler setting libswscale
 //! takes from the caller: 10-bit 4:2:0 (the vertical chroma filter,
-//! [`VideoOptions::chroma_filter`], bilinear by default). A stream that cannot be converted exactly (another
+//! [`VideoOptions::chroma_filter`], bicubic by default: torchcodec sets no scaler flags). A stream that cannot be converted exactly (another
 //! codec, 12-bit or monochrome video, a matrix [`yuv::Matrix`] does not hold, a
 //! shape libswscale does not define) is **refused by name** with
 //! [`MediaError::Unsupported`]; only an explicit [`ColorPath::AvFoundation`]
@@ -48,13 +48,14 @@
 //!
 //! The frames come out as stored; the track's `preferredTransform` is applied
 //! by this module as one of the eight EXIF orientations ([`Rotation::Apply`],
-//! the default). The order relative to the colour conversion changes the bytes,
-//! and is the `ffmpeg` CLI's autorotate order (measured, `yuv.rs` experiment 9): 4:2:0
-//! planes are turned first and converted at the upright size (the converter's choice
-//! depends on the width, and the 10-bit chroma filter on the rows, of the upright
-//! picture), 4:2:2 and 4:4:4 frames are converted first and the RGB is turned.
-//! What torchcodec does with a rotation flag was not run, so its order is
-//! unverified. [`Rotation::Ignore`] returns the frames as stored.
+//! the default). The order relative to the colour conversion changes the bytes
+//! for 4:2:0, and is torchcodec's, for every layout: the stored picture is converted
+//! (the converter's choice depends on the stored width, and the 10-bit chroma filter
+//! on the stored rows) and the RGB is turned afterwards, because torchcodec makes a
+//! rotation a libavfilter transform after `format=rgb24,` (`yuv.rs`, "What the
+//! reference loader does with libswscale"). The `ffmpeg` CLI's autorotate turns 4:2:0
+//! planes first and differs (11,185 of 11,520 bytes on a 48x40 clip). Source read, not
+//! run: torchcodec was never executed here. [`Rotation::Ignore`] returns the frames as stored.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -700,15 +701,12 @@ impl VideoSource {
             })?,
         };
         let filter = self.options.chroma_filter;
-        // 4:2:0 is converted after it is turned (see `convert_native`), so its shape is the upright one.
-        let (w, h) = if layout.chroma == Chroma::C420 && self.options.rotation == Rotation::Apply {
-            orient::oriented_size(info.orientation, info.stored_width, info.stored_height)
-        } else {
-            (info.stored_width, info.stored_height)
-        };
-        yuv::check_shape(layout, w, h, filter).map_err(|e| MediaError::Unsupported {
-            what: "video",
-            detail: e.to_string(),
+        // Frames are converted at the stored size and turned afterwards (see `convert_native`).
+        yuv::check_shape(layout, info.stored_width, info.stored_height, filter).map_err(|e| {
+            MediaError::Unsupported {
+                what: "video",
+                detail: e.to_string(),
+            }
         })?;
         Ok(Plan::Swscale {
             layout,
@@ -1680,24 +1678,6 @@ fn convert_frame(image: CfTypeRef, orientation: u32, rotation: Rotation, expect:
     Ok((rgb, w, h))
 }
 
-/// A plane's samples moved by EXIF orientation `o`: `units` samples make one
-/// pixel (1 for luma, 2 for an interleaved Cb, Cr pair); returns the new plane
-/// and its width and height in pixels.
-fn orient_plane(o: u32, plane: &Samples, width: usize, height: usize, units: usize) -> (Samples, usize, usize) {
-    match plane {
-        Samples::U8(v) => {
-            let (out, w, h) = orient::apply(o, v.clone(), width, height, units);
-            (Samples::U8(out), w, h)
-        }
-        Samples::U16(v) => {
-            let bytes: Vec<u8> = v.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let (out, w, h) = orient::apply(o, bytes, width, height, 2 * units);
-            let words = out.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-            (Samples::U16(words), w, h)
-        }
-    }
-}
-
 /// Convert planes of `width x height` (tightly packed, as [`NativeFrame`]).
 fn convert_planes(
     width: usize,
@@ -1754,13 +1734,12 @@ fn convert_planes(
 
 /// Decoded planes as an RGB frame by libswscale's arithmetic (`params` is
 /// matrix, range, flavor, chroma filter and threads), rotated per `orientation`
-/// when `rotation` is [`Rotation::Apply`] in the order the `ffmpeg` CLI's
-/// autorotate has, which the bytes depend on for some layouts: for 4:2:0
-/// (whose planes it can turn) the planes are turned first and the converted
-/// picture has the turned size (the converter, its width-dependent choice and,
-/// at 10 bits, the vertical chroma filter, act on the upright picture); for 4:2:2
-/// and 4:4:4 the CLI converts first and turns the RGB. Measured on all three at
-/// 8 and 10 bits; whether torchcodec orders the same is not known.
+/// when `rotation` is [`Rotation::Apply`]. The order is torchcodec's, for every
+/// layout: the picture is converted at its stored size (the converter's
+/// width-dependent choice and, at 10 bits, the vertical chroma filter, act on the
+/// stored picture) and the RGB is turned afterwards (`format=rgb24,` then the
+/// rotation filters in its filter graph; `yuv.rs`, experiments 9 and 10). The
+/// `ffmpeg` CLI's autorotate differs for 4:2:0, where it turns the planes first.
 fn convert_native(
     frame: &NativeFrame,
     params: &Params,
@@ -1776,15 +1755,8 @@ fn convert_native(
         });
     }
     check_size((w, h), orientation, rotation, expect)?;
-    let turn = rotation == Rotation::Apply && orientation != 1;
-    if turn && frame.layout.chroma == Chroma::C420 {
-        let (y, tw, th) = orient_plane(orientation, &frame.y, w, h, 1);
-        let (uv, ..) = orient_plane(orientation, &frame.uv, w / 2, h / 2, 2);
-        let rgb = convert_planes(tw, th, frame.layout, &y, &uv, params)?;
-        return Ok((rgb, tw, th));
-    }
     let rgb = convert_planes(w, h, frame.layout, &frame.y, &frame.uv, params)?;
-    if turn {
+    if rotation == Rotation::Apply && orientation != 1 {
         return Ok(orient::apply(orientation, rgb, w, h, 3));
     }
     Ok((rgb, w, h))

@@ -53,7 +53,8 @@ fn video_config() -> VideoConfig {
 }
 
 /// The golden of a fixture's frames under `options`: the 10-bit 4:2:0 ones depend on the
-/// chroma filter (`.bilinear.rgb24` is bilinear, `.rgb24` is the CLI's own default, bicubic).
+/// chroma filter (`.bilinear.rgb24` is bilinear, `.rgb24` is torchcodec's: scaler flags unset,
+/// which is bicubic).
 fn rgb_golden(f: &Fact, filter: ChromaFilter) -> Vec<u8> {
     let ten_420 = f.layout()
         == Layout {
@@ -167,11 +168,11 @@ fn rgb_frames_are_byte_equal_to_the_oracle() {
         assert_eq!((all.width, all.height), (w, h), "{}: size after rotation", f.name);
         assert_eq!(
             all.conversion,
-            expected_conversion(&f, ChromaFilter::Bilinear),
+            expected_conversion(&f, ChromaFilter::default()),
             "{}",
             f.name
         );
-        let want = rgb_golden(&f, ChromaFilter::Bilinear);
+        let want = rgb_golden(&f, ChromaFilter::default());
         let per = w * h * 3;
         assert_eq!(want.len(), per * f.frames, "{}: golden size", f.name);
         for (k, frame) in all.frames.iter().enumerate() {
@@ -200,7 +201,9 @@ fn rgb_frames_are_byte_equal_to_the_oracle() {
 }
 
 #[test]
-fn ten_bit_420_under_the_clis_default_bicubic_filter_is_exact_too() {
+fn ten_bit_420_is_bicubic_by_default_as_torchcodec_sets_no_flags_and_bilinear_is_exact_when_asked() {
+    assert_eq!(ChromaFilter::default(), ChromaFilter::Bicubic);
+    assert_eq!(VideoOptions::default().chroma_filter, ChromaFilter::Bicubic);
     let mut checked = 0;
     for f in exact_fixtures() {
         if f.layout()
@@ -212,7 +215,7 @@ fn ten_bit_420_under_the_clis_default_bicubic_filter_is_exact_too() {
             continue;
         }
         let options = VideoOptions {
-            chroma_filter: ChromaFilter::Bicubic,
+            chroma_filter: ChromaFilter::Bilinear,
             ..VideoOptions::default()
         };
         let all = open(&f.name, &options)
@@ -220,14 +223,14 @@ fn ten_bit_420_under_the_clis_default_bicubic_filter_is_exact_too() {
             .unwrap_or_else(|e| panic!("{}: {e}", f.name));
         assert_eq!(
             all.conversion,
-            expected_conversion(&f, ChromaFilter::Bicubic),
+            expected_conversion(&f, ChromaFilter::Bilinear),
             "{}",
             f.name
         );
-        let want = rgb_golden(&f, ChromaFilter::Bicubic);
-        assert_eq!(first_diff(&all.frames.concat(), &want), None, "{}: bicubic", f.name);
+        let want = rgb_golden(&f, ChromaFilter::Bilinear);
+        assert_eq!(first_diff(&all.frames.concat(), &want), None, "{}: bilinear", f.name);
         // And the two filters really are different pictures, so the test could fail.
-        assert_ne!(rgb_golden(&f, ChromaFilter::Bilinear), want, "{}", f.name);
+        assert_ne!(rgb_golden(&f, ChromaFilter::default()), want, "{}", f.name);
         checked += 1;
     }
     assert!(checked >= 8, "{checked} 10-bit 4:2:0 fixtures");
@@ -305,29 +308,29 @@ fn rotation_ignored_returns_the_frames_as_stored() {
 }
 
 #[test]
-fn rotation_follows_the_clis_autorotate_where_the_order_of_turning_and_converting_shows() {
-    // 4:2:0 is turned before it is converted (so the converter, chosen by width, and at 10 bits the
-    // vertical chroma filter act on the upright picture); 4:2:2 and 4:4:4 are converted first.
-    // At 48x40 the two orders give different bytes for 4:2:0 (a NEON width in one orientation and
-    // not the other), which is what these fixtures hold the order to. The upright goldens are the
-    // CLI's autorotate (`rgb_frames_are_byte_equal_to_the_oracle`); here the other order is shown
-    // to be a different picture, so that test could fail.
+fn rotation_converts_at_the_stored_size_and_turns_the_rgb_as_torchcodec_does() {
+    // torchcodec makes a rotation a libavfilter transform after `format=rgb24,`: the stored
+    // picture is converted, then the RGB is turned, for every layout. The `ffmpeg` CLI's
+    // autorotate turns 4:2:0 planes first. At 48x40 the two orders give different bytes for
+    // 4:2:0 (a NEON width in one orientation and not the other), so the goldens can tell them
+    // apart: `.rgb24` is torchcodec's, `.cli_autorotate.rgb24` the CLI's.
     for name in [
         "hevc_420_709_tv_48x40_rot90",
         "hevc_p10_709_tv_48x40_rot90",
         "hevc_p10_601_pc_40x48_rot270",
     ] {
         let f = fact(name);
-        let src = open(
+        let (w, h) = (f.width, f.height);
+        let stored = open(
             name,
             &VideoOptions {
                 rotation: Rotation::Ignore,
                 ..VideoOptions::default()
             },
-        );
-        let stored = src.decode_frames(&[0]).unwrap();
-        // Convert-then-turn: turn the stored RGB.
-        let (w, h) = (f.width, f.height);
+        )
+        .decode_frames(&[0])
+        .unwrap();
+        // Convert, then turn the stored RGB.
         let turned: Vec<u8> = {
             let frame = &stored.frames[0];
             let mut out = vec![0u8; frame.len()];
@@ -344,13 +347,26 @@ fn rotation_follows_the_clis_autorotate_where_the_order_of_turning_and_convertin
             }
             out
         };
-        let want = rgb_golden(&f, ChromaFilter::Bilinear);
         let per = w * h * 3;
-        assert_ne!(
-            turned,
-            &want[..per],
-            "{name}: the order of turning and converting must show in these bytes"
+        let applied = open(name, &VideoOptions::default()).decode_frames(&[0]).unwrap();
+        assert_eq!(
+            first_diff(&applied.frames[0], &turned),
+            None,
+            "{name}: convert, then turn"
         );
+        let torchcodec = bytes(&format!("{name}.rgb24"));
+        assert_eq!(
+            first_diff(&applied.frames[0], &torchcodec[..per]),
+            None,
+            "{name}: the golden"
+        );
+        let cli = bytes(&format!("{name}.cli_autorotate.rgb24"));
+        assert_ne!(
+            &cli[..per],
+            &torchcodec[..per],
+            "{name}: the CLI's order must show in these bytes, or this test cannot tell the orders apart"
+        );
+        assert_ne!(applied.frames[0].as_slice(), &cli[..per], "{name}: not the CLI order");
     }
 }
 
@@ -436,7 +452,7 @@ fn an_untagged_stream_is_converted_with_bt601_as_libswscale_does() {
             matrix: Matrix::Bt601,
             range: Range::Limited,
             flavor: Flavor::Aarch64,
-            filter: ChromaFilter::Bilinear,
+            filter: ChromaFilter::default(),
         }
     );
 }
@@ -505,7 +521,7 @@ fn ten_bit_through_avfoundation_is_not_the_oracle_and_is_never_the_default() {
         .decode_frames(&(0..f.frames).collect::<Vec<_>>())
         .unwrap();
     assert_eq!(d.conversion, Conversion::AvFoundation);
-    let want = rgb_golden(&f, ChromaFilter::Bilinear);
+    let want = rgb_golden(&f, ChromaFilter::default());
     let got: Vec<u8> = d.frames.concat();
     let mean = got
         .iter()

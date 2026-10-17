@@ -35,7 +35,8 @@
 //! `tests/media_yuv_exact.rs` (8-bit 4:2:0) and `tests/media_yuv_formats.rs` (the
 //! other formats). Their `--ignored` tests run `ffmpeg` live and compare every
 //! `(Y, Cb, Cr)` triple of 8 bits (all 2^24, five matrices, both ranges, 4:2:0,
-//! 4:2:2 and 4:4:4), sampled triples of 10 bits for 4:4:4 and 4:2:2, and the 10-bit
+//! 4:2:2 and 4:4:4), every 10-bit triple for 4:4:4 (2^30) and every distinct rounded
+//! combination for 4:2:2, and the 10-bit
 //! 4:2:0 filters at many heights, and the committed goldens hold random planes of
 //! every format.
 //!
@@ -53,8 +54,11 @@
 //! libswscale is LGPL-2.1+; this module is not a port of it. No libswscale
 //! source file was read while writing it (none is installed here; the Homebrew
 //! build ships only the public headers, which hold no conversion code, and they
-//! were not read either), no FFmpeg source was read online, and no torchcodec
-//! source was read for this module. The matrices are the public ITU-R BT.601,
+//! were not read either) and no FFmpeg source was read online. Four files of
+//! torchcodec v0.17.0 (BSD-3, not FFmpeg; `SwScale.cpp`, `FilterGraph.cpp`,
+//! `CpuDeviceInterface.cpp`, `Transform.cpp`) were read, by the lane's integrator and
+//! then by the author, for how torchcodec calls libswscale (the scaler flags, the filter
+//! graph, the order of rotation and conversion), never for the arithmetic. The matrices are the public ITU-R BT.601,
 //! BT.709 and BT.2020, FCC and SMPTE 240M definitions with the limited-range
 //! scaling of H.273. The shape of the paths (a luma table plus integer chroma
 //! offsets; 13-bit coefficients through a 16-bit multiply-high; a direct
@@ -114,20 +118,39 @@
 //!    formats write every column. H.264 and HEVC cannot code those 4:2:0 and 4:2:2
 //!    shapes (their conformance window crops in units of the chroma sample), so they
 //!    do not arise; this module refuses them by name.
-//! 9. Rotation: the CLI's autorotation turns an 8-bit or 10-bit 4:2:0 picture's
-//!    **planes** before the colour conversion (so the converter sees the upright
-//!    width, and the 10-bit vertical chroma filter the upright rows) and a 4:2:2 or
-//!    4:4:4 picture's **RGB** after it. On a 48x40 rotated-90 8-bit 4:2:0 fixture the
-//!    two orders differ in 11,185 of 11,520 bytes. `media::video` follows the CLI.
-//!    Which order torchcodec has is not known here.
+//! 9. Rotation in the `ffmpeg` CLI: its autorotation turns an 8-bit or 10-bit 4:2:0
+//!    picture's **planes** before the colour conversion (so the converter sees the
+//!    upright width, and the 10-bit vertical chroma filter the upright rows) and a
+//!    4:2:2 or 4:4:4 picture's **RGB** after it. On a 48x40 rotated-90 8-bit 4:2:0
+//!    fixture the two orders differ in 11,185 of 11,520 bytes. This is *not* the order
+//!    of the reference loader (next paragraph); `media::video` does not follow it.
+//! 10. The filter graph: through the public libavfilter API (a `buffer` source given
+//!     format, size, aspect and time base only, a plain `buffersink`, frames carrying
+//!     their colorspace and range), the graph `format=rgb24` gave the bytes of
+//!     `sws_scale` with flags 0 and of the CLI's `-pix_fmt rgb24` in all 34 classes of
+//!     the random-plane goldens (every format here, odd sizes and widths that are not
+//!     multiples of 32 included, 0 differing bytes), and `format=rgb24,transpose=cclock`,
+//!     `,transpose=clock` and `,hflip,vflip` gave that conversion turned afterwards in
+//!     RGB (all 34 classes with each of the three transforms, 102 checks, 0 differing;
+//!     `scripts/ffmpeg_graph_probe.py`, built on `scripts/ffmpeg_graph_probe.c`). A separate probe of the integrator's, through libswscale's public
+//!     API on a 64x48 10-bit 4:2:0 frame, found flags 0 equal to `SWS_BICUBIC` (0 of 9216
+//!     bytes) and unequal to `SWS_BILINEAR` (6552).
 //!
-//! The scaler flags torchcodec uses are not known here (its source was not read
-//! and it is not installed). They change one class: 10-bit 4:2:0. The 8-bit 4:2:0 and
-//! 4:2:2 and all 4:4:4 results are the same under `bilinear`, `bicubic`, `neighbor`,
-//! `area` and the others tried. [`ChromaFilter`] chooses; the default is
-//! [`ChromaFilter::Bilinear`], the recollection of torchcodec's own choice
-//! (`SWS_BILINEAR`), and [`ChromaFilter::Bicubic`] is what the `ffmpeg` CLI and
-//! `sws_getContext` with flags 0 give.
+//! # What the reference loader does with libswscale
+//!
+//! From torchcodec v0.17.0 (the three releases 0.12.0, 0.15.0 and 0.17.0 agree on the
+//! flags): the colour-conversion `SwsContext` is made with `swsFlags = 0`, used when the
+//! frame's width is a multiple of 32 and there is no transform; any other width, and any
+//! transform, goes through a libavfilter graph `format=rgb24,` followed by the transform
+//! filters (a rotation is `transpose=cclock`, `transpose=clock` or `hflip,vflip`), with no
+//! scaler flags set. By experiment 10 both give the bytes of the unset-flags conversion, so
+//! the one class that depends on the scaler's flags, 10-bit 4:2:0, uses the bicubic filter:
+//! [`ChromaFilter::Bicubic`] is the default and [`ChromaFilter::Bilinear`] stays selectable.
+//! The 8-bit 4:2:0 and 4:2:2 and all 4:4:4 results are the same under `bilinear`,
+//! `bicubic`, `neighbor`, `area` and the others tried. And a rotation is a transform
+//! applied after the conversion, at the stored size, for every layout (the graph's
+//! comment, "Note [Transform and Format Conversion Order]"): `media::video` converts,
+//! then turns the RGB.
 
 use std::fmt;
 
@@ -212,10 +235,12 @@ impl Flavor {
 /// (The other formats do not depend on it.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ChromaFilter {
-    /// `SWS_BILINEAR` (the default here: the flag torchcodec is recalled to set).
-    #[default]
+    /// `SWS_BILINEAR`: not what torchcodec uses, kept selectable.
     Bilinear,
-    /// `SWS_BICUBIC`, the `ffmpeg` CLI's default and what unset flags give.
+    /// `SWS_BICUBIC`, what unset flags (`swsFlags = 0`) give, the `ffmpeg` CLI's default and
+    /// torchcodec's: its colour conversion passes no flags, through `sws_scale` and through its
+    /// `format=rgb24` filtergraph alike (see the module's provenance note).
+    #[default]
     Bicubic,
 }
 

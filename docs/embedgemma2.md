@@ -2408,7 +2408,7 @@ let out = model.encode(&[MmItem::Video(&frames)], None)?;                  // on
 From a file, `tessl::media::video::decode_video_file` samples and decodes the frames and
 `preprocess_decoded_video` makes the same `PreparedVideo`; for the H.264 and HEVC streams
 VideoToolbox decodes (8 and 10 bit, 4:2:0, 4:2:2, 4:4:4) the frames are byte-equal to the `ffmpeg`
-CLI's, which the reference loader's converter is (torchcodec's own flags are unverified), and the embedding of an MP4
+CLI's, arranged as torchcodec's source arranges libswscale (unset flags, convert then rotate), and the embedding of an MP4
 equals sentence-transformers' to 8.5e-7 at worst (see "Media decoding", "Video" and "End to end").
 
 ### The token layout
@@ -2838,22 +2838,26 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
 - **Video.** `fetch_videos` prefers torchcodec (`VideoDecoder(seek_mode="exact")`); torchvision
   0.29 no longer decodes video (removed in 0.26) and torchcodec is not installed here, so the
   oracle is the `ffmpeg` CLI, which wraps the library torchcodec calls. torchcodec is **not
-  installed, so its behaviour below is from its documented design and was not run**; what
-  makes the CLI an equivalent oracle is that for even-sized 8-bit 4:2:0 frames both convert
-  with libswscale using the frame's own matrix and range, with chroma replicated 2x2 (the
-  scaler flags do not matter when the frame is not resized; the CLI half is verified, the
-  torchcodec half is inferred). Whether torchcodec applies a rotation flag, and in what order
-  with the conversion, was **not checked**; the default here applies it. For even sizes the
-  order does not change the bytes (a 90 degree turn or flip maps 2x2 chroma blocks to 2x2
-  blocks), except through the width-dependent choice between the two converters (below),
-  which the rotated fixtures do not separate. The reference
+  installed and was never run**; its **source** (v0.17.0, BSD-3: `SwScale.cpp`,
+  `FilterGraph.cpp`, `CpuDeviceInterface.cpp`, `Transform.cpp`) was read by the lane's
+  integrator and then by the author, for how it calls libswscale, and says: the colour
+  conversion is `sws_scale` with `swsFlags = 0` for widths that are multiples of 32 with no
+  transform, and a libavfilter graph `format=rgb24,` plus the transforms (no scaler flags
+  set) for every other width and for any rotation, a rotation being a transform applied after
+  the conversion. Black-box probes through the public libswscale and libavfilter API show the
+  graph, `sws_scale` flags 0 and the CLI's `-pix_fmt rgb24` give the same bytes (34 classes,
+  0 differing), so the CLI is an equivalent oracle for the conversion (verified), arranged
+  as torchcodec arranges it: converted at the stored size with unset flags (bicubic for the
+  one class that depends on them, 10-bit 4:2:0), then the RGB rotated, for every layout
+  (the source's order read, not run; the CLI's own autorotate differs for 4:2:0). The reference
   loader's metadata is taken in exact seek mode: `num_frames` is the
   packet count, `duration` is `max(pts + packet duration) - min(pts)` in seconds, and `fps`
   is `num_frames / duration`, which is not the header's rate (the end-to-end fixture:
   23.976023976023978 against a nominal 23.976024); the sampler
   (`EmbeddingGemma2VideoProcessor.sample_frames`) runs on those. An untagged stream is
   converted as BT.601 limited, as libswscale does. This follows exactly (below). The
-  rotation default (`Rotation::Apply`) is what the CLI and OpenCV do.
+  rotation default (`Rotation::Apply`) is what torchcodec does (a transform after the
+  conversion), and what the CLI and OpenCV do up to that order.
 
 ### Images
 
@@ -3161,19 +3165,27 @@ Run on 2026-10-17: the five `--ignored` tests (`exhaustive_against_a_live_ffmpeg
 of `media_yuv_formats`) passed, 0 differing bytes.
 
 **The 10-bit 4:2:0 filter.** The scaler resamples the half-height chroma to luma rows with a
-filter that depends on its flags: bilinear `(3072, 1024)/4096`, or the `ffmpeg` CLI's default,
-bicubic `(-115, 985, 3572, -346)/4096` and its mirror, both with edge rows measured. Both are
-exact against the CLI run with the matching `-sws_flags`, for even heights from 14 (bicubic)
-or 8 (bilinear); below that the scaler's filter shrinks and the picture is refused by name
-(`YuvError::TooShort`). **Which flags torchcodec passes is not established**: its source was not
-read (the brief forbids it for FFmpeg and it was not downloaded, and it is not installed), and
-the only thing written down here is a recollection that it asks for bilinear scaling, which is
-unverified. `VideoOptions::chroma_filter` defaults to `Bilinear` on that recollection and
-`Bicubic` selects the CLI's own; the reference decode in the end-to-end script passes
-`-sws_flags bilinear` to agree with that default, so the end-to-end case shows tessl equals
-the CLI under the chosen flag, not that torchcodec uses it. If torchcodec's flag is bicubic,
-only 10-bit 4:2:0 changes (about 65 percent of its bytes differ between the two filters), and
-`ChromaFilter::Bicubic` is already exact.
+filter that depends on its flags: bilinear `(3072, 1024)/4096`, or, with the flags unset
+(`swsFlags = 0`, the `ffmpeg` CLI's default), bicubic `(-115, 985, 3572, -346)/4096` and its
+mirror, both with edge rows measured. Both are exact against the CLI run with the matching
+`-sws_flags`, for even heights from 14 (bicubic) or 8 (bilinear); below that the scaler's
+filter shrinks and the picture is refused by name (`YuvError::TooShort`).
+**torchcodec's flags are established from its source, not from the numbers.** v0.17.0 (and
+v0.12.0 and v0.15.0) builds its colour-conversion `SwsContext` with `swsFlags = 0`
+(`SwScale.cpp`), and sends widths that are not multiples of 32, and any transform, through a
+graph whose string starts `format=rgb24,` and which sets no scaler flags (`FilterGraph.cpp`,
+`CpuDeviceInterface.cpp`). Two black-box probes through the public API tie that to a filter:
+the integrator's (libswscale 10.1.102, 64x48 10-bit 4:2:0 to rgb24: flags 0 against
+`SWS_BICUBIC` 0 of 9216 bytes differ, against `SWS_BILINEAR` 6552), and this lane's, which
+feeds frames carrying their own colorspace and range through a `buffer` source and a plain
+`buffersink` around `format=rgb24` (torchcodec's arrangement) and finds the graph, `sws_scale`
+flags 0 and the CLI's `-pix_fmt rgb24` equal in all 34 random-plane classes (every format
+here, widths of every residue modulo 32, odd sizes), 0 differing bytes
+(`scripts/ffmpeg_graph_probe.py`, committed, needs Homebrew ffmpeg's headers and libraries). So the reference is
+**bicubic**: `VideoOptions::chroma_filter` defaults to `Bicubic`, the reference decode of the
+end-to-end script uses the CLI's default flags, and `Bilinear` stays selectable (it was this
+lane's earlier default, chosen from a recollection that was wrong). What remains unverified is
+only that torchcodec was never run: the statement is of what its source does.
 
 **Odd sizes.** H.264 and HEVC cannot code an odd width or height in 4:2:0, or an odd width in
 4:2:2 (the conformance window crops in chroma units), so odd shapes occur only in 4:4:4 (any
@@ -3182,11 +3194,20 @@ an odd-width 8-bit 4:2:0 or 4:2:2 picture **unwritten** (a destination pre-fille
 it) and uses a non-periodic vertical filter for odd-height 4:2:0; neither is a defined output,
 so the converter refuses those shapes by name (`YuvError::Size`).
 
-**Rotation order.** The CLI's autorotation turns a 4:2:0 picture's planes before the
-conversion (the converter's width rule, and the 10-bit filter, see the upright picture) and a
-4:2:2 or 4:4:4 picture's RGB after it. On the 48x40 rotated fixture the two orders differ in
-11185 of 11520 bytes of 8-bit 4:2:0, so `media::video` follows the CLI. torchcodec's order is
-unknown.
+**Rotation order.** torchcodec turns a frame by a libavfilter transform (`Transform.cpp`:
+`transpose=cclock`, `transpose=clock` or `hflip,vflip`) placed after the explicit
+`format=rgb24,` (`CpuDeviceInterface.cpp`, "Note [Transform and Format Conversion Order]"), and
+a transform makes the frame ineligible for the swscale path, so for every layout, 4:2:0
+included, the stored picture is converted at the stored size and the RGB is turned. A probe
+through the public API confirms the graph `format=rgb24,transpose=...` equals the CLI's
+conversion turned afterwards (all 34 classes with each of 3 transforms, 102 checks, 0
+differing bytes; `scripts/ffmpeg_graph_probe.py`, committed). **`media::video`
+converts, then turns, for all layouts.** The CLI's autorotate is different for 4:2:0 (it turns
+the planes first): on the 48x40 rotated fixture the two orders differ in 11185 of 11520 bytes
+of 8-bit 4:2:0, which `*.cli_autorotate.rgb24` keeps and
+`rotation_converts_at_the_stored_size_and_turns_the_rgb_as_torchcodec_does` holds the
+goldens apart by. (Lane V converted and then turned; this lane first switched to the CLI's order for 4:2:0 on
+a guess about torchcodec that its source contradicts, and switched back.)
 
 **Why AVAssetReader's chroma differs.** Found in this lane. With the reader asked for
 `420v`, luma is the decoder's (0 differing samples) and chroma differs in 52 to 86 percent of
@@ -3217,10 +3238,12 @@ exact without needing the reader's resampling modelled.
 
 **Parity per fixture class** (`tests/media_video_exact.rs`, 13 tests, local-only because
 VideoToolbox is not available to the hosted sandbox; frames are compared to the `ffmpeg` CLI's
-decode, `-pix_fmt rgb24`, autorotate; goldens from `scripts/gen_media_video_exact_fixtures.py`
-in `tests/fixtures/media_video/`, 0 differing bytes in all; 10-bit 4:2:0 against the
-`-sws_flags bilinear` golden, and again against the CLI's default under
-`ChromaFilter::Bicubic`):
+decode, `-pix_fmt rgb24` with flags unset, converted at the stored size and then rotated or
+flipped as RGB, torchcodec's arrangement; goldens from
+`scripts/gen_media_video_exact_fixtures.py` in `tests/fixtures/media_video/`, 0 differing
+bytes in all; the 10-bit 4:2:0 fixtures against that golden under the default
+`ChromaFilter::Bicubic`, and again against the `-sws_flags bilinear` golden under
+`ChromaFilter::Bilinear`):
 
 | class | fixtures |
 |---|---|
@@ -3257,9 +3280,10 @@ fixture (12 files, 48 settings). The end-to-end file has a nominal 24000/1001 ra
   frames is an error, not a misaligned clip.
 - **Rotation**: `preferredTransform` becomes an EXIF orientation (1 to 8; a 90 degrees
   counter-clockwise display matrix is 8). `Rotation::Apply` (default) returns upright frames,
-  turning 4:2:0 planes before the conversion and 4:2:2 and 4:4:4 frames after it, as the
-  `ffmpeg` CLI's autorotate does (0 differing bytes on `quad_rot90.mp4` and the rotated and
-  flipped fixtures of every layout); `Rotation::Ignore` returns frames as stored,
+  converting the stored picture and then turning the RGB for every layout, as torchcodec's
+  filter graph does (0 differing bytes on `quad_rot90.mp4` and on the rotated and flipped
+  fixtures of every layout; the `ffmpeg` CLI's autorotate turns 4:2:0 planes first and
+  differs); `Rotation::Ignore` returns frames as stored,
   equal to `-noautorotate`. A transform that is not a right-angle rotation or flip is refused
   when applying. OpenCV's own colour conversion is 9.7 mean from FFmpeg's on the quadrant
   file, so it serves as a rotation oracle only.
@@ -3356,7 +3380,8 @@ of `tests/fixtures/media_video/` through `decode_video_file`, `preprocess_decode
 facade (`MmItem::Video`, or `MmItem::TimestampedVideo` with the snapshot's tokenizer),
 against sentence-transformers' embedding of the frames and metadata the reference loader would
 produce from the same file. torchcodec is not installed, so the array it is given is the
-`ffmpeg` CLI's decode of the whole file to rgb24 with autorotation and the metadata is
+`ffmpeg` CLI's decode of the whole file to rgb24 with the scaler flags unset, the stored
+picture converted and then rotated as RGB (torchcodec's arrangement, from its source), and the metadata is
 torchcodec's exact-mode figures (`make_video_reference.py` docstring; the sampler's indices it
 keeps are asserted equal to the fixture's `facts.txt`, and tessl's equal them too). Snapshot
 `914f7f89`, Apple M5 Pro, 2026-10-17, fp32 sdpa goldens, `GemmOperands::ExactF32`; every case
@@ -3366,9 +3391,9 @@ holds the 1e-4 / 0.99999 bounds of `tests/embedgemma2_e2e_model.rs`:
 |---|---|---|---|---|
 | `e2e_video` | 96x64, 80 frames, 24000/1001 fps, H.264 BT.709 limited | 0, 23, 47 | 1.79e-7 | 1.000000000 |
 | `e2e_video_ts` | the same with `add_timestamps` on (`00:00`, `00:00`, `00:01` labels) | 0, 23, 47 | 1.79e-7 | 1.000000000 |
-| `rot90` | 64x48 stored, display matrix 90 (the model sees 48x64) | 0 | 1.79e-7 | 1.000000000 |
+| `rot90` | 64x48 stored, display matrix 90 (the model sees 48x64); converted at width 64, then turned | 0 | 1.79e-7 | 1.000000000 |
 | `hevc_pc` | HEVC 34x26, BT.601 full range, a width off the NEON widths | 0 | 8.53e-7 | 1.000000000 |
-| `hevc_main10` | HEVC Main 10 (`yuv420p10le`) 66x38, BT.601 full range; the reference decode is given `-sws_flags bilinear` (see "The 10-bit 4:2:0 filter") | 0 | 1.79e-7 | 1.000000000 |
+| `hevc_main10` | HEVC Main 10 (`yuv420p10le`) 66x38, BT.601 full range, the bicubic filter unset flags give (see "The 10-bit 4:2:0 filter") | 0 | 2.83e-7 | 1.000000000 |
 | `odd_444_10bit` | HEVC 4:4:4 10-bit at an odd 33x17, SMPTE 240M | 0 | 1.38e-7 | 1.000000000 |
 | `odd_422` | HEVC 4:2:2 at an odd height of 33 | 0 | 2.98e-7 | 1.000000000 |
 
@@ -3463,17 +3488,16 @@ own speed (it is the same algorithm in C with NEON).
 
 ### What is left
 
-- torchcodec itself is not in the environment: the video reference is the `ffmpeg` CLI and
-  torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
-  the last inferred step. What it does with a rotation flag is unverified (the default here
-  follows FFmpeg's CLI and OpenCV).
+- torchcodec itself is not in the environment and was never run: the video reference is the
+  `ffmpeg` CLI arranged as torchcodec's source (v0.17.0) arranges libswscale, with its
+  exact-mode figures, so a run with torchcodec installed would close the last inferred step.
+  The scaler flags (unset: bicubic), the filter graph's equality with `sws_scale` and the
+  rotation order (convert, then turn the RGB) are read from its source and probed through the
+  public API, not run against torchcodec.
 - `AVAssetReader`'s chroma difference is characterised as a three-tap resampling (a
   re-siting to `BottomLeft` is the inference, with `top`/`bottom` as the open contradiction),
   not reproduced to the byte (96 percent of samples with
   `(1, 10, 5)/16`); VideoToolbox is driven directly, so nothing depends on it.
-- torchcodec's scaler flags and its rotation order are not established. Only 10-bit 4:2:0 and
-  rotated 4:2:0/10-bit streams depend on them (above), and `ChromaFilter` and the rotation
-  order are the two places to change if a run with torchcodec shows otherwise.
 - VideoToolbox does not decode H.264 High 10, 4:2:2 or 4:4:4 on this machine, so those H.264
   shapes cannot be decoded by this path (VideoToolbox answered "Cannot Decode" when a session was
   created for them, checked in this lane with a scratch program and not kept as a test), and

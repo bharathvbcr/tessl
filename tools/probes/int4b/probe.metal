@@ -46,7 +46,8 @@ TAIL(int4b_format, int4b_format, int32_t)
 // Unlisted combination (MPPTensorOpsMatMul2d.h:52-61): negative control.
 TAIL(half, uint4b_format, int32_t)
 #elif defined(V_MLX_GROUP_LOOP)
-// Design sketch for MLX Q4 (w = scale*q + bias, group G along K): W is [N,K]
+// Design sketch for MLX Q4 (w = scale*q + bias, unsigned nibbles per
+// src/nn.rs:3257, hence uint4b_format; group G along K): W is [N,K]
 // nibbles, K contiguous (transpose_right), one matmul2d per group into a fresh
 // cooperative destination, then scale/bias applied per element in registers.
 // out[m,n] = sum_g ( s[n,g] * P_g[m,n] + b[n,g] * xsum[m,g] ).
@@ -59,7 +60,7 @@ kernel void k(device half *A [[buffer(0)]], device uchar *W [[buffer(1)]],
     constexpr auto d = matmul2d_descriptor(32, 32, G, false, true, false,
                                            matmul2d_descriptor::mode::multiply);
     matmul2d<d, execution_simdgroups<4>> op;
-    using TW = tensor<device int4b_format, dextents<int32_t, 2>, tensor_inline>;
+    using TW = tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline>;
     auto tA = tensor(A, dextents<int32_t, 2>{K, M}, array<int, 2>{1, K});
     TW tW((TW::data_handle_type)W, dextents<int32_t, 2>{K, N}, array<int, 2>{1, K});
     auto tC = tensor(C, dextents<int32_t, 2>{N, M}, array<int, 2>{1, N});

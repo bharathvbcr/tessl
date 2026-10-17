@@ -3,7 +3,7 @@ EmbedGemma2 small-M GEMMs (lane G): an opt-in parallel K-partition path for the 
 Machine: Apple M5 Pro, 64 GB, macOS 27, 2026-10-15. Before = eg2/integrate 27a0407 built in its own
 worktree and target dir; after = the same tree plus this change (branch worktree-agent-a17ffa3c9da42a5f0).
 Data: embedgemma2_small_m_m5pro.json (every round of every lane, the merged statistics, the per-GEMM rows).
-Plot: embedgemma2_small_m_m5pro.png (embedgemma2_small_m_plot.py). Merge: `results_report small-m` (src/bin/results_report).
+Plot: embedgemma2_small_m_m5pro.svg (`plot_results small-m`). Merge: `results_report small-m` (src/bin/results_report).
 Tools: target/release/bench_paired over bench_embedgemma2 (whole encode); bench_gemm_routes lane nnsmall
 (one GEMM). EMBEDGEMMA2_SNAPSHOT = google/embeddinggemma-2 snapshot 914f7f89142e.
 
@@ -132,4 +132,4 @@ REPRODUCE
    --rounds 16 for the others)
   BENCH_LANES=nnsmall target/release/bench_gemm_routes     (BENCH_ROWS, BENCH_WIDTHS, BENCH_SHAPES to vary)
   cargo run --release --bin results_report -- small-m <results dir> <raw dir> before-27a0407 after control-before-again
-  uv run --with matplotlib==3.9.2 python embedgemma2_small_m_plot.py <results dir>
+  cargo run --release --bin plot_results -- small-m <results dir>/embedgemma2_small_m_m5pro.json

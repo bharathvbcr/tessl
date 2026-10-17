@@ -68,6 +68,6 @@ What the memory change does fix is across calls: consecutive tower calls held tw
 (tests/embedgemma2_memory.rs, tiny checkpoint: 1,769,472 and 540,672 bytes above the first call against bounds of 8,192
 and 16,384 before; within the bounds after). That is a measurement of the tiny model's allocator, not of this table.
 
-Plot: embedgemma2_mm_onewait_m5pro.png (embedgemma2_mm_onewait_plot.py); data: embedgemma2_mm_onewait_m5pro.json
+Plot: embedgemma2_mm_onewait_m5pro.svg (`plot_results mm-onewait`); data: embedgemma2_mm_onewait_m5pro.json
 (every round and lane under "raw"; the per-process stdout of the lanes, with sync_waits, was kept beside it by
 bench_paired in target/ and is not committed).

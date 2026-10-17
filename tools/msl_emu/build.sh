@@ -24,15 +24,15 @@ for k in qwen35_gdn qwen35_attn qwen35_mlp qwen35_score flash_attn_rows qwen35_a
     "$ROOT/kernels/$k.metal" > "$OUT/gen/$k.cpp"
 done
 # encoder_attn.metal's second half (ENCODER_TILED_KERNEL) runs on TensorOps through
-# attn_tiled.h, which the emulator cannot execute. Cut the file at the line that opens it,
+# encoder_attn_tiled.h (attn_tiled.h), which the emulator cannot execute. Cut the file at the line that opens it,
 # and its `#include`, so the rows kernels above that line compile as written. Refuse to
 # build if the marker moved: a silent no-op here would compile the TensorOps half or none.
-marker='/// The same contract on the matrix units'
+marker='// The same contract on the matrix units'
 if ! grep -qF "$marker" "$ROOT/kernels/encoder_attn.metal"; then
   echo "msl_emu: encoder_attn.metal no longer has the line that opens its TensorOps half" >&2
   exit 1
 fi
-awk -v m="$marker" 'index($0, m) == 1 { exit } !/^#include "attn_tiled.h"/ { print }' \
+awk -v m="$marker" 'index($0, m) == 1 { exit } !/^#include "(encoder_)?attn_tiled\.h"/ { print }' \
   "$OUT/gen/encoder_attn.cpp" > "$OUT/gen/encoder_attn.rows.cpp"
 mv "$OUT/gen/encoder_attn.rows.cpp" "$OUT/gen/encoder_attn.cpp"
 # Any threadgroup array the rewrite did not take (2-D, several declarators on

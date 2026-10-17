@@ -98,6 +98,11 @@ pub const PLOTS: &[Plot] = &[
         file: "media_resample_m5pro.json",
         render: crate::resample::resample,
     },
+    Plot {
+        name: "go-overhead",
+        file: "embedgemma2_go_m5pro.json",
+        render: crate::go_overhead::go_overhead,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Plot> {

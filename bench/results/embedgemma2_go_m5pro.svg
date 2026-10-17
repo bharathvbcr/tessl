@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="647.8" viewBox="0 0 1400 647.8" role="img">
+<title>tessl from Go over gusset: the cost of the boundary against the same call made from Rust (Apple M5 Pro)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">tessl from Go over gusset: the cost of the boundary against the same call made from Rust (Apple M5 Pro)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">Tiny multimodal checkpoint, one call per point; minimum of 3000 calls (15 rounds of 200) per arm, the arms alternating in separate processes, and all arms&apos; outputs are bit-identical. Indicative: a shared machine.</text>
+<g class="panel">
+<line class="grid" x1="71.04" y1="582.46" x2="765.04" y2="582.46"/>
+<line class="axis" x1="67.04" y1="582.46" x2="71.04" y2="582.46"/>
+<text class="mut" x="64.04" y="586.31" font-size="11" text-anchor="end">200</text>
+<line class="grid" x1="71.04" y1="490.73" x2="765.04" y2="490.73"/>
+<line class="axis" x1="67.04" y1="490.73" x2="71.04" y2="490.73"/>
+<text class="mut" x="64.04" y="494.58" font-size="11" text-anchor="end">500</text>
+<line class="grid" x1="71.04" y1="421.33" x2="765.04" y2="421.33"/>
+<line class="axis" x1="67.04" y1="421.33" x2="71.04" y2="421.33"/>
+<text class="mut" x="64.04" y="425.18" font-size="11" text-anchor="end">1000</text>
+<line class="grid" x1="71.04" y1="351.93" x2="765.04" y2="351.93"/>
+<line class="axis" x1="67.04" y1="351.93" x2="71.04" y2="351.93"/>
+<text class="mut" x="64.04" y="355.78" font-size="11" text-anchor="end">2000</text>
+<line class="grid" x1="71.04" y1="260.19" x2="765.04" y2="260.19"/>
+<line class="axis" x1="67.04" y1="260.19" x2="71.04" y2="260.19"/>
+<text class="mut" x="64.04" y="264.04" font-size="11" text-anchor="end">5000</text>
+<line class="grid" x1="71.04" y1="190.8" x2="765.04" y2="190.8"/>
+<line class="axis" x1="67.04" y1="190.8" x2="71.04" y2="190.8"/>
+<text class="mut" x="64.04" y="194.65" font-size="11" text-anchor="end">10k</text>
+<line class="grid" x1="71.04" y1="121.4" x2="765.04" y2="121.4"/>
+<line class="axis" x1="67.04" y1="121.4" x2="71.04" y2="121.4"/>
+<text class="mut" x="64.04" y="125.25" font-size="11" text-anchor="end">20k</text>
+<line class="axis" x1="120.61" y1="582.46" x2="120.61" y2="586.46"/>
+<text class="mut" x="123.61" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 123.61 596.46)">texts x1</text>
+<line class="axis" x1="219.76" y1="582.46" x2="219.76" y2="586.46"/>
+<text class="mut" x="222.76" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 222.76 596.46)">texts x4</text>
+<line class="axis" x1="318.9" y1="582.46" x2="318.9" y2="586.46"/>
+<text class="mut" x="321.9" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 321.9 596.46)">texts x16</text>
+<line class="axis" x1="418.04" y1="582.46" x2="418.04" y2="586.46"/>
+<text class="mut" x="421.04" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 421.04 596.46)">texts x64</text>
+<line class="axis" x1="517.19" y1="582.46" x2="517.19" y2="586.46"/>
+<text class="mut" x="520.19" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 520.19 596.46)">texts x256</text>
+<line class="axis" x1="616.33" y1="582.46" x2="616.33" y2="586.46"/>
+<text class="mut" x="619.33" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 619.33 596.46)">images x1</text>
+<line class="axis" x1="715.47" y1="582.46" x2="715.47" y2="586.46"/>
+<text class="mut" x="718.47" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 718.47 596.46)">images x8</text>
+<line class="axis" x1="71.04" y1="582.46" x2="765.04" y2="582.46"/>
+<line class="axis" x1="71.04" y1="121.4" x2="71.04" y2="582.46"/>
+<text class="mut" x="31.52" y="351.93" font-size="12" text-anchor="middle" transform="rotate(-90 31.52 351.93)">wall time per call, us</text>
+<text class="ink" x="71.04" y="73.06" font-size="13" font-weight="600">Time per call (log scale; bar: minimum; black tick: median; label: Go / worker-thread direct)</text>
+<rect class="key" x="71.04" y="81.9" width="14" height="10" fill="#b3b2ac"/>
+<text class="mut" x="91.04" y="90.9" font-size="11">tessl&apos;s C ABI from Rust, model on the main thread</text>
+<rect class="key" x="357.42" y="81.9" width="14" height="10" fill="#8a8985"/>
+<text class="mut" x="377.42" y="90.9" font-size="11">the same, on a thread of its own (the engine&apos;s worker)</text>
+<rect class="key" x="71.04" y="98.9" width="14" height="10" fill="#2a78d6"/>
+<text class="mut" x="91.04" y="107.9" font-size="11">the Go package through gusset</text>
+<line class="key sk" x1="261.72" y1="103.9" x2="275.72" y2="103.9" stroke-width="1.6"/>
+<text class="mut" x="281.72" y="107.9" font-size="11">median</text>
+<rect x="79.96" y="503.59" width="25.78" height="78.87" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="79.96" y1="417.66" x2="105.74" y2="417.66" class="median sk" stroke-width="2"/>
+<rect x="107.72" y="498.23" width="25.78" height="84.24" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="107.72" y1="416.98" x2="133.5" y2="416.98" class="median sk" stroke-width="2"/>
+<rect x="135.48" y="480.79" width="25.78" height="101.67" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="135.48" y1="352.85" x2="161.26" y2="352.85" class="median sk" stroke-width="2"/>
+<text class="mut" x="148.37" y="474.79" font-size="10" text-anchor="middle">1.19x</text>
+<rect x="179.11" y="486.29" width="25.78" height="96.17" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="179.11" y1="420.15" x2="204.88" y2="420.15" class="median sk" stroke-width="2"/>
+<rect x="206.87" y="493.42" width="25.78" height="89.04" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="206.87" y1="433.01" x2="232.64" y2="433.01" class="median sk" stroke-width="2"/>
+<rect x="234.63" y="468.51" width="25.78" height="113.95" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="234.63" y1="341.44" x2="260.4" y2="341.44" class="median sk" stroke-width="2"/>
+<text class="mut" x="247.52" y="462.51" font-size="10" text-anchor="middle">1.28x</text>
+<rect x="278.25" y="434.88" width="25.78" height="147.58" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="278.25" y1="383.24" x2="304.03" y2="383.24" class="median sk" stroke-width="2"/>
+<rect x="306.01" y="443.13" width="25.78" height="139.33" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="306.01" y1="387.45" x2="331.79" y2="387.45" class="median sk" stroke-width="2"/>
+<rect x="333.77" y="426.95" width="25.78" height="155.51" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="333.77" y1="306.51" x2="359.55" y2="306.51" class="median sk" stroke-width="2"/>
+<text class="mut" x="346.66" y="420.95" font-size="10" text-anchor="middle">1.18x</text>
+<rect x="377.39" y="339.4" width="25.78" height="243.07" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="377.39" y1="325.86" x2="403.17" y2="325.86" class="median sk" stroke-width="2"/>
+<rect x="405.15" y="334.86" width="25.78" height="247.61" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="405.15" y1="325.2" x2="430.93" y2="325.2" class="median sk" stroke-width="2"/>
+<rect x="432.91" y="328.47" width="25.78" height="254" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="432.91" y1="281.3" x2="458.69" y2="281.3" class="median sk" stroke-width="2"/>
+<text class="mut" x="445.8" y="322.47" font-size="10" text-anchor="middle">1.07x</text>
+<rect x="476.54" y="206.06" width="25.78" height="376.4" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="476.54" y1="199.05" x2="502.31" y2="199.05" class="median sk" stroke-width="2"/>
+<rect x="504.3" y="204.64" width="25.78" height="377.82" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="504.3" y1="197.65" x2="530.07" y2="197.65" class="median sk" stroke-width="2"/>
+<rect x="532.06" y="202.14" width="25.78" height="380.32" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="532.06" y1="181.6" x2="557.83" y2="181.6" class="median sk" stroke-width="2"/>
+<text class="mut" x="544.95" y="196.14" font-size="10" text-anchor="middle">1.02x</text>
+<rect x="575.68" y="431.78" width="25.78" height="150.69" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="575.68" y1="415.17" x2="601.46" y2="415.17" class="median sk" stroke-width="2"/>
+<rect x="603.44" y="434.21" width="25.78" height="148.25" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="603.44" y1="413.7" x2="629.22" y2="413.7" class="median sk" stroke-width="2"/>
+<rect x="631.2" y="426.37" width="25.78" height="156.1" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="631.2" y1="343.91" x2="656.98" y2="343.91" class="median sk" stroke-width="2"/>
+<text class="mut" x="644.09" y="420.37" font-size="10" text-anchor="middle">1.08x</text>
+<rect x="674.82" y="318.21" width="25.78" height="264.26" class="bar" fill="#b3b2ac" fill-opacity="0.9"/>
+<line x1="674.82" y1="267.07" x2="700.6" y2="267.07" class="median sk" stroke-width="2"/>
+<rect x="702.58" y="316.54" width="25.78" height="265.93" class="bar" fill="#8a8985" fill-opacity="0.9"/>
+<line x1="702.58" y1="263.44" x2="728.36" y2="263.44" class="median sk" stroke-width="2"/>
+<rect x="730.34" y="317.32" width="25.78" height="265.14" class="bar" fill="#2a78d6" fill-opacity="0.9"/>
+<line x1="730.34" y1="214.1" x2="756.12" y2="214.1" class="median sk" stroke-width="2"/>
+<text class="mut" x="743.23" y="311.32" font-size="10" text-anchor="middle">0.99x</text>
+</g>
+<g class="panel">
+<line class="grid" x1="861.69" y1="582.46" x2="1374" y2="582.46"/>
+<line class="axis" x1="857.69" y1="582.46" x2="861.69" y2="582.46"/>
+<text class="mut" x="854.69" y="586.31" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="861.69" y1="467.2" x2="1374" y2="467.2"/>
+<line class="axis" x1="857.69" y1="467.2" x2="861.69" y2="467.2"/>
+<text class="mut" x="854.69" y="471.05" font-size="11" text-anchor="end">500</text>
+<line class="grid" x1="861.69" y1="351.93" x2="1374" y2="351.93"/>
+<line class="axis" x1="857.69" y1="351.93" x2="861.69" y2="351.93"/>
+<text class="mut" x="854.69" y="355.78" font-size="11" text-anchor="end">1000</text>
+<line class="grid" x1="861.69" y1="236.67" x2="1374" y2="236.67"/>
+<line class="axis" x1="857.69" y1="236.67" x2="861.69" y2="236.67"/>
+<text class="mut" x="854.69" y="240.52" font-size="11" text-anchor="end">1500</text>
+<line class="grid" x1="861.69" y1="121.4" x2="1374" y2="121.4"/>
+<line class="axis" x1="857.69" y1="121.4" x2="861.69" y2="121.4"/>
+<text class="mut" x="854.69" y="125.25" font-size="11" text-anchor="end">2000</text>
+<line class="axis" x1="898.28" y1="582.46" x2="898.28" y2="586.46"/>
+<text class="mut" x="901.28" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 901.28 596.46)">texts x1</text>
+<line class="axis" x1="971.47" y1="582.46" x2="971.47" y2="586.46"/>
+<text class="mut" x="974.47" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 974.47 596.46)">texts x4</text>
+<line class="axis" x1="1044.66" y1="582.46" x2="1044.66" y2="586.46"/>
+<text class="mut" x="1047.66" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 1047.66 596.46)">texts x16</text>
+<line class="axis" x1="1117.84" y1="582.46" x2="1117.84" y2="586.46"/>
+<text class="mut" x="1120.84" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 1120.84 596.46)">texts x64</text>
+<line class="axis" x1="1191.03" y1="582.46" x2="1191.03" y2="586.46"/>
+<text class="mut" x="1194.03" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 1194.03 596.46)">texts x256</text>
+<line class="axis" x1="1264.22" y1="582.46" x2="1264.22" y2="586.46"/>
+<text class="mut" x="1267.22" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 1267.22 596.46)">images x1</text>
+<line class="axis" x1="1337.41" y1="582.46" x2="1337.41" y2="586.46"/>
+<text class="mut" x="1340.41" y="596.46" font-size="11" text-anchor="end" transform="rotate(-30 1340.41 596.46)">images x8</text>
+<line class="axis" x1="861.69" y1="582.46" x2="1374" y2="582.46"/>
+<line class="axis" x1="861.69" y1="121.4" x2="861.69" y2="582.46"/>
+<text class="mut" x="816.56" y="351.93" font-size="12" text-anchor="middle" transform="rotate(-90 816.56 351.93)">added wall time per call, us</text>
+<text class="ink" x="861.69" y="73.06" font-size="13" font-weight="600">What the Go call adds (same call, same GPU time)</text>
+<rect class="key" x="861.69" y="81.9" width="14" height="10" fill="#eb6834"/>
+<text class="mut" x="881.69" y="90.9" font-size="11">Go wall minus the engine&apos;s timing of the same call</text>
+<line class="key sk" x1="1150.93" y1="86.9" x2="1164.93" y2="86.9" stroke-width="1.6"/>
+<text class="mut" x="1170.93" y="90.9" font-size="11">median</text>
+<line class="key" stroke="#8a8985" x1="861.69" y1="103.9" x2="875.69" y2="103.9" stroke-width="1.6" stroke-dasharray="4 3"/>
+<text class="mut" x="881.69" y="107.9" font-size="11">a round trip with no work (Ping, minimum)</text>
+<line x1="861.69" y1="582.26" x2="1374" y2="582.26" class="ref mk" stroke-width="1.2" stroke-dasharray="5 4"/>
+<rect x="879.98" y="575.1" width="36.59" height="7.37" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="879.98" y1="464.31" x2="916.58" y2="464.31" class="median sk" stroke-width="2"/>
+<text class="mut" x="898.28" y="458.31" font-size="10" text-anchor="middle">32</text>
+<rect x="953.17" y="573.41" width="36.59" height="9.06" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="953.17" y1="492" x2="989.77" y2="492" class="median sk" stroke-width="2"/>
+<text class="mut" x="971.47" y="486" font-size="10" text-anchor="middle">39</text>
+<rect x="1026.36" y="571.49" width="36.59" height="10.97" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="1026.36" y1="468.34" x2="1062.95" y2="468.34" class="median sk" stroke-width="2"/>
+<text class="mut" x="1044.66" y="462.34" font-size="10" text-anchor="middle">48</text>
+<rect x="1099.55" y="565.6" width="36.59" height="16.87" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="1099.55" y1="427.64" x2="1136.14" y2="427.64" class="median sk" stroke-width="2"/>
+<text class="mut" x="1117.84" y="421.64" font-size="10" text-anchor="middle">73</text>
+<rect x="1172.73" y="556.43" width="36.59" height="26.03" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="1172.73" y1="276.49" x2="1209.33" y2="276.49" class="median sk" stroke-width="2"/>
+<text class="mut" x="1191.03" y="270.49" font-size="10" text-anchor="middle">113</text>
+<rect x="1245.92" y="570.97" width="36.59" height="11.5" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="1245.92" y1="484.64" x2="1282.52" y2="484.64" class="median sk" stroke-width="2"/>
+<text class="mut" x="1264.22" y="478.64" font-size="10" text-anchor="middle">50</text>
+<rect x="1319.11" y="559.21" width="36.59" height="23.25" class="bar" fill="#eb6834" fill-opacity="0.9"/>
+<line x1="1319.11" y1="371.06" x2="1355.7" y2="371.06" class="median sk" stroke-width="2"/>
+<text class="mut" x="1337.41" y="365.06" font-size="10" text-anchor="middle">101</text>
+</g>
+</svg>

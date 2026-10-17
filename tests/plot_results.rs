@@ -23,6 +23,9 @@ mod chart;
 #[path = "../src/bin/plot_results/data.rs"]
 mod data;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/go_overhead.rs"]
+mod go_overhead;
+#[allow(dead_code)]
 #[path = "../src/json.rs"]
 mod json;
 #[allow(dead_code)]
@@ -388,6 +391,7 @@ const ALL: &[(&str, &str)] = &[
     ("video", "embedgemma2_video_m5pro"),
     ("media-decode", "media_decode_m5pro"),
     ("media-resample", "media_resample_m5pro"),
+    ("go-overhead", "embedgemma2_go_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------

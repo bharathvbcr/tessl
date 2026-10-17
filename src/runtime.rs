@@ -2120,13 +2120,23 @@ impl GpuRuntime {
         Ok(())
     }
 
-    /// Whether a command buffer is open and still recording: work encoded
-    /// since the last commit that no GPU submission references yet. Read-only;
-    /// pair it with [`Self::last_signaled_value`] to name the commit that will
-    /// carry that work (`last_signaled_value() + 1`).
-    pub(crate) fn has_open_batch(&self) -> bool {
+    /// The lifetime-event value whose completion proves everything recorded so
+    /// far has finished: `event_value + 1` while a command buffer is open (the
+    /// next commit carries it), else `event_value` (the last commit already
+    /// did). Read-only.
+    ///
+    /// Both reads happen under the `active_m4` lock. `commit_m4` clears
+    /// `cb_open` and bumps `event_value` while holding that same lock, so the
+    /// pair is never observed half-updated by a concurrent commit. Reading
+    /// the open flag and [`Self::last_signaled_value`] separately would be.
+    pub(crate) fn pending_commit_value(&self) -> u64 {
         let guard = self.active_m4.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().is_some_and(|b| b.cb_open)
+        let signaled = self.metal4.event_value.load(Ordering::Acquire);
+        if guard.as_ref().is_some_and(|b| b.cb_open) {
+            signaled + 1
+        } else {
+            signaled
+        }
     }
 
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {

@@ -288,11 +288,9 @@ impl IcbCopySmoke {
             }
             Ok(())
         })?;
-        // The commit that carries this execute: the next one if its batch is
-        // still open (a commit signals `last_signaled_value() + 1`), else the
-        // one that already took it. Completion of that value ends the hazard.
-        let signaled = rt.last_signaled_value();
-        self.in_flight_until = Some(if rt.has_open_batch() { signaled + 1 } else { signaled });
+        // The commit that carries this execute, read atomically against
+        // concurrent commits. Completion of that value ends the hazard.
+        self.in_flight_until = Some(rt.pending_commit_value());
         if need_opt {
             self.optimized = true;
         }
@@ -500,7 +498,11 @@ mod tests {
         let (rt, src, dst, mut smoke) = rig();
         rt.set_async_encode(true).unwrap();
         smoke.execute(&rt).expect("execute");
-        assert!(rt.has_open_batch(), "async execute leaves its batch open");
+        assert_eq!(
+            rt.pending_commit_value(),
+            rt.last_signaled_value() + 1,
+            "async execute leaves its batch open"
+        );
         let err = smoke.encode_copy(&src, &dst).unwrap_err();
         assert!(err.contains("synchronize"), "{err}");
         // Committed but not waited on is still not known complete: either the
@@ -551,8 +553,30 @@ mod tests {
             let _nop = crate::BinderEncodeNopGuard::enter();
             smoke.execute(&rt).expect("nop execute");
         }
-        assert!(!rt.has_open_batch());
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
         smoke.encode_copy(&src, &dst).expect("nothing was recorded");
+    }
+
+    /// `pending_commit_value` names the commit that carries what is recorded:
+    /// the next one while a batch is open, the last one after a commit, and the
+    /// completed value after a synchronize. The race it closes (a commit
+    /// between two separate reads) cannot be forced deterministically from a
+    /// test, so none is attempted.
+    #[test]
+    fn pending_commit_value_tracks_the_carrying_commit() {
+        let (rt, _src, _dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
+        smoke.execute(&rt).expect("execute");
+        let open = rt.pending_commit_value();
+        assert_eq!(open, rt.last_signaled_value() + 1);
+        rt.commit(false).unwrap();
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
+        assert_eq!(rt.pending_commit_value(), open);
+        rt.synchronize().unwrap();
+        assert_eq!(rt.last_completed_value(), open);
+        assert_eq!(rt.pending_commit_value(), open);
     }
 
     /// A poisoned runtime aborts its open batch, which never commits, so an

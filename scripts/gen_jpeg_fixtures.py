@@ -588,7 +588,7 @@ def cut_mid(name, data, klass, note, ks=None):
         body = pos[k] + 2 + struct.unpack(">H", data[pos[k] + 2:pos[k] + 4])[0]
         for third in (1, 2):
             at = body + (pos[k + 1] - body) * third // 3
-            case(f"{name}_mid{k}_{third}", data[:at] + b"\xff\xd9", klass, f"{note} cut inside scan {k + 1}, {third}/3 of it + EOI")
+            case(f"{name}_mid{k}_{third}", data[:at] + b"\xff\xd9", klass, f"{note} cut inside scan {k + 1}, {third}/3 of it + EOI", tessl="either")
 
 
 def smoothing_cases():
@@ -697,7 +697,8 @@ def lossless_cases():
         case(f"lossless_refused_gray_psv{psv}", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=psv), k, "one component: gray to RGB is not converted", tessl="either")
         case(f"lossless_refused_ycc_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, jfif=True), k, "YCbCr to RGB is not converted", tessl="either")
         case(f"lossless_refused_adobe1_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, adobe=1), k, "Adobe transform 1 (YCbCr)", tessl="either")
-    case("lossless_refused_ids_123", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=2), k, "no marker, ids 1 2 3: YCbCr", tessl="either")
+    case("lossless_ids_123_no_marker", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=2), k, "no JFIF or Adobe marker, ids 1 2 3: decoded as RGB")
+    case("lossless_ids_789_no_marker", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=3, comp_ids=[7, 8, 9]), k, "no marker, unrecognised ids")
     for pt in (1, 2, 4, 7):
         for psv in (1, 4, 6, 7):
             case(f"lossless_pt{pt}_psv{psv}", write_lossless(12, 10, c3, ll_planes(rng, c3, 12, 10, pt=pt), psv=psv, pt=pt, adobe=0), k, f"point transform {pt}, predictor {psv}")
@@ -789,7 +790,7 @@ def lossless_cases():
     for psv, pt in ((1, 1), (4, 3), (7, 2)):
         cj_case(f"lossless_cjpeg_psv{psv}_pt{pt}", photo(16, 24, 9), ["-lossless", f"{psv},{pt}"], f"cjpeg -lossless {psv},{pt}")
     im = photo(17, 23, 4)
-    cj_case("lossless_cjpeg_gray", im, ["-lossless", "5", "-grayscale"], "cjpeg gray, predictor 5")
+    cj_case("lossless_cjpeg_gray_flag", im, ["-lossless", "5", "-grayscale"], "cjpeg -grayscale is ignored under -lossless: an RGB file, predictor 5")
     cj_case("lossless_cjpeg_rgb", im, ["-lossless", "6", "-rgb"], "cjpeg -rgb, predictor 6")
     cj_case("lossless_cjpeg_420", im, ["-lossless", "2", "-sample", "2x2,1x1,1x1"], "cjpeg 4:2:0, predictor 2")
     cj_case("lossless_cjpeg_422", im, ["-lossless", "2", "-sample", "2x1,1x1,1x1"], "cjpeg 4:2:2, predictor 2")

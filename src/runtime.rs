@@ -3414,6 +3414,46 @@ mod audit_tests {
         );
     }
 
+    fn test_watch(state: &Arc<FeedbackState>) -> FeedbackWatch {
+        FeedbackWatch {
+            state: Arc::clone(state),
+            _options: MTL4CommitOptions::new(),
+            block: None,
+        }
+    }
+
+    /// The commit-feedback error path: a callback that reported a fault turns
+    /// into an `Err` and the poison latch; one that has not run yet stays
+    /// queued and is not a fault. (The real callback needs a failing GPU
+    /// command buffer, so the watches here are filled in by hand.)
+    #[test]
+    fn observe_finished_feedback_poisons_on_a_reported_fault_and_requeues_a_pending_watch() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(!rt.is_poisoned());
+
+        let pending = Arc::new(FeedbackState::new());
+        rt.metal4.allocators.lock().unwrap()[1].feedback = Some(test_watch(&pending));
+        rt.observe_finished_feedback().unwrap();
+        assert!(!rt.is_poisoned(), "a callback that has not run is silence, not a fault");
+        {
+            let mut slots = rt.metal4.allocators.lock().unwrap();
+            assert!(
+                slots.iter().any(|s| s.feedback.is_some()),
+                "the pending watch was dropped"
+            );
+            for s in slots.iter_mut() {
+                s.feedback = None;
+            }
+        }
+
+        let failed = Arc::new(FeedbackState::new());
+        failed.fail("page fault".to_string());
+        rt.metal4.allocators.lock().unwrap()[0].feedback = Some(test_watch(&failed));
+        let err = rt.observe_finished_feedback().unwrap_err();
+        assert_eq!(err, "Metal 4 command buffer fault: page fault");
+        assert!(rt.is_poisoned(), "a reported fault did not set the poison latch");
+    }
+
     /// Hot buffers and large Cold ones are made at their size rounded to a
     /// 16 KiB page, and that is what Metal charges for them; small Cold
     /// temporaries keep power-of-two buckets. Before, every request took its

@@ -24,111 +24,56 @@ const BANNED: &[&str] = &[
     ".write_bytes(",
 ];
 
-/// Types whose `read_f32` / `read_u32` return `Result` (a file read, not a
-/// `GpuBuffer` mapping): `SafeTensors` and the checkpoint traits.
-const SAFE_TYPES: &[&str] = &["SafeTensors", "CheckpointSource", "TensorSource"];
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// One reviewed exemption: `count` calls of `method` on exactly `receiver`
+/// (the identifier chain right before the dot) in `file`.
+struct Site {
+    file: &'static str,
+    receiver: &'static str,
+    method: &'static str,
+    count: usize,
 }
 
-/// Byte offsets of every whole-word occurrence of `word` in `s`.
-fn word_positions<'a>(s: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
-    s.match_indices(word)
-        .map(|(i, _)| i)
-        .filter(move |&i| !s[..i].ends_with(is_ident_char) && !s[i + word.len()..].starts_with(is_ident_char))
-}
+/// Why this is a site list. `SafeTensors::read_f32` / `read_u32` and the
+/// `CheckpointSource` / `TensorSource` trait methods share names with the
+/// panicking `GpuBuffer` accessors but return `Result` (they read a file, not a
+/// mapping). Renaming them is a public API change the owner has not approved,
+/// and text scanning cannot infer a receiver's type soundly (aliases, wrapper
+/// types, shadowing, pattern bindings), so no heuristic is attempted: every
+/// exempt call is a reviewed site, counted exactly.
+///
+/// To add a site: confirm by reading the call that the receiver is a
+/// `SafeTensors` / `CheckpointSource` / `TensorSource` value, then add a row
+/// with the file, the receiver text as written (`self.st`, `st`) and the number
+/// of such calls. A new call beyond the count fails the test and names the
+/// call; a count above what the file holds (a stale row) fails and names the row.
+const ALLOWED_SITES: &[Site] = &[
+    Site {
+        file: "src/loader.rs",
+        receiver: "self.st",
+        method: ".read_f32(",
+        count: 2,
+    },
+    Site {
+        file: "src/safetensors.rs",
+        receiver: "st",
+        method: ".read_f32(",
+        count: 1,
+    },
+];
 
-/// A type or initializer expression: up to the first `,` `=` `;` `{` at depth
-/// zero, or the first unbalanced closer.
-fn clause(s: &str) -> &str {
-    let mut depth = 0i32;
-    for (i, c) in s.char_indices() {
-        match c {
-            '<' | '(' | '[' => depth += 1,
-            '>' | ')' | ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return &s[..i];
-                }
-            }
-            ',' | '=' | ';' | '{' if depth == 0 => return &s[..i],
-            _ => {}
-        }
-    }
-    s
-}
-
-fn mentions_safe_type(text: &str) -> bool {
-    SAFE_TYPES.iter().any(|t| word_positions(text, t).next().is_some())
-}
-
-/// Does the file declare `fn name` with a safe type in its return type?
-fn fn_returns_safe_type(stripped: &str, name: &str) -> bool {
-    word_positions(stripped, name).any(|i| {
-        stripped[..i].trim_end().ends_with("fn") && {
-            let sig = stripped[i..].split(['{', ';']).next().unwrap_or("");
-            sig.split_once("->").is_some_and(|(_, ret)| mentions_safe_type(ret))
-        }
-    })
-}
-
-/// Is `ident` bound to a safe type everywhere this file binds it? A binding is
-/// `ident: Type` (parameter, field, typed `let`), `let [mut] ident = init`, or a
-/// `for` / closure-parameter binding. Safe means: the type mentions a safe
-/// type, or names a generic whose own bound does (`S: CheckpointSource`); an
-/// initializer is `SafeTensors::...` or a call to a file-local `fn` returning
-/// one. One non-safe binding anywhere in the file revokes the exemption
-/// (shadowing is not resolved by text scanning), and so does having no
-/// recognisable binding. `depth` bounds the generic-bound recursion.
-fn is_safe_binding(stripped: &str, ident: &str, depth: u8) -> bool {
-    let mut found = false;
-    for i in word_positions(stripped, ident) {
-        let before = stripped[..i].trim_end();
-        let before = before
-            .strip_suffix("mut")
-            .filter(|r| !r.ends_with(is_ident_char))
-            .map_or(before, str::trim_end);
-        let after = stripped[i + ident.len()..].trim_start();
-        let is_let = before.ends_with("let") && !before[..before.len() - 3].ends_with(is_ident_char);
-        let safe = if after.starts_with(':') && !after.starts_with("::") {
-            let ty = clause(&after[1..]);
-            mentions_safe_type(ty)
-                || (depth < 2
-                    && ty
-                        .split(|c: char| !is_ident_char(c))
-                        .filter(|t| *t != ident && t.starts_with(char::is_uppercase))
-                        .any(|t| is_safe_binding(stripped, t, depth + 1)))
-        } else if is_let {
-            let init = after.strip_prefix('=').unwrap_or("").split(';').next().unwrap_or("");
-            let init = init.trim_start_matches(|c: char| c == '&' || c.is_whitespace());
-            let init = init.strip_prefix("self.").unwrap_or(init);
-            let callee = init.split('(').next().unwrap_or("").trim();
-            init.contains("SafeTensors::")
-                || (!callee.is_empty() && callee.chars().all(is_ident_char) && fn_returns_safe_type(stripped, callee))
-        } else if before.ends_with("for") || before.ends_with('|') {
-            false
-        } else {
-            continue;
-        };
-        if !safe {
-            return false;
-        }
-        found = true;
-    }
-    found
-}
-
-/// `SafeTensors::read_f32` / `read_u32` (and the `CheckpointSource` /
-/// `TensorSource` trait methods) share two banned names but return `Result`.
-/// The exemption applies only when the receiver is a plain identifier (or
-/// `self.ident`) that this file binds to such a type. A chained receiver such
-/// as `checkpoint().read_f32(` or `a[0].read_f32(` has no identifier and is
-/// flagged.
-fn is_safetensors_receiver(stripped: &str, line: &str, at: usize) -> bool {
+/// The identifier chain immediately before the dot (`self.st`, `st`); empty
+/// when the receiver is a call, index or other expression, so those never match.
+fn receiver_text(line: &str, at: usize) -> &str {
     let before = &line[..at];
-    let ident = &before[before.rfind(|c: char| !is_ident_char(c)).map_or(0, |p| p + 1)..];
-    !ident.is_empty() && is_safe_binding(stripped, ident, 0)
+    let start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .map_or(0, |p| p + 1);
+    let chain = &before[start..];
+    if chain.starts_with('.') {
+        ""
+    } else {
+        chain
+    }
 }
 
 /// Blank out comments, string and char literals (keeping newlines so line
@@ -268,20 +213,51 @@ fn blank_cfg_test_items(mut s: String) -> String {
     s
 }
 
-/// `file:line: .accessor` for every banned call in `src`.
-fn violations(file: &str, src: &str) -> Vec<String> {
+/// `file:line: .accessor` for every banned call in `src` that is not covered by
+/// a `sites` row, plus one line per row whose count the file does not match:
+/// calls beyond the count are reported individually, a shortfall names the row.
+fn violations_with(file: &str, src: &str, sites: &[Site]) -> Vec<String> {
     let stripped = strip(src);
     let mut out = Vec::new();
+    let mut seen = vec![0usize; sites.len()];
     for (n, line) in stripped.lines().enumerate() {
-        for pat in BANNED {
-            for (at, _) in line.match_indices(pat) {
-                if !is_safetensors_receiver(&stripped, line, at) {
-                    out.push(format!("{file}:{}: {}", n + 1, pat.trim_end_matches('(')));
+        let mut calls: Vec<(usize, &str)> = BANNED
+            .iter()
+            .flat_map(|pat| line.match_indices(pat).map(move |(at, _)| (at, *pat)))
+            .collect();
+        calls.sort_unstable();
+        for (at, pat) in calls {
+            let recv = receiver_text(line, at);
+            let site = sites
+                .iter()
+                .position(|s| s.file == file && s.receiver == recv && s.method == pat);
+            match site {
+                Some(i) if seen[i] < sites[i].count => seen[i] += 1,
+                Some(i) => {
+                    out.push(format!(
+                        "{file}:{}: {} on `{recv}` exceeds the {} reviewed call(s) in ALLOWED_SITES",
+                        n + 1,
+                        pat.trim_end_matches('('),
+                        sites[i].count
+                    ));
                 }
+                None => out.push(format!("{file}:{}: {}", n + 1, pat.trim_end_matches('('))),
             }
         }
     }
+    for (s, &got) in sites.iter().zip(&seen) {
+        if s.file == file && got < s.count {
+            out.push(format!(
+                "{file}: stale ALLOWED_SITES row: `{}{}` expected {} call(s), found {got}",
+                s.receiver, s.method, s.count
+            ));
+        }
+    }
     out
+}
+
+fn violations(file: &str, src: &str) -> Vec<String> {
+    violations_with(file, src, ALLOWED_SITES)
 }
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -364,9 +340,17 @@ fn library_code_never_calls_a_panicking_host_accessor() {
     assert!(files.len() > 10, "found only {} source files", files.len());
     let test_only = cfg_test_only_paths(&files);
     let mut bad = Vec::new();
+    let mut scanned = Vec::new();
     for f in files.iter().filter(|f| !test_only.iter().any(|t| f.starts_with(t))) {
         let rel = f.strip_prefix(root).unwrap().display().to_string();
         bad.extend(violations(&rel, &std::fs::read_to_string(f).unwrap()));
+        scanned.push(rel);
+    }
+    for s in ALLOWED_SITES.iter().filter(|s| !scanned.iter().any(|r| r == s.file)) {
+        bad.push(format!(
+            "{}: stale ALLOWED_SITES row: file is not scanned library code",
+            s.file
+        ));
     }
     assert!(
         bad.is_empty(),
@@ -416,59 +400,65 @@ fn after_tests(b: &GpuBuffer) {
     assert_eq!(v, vec!["x.rs:20: .contents_u8".to_string()], "{v:?}");
 }
 
-/// A checkpoint read (a `Result`-returning file read) is not a mapping, but the
-/// exemption follows the receiver's declared type, never its name.
+const PLANTED: &[Site] = &[Site {
+    file: "p.rs",
+    receiver: "self.st",
+    method: ".read_f32(",
+    count: 2,
+}];
+
+/// A `Result`-returning checkpoint read is exempt only at a reviewed site, by
+/// exact file and receiver text, and the per-file count must match exactly.
 #[test]
-fn the_safetensors_exemption_follows_the_receiver_type_not_its_name() {
-    let flagged = |src: &str| violations("y.rs", src).len();
-    // `st` bound to a GpuBuffer is a panicking accessor (regression: the old
-    // scanner exempted any receiver literally named `st`).
-    assert_eq!(flagged("fn f(st: &GpuBuffer) { st.read_f32(); }"), 1);
-    assert_eq!(flagged("fn f(rt: &R) { let st = rt.alloc(4); st.read_f32(); }"), 1);
+fn the_exemption_is_an_exact_counted_site_list() {
+    let v = |file: &str, src: &str| violations_with(file, src, PLANTED);
+    let two = "fn f(&self) {\n    self.st.read_f32(&a)?;\n    self.st.read_f32(&b)?;\n}\n";
+    assert!(v("p.rs", two).is_empty());
+    // A third call with the allowlisted receiver text is an unreviewed call.
+    let three = format!("{two}fn g(&self) {{ self.st.read_f32(&c)?; }}\n");
     assert_eq!(
-        flagged("struct L { st: GpuBuffer }\nfn f(l: &L) { l.st.read_u32(); }"),
-        1
+        v("p.rs", &three),
+        vec!["p.rs:5: .read_f32 on `self.st` exceeds the 2 reviewed call(s) in ALLOWED_SITES"]
     );
-    // Unbound receiver names are flagged, including the old `st`.
-    assert_eq!(flagged("fn f() { st.read_f32(&n)?; }"), 1);
-    assert_eq!(flagged("fn f() { self.st.read_f32(&n)?; }"), 1);
-    // SafeTensors / CheckpointSource receivers pass under any name.
-    assert_eq!(flagged("fn f(ckpt: &SafeTensors) { ckpt.read_f32(&n)?; }"), 0);
-    assert_eq!(flagged("fn f(c: &dyn CheckpointSource) { c.read_u32(&n)?; }"), 0);
-    assert_eq!(flagged("fn f(c: &impl CheckpointSource) { c.read_f32(&n)?; }"), 0);
-    assert_eq!(flagged("fn f<S: CheckpointSource>(c: &S) { c.read_f32(&n)?; }"), 0);
+    // A missing site is a stale row.
+    let one = "fn f(&self) { self.st.read_f32(&a)?; }\n";
     assert_eq!(
-        flagged("fn f<S>(c: &S) where S: CheckpointSource { c.read_f32(&n)?; }"),
-        0
+        v("p.rs", one),
+        vec!["p.rs: stale ALLOWED_SITES row: `self.st.read_f32(` expected 2 call(s), found 1"]
     );
+    // Same receiver in another file, another method, or another receiver text.
+    assert_eq!(v("q.rs", two).len(), 2);
+    assert_eq!(v("p.rs", "fn f(&self) { self.st.read_u32(&a)?; }\n").len(), 2);
+    assert_eq!(v("p.rs", &format!("{two}fn g() {{ st.read_f32(&c); }}\n")).len(), 1);
+    // Multiple calls on one line are counted individually.
     assert_eq!(
-        flagged("fn f() { let st = SafeTensors::open(p)?; st.read_f32(&n)?; }"),
-        0
-    );
-    assert_eq!(
-        flagged("struct L<'a> { st: &'a dyn TensorSource }\nfn f(l: &L) { l.st.read_f32(&n)?; }"),
-        0
-    );
-    assert_eq!(
-        flagged("fn shard(&self) -> Result<&SafeTensors, String> { x }\nfn f(&self) { let st = self.shard(n)?; st.read_f32(n) }"),
-        0
-    );
-    // A chained receiver has no identifier to resolve: flagged.
-    assert_eq!(flagged("fn f() { checkpoint().read_f32(&n)?; }"), 1);
-    assert_eq!(flagged("fn f(v: &[SafeTensors]) { v[0].read_f32(&n)?; }"), 1);
-    // Shadowing is not resolved: one non-safe binding in the file revokes the
-    // exemption for every use of that name (conservative, may over-flag).
-    assert_eq!(
-        flagged("fn a(st: &SafeTensors) { st.read_f32(&n)?; }\nfn b(st: &GpuBuffer) { st.read_f32(); }"),
-        2
-    );
-    // Several calls on one line are judged independently.
-    assert_eq!(
-        flagged(
-            "fn f(st: &SafeTensors, b: &GpuBuffer) { st.read_f32(&n)?; b.read_f32(); st.read_u32(&n)?; b.read_u32(); }"
+        v(
+            "p.rs",
+            "fn f(&self, b: &GpuBuffer) { self.st.read_f32(&a)?; b.read_f32(); self.st.read_f32(&c)?; }\n"
         ),
-        2
+        vec!["p.rs:1: .read_f32"]
     );
+}
+
+/// The regression the old `st` name rule missed, plus type-mentioning shapes a
+/// text-level type inference would wrongly clear: none has a site row.
+#[test]
+fn receivers_without_a_reviewed_site_are_flagged() {
+    for src in [
+        "fn f(st: &GpuBuffer) { st.read_f32(); }",
+        "fn f(rt: &R) { let st = rt.alloc(4); st.read_f32(); }",
+        "struct L { st: GpuBuffer }\nfn f(l: &L) { l.st.read_u32(); }",
+        "fn f(st: Result<GpuBuffer, SafeTensors>) { st.read_f32(); }",
+        "type SafeTensors = GpuBuffer;\nfn f(st: &SafeTensors) { st.read_f32(); }",
+        "use x::GpuBuffer as SafeTensors;\nfn f(st: &SafeTensors) { st.read_f32(); }",
+        "fn f(p: &str, buf: GpuBuffer) { let st = SafeTensors::open(p).map(|_| buf).unwrap(); st.read_f32(); }",
+        "fn f(o: &O) { if let Some(st) = o.get() { st.read_f32(); } }",
+        "fn f(c: &C) { c.checkpoint().read_f32(&n); }",
+        "fn f(v: &[SafeTensors]) { v[0].read_f32(&n); }",
+        "fn f(ckpt: &SafeTensors) { ckpt.read_f32(&n)?; }",
+    ] {
+        assert_eq!(violations("y.rs", src).len(), 1, "{src}");
+    }
 }
 
 #[test]

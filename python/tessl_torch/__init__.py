@@ -1456,3 +1456,8 @@ class Qwen35(_Owned):
         self._check(status, err)
         self._has_grads = True
         return loss.value
+
+
+from .embedgemma2 import EmbedGemma2  # noqa: E402  (after the definitions it imports from this module)
+
+__all__ += ["EmbedGemma2"]

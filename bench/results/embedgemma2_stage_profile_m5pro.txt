@@ -1,0 +1,603 @@
+EmbedGemma2 per-stage GPU time (G5) and device-memory accounting (G6)
+======================================================================
+Machine: Apple M5 Pro, 64 GB, macOS 27 (Darwin 27.0.0), 2026-10-15. Library at 60a6240 (branch
+worktree-agent-aa4d6ba1364869275, which adds only src/bin/profile_embedgemma2.rs, this file and
+its data, and a paragraph in docs/embedgemma2.md; no library code changed). Checkpoint:
+google/embeddinggemma-2 snapshot 914f7f89142e33e77833254d9c9b90c3cef7303b. Tool:
+target/release/profile_embedgemma2 (src/bin/profile_embedgemma2.rs), analysis by
+`results_report stage` (src/bin/results_report) and bench/results/embedgemma2_stage_profile_plot.py. Data (every raw sample of every
+pass and every mode): embedgemma2_stage_profile_m5pro.json. Plot: embedgemma2_stage_profile_m5pro.png.
+The stage tables at the end of this file are the report tool's output (it also writes them to
+embedgemma2_stage_profile_tables.txt, not committed).
+
+Verified = measured here and the output is in the JSON. Inferred = follows from measured numbers by
+an argument stated next to it. Unverified = not measured.
+
+SUMMARY
+  * G5. In every workload, exact-f32 GEMMs are 52-88 % of a forward. The largest single stages are the
+    gate|up GEMM (14-32 %), then, depending on length, the sliding-window attention (up to 16 %) or
+    the global attention (27 % at 2x4096), then the qkv and down GEMMs. The elementwise stages
+    (norms, residual adds, gelus, rope, scale, gather) together are 10-18 %, and at >= 2048 rows
+    each runs at 190-285 GB/s of counted traffic, about the 218-246 GB/s a blit reaches: a faster
+    kernel gains little there, only fusion removes the traffic. The GEMMs are compute-bound on the
+    f32 TensorOps rate (75-98 % of the 7.4 TFLOP/s a 4096^3 f32 GEMM reaches) at >= 2048 rows.
+    With bf16 operands the same shapes run 3.8-4.6x faster (24-29 TFLOP/s) at >= 2048 rows and
+    1.9-2.2x at 16 rows (weight-bandwidth side). Attention, 3.5-43 % of a forward, also runs at the
+    f32 matrix rate (5.0-6.0 TFLOP/s at >= 256 tokens per sequence). Verified.
+  * G6. The cause is isolated and it is three things, not the two guessed. (1) One activation set
+    grew from 576 to 736 MiB at 8192 rows (+160 MiB, +27.8 %): the per-layer-input run buffer is
+    +240 MiB, the packed gate|up and the dropped normed-V buffer save 80 MiB (the audit's "packed
+    gate|up" is a saving, not a cause). (2) Two sets are live
+    at once whenever encode is called again without a wait in between: encode's last act is to drop
+    its activations, the pool recycles them only at the next commit, and the next encode allocates
+    first. So a loop of encodes peaks at 2 x 736 = 1472 MiB, not 736. (3) bench_embedgemma2's
+    "device_peak_mib" starts each workload from what the earlier workloads left cached, so the
+    three rows 32x256 / 8x1024 / 2x4096 of the committed table are one number (1652), not three
+    measurements: 1652.4 = 436.3 (cached by 1x16, 64x32) + 2 x 608.1 (two sets, 128.3 reused from
+    the cache). Reproduced to 0.01 MiB below. Verified.
+
+MACHINE STATE AND NOISE
+  Other sessions share this GPU and CPU (three other tessl worktrees were running GPU tests, and
+  builds and tests of two other repositories were running, during this work), and the GPU is not
+  idle in the display sense: ioreg's "Device Utilization %" read 17-75 % with no job of mine
+  running, and 0 % in quiet windows.
+  The harness therefore waited for any other tessl test or bench binary to exit before each sample
+  (libproc scan of the process table), retook samples during which one appeared, flagged what it
+  could not make clean, and records the ioreg reading at the start and end of each workload.
+  Four passes of the whole stage run were taken (pass 1 12:27-12:45 CDT, passes 2-4 12:49-13:12 CDT
+  after the load had gone). Pass 1 is kept in the JSON but excluded from every figure below: the
+  GPU was visibly slow in it (64x32 full forward 188.8 ms against 102.9-109.3 ms in the others,
+  gate|up GEMM 3.9 against 6.3 TFLOP/s), not through a tessl process the harness could see (the
+  slowdown source is unknown). Passes 2, 3, 4 ran at ioreg utilization 0-4 % at start; they
+  disagree by up to 9 % (8x1024: 621.5, 567.0, 582.6 ms) and 22 % (2x4096: 832.6, 708.6, 680.5 ms)
+  on the whole forward. A stage's figure below is the minimum over every kept sample of the three
+  passes (the house method: min-of-N), and the per-class tables show the range of the per-pass
+  minima. Treat any figure as good to about +-10 %, and any difference under 10 % between two
+  workloads' ranks as noise. The existing bench numbers (embedgemma2_before_after_m5pro.txt, async
+  lane: 7.4 / 102.7 / 466.1 / 528.7 / 689.1 ms for 1x16 / 64x32 / 32x256 / 8x1024 / 2x4096) agree
+  with the replica's 7.3 / 102.9 / 466.0 / 567.0 / 680.5 ms to about 7 % at every workload.
+
+METHOD (what was timed)
+  Stages. The runtime stamps GPU timestamps only at the start and the end of a command buffer
+  (take_metal4_stamps; mid-commits and constant-arena reclaims leave no end stamp), and
+  new_inference() has none, so a per-dispatch GPU time is not available. Instead the harness holds
+  a replica of EmbedGemma2Model::forward built from the library's public kernels (gemm,
+  gemm_nt_f32, encoder_attn, segment_mean_rows, l2_normalize_rows, qwen35::{embed_rows_scaled,
+  gated_act, attn_qk_norm_rope_columns}, nn::{rms_norm_f32, rms_norm_residual_add_f32,
+  scale_f32_inplace}), loaded from the real checkpoint (all 24 layers' weights packed as
+  Loader::linear packs them, so the weights cycle through the caches as in an encode). The replica
+  runs in async mode (set_async_encode(true)); 1-10 forwards are queued per host wait so the wait is
+  a small part of each sample (10 at 1x16, 1 elsewhere); the host's encode time per forward is
+  0.13-0.35 ms in every workload, so no workload is host-bound and the GPU time is what is
+  measured. It is switched stage by stage with a bit mask over 21 classes:
+     full         every class on;
+     only:<c>     only class c, every other dispatch skipped: that stage's cost across all its
+                  layers with its real shapes, real weights, real dispatch barriers;
+     skip:<c>     everything but c (pass 3 only);
+     none         no dispatch: the harness floor (0.001-0.012 ms);
+     encode       EmbedGemma2Model::encode itself.
+  The 5 workloads are timed interleaved (forward order on even rounds, reversed on odd), 9 rounds
+  per pass. A skipped stage leaves stale data in its output; the activations are host-zeroed so
+  nothing downstream can see a NaN, and GPU time does not depend on values (inferred; the sums
+  below are consistent with it).
+  Checks. (1) The replica reproduces encode: its embeddings are bit-identical to
+  EmbedGemma2Model::encode's on the same tokens at all five workloads (768, 49152, 24576, 6144 and
+  1536 values, max abs diff 0; verified, in the JSON as replica_vs_encode). (2) The sum of the 21
+  stages' "only" times against the full forward: 106.4 % (1x16), 109.9 % (64x32), 98.8 % (32x256),
+  99.7 % (8x1024), 105.9 % (2x4096). The gap on the two small workloads is the per-wait and
+  per-class ramp each "only" run pays and the full forward does not (inferred); at the large ones
+  the stages add up to the whole within noise. (3) encode() against the replica, by workload
+  (1x16 / 64x32 / 32x256 / 8x1024 / 2x4096): 7.82 / 102.28 / 451.84 / 552.27 / 692.55 ms against
+  7.30 / 102.92 / 466.05 / 566.97 / 680.48: -3 % to +7 %, inside noise, so the library's per-call
+  extras (activation allocation, id upload, readback) cost nothing measurable. The allocation
+  churn alone, measured with no forward (mode alloc), is 0.4-0.8 ms per call at every size. A
+  forward on freshly allocated, unzeroed activations per call (as encode makes them) against the
+  replica's one host-zeroed set, 10 comparisons (5 workloads x passes 2 and 3): -10 % to +10 %,
+  no systematic sign. The replica's stage times are therefore the library's within noise.
+  The ablation (full - skip) is too noisy to use. Its sum over all 21 stages is 117 / 21 / -13 /
+  122 / 78 % of the full forward at 1x16 / 64x32 / 32x256 / 8x1024 / 2x4096 in pass 3, because a
+  stage's marginal time (a few ms to 100 ms) sits under the drift between two full-forward
+  minima. It agrees with the stage alone for the largest stage (gate|up GEMM: 132 vs 137 ms at
+  8x1024, 136 vs 135 at 2x4096) and is not trustworthy below about 10 % of the forward. All
+  statements below use the "only" times.
+  Dispatches and fixed costs. 369 dispatches per forward at 1x16 and 64x32, 372 at 8192 rows (the
+  per-layer-input projection runs in 1 GEMM, or 2 when its 256 MiB run buffer holds 15 layers).
+  A 64-element in-place scale (mode gemm): 1.64 us per queued dispatch (min of 9 x 2000 per wait),
+  169 us per dispatch when each commits and waits (min of 5 x 100): 369 x 169 us = 62 ms, most of
+  the 77 ms between the committed synchronous and queued 1x16 encodes (85 vs 7.4 ms, G1).
+  Queued dispatch cost is 369 x 1.64 us = 0.6 ms, 8 % of the 7.3 ms forward.
+  Ceilings. The M5 Pro's peak bandwidth and FLOP/s are not stated in anything this repository
+  holds and are not used. "Ceiling" below is only what this harness measured on this machine in
+  the same session: gpu_copy 256 MiB -> 256 MiB: 218 GB/s (an earlier run 246; the in-place scale
+  kernel 228); exact-f32 TensorOps GEMM 4096^3: 7.36 TFLOP/s; bf16-operand GEMM (gemm_bf16, f32
+  accumulate) 4096^3: 30.13 TFLOP/s. They are what the library's kernels reach, not hardware
+  limits; elementwise kernels below read above the copy ceiling because 16 MiB tensors partly stay
+  in the system cache. Machine balance (flop per byte) is 33.7 for exact f32 and 137.9 for bf16.
+
+RESULTS: G5, WHERE THE TIME GOES
+  Whole forward, replica against encode, sum of stages, and the ranking by group are in the generated
+  tables at the end of this file (verified). Top five stage groups, % of the replica's forward:
+    1x16 (16 rows)    down GEMM 28.3; per-layer-input GEMMs 18.5; o GEMMs 17.3; gate|up GEMM 13.6; qkv GEMMs 10.9
+    64x32 (2048)      gate|up GEMM 31.9; qkv GEMMs 17.9; down GEMM 14.7; per-layer-input GEMMs 13.9; o GEMMs 9.6
+    32x256 (8192)     gate|up GEMM 27.6; qkv GEMMs 15.6; down GEMM 12.3; per-layer-input GEMMs 11.0; o GEMMs 8.0
+    8x1024 (8192)     gate|up GEMM 23.9; attention sliding 15.4; qkv GEMMs 12.4; down GEMM 10.9; per-layer-input GEMMs 9.1
+    2x4096 (8192)     attention global 27.3; gate|up GEMM 19.6; attention sliding 15.8; qkv GEMMs 10.9; down GEMM 8.9
+  Shares by kind (% of the forward): exact-f32 GEMMs 88.4 / 88.1 / 74.5 / 62.8 / 52.5; attention
+  (sliding + global) 4.8 / 3.5 / 9.5 / 24.3 / 43.1; elementwise 13.0 / 18.4 / 14.8 / 12.6 / 10.4 (same
+  workload order). Attention is cheap while the sequence is short (a sliding layer skips key tiles
+  outside the window, kernels/attn_tiled.h:51-54, so it is linear in length) and grows with it:
+  the 4 global layers alone cost 186 ms of 680 at 2x4096.
+
+  Compute-bound or bandwidth-bound (measured ceilings above; "AI" is flop per byte moved, each operand
+  once; the full table is in embedgemma2_stage_profile_m5pro.json under gemm.gemm_shapes):
+  GEMM at 8192 rows, f32 (stage alone, real weights, in the forward):
+    gate|up 6.09-6.41 TFLOP/s, down 6.70-7.19, qkv sliding 6.0-6.4, o 6.4-6.7, ple_gate/out 5.9-6.2,
+    per-layer-input projection 5.8-6.2: 79-98 % of the 7.36 TFLOP/s f32 ceiling (most 83-93 %), at
+    28-50 GB/s (13-23 % of the copy ceiling). AI 124-216 against a balance of 33.7. Compute-bound on
+    the f32 matrix rate.
+    A bf16 weight copy halves the bytes and does not move this: what changes the time is the bf16
+    matrix rate (next table). At 2048 rows (64x32) the same: 5.4-6.8 TFLOP/s, AI 114-186.
+  GEMM at 16 rows (1x16): AI 7.5-7.7, under the balance, so the weights' bytes set the floor; but only
+    gate|up (185 GB/s, 84 % of the copy ceiling) and qkv (122-158 GB/s) come near it. down, o and the
+    two per-layer-input GEMMs run at 37-48 GB/s (17-22 %): K = 2048 or N = 512 gives few tiles and
+    the time is latency, not bytes. These four are 62 % of the 1x16 forward.
+  Attention: sliding 5.4-6.0 TFLOP/s, global 5.0-5.9 at >= 256 tokens per sequence (67-82 % of the f32
+    ceiling): compute-bound on the f32 matrix rate. At 32 tokens per sequence (64x32) 1.6-2.4 TFLOP/s,
+    but attention is 3.5 % there.
+  Elementwise stages at >= 2048 rows: gelu*up 235-253 GB/s, rms_norm 225-241, norm+residual 193-284,
+    qk-norm+rope+kv store 211-232, per-layer scale+norm 191-248, per-layer gelu 229-235 (bytes counted
+    once; the copy ceiling measured 218-246 GB/s, but 16 MiB tensors partly stay in the system
+    cache). They are bandwidth-bound and already at the practical roofline: a better kernel has
+    nothing to win, removing the traffic by fusion does. At 16 rows they cost 2.5-7 us per dispatch
+    (up to 35 us for the per-layer scale+norm pair): the dispatches, not the bytes, are what they
+    cost there.
+
+  bf16-operand GEMM, measured (gemm_bf16: bf16 weights and activations, f32 accumulate and output;
+  weights cycled over 24 distinct copies; the conversion of an f32 activation to bf16 is NOT
+  included, a fused producer would write bf16 directly):
+  see the table at the end. Summary: f32/bf16 time = 3.78-4.60 at 2048 and 8192 rows (bf16 rate
+  24-29 TFLOP/s, 79-95 % of its own 30.13 TFLOP/s ceiling) and 1.94-2.23 at 16 rows (the bytes halve).
+  Not run: the bf16 GEMM inside a forward, and its numerics against the f32 forward (unverified).
+
+RESULTS: G6, DEVICE MEMORY
+  Reconciled to the byte. Device allocated bytes above the loaded model, per fresh process, from
+  GpuRuntime::current_allocated_bytes and peak_allocated_bytes (the bench's own meter):
+  ledger (mode ledger, one forward, sync after every stage, peak reset around it): no stage allocates
+    anything but 0.25 MiB once (the first qkv GEMM, a pipeline); the 372 dispatches use no scratch.
+    So the activations are the whole device footprint of a forward. Verified.
+  Not an artifact of the allocation meter: the itemized set computed from acts() allocates 736.02 MiB
+    in a bare process (mode memory step A), and encode allocates 736.33 MiB the first time: the 0.31
+    MiB difference is ForwardIo and rounding.
+
+  Why 1283 -> 1652 MiB:
+    a. The activation set grew 576.08 -> 736.08 MiB at 8192 rows (x1.278; 216.4 vs 144.4 at 2048 rows,
+       x1.499): HEAD's PLE run buffer 256 MiB against 16 (+240); gate|up packed 128 against gate +
+       up + mid 192 (mid now aliases attn) (-64); normed-V buffer gone (-16) = +160. Verified
+       (itemized, below; allocation measured).
+    b. Two sets are live at once when encode is called again without a wait between. Mechanism
+       (verified by the E,E,E,E and E,S,E,S,E rows): encode ends with rt.synchronize() and only then
+       drops its activations; Cold buffers return to the pool freelist in drain_cold_recycles, which
+       runs inside the next waiting commit; the next encode calls acts() before its first commit, so
+       it misses the freelist and allocates a second set (+736.08 MiB in step 1, 0.00 in steps 2-3,
+       which reuse the first set's). With rt.synchronize() between the calls the peak is 736 MiB.
+       Every caller that loops encode pays this, not only the bench.
+    c. The bench starts each workload's peak from the pool's current allocation, which includes the
+       freelist cache of the earlier workloads, and keeps the lifetime maximum: 1652.38 = 436.25
+       (cached after 1x16 and 64x32) + 2 x 608.06 (the two sets, 128.27 of each reused from the
+       cache). Reproduced with PROFILE_PRELUDE=1x16,64x32 (1652.38) and with bench_embedgemma2
+       itself rebuilt here (1652.4 at 32x256, 8x1024 and 2x4096; 1472.4 for 8x1024 alone; 64x32:
+       433.0 alone, 436.2 after 1x16). So the committed rows "32x256 / 8x1024 / 2x4096" are one
+       number measured once, not three. The 2a7cb8b figure fits the same decomposition (2 x 576.08 =
+       1152.2, plus about 131 MiB of cache residue = 1283; at 64x32 2 x 144.4 = 288.8 against 291
+       recorded). That is inferred: 2a7cb8b itself was not rerun, only its allocation list (git show
+       2a7cb8b:src/embedgemma2.rs, acts()) was allocated.
+    Of the 369 MiB rise, 2 x 160 = 320 is (a) counted twice through (b); the other 49 is the cache residue
+    differing (c).
+
+  Smaller footprint without extra passes (mode memory, mode ple):
+    - Wait before returning (or reuse the activations across calls): 8x1024 peak 1472 -> 736 MiB (-50 %),
+      bench order 1652 -> 1044 (-37 %). Measured by the S steps; the library change itself is not
+      written (not in this lane's scope).
+    - set_ple_run_bytes: at 8192 rows 256 MiB -> 64 MiB -> 16 MiB gives a set of 736 -> 544 -> 496 MiB
+      (peak with two live sets 1472 -> 1088 -> 992). Time cost, encode() interleaved min of 9:
+      32x256 442.8 / 443.8 / 466.5 / 466.9 ms for 256 MiB / 64 MiB / 16 MiB / one layer per run
+      (+0.2 %, +5.4 %, +5.4 %; medians 492 / 480 / 481 / 482 ms); 8x1024 568.0 / 556.2 / 556.0 / 562.1
+      ms (-2.1 %, -2.1 %, -1.0 %; medians 587 / 584 / 578 / 579). So a 16-64 MiB bound costs between
+      -2 % and +5 %, inside the run-to-run noise here: it buys 192-240 MiB per set for nothing
+      measurable. (ple 16 MiB and one layer coincide at 8192 rows: one layer is 16 MiB.)
+    - Aliasing, inferred from forward() and not built or measured: qkv (96 MiB) is dead once
+      attn_qk_norm_rope_columns has run, and gate_up (128 MiB) is written only later, so one
+      128 MiB buffer serves both (-96 MiB); mid already aliases attn. With the PLE bound at 16 MiB
+      the set would be about 400 MiB (-46 %).
+
+RECOMMENDATIONS (each: expected gain, evidence)
+  Gains are upper bounds from the measured shares and rates above, not predictions of a built kernel.
+  1. bf16-operand GEMMs (G2). The GEMMs are 52-88 % of a forward and run at the f32 matrix rate
+     (6-7 TFLOP/s) against 22-29 measured with bf16 operands. If every GEMM took the measured
+     bf16 rate and nothing else changed, the forward would take 0.54 / 0.33 / 0.43 / 0.52 / 0.60 of
+     today's at 1x16 / 64x32 / 32x256 / 8x1024 / 2x4096 (1.9x / 3.0x / 2.3x / 1.9x / 1.7x faster), before the
+     cost of writing bf16 activations (fuse it into the producing elementwise stage) and before any
+     numerics check; the 16-row case gains through bytes (1.9-2.2x per GEMM), the rest through
+     the matrix rate. Largest single win available. Needs the precision decision of G2.
+  2. bf16 attention matmuls, only together with 1 (same precision decision): attention is 24 % at
+     8x1024 and 43 % at 2x4096 at the f32 matrix rate (5.0-6.0 TFLOP/s). With bf16 QK and PV at a
+     third of the time (assumed from the GEMM ratio, not measured for attention), 8x1024 would go
+     from 0.52 (GEMMs only) to 0.35 of today's, 2x4096 from 0.60 to 0.35. Under exact f32 there is
+     little left: attention is already at 67-82 % of the f32 ceiling (<= 1.3x on its share, <= 5-9 %
+     of the forward at 8x1024, 2x4096).
+  3. Small-M GEMM for the latency workload (new; not on the board). At 16 rows down, o and the
+     per-layer-input GEMMs run at 17-22 % of the copy bandwidth (37-48 GB/s) where gate|up reaches 84 %
+     with the same code. A kernel for K = 2048 / N = 512 and N = 512 shapes (split-K, or more tiles)
+     that reached 70 % of the copy ceiling would take down 2.07 -> 0.66 ms, o 1.26 -> 0.39 ms and
+     ple_gate + ple_out 1.22 -> 0.33 ms: 7.3 -> 4.1 ms (1.8x) at 1x16. Applies below about 64 rows
+     (AI under 33.7 flop/B); at 64x32 these GEMMs are already compute-bound. Evidence: gemm table at 16
+     rows, stage table at 1x16. Helps the bf16 path equally.
+  4. Fusion, G7 (value now ranked). Elementwise stages are 10-18 % of the forward and sit at the
+     bandwidth roofline, so only removing a pass helps. The candidates and their measured cost at
+     8x1024 / 32x256 / 64x32: gelu*up into the gate|up GEMM's epilogue (20.0 / 19.1 / 5.1 ms, and the GEMM
+     writes 2048 instead of 4096 columns); the three norm+residual into the o / down / ple_out
+     epilogues, whose N = 512 is one full row (14.5 / 14.1 / 3.6 ms); rms_norm into the next GEMM's
+     A read (6.8 / 6.7 / 1.8 ms); per-layer-input gelu and scale+norm (12.2 / 11.6 / 3.4 ms). If every
+     one became free: 9.4 % / 11.1 % / 13.5 % of the forward at those workloads (7.8 % at 2x4096). The
+     GEMM-fused ones cost registers and occupancy, so plan on half: 4-7 %. gemm_epilogue exists
+     (src/gemm.rs:858); that it can carry gelu*up over the packed gate|up output is unverified. The
+     fusion also removes up to about 170 of 369 dispatches (not counted; 1.6 us each queued is up to
+     4 % at 1x16).
+  5. Memory (G6): (a) wait before encode returns, or keep the activations across calls: -50 % peak
+     in a loop of encodes (measured); (b) PLE_RUN_BYTES 256 MiB -> 16-64 MiB: -192 to -240 MiB per
+     set at no measurable time (measured); (c) alias qkv with gate_up: -96 MiB (inferred). Together
+     1472 -> about 400 MiB at 8x1024 (-73 %; (c) is inferred, so the end figure is too).
+  Not worth doing, measured: a faster elementwise kernel (at the roofline); host-side allocation
+  (0.4-0.8 ms per call); the host encode (0.13-0.35 ms per forward, never the limit).
+
+VERIFIED / INFERRED / UNVERIFIED
+  Verified (measured here, in the JSON): the replica reproduces encode bit for bit at 5 workloads; stage
+  times; sum of stages vs whole; GEMM and attention rates; ceilings; bf16 GEMM rates at the forward's shapes;
+  per-dispatch queued (1.64 us) and synchronous (169 us) cost; the activation sets by buffer; the
+  memory reconciliation (736.33, 1472.41, 1652.38 MiB reproduced; ledger no scratch); PLE bound cost.
+  Inferred: that GPU time is independent of the values (zeroed inputs in the "only" runs); that a bf16
+  forward would approach the isolated-GEMM bound; 2a7cb8b's measured peak decomposition; that the
+  per-wait/ramp cost explains the 6-10 % excess of the stage sum at the two small workloads; the
+  aliasing saving; the bf16-attention estimate; the fusion estimates.
+  Unverified: the M5 Pro's hardware peaks (not used); a bf16 forward's accuracy and speed; any
+  fusion or small-M kernel; whether skip-ablation could be made to work with more rounds; the cause of
+  pass 1's slow GPU; behaviour under other loads (the machine was shared; see MACHINE STATE).
+  Not done: GPU timestamp per dispatch (the runtime does not expose it); the ragged workloads of
+  bench_embedgemma2 (uniform BxT only here); a run of 2a7cb8b's binary.
+
+REPRODUCE
+  cargo build --release --bin profile_embedgemma2
+  EMBEDGEMMA2_SNAPSHOT=<snapshot> PROFILE_MODE=stages PROFILE_ROUNDS=9 PROFILE_JSON=p.json target/release/profile_embedgemma2
+  (PROFILE_SKIP=0 for the quick form); PROFILE_MODE=gemm | memory-sweep | ledger | layout | alloc | ple.
+  Then cargo run --release --bin results_report -- stage <dir> p*.json --gemm ... and ..._plot.py.
+
+DATA: THE FORWARD'S GEMM SHAPES IN ISOLATION (mode gemm; 24 distinct weights cycled; min of 9; GPU util 0 %)
+  rows = 16 / 2048 / 8192; the exact-f32 TensorOps GEMM (gemm, what the forward runs) against
+  gemm_bf16 (bf16 operands, f32 accumulate; bf16 inputs prepared in advance). TF = TFLOP/s;
+  "%copy" = achieved GB/s over the measured copy ceiling; "%f32 ceil" and "%bf16 ceil" over the
+  measured 4096^3 rates. AI = flop per byte moved.
+ceilings (measured on this machine, GPU util 0%): gpu_copy 218 GB/s, in-place scale 228 GB/s, f32 GEMM 4096^3 7.36 TFLOP/s, bf16-operand GEMM 4096^3 30.13 TFLOP/s
+dispatch cost, 64-element scale: queued 1.64 us/dispatch (min of 9 x 2000 per wait), commit+wait each 169.0 us (min of 5 x 100)
+copy ceiling 218 GB/s; f32 ceiling 7.36 TF; bf16 ceiling 30.13 TF; machine balance f32 33.7 flop/B, bf16 137.9 flop/B
+gemm          rows  AI f32  GB/s f32  %copy  TF f32 %f32 ceil  AI bf16 TF bf16 %bf16 ceil f32/bf16  verdict(f32)
+qkv sliding     16     7.7       122    56%    0.94       13%     14.9    1.83         6%     1.95  bandwidth side of the roofline
+qkv global      16     7.7       158    73%    1.22       17%     15.0    2.39         8%     1.96  bandwidth side of the roofline
+o sliding       16     7.6        44    20%    0.33        5%     15.1    0.72         2%     2.15  bandwidth side of the roofline but far under it (latency/parallelism)
+o global        16     7.7        48    22%    0.37        5%     15.3    0.82         3%     2.23  bandwidth side of the roofline but far under it (latency/parallelism)
+gate|up         16     7.7       185    84%    1.43       19%     15.0    2.76         9%     1.94  bandwidth side of the roofline
+down            16     7.7        47    21%    0.36        5%     15.3    0.80         3%     2.21  bandwidth side of the roofline but far under it (latency/parallelism)
+ple_gate        16     7.5        37    17%    0.28        4%     14.6    0.62         2%     2.20  bandwidth side of the roofline but far under it (latency/parallelism)
+ple_out         16     7.5        37    17%    0.28        4%     14.6    0.59         2%     2.11  bandwidth side of the roofline but far under it (latency/parallelism)
+qkv sliding   2048   170.7        38    17%    6.48       88%    204.8   28.69        95%     4.43  compute-bound
+qkv global    2048   180.7        36    16%    6.43       87%    211.9   26.32        87%     4.09  compute-bound
+o sliding     2048   146.3        40    18%    5.78       79%    227.6   24.64        82%     4.26  compute-bound
+o global      2048   170.7        37    17%    6.30       86%    292.6   23.84        79%     3.78  compute-bound
+gate|up       2048   186.2        32    15%    5.92       80%    215.6   25.69        85%     4.34  compute-bound
+down          2048   170.7        36    17%    6.19       84%    292.6   23.75        79%     3.84  compute-bound
+ple_gate      2048   113.8        48    22%    5.50       75%    157.5   24.07        80%     4.38  compute-bound
+ple_out       2048   113.8        50    23%    5.66       77%    157.5   24.70        82%     4.37  compute-bound
+qkv sliding   8192   195.0        32    15%    6.22       85%    221.4   26.97        90%     4.33  compute-bound
+qkv global    8192   208.3        29    13%    6.11       83%    229.7   27.97        93%     4.58  compute-bound
+o sliding     8192   163.8        40    18%    6.48       88%    248.2   27.95        93%     4.32  compute-bound
+o global      8192   195.0        34    16%    6.70       91%    327.7   26.46        88%     3.95  compute-bound
+gate|up       8192   215.6        30    14%    6.38       87%    234.1   27.35        91%     4.29  compute-bound
+down          8192   195.0        35    16%    6.84       93%    327.7   27.45        91%     4.01  compute-bound
+ple_gate      8192   124.1        47    22%    5.86       80%    167.2   26.93        89%     4.59  compute-bound
+ple_out       8192   124.1        47    22%    5.88       80%    167.2   27.04        90%     4.60  compute-bound
+
+DATA: DEVICE MEMORY (modes memory-sweep, layout)
+
+Peak device MiB above the loaded model (max over the steps), one fresh process per cell
+  configuration               1x16     64x32    32x256    8x1024    2x4096
+  bench-order                  4.2     436.2    1652.4    1652.4    1652.4   workloads in bench order (earlier ones encoded twice first), then E,E,E,E
+  alone-back-to-back           4.2     433.0    1472.7    1472.4    1472.3   fresh process, E,E,E,E (encode called again with no wait between)
+  alone-sync-between           2.2     216.6     736.5     736.3     736.3   fresh process, E,S,E,S,E (rt.synchronize() between encodes)
+  single                       2.2     216.6     736.5     736.3     736.3   fresh process, one E
+  paper-head                   2.0     216.4     736.2     736.1     736.0   fresh process, allocate HEAD's acts() set by its formulas, free
+  paper-2a7cb8b                1.2     144.4     576.2     576.1     576.0   fresh process, allocate 2a7cb8b's acts() set by its formulas, free
+  ple64                        4.2     369.0    1088.7    1088.4    1088.3   set_ple_run_bytes(64 MiB), E,E,S,E
+  ple16                        4.2     273.0     992.7     992.4     992.3   set_ple_run_bytes(16 MiB), E,E,S,E
+  ple-one-layer                2.3     249.0     992.7     992.4     992.3   set_ple_run_bytes(1), E,E,S,E
+
+Per-step trace, 8x1024, E,E,E,E fresh process (MiB above the loaded model)
+  step 0 E: allocated +736.33, total 736.33, peak 736.33
+  step 1 E: allocated +736.08, total 1472.41, peak 1472.41
+  step 2 E: allocated +0.00, total 1472.41, peak 1472.41
+  step 3 E: allocated +0.00, total 1472.41, peak 1472.41
+Per-step trace, 32x256 in bench order (after 1x16 and 64x32, each encoded twice)
+  cached by the earlier workloads: 436.25 MiB
+  step 0 E: allocated +608.06, total 1044.31, peak 1044.31
+  step 1 E: allocated +608.06, total 1652.38, peak 1652.38
+  step 2 E: allocated +0.00, total 1652.38, peak 1652.38
+  step 3 E: allocated +0.00, total 1652.38, peak 1652.38
+
+Activation set at 8x1024 (8192 rows): bytes the pool charges, MiB
+  HEAD                        MiB   | 2a7cb8b           MiB
+  embeds                    16.00   | ids              0.03
+  resid                     16.00   | lens             0.00
+  x                         16.00   | segments         0.00
+  qkv                       96.00   | embeds          16.00
+  q                         64.00   | resid           16.00
+  k                         16.00   | x               16.00
+  v                         16.00   | qkv             96.00
+  attn (+mlp mid)           64.00   | q               64.00
+  y                         16.00   | k               16.00
+  gate_up                  128.00   | v               16.00
+  ple run                  256.00   | v_normed        16.00
+  ple_gate                  16.00   | attn            64.00
+  ple_mid                   16.00   | y               16.00
+  pooled                     0.02   | gate            64.00
+  io ids                     0.03   | up              64.00
+  io lens                    0.00   | mid             64.00
+  io segments                0.00   | ple             16.00
+  io out                     0.03   | ple_gate        16.00
+                                    | ple_mid         16.00
+                                    | pooled           0.02
+                                    | out              0.03
+  total                    736.08   | total          576.08   (HEAD / 2a7cb8b = 1.278)
+
+Activation set at 64x32 (2048 rows): bytes the pool charges, MiB
+  HEAD                        MiB   | 2a7cb8b           MiB
+  embeds                     4.00   | ids              0.01
+  resid                      4.00   | lens             0.00
+  x                          4.00   | segments         0.00
+  qkv                       24.00   | embeds           4.00
+  q                         16.00   | resid            4.00
+  k                          4.00   | x                4.00
+  v                          4.00   | qkv             24.00
+  attn (+mlp mid)           16.00   | q               16.00
+  y                          4.00   | k                4.00
+  gate_up                   32.00   | v                4.00
+  ple run                   96.00   | v_normed         4.00
+  ple_gate                   4.00   | attn            16.00
+  ple_mid                    4.00   | y                4.00
+  pooled                     0.12   | gate            16.00
+  io ids                     0.01   | up              16.00
+  io lens                    0.00   | mid             16.00
+  io segments                0.00   | ple              4.00
+  io out                     0.25   | ple_gate         4.00
+                                    | ple_mid          4.00
+                                    | pooled           0.12
+                                    | out              0.25
+  total                    216.38   | total          144.38   (HEAD / 2a7cb8b = 1.499)
+
+Activation set at 1x16 (16 rows): bytes the pool charges, MiB
+  HEAD                        MiB   | 2a7cb8b           MiB
+  embeds                     0.03   | ids              0.00
+  resid                      0.03   | lens             0.00
+  x                          0.03   | segments         0.00
+  qkv                        0.25   | embeds           0.03
+  q                          0.12   | resid            0.03
+  k                          0.03   | x                0.03
+  v                          0.03   | qkv              0.25
+  attn (+mlp mid)            0.12   | q                0.12
+  y                          0.03   | k                0.03
+  gate_up                    0.25   | v                0.03
+  ple run                    1.00   | v_normed         0.03
+  ple_gate                   0.03   | attn             0.12
+  ple_mid                    0.03   | y                0.03
+  pooled                     0.00   | gate             0.12
+  io ids                     0.00   | up               0.12
+  io lens                    0.00   | mid              0.12
+  io segments                0.00   | ple              0.03
+  io out                     0.00   | ple_gate         0.03
+                                    | ple_mid          0.03
+                                    | pooled           0.00
+                                    | out              0.00
+  total                      2.01   | total            1.19   (HEAD / 2a7cb8b = 1.681)
+
+
+DATA: STAGE TABLES (mode stages; generated by `results_report stage` from passes 2-4;
+pass 1 excluded as stated above; also in embedgemma2_stage_profile_tables.txt)
+
+Whole forward: replica (async, forwards queued) against EmbedGemma2Model::encode, and the sum of its stages
+  workload    rows  replica ms           per-pass min  encode() ms  sum(stages) ms  sum/replica
+  1x16          16        7.30            7.8 7.9 7.3         7.82            7.76      106.4%
+  64x32       2048      102.92      107.8 109.3 102.9       102.28          113.14      109.9%
+  32x256      8192      466.05      493.4 480.0 466.0       451.84          460.34       98.8%
+  8x1024      8192      566.97      621.5 567.0 582.6       552.27          565.48       99.7%
+  2x4096      8192      680.48      832.6 708.6 680.5       692.55          720.64      105.9%
+
+Ranking by stage group: ms per forward (best over passes) and % of the replica's forward
+  group                                                          1x16            64x32           32x256           8x1024           2x4096
+  gate|up GEMM                                            0.99  13.6%     32.88  31.9%    128.68  27.6%    135.50  23.9%    133.27  19.6%
+  attention sliding (hd256)                               0.24   3.3%      2.24   2.2%     30.68   6.6%     87.39  15.4%    107.21  15.8%
+  qkv GEMMs (sliding + global)                            0.79  10.9%     18.40  17.9%     72.83  15.6%     70.15  12.4%     74.33  10.9%
+  down GEMM                                               2.06  28.3%     15.14  14.7%     57.36  12.3%     61.54  10.9%     60.49   8.9%
+  per-layer-input GEMMs (proj, ple_gate, ple_out)         1.35  18.5%     14.29  13.9%     51.21  11.0%     51.56   9.1%     52.11   7.7%
+  attention global (hd512)                                0.11   1.5%      1.36   1.3%     13.69   2.9%     50.67   8.9%    185.58  27.3%
+  o GEMMs (sliding + global)                              1.26  17.3%      9.92   9.6%     37.07   8.0%     37.25   6.6%     36.75   5.4%
+  rms_norm x48 + norm-residual x72                        0.40   5.5%      5.35   5.2%     20.76   4.5%     21.37   3.8%     21.52   3.2%
+  gelu*up (mlp)                                           0.12   1.6%      5.14   5.0%     19.13   4.1%     20.03   3.5%     19.47   2.9%
+  qk-norm + rope + kv store                               0.16   2.3%      4.14   4.0%     15.86   3.4%     15.68   2.8%     15.05   2.2%
+  per-layer-input scale+norm, gelu*input                  0.17   2.4%      3.40   3.3%     11.64   2.5%     12.21   2.2%     11.97   1.8%
+  gather, final norm, pool, projection, l2                0.10   1.4%      0.88   0.9%      1.43   0.3%      2.12   0.4%      2.88   0.4%
+
+Top 5 groups at each workload
+  1x16     down GEMM 28.3%; per-layer-input GEMMs (proj, ple_gate, ple_out) 18.5%; o GEMMs (sliding + global) 17.3%; gate|up GEMM 13.6%; qkv GEMMs (sliding + global) 10.9%
+  64x32    gate|up GEMM 31.9%; qkv GEMMs (sliding + global) 17.9%; down GEMM 14.7%; per-layer-input GEMMs (proj, ple_gate, ple_out) 13.9%; o GEMMs (sliding + global) 9.6%
+  32x256   gate|up GEMM 27.6%; qkv GEMMs (sliding + global) 15.6%; down GEMM 12.3%; per-layer-input GEMMs (proj, ple_gate, ple_out) 11.0%; o GEMMs (sliding + global) 8.0%
+  8x1024   gate|up GEMM 23.9%; attention sliding (hd256) 15.4%; qkv GEMMs (sliding + global) 12.4%; down GEMM 10.9%; per-layer-input GEMMs (proj, ple_gate, ple_out) 9.1%
+  2x4096   attention global (hd512) 27.3%; gate|up GEMM 19.6%; attention sliding (hd256) 15.8%; qkv GEMMs (sliding + global) 10.9%; down GEMM 8.9%
+
+Per class, 1x16 (16 rows, 369 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  down GEMM                            24     2.065    28.3%    2.065-2.234       86.0     51     0.39
+  gate|up GEMM                         24     0.993    13.6%    0.993-1.151       41.4    210     1.62
+  o GEMM sliding                       20     0.915    12.5%    0.915-1.007       45.8     48     0.37
+  qkv GEMM sliding                     20     0.613     8.4%    0.613-0.714       30.7    142     1.09
+  ple_gate GEMM                        24     0.608     8.3%    0.608-0.682       25.3     44     0.33
+  ple_out GEMM                         24     0.608     8.3%    0.608-0.687       25.3     44     0.33
+  o GEMM global                         4     0.345     4.7%    0.345-0.396       86.2     51     0.39
+  attention sliding (hd256)            20     0.241     3.3%    0.241-0.284       12.0     16     0.09
+  qkv GEMM global                       4     0.179     2.5%    0.179-0.228       44.8    146     1.12
+  qk-norm+rope+kv store                24     0.164     2.3%    0.164-0.201        6.9     41      nan
+  PLE projection GEMM (NT)              1     0.131     1.8%    0.131-0.206      130.9    198     1.54
+  gelu*up (mlp)                        24     0.119     1.6%    0.119-0.143        5.0     79      nan
+  rms_norm (input, pre-ffn)            48     0.118     1.6%    0.118-0.162        2.5     27      nan
+  attention global (hd512)              4     0.107     1.5%    0.107-0.134       26.7     12     0.08
+  ple gelu*input                       24     0.103     1.4%    0.103-0.127        4.3     23      nan
+  norm+residual (post-ffn)             24     0.101     1.4%    0.101-0.120        4.2     23      nan
+  norm+residual (post-attn)            24     0.101     1.4%    0.101-0.124        4.2     23      nan
+  norm+residual*scalar (post-ple)      24     0.080     1.1%    0.080-0.123        3.3     30      nan
+  tail (final norm, pool, proj, l2)     4     0.075     1.0%    0.075-0.106       18.9     22     0.01
+  PLE scale+norm                        2     0.069     0.9%    0.069-0.094       34.6     46      nan
+  gather+copy                           2     0.029     0.4%    0.029-0.080       14.5      4      nan
+
+Per class, 64x32 (2048 rows, 369 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  gate|up GEMM                         24    32.876    31.9%   32.876-35.575    1369.8     34     6.27
+  down GEMM                            24    15.140    14.7%   15.140-16.660     630.9     40     6.81
+  qkv GEMM sliding                     20    13.788    13.4%   13.788-15.001     689.4     37     6.23
+  o GEMM sliding                       20     6.925     6.7%    6.925-7.463      346.3     42     6.20
+  gelu*up (mlp)                        24     5.142     5.0%    5.142-5.889      214.3    235      nan
+  PLE projection GEMM (NT)              1     4.798     4.7%    4.798-5.568     4798.5     27     5.37
+  ple_gate GEMM                        24     4.751     4.6%    4.751-5.387      198.0     48     5.42
+  ple_out GEMM                         24     4.745     4.6%    4.745-5.372      197.7     48     5.43
+  qkv GEMM global                       4     4.608     4.5%    4.608-5.045     1152.0     31     5.59
+  qk-norm+rope+kv store                24     4.144     4.0%    4.144-4.628      172.7    211      nan
+  o GEMM global                         4     2.991     2.9%    2.991-3.463      747.8     34     5.74
+  attention sliding (hd256)            20     2.244     2.2%    2.244-2.979      112.2    224     2.39
+  PLE scale+norm                        2     2.109     2.0%    2.109-2.570     1054.3    191      nan
+  rms_norm (input, pre-ffn)            48     1.791     1.7%    1.791-2.087       37.3    225      nan
+  attention global (hd512)              4     1.360     1.3%    1.360-1.588      340.1    123     1.58
+  norm+residual*scalar (post-ple)      24     1.296     1.3%    1.296-1.572       54.0    233      nan
+  ple gelu*input                       24     1.295     1.3%    1.295-1.478       53.9    233      nan
+  norm+residual (post-ffn)             24     1.193     1.2%    1.193-1.552       49.7    253      nan
+  norm+residual (post-attn)            24     1.065     1.0%    1.065-1.322       44.4    284      nan
+  tail (final norm, pool, proj, l2)     4     0.459     0.4%    0.459-0.800      114.7     31     0.11
+  gather+copy                           2     0.421     0.4%    0.421-0.856      210.5     35      nan
+
+Per class, 32x256 (8192 rows, 372 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  gate|up GEMM                         24   128.679    27.6%  128.679-150.486   5361.6     30     6.41
+  down GEMM                            24    57.358    12.3%   57.358-68.489    2389.9     37     7.19
+  qkv GEMM sliding                     20    55.315    11.9%   55.315-63.492    2765.7     32     6.21
+  attention sliding (hd256)            20    30.685     6.6%   30.685-33.254    1534.2     66     5.60
+  o GEMM sliding                       20    26.539     5.7%   26.539-29.717    1326.9     40     6.47
+  gelu*up (mlp)                        24    19.135     4.1%   19.135-21.643     797.3    253      nan
+  qkv GEMM global                       4    17.513     3.8%   17.513-19.049    4378.3     28     5.89
+  ple_gate GEMM                        24    17.450     3.7%   17.450-19.478     727.1     48     5.91
+  ple_out GEMM                         24    17.043     3.7%   17.043-20.067     710.1     49     6.05
+  PLE projection GEMM (NT)              2    16.720     3.6%   16.720-19.174    8359.9     28     6.17
+  qk-norm+rope+kv store                24    15.859     3.4%   15.859-17.868     660.8    220      nan
+  attention global (hd512)              4    13.686     2.9%   13.686-15.396    3421.4     49     5.02
+  o GEMM global                         4    10.528     2.3%   10.528-12.018    2632.1     33     6.53
+  rms_norm (input, pre-ffn)            48     6.669     1.4%    6.669-7.622      138.9    241      nan
+  PLE scale+norm                        4     6.500     1.4%    6.500-7.341     1625.0    248      nan
+  ple gelu*input                       24     5.136     1.1%    5.136-5.949      214.0    235      nan
+  norm+residual*scalar (post-ple)      24     4.739     1.0%    4.739-5.632      197.5    255      nan
+  norm+residual (post-ffn)             24     4.719     1.0%    4.719-5.569      196.6    256      nan
+  norm+residual (post-attn)            24     4.637     1.0%    4.637-5.612      193.2    261      nan
+  tail (final norm, pool, proj, l2)     4     0.899     0.2%    0.899-1.058      224.8     58     0.03
+  gather+copy                           2     0.533     0.1%    0.533-1.040      266.8    110      nan
+
+Per class, 8x1024 (8192 rows, 372 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  gate|up GEMM                         24   135.505    23.9%  135.505-142.986   5646.0     28     6.09
+  attention sliding (hd256)            20    87.390    15.4%   87.390-92.532    4369.5     23     5.90
+  down GEMM                            24    61.535    10.9%   61.535-66.956    2564.0     34     6.70
+  qkv GEMM sliding                     20    53.674     9.5%   53.674-57.965    2683.7     33     6.40
+  attention global (hd512)              4    50.670     8.9%   50.670-55.947   12667.6     13     5.42
+  o GEMM sliding                       20    27.011     4.8%   27.011-29.589    1350.6     39     6.36
+  gelu*up (mlp)                        24    20.032     3.5%   20.032-21.443     834.6    241      nan
+  PLE projection GEMM (NT)              2    17.658     3.1%   17.658-18.649    8829.0     26     5.84
+  ple_out GEMM                         24    17.277     3.0%   17.277-18.927     719.9     48     5.97
+  ple_gate GEMM                        24    16.624     2.9%   16.624-19.144     692.7     50     6.20
+  qkv GEMM global                       4    16.478     2.9%   16.478-18.708    4119.5     30     6.26
+  qk-norm+rope+kv store                24    15.680     2.8%   15.680-16.654     653.3    223      nan
+  o GEMM global                         4    10.237     1.8%   10.237-11.145    2559.2     34     6.71
+  PLE scale+norm                        4     6.931     1.2%    6.931-7.550     1732.8    232      nan
+  rms_norm (input, pre-ffn)            48     6.832     1.2%    6.832-7.575      142.3    236      nan
+  ple gelu*input                       24     5.281     0.9%    5.281-5.938      220.0    229      nan
+  norm+residual (post-attn)            24     5.011     0.9%    5.011-5.571      208.8    241      nan
+  norm+residual (post-ffn)             24     4.815     0.8%    4.815-5.666      200.6    251      nan
+  norm+residual*scalar (post-ple)      24     4.715     0.8%    4.715-5.628      196.4    256      nan
+  tail (final norm, pool, proj, l2)     4     1.181     0.2%    1.181-1.319      295.3     44     0.01
+  gather+copy                           2     0.939     0.2%    0.939-1.074      469.7     63      nan
+
+Per class, 2x4096 (8192 rows, 372 dispatches per forward); only = that class alone, best over passes [lowest, highest per-pass minimum]
+  class                              disp   only ms % of fwd       pass range  us/disp   GB/s  TFLOP/s
+  attention global (hd512)              4   185.580    27.3%  185.580-203.103  46395.0      4     5.92
+  gate|up GEMM                         24   133.274    19.6%  133.274-141.050   5553.1     29     6.19
+  attention sliding (hd256)            20   107.213    15.8%  107.213-114.696   5360.7     19     6.01
+  down GEMM                            24    60.489     8.9%   60.489-63.489    2520.4     35     6.82
+  qkv GEMM sliding                     20    57.324     8.4%   57.324-60.748    2866.2     31     5.99
+  o GEMM sliding                       20    26.257     3.9%   26.257-28.702    1312.8     40     6.54
+  gelu*up (mlp)                        24    19.473     2.9%   19.473-20.823     811.4    248      nan
+  ple_gate GEMM                        24    17.471     2.6%   17.471-18.877     728.0     48     5.90
+  PLE projection GEMM (NT)              2    17.469     2.6%   17.469-17.800    8734.4     26     5.90
+  ple_out GEMM                         24    17.170     2.5%   17.170-18.863     715.4     48     6.00
+  qkv GEMM global                       4    17.006     2.5%   17.006-18.966    4251.5     29     6.06
+  qk-norm+rope+kv store                24    15.050     2.2%   15.050-16.127     627.1    232      nan
+  o GEMM global                         4    10.497     1.5%   10.497-11.040    2624.3     34     6.55
+  rms_norm (input, pre-ffn)            48     6.888     1.0%    6.888-7.750      143.5    234      nan
+  PLE scale+norm                        4     6.799     1.0%    6.799-7.527     1699.8    237      nan
+  ple gelu*input                       24     5.172     0.8%    5.172-6.016      215.5    234      nan
+  norm+residual*scalar (post-ple)      24     4.952     0.7%    4.952-5.703      206.4    244      nan
+  norm+residual (post-attn)            24     4.862     0.7%    4.862-5.588      202.6    248      nan
+  norm+residual (post-ffn)             24     4.820     0.7%    4.820-5.496      200.8    251      nan
+  tail (final norm, pool, proj, l2)     4     1.953     0.3%    1.953-2.199      488.2     27     0.00
+  gather+copy                           2     0.923     0.1%    0.923-0.969      461.3     64      nan
+
+Ablation cross-check, pass stages_p3, 1x16: full 7.9 ms; for the six largest stages, full - skip against the stage alone
+    down GEMM                          alone     2.23   full-skip     2.10
+    gate|up GEMM                       alone     1.15   full-skip     1.13
+    o GEMM sliding                     alone     0.98   full-skip     1.09
+    qkv GEMM sliding                   alone     0.71   full-skip     0.76
+    ple_out GEMM                       alone     0.69   full-skip     0.74
+    ple_gate GEMM                      alone     0.68   full-skip     0.69
+    sum over all 21 stages of full-skip: 9.2 ms = 117% of full
+Ablation cross-check, pass stages_p3, 64x32: full 109.3 ms; for the six largest stages, full - skip against the stage alone
+    gate|up GEMM                       alone    35.58   full-skip    31.26
+    down GEMM                          alone    16.66   full-skip    10.35
+    qkv GEMM sliding                   alone    15.00   full-skip    11.67
+    o GEMM sliding                     alone     7.46   full-skip     3.54
+    gelu*up (mlp)                      alone     5.82   full-skip     0.93
+    PLE projection GEMM (NT)           alone     5.45   full-skip    -0.78
+    sum over all 21 stages of full-skip: 22.8 ms = 21% of full
+Ablation cross-check, pass stages_p3, 32x256: full 480.0 ms; for the six largest stages, full - skip against the stage alone
+    gate|up GEMM                       alone   150.49   full-skip   116.32
+    down GEMM                          alone    68.49   full-skip    37.76
+    qkv GEMM sliding                   alone    63.49   full-skip    25.12
+    attention sliding (hd256)          alone    33.25   full-skip    17.17
+    o GEMM sliding                     alone    29.72   full-skip     0.62
+    gelu*up (mlp)                      alone    20.60   full-skip    -8.61
+    sum over all 21 stages of full-skip: -61.9 ms = -13% of full
+Ablation cross-check, pass stages_p3, 8x1024: full 567.0 ms; for the six largest stages, full - skip against the stage alone
+    gate|up GEMM                       alone   136.80   full-skip   132.19
+    attention sliding (hd256)          alone    87.39   full-skip   110.10
+    down GEMM                          alone    63.72   full-skip    33.29
+    qkv GEMM sliding                   alone    53.67   full-skip    85.72
+    attention global (hd512)           alone    50.67   full-skip    78.37
+    o GEMM sliding                     alone    27.89   full-skip    63.55
+    sum over all 21 stages of full-skip: 693.5 ms = 122% of full
+Ablation cross-check, pass stages_p3, 2x4096: full 708.6 ms; for the six largest stages, full - skip against the stage alone
+    attention global (hd512)           alone   194.58   full-skip   185.07
+    gate|up GEMM                       alone   134.91   full-skip   135.79
+    attention sliding (hd256)          alone   107.30   full-skip    82.41
+    down GEMM                          alone    60.90   full-skip    62.93
+    qkv GEMM sliding                   alone    57.39   full-skip    55.72
+    o GEMM sliding                     alone    27.45   full-skip     5.12
+    sum over all 21 stages of full-skip: 554.6 ms = 78% of full
+

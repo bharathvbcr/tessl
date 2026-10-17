@@ -33,8 +33,28 @@
 //! * the Matryoshka prefixes (512, 256, 128) within the embedding bounds of
 //!   sentence-transformers' `encode(truncate_dim=d, normalize_embeddings=True)`.
 //!
-//! The bf16 reference is reported, not gated: it is how far the checkpoint's
-//! own dtype moves the embedding, the scale against which `1e-4` is small.
+//! The bf16 reference is reported by that test, not gated: it is how far the
+//! checkpoint's own dtype moves the embedding, the scale against which `1e-4`
+//! is small. The `GemmOperands::Bf16` forward has its own test,
+//! `embedgemma2_bf16_is_no_worse_than_transformers_bf16`, held to that
+//! reference the way `tests/qwen35_model.rs` holds Qwen3.5's bf16 forward. It
+//! rounds only what feeds a GEMM (the residual stream, norms and attention stay
+//! f32), so it has fewer sources of rounding than transformers' bf16 forward,
+//! which rounds every activation. Bounds, fixed before the first run, per text
+//! (8 texts of 10 to 6147 tokens), `cos` meaning cosine against the fp32
+//! reference:
+//!
+//! * `cos >= 0.9999`, the floor for a bf16 forward (transformers' own reaches
+//!   0.99990 to 0.99998);
+//! * no worse than transformers' bf16 forward on average: the mean of
+//!   `1 - cos` over the texts at most that of `emb_bf16.npy`;
+//! * against `emb_bf16.npy`, cosine at least `0.9996`: both are within
+//!   `1 - cos <= 1e-4` of fp32, so the angles (`theta ~ sqrt(2 (1 - cos))`,
+//!   at most 0.0141 each) put them within 0.0283 of each other by the triangle
+//!   inequality, `1 - cos <= 4e-4`. A consequence, not a second tolerance: it
+//!   is here so a wrong reference file or a swapped text fails;
+//! * each text alone vs inside the ragged batch within `1e-5`: a bf16 GEMM sums
+//!   K in one order whatever M is, so the values that round are the same bits.
 
 mod common;
 
@@ -42,6 +62,7 @@ use std::path::PathBuf;
 
 use common::with_gpu;
 use tessl::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model};
+use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::safetensors::SafeTensors;
 
@@ -221,6 +242,118 @@ fn embedgemma2_matches_sentence_transformers() {
         assert!(
             model.encode(&[&texts[0]], Some(769), false).is_err(),
             "truncate_dim past 768"
+        );
+
+        assert!(
+            failures.is_empty(),
+            "{} bound(s) exceeded:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// Floor for a bf16 forward's cosine against the fp32 reference.
+const BF16_COS_FLOOR: f64 = 0.9999;
+/// Against transformers' bf16 embeddings: the triangle inequality over two
+/// forwards each within `1 - cos <= 1e-4` of fp32 (see the module docs).
+const BF16_VS_HF_COS: f64 = 0.9996;
+
+#[test]
+#[ignore]
+fn embedgemma2_bf16_is_no_worse_than_transformers_bf16() {
+    let snap = snapshot();
+    let cfg = EmbedGemma2Config::from_config_file(&snap.join("config.json")).unwrap();
+    let st = SafeTensors::open(&snap.join("model.safetensors")).unwrap();
+    let texts = texts();
+    let (es, fp32) = npy_f32("emb_f32.npy");
+    let (_, hf_bf16) = npy_f32("emb_bf16.npy");
+    let dim = es[1];
+    assert_eq!(es[0], texts.len(), "reference rows vs texts");
+
+    with_gpu(|rt| {
+        let mut failures: Vec<String> = Vec::new();
+        let exact = EmbedGemma2Model::load(rt, &st, PREFIX, cfg.clone()).unwrap();
+        let model = EmbedGemma2Model::load_with(rt, &st, PREFIX, cfg.clone(), GemmOperands::Bf16).unwrap();
+        assert_eq!(exact.operands(), GemmOperands::ExactF32);
+        assert_eq!(model.operands(), GemmOperands::Bf16);
+        let (b_exact, b_bf16) = (exact.weight_bytes(), model.weight_bytes());
+        eprintln!(
+            "device weight bytes: ExactF32 {b_exact} ({:.1} MiB), Bf16 {b_bf16} ({:.1} MiB)",
+            b_exact as f64 / (1 << 20) as f64,
+            b_bf16 as f64 / (1 << 20) as f64
+        );
+        assert!(
+            b_bf16 < b_exact,
+            "Bf16 holds {b_bf16} bytes of weights, ExactF32 {b_exact}"
+        );
+        drop(exact);
+
+        let (mut deficit_ours, mut deficit_hf) = (0.0f64, 0.0f64);
+        let mut alone = Vec::new();
+        for (n, ids) in texts.iter().enumerate() {
+            let e = model.encode(&[ids], None, false).unwrap().embeddings;
+            let (f, h) = (&fp32[n * dim..(n + 1) * dim], &hf_bf16[n * dim..(n + 1) * dim]);
+            let (cos_f, cos_h, cos_hf) = (cosine(&e, f), cosine(&e, h), cosine(h, f));
+            eprintln!(
+                "text {n}: {} tokens, tessl bf16 vs fp32 cosine {cos_f:.8} (max abs {:.2e}); vs transformers bf16 \
+                 cosine {cos_h:.8} (max abs {:.2e}); transformers bf16 vs fp32 cosine {cos_hf:.8}",
+                ids.len(),
+                max_abs(&e, f),
+                max_abs(&e, h)
+            );
+            deficit_ours += 1.0 - cos_f;
+            deficit_hf += 1.0 - cos_hf;
+            if cos_f < BF16_COS_FLOOR {
+                failures.push(format!("text {n}: cosine vs fp32 {cos_f:.8} < {BF16_COS_FLOOR}"));
+            }
+            if cos_h < BF16_VS_HF_COS {
+                failures.push(format!(
+                    "text {n}: cosine vs transformers bf16 {cos_h:.8} < {BF16_VS_HF_COS}"
+                ));
+            }
+            let norm = e.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "text {n}: norm {norm}");
+            alone.push(e);
+        }
+        let k = texts.len() as f64;
+        eprintln!(
+            "mean 1 - cos vs fp32: tessl bf16 {:.3e}, transformers bf16 {:.3e}",
+            deficit_ours / k,
+            deficit_hf / k
+        );
+        if deficit_ours > deficit_hf {
+            failures.push(format!(
+                "tessl bf16 is further from fp32 (mean 1 - cos {:.3e}) than transformers' bf16 forward ({:.3e})",
+                deficit_ours / k,
+                deficit_hf / k
+            ));
+        }
+
+        // Alone vs one ragged batch (more than one forward).
+        let refs: Vec<&[u32]> = texts.iter().map(Vec::as_slice).collect();
+        let out = model.encode(&refs, None, false).unwrap();
+        assert!(
+            out.forwards >= 2,
+            "expected a split batch, got {} forward(s)",
+            out.forwards
+        );
+        for (n, e) in alone.iter().enumerate() {
+            let err = max_abs(e, &out.embeddings[n * dim..(n + 1) * dim]);
+            eprintln!("text {n}: alone vs batched max abs {err:.2e}");
+            if err > BATCH_ABS {
+                failures.push(format!("text {n}: alone vs batched max abs {err:.3e}"));
+            }
+        }
+
+        // Relaxed precision touches no bf16 GEMM, so the forward runs with it on.
+        rt.set_relaxed_precision(true);
+        let relaxed = model.encode(&refs, None, false);
+        rt.set_relaxed_precision(false);
+        assert_eq!(
+            relaxed.expect("Bf16 refused relaxed precision").embeddings,
+            out.embeddings,
+            "relaxed precision changed a bf16 embedding"
         );
 
         assert!(

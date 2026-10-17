@@ -15,17 +15,55 @@ pub(crate) enum Json {
     Object(Vec<(String, Json)>),
     Array(Vec<Json>),
     Str(String),
-    /// A number, with its exact value when it is a non-negative integer that
-    /// fits `u64`.
+    /// A number: its `f64` value, and its exact integer when it was written as
+    /// one (no fraction, no exponent) with a magnitude that fits `u64`. `form`
+    /// says which, and `int` is that magnitude (0 for [`NumForm::Float`] and
+    /// [`NumForm::BigInt`]). A non-negative integer is matched as
+    /// `Json::Num { form: NumForm::Uint, int: n, .. }`. The two fields keep a
+    /// node as small as the `value` + `Option<u64>` it replaced, which the
+    /// header-amplification bound in `parser_mutation` pins.
     Num {
         value: f64,
-        uint: Option<u64>,
+        int: u64,
+        form: NumForm,
     },
     Bool(bool),
     Null,
 }
 
+/// How a [`Json::Num`] was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumForm {
+    /// With a fraction or an exponent (`5.0`, `5e0`).
+    Float,
+    /// A non-negative integer; `int` is its value.
+    Uint,
+    /// A negative integer (`-0` included); `int` is its magnitude.
+    NegInt,
+    /// An integer whose magnitude overflows `u64`; only `value` is kept.
+    BigInt,
+}
+
 impl Json {
+    /// For a number written as an integer whose magnitude fits `u64`, that
+    /// integer exactly (`-0` is 0); `None` for anything else.
+    #[allow(dead_code)]
+    pub(crate) fn exact_int(&self) -> Option<i128> {
+        match self {
+            Json::Num {
+                int,
+                form: NumForm::Uint,
+                ..
+            } => Some(i128::from(*int)),
+            Json::Num {
+                int,
+                form: NumForm::NegInt,
+                ..
+            } => Some(-i128::from(*int)),
+            _ => None,
+        }
+    }
+
     /// The field `key` of an object.
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
@@ -248,8 +286,13 @@ impl Parser<'_> {
                 self.syntax.what
             ));
         }
-        let uint = if integral && !negative { uint } else { None };
-        Ok(Json::Num { value, uint })
+        let (int, form) = match (integral, uint) {
+            (false, _) => (0, NumForm::Float),
+            (true, None) => (0, NumForm::BigInt),
+            (true, Some(n)) if negative => (n, NumForm::NegInt),
+            (true, Some(n)) => (n, NumForm::Uint),
+        };
+        Ok(Json::Num { value, int, form })
     }
 
     fn string(&mut self) -> Result<String, String> {
@@ -356,18 +399,49 @@ mod tests {
 
     #[test]
     fn numbers_follow_the_rfc_grammar() {
-        for (text, value, uint) in [
-            ("0", 0.0, Some(0)),
-            ("-0", -0.0, None),
-            ("10000000", 1e7, Some(10_000_000)),
-            ("1e-06", 1e-6, None),
-            ("0.25", 0.25, None),
-            ("-1.5E+3", -1500.0, None),
-            ("18446744073709551615", 18446744073709551615.0, Some(u64::MAX)),
-            ("18446744073709551616", 18446744073709551616.0, None),
+        use NumForm::{BigInt, Float, NegInt, Uint};
+        // (text, value, int, form, exact_int)
+        for (text, value, int, form, exact) in [
+            ("0", 0.0, 0, Uint, Some(0)),
+            ("-0", -0.0, 0, NegInt, Some(0)),
+            ("-5", -5.0, 5, NegInt, Some(-5)),
+            ("5.0", 5.0, 0, Float, None),
+            ("5e0", 5.0, 0, Float, None),
+            ("10000000", 1e7, 10_000_000, Uint, Some(10_000_000)),
+            ("1e-06", 1e-6, 0, Float, None),
+            ("0.25", 0.25, 0, Float, None),
+            ("-1.5E+3", -1500.0, 0, Float, None),
+            (
+                "18446744073709551615",
+                18446744073709551615.0,
+                u64::MAX,
+                Uint,
+                Some(i128::from(u64::MAX)),
+            ),
+            (
+                "-18446744073709551615",
+                -18446744073709551615.0,
+                u64::MAX,
+                NegInt,
+                Some(-i128::from(u64::MAX)),
+            ),
+            ("18446744073709551616", 18446744073709551616.0, 0, BigInt, None),
+            (
+                "-170141183460469231731687303715884105728",
+                -170141183460469231731687303715884105728.0,
+                0,
+                BigInt,
+                None,
+            ),
+            ("1000000000000000000000000000000000000000", 1e39, 0, BigInt, None),
         ] {
-            assert_eq!(num(text).unwrap(), Json::Num { value, uint }, "{text}");
+            let got = num(text).unwrap();
+            assert_eq!(got, Json::Num { value, int, form }, "{text}");
+            assert_eq!(got.exact_int(), exact, "{text}");
         }
+        // The node size is what the header-amplification bound in
+        // `parser_mutation` rests on; a wider number would show up there too.
+        assert!(std::mem::size_of::<Json>() <= 32, "{}", std::mem::size_of::<Json>());
         for bad in [
             "01", "1.", ".5", "1e", "1e+", "-", "+1", "--1", "1.e3", "0x10", "NaN", "1e400",
         ] {

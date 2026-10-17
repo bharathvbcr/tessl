@@ -1,0 +1,492 @@
+{
+  "rounds": 8,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "before",
+      "argv": [
+        "target/bench_lanes/before"
+      ],
+      "env": {}
+    },
+    {
+      "name": "after",
+      "argv": [
+        "target/bench_lanes/after"
+      ],
+      "env": {}
+    },
+    {
+      "name": "control",
+      "argv": [
+        "target/bench_lanes/control"
+      ],
+      "env": {}
+    }
+  ],
+  "env": {
+    "BENCH_ITERS": "8",
+    "BENCH_WARMUP": "2"
+  },
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "mixed_full",
+      "before": {
+        "ms_min_median": 1091.5055,
+        "ms_min_min": 1069.7004,
+        "ms_min_max": 1128.9725,
+        "ms_min_all": [
+          1069.7004,
+          1092.9495,
+          1102.1106,
+          1076.7674,
+          1090.0615,
+          1101.0481,
+          1069.8263,
+          1128.9725
+        ],
+        "device_peak_mib_max": 628.6,
+        "forwards_max": 5
+      },
+      "after": {
+        "ms_min_median": 1088.94245,
+        "ms_min_min": 1069.1075,
+        "ms_min_max": 1148.7775,
+        "ms_min_all": [
+          1139.6239,
+          1099.7635,
+          1078.1214,
+          1148.7775,
+          1077.2803,
+          1136.8179,
+          1069.1075,
+          1073.0875
+        ],
+        "device_peak_mib_max": 628.5,
+        "forwards_max": 5,
+        "vs_base": {
+          "median": 1.0027813105152767,
+          "lo": 0.9504992371381943,
+          "hi": 1.066876188859358
+        }
+      },
+      "control": {
+        "ms_min_median": 1092.4717999999998,
+        "ms_min_min": 1069.9335,
+        "ms_min_max": 1166.4272,
+        "ms_min_all": [
+          1093.8898,
+          1091.0538,
+          1104.4443,
+          1166.4272,
+          1141.8777,
+          1080.3557,
+          1069.9335,
+          1069.9885
+        ],
+        "device_peak_mib_max": 628.6,
+        "forwards_max": 5,
+        "vs_base": {
+          "median": 1.0011088428827404,
+          "lo": 0.9477542632792206,
+          "hi": 1.083267565492789
+        },
+        "vs_prev": {
+          "median": 0.998942339266877,
+          "lo": 0.9503331184352394,
+          "hi": 1.0599634097086896
+        }
+      }
+    },
+    {
+      "workload": "mixed_short",
+      "before": {
+        "ms_min_median": 413.44665,
+        "ms_min_min": 399.5378,
+        "ms_min_max": 459.7199,
+        "ms_min_all": [
+          403.0723,
+          418.4353,
+          459.7199,
+          414.753,
+          414.6165,
+          412.2768,
+          399.5378,
+          408.4277
+        ],
+        "device_peak_mib_max": 653.8,
+        "forwards_max": 4
+      },
+      "after": {
+        "ms_min_median": 413.94915000000003,
+        "ms_min_min": 398.748,
+        "ms_min_max": 425.218,
+        "ms_min_all": [
+          425.218,
+          415.1062,
+          412.7921,
+          421.156,
+          401.9433,
+          422.5848,
+          398.748,
+          405.2298
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 0.9950967167339171,
+          "lo": 0.8979208861743858,
+          "hi": 1.05494225229568
+        }
+      },
+      "control": {
+        "ms_min_median": 415.0818,
+        "ms_min_min": 399.2981,
+        "ms_min_max": 443.3123,
+        "ms_min_all": [
+          424.1339,
+          404.5233,
+          443.3123,
+          427.8258,
+          414.1024,
+          416.0612,
+          399.2981,
+          403.5563
+        ],
+        "device_peak_mib_max": 653.8,
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 0.999080057879934,
+          "lo": 0.9643095719806778,
+          "hi": 1.0522526603787956
+        },
+        "vs_prev": {
+          "median": 0.9994150261351005,
+          "lo": 0.9745055602638554,
+          "hi": 1.073936007980773
+        }
+      }
+    },
+    {
+      "workload": "media_only",
+      "before": {
+        "ms_min_median": 390.84555,
+        "ms_min_min": 380.4006,
+        "ms_min_max": 399.7825,
+        "ms_min_all": [
+          385.7424,
+          392.3436,
+          387.8264,
+          399.7825,
+          398.9812,
+          398.7044,
+          380.4006,
+          389.3475
+        ],
+        "device_peak_mib_max": 653.8,
+        "forwards_max": 2
+      },
+      "after": {
+        "ms_min_median": 401.4319,
+        "ms_min_min": 380.0164,
+        "ms_min_max": 423.3147,
+        "ms_min_all": [
+          399.5642,
+          421.7972,
+          423.3147,
+          400.0424,
+          397.3145,
+          402.8214,
+          380.0164,
+          407.2862
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 1.0230788151514338,
+          "lo": 0.9958226101881492,
+          "hi": 1.0915056324169785
+        }
+      },
+      "control": {
+        "ms_min_median": 398.2092,
+        "ms_min_min": 380.5721,
+        "ms_min_max": 413.3492,
+        "ms_min_all": [
+          396.3203,
+          383.0718,
+          413.3492,
+          406.8127,
+          400.0981,
+          400.9414,
+          380.5721,
+          381.578
+        ],
+        "device_peak_mib_max": 653.8,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 1.004205026495331,
+          "lo": 0.9763681630081388,
+          "hi": 1.0658098571938373
+        },
+        "vs_prev": {
+          "median": 0.9936071620222804,
+          "lo": 0.9081895280480762,
+          "hi": 1.0169239560606576
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "before": [{"workload":"mixed_full","ms_min":1069.7004,"ms_median":1072.9752,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":403.0723,"ms_median":403.5853,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":385.7424,"ms_median":390.2768,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1139.6239,"ms_median":1161.6339,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":425.2180,"ms_median":426.1913,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":399.5642,"ms_median":402.1115,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1093.8898,"ms_median":1117.9334,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":424.1339,"ms_median":426.2271,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":396.3203,"ms_median":401.7732,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1092.9495,"ms_median":1237.0239,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":418.4353,"ms_median":420.4352,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":392.3436,"ms_median":399.4051,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1099.7635,"ms_median":1188.5662,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":415.1062,"ms_median":420.4134,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":421.7972,"ms_median":427.1969,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1091.0538,"ms_median":1117.1965,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":404.5233,"ms_median":407.2498,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":383.0718,"ms_median":384.2950,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1102.1106,"ms_median":1184.7641,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":459.7199,"ms_median":468.9255,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":387.8264,"ms_median":407.4377,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1078.1214,"ms_median":1143.2850,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":412.7921,"ms_median":440.2917,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":423.3147,"ms_median":432.1822,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1104.4443,"ms_median":1244.3912,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":443.3123,"ms_median":449.9987,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":413.3492,"ms_median":416.6792,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1076.7674,"ms_median":1147.1180,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":414.7530,"ms_median":425.9232,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":399.7825,"ms_median":403.8504,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1148.7775,"ms_median":1175.0298,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":421.1560,"ms_median":425.5674,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":400.0424,"ms_median":406.2637,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1166.4272,"ms_median":1197.8579,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":427.8258,"ms_median":434.3775,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":406.8127,"ms_median":414.7583,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1090.0615,"ms_median":1155.4154,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":414.6165,"ms_median":421.0622,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":398.9812,"ms_median":404.3399,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1077.2803,"ms_median":1101.4911,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":401.9433,"ms_median":404.6089,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":397.3145,"ms_median":407.7965,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1141.8777,"ms_median":1174.4583,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":414.1024,"ms_median":423.0453,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":400.0981,"ms_median":404.8385,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1101.0481,"ms_median":1137.6029,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":412.2768,"ms_median":423.4066,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":398.7044,"ms_median":400.4327,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1136.8179,"ms_median":1182.1784,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":422.5848,"ms_median":432.2406,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":402.8214,"ms_median":408.0006,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1080.3557,"ms_median":1138.3442,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":416.0612,"ms_median":429.7147,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":400.9414,"ms_median":404.1590,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1069.8263,"ms_median":1076.6274,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":399.5378,"ms_median":399.9667,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":380.4006,"ms_median":380.6373,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1069.1075,"ms_median":1070.0151,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":398.7480,"ms_median":399.6613,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":380.0164,"ms_median":380.1905,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1069.9335,"ms_median":1070.6244,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":399.2981,"ms_median":399.9402,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":380.5721,"ms_median":380.9064,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1128.9725,"ms_median":1160.2786,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":408.4277,"ms_median":418.9652,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":389.3475,"ms_median":394.3945,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}],
+      "after": [{"workload":"mixed_full","ms_min":1073.0875,"ms_median":1078.4358,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.5},{"workload":"mixed_short","ms_min":405.2298,"ms_median":406.2231,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":407.2862,"ms_median":410.8045,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1069.9885,"ms_median":1077.6725,"iters":8,"items":12,"sync_waits":2,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.6},{"workload":"mixed_short","ms_min":403.5563,"ms_median":409.5225,"iters":8,"items":12,"sync_waits":2,"forwards":4,"emb_err_max":null,"device_peak_mib":653.8},{"workload":"media_only","ms_min":381.5780,"ms_median":384.8845,"iters":8,"items":4,"sync_waits":2,"forwards":2,"emb_err_max":null,"device_peak_mib":653.8}]
+    }
+  ],
+  "lane_archive": "target/mm_onewait_attempt1.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-16T03:42:49Z",
+    "invocation_shell": "'$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/release/bench_paired' --rounds 8 --evidence --max-spread 1.25 --out target/mm_onewait_attempt1.json before=target/bench_lanes/before after=target/bench_lanes/after control=target/bench_lanes/control",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/release/bench_paired",
+      "--rounds",
+      "8",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--out",
+      "target/mm_onewait_attempt1.json",
+      "before=target/bench_lanes/before",
+      "after=target/bench_lanes/after",
+      "control=target/bench_lanes/control"
+    ],
+    "cwd": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 8,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": false,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "before",
+          "argv": [
+            "target/bench_lanes/before"
+          ],
+          "env": {}
+        },
+        {
+          "name": "after",
+          "argv": [
+            "target/bench_lanes/after"
+          ],
+          "env": {}
+        },
+        {
+          "name": "control",
+          "argv": [
+            "target/bench_lanes/control"
+          ],
+          "env": {}
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932",
+      "scope": ".",
+      "revision": "1b75d740b7ab47695cc2dde51906bcabdabc85ae",
+      "dirty": true,
+      "status_porcelain": [
+        " M docs/embedgemma2.md",
+        " M docs/embedgemma2_audit.md",
+        " M src/embedgemma2_mm.rs"
+      ],
+      "status_line_count": 3,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e0440848eee23f856f75d839d05c3c2ccce0072ac8a39258b011e666b4425121",
+      "tracked_diff_bytes": 18659
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 11.8916015625,
+        "loadavg_5m": 17.58837890625,
+        "loadavg_15m": 15.81982421875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.66064453125,
+        "normalized_loadavg_5m": 0.9771321614583334,
+        "normalized_loadavg_15m": 0.8788791232638888
+      },
+      "finish": {
+        "loadavg_1m": 18.125,
+        "loadavg_5m": 26.96337890625,
+        "loadavg_15m": 23.12841796875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 1.0069444444444444,
+        "normalized_loadavg_5m": 1.4979654947916667,
+        "normalized_loadavg_15m": 1.284912109375
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/release/bench_paired",
+        "size_bytes": 887472,
+        "mtime_ns": 1792122129086252979,
+        "sha256": "1f53f24531255b5ed8ae0b622d09734bf4c552045708a2cc223860e3d112a7ac"
+      },
+      "lane:after:after": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/bench_lanes/after",
+        "size_bytes": 3741600,
+        "mtime_ns": 1792122129107729771,
+        "sha256": "ff21487dd7400049ebafa6b98b4f6cf13d31a272edfecf5ce5653b1d1fe3f1f3"
+      },
+      "lane:before:before": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/bench_lanes/before",
+        "size_bytes": 3754688,
+        "mtime_ns": 1792122129112562655,
+        "sha256": "4ad5fcc86129b577a89f12896da1e10d01ea63529be4bce802ad28aa1c45ed82"
+      },
+      "lane:control:control": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a1bcd94eed1deb932/target/bench_lanes/control",
+        "size_bytes": 3754688,
+        "mtime_ns": 1792122129118198125,
+        "sha256": "4ad5fcc86129b577a89f12896da1e10d01ea63529be4bce802ad28aa1c45ed82"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-16T03:53:11Z"
+  }
+}

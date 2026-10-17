@@ -54,10 +54,15 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: tools/msl_emu/requirements.txt
+      - uses: dtolnay/rust-toolchain@stable
       - name: MSL dialect lint
         # No Metal compiler on Linux: fail instead on any construct the Qwen3.5
         # kernels use that no compiling tessl kernel uses and nobody reviewed.
-        run: python3 tools/msl_emu/dialect_lint.py
+        # The lint is std-only (the crate itself does not build on Linux), so a
+        # bare rustc compiles it.
+        run: |
+          rustc --edition 2021 -O -o "$RUNNER_TEMP/dialect_lint" src/bin/dialect_lint.rs
+          "$RUNNER_TEMP/dialect_lint"
       - name: Install the oracle
         run: pip install -r tools/msl_emu/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Emulator vs transformers
@@ -105,8 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Python for the source-text gates
-        # The device-free tests below drive tools/msl_emu/dialect_lint.py; the
-        # parity harness needs numpy.
+        # The parity harness below needs numpy.
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"

@@ -1,0 +1,115 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_embedgemma2_tok_fixtures.py",
+ "generator_commit": "3cb86ad753a05144f85929d647663bf11af3d333",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.3",
+  "python": "3.14.8"
+ },
+ "versions_role": "reproduced",
+ "inputs_source": "hand-written: the three committed tiny_*.json tokenizers; the corpus is fixed strings plus random.Random(SEED) draws in the generator, so a rerun is deterministic",
+ "files": {
+  "tiny_bytes": {
+   "role": "golden",
+   "published": true,
+   "note": "Tokenizer.encode/decode oracles for tiny_bytes.json from the tokenizers library"
+  },
+  "tiny_bytes.json": {
+   "role": "input",
+   "published": true,
+   "note": "hand-written tokenizer (see the generator's docstring for what it exercises)"
+  },
+  "tiny_gemma": {
+   "role": "golden",
+   "published": true,
+   "note": "Tokenizer.encode/decode oracles for tiny_gemma.json from the tokenizers library"
+  },
+  "tiny_gemma.json": {
+   "role": "input",
+   "published": true,
+   "note": "hand-written tokenizer (see the generator's docstring for what it exercises)"
+  },
+  "tiny_legacy": {
+   "role": "golden",
+   "published": true,
+   "note": "Tokenizer.encode/decode oracles for tiny_legacy.json from the tokenizers library"
+  },
+  "tiny_legacy.json": {
+   "role": "input",
+   "published": true,
+   "note": "hand-written tokenizer (see the generator's docstring for what it exercises)"
+  }
+ },
+ "reproduction": {
+  "byte_identical": [
+   "tiny_bytes/dec_group_idx.npy",
+   "tiny_bytes/dec_groups.txt",
+   "tiny_bytes/dec_id_offsets.npy",
+   "tiny_bytes/dec_ids.npy",
+   "tiny_bytes/dec_out.bin",
+   "tiny_bytes/dec_out_offsets.npy",
+   "tiny_bytes/dec_skip.npy",
+   "tiny_bytes/group_idx.npy",
+   "tiny_bytes/groups.txt",
+   "tiny_bytes/plain_ids.npy",
+   "tiny_bytes/plain_ids_offsets.npy",
+   "tiny_bytes/prompt_idx.npy",
+   "tiny_bytes/prompts.txt",
+   "tiny_bytes/raw_ids.npy",
+   "tiny_bytes/raw_ids_offsets.npy",
+   "tiny_bytes/st_ids.npy",
+   "tiny_bytes/st_ids_offsets.npy",
+   "tiny_bytes/status.npy",
+   "tiny_bytes/text_offsets.npy",
+   "tiny_bytes/texts.bin",
+   "tiny_gemma/dec_group_idx.npy",
+   "tiny_gemma/dec_groups.txt",
+   "tiny_gemma/dec_id_offsets.npy",
+   "tiny_gemma/dec_ids.npy",
+   "tiny_gemma/dec_out.bin",
+   "tiny_gemma/dec_out_offsets.npy",
+   "tiny_gemma/dec_skip.npy",
+   "tiny_gemma/group_idx.npy",
+   "tiny_gemma/groups.txt",
+   "tiny_gemma/plain_ids.npy",
+   "tiny_gemma/plain_ids_offsets.npy",
+   "tiny_gemma/prompt_idx.npy",
+   "tiny_gemma/prompts.txt",
+   "tiny_gemma/raw_ids.npy",
+   "tiny_gemma/raw_ids_offsets.npy",
+   "tiny_gemma/st_ids.npy",
+   "tiny_gemma/st_ids_offsets.npy",
+   "tiny_gemma/status.npy",
+   "tiny_gemma/text_offsets.npy",
+   "tiny_gemma/texts.bin",
+   "tiny_legacy/dec_group_idx.npy",
+   "tiny_legacy/dec_groups.txt",
+   "tiny_legacy/dec_id_offsets.npy",
+   "tiny_legacy/dec_ids.npy",
+   "tiny_legacy/dec_out.bin",
+   "tiny_legacy/dec_out_offsets.npy",
+   "tiny_legacy/dec_skip.npy",
+   "tiny_legacy/group_idx.npy",
+   "tiny_legacy/groups.txt",
+   "tiny_legacy/plain_ids.npy",
+   "tiny_legacy/plain_ids_offsets.npy",
+   "tiny_legacy/prompt_idx.npy",
+   "tiny_legacy/prompts.txt",
+   "tiny_legacy/raw_ids.npy",
+   "tiny_legacy/raw_ids_offsets.npy",
+   "tiny_legacy/st_ids.npy",
+   "tiny_legacy/st_ids_offsets.npy",
+   "tiny_legacy/status.npy",
+   "tiny_legacy/text_offsets.npy",
+   "tiny_legacy/texts.bin"
+  ],
+  "differing_non_npy": [],
+  "max_relative_to_peak": {},
+  "how": "`scripts/gen_embedgemma2_tok_fixtures.py tiny` rerun in place on 2026-10-16 during the eg2/integrate merge; git diff empty"
+ },
+ "oracle_versions": {
+  "tokenizers": "0.23.2"
+ }
+}

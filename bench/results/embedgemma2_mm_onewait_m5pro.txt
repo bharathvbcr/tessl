@@ -1,0 +1,73 @@
+EmbeddingGemma 2 multimodal facade, one host wait instead of two: interleaved before / after / control
+(Apple M5 Pro, real checkpoint 914f7f89; GPU shared with other jobs the whole time)
+
+lanes   before  = 27a0407's EmbedGemma2Multimodal::encode (worktree target/before, its own target dir)
+        after   = this lane's head (GPU-resident soft-token hand-off, towers release activations before their wait)
+        control = a copy of the before binary: its own ratio to before is the noise floor of this run
+driver  src/bin/bench_embedgemma2_mm.rs, the same source file in both builds (it uses only the library's public
+        EmbedGemma2Multimodal::load / encode, so it builds unchanged at 27a0407; the before build was given a copy of
+        the file, it is not in that commit). One encode call from host ids, pixels and features to host embeddings.
+run     bench_paired --rounds 8 --evidence --max-spread 1.25 --out ... before=... after=... control=...
+        BENCH_ITERS=8 BENCH_WARMUP=2 (min of 8 timed calls per process), every lane a fresh process, order reversed on
+        odd rounds. The drift gate (spread <= 1.25) passed on the first attempt; provenance (revision, lane executable
+        hashes, host, load) is in the JSON. "dirty": true there: the docs of this change were still uncommitted.
+        EMBEDGEMMA2_SNAPSHOT, EMBEDGEMMA2_REF_DIR, EMBEDGEMMA2_MM_REF_DIR as in docs/embedgemma2.md.
+workloads (one call each, f32 operands)
+        mixed_full   image 0, clip 0, the eight reference texts (10 to 6147 tokens), image 1, clip 1 (12 items, the
+                     batch of tests/embedgemma2_multimodal_model.rs; 5 text forwards)
+        mixed_short  the same 12 items, every text cut to its first 48 ids (the towers are most of the call)
+        media_only   the two images and the two clips (4 items)
+
+BOUNDS, fixed before the paired run (the hashes and the waits were checked on one process per build first):
+  1. every embedding bit for bit equal between the builds: the HASH line of each workload (fnv1a64 over the bits)
+  2. host waits of one call: before 2, after 1 (infer_trace, each lane counts them on its own)
+  3. not slower: the median per-round ratio after/before <= 1.03 on every workload
+  4. a speedup is claimed only if every round's after/before ratio is below 1 AND the control's median ratio is within
+     [0.97, 1.03]; anything else is "not distinguishable"
+  5. the real-checkpoint accuracy bound of the driver, 1e-4 max abs against sentence-transformers, every process
+
+OBSERVED
+  1. HASH identical, before and after: mixed_full 922bb84e7eb7eef9, mixed_short 3f25a99974a7687c,
+     media_only c37bcf8a3961f5e5 (verified: one process of each build before the run, and the real-checkpoint tests
+     print the same per-row errors to the digit at both revisions)
+  2. sync_waits printed by all 24 processes of each lane (8 rounds x 3 workloads): before 2, after 1, control 2
+  3. holds: medians 1.003x, 0.995x, 1.023x (the last inside its bound but not by much; see below)
+  4. not met on any workload, so NO SPEEDUP IS CLAIMED
+  5. emb_err_max 2.98e-7 on mixed_full in every process (bound 1e-4)
+
+RESULT: no time difference can be claimed. The removed wait is a host round trip, not GPU work: one commit-and-wait is
+about 0.25 ms (docs/benchmarking.md's submit-and-wait floor, inferred for this call) plus the read back and re-upload of
+the towers' soft tokens (4 images' and clips' worth of 512-wide f32 rows, about 1 MB), against calls of 380 to 1070 ms.
+The change is a few tenths of a millisecond to about one, under every spread here.
+
+  workload      before ms   after ms  after/before median [lowest, highest round]   control/before median [lo, hi]
+  mixed_full     1091.5     1088.9      1.003x [0.950, 1.067]                         1.001x [0.948, 1.083]
+  mixed_short     413.4      413.9      0.995x [0.898, 1.055]                         0.999x [0.964, 1.052]
+  media_only      390.8      401.4      1.023x [0.996, 1.092]                         1.004x [0.976, 1.066]
+  (ms = median over the 8 rounds of each round's min of 8 calls)
+
+  fastest round per lane, which is where a shared GPU interferes least (ms):
+  workload      before    after   control
+  mixed_full    1069.7   1069.1   1069.9
+  mixed_short    399.5    398.7    399.3
+  media_only     380.4    380.0    380.6
+
+Every after/before range straddles 1 (media_only's lowest round is 0.996) and contains the control's. The media_only
+median of 1.023x is the one figure that leans the wrong way: seven of the after lane's eight rounds read 397 to 423 ms
+and one 380.0 (before's eight: 380.4 to 399.8; control, the same binary as before: 380.6 to 413.3, median 398.2 against
+before's 390.8). The control sits 1.9 % from before on this workload, so 2.3 % is inside this run's noise, and the three
+lanes' fastest rounds agree to 0.2 %. It is within bound 3, so it is reported, not explained away: a repeat on an idle
+host is what would settle a difference of a millisecond, and it is the follow-up (bench_paired --evidence --rounds 12
+--max-spread 1.10 with these lanes).
+
+DEVICE PEAK above the loaded model (device_peak_mib, the largest of the 8 processes; one tower's set and the text
+encoder's are live together until the wait in both builds, because nothing can be recycled before it):
+  mixed_full  628.6 -> 628.5 MiB     mixed_short 653.8 -> 653.6 MiB     media_only 653.8 -> 653.6 MiB
+The 0.1 to 0.2 MiB is the soft tokens' host copy and upload no longer made. No peak claim beyond "unchanged".
+What the memory change does fix is across calls: consecutive tower calls held two activation sets and now hold one
+(tests/embedgemma2_memory.rs, tiny checkpoint: 1,769,472 and 540,672 bytes above the first call against bounds of 8,192
+and 16,384 before; within the bounds after). That is a measurement of the tiny model's allocator, not of this table.
+
+Plot: embedgemma2_mm_onewait_m5pro.png (embedgemma2_mm_onewait_plot.py); data: embedgemma2_mm_onewait_m5pro.json
+(every round and lane under "raw"; the per-process stdout of the lanes, with sync_waits, was kept beside it by
+bench_paired in target/ and is not committed).

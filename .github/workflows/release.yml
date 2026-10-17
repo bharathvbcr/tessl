@@ -130,16 +130,9 @@ jobs:
           set -euo pipefail
           TAG="v${VERSION}"
           BODY_FILE="$(mktemp)"
-          VERSION="$VERSION" python3 - <<'PY' >"$BODY_FILE"
-          import os, pathlib, re, sys
-          text = pathlib.Path("CHANGELOG.md").read_text()
-          version = os.environ["VERSION"]
-          pat = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
-          m = re.search(pat, text, re.S)
-          if not m:
-              sys.exit(f"CHANGELOG section for {version} not found")
-          print(m.group(1).strip())
-          PY
+          # The section extractor is src/bin/release_check.rs (std only, so a bare rustc builds it).
+          rustc --edition 2021 -O -o "$RUNNER_TEMP/release_check" src/bin/release_check.rs
+          "$RUNNER_TEMP/release_check" changelog-section CHANGELOG.md "$VERSION" >"$BODY_FILE"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "GitHub Release $TAG already exists; leaving it"
           else

@@ -1,0 +1,70 @@
+audio_tower.subsample_conv_projection.layer0.conv.weight 16 1 3 3
+audio_tower.subsample_conv_projection.layer0.norm.weight 16
+audio_tower.subsample_conv_projection.layer1.conv.weight 8 16 3 3
+audio_tower.subsample_conv_projection.layer1.norm.weight 8
+audio_tower.subsample_conv_projection.input_proj_linear.weight 32 32
+audio_tower.layers.0.feed_forward1.ffw_layer_1.input_min
+audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max
+audio_tower.layers.0.feed_forward1.ffw_layer_1.output_min
+audio_tower.layers.0.feed_forward1.ffw_layer_1.output_max
+audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight 128 32
+audio_tower.layers.0.feed_forward1.ffw_layer_2.input_min
+audio_tower.layers.0.feed_forward1.ffw_layer_2.input_max
+audio_tower.layers.0.feed_forward1.ffw_layer_2.output_min
+audio_tower.layers.0.feed_forward1.ffw_layer_2.output_max
+audio_tower.layers.0.feed_forward1.ffw_layer_2.linear.weight 32 128
+audio_tower.layers.0.feed_forward1.pre_layer_norm.weight 32
+audio_tower.layers.0.feed_forward1.post_layer_norm.weight 32
+audio_tower.layers.0.feed_forward2.ffw_layer_1.input_min
+audio_tower.layers.0.feed_forward2.ffw_layer_1.input_max
+audio_tower.layers.0.feed_forward2.ffw_layer_1.output_min
+audio_tower.layers.0.feed_forward2.ffw_layer_1.output_max
+audio_tower.layers.0.feed_forward2.ffw_layer_1.linear.weight 128 32
+audio_tower.layers.0.feed_forward2.ffw_layer_2.input_min
+audio_tower.layers.0.feed_forward2.ffw_layer_2.input_max
+audio_tower.layers.0.feed_forward2.ffw_layer_2.output_min
+audio_tower.layers.0.feed_forward2.ffw_layer_2.output_max
+audio_tower.layers.0.feed_forward2.ffw_layer_2.linear.weight 32 128
+audio_tower.layers.0.feed_forward2.pre_layer_norm.weight 32
+audio_tower.layers.0.feed_forward2.post_layer_norm.weight 32
+audio_tower.layers.0.self_attn.per_dim_scale 16
+audio_tower.layers.0.self_attn.q_proj.input_min
+audio_tower.layers.0.self_attn.q_proj.input_max
+audio_tower.layers.0.self_attn.q_proj.output_min
+audio_tower.layers.0.self_attn.q_proj.output_max
+audio_tower.layers.0.self_attn.q_proj.linear.weight 32 32
+audio_tower.layers.0.self_attn.k_proj.input_min
+audio_tower.layers.0.self_attn.k_proj.input_max
+audio_tower.layers.0.self_attn.k_proj.output_min
+audio_tower.layers.0.self_attn.k_proj.output_max
+audio_tower.layers.0.self_attn.k_proj.linear.weight 32 32
+audio_tower.layers.0.self_attn.v_proj.input_min
+audio_tower.layers.0.self_attn.v_proj.input_max
+audio_tower.layers.0.self_attn.v_proj.output_min
+audio_tower.layers.0.self_attn.v_proj.output_max
+audio_tower.layers.0.self_attn.v_proj.linear.weight 32 32
+audio_tower.layers.0.self_attn.post.input_min
+audio_tower.layers.0.self_attn.post.input_max
+audio_tower.layers.0.self_attn.post.output_min
+audio_tower.layers.0.self_attn.post.output_max
+audio_tower.layers.0.self_attn.post.linear.weight 32 32
+audio_tower.layers.0.self_attn.relative_k_proj.weight 32 32
+audio_tower.layers.0.lconv1d.linear_start.input_min
+audio_tower.layers.0.lconv1d.linear_start.input_max
+audio_tower.layers.0.lconv1d.linear_start.output_min
+audio_tower.layers.0.lconv1d.linear_start.output_max
+audio_tower.layers.0.lconv1d.linear_start.linear.weight 64 32
+audio_tower.layers.0.lconv1d.linear_end.input_min
+audio_tower.layers.0.lconv1d.linear_end.input_max
+audio_tower.layers.0.lconv1d.linear_end.output_min
+audio_tower.layers.0.lconv1d.linear_end.output_max
+audio_tower.layers.0.lconv1d.linear_end.linear.weight 32 32
+audio_tower.layers.0.lconv1d.depthwise_conv1d.weight 32 1 5
+audio_tower.layers.0.lconv1d.pre_layer_norm.weight 32
+audio_tower.layers.0.lconv1d.conv_norm.weight 32
+audio_tower.layers.0.norm_pre_attn.weight 32
+audio_tower.layers.0.norm_post_attn.weight 32
+audio_tower.layers.0.norm_out.weight 32
+audio_tower.output_proj.weight 24 32
+audio_tower.output_proj.bias 24
+embed_audio.embedding_projection.weight 8 24

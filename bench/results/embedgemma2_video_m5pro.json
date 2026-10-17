@@ -1,0 +1,157 @@
+{
+ "what": "bench_embedgemma2_video: one video of 32 synthetic 640x360 frames (120 soft tokens a frame, 3906 ids), min and median of 15 calls after 3 warmup, three consecutive runs",
+ "machine": "Apple M5 Pro, shared with other work (load_avg_1m is the one-minute load average when the workload started; 18 cores)",
+ "command": "EMBEDGEMMA2_SNAPSHOT=... BENCH_ITERS=15 BENCH_WARMUP=3 target/release/bench_embedgemma2_video",
+ "runs": [
+  {
+   "run": 1,
+   "rows": [
+    {
+     "workload": "preprocess",
+     "precision": "f32",
+     "ms_min": 50.2898,
+     "ms_median": 86.1159,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 72.6382
+    },
+    {
+     "workload": "tower",
+     "precision": "f32",
+     "ms_min": 3453.8227,
+     "ms_median": 4762.0165,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 77.1279
+    },
+    {
+     "workload": "encode",
+     "precision": "f32",
+     "ms_min": 3817.0481,
+     "ms_median": 5199.6382,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 82.1714
+    },
+    {
+     "workload": "tower",
+     "precision": "bf16",
+     "ms_min": 1499.1063,
+     "ms_median": 1639.4851,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 82.0532
+    },
+    {
+     "workload": "encode",
+     "precision": "bf16",
+     "ms_min": 1488.1206,
+     "ms_median": 2546.0003,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 98.3843
+    }
+   ]
+  },
+  {
+   "run": 2,
+   "rows": [
+    {
+     "workload": "preprocess",
+     "precision": "f32",
+     "ms_min": 114.9117,
+     "ms_median": 213.2695,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 104.0352
+    },
+    {
+     "workload": "tower",
+     "precision": "f32",
+     "ms_min": 2773.7,
+     "ms_median": 3921.7508,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 105.7495
+    },
+    {
+     "workload": "encode",
+     "precision": "f32",
+     "ms_min": 4033.5778,
+     "ms_median": 6035.9751,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 70.7622
+    },
+    {
+     "workload": "tower",
+     "precision": "bf16",
+     "ms_min": 1685.1757,
+     "ms_median": 2175.0848,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 35.5625
+    },
+    {
+     "workload": "encode",
+     "precision": "bf16",
+     "ms_min": 1648.9234,
+     "ms_median": 2402.8156,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 30.311
+    }
+   ]
+  },
+  {
+   "run": 3,
+   "rows": [
+    {
+     "workload": "preprocess",
+     "precision": "f32",
+     "ms_min": 66.3266,
+     "ms_median": 146.9317,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 32.9751
+    },
+    {
+     "workload": "tower",
+     "precision": "f32",
+     "ms_min": 2423.08,
+     "ms_median": 3977.3059,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 53.0718
+    },
+    {
+     "workload": "encode",
+     "precision": "f32",
+     "ms_min": 3731.8417,
+     "ms_median": 5066.8696,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 109.7705
+    },
+    {
+     "workload": "tower",
+     "precision": "bf16",
+     "ms_min": 791.3211,
+     "ms_median": 1794.6217,
+     "iters": 15,
+     "sync_waits": null,
+     "load_avg_1m": 79.604
+    },
+    {
+     "workload": "encode",
+     "precision": "bf16",
+     "ms_min": 2052.2225,
+     "ms_median": 2604.3525,
+     "iters": 15,
+     "sync_waits": 1,
+     "load_avg_1m": 106.063
+    }
+   ]
+  }
+ ]
+}

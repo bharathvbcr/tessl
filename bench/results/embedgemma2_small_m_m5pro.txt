@@ -1,0 +1,135 @@
+EmbedGemma2 small-M GEMMs (lane G): an opt-in parallel K-partition path for the few-tile exact-f32 NN GEMMs
+===========================================================================================================
+Machine: Apple M5 Pro, 64 GB, macOS 27, 2026-10-15. Before = eg2/integrate 27a0407 built in its own
+worktree and target dir; after = the same tree plus this change (branch worktree-agent-a17ffa3c9da42a5f0).
+Data: embedgemma2_small_m_m5pro.json (every round of every lane, the merged statistics, the per-GEMM rows).
+Plot: embedgemma2_small_m_m5pro.png (embedgemma2_small_m_plot.py). Merge: `results_report small-m` (src/bin/results_report).
+Tools: target/release/bench_paired over bench_embedgemma2 (whole encode); bench_gemm_routes lane nnsmall
+(one GEMM). EMBEDGEMMA2_SNAPSHOT = google/embeddinggemma-2 snapshot 914f7f89142e.
+
+Verified = measured here and in the JSON. Inferred = follows from measured numbers by the argument given.
+Unverified = not measured.
+
+WHAT CHANGED
+  An exact-f32 NN GEMM whose C is a few tiles over a long K ran one single-simdgroup threadgroup per 32x32
+  tile, each walking all of K (down, o, ple at 16 rows: 16 threadgroups), so its time was that walk's
+  latency, 17-22 % of the copy bandwidth. A call can now opt in (gemm_small_m(a, b, c, backend, scratch))
+  to running every K-partition's tiles in one dispatch into a scratch slice per partition, with
+  reduce_partitions_f32 adding the slices in order (the TN split-K's design):
+  matmul2d_tensorops_nn_splitk_par_f32. Gate (src/gemm.rs nn_small_par_k_tile): N <= 512, K >= 512, under 64
+  tiles of 32x32 (M <= 96 at N 512), about 128 threadgroups in all, the width sized from one tile row so it
+  does not move with M. At the forward's shapes: down and o global (K 2048, N 512): 8 partitions of 256; o
+  sliding (K 1024): 8 of 128; ple_gate / ple_out (K 512): 4 of 128, at every M up to 96. qkv (N 2048-3072) and
+  gate|up (N 4096) keep the single dispatch.
+  THE OPT-IN IS THE CALL'S. gemm, gemm_tiled, ExactF32.nn, the vision and audio towers (embedgemma2::project),
+  Qwen3.5 and every external consumer keep exactly the route they had on 27a0407: no split-K, the same bits.
+  Only EmbedGemma2Model's own project (the text encoder, ExactF32) calls gemm_small_m; Bf16 is untouched.
+  The scratch is the forward's own idle activation buffer (acts.qkv, which holds nothing at the o, down and
+  per-layer-input GEMMs; acts.attn at the qkv and gate|up GEMMs), so the path adds no device memory.
+  Accuracy: only the summation order moves (K in partitions summed in order, deterministic); tests hold every
+  result to gamma_(K+8) * sum|a.b| (the bound all exact-f32 GEMMs meet), worst 0.0039 of it. A text
+  sequence's embedding alone (the lane, 10-40 rows) against the same one batched (200 rows, one dispatch) moves
+  by 1.3e-7 at real GEMM shapes, 1.7e-7 on the real checkpoint, against the existing bound of 1e-5.
+
+MACHINE STATE
+  The GPU read 10 % utilization when the committed runs began and the control lane's median is 0.997-1.001 on
+  every workload, with ranges of 0.94-1.04 (1x16) and under 0.04 elsewhere: a quiet machine, every round clean.
+
+METHOD
+  bench_paired, three lanes per run (before 27a0407, after, control = before again), a fresh process per
+  lane per round, lane order reversed on odd rounds, BENCH_ITERS encodes per process and the process's
+  min-of-N reported; per workload the figure is per round. Runs, all exact f32: 1x16 and 1x64, 40 rounds x 20
+  iterations (warmup 5); 64x32, 30 rounds x 10 (warmup 2); 8x1024, 16 rounds x 3 (warmup 1). "clean rounds" are
+  rounds in which the control lane is within 10 % of the before lane on that workload. The one-GEMM figures
+  come from bench_gemm_routes lane nnsmall: the plain single dispatch (raw), production (gemm_small_m, a pool
+  scratch), and forced widths, interleaved, 12 rounds x 8 calls x 24 GEMMs, weights cycled over 24 copies as
+  in a forward, every arm's output checked against the plain one first (<= 2.2e-6 of the output's scale).
+
+RESULTS
+  Whole encode, after / before (< 1 is faster). "min of rounds" is the house min-of-N over rounds; "median
+  ratio" the median over rounds of the per-round ratio with its lowest and highest round, and the control's
+  same figures; "clean" the rounds the control agrees with the before lane.
+
+WHOLE ENCODE: after / before (ms = min of rounds' min-of-N)
+prec  workload rounds    before     after  min-of-rounds     median ratio [lo,hi]        control [lo,hi]  clean n  clean median
+f32   1x16         40     7.116     4.247          0.597    0.602 [0.58,0.63]    0.997 [0.94,1.04]       40         0.602
+f32   1x64         40     7.771     5.458          0.702    0.698 [0.67,0.71]    1.000 [0.96,1.04]       40         0.698
+f32   64x32        30   101.486   101.502          1.000    1.000 [1.00,1.02]    1.000 [0.99,1.00]       30         1.000
+f32   8x1024       16   516.720   516.873          1.000    1.000 [1.00,1.00]    1.001 [1.00,1.00]       16         1.000
+
+DEVICE MEMORY (bench_embedgemma2 device_peak_mib / peak_footprint_mib, real checkpoint)
+  1x16: 2 MiB / 872.3 MiB before and after; 1x64: 6.8 MiB / 877.1 before, 877.2 after (the 0.1 is process
+  noise: the control lane's footprint is 877.1). The lane's scratch is the forward's own idle buffer, not a pool
+  allocation. (A pooled scratch measured 1.5 MiB at 16 rows and 10 MiB at 96 for a 2-layer model, 12 times
+  that for 24 layers, none of it recycled before the next commit: tests/embedgemma2_small_m.rs
+  the_lane_adds_no_device_memory holds one forward's bytes to the itemized activation set exactly, at 16, 48,
+  96 rows, in the lane, and 97, 200, past it.)
+
+ONE GEMM, us per call (median of interleaved rounds); plain / this = median of per-round ratios [lo, hi]
+  (full table, with the forced widths, in the JSON "gemm" key; M = 1, 16, 32, 64 each)
+f32   down           M=16  K=2048  N=512   plain 89.9  production 29.7 (3.03x [2.99,3.10])
+f32   o global       M=16  K=2048  N=512   plain 89.4  production 29.7 (2.99x [2.98,3.09])
+f32   o sliding      M=16  K=1024  N=512   plain 48.8  production 20.8 (2.35x [2.20,2.37])
+f32   ple_gate/out   M=16  K=512   N=512   plain 28.6  production 15.9 (1.79x [1.75,1.90])
+  At 1 and 64 rows: down 3.11x and 2.36x, o global 3.13x and 2.36x, o sliding 2.48x and 1.79x, ple 1.83x and
+  1.54x. qkv (N 2048-3072) and gate|up (N 4096) are not routed; the forced lane on them measured 0.6-1.2x at
+  16-64 rows (JSON), a loss as often as a gain. The forced widths put 128-256 within 10 % of each other at
+  K 2048 and 64-128 at K 512, with 512 and up behind; the gate's 128 threadgroups is the middle of that.
+  The audio tower's K-256 and K-1024 GEMMs (not routed by this change and not in the JSON; the K floor of
+  512 and the N cap keep them out of the gate; bench_gemm_routes BENCH_SHAPES="audio tiny ffn2,audio wide
+  ffn2,audio wide attn" BENCH_ROWS=10,35,120, an earlier quiet run): K 256, 11-16 us, forced 1.15-1.45x (3-5
+  us each); wide ffn2 (K 1024, N 256) 2.5-2.9x at 10-35 rows.
+  At 16 rows the down GEMM moves 4.2 MiB in 29.7 us = 141 GB/s, about 64 % of the ~220 GB/s copy ceiling (it
+  was 45 GB/s, 17-22 %).
+
+READING THE RESULTS
+  1x16 (the latency workload): 0.602x of the time (1.66x faster) with the control at 0.997, every one of 40
+  rounds between 0.58 and 0.63; 1x64 0.698x. The stage profile's recommendation 3 estimated 7.3 -> 4.1 ms
+  (1.8x) for 70 % of the copy ceiling on the four shapes; measured 7.1 -> 4.2 ms with 64 %. Inferred, not
+  measured: that the rest is the per-GEMM reduce dispatch and barrier (a fused reduce, or the reduce folded
+  into the following norm + residual kernel, would remove it) and the unchanged qkv / gate|up /
+  PLE-projection stages.
+  64x32 and 8x1024 do not regress: 1.000x and 1.000x, 30 and 16 clean rounds. Their GEMMs are past the gate
+  (M = 2048 and 8192 rows; src/gemm.rs small_m_select tests assert the gate returns none there, and
+  tests/embedgemma2_small_m.rs asserts the traced forward of 200 rows dispatches the lane zero times).
+
+CONTRACTS KEPT (--ignored --test-threads=1, EMBEDGEMMA2_SNAPSHOT / _REF_DIR / _MM_REF_DIR /
+_MM_REF_EAGER_DIR), all green:
+  embedgemma2_model: f32 texts alone vs batched 0 to 1.7e-7 (BATCH_ABS 1e-5; they were 0 on 27a0407, the lane
+    moves the sum's order), bf16 exactly 0 (untouched);
+  embedgemma2_mm_model: audio alone vs batched 1.6e-7 and 2.1e-7, images 0;
+  embedgemma2_e2e_model, embedgemma2_multimodal_model: mixed call against alone 1.2e-7 to 3.0e-7;
+  embedgemma2_vision_model: images alone vs batched bit-identical, as on 27a0407;
+  embedgemma2_audio_model: soft tokens alone vs batched bit-identical true (the tower never takes the lane),
+    both tests (the second with EMBEDGEMMA2_MM_REF_EAGER_DIR).
+  tests/embedgemma2_small_m.rs (synthetic weights at the checkpoint's GEMM shapes: hidden 512, intermediate
+  2048, heads 4 x 256, a global layer of 512; two layers): five texts of 10-40 tokens alone (the lane, 8 lane
+  GEMMs per forward, counted by the traced kernel) against the five together (200 rows, the lane zero
+  times): 8.9e-8 to 1.3e-7, bound 1e-5 fixed before the first run.
+
+VERIFIED / INFERRED / UNVERIFIED
+  Verified: the lane's results against an f64 reference at M in {1, 7, 16, 63, 64} and the real K / N, through
+  gemm_small_m and the forced entry (tests/gemm_small_m.rs; mutation-checked in the earlier build: dropping the
+  A partition offset, or skipping one tile of one partition, fails 4 of 7 tests with errors of 500-1000x the
+  budget, and a poisoned scratch turns an unwritten element into a NaN); bit-for-bit repeats; the route per
+  shape with and without the opt-in; a caller's scratch (used when big enough, the single dispatch when one
+  element short, an error when bf16); the width not moving with M inside the gate; the encode speedups and
+  per-GEMM ratios above; the contracts above.
+  Inferred: that the 64x32 and 8x1024 kernels are the same as 27a0407's (from the gate's tests and the traced
+  200-row forward, not from a dispatch trace of the benchmark's own 2048-row forward).
+  Unverified: a stage profile of the new build; other consumers' (ojas, qd-metal, MLSystemsLab) behaviour is
+  unchanged by construction (they call gemm, which is untouched; not run here). A bf16 lane (commit b85f5e1,
+  1x16 0.79x) is not part of this change: it moved the bf16 text alone-vs-batched check by 2.4e-4 to 5.7e-4
+  against 1e-5.
+
+REPRODUCE
+  cargo build --release --bin bench_embedgemma2 --bin bench_paired --bin bench_gemm_routes
+  (before: git worktree add --detach target/before 27a0407, built with its own target dir)
+  EMBEDGEMMA2_SNAPSHOT=<snapshot> BENCH_WORKLOADS=1x16,1x64 BENCH_ITERS=20 BENCH_WARMUP=5 \
+    target/release/bench_paired --rounds 40 --out paired_lat_f32.json before-27a0407=<before>/bench_embedgemma2 \
+    after=target/release/bench_embedgemma2 control-before-again=<before>/bench_embedgemma2
+  (BENCH_WORKLOADS=64x32 BENCH_ITERS=10 BENCH_WARMUP=2 --rounds 30 / 8x1024 BENCH_ITERS=3 BENCH_WARMUP=1
+   --rounds 16 for the others)
+  BENCH_LANES=nnsmall target/release/bench_gemm_routes     (BENCH_ROWS, BENCH_WIDTHS, BENCH_SHAPES to vary)
+  cargo run --release --bin results_report -- small-m <results dir> <raw dir> before-27a0407 after control-before-again
+  uv run --with matplotlib==3.9.2 python embedgemma2_small_m_plot.py <results dir>

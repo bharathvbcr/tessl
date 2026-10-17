@@ -34,8 +34,10 @@ echo "==> device-free selection with the device hidden (CI: check job; includes 
 echo "==> hosted manifest completeness (every test that passes with the device hidden is selected)"
 ./scripts/hosted_tests.sh --outside
 
-echo "==> MSL dialect lint (CI: kernel-emulator job)"
-python3 tools/msl_emu/dialect_lint.py
+echo "==> MSL dialect lint (CI: kernel-emulator job, which compiles it with a bare rustc as here)"
+mkdir -p target
+rustc --edition 2021 -O -o target/dialect_lint src/bin/dialect_lint.rs
+target/dialect_lint
 
 echo "==> kernel IR check (fast-math: no inf/NaN constants, no fcmp uno/ord, isfinite stays a bit test)"
 # Exit 77 means no Metal toolchain: SKIPPED is printed and the run still fails, because the
@@ -80,9 +82,9 @@ echo "==> parity harness, host-only (adversarial scorer, ladder and evidence con
 echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"
 # The same oracle python as above: a missing torch already stopped the script, so this
 # cannot be skipped silently. The recording stand-in replaces libtessl; nothing is built.
-"$ORACLE_PY" -m unittest python/tests/test_binding_host.py -v
+"$ORACLE_PY" -m unittest python/tests/test_binding_host.py python/tests/test_embedgemma2_host.py python/tests/test_embedgemma2_mm_host.py -v
 
-echo "==> torch binding GPU tests (python/tests: test_cross_entropy, test_gdn, test_qwen35)"
+echo "==> torch binding GPU tests (python/tests: test_cross_entropy, test_gdn, test_qwen35, test_embedgemma2, test_embedgemma2_mm)"
 # These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal
 # runtime, so they belong under the machine-wide heavy-job lock, which exports MAC_HEAVY_LABEL.
 # Outside the lock they are not run, and that is printed rather than left to read as a pass.

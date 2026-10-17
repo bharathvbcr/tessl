@@ -29,6 +29,13 @@
 //!   bench/results/splitk_par_bf16_m5pro.txt.)
 //! - `smallm`: plain bf16 NN at M = 16..1024, the 128x64 and 64x64 tiles
 //!   (`gemm_tiled`) against production's choice.
+//! - `nnsmall`: the small-M exact-f32 NN lane, at EmbeddingGemma 2's GEMM shapes
+//!   (`BENCH_SHAPES`: names, default the forward's; the `audio *` ones are the small-B shapes) and `BENCH_ROWS` rows
+//!   (default 1,16,32,64), weights cycled over 24 copies as in a forward.
+//!   Arms: the plain single dispatch (raw), production (`gemm_small_m`, whatever it
+//!   routes to), and the parallel split-K at `BENCH_WIDTHS` (default
+//!   64,128,256,512,1024, those under K). Every arm's output is checked against
+//!   the plain one before anything is timed.
 //! - `batched`: strided-batched NN (`gemm_batched`, batch > 1) on bf16, f16
 //!   and relaxed f32 at N <= 512 and bf16 short M, where the single-matrix
 //!   path takes 64x64: production against the 64x64 batched kernel.
@@ -44,8 +51,8 @@ mod common;
 use objc2_metal::MTLComputePipelineState;
 use std::sync::Arc;
 use tessl::gemm::{
-    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_tiled, gemm_tn_bf16, Activation,
-    BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
+    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_f32, gemm_small_m,
+    gemm_tiled, gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
 };
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
@@ -554,6 +561,165 @@ fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     Ok(())
 }
 
+/// The exact-f32 NN as it ran before the small-M lane: C zeroed, then one
+/// `matmul2d_tensorops_f32` dispatch (32x32 tiles, one simdgroup each) over
+/// all of K. Raw, so the comparison does not depend on what `gemm` routes to.
+fn plain_nn(
+    rt: &Arc<GpuRuntime>,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    (m, n, k): (usize, usize, usize),
+) -> Result<(), String> {
+    // The kernel and the tile it is compiled for, together.
+    const PLAIN_F32: (&str, usize, usize) = ("matmul2d_tensorops_f32", 32, 1);
+    let (kernel, tile, simdgroups) = PLAIN_F32;
+    let z = rt.pipeline("zero_f32")?;
+    let p = rt.pipeline(kernel)?;
+    let numel = c.numel();
+    let z_tpt = z.threadExecutionWidth().min(numel).max(1);
+    let (tiles_n, tiles_m) = (n.div_ceil(tile), m.div_ceil(tile));
+    let tpt = p.threadExecutionWidth() * simdgroups;
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&z);
+        bnd.bind_tensor(c, 0);
+        bnd.bind_u32(numel as u32, 1);
+        bnd.dispatch(mtl_size(numel.div_ceil(z_tpt), 1, 1), mtl_size(z_tpt, 1, 1));
+        if bnd.needs_explicit_barriers() {
+            bnd.barrier();
+        }
+        bnd.set_pipeline(&p);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(tiles_n as u32, 6);
+        bnd.bind_u32(tiles_m as u32, 7);
+        bnd.dispatch(mtl_size(tiles_n * tiles_m, 1, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
+}
+
+/// The small-M exact-f32 NN (`gemm_nn_splitk_par_f32`) at the EmbeddingGemma 2
+/// forward's shapes and row counts: the plain single dispatch, production
+/// (`gemm`, whatever it routes to), and the parallel split-K at forced widths.
+/// A layer's weight is one of 24 distinct copies cycled, as in a forward, so
+/// the weights stream from memory rather than sit in cache.
+fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
+    let tile = 32;
+    // (name, K, N): the forward's GEMMs.
+    const SHAPES: &[(&str, usize, usize)] = &[
+        ("down", 2048, 512),
+        ("o global", 2048, 512),
+        ("o sliding", 1024, 512),
+        ("ple_gate/out", 512, 512),
+        ("qkv sliding", 512, 2048),
+        ("qkv global", 512, 3072),
+        ("gate|up", 512, 4096),
+        // The audio tower's GEMMs in tests/embedgemma2_audio_tiny.rs's two
+        // configurations: a B small enough to sit in cache.
+        ("audio tiny ffn2", 256, 64),
+        ("audio wide ffn2", 1024, 256),
+        ("audio wide attn", 256, 256),
+    ];
+    const LAYERS: usize = 24;
+    let only: Option<Vec<String>> = std::env::var("BENCH_SHAPES")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+    let ms: Vec<usize> = match std::env::var("BENCH_ROWS") {
+        Ok(v) => v
+            .split(',')
+            .map(|r| r.trim().parse::<usize>().ok().filter(|&r| r > 0))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("BENCH_ROWS={v:?}: expected positive integers separated by commas"))?,
+        Err(_) => vec![1, 16, 32, 64],
+    };
+    let widths: Vec<usize> = match std::env::var("BENCH_WIDTHS") {
+        Ok(v) => v
+            .split(',')
+            .map(|r| r.trim().parse::<usize>().ok().filter(|&r| r > 0 && r % 4 == 0))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("BENCH_WIDTHS={v:?}: expected positive multiples of 4 separated by commas"))?,
+        Err(_) => vec![64, 128, 256, 512, 1024],
+    };
+    for &(name, k, n) in SHAPES {
+        // Without BENCH_SHAPES the forward's shapes only, as committed.
+        let wanted = match &only {
+            Some(o) => o.iter().any(|s| s == name),
+            None => !name.starts_with("audio"),
+        };
+        if !wanted {
+            continue;
+        }
+        for &m in &ms {
+            let a = rt.alloc_tensor_f32(&[m, k])?;
+            a.buffer.write_f32(&common::fill(m * k, 0x7a1 ^ (m * n + k) as u64));
+            let ws: Vec<Tensor> = (0..LAYERS)
+                .map(|l| {
+                    let w = rt.alloc_tensor_f32(&[k, n])?;
+                    w.buffer.write_f32(&common::fill(k * n, 0x7b2 ^ l as u64));
+                    Ok(w)
+                })
+                .collect::<Result<_, String>>()?;
+            let live: Vec<usize> = widths.iter().copied().filter(|&w| w < k).collect();
+            let cs: Vec<Tensor> = (0..2 + live.len())
+                .map(|_| rt.alloc_tensor_f32(&[m, n]))
+                .collect::<Result<_, _>>()?;
+            // Every arm computes the same product, up to the summation order.
+            plain_nn(rt, &a, &ws[0], &cs[0], (m, n, k))?;
+            gemm_small_m(&a, &ws[0], &cs[1], GemmBackend::TensorOps, None)?;
+            for (i, &w) in live.iter().enumerate() {
+                gemm_nn_splitk_par_f32(&a, &ws[0], &cs[2 + i], w)?;
+            }
+            rt.synchronize()?;
+            let base = cs[0].buffer.read_f32()[..m * n].to_vec();
+            let worst = cs[1..]
+                .iter()
+                .map(|c| rel_diff(&base, &c.buffer.read_f32()[..m * n]))
+                .fold(0.0, f64::max);
+            if worst.is_nan() || worst >= 1e-5 {
+                return Err(format!(
+                    "{name} M={m} N={n} K={k}: arms disagree by {worst:.2e} of the output's scale"
+                ));
+            }
+            let reps = run.reps.div_ceil(LAYERS).max(1) * LAYERS;
+            let mut arms = Vec::new();
+            let mut i = 0usize;
+            let (a_ref, ws_ref) = (&a, &ws);
+            let c_plain = &cs[0];
+            arms.push(arm("plain", rt, reps, move || {
+                i += 1;
+                plain_nn(rt, a_ref, &ws_ref[i % LAYERS], c_plain, (m, n, k))
+            }));
+            let mut i = 0usize;
+            let c_prod = &cs[1];
+            arms.push(arm("production", rt, reps, move || {
+                i += 1;
+                gemm_small_m(a_ref, &ws_ref[i % LAYERS], c_prod, GemmBackend::TensorOps, None)
+            }));
+            for (j, &w) in live.iter().enumerate() {
+                let mut i = 0usize;
+                let c = &cs[2 + j];
+                arms.push(arm(&format!("par_splitk_{w}"), rt, reps, move || {
+                    i += 1;
+                    gemm_nn_splitk_par_f32(a_ref, &ws_ref[i % LAYERS], c, w)
+                }));
+            }
+            let tiles = m.div_ceil(tile) * n.div_ceil(tile);
+            report(
+                &format!(
+                    "nnsmall f32 {name} M={m} N={n} K={k}  ({tiles} tiles of {tile}x{tile}; arms agree within {worst:.1e})",
+                ),
+                &mut arms,
+                run,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn smallm_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     const MS: [usize; 7] = [16, 32, 64, 128, 256, 512, 1024];
     const NK: [(usize, usize); 4] = [(3072, 768), (768, 3072), (4096, 4096), (2048, 2048)];
@@ -605,7 +771,7 @@ fn main() -> Result<(), String> {
         rounds: common::env_usize("BENCH_ROUNDS", 6, 1)?,
         unstable: Default::default(),
     };
-    let lanes = std::env::var("BENCH_LANES").unwrap_or_else(|_| "splitk,smallm,batched,epi".into());
+    let lanes = std::env::var("BENCH_LANES").unwrap_or_else(|_| "splitk,smallm,nnsmall,batched,epi".into());
     println!("device: {}", rt.device_name());
     println!(
         "async encode, {} GEMMs per command buffer, {} calls per arm per round, {} rounds \
@@ -619,9 +785,14 @@ fn main() -> Result<(), String> {
         match lane {
             "splitk" => splitk_lane(&rt, &run)?,
             "smallm" => smallm_lane(&rt, &run)?,
+            "nnsmall" => nnsmall_lane(&rt, &run)?,
             "batched" => batched_lane(&rt, &run)?,
             "epi" => epi_lane(&rt, &run)?,
-            other => return Err(format!("BENCH_LANES: no lane {other:?} (splitk, smallm, batched, epi)")),
+            other => {
+                return Err(format!(
+                    "BENCH_LANES: no lane {other:?} (splitk, smallm, nnsmall, batched, epi)"
+                ))
+            }
         }
     }
     rt.set_async_encode(false)?;

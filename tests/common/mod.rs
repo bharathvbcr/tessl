@@ -22,6 +22,19 @@ pub mod qwen35;
 /// fixture, and composable into a whole forward.
 pub mod embedgemma2;
 
+/// f64 references for EmbeddingGemma 2's audio tower, written as transformers
+/// writes the chunked attention, and composable into a whole host forward.
+pub mod embedgemma2_audio;
+/// The tiny multimodal checkpoint (text, vision and audio in one file) and the
+/// processor-shaped inputs for `EmbedGemma2Multimodal` and its C ABI entries.
+pub mod embedgemma2_mm;
+/// The (text, ids) corpora of `scripts/gen_embedgemma2_tok_fixtures.py` and a
+/// per-group tally for the tokenizer parity tests.
+pub mod embedgemma2_tok;
+/// f64 references for EmbeddingGemma 2's vision tower: the axial RoPE, the
+/// pooler as transformers writes it, and a whole host forward.
+pub mod embedgemma2_vision;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, GpuBuffer};
@@ -71,27 +84,42 @@ pub fn with_gpu<R>(f: impl FnOnce(&Arc<GpuRuntime>) -> R) -> R {
 /// the parent it spawns the child, asserts it passed *and ran exactly one
 /// test* (a filter matching nothing also exits 0), and returns its stdout.
 pub fn in_traced_child(test_name: &str, body: impl FnOnce()) -> Option<String> {
+    in_child(test_name, &[("TESSL_KERNEL_TRACE", "1")], body)
+}
+
+/// Run `body` in a child process of its own, as [`in_traced_child`] does,
+/// with `env` set there.
+///
+/// Also for a test that reads a per-process figure other tests in the binary
+/// move: `GpuRuntime::current_allocated_bytes` is the device's allocation for
+/// the whole process, so a parallel test, or one that ran first and paid a
+/// pipeline's first compile, changes what a measured window sees.
+pub fn in_child(test_name: &str, env: &[(&str, &str)], body: impl FnOnce()) -> Option<String> {
     const CHILD: &str = "TESSL_TRACED_CHILD";
     if std::env::var_os(CHILD).is_some() {
         body();
         return None;
     }
     let exe = std::env::current_exe().expect("test binary path");
-    let out = std::process::Command::new(exe)
-        .args(["--exact", "--test-threads=1", "--nocapture", test_name])
-        .env(CHILD, "1")
-        .env("TESSL_KERNEL_TRACE", "1")
-        .output()
-        .expect("spawn traced child test");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["--exact", "--test-threads=1", "--nocapture", test_name])
+        .env(CHILD, "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn child test");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),
-        "traced child {test_name} failed:\n{stdout}\n{stderr}"
+        "child {test_name} failed:
+{stdout}
+{stderr}"
     );
     assert!(
         stdout.contains("1 passed"),
-        "traced child ran no test (filter out of sync with {test_name}?):\n{stdout}"
+        "child ran no test (filter out of sync with {test_name}?):
+{stdout}"
     );
     Some(stdout)
 }

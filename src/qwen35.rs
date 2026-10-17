@@ -1716,6 +1716,12 @@ pub struct QkvColumns {
 /// column blocks, as one GEMM over `[q_proj | k_proj | v_proj]` writes them
 /// (Gemma's layout: `k_col = q_heads * head_dim`, `v_col = k_col + kv_heads *
 /// head_dim`). Same norm (`* (w + weight_bias)`), RoPE and cache store.
+///
+/// `out` is the element type of `targets`: [`DType::F32`], or [`DType::BF16`]
+/// for the bf16 encoder attention's operands, written rounded to nearest even
+/// from the f32 result (`targets` are then bf16 buffers, and their K/V
+/// capacity is derived at two bytes an element,
+/// [`crate::nn::attn_kv_capacity_bf16`]). Any other type is refused.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_qk_norm_rope_columns(
     rt: &Arc<GpuRuntime>,
@@ -1726,11 +1732,12 @@ pub fn attn_qk_norm_rope_columns(
     q_norm_w: &GpuBuffer,
     k_norm_w: &GpuBuffer,
     targets: &AttnTargets<'_>,
+    out: DType,
     pos_offset: u32,
     theta: f32,
     eps: f32,
 ) -> Result<(), String> {
-    qk_norm_rope_impl(
+    qk_norm_rope_as(
         rt,
         shape,
         proj,
@@ -1748,6 +1755,7 @@ pub fn attn_qk_norm_rope_columns(
             weight_bias,
             v_norm: columns.v_norm,
         },
+        out,
     )
 }
 
@@ -1929,6 +1937,8 @@ enum RopePos<'a> {
     PerRow(&'a GpuBuffer),
 }
 
+/// [`qk_norm_rope_as`] with f32 targets: every entry point but the bf16
+/// encoder's.
 #[allow(clippy::too_many_arguments)]
 fn qk_norm_rope_impl(
     rt: &Arc<GpuRuntime>,
@@ -1943,10 +1953,54 @@ fn qk_norm_rope_impl(
     eps: f32,
     read: QkRead,
 ) -> Result<(), String> {
+    qk_norm_rope_as(
+        rt,
+        shape,
+        proj,
+        q_norm_w,
+        k_norm_w,
+        targets,
+        pos,
+        slot_base,
+        theta,
+        eps,
+        read,
+        DType::F32,
+    )
+}
+
+/// The norm, RoPE and cache store, writing `q_out`, `k_cache` and `v_cache`
+/// as `out` ([`DType::F32`], or [`DType::BF16`] rounded to nearest even from
+/// the f32 result, with the scalar-position kernel only).
+#[allow(clippy::too_many_arguments)]
+fn qk_norm_rope_as(
+    rt: &Arc<GpuRuntime>,
+    shape: &AttnShape,
+    proj: Cols<'_>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: &GpuBuffer,
+    targets: &AttnTargets<'_>,
+    pos: RopePos<'_>,
+    slot_base: u32,
+    theta: f32,
+    eps: f32,
+    read: QkRead,
+    out: DType,
+) -> Result<(), String> {
     const WHAT: &str = "qwen35::attn_qk_norm_rope";
     let s = shape;
     if s.head_dim == 0 || s.q_heads == 0 || s.kv_heads == 0 {
         return Err(format!("{WHAT}: head_dim and head counts must be non-zero"));
+    }
+    match (out, &pos) {
+        (DType::F32, _) | (DType::BF16, RopePos::Scalar(_)) => {}
+        (DType::BF16, _) => {
+            return Err(format!(
+                "{WHAT}: bf16 targets are written by the scalar-position kernel only; \
+                 the position-buffer variants write f32"
+            ))
+        }
+        _ => return Err(format!("{WHAT}: targets must be f32 or bf16, got {out:?}")),
     }
     if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
         return Err(format!(
@@ -2009,7 +2063,12 @@ fn qk_norm_rope_impl(
         // capacity, which must not read as "positions past capacity".
         return Ok(());
     }
-    let kv_capacity = crate::nn::attn_kv_capacity(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?;
+    let kv_capacity = match out {
+        DType::BF16 => {
+            crate::nn::attn_kv_capacity_bf16(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?
+        }
+        _ => crate::nn::attn_kv_capacity(targets.k_cache, targets.v_cache, s.batch, s.kv_heads, s.head_dim)?,
+    };
     // Both are known on the host whatever the position mode. With no slots
     // every token would be skipped as out of range, a call that "succeeds"
     // and writes nothing. And a cache whose last slot's absolute position
@@ -2056,9 +2115,15 @@ fn qk_norm_rope_impl(
         ],
         WHAT,
     )?;
-    require::<f32>(rt, targets.q_out, q_elems, "attn q_out")?;
-    require::<f32>(rt, targets.k_cache, cache_elems, "attn k_cache")?;
-    require::<f32>(rt, targets.v_cache, cache_elems, "attn v_cache")?;
+    if out == DType::BF16 {
+        require::<u16>(rt, targets.q_out, q_elems, "attn q_out (bf16)")?;
+        require::<u16>(rt, targets.k_cache, cache_elems, "attn k_cache (bf16)")?;
+        require::<u16>(rt, targets.v_cache, cache_elems, "attn v_cache (bf16)")?;
+    } else {
+        require::<f32>(rt, targets.q_out, q_elems, "attn q_out")?;
+        require::<f32>(rt, targets.k_cache, cache_elems, "attn k_cache")?;
+        require::<f32>(rt, targets.v_cache, cache_elems, "attn v_cache")?;
+    }
     if rows == 0 {
         return Ok(());
     }
@@ -2081,9 +2146,10 @@ fn qk_norm_rope_impl(
         ],
     )?;
     let units = usize_product(&[rows as usize, s.q_heads as usize + 2 * s.kv_heads as usize], WHAT)?;
-    let name = match pos {
-        RopePos::Scalar(_) => "qwen35_attn_qk_norm_rope",
-        RopePos::Buffer(_) | RopePos::PerRow(_) => "qwen35_attn_qk_norm_rope_posbuf",
+    let name = match (&pos, out) {
+        (RopePos::Scalar(_), DType::BF16) => "qwen35_attn_qk_norm_rope_bf16",
+        (RopePos::Scalar(_), _) => "qwen35_attn_qk_norm_rope",
+        (RopePos::Buffer(_) | RopePos::PerRow(_), _) => "qwen35_attn_qk_norm_rope_posbuf",
     };
     let p = pipeline_for(rt, name, ROWS_PER_TG * 32, 0)?;
     dispatch_groups(

@@ -1,0 +1,37 @@
+EmbeddingGemma 2 audio tower: interleaved before / after / control (Apple M5 Pro, real checkpoint 914f7f89)
+
+lanes   before  = df5d329's encode_audio (built in its own worktree and target dir), bench_embedgemma2_audio unchanged
+        after   = the lane's head
+        control = a copy of the before binary: its own ratio to before is the noise floor of this run
+run     bench_paired --rounds 12 --out bench/results/embedgemma2_audio_speed_m5pro.json before=... after=... control=...
+        BENCH_ITERS=8 BENCH_WARMUP=2 (min of 8 timed encode_audio calls per process), every lane a fresh process,
+        order reversed on odd rounds. Dispatch queueing on (set_async_encode), so both builds time the pipelined forward.
+
+RESULT: NO SPEEDUP CAN BE CLAIMED FROM THIS RUN. The machine was shared with other build and benchmark jobs the whole
+time (1-minute load average 45 to 220 on this host while this ran; the GPU was at 99-100 % in the profiler). The control,
+which is the same binary as before, differs from it by 0.31x to 2.2x in single rounds, so every after/before range below
+contains the control's range, and the median ratios (0.84x, 0.84x, 0.95x; control 1.08x, 1.03x, 1.04x) are not
+distinguishable from it. The soft-token error the bench checks on every process is the same in both builds (clip 1.0 s
+3.8e-6, clip 3.3 s 2.1e-5 of transformers' largest magnitude, bound 1e-4); the batch has no reference.
+
+Attempts, in order, all on the same two binaries:
+  1. --rounds 8 --evidence --max-spread 1.25: exit 3, the drift gate refused 9 of 9 ratio series (spreads 1.9x to 3.7x),
+     nothing was published. Kept outside the tree.
+  2. this run (no --evidence, so no provenance block, no drift gate; every round and lane is in the JSON under "raw"):
+     the table below.
+  3. a clip-only rerun, BENCH_ITERS=100, 12 rounds (min of 100 per process): median ratios 0.77x and 0.86x, control 0.93x
+     and 0.87x, single-round ranges 0.15x to 2.6x. Also noise. Not committed.
+  Waiting for a quiet host (1-minute load below 12) for 9 minutes did not produce one (load 118 at the end).
+
+What does carry information is inside one run, where load hits all stages alike: the stage profile
+(embedgemma2_audio_profile_m5pro.txt) has the GEMMs, which did not change, as its own control, and there the non-GEMM
+time per ms of GEMM time went from 0.28 / 0.42 / 0.41 to 0.25 / 0.25 / 0.21 (1.0 s clip, 3.3 s clip, 8x30 s batch).
+The repeat that should replace this one is `bench_paired --evidence --rounds 8 --max-spread 1.25` on an idle host
+with the same three lanes and BENCH_ITERS=20.
+
+Raw table (bench_paired output; vs base = median of per-round ratios to before, [lowest, highest round]):
+
+                workload              before ms               after ms       vs base [lo, hi]             control ms       vs base [lo, hi]       vs prev [lo, hi]
+               clip_1.0s                 53.467                 46.086  0.841x [0.235, 0.902]                 57.939  1.082x [0.306, 1.266]  1.270x [0.350, 5.393]
+               clip_3.3s                 63.547                 54.826  0.841x [0.371, 1.098]                 52.899  1.031x [0.309, 1.266]  1.057x [0.346, 2.795]
+             batch_8x30s               1628.087               1486.010  0.945x [0.582, 1.853]               1614.047  1.036x [0.796, 2.196]  1.109x [0.964, 1.570]

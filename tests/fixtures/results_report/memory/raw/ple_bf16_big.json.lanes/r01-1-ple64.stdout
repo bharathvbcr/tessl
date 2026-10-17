@@ -1,0 +1,1 @@
+[{"workload": "32x256", "ms_min": 434.7288}, {"workload": "8x1024", "ms_min": 514.212}, {"workload": "2x4096", "ms_min": 624.3398}]

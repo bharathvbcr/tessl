@@ -54,7 +54,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::{dispatch_1d, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{encoder_attn, EncoderAttnDims};
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35;
@@ -451,9 +451,11 @@ impl BertConfig {
         }
         let uint = |k: &str| -> Result<u32, String> {
             match c.get(k) {
-                Some(Json::Num { uint: Some(n), .. }) => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Some(Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
                 None => Err(format!("config.json: missing {k:?}")),
             }
@@ -884,25 +886,39 @@ impl BertSparseModel {
         let mut pooled = vec![0.0f32; batch.len() * v];
         let mut out_trace = Vec::new();
         let mut forwards = 0u32;
-        let mut start = 0usize;
-        while start < batch.len() {
-            // Grow the forward while it stays inside the row budget.
-            let mut end = start + 1;
-            let mut longest = batch[start].len();
-            while end < batch.len() {
-                let l = longest.max(batch[end].len());
-                if (end + 1 - start) * l > MAX_BATCH_TOKENS {
-                    break;
+        // Queue the dispatches whatever the caller set for the runtime's
+        // `async_encode` ([`GpuRuntime::async_scope`] leaves the flag alone):
+        // a forward then waits only where it reads back (once per head block,
+        // and per layer with `trace`), not once per dispatch. Waited for even
+        // when a forward fails, so no queued command outlives the activations
+        // it binds; the scope ends after that wait.
+        let scope = self.rt.async_scope();
+        let ran = (|| -> Result<(), String> {
+            let mut start = 0usize;
+            while start < batch.len() {
+                // Grow the forward while it stays inside the row budget.
+                let mut end = start + 1;
+                let mut longest = batch[start].len();
+                while end < batch.len() {
+                    let l = longest.max(batch[end].len());
+                    if (end + 1 - start) * l > MAX_BATCH_TOKENS {
+                        break;
+                    }
+                    longest = l;
+                    end += 1;
                 }
-                longest = l;
-                end += 1;
+                let (p, t) = self.forward(&batch[start..end], trace)?;
+                pooled[start * v..end * v].copy_from_slice(&p);
+                out_trace = t;
+                forwards += 1;
+                start = end;
             }
-            let (p, t) = self.forward(&batch[start..end], trace)?;
-            pooled[start * v..end * v].copy_from_slice(&p);
-            out_trace = t;
-            forwards += 1;
-            start = end;
-        }
+            Ok(())
+        })();
+        let waited = self.rt.synchronize();
+        drop(scope);
+        ran?;
+        waited?;
         Ok(SparseOutput {
             pooled,
             trace: out_trace,

@@ -32,7 +32,7 @@ use tessl::gemm::{gemm, GemmBackend};
 use tessl::nn::{self, mlp_gelu_tanh, rms_norm_f32, rms_norm_residual_add_f32, scale_f32_inplace};
 use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, QkvColumns};
-use tessl::tensor::GpuBuffer;
+use tessl::tensor::{DType, GpuBuffer};
 use tessl::GpuRuntime;
 
 const KERNEL_REL: f64 = 2e-5;
@@ -65,6 +65,21 @@ fn buf_f32(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
     b
 }
 
+/// `x` rounded to bf16, round to nearest even, widened back (finite inputs).
+fn bf16_rne(x: f32) -> f32 {
+    let b = x.to_bits();
+    f32::from_bits(b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+}
+
+/// `data` as a bf16 device buffer, each element rounded with [`bf16_rne`].
+fn bf16_buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
+    let b = rt.alloc_buffer(data.len().max(1) * 2).unwrap();
+    let mut bits: Vec<u16> = data.iter().map(|&x| (bf16_rne(x).to_bits() >> 16) as u16).collect();
+    bits.resize(data.len().max(1), 0);
+    b.write_bf16_bits(&bits);
+    b
+}
+
 fn buf_u32(rt: &Arc<GpuRuntime>, data: &[u32]) -> GpuBuffer {
     let b = rt.alloc_buffer(data.len().max(1) * 4).unwrap();
     b.write_u32(data);
@@ -82,6 +97,10 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], idx: &[usize], rel: f64) 
             at = i;
         }
     }
+    eprintln!(
+        "{what}: max abs error {worst:.3e} = {:.2e} of max |ref| {scale:.3e}",
+        worst / scale
+    );
     assert!(
         worst <= rel * scale,
         "{what}: max abs error {worst:.3e} at {at} exceeds {rel:.0e} * {scale:.3e} (got {}, want {})",
@@ -253,6 +272,26 @@ fn pool_reference_matches_transformers() {
 /// Both kernels hold the same contract; every attention test runs on each.
 const KERNELS: [EncoderAttnKernel; 2] = [EncoderAttnKernel::Rows, EncoderAttnKernel::Tiled];
 
+/// The kernels whose outputs are compared with each other bitwise (batch
+/// independence, repeatability), which holds for the bf16-operand kernel too:
+/// it has no f32 reference to share a bound with, but its arithmetic does not
+/// depend on the batch or the run.
+const BITWISE_KERNELS: [EncoderAttnKernel; 3] = [
+    EncoderAttnKernel::Rows,
+    EncoderAttnKernel::Tiled,
+    EncoderAttnKernel::TiledBf16,
+];
+
+/// Whether `kernel` is compiled for head dim `d` (the bf16 kernel is not for 32).
+fn compiled(kernel: EncoderAttnKernel, d: usize) -> bool {
+    kernel != EncoderAttnKernel::TiledBf16 || d != 32
+}
+
+/// The head dims the structural tests (batch-independence, masking, length
+/// clamping) cover: the text encoder's sliding layers (256), the vision
+/// tower's (64) and BERT-small's (32). D=512 has its own cases.
+const HEAD_DIMS: [usize; 3] = [256, 64, 32];
+
 fn run_attn(
     rt: &Arc<GpuRuntime>,
     kernel: EncoderAttnKernel,
@@ -262,7 +301,13 @@ fn run_attn(
     v: &[f32],
     lens: &[u32],
 ) -> Vec<f64> {
-    let (qb, kb, vb) = (buf_f32(rt, q), buf_f32(rt, k), buf_f32(rt, v));
+    // `TiledBf16` reads bf16 operands: the f32 inputs are rounded here, on the
+    // host, with `bf16_rne`.
+    let (qb, kb, vb) = if kernel == EncoderAttnKernel::TiledBf16 {
+        (bf16_buf(rt, q), bf16_buf(rt, k), bf16_buf(rt, v))
+    } else {
+        (buf_f32(rt, q), buf_f32(rt, k), buf_f32(rt, v))
+    };
     let o = rt.alloc_buffer(q.len().max(1) * 4).unwrap();
     // Poison the output so an unwritten element cannot pass as zero.
     o.write_f32(&vec![f32::NAN; q.len()]);
@@ -438,15 +483,337 @@ fn encoder_attn_matches_the_reference_at_the_real_window() {
                 },
                 14,
             );
+            // The vision tower's shape: 12 heads of 64, MHA, every key, up to
+            // 2520 patches, the shorter image padded behind its live rows.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 2,
+                    t: 2520,
+                    h: 12,
+                    hkv: 12,
+                    d: 64,
+                    window: 0,
+                    lens: vec![2520, 2007],
+                },
+                15,
+            );
+            // Head dim 64 with a window (DistilBERT-like) and ragged lengths.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 3,
+                    t: 700,
+                    h: 12,
+                    hkv: 12,
+                    d: 64,
+                    window: 100,
+                    lens: vec![700, 650, 1],
+                },
+                16,
+            );
+            // BERT-small's head dim.
+            check_random(
+                rt,
+                kernel,
+                &Attn {
+                    b: 2,
+                    t: 600,
+                    h: 12,
+                    hkv: 12,
+                    d: 32,
+                    window: 0,
+                    lens: vec![600, 333],
+                },
+                17,
+            );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The bf16-operand kernel: bounds derived from the rounding
+// ---------------------------------------------------------------------------
+//
+// `EncoderAttnKernel::TiledBf16` rounds Q, K and V to bf16 (the q/k-norm-RoPE
+// writer stores them so) and the probability tile P that multiplies V; scores,
+// the online softmax, the accumulator and the output are f32. Fixed before the
+// first run of these tests. Let u = 2^-8 be bf16's unit roundoff (the bound
+// `tests/embedgemma2_tiny.rs` uses); a rounding is a relative error uniform in
+// [-u, u], so independent roundings have variance u^2/3 of the value squared.
+// For one query row with weights w_j = softmax_j(q . k_j) and output
+// o_x = sum_j w_j v_jx, the first-order error of the kernel's output is
+//
+//   (a) V rounding:         sum_j w_j dv_jx           var (u^2/3) sum_j w_j^2 v_jx^2
+//   (b) P rounding: the kernel normalizes by the sum of the rounded weights, so
+//       dw_j = w_j (eta_j - sum_k w_k eta_k):
+//                           sum_j dw_j v_jx           var (u^2/3) sum_j w_j^2 (v_jx - o_x)^2
+//   (c) K rounding: ds_j = sum_i q_i k_ji eps_ji moves the weights by
+//       w_j (ds_j - mean_w ds), so the output by sum_j w_j (v_jx - o_x) ds_j:
+//                                                     var (u^2/3) sum_j w_j^2 (v_jx - o_x)^2 sum_i q_i^2 k_ji^2
+//   (d) Q rounding: the same eps_i for every key, ds_j = sum_i q_i eps_i k_ji:
+//       sum_i q_i eps_i Cov_w(v_x, k_i), and |Cov_w| <= sd_w(v_x) sd_w(k_i)
+//       (Cauchy-Schwarz), so            var <= (u^2/3) sd_w(v_x)^2 sum_i q_i^2 sd_w(k_i)^2.
+//
+// Second-order terms are O(ds^2) ~ 1e-4 of the first-order ones here. The
+// element-wise standard deviation sigma_x is the square root of the four
+// variances' sum (`bf16_model`, in f64 from the exact inputs), and a kernel
+// element must lie within 6 sigma_x of the f64 reference plus the f32
+// kernels' own `KERNEL_REL * max|ref|` (the accumulation and exp error that
+// the bf16 kernel shares): 6 sigma is 2e-9 per element for a Gaussian, and
+// the (d) term is an upper bound, so the bound is conservative by design.
+//
+// A second reference removes (a), (c) and (d): the f64 attention of the
+// bf16-ROUNDED inputs. The kernel then differs from it only by (b) and the
+// f32 term: within 6 sigma_p (b's alone) plus the same f32 term. That is the
+// bound on whether the kernel does the right arithmetic on the bf16 values it
+// reads; the first is whether the whole is as accurate as bf16 operands can be.
+
+/// bf16's unit roundoff.
+const BF16_U: f64 = 1.0 / 256.0;
+/// Standard deviations a kernel element may sit from its reference.
+const BF16_SIGMAS: f64 = 6.0;
+
+/// One probed output element: its f64 reference and the standard deviations
+/// of the bf16 operand rounding's first-order error (module comment above):
+/// all four sources, and P's rounding alone.
+struct Bf16Pred {
+    idx: usize,
+    want: f64,
+    sigma: f64,
+    sigma_p: f64,
+}
+
+fn bf16_model(a: &Attn, q: &[f64], k: &[f64], v: &[f64], rows: Option<&[usize]>) -> Vec<Bf16Pred> {
+    let group = a.h / a.hkv;
+    let all: Vec<usize> = (0..a.t).collect();
+    let rows = rows.unwrap_or(&all);
+    let u2 = BF16_U * BF16_U / 3.0;
+    let mut out = Vec::new();
+    for b in 0..a.b {
+        let len = a.lens[b].min(a.t);
+        for &i in rows {
+            if i >= len {
+                continue;
+            }
+            let lo = if a.window == 0 { 0 } else { i.saturating_sub(a.window) };
+            let hi = if a.window == 0 { len } else { len.min(i + a.window + 1) };
+            for h in 0..a.h {
+                let hk = h / group;
+                let qo = ((b * a.t + i) * a.h + h) * a.d;
+                let kv = |j: usize| ((b * a.t + j) * a.hkv + hk) * a.d;
+                let s: Vec<f64> = (lo..hi)
+                    .map(|j| (0..a.d).map(|x| q[qo + x] * k[kv(j) + x]).sum::<f64>())
+                    .collect();
+                let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let mut w: Vec<f64> = s.iter().map(|s| (s - m).exp()).collect();
+                let z: f64 = w.iter().sum();
+                w.iter_mut().for_each(|w| *w /= z);
+                // g_j = sum_i q_i^2 k_ji^2.
+                let g: Vec<f64> = (lo..hi)
+                    .map(|j| (0..a.d).map(|x| (q[qo + x] * k[kv(j) + x]).powi(2)).sum::<f64>())
+                    .collect();
+                // sum_i q_i^2 sd_w(k_i)^2.
+                let mut qk = 0.0;
+                for x in 0..a.d {
+                    let kbar: f64 = (lo..hi).zip(&w).map(|(j, w)| w * k[kv(j) + x]).sum();
+                    let var: f64 = (lo..hi).zip(&w).map(|(j, w)| w * (k[kv(j) + x] - kbar).powi(2)).sum();
+                    qk += q[qo + x].powi(2) * var;
+                }
+                for x in 0..a.d {
+                    let o: f64 = (lo..hi).zip(&w).map(|(j, w)| w * v[kv(j) + x]).sum();
+                    let (mut ax, mut b1, mut b2, mut vw) = (0.0, 0.0, 0.0, 0.0);
+                    for (n, j) in (lo..hi).enumerate() {
+                        let vj = v[kv(j) + x];
+                        let dv = vj - o;
+                        ax += (w[n] * vj).powi(2);
+                        let t = (w[n] * dv).powi(2);
+                        b1 += t;
+                        b2 += t * g[n];
+                        vw += w[n] * dv * dv;
+                    }
+                    out.push(Bf16Pred {
+                        idx: qo + x,
+                        want: o,
+                        sigma: (u2 * (ax + b1 + b2 + vw * qk)).sqrt(),
+                        sigma_p: (u2 * b1).sqrt(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The bf16 kernel on `a` (random operands, the f32 kernels' distribution) at
+/// `device_lens` (default `a.lens`) against both references, in the bounds
+/// above; `rows` limits the reference to those query rows (all when `None`).
+/// Returns the largest `|error| / (6 sigma)` seen against each reference.
+fn check_bf16(
+    rt: &Arc<GpuRuntime>,
+    a: &Attn,
+    seed: u64,
+    rows: Option<&[usize]>,
+    device_lens: Option<&[u32]>,
+) -> (f64, f64) {
+    let f = |v: Vec<f64>| -> Vec<f64> { v.iter().map(|&x| f64::from(x as f32)).collect() };
+    let q = f(random(a.b * a.t * a.h * a.d, seed, 0.25));
+    let k = f(random(a.b * a.t * a.hkv * a.d, seed + 1, 0.25));
+    let v = f(random(a.b * a.t * a.hkv * a.d, seed + 2, 1.0));
+    let round = |x: &[f64]| -> Vec<f64> { x.iter().map(|&x| f64::from(bf16_rne(x as f32))).collect() };
+    let lens: Vec<u32> = match device_lens {
+        Some(l) => l.to_vec(),
+        None => a.lens.iter().map(|&l| l as u32).collect(),
+    };
+    let got = run_attn(
+        rt,
+        EncoderAttnKernel::TiledBf16,
+        a,
+        &f32s(&q),
+        &f32s(&k),
+        &f32s(&v),
+        &lens,
+    );
+    let what = format!("TiledBf16 D={} window={} lens={:?}", a.d, a.window, a.lens);
+    assert!(got.iter().all(|x| x.is_finite()), "{what}: non-finite output");
+    padding_is_zero(&what, a, &got);
+    let exact = bf16_model(a, &q, &k, &v, rows);
+    let rounded = bf16_model(a, &round(&q), &round(&k), &round(&v), rows);
+    assert_eq!(exact.len(), rounded.len(), "{what}: probes");
+    assert!(!exact.is_empty(), "{what}: no live rows probed");
+    let scale = exact.iter().map(|p| p.want.abs()).fold(0.0, f64::max);
+    let f32_term = KERNEL_REL * scale;
+    let (mut worst_exact, mut worst_round) = (0.0f64, 0.0f64);
+    for (e, r) in exact.iter().zip(&rounded) {
+        let err_e = (got[e.idx] - e.want).abs();
+        let err_r = (got[r.idx] - r.want).abs();
+        let (bound_e, bound_r) = (BF16_SIGMAS * e.sigma + f32_term, BF16_SIGMAS * r.sigma_p + f32_term);
+        assert!(
+            err_e <= bound_e,
+            "{what} element {}: |{} - {}| = {err_e:.3e} exceeds {BF16_SIGMAS} sigma ({:.3e}) + {f32_term:.1e} against the exact inputs",
+            e.idx,
+            got[e.idx],
+            e.want,
+            e.sigma
+        );
+        assert!(
+            err_r <= bound_r,
+            "{what} element {}: |{} - {}| = {err_r:.3e} exceeds {BF16_SIGMAS} sigma_p ({:.3e}) + {f32_term:.1e} against the rounded inputs",
+            r.idx,
+            got[r.idx],
+            r.want,
+            r.sigma_p
+        );
+        worst_exact = worst_exact.max(err_e / bound_e);
+        worst_round = worst_round.max(err_r / bound_r);
+    }
+    let max_err = |p: &[Bf16Pred]| p.iter().map(|p| (got[p.idx] - p.want).abs()).fold(0.0, f64::max);
+    eprintln!(
+        "{what}: max abs error {:.3e} = {:.2e} of max |ref| {scale:.3e} against the exact inputs, {:.3e} against the rounded; \
+         worst error / bound {worst_exact:.3} and {worst_round:.3}",
+        max_err(&exact),
+        max_err(&exact) / scale,
+        max_err(&rounded)
+    );
+    (worst_exact, worst_round)
+}
+
+#[test]
+fn encoder_attn_bf16_matches_the_reference_within_the_derived_bounds() {
+    with_gpu(|rt| {
+        // The text encoder's sliding layers: D=256, window 512, a sequence
+        // longer than the window on both sides, ragged others.
+        let swa = Attn {
+            b: 4,
+            t: 1100,
+            h: 4,
+            hkv: 2,
+            d: 256,
+            window: 512,
+            lens: vec![1100, 513, 1, 600],
+        };
+        check_bf16(rt, &swa, 11, Some(&probe_rows(1100, 512)), None);
+        // Its global layers: D=512, MQA, every key.
+        let global = Attn {
+            b: 2,
+            t: 700,
+            h: 4,
+            hkv: 1,
+            d: 512,
+            window: 0,
+            lens: vec![700, 1],
+        };
+        check_bf16(rt, &global, 12, Some(&probe_rows(700, 0)), None);
+        // The narrowest window.
+        let narrow = Attn {
+            b: 1,
+            t: 70,
+            h: 2,
+            hkv: 1,
+            d: 256,
+            window: 1,
+            lens: vec![70],
+        };
+        check_bf16(rt, &narrow, 14, None, None);
+        // The vision tower: 12 heads of 64, every key, 2520 patches, the
+        // shorter image padded behind its live rows.
+        let vision = Attn {
+            b: 2,
+            t: 2520,
+            h: 12,
+            hkv: 12,
+            d: 64,
+            window: 0,
+            lens: vec![2520, 2007],
+        };
+        check_bf16(rt, &vision, 15, Some(&probe_rows(2520, 0)), None);
+        // D=64 with a window and ragged lengths.
+        let windowed = Attn {
+            b: 3,
+            t: 700,
+            h: 12,
+            hkv: 12,
+            d: 64,
+            window: 100,
+            lens: vec![700, 650, 1],
+        };
+        check_bf16(rt, &windowed, 16, Some(&probe_rows(700, 100)), None);
+        // Masked rows beside live ones in one tile, a length-0 row, and
+        // lengths past the padded length (device values, clamped to T).
+        let ragged = Attn {
+            b: 4,
+            t: 12,
+            h: 2,
+            hkv: 1,
+            d: 256,
+            window: 3,
+            lens: vec![5, 0, 12, 1],
+        };
+        check_bf16(rt, &ragged, 51, None, None);
+        let clamped = Attn {
+            b: 2,
+            t: 40,
+            h: 2,
+            hkv: 1,
+            d: 64,
+            window: 7,
+            lens: vec![40, 0],
+        };
+        check_bf16(rt, &clamped, 41, None, Some(&[u32::MAX, 0]));
     });
 }
 
 #[test]
 fn encoder_attn_row_matches_the_same_sequence_alone_bit_for_bit() {
     with_gpu(|rt| {
-        for kernel in KERNELS {
-            let (h, hkv, d, window) = (4usize, 2usize, 256usize, 512usize);
+        for (kernel, d) in BITWISE_KERNELS
+            .into_iter()
+            .flat_map(|k| HEAD_DIMS.map(move |d| (k, d)))
+            .filter(|&(k, d)| compiled(k, d))
+        {
+            let (h, hkv, window) = (4usize, 2usize, 512usize);
             let (t_long, len) = (900usize, 333usize);
             let q = f32s(&random(t_long * h * d, 21, 0.25));
             let k = f32s(&random(t_long * hkv * d, 22, 0.25));
@@ -491,7 +858,7 @@ fn encoder_attn_row_matches_the_same_sequence_alone_bit_for_bit() {
                 assert_eq!(
                     x.to_bits(),
                     y.to_bits(),
-                    "{kernel:?} element {i}: batched {x} vs alone {y}"
+                    "{kernel:?} D={d} element {i}: batched {x} vs alone {y}"
                 );
             }
         }
@@ -501,7 +868,7 @@ fn encoder_attn_row_matches_the_same_sequence_alone_bit_for_bit() {
 #[test]
 fn encoder_attn_is_bitwise_repeatable() {
     with_gpu(|rt| {
-        for kernel in KERNELS {
+        for kernel in BITWISE_KERNELS {
             let a = Attn {
                 b: 2,
                 t: 300,
@@ -529,13 +896,13 @@ fn encoder_attn_clamps_device_lengths() {
     // The host cannot see a device length: 0 gives an all-zero row, and one
     // past the padded length behaves as the padded length.
     with_gpu(|rt| {
-        for kernel in KERNELS {
+        for (kernel, d) in KERNELS.into_iter().flat_map(|k| HEAD_DIMS.map(move |d| (k, d))) {
             let a = Attn {
                 b: 2,
                 t: 40,
                 h: 2,
                 hkv: 1,
-                d: 256,
+                d,
                 window: 7,
                 lens: vec![40, 0],
             };
@@ -545,7 +912,7 @@ fn encoder_attn_clamps_device_lengths() {
             let got = run_attn(rt, kernel, &a, &f32s(&q), &f32s(&k), &f32s(&v), &[u32::MAX, 0]);
             let want = attn_ref(&Attn { lens: vec![40, 0], ..a }, &q, &k, &v, None);
             let idx: Vec<usize> = (0..got.len()).collect();
-            assert_close(&format!("{kernel:?} clamped"), &got, &want, &idx, KERNEL_REL);
+            assert_close(&format!("{kernel:?} D={d} clamped"), &got, &want, &idx, KERNEL_REL);
         }
     });
 }
@@ -560,14 +927,23 @@ fn encoder_attn_fully_masked_rows_are_zeros_beside_live_rows() {
     // which is the case a fast-math-folded infinity compare would turn into
     // NaN. Length 0 skips the loop entirely and is checked alongside.
     with_gpu(|rt| {
-        for kernel in KERNELS {
-            for (scale, window) in [(0.25, 0usize), (4.0, 0), (0.25, 3), (4.0, 3)] {
+        for (kernel, d) in KERNELS.into_iter().flat_map(|k| HEAD_DIMS.map(move |d| (k, d))) {
+            // The large scale makes scores of order sqrt(D) * scale^2 / 3, so
+            // the running max is far from its seed. At D=256 (sd ~85) a row
+            // is one-hot and the 2e-5 f32 bound holds with room; at D <= 64
+            // two or three keys still compete at |s| ~ 100, where f32
+            // rounding of the score alone (2^-24 * |s| * |v|) is a few 1e-5
+            // of the output: the rows kernel at D=64, scale 4 measured 6.3e-5
+            // against the same f64 reference (conditioning of the problem,
+            // not a masking fault). Those dims run the moderate scale 1.
+            let big = if d == 256 { 4.0 } else { 1.0 };
+            for (scale, window) in [(0.25, 0usize), (big, 0), (0.25, 3), (big, 3)] {
                 let a = Attn {
                     b: 4,
                     t: 12,
                     h: 2,
                     hkv: 1,
-                    d: 256,
+                    d,
                     window,
                     lens: vec![5, 0, 12, 1],
                 };
@@ -576,7 +952,7 @@ fn encoder_attn_fully_masked_rows_are_zeros_beside_live_rows() {
                 let v = random(a.b * a.t * a.hkv * a.d, 53, 1.0);
                 let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
                 let got = run_attn(rt, kernel, &a, &f32s(&q), &f32s(&k), &f32s(&v), &lens);
-                let what = format!("{kernel:?} scale={scale} window={window}");
+                let what = format!("{kernel:?} D={d} scale={scale} window={window}");
                 assert!(got.iter().all(|x| x.is_finite()), "{what}: non-finite output");
                 padding_is_zero(&what, &a, &got);
                 let want = attn_ref(&a, &q, &k, &v, None);
@@ -643,7 +1019,10 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             "K and V of different capacities: accepted"
         );
         encoder_attn(rt, &q, &long_k, &long_v, &o, &lens, ok).expect("K/V of 10 positions for seq 8");
-        // The tiled kernel is compiled for head dims 256 and 512 only.
+        // The f32 tiled kernel is compiled for head dims 32, 64, 256 and 512;
+        // the bf16 one for 64, 256 and 512 only, and it reads bf16 buffers
+        // (two bytes an element), so f32-sized K/V of the same element count
+        // are half as many positions to it.
         let small = EncoderAttnDims { head_dim: 64, ..ok };
         let (q64, k64, v64, o64) = (
             rt.alloc_buffer(4 * 8 * 2 * 64 * 4).unwrap(),
@@ -651,11 +1030,44 @@ fn encoder_attn_refuses_what_it_cannot_run() {
             rt.alloc_buffer(4 * 8 * 64 * 4).unwrap(),
             rt.alloc_buffer(4 * 8 * 2 * 64 * 4).unwrap(),
         );
-        encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, EncoderAttnKernel::Rows)
-            .expect("the rows kernel at head dim 64");
+        for kernel in [
+            EncoderAttnKernel::Rows,
+            EncoderAttnKernel::Tiled,
+            EncoderAttnKernel::TiledBf16,
+        ] {
+            encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, kernel)
+                .unwrap_or_else(|e| panic!("{kernel:?} at head dim 64: {e}"));
+        }
+        let tiny = EncoderAttnDims { head_dim: 32, ..ok };
+        let (q32, k32, v32, o32) = (
+            rt.alloc_buffer(4 * 8 * 2 * 32 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 32 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 32 * 4).unwrap(),
+            rt.alloc_buffer(4 * 8 * 2 * 32 * 4).unwrap(),
+        );
+        for kernel in [EncoderAttnKernel::Rows, EncoderAttnKernel::Tiled] {
+            encoder_attn_with(rt, &q32, &k32, &v32, &o32, &lens, tiny, kernel)
+                .unwrap_or_else(|e| panic!("{kernel:?} at head dim 32: {e}"));
+        }
         assert!(
-            encoder_attn_with(rt, &q64, &k64, &v64, &o64, &lens, small, EncoderAttnKernel::Tiled).is_err(),
-            "the tiled kernel at head dim 64: accepted"
+            encoder_attn_with(rt, &q32, &k32, &v32, &o32, &lens, tiny, EncoderAttnKernel::TiledBf16).is_err(),
+            "the bf16 tiled kernel at head dim 32: accepted"
+        );
+        // bf16 buffers too short for the shape are refused like f32 ones.
+        let short_q = rt.alloc_buffer(4 * 8 * 2 * 64 * 2 - 2).unwrap();
+        assert!(
+            encoder_attn_with(
+                rt,
+                &short_q,
+                &k64,
+                &v64,
+                &o64,
+                &lens,
+                small,
+                EncoderAttnKernel::TiledBf16
+            )
+            .is_err(),
+            "a bf16 q one element short: accepted"
         );
         let short_lens = buf_u32(rt, &[8]);
         assert!(
@@ -665,10 +1077,19 @@ fn encoder_attn_refuses_what_it_cannot_run() {
     });
 }
 
+/// The norm+RoPE+store outputs of one fixture, widened to f32: q, then k and
+/// v from the fixture's first position on.
+struct QkvOut {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
 /// Run the columns norm+RoPE on fixture `name` at its own positions (the
 /// caches hold `pos0 + T` slots, so the kernel writes at the fixture's real
-/// positions) and compare q/k/v with the fixture within `rel`.
-fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
+/// positions), storing as `out` (f32, or bf16 widened back exactly).
+fn run_qkv(rt: &Arc<GpuRuntime>, name: &str, out: DType) -> QkvOut {
+    let elem = if out == DType::BF16 { 2 } else { 4 };
     let (qs, q) = load(&format!("{name}_q_in"));
     let (ks, k) = load(&format!("{name}_k_in"));
     let (_, v) = load(&format!("{name}_v_in"));
@@ -688,9 +1109,9 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
     let pb = buf_f32(rt, &proj);
     let qw = buf_f32(rt, &f32s(&load(&format!("{name}_q_norm_w")).1));
     let kw = buf_f32(rt, &f32s(&load(&format!("{name}_k_norm_w")).1));
-    let qo = rt.alloc_buffer(t * hq * d * 4).unwrap();
-    let ko = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
-    let vo = rt.alloc_buffer(cap * hkv * d * 4).unwrap();
+    let qo = rt.alloc_buffer(t * hq * d * elem).unwrap();
+    let ko = rt.alloc_buffer(cap * hkv * d * elem).unwrap();
+    let vo = rt.alloc_buffer(cap * hkv * d * elem).unwrap();
     qwen35::attn_qk_norm_rope_columns(
         rt,
         &AttnShape {
@@ -716,23 +1137,38 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
             k_cache: &ko,
             v_cache: &vo,
         },
+        out,
         pos0 as u32,
         theta,
         1e-6,
     )
     .unwrap_or_else(|e| panic!("{name}: {e}"));
     rt.synchronize().unwrap();
-    let slots = |b: &GpuBuffer| -> Vec<f64> {
-        b.read_f32()[pos0 * hkv * d..cap * hkv * d]
-            .iter()
-            .map(|&x| f64::from(x))
-            .collect()
+    let widen = |b: &GpuBuffer| -> Vec<f32> {
+        if out == DType::BF16 {
+            b.contents_u16()
+                .iter()
+                .map(|&h| f32::from_bits(u32::from(h) << 16))
+                .collect()
+        } else {
+            b.read_f32()
+        }
     };
-    let got_q: Vec<f64> = qo.read_f32()[..t * hq * d].iter().map(|&x| f64::from(x)).collect();
+    QkvOut {
+        q: widen(&qo)[..t * hq * d].to_vec(),
+        k: widen(&ko)[pos0 * hkv * d..cap * hkv * d].to_vec(),
+        v: widen(&vo)[pos0 * hkv * d..cap * hkv * d].to_vec(),
+    }
+}
+
+/// [`run_qkv`] at f32, held to the fixture's q/k/v within `rel`.
+fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
+    let got = run_qkv(rt, name, DType::F32);
+    let wide = |v: &[f32]| -> Vec<f64> { v.iter().map(|&x| f64::from(x)).collect() };
     for (what, got, want) in [
-        ("q", got_q, load(&format!("{name}_q_out")).1),
-        ("k", slots(&ko), load(&format!("{name}_k_out")).1),
-        ("v", slots(&vo), load(&format!("{name}_v_out")).1),
+        ("q", wide(&got.q), load(&format!("{name}_q_out")).1),
+        ("k", wide(&got.k), load(&format!("{name}_k_out")).1),
+        ("v", wide(&got.v), load(&format!("{name}_v_out")).1),
     ] {
         assert_close(
             &format!("{name} {what}"),
@@ -742,6 +1178,52 @@ fn check_qkv(rt: &Arc<GpuRuntime>, name: &str, rel: f64) {
             rel,
         );
     }
+}
+
+/// A K/V buffer's positions per sequence depend on its element size: the same
+/// bytes hold twice as many bf16 positions as f32 ones. The writer and the
+/// attention both derive the capacity from the buffers, so sizing a bf16 pair
+/// as f32 would put batch row `b` at twice the stride the data was written at.
+#[test]
+fn kv_capacity_follows_the_element_size() {
+    with_gpu(|rt| {
+        let (batch, hkv, d) = (3u32, 2u32, 64u32);
+        let bytes = (batch * hkv * d * 10 * 4) as usize; // ten f32 positions
+        let (k, v) = (rt.alloc_buffer(bytes).unwrap(), rt.alloc_buffer(bytes).unwrap());
+        assert_eq!(nn::attn_kv_capacity(&k, &v, batch, hkv, d).unwrap(), 10);
+        assert_eq!(nn::attn_kv_capacity_bf16(&k, &v, batch, hkv, d).unwrap(), 20);
+        let v_short = rt.alloc_buffer(bytes - 2 * (batch * hkv * d) as usize).unwrap();
+        assert!(
+            nn::attn_kv_capacity_bf16(&k, &v_short, batch, hkv, d).is_err(),
+            "K and V of different bf16 capacities: accepted"
+        );
+    });
+}
+
+/// The bf16 targets are the f32 targets rounded once: the same f32 norm, RoPE
+/// and V norm run, then the store rounds to nearest even (what a separate
+/// cast pass would do), so every bit matches the host's rounding of the f32
+/// output. This is the claim that the writer adds no pass and no second
+/// rounding.
+#[test]
+fn qkv_columns_bf16_output_is_the_rounded_f32_output() {
+    with_gpu(|rt| {
+        for name in ["qkv256", "qkv512"] {
+            let f = run_qkv(rt, name, DType::F32);
+            let b = run_qkv(rt, name, DType::BF16);
+            for (what, got, want) in [("q", &b.q, &f.q), ("k", &b.k, &f.k), ("v", &b.v, &f.v)] {
+                assert_eq!(got.len(), want.len(), "{name} {what}");
+                for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        bf16_rne(*w).to_bits(),
+                        "{name} {what}[{i}]: bf16 {g} vs rounded f32 {}",
+                        bf16_rne(*w)
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[test]
@@ -1030,6 +1512,81 @@ fn config_reads_the_checkpoint() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 7. The fused row passes and the bf16-output attention (G7)
+//
+// Each fused kernel is the composition of the kernels it replaced, and the
+// forward's exact-f32 result must not move a bit, so the bound is equality:
+// every output element is compared by its bit pattern with the unfused kernels
+// run on the same inputs, over widths that are and are not powers of two (1,
+// 33, 1000, 768), rows from 1 up, and a layer scale of exactly 1 (the plain
+// add) and not. Outputs are poisoned with NaN first, so an element a kernel
+// does not write cannot match.
+//
+// This block sits above `config_refuses_what_the_forward_does_not_implement`,
+// not at the end of the file: that test's string literals leave its braces
+// unbalanced, so `tests/hosted_selection.rs` reads it up to the next
+// `#[test]`, and a helper mentioning `GpuRuntime` in between would make the
+// device-free hosted test look like a device one.
+// ---------------------------------------------------------------------------
+
+use tessl::embedgemma2::{
+    encoder_attn_bf16_out, resid_add_bf16_copy, resid_add_norm_bf16, resid_add_norm_f32, scale_rms_norm_inplace,
+};
+use tessl::nn::rms_norm_bf16;
+
+const FUSED_EPS: f32 = 1e-6;
+/// `(rows, dim)`: width 1 and 33 (a ragged simdgroup), 1000 (not a power of
+/// two), the checkpoint's 512 and the 768 of its vision tower, and 2048 and
+/// 4096, where the threadgroup is as wide as the launch allows.
+const FUSED_SHAPES: [(u32, u32); 9] = [
+    (1, 1),
+    (1, 8),
+    (9, 33),
+    (3, 64),
+    (5, 512),
+    (4, 1000),
+    (7, 768),
+    (2, 2048),
+    (3, 4096),
+];
+/// Layer scales: exactly 1 (the plain add) and two that are not.
+const FUSED_LAYER_SCALES: [f32; 3] = [1.0, 0.37, 1.75];
+
+fn rand32(n: usize, seed: u64, scale: f64) -> Vec<f32> {
+    f32s(&random(n, seed, scale))
+}
+
+/// A checkpoint-like norm weight: around 1, not all equal.
+fn norm_weight(dim: usize, seed: u64) -> Vec<f32> {
+    random(dim, seed, 0.8).iter().map(|&x| (1.0 + x) as f32).collect()
+}
+
+fn bits32(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+fn poisoned_f32(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
+    buf_f32(rt, &vec![f32::NAN; n])
+}
+
+/// A bf16 buffer of `n` elements filled with the NaN pattern.
+fn poisoned_bf16(rt: &Arc<GpuRuntime>, n: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(n.max(1) * 2).unwrap();
+    b.write_bf16_bits(&vec![0x7fc0u16; n.max(1)]);
+    b
+}
+
+fn read_bf16_bits(rt: &Arc<GpuRuntime>, b: &GpuBuffer, n: usize) -> Vec<u16> {
+    rt.synchronize().unwrap();
+    b.try_contents_u16().unwrap()[..n].to_vec()
+}
+
+/// `bf16_rne(x)` as the 16 stored bits.
+fn bf16_bits_of(x: f32) -> u16 {
+    (bf16_rne(x).to_bits() >> 16) as u16
+}
+
 #[test]
 fn config_refuses_what_the_forward_does_not_implement() {
     let cases = [
@@ -1061,4 +1618,319 @@ fn config_refuses_what_the_forward_does_not_implement() {
             "{from} -> {to}: accepted"
         );
     }
+}
+
+#[test]
+fn the_fused_row_passes_launch_as_wide_as_the_kernels_they_replace() {
+    // The fused passes reduce a row in the lane order the unfused norms do only
+    // if both launch the same number of lanes per row; the host picks that from
+    // each pipeline's limit (`nn::reduce_tptg`), so the limits must agree.
+    use objc2_metal::MTLComputePipelineState;
+    with_gpu(|rt| {
+        let max = |name: &str| rt.pipeline(name).unwrap().maxTotalThreadsPerThreadgroup().min(1024);
+        for (fused, unfused) in [
+            ("eg2t_resid_norm_f32", "rms_norm_residual_add_f32"),
+            ("eg2t_resid_norm_f32", "rms_norm_f32"),
+            ("eg2t_resid_norm_bf16", "rms_norm_bf16"),
+            ("eg2t_resid_add_bf16_copy", "rms_norm_residual_add_f32"),
+            ("eg2t_scale_rms_norm_f32", "rms_norm_f32"),
+        ] {
+            assert_eq!(max(fused), max(unfused), "{fused} against {unfused}");
+        }
+    });
+}
+
+#[test]
+fn resid_add_norm_f32_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 700 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let w_next = buf_f32(rt, &norm_weight(dim as usize, seed + 3));
+                let (resid_u, out_u) = (buf_f32(rt, &resid0), poisoned_f32(rt, n));
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                rms_norm_f32(rt, &resid_u, &w_next, &out_u, rows, dim, FUSED_EPS).unwrap();
+                let (resid_f, out_f) = (buf_f32(rt, &resid0), poisoned_f32(rt, n));
+                resid_add_norm_f32(rt, &y, &w_post, &resid_f, &w_next, &out_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                assert_eq!(
+                    bits32(&resid_f.read_f32()[..n]),
+                    bits32(&resid_u.read_f32()[..n]),
+                    "residual, {what}"
+                );
+                assert_eq!(
+                    bits32(&out_f.read_f32()[..n]),
+                    bits32(&out_u.read_f32()[..n]),
+                    "normed output, {what}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn resid_add_norm_bf16_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 900 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let w_next = buf_f32(rt, &norm_weight(dim as usize, seed + 3));
+                let (resid_u, out_u) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                rms_norm_bf16(rt, &resid_u, &w_next, &out_u, rows, dim, FUSED_EPS).unwrap();
+                let (resid_f, out_f) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                resid_add_norm_bf16(rt, &y, &w_post, &resid_f, &w_next, &out_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                assert_eq!(
+                    bits32(&resid_f.read_f32()[..n]),
+                    bits32(&resid_u.read_f32()[..n]),
+                    "residual, {what}"
+                );
+                assert_eq!(
+                    read_bf16_bits(rt, &out_f, n),
+                    read_bf16_bits(rt, &out_u, n),
+                    "bf16 normed output, {what}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn resid_add_bf16_copy_is_the_unfused_add_and_cast_bit_for_bit() {
+    with_gpu(|rt| {
+        for (rows, dim) in FUSED_SHAPES {
+            for s in FUSED_LAYER_SCALES {
+                let n = (rows * dim) as usize;
+                let seed = 1100 + u64::from(rows) * 31 + u64::from(dim);
+                let y = buf_f32(rt, &rand32(n, seed, 3.0));
+                let resid0 = rand32(n, seed + 1, 5.0);
+                let w_post = buf_f32(rt, &norm_weight(dim as usize, seed + 2));
+                let resid_u = buf_f32(rt, &resid0);
+                rms_norm_residual_add_f32(rt, &y, &w_post, &resid_u, rows, dim, FUSED_EPS, s).unwrap();
+                let (resid_f, copy_f) = (buf_f32(rt, &resid0), poisoned_bf16(rt, n));
+                resid_add_bf16_copy(rt, &y, &w_post, &resid_f, &copy_f, rows, dim, FUSED_EPS, s).unwrap();
+                rt.synchronize().unwrap();
+                let what = format!("{rows}x{dim} layer_scale {s}");
+                let want = resid_u.read_f32();
+                assert_eq!(bits32(&resid_f.read_f32()[..n]), bits32(&want[..n]), "residual, {what}");
+                // The cast is the GPU's round to nearest even, `bf16_rne` on the host.
+                let want_bits: Vec<u16> = want[..n].iter().map(|&x| bf16_bits_of(x)).collect();
+                assert_eq!(read_bf16_bits(rt, &copy_f, n), want_bits, "bf16 copy, {what}");
+            }
+        }
+    });
+}
+
+#[test]
+fn scale_rms_norm_inplace_is_the_unfused_pair_bit_for_bit() {
+    with_gpu(|rt| {
+        // 512^-0.5 (the checkpoint's: not a power of two, so the scale rounds),
+        // 1, and a scale that makes some rows' squares large.
+        for scale in [512f32.powf(-0.5), 1.0, 3.5] {
+            for (rows, dim) in FUSED_SHAPES {
+                let n = (rows * dim) as usize;
+                let seed = 1300 + u64::from(rows) * 31 + u64::from(dim);
+                let x0 = rand32(n, seed, 4.0);
+                let w = buf_f32(rt, &norm_weight(dim as usize, seed + 1));
+                let xu = buf_f32(rt, &x0);
+                scale_f32_inplace(rt, &xu, scale, rows * dim).unwrap();
+                rms_norm_f32(rt, &xu, &w, &xu, rows, dim, FUSED_EPS).unwrap();
+                let xf = buf_f32(rt, &x0);
+                scale_rms_norm_inplace(rt, &xf, &w, rows, dim, FUSED_EPS, scale).unwrap();
+                rt.synchronize().unwrap();
+                assert_eq!(
+                    bits32(&xf.read_f32()[..n]),
+                    bits32(&xu.read_f32()[..n]),
+                    "{rows}x{dim} scale {scale}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn the_fused_row_passes_refuse_what_they_cannot_run() {
+    with_gpu(|rt| {
+        let (rows, dim) = (4u32, 64u32);
+        let n = (rows * dim) as usize;
+        let (y, resid) = (buf_f32(rt, &rand32(n, 1, 1.0)), buf_f32(rt, &rand32(n, 2, 1.0)));
+        let (w1, w2) = (buf_f32(rt, &norm_weight(64, 3)), buf_f32(rt, &norm_weight(64, 4)));
+        let out = poisoned_f32(rt, n);
+        resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, FUSED_EPS, 1.0).expect("the valid call");
+        rt.synchronize().unwrap();
+        let before = out.read_f32();
+        let short_w = buf_f32(rt, &norm_weight(63, 5));
+        let (bf_out, bf_short) = (poisoned_bf16(rt, n), poisoned_bf16(rt, n - 1));
+        let results = [
+            (
+                "dim 0",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, 0, FUSED_EPS, 1.0),
+            ),
+            (
+                "eps 0",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, 0.0, 1.0),
+            ),
+            (
+                "a NaN layer scale",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, rows, dim, FUSED_EPS, f32::NAN),
+            ),
+            (
+                "out aliasing resid",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &resid, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a weight one element short",
+                resid_add_norm_f32(rt, &y, &short_w, &resid, &w2, &out, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "an f32 out given bf16 storage",
+                resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &bf_out, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a bf16 out one element short",
+                resid_add_norm_bf16(rt, &y, &w1, &resid, &w2, &bf_short, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "a bf16 copy one element short",
+                resid_add_bf16_copy(rt, &y, &w1, &resid, &bf_short, rows, dim, FUSED_EPS, 1.0),
+            ),
+            (
+                "scale_rms_norm with an infinite scale",
+                scale_rms_norm_inplace(rt, &resid, &w1, rows, dim, FUSED_EPS, f32::INFINITY),
+            ),
+            (
+                "scale_rms_norm with the weight aliasing x",
+                scale_rms_norm_inplace(rt, &w1, &w1, 1, dim, FUSED_EPS, 1.0),
+            ),
+        ];
+        for (what, r) in results {
+            assert!(r.is_err(), "{what}: accepted");
+        }
+        // A refused call writes nothing.
+        rt.synchronize().unwrap();
+        assert_eq!(
+            bits32(&out.read_f32()[..n]),
+            bits32(&before[..n]),
+            "a refusal wrote to out"
+        );
+        // Zero rows is a no-op, not an error.
+        resid_add_norm_f32(rt, &y, &w1, &resid, &w2, &out, 0, dim, FUSED_EPS, 1.0).expect("0 rows");
+        scale_rms_norm_inplace(rt, &resid, &w1, 0, dim, FUSED_EPS, 1.0).expect("0 rows");
+    });
+}
+
+/// `bf16o` (bf16 operands, bf16 output) against `TiledBf16` (f32 output) on
+/// the same bf16 operands: the output is the f32 result rounded to nearest
+/// even, every element, padding rows as +0, at the text encoder's head dims
+/// (256, 512) and the vision tower's (64), with a window, ragged lengths and a
+/// length past `seq`.
+#[test]
+fn the_bf16_output_attention_is_the_bf16_kernel_rounded_bit_for_bit() {
+    with_gpu(|rt| {
+        let cases = [
+            // (batch, seq, heads, heads_kv, head_dim, window, lens)
+            (3usize, 37usize, 4usize, 2usize, 256usize, 3usize, vec![37usize, 20, 1]),
+            (2, 70, 4, 1, 512, 0, vec![70, 33]),
+            (2, 40, 6, 2, 64, 5, vec![40, 17]),
+            (1, 129, 4, 2, 256, 0, vec![129]),
+        ];
+        for (ci, (b, t, h, hkv, d, window, lens)) in cases.into_iter().enumerate() {
+            let a = Attn {
+                b,
+                t,
+                h,
+                hkv,
+                d,
+                window,
+                lens,
+            };
+            let q = rand32(b * t * h * d, 40 + ci as u64, 0.25);
+            let k = rand32(b * t * hkv * d, 50 + ci as u64, 0.25);
+            let v = rand32(b * t * hkv * d, 60 + ci as u64, 1.0);
+            let lens: Vec<u32> = a.lens.iter().map(|&l| l as u32).collect();
+            // The f32-output kernel on these operands, as the unfused forward ran it.
+            let f32_out = run_attn(rt, EncoderAttnKernel::TiledBf16, &a, &q, &k, &v, &lens);
+            // The bf16-output kernel on the very same operands.
+            let n = q.len();
+            let o = poisoned_bf16(rt, n);
+            encoder_attn_bf16_out(
+                rt,
+                &bf16_buf(rt, &q),
+                &bf16_buf(rt, &k),
+                &bf16_buf(rt, &v),
+                &o,
+                &buf_u32(rt, &lens),
+                EncoderAttnDims {
+                    batch: b as u32,
+                    seq: t as u32,
+                    heads: h as u32,
+                    heads_kv: hkv as u32,
+                    head_dim: d as u32,
+                    window: window as u32,
+                    scale: 1.0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("D={d}: {e}"));
+            let got = read_bf16_bits(rt, &o, n);
+            let want: Vec<u16> = f32_out.iter().map(|&x| bf16_bits_of(x as f32)).collect();
+            let wrong = got.iter().zip(&want).position(|(g, w)| g != w);
+            assert!(
+                wrong.is_none(),
+                "D={d} window={window}: element {:?} is {:#06x}, the rounded f32-output kernel gives {:#06x}",
+                wrong,
+                wrong.map_or(0, |i| got[i]),
+                wrong.map_or(0, |i| want[i])
+            );
+            // The padding rows are +0 in bf16 too (bits 0).
+            for bi in 0..b {
+                for ti in a.lens[bi].min(t)..t {
+                    let base = (bi * t + ti) * h * d;
+                    assert!(
+                        got[base..base + h * d].iter().all(|&x| x == 0),
+                        "D={d}: padding row b={bi} t={ti} is not +0"
+                    );
+                }
+            }
+        }
+        // Refusals: head dim 32 has no bf16o kernel, and `o` must hold bf16
+        // for every element.
+        let dims = EncoderAttnDims {
+            batch: 1,
+            seq: 8,
+            heads: 2,
+            heads_kv: 1,
+            head_dim: 64,
+            window: 0,
+            scale: 1.0,
+        };
+        let lens = buf_u32(rt, &[8]);
+        let (q, k, v) = (
+            rt.alloc_buffer(8 * 2 * 64 * 2).unwrap(),
+            rt.alloc_buffer(8 * 64 * 2).unwrap(),
+            rt.alloc_buffer(8 * 64 * 2).unwrap(),
+        );
+        let o = rt.alloc_buffer(8 * 2 * 64 * 2).unwrap();
+        encoder_attn_bf16_out(rt, &q, &k, &v, &o, &lens, dims).expect("the valid call");
+        let short = rt.alloc_buffer(8 * 2 * 64 * 2 - 2).unwrap();
+        assert!(
+            encoder_attn_bf16_out(rt, &q, &k, &v, &short, &lens, dims).is_err(),
+            "a bf16 o one element short: accepted"
+        );
+        let d32 = EncoderAttnDims { head_dim: 32, ..dims };
+        assert!(
+            encoder_attn_bf16_out(rt, &q, &k, &v, &o, &lens, d32).is_err(),
+            "the bf16 output kernel at head dim 32: accepted"
+        );
+    });
 }

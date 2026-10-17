@@ -1,0 +1,1070 @@
+{
+  "rounds": 6,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "before_async",
+      "argv": [
+        "/Users/bharath/Code/research/tessl-eg2/target/before/target/release/bench_embedgemma2"
+      ],
+      "env": {
+        "BENCH_ASYNC": "1",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "control",
+      "argv": [
+        "/Users/bharath/Code/research/tessl-eg2/target/bench_eg2_control"
+      ],
+      "env": {
+        "BENCH_ASYNC": "1",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "after_f32",
+      "argv": [
+        "/Users/bharath/Code/research/tessl-eg2/target/release/bench_embedgemma2"
+      ],
+      "env": {
+        "BENCH_PRECISION": "f32",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "after_bf16",
+      "argv": [
+        "/Users/bharath/Code/research/tessl-eg2/target/release/bench_embedgemma2"
+      ],
+      "env": {
+        "BENCH_PRECISION": "bf16",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    }
+  ],
+  "env": {
+    "BENCH_ITERS": "10",
+    "BENCH_WARMUP": "3"
+  },
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "1x16",
+      "before_async": {
+        "ms_min_median": 7.3713,
+        "ms_min_min": 7.2605,
+        "ms_min_max": 7.4411,
+        "ms_min_all": [
+          7.4411,
+          7.3033,
+          7.3732,
+          7.2605,
+          7.3717,
+          7.3709
+        ],
+        "device_peak_mib_max": 4.2,
+        "peak_footprint_mib_max": 873.7,
+        "forwards_max": 1
+      },
+      "control": {
+        "ms_min_median": 7.2924,
+        "ms_min_min": 7.085,
+        "ms_min_max": 7.724,
+        "ms_min_all": [
+          7.724,
+          7.4049,
+          7.085,
+          7.2966,
+          7.2147,
+          7.2882
+        ],
+        "device_peak_mib_max": 4.2,
+        "peak_footprint_mib_max": 874.4,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9968761562952433,
+          "lo": 0.9609124938968155,
+          "hi": 1.0380185725228797
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 4.441649999999999,
+        "ms_min_min": 4.2745,
+        "ms_min_max": 4.6314,
+        "ms_min_all": [
+          4.443,
+          4.6314,
+          4.2745,
+          4.4694,
+          4.4403,
+          4.4223
+        ],
+        "device_peak_mib_max": 2,
+        "peak_footprint_mib_max": 871.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.601155769629232,
+          "lo": 0.5797347149134704,
+          "hi": 0.6341516848547917
+        },
+        "vs_prev": {
+          "median": 0.6096535998148439,
+          "lo": 0.5752200932159502,
+          "hi": 0.6254507150670503
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 3.9032999999999998,
+        "ms_min_min": 3.7584,
+        "ms_min_max": 4.179,
+        "ms_min_all": [
+          3.8354,
+          4.179,
+          3.9344,
+          3.9223,
+          3.8843,
+          3.7584
+        ],
+        "device_peak_mib_max": 2,
+        "peak_footprint_mib_max": 605.2,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.5302643615242062,
+          "lo": 0.509897027500034,
+          "hi": 0.5722070844686649
+        },
+        "vs_prev": {
+          "median": 0.8761865342270975,
+          "lo": 0.849874499694729,
+          "hi": 0.9204351386127033
+        }
+      }
+    },
+    {
+      "workload": "64x32",
+      "before_async": {
+        "ms_min_median": 102.17394999999999,
+        "ms_min_min": 101.9693,
+        "ms_min_max": 102.2996,
+        "ms_min_all": [
+          102.2222,
+          102.2996,
+          102.07,
+          101.9693,
+          102.1257,
+          102.2554
+        ],
+        "device_peak_mib_max": 436.2,
+        "peak_footprint_mib_max": 1306,
+        "forwards_max": 1
+      },
+      "control": {
+        "ms_min_median": 102.0832,
+        "ms_min_min": 101.9585,
+        "ms_min_max": 102.9221,
+        "ms_min_all": [
+          102.9221,
+          101.9626,
+          101.9585,
+          102.1576,
+          102.0322,
+          102.1342
+        ],
+        "device_peak_mib_max": 436.2,
+        "peak_footprint_mib_max": 1307,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9989960370113105,
+          "lo": 0.9967057544702032,
+          "hi": 1.0068468493145324
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 101.733,
+        "ms_min_min": 101.6056,
+        "ms_min_max": 102.0679,
+        "ms_min_all": [
+          101.6965,
+          101.6056,
+          101.7695,
+          101.613,
+          101.7748,
+          102.0679
+        ],
+        "device_peak_mib_max": 114.2,
+        "peak_footprint_mib_max": 984.2,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9965349246509458,
+          "lo": 0.9932160047546618,
+          "hi": 0.9981663560066265
+        },
+        "vs_prev": {
+          "median": 0.9969879915881812,
+          "lo": 0.9880919646995154,
+          "hi": 0.999350854072387
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 37.05755,
+        "ms_min_min": 36.8238,
+        "ms_min_max": 38.4456,
+        "ms_min_all": [
+          37.4611,
+          38.4456,
+          36.9875,
+          36.8238,
+          37.0334,
+          37.0817
+        ],
+        "device_peak_mib_max": 112.2,
+        "peak_footprint_mib_max": 715.9,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.36263186369085576,
+          "lo": 0.3611263390059557,
+          "hi": 0.37581378617316197
+        },
+        "vs_prev": {
+          "median": 0.3636598954380783,
+          "lo": 0.36239260724513594,
+          "hi": 0.37838071917295896
+        }
+      }
+    },
+    {
+      "workload": "32x256",
+      "before_async": {
+        "ms_min_median": 430.74505,
+        "ms_min_min": 429.9744,
+        "ms_min_max": 434.8411,
+        "ms_min_all": [
+          434.8411,
+          431.1981,
+          430.7403,
+          429.9744,
+          430.2744,
+          430.7498
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2522.3,
+        "forwards_max": 1
+      },
+      "control": {
+        "ms_min_median": 431.76215,
+        "ms_min_min": 429.9403,
+        "ms_min_max": 439.6925,
+        "ms_min_all": [
+          439.6925,
+          431.4415,
+          429.9403,
+          430.5597,
+          432.0828,
+          432.2947
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2523.2,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.0024738903053088,
+          "lo": 0.998142732407439,
+          "hi": 1.0111567190865813
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 431.5155,
+        "ms_min_min": 429.0632,
+        "ms_min_max": 432.6845,
+        "ms_min_all": [
+          432.6845,
+          431.4996,
+          429.0632,
+          431.0275,
+          431.5314,
+          432.2076
+        ],
+        "device_peak_mib_max": 466.3,
+        "peak_footprint_mib_max": 1336.4,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.001574215082472,
+          "lo": 0.9950404872032567,
+          "hi": 1.0033843312289408
+        },
+        "vs_prev": {
+          "median": 0.999261186390932,
+          "lo": 0.9840615884965062,
+          "hi": 1.0010864927674372
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 156.27655,
+        "ms_min_min": 154.7627,
+        "ms_min_max": 168.6011,
+        "ms_min_all": [
+          156.5337,
+          168.6011,
+          154.7627,
+          157.3705,
+          156.0194,
+          155.3566
+        ],
+        "device_peak_mib_max": 424.4,
+        "peak_footprint_mib_max": 1028.2,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.36163497016376267,
+          "lo": 0.359294684059049,
+          "hi": 0.39100612920140415
+        },
+        "vs_prev": {
+          "median": 0.3616607496073687,
+          "lo": 0.35944902403382073,
+          "hi": 0.3907329230432659
+        }
+      }
+    },
+    {
+      "workload": "8x1024",
+      "before_async": {
+        "ms_min_median": 520.0235,
+        "ms_min_min": 517.5943,
+        "ms_min_max": 530.8908,
+        "ms_min_all": [
+          530.8908,
+          518.8527,
+          517.7725,
+          527.2794,
+          517.5943,
+          521.1943
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2522.4,
+        "forwards_max": 1
+      },
+      "control": {
+        "ms_min_median": 522.4295500000001,
+        "ms_min_min": 517.5563,
+        "ms_min_max": 531.6523,
+        "ms_min_all": [
+          531.6523,
+          519.044,
+          517.5563,
+          524.9868,
+          530.7777,
+          519.8723
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2523.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9999755700933537,
+          "lo": 0.9956520205416711,
+          "hi": 1.0254705277859513
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 527.0545500000001,
+        "ms_min_min": 516.2427,
+        "ms_min_max": 532.9126,
+        "ms_min_all": [
+          527.0329,
+          522.0556,
+          516.2427,
+          532.9126,
+          530.4885,
+          527.0762
+        ],
+        "device_peak_mib_max": 466.3,
+        "peak_footprint_mib_max": 1336.6,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.0084282814585561,
+          "lo": 0.9927331571765795,
+          "hi": 1.0249117890208608
+        },
+        "vs_prev": {
+          "median": 1.0026286723611135,
+          "lo": 0.991311238567011,
+          "hi": 1.0150971414900336
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 184.92835000000002,
+        "ms_min_min": 177.382,
+        "ms_min_max": 195.5999,
+        "ms_min_all": [
+          177.382,
+          195.5999,
+          186.269,
+          186.768,
+          179.8692,
+          183.5877
+        ],
+        "device_peak_mib_max": 424.4,
+        "peak_footprint_mib_max": 1028.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.35322747440963764,
+          "lo": 0.3341214426771005,
+          "hi": 0.3769854141647523
+        },
+        "vs_prev": {
+          "median": 0.3493899340074039,
+          "lo": 0.3365672237919113,
+          "hi": 0.37467254445695053
+        }
+      }
+    },
+    {
+      "workload": "2x4096",
+      "before_async": {
+        "ms_min_median": 670.6856,
+        "ms_min_min": 660.863,
+        "ms_min_max": 680.5983,
+        "ms_min_all": [
+          679.4775,
+          662.0788,
+          660.863,
+          680.5983,
+          665.0279,
+          676.3433
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2522.5,
+        "forwards_max": 1
+      },
+      "control": {
+        "ms_min_median": 668.4820500000001,
+        "ms_min_min": 659.3145,
+        "ms_min_max": 686.5259,
+        "ms_min_all": [
+          686.5259,
+          661.1477,
+          659.3145,
+          673.0906,
+          663.8735,
+          674.3387
+        ],
+        "device_peak_mib_max": 1652.4,
+        "peak_footprint_mib_max": 2523.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9979604923505763,
+          "lo": 0.9889689703897292,
+          "hi": 1.0103732647512242
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 673.8388,
+        "ms_min_min": 666.1147,
+        "ms_min_max": 683.828,
+        "ms_min_all": [
+          666.1569,
+          666.1147,
+          673.8261,
+          683.828,
+          678.1687,
+          673.8515
+        ],
+        "device_peak_mib_max": 466.3,
+        "peak_footprint_mib_max": 1336.6,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.005420591830398,
+          "lo": 0.9803958188460986,
+          "hi": 1.0197597724847332
+        },
+        "vs_prev": {
+          "median": 1.0117325389380638,
+          "lo": 0.9703303254837145,
+          "hi": 1.0220101332520368
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 228.8666,
+        "ms_min_min": 222.1452,
+        "ms_min_max": 230.4788,
+        "ms_min_all": [
+          222.1452,
+          228.3789,
+          228.8378,
+          230.4788,
+          228.9555,
+          228.8954
+        ],
+        "device_peak_mib_max": 424.4,
+        "peak_footprint_mib_max": 1028.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.3414604989178948,
+          "lo": 0.3269353289844035,
+          "hi": 0.346271163614849
+        },
+        "vs_prev": {
+          "median": 0.33860902793785025,
+          "lo": 0.3334727899688497,
+          "hi": 0.3428522144909878
+        }
+      }
+    },
+    {
+      "workload": "128x8-512",
+      "before_async": {
+        "ms_min_median": 1814.4549,
+        "ms_min_min": 1801.8286,
+        "ms_min_max": 1827.9628,
+        "ms_min_all": [
+          1820.4548,
+          1804.1843,
+          1801.8286,
+          1812.1958,
+          1827.9628,
+          1816.714
+        ],
+        "device_peak_mib_max": 2478.5,
+        "peak_footprint_mib_max": 3354.2,
+        "forwards_max": 16
+      },
+      "control": {
+        "ms_min_median": 1809.54235,
+        "ms_min_min": 1802.4585,
+        "ms_min_max": 1837.6943,
+        "ms_min_all": [
+          1837.6943,
+          1804.2871,
+          1802.4585,
+          1815.3442,
+          1810.6697,
+          1808.415
+        ],
+        "device_peak_mib_max": 2478.5,
+        "peak_footprint_mib_max": 3354.8,
+        "forwards_max": 16,
+        "vs_base": {
+          "median": 1.000203283979224,
+          "lo": 0.9905396871314887,
+          "hi": 1.0094698863163205
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 1803.6097,
+        "ms_min_min": 1795.6717,
+        "ms_min_max": 1823.2975,
+        "ms_min_all": [
+          1799.4801,
+          1802.1769,
+          1805.0425,
+          1823.2975,
+          1795.6717,
+          1808.0143
+        ],
+        "device_peak_mib_max": 650.6,
+        "peak_footprint_mib_max": 1533.6,
+        "forwards_max": 16,
+        "vs_base": {
+          "median": 0.9970493316525079,
+          "lo": 0.9823349249776856,
+          "hi": 1.0061261040335707
+        },
+        "vs_prev": {
+          "median": 0.9993044384789043,
+          "lo": 0.9792053553194348,
+          "hi": 1.0043811526210842
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 656.62405,
+        "ms_min_min": 644.9694,
+        "ms_min_max": 675.3893,
+        "ms_min_all": [
+          675.3893,
+          644.9694,
+          658.4362,
+          658.2995,
+          654.9486,
+          652.6966
+        ],
+        "device_peak_mib_max": 605,
+        "peak_footprint_mib_max": 1214,
+        "forwards_max": 16,
+        "vs_base": {
+          "median": 0.361266931519691,
+          "lo": 0.35748531898875296,
+          "hi": 0.37100031266911987
+        },
+        "vs_prev": {
+          "median": 0.36289312688900677,
+          "lo": 0.3578835129892077,
+          "hi": 0.37532468405735636
+        }
+      }
+    },
+    {
+      "workload": "1x4096+63x32",
+      "before_async": {
+        "ms_min_median": 438.80345,
+        "ms_min_min": 434.3252,
+        "ms_min_max": 454.8719,
+        "ms_min_all": [
+          454.8719,
+          436.7982,
+          434.3252,
+          437.9462,
+          442.3535,
+          439.6607
+        ],
+        "device_peak_mib_max": 2638.5,
+        "peak_footprint_mib_max": 3706.8,
+        "forwards_max": 2
+      },
+      "control": {
+        "ms_min_median": 437.18275,
+        "ms_min_min": 434.0113,
+        "ms_min_max": 449.7853,
+        "ms_min_all": [
+          449.7853,
+          435.4493,
+          434.0113,
+          440.8568,
+          438.9162,
+          434.7993
+        ],
+        "device_peak_mib_max": 2638.5,
+        "peak_footprint_mib_max": 3707.2,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.9945706820218039,
+          "lo": 0.9888175110399214,
+          "hi": 1.006646021817292
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 431.2314,
+        "ms_min_min": 429.1725,
+        "ms_min_max": 439.3671,
+        "ms_min_all": [
+          429.8028,
+          429.7424,
+          439.3671,
+          438.3874,
+          429.1725,
+          432.66
+        ],
+        "device_peak_mib_max": 746.6,
+        "peak_footprint_mib_max": 1623.1,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.9839617922815329,
+          "lo": 0.9448875606516912,
+          "hi": 1.0116085826933368
+        },
+        "vs_prev": {
+          "median": 0.9906464304605416,
+          "lo": 0.9555732479474095,
+          "hi": 1.012340231694428
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 150.79265,
+        "ms_min_min": 147.1139,
+        "ms_min_max": 157.9266,
+        "ms_min_all": [
+          157.9266,
+          147.1139,
+          151.2503,
+          151.6628,
+          150.3324,
+          150.335
+        ],
+        "device_peak_mib_max": 605,
+        "peak_footprint_mib_max": 1214,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.34411938490392113,
+          "lo": 0.3368006095263213,
+          "hi": 0.348242054571091
+        },
+        "vs_prev": {
+          "median": 0.3467114720219801,
+          "lo": 0.3423304286474875,
+          "hi": 0.36743967233345154
+        }
+      }
+    },
+    {
+      "workload": "1x6147+1x1658+6x10-42",
+      "before_async": {
+        "ms_min_median": 706.77295,
+        "ms_min_min": 698.8657,
+        "ms_min_max": 718.9626,
+        "ms_min_all": [
+          718.9626,
+          701.2949,
+          698.8657,
+          707.24,
+          716.564,
+          706.3059
+        ],
+        "device_peak_mib_max": 3120.3,
+        "peak_footprint_mib_max": 3996.7,
+        "forwards_max": 3
+      },
+      "control": {
+        "ms_min_median": 703.4346499999999,
+        "ms_min_min": 699.0495,
+        "ms_min_max": 714.7598,
+        "ms_min_all": [
+          708.655,
+          699.6856,
+          699.0495,
+          705.0693,
+          714.7598,
+          701.8
+        ],
+        "device_peak_mib_max": 3120.3,
+        "peak_footprint_mib_max": 3997.2,
+        "forwards_max": 3,
+        "vs_base": {
+          "median": 0.9972064478993805,
+          "lo": 0.985663231995656,
+          "hi": 1.0002629975973925
+        }
+      },
+      "after_f32": {
+        "ms_min_median": 695.8933,
+        "ms_min_min": 693.657,
+        "ms_min_max": 709.8815,
+        "ms_min_all": [
+          693.657,
+          693.8096,
+          709.8815,
+          707.2192,
+          694.5661,
+          697.2205
+        ],
+        "device_peak_mib_max": 1034.9,
+        "peak_footprint_mib_max": 1911.5,
+        "forwards_max": 3,
+        "vs_base": {
+          "median": 0.9882315968797002,
+          "lo": 0.9648026197746588,
+          "hi": 1.015762398984526
+        },
+        "vs_prev": {
+          "median": 0.9925382895033643,
+          "lo": 0.9717475717017101,
+          "hi": 1.0154953261535842
+        }
+      },
+      "after_bf16": {
+        "ms_min_median": 236.412,
+        "ms_min_min": 229.2909,
+        "ms_min_max": 243.2692,
+        "ms_min_all": [
+          243.2692,
+          229.2909,
+          237.077,
+          238.2962,
+          235.5865,
+          235.747
+        ],
+        "device_peak_mib_max": 887.2,
+        "peak_footprint_mib_max": 1496.4,
+        "forwards_max": 3,
+        "vs_base": {
+          "median": 0.33535644116178887,
+          "lo": 0.326953611098555,
+          "hi": 0.3392311283841803
+        },
+        "vs_prev": {
+          "median": 0.3375360854621511,
+          "lo": 0.3304810138112819,
+          "hi": 0.3507053197762006
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.4411,"ms_median":7.4653,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.2},{"workload":"64x32","backend":"tessl-f32","ms_min":102.2222,"ms_median":102.7612,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.5},{"workload":"32x256","backend":"tessl-f32","ms_min":434.8411,"ms_median":436.5613,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.0},{"workload":"8x1024","backend":"tessl-f32","ms_min":530.8908,"ms_median":542.4441,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.2},{"workload":"2x4096","backend":"tessl-f32","ms_min":679.4775,"ms_median":683.8418,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.3},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1820.4548,"ms_median":1839.2095,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.9},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":454.8719,"ms_median":458.4244,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.6},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":718.9626,"ms_median":722.8422,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.6}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.7240,"ms_median":7.8161,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.3},{"workload":"64x32","backend":"tessl-f32","ms_min":102.9221,"ms_median":103.1601,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.6},{"workload":"32x256","backend":"tessl-f32","ms_min":439.6925,"ms_median":445.7981,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.1},{"workload":"8x1024","backend":"tessl-f32","ms_min":531.6523,"ms_median":533.2622,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.2},{"workload":"2x4096","backend":"tessl-f32","ms_min":686.5259,"ms_median":689.9582,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.3},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1837.6943,"ms_median":1853.0160,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.8},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":449.7853,"ms_median":450.8208,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.4},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":708.6550,"ms_median":711.6951,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.3}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.4430,"ms_median":4.6412,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.2},{"workload":"64x32","backend":"tessl-f32","ms_min":101.6965,"ms_median":101.9825,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":983.5},{"workload":"32x256","backend":"tessl-f32","ms_min":432.6845,"ms_median":434.6481,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.8},{"workload":"8x1024","backend":"tessl-f32","ms_min":527.0329,"ms_median":528.5145,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.8},{"workload":"2x4096","backend":"tessl-f32","ms_min":666.1569,"ms_median":670.4732,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.9},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1799.4801,"ms_median":1801.1673,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1529.2},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":429.8028,"ms_median":431.0645,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1622.0},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":693.6570,"ms_median":694.9480,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1910.4}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.8354,"ms_median":4.0409,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":603.9},{"workload":"64x32","backend":"tessl-bf16","ms_min":37.4611,"ms_median":37.6276,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":714.3},{"workload":"32x256","backend":"tessl-bf16","ms_min":156.5337,"ms_median":158.0846,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1026.6},{"workload":"8x1024","backend":"tessl-bf16","ms_min":177.3820,"ms_median":181.2813,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1026.7},{"workload":"2x4096","backend":"tessl-bf16","ms_min":222.1452,"ms_median":226.7045,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1026.9},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":675.3893,"ms_median":682.2376,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.4},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":157.9266,"ms_median":159.2525,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.5},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":243.2692,"ms_median":244.8031,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1495.9}]
+    },
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.3033,"ms_median":7.4611,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.0},{"workload":"64x32","backend":"tessl-f32","ms_min":102.2996,"ms_median":102.5808,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.1},{"workload":"32x256","backend":"tessl-f32","ms_min":431.1981,"ms_median":431.8491,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.5},{"workload":"8x1024","backend":"tessl-f32","ms_min":518.8527,"ms_median":520.3025,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.6},{"workload":"2x4096","backend":"tessl-f32","ms_min":662.0788,"ms_median":666.5789,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.7},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1804.1843,"ms_median":1806.8063,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.3},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":436.7982,"ms_median":437.4755,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3705.5},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":701.2949,"ms_median":703.4396,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3995.4}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.4049,"ms_median":7.4634,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.0},{"workload":"64x32","backend":"tessl-f32","ms_min":101.9626,"ms_median":102.1189,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.2},{"workload":"32x256","backend":"tessl-f32","ms_min":431.4415,"ms_median":432.3801,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.6},{"workload":"8x1024","backend":"tessl-f32","ms_min":519.0440,"ms_median":519.5889,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.7},{"workload":"2x4096","backend":"tessl-f32","ms_min":661.1477,"ms_median":661.6732,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.8},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1804.2871,"ms_median":1805.7444,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.2},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":435.4493,"ms_median":436.2235,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3705.4},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":699.6856,"ms_median":702.7081,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3995.3}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.6314,"ms_median":4.6896,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.0},{"workload":"64x32","backend":"tessl-f32","ms_min":101.6056,"ms_median":101.8814,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":983.3},{"workload":"32x256","backend":"tessl-f32","ms_min":431.4996,"ms_median":432.9820,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.7},{"workload":"8x1024","backend":"tessl-f32","ms_min":522.0556,"ms_median":523.1894,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.7},{"workload":"2x4096","backend":"tessl-f32","ms_min":666.1147,"ms_median":667.3156,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.8},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1802.1769,"ms_median":1810.6496,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1533.6},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":429.7424,"ms_median":430.3091,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1622.3},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":693.8096,"ms_median":694.5723,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1910.8}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":4.1790,"ms_median":4.2826,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.0},{"workload":"64x32","backend":"tessl-bf16","ms_min":38.4456,"ms_median":38.9897,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":715.2},{"workload":"32x256","backend":"tessl-bf16","ms_min":168.6011,"ms_median":171.9437,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.6},{"workload":"8x1024","backend":"tessl-bf16","ms_min":195.5999,"ms_median":197.2777,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.7},{"workload":"2x4096","backend":"tessl-bf16","ms_min":228.3789,"ms_median":232.1201,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.7},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":644.9694,"ms_median":662.6513,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.6},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":147.1139,"ms_median":147.8030,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.6},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":229.2909,"ms_median":231.2627,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1495.9}]
+    },
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.3732,"ms_median":7.5790,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.1},{"workload":"64x32","backend":"tessl-f32","ms_min":102.0700,"ms_median":102.3508,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.2},{"workload":"32x256","backend":"tessl-f32","ms_min":430.7403,"ms_median":431.3077,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":517.7725,"ms_median":519.5077,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.5},{"workload":"2x4096","backend":"tessl-f32","ms_min":660.8630,"ms_median":664.1707,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.6},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1801.8286,"ms_median":1803.9842,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.0},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":434.3252,"ms_median":435.3330,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3705.2},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":698.8657,"ms_median":700.1852,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3995.2}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.0850,"ms_median":7.1582,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.1},{"workload":"64x32","backend":"tessl-f32","ms_min":101.9585,"ms_median":102.0995,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.2},{"workload":"32x256","backend":"tessl-f32","ms_min":429.9403,"ms_median":430.3244,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":517.5563,"ms_median":518.6035,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.6},{"workload":"2x4096","backend":"tessl-f32","ms_min":659.3145,"ms_median":660.5900,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2521.7},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1802.4585,"ms_median":1804.5101,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.1},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":434.0113,"ms_median":435.3565,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3705.3},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":699.0495,"ms_median":699.9947,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3995.5}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.2745,"ms_median":4.3412,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":870.8},{"workload":"64x32","backend":"tessl-f32","ms_min":101.7695,"ms_median":102.0678,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":983.2},{"workload":"32x256","backend":"tessl-f32","ms_min":429.0632,"ms_median":429.8469,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":516.2427,"ms_median":518.1039,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.6},{"workload":"2x4096","backend":"tessl-f32","ms_min":673.8261,"ms_median":676.7196,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1335.7},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1805.0425,"ms_median":1822.3543,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1526.4},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":439.3671,"ms_median":439.6079,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1622.5},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":709.8815,"ms_median":713.4255,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1911.1}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.9344,"ms_median":4.0455,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.2},{"workload":"64x32","backend":"tessl-bf16","ms_min":36.9875,"ms_median":37.4054,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":714.8},{"workload":"32x256","backend":"tessl-bf16","ms_min":154.7627,"ms_median":156.8339,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.3},{"workload":"8x1024","backend":"tessl-bf16","ms_min":186.2690,"ms_median":188.5305,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.4},{"workload":"2x4096","backend":"tessl-bf16","ms_min":228.8378,"ms_median":230.4221,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.5},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":658.4362,"ms_median":662.1471,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.8},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":151.2503,"ms_median":151.7117,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.8},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":237.0770,"ms_median":238.4328,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1496.1}]
+    },
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.2605,"ms_median":7.4622,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.7},{"workload":"64x32","backend":"tessl-f32","ms_min":101.9693,"ms_median":102.3341,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1306.0},{"workload":"32x256","backend":"tessl-f32","ms_min":429.9744,"ms_median":431.4434,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.3},{"workload":"8x1024","backend":"tessl-f32","ms_min":527.2794,"ms_median":533.4655,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.4},{"workload":"2x4096","backend":"tessl-f32","ms_min":680.5983,"ms_median":684.2636,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.5},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1812.1958,"ms_median":1817.4731,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3354.2},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":437.9462,"ms_median":439.3569,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.6},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":707.2400,"ms_median":714.9874,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.5}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.2966,"ms_median":7.3589,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":874.4},{"workload":"64x32","backend":"tessl-f32","ms_min":102.1576,"ms_median":102.2929,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1307.0},{"workload":"32x256","backend":"tessl-f32","ms_min":430.5597,"ms_median":432.4562,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2523.2},{"workload":"8x1024","backend":"tessl-f32","ms_min":524.9868,"ms_median":532.0816,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2523.3},{"workload":"2x4096","backend":"tessl-f32","ms_min":673.0906,"ms_median":679.7128,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2523.3},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1815.3442,"ms_median":1829.9905,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3354.8},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":440.8568,"ms_median":444.7369,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3707.2},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":705.0693,"ms_median":710.3275,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3997.2}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.4694,"ms_median":4.5893,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.1},{"workload":"64x32","backend":"tessl-f32","ms_min":101.6130,"ms_median":101.7537,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":983.9},{"workload":"32x256","backend":"tessl-f32","ms_min":431.0275,"ms_median":433.8661,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.2},{"workload":"8x1024","backend":"tessl-f32","ms_min":532.9126,"ms_median":535.3851,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.3},{"workload":"2x4096","backend":"tessl-f32","ms_min":683.8280,"ms_median":685.8994,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.4},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1823.2975,"ms_median":1830.1640,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1530.8},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":438.3874,"ms_median":439.9482,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1622.8},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":707.2192,"ms_median":713.4480,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1911.2}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.9223,"ms_median":4.0103,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":605.2},{"workload":"64x32","backend":"tessl-bf16","ms_min":36.8238,"ms_median":37.2145,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":715.9},{"workload":"32x256","backend":"tessl-bf16","ms_min":157.3705,"ms_median":159.0252,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1028.2},{"workload":"8x1024","backend":"tessl-bf16","ms_min":186.7680,"ms_median":187.9509,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1028.3},{"workload":"2x4096","backend":"tessl-bf16","ms_min":230.4788,"ms_median":230.8923,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1028.3},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":658.2995,"ms_median":662.3278,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1214.0},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":151.6628,"ms_median":152.1965,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1214.0},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":238.2962,"ms_median":238.7224,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1496.4}]
+    },
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.3717,"ms_median":7.5210,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.6},{"workload":"64x32","backend":"tessl-f32","ms_min":102.1257,"ms_median":102.2745,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1305.9},{"workload":"32x256","backend":"tessl-f32","ms_min":430.2744,"ms_median":430.4635,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.1},{"workload":"8x1024","backend":"tessl-f32","ms_min":517.5943,"ms_median":518.9246,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.2},{"workload":"2x4096","backend":"tessl-f32","ms_min":665.0279,"ms_median":669.6017,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.2},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1827.9628,"ms_median":1832.1190,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3353.6},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":442.3535,"ms_median":444.6380,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.4},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":716.5640,"ms_median":719.6563,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.4}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.2147,"ms_median":7.3476,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.4},{"workload":"64x32","backend":"tessl-f32","ms_min":102.0322,"ms_median":102.2570,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1306.0},{"workload":"32x256","backend":"tessl-f32","ms_min":432.0828,"ms_median":434.2286,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.2},{"workload":"8x1024","backend":"tessl-f32","ms_min":530.7777,"ms_median":533.2903,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.3},{"workload":"2x4096","backend":"tessl-f32","ms_min":663.8735,"ms_median":666.1637,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.4},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1810.6697,"ms_median":1815.4318,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3354.2},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":438.9162,"ms_median":442.6598,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.5},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":714.7598,"ms_median":716.8088,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.5}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.4403,"ms_median":4.5105,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.3},{"workload":"64x32","backend":"tessl-f32","ms_min":101.7748,"ms_median":102.1384,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":983.9},{"workload":"32x256","backend":"tessl-f32","ms_min":431.5314,"ms_median":433.4345,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.3},{"workload":"8x1024","backend":"tessl-f32","ms_min":530.4885,"ms_median":531.9393,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.4},{"workload":"2x4096","backend":"tessl-f32","ms_min":678.1687,"ms_median":679.3056,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.4},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1795.6717,"ms_median":1810.6515,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1526.9},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":429.1725,"ms_median":429.8974,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1622.9},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":694.5661,"ms_median":695.9615,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1911.4}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.8843,"ms_median":3.9505,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.5},{"workload":"64x32","backend":"tessl-bf16","ms_min":37.0334,"ms_median":37.1596,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":715.2},{"workload":"32x256","backend":"tessl-bf16","ms_min":156.0194,"ms_median":156.7089,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.5},{"workload":"8x1024","backend":"tessl-bf16","ms_min":179.8692,"ms_median":183.8722,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.6},{"workload":"2x4096","backend":"tessl-bf16","ms_min":228.9555,"ms_median":229.7207,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.7},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":654.9486,"ms_median":657.8905,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1214.0},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":150.3324,"ms_median":150.6140,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1214.0},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":235.5865,"ms_median":237.1922,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1496.3}]
+    },
+    {
+      "before_async": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.3709,"ms_median":7.4396,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.6},{"workload":"64x32","backend":"tessl-f32","ms_min":102.2554,"ms_median":102.4191,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1306.0},{"workload":"32x256","backend":"tessl-f32","ms_min":430.7498,"ms_median":431.1956,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.3},{"workload":"8x1024","backend":"tessl-f32","ms_min":521.1943,"ms_median":522.0877,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.4},{"workload":"2x4096","backend":"tessl-f32","ms_min":676.3433,"ms_median":677.1270,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.5},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1816.7140,"ms_median":1825.6947,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3354.2},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":439.6607,"ms_median":441.3680,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.8},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":706.3059,"ms_median":710.6962,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.7}],
+      "control": [{"workload":"1x16","backend":"tessl-f32","ms_min":7.2882,"ms_median":7.3663,"iters":10,"async":1,"forwards":1,"device_peak_mib":4.2,"peak_footprint_mib":873.7},{"workload":"64x32","backend":"tessl-f32","ms_min":102.1342,"ms_median":102.4117,"iters":10,"async":1,"forwards":1,"device_peak_mib":436.2,"peak_footprint_mib":1306.1},{"workload":"32x256","backend":"tessl-f32","ms_min":432.2947,"ms_median":433.1924,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":519.8723,"ms_median":532.0424,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.4},{"workload":"2x4096","backend":"tessl-f32","ms_min":674.3387,"ms_median":679.5505,"iters":10,"async":1,"forwards":1,"device_peak_mib":1652.4,"peak_footprint_mib":2522.5},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1808.4150,"ms_median":1817.9735,"iters":10,"async":1,"forwards":16,"device_peak_mib":2478.5,"peak_footprint_mib":3354.1},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":434.7993,"ms_median":436.4555,"iters":10,"async":1,"forwards":2,"device_peak_mib":2638.5,"peak_footprint_mib":3706.6},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":701.8000,"ms_median":703.3361,"iters":10,"async":1,"forwards":3,"device_peak_mib":3120.3,"peak_footprint_mib":3996.5}],
+      "after_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.4223,"ms_median":4.4809,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.1},{"workload":"64x32","backend":"tessl-f32","ms_min":102.0679,"ms_median":102.2569,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.2,"peak_footprint_mib":984.2},{"workload":"32x256","backend":"tessl-f32","ms_min":432.2076,"ms_median":436.0937,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":527.0762,"ms_median":527.8921,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.6},{"workload":"2x4096","backend":"tessl-f32","ms_min":673.8515,"ms_median":677.3041,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.3,"peak_footprint_mib":1336.6},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1808.0143,"ms_median":1817.0864,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":650.6,"peak_footprint_mib":1527.1},{"workload":"1x4096+63x32","backend":"tessl-f32","ms_min":432.6600,"ms_median":433.8585,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":777.8,"device_peak_mib":746.6,"peak_footprint_mib":1623.1},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-f32","ms_min":697.2205,"ms_median":708.1135,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":777.8,"device_peak_mib":1034.9,"peak_footprint_mib":1911.5}],
+      "after_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.7584,"ms_median":3.8708,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.2},{"workload":"64x32","backend":"tessl-bf16","ms_min":37.0817,"ms_median":37.2917,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.2,"peak_footprint_mib":715.3},{"workload":"32x256","backend":"tessl-bf16","ms_min":155.3566,"ms_median":156.2775,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.7},{"workload":"8x1024","backend":"tessl-bf16","ms_min":183.5877,"ms_median":186.1669,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.8},{"workload":"2x4096","backend":"tessl-bf16","ms_min":228.8954,"ms_median":229.7278,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.4,"peak_footprint_mib":1027.8},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":652.6966,"ms_median":656.1766,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.7},{"workload":"1x4096+63x32","backend":"tessl-bf16","ms_min":150.3350,"ms_median":150.8265,"iters":10,"async":0,"serialized":0,"forwards":2,"weight_mib":517.0,"device_peak_mib":605.0,"peak_footprint_mib":1213.7},{"workload":"1x6147+1x1658+6x10-42","backend":"tessl-bf16","ms_min":235.7470,"ms_median":237.6553,"iters":10,"async":0,"serialized":0,"forwards":3,"weight_mib":517.0,"device_peak_mib":887.2,"peak_footprint_mib":1496.0}]
+    }
+  ],
+  "lane_archive": "bench/results/embedgemma2_final_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-16T05:09:39Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 6 --evidence --max-spread 1.25 --clean-env --out bench/results/embedgemma2_final_m5pro.json 'before_async:BENCH_ASYNC=1,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/before/target/release/bench_embedgemma2' 'control:BENCH_ASYNC=1,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/bench_eg2_control' 'after_f32:BENCH_PRECISION=f32,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2' 'after_bf16:BENCH_PRECISION=bf16,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+      "--rounds",
+      "6",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--clean-env",
+      "--out",
+      "bench/results/embedgemma2_final_m5pro.json",
+      "before_async:BENCH_ASYNC=1,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/before/target/release/bench_embedgemma2",
+      "control:BENCH_ASYNC=1,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/bench_eg2_control",
+      "after_f32:BENCH_PRECISION=f32,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2",
+      "after_bf16:BENCH_PRECISION=bf16,BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2"
+    ],
+    "cwd": "$HOME/Code/research/tessl-eg2",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 6,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "before_async",
+          "argv": [
+            "/Users/bharath/Code/research/tessl-eg2/target/before/target/release/bench_embedgemma2"
+          ],
+          "env": {
+            "BENCH_ASYNC": "1",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "control",
+          "argv": [
+            "/Users/bharath/Code/research/tessl-eg2/target/bench_eg2_control"
+          ],
+          "env": {
+            "BENCH_ASYNC": "1",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "after_f32",
+          "argv": [
+            "/Users/bharath/Code/research/tessl-eg2/target/release/bench_embedgemma2"
+          ],
+          "env": {
+            "BENCH_PRECISION": "f32",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "after_bf16",
+          "argv": [
+            "/Users/bharath/Code/research/tessl-eg2/target/release/bench_embedgemma2"
+          ],
+          "env": {
+            "BENCH_PRECISION": "bf16",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-eg2",
+      "scope": ".",
+      "revision": "7459e16b80a2c87f1df0a608f2908115187510a9",
+      "dirty": true,
+      "status_porcelain": [
+        "?? bench/results/embedgemma2_final_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_final_plot.py"
+      ],
+      "status_line_count": 2,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 27.3720703125,
+        "loadavg_5m": 80.1298828125,
+        "loadavg_15m": 62.20947265625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 1.5206705729166667,
+        "normalized_loadavg_5m": 4.45166015625,
+        "normalized_loadavg_15m": 3.456081814236111
+      },
+      "finish": {
+        "loadavg_1m": 45.6005859375,
+        "loadavg_5m": 40.54736328125,
+        "loadavg_15m": 39.90576171875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 2.5333658854166665,
+        "normalized_loadavg_5m": 2.2526312934027777,
+        "normalized_loadavg_15m": 2.2169867621527777
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+        "size_bytes": 887424,
+        "mtime_ns": 1792123774657006325,
+        "sha256": "8f48dae957ec4dfd51de09a43b755a72958674b91d7eeb4a582be24ecc28277b"
+      },
+      "lane:after_bf16:bench_embedgemma2": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2",
+        "size_bytes": 3470464,
+        "mtime_ns": 1792123746976581302,
+        "sha256": "e7fe7072bad37db9e18ef60e826a0ba5709cbd9ea1df745a4e61ab5390deeef6"
+      },
+      "lane:after_f32:bench_embedgemma2": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2",
+        "size_bytes": 3470464,
+        "mtime_ns": 1792123746976581302,
+        "sha256": "e7fe7072bad37db9e18ef60e826a0ba5709cbd9ea1df745a4e61ab5390deeef6"
+      },
+      "lane:before_async:bench_embedgemma2": {
+        "path": "$HOME/Code/research/tessl-eg2/target/before/target/release/bench_embedgemma2",
+        "size_bytes": 3215024,
+        "mtime_ns": 1792093376716659929,
+        "sha256": "c48283ad84cb59a9f543d76cd17651243568549dac4409d38bbb8521e8151e2f"
+      },
+      "lane:control:bench_eg2_control": {
+        "path": "$HOME/Code/research/tessl-eg2/target/bench_eg2_control",
+        "size_bytes": 3215024,
+        "mtime_ns": 1792124571659690584,
+        "sha256": "c48283ad84cb59a9f543d76cd17651243568549dac4409d38bbb8521e8151e2f"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-16T05:32:03Z"
+  }
+}

@@ -1,0 +1,135 @@
+{
+ "summary": [
+  {
+   "workload": "1x16",
+   "before-27a0407": {
+    "ms_min_median": 7.6061,
+    "ms_min_min": 7.116,
+    "ms_min_max": 8.3854,
+    "ms_min_all": [
+     7.9864,
+     8.2009,
+     8.3854,
+     8.1754,
+     8.0981
+    ],
+    "device_peak_mib_max": 2,
+    "peak_footprint_mib_max": 872.3,
+    "forwards_max": 1
+   },
+   "after": {
+    "ms_min_median": 4.45975,
+    "ms_min_min": 4.2472,
+    "ms_min_max": 5.1081,
+    "ms_min_all": [
+     4.8899,
+     5.073,
+     5.1081,
+     5.0244,
+     4.9557
+    ],
+    "device_peak_mib_max": 2,
+    "peak_footprint_mib_max": 872.3,
+    "forwards_max": 1,
+    "vs_base": {
+     "median": 0.6017392605544154,
+     "lo": 0.5799764736635734,
+     "hi": 0.6300186238613473
+    }
+   },
+   "control-before-again": {
+    "ms_min_median": 7.39305,
+    "ms_min_min": 7.1166,
+    "ms_min_max": 8.267,
+    "ms_min_all": [
+     8.0962,
+     8.0565,
+     8.1808,
+     8.1243,
+     8.0042
+    ],
+    "device_peak_mib_max": 2,
+    "peak_footprint_mib_max": 872.3,
+    "forwards_max": 1,
+    "vs_base": {
+     "median": 0.9965430655451163,
+     "lo": 0.9395928089090472,
+     "hi": 1.0385814245250073
+    },
+    "vs_prev": {
+     "median": 1.6546747845311915,
+     "lo": 1.4913730694980694,
+     "hi": 1.6923410272785329
+    }
+   }
+  },
+  {
+   "workload": "1x64",
+   "before-27a0407": {
+    "ms_min_median": 8.1314,
+    "ms_min_min": 7.7712,
+    "ms_min_max": 8.8368,
+    "ms_min_all": [
+     8.4613,
+     8.7705,
+     8.7594,
+     8.6005,
+     8.6162
+    ],
+    "device_peak_mib_max": 6.8,
+    "peak_footprint_mib_max": 877.1,
+    "forwards_max": 1
+   },
+   "after": {
+    "ms_min_median": 5.54805,
+    "ms_min_min": 5.4578,
+    "ms_min_max": 6.0633,
+    "ms_min_all": [
+     5.8331,
+     5.868,
+     6.0633,
+     5.9626,
+     5.8366
+    ],
+    "device_peak_mib_max": 6.8,
+    "peak_footprint_mib_max": 877.2,
+    "forwards_max": 1,
+    "vs_base": {
+     "median": 0.6979152342296906,
+     "lo": 0.6689693951321392,
+     "hi": 0.7060947503201024
+    }
+   },
+   "control-before-again": {
+    "ms_min_median": 8.02195,
+    "ms_min_min": 7.7741,
+    "ms_min_max": 8.7885,
+    "ms_min_all": [
+     8.5521,
+     8.5805,
+     8.7442,
+     8.7885,
+     8.55
+    ],
+    "device_peak_mib_max": 6.8,
+    "peak_footprint_mib_max": 877.1,
+    "forwards_max": 1,
+    "vs_base": {
+     "median": 1.0001672078189727,
+     "lo": 0.9569297086176305,
+     "hi": 1.0448735709725219
+    },
+    "vs_prev": {
+     "median": 1.4382300688234655,
+     "lo": 1.3909957938829556,
+     "hi": 1.4930535508083143
+    }
+   }
+  }
+ ],
+ "env": {
+  "BENCH_WORKLOADS": "1x16,1x64",
+  "BENCH_ITERS": "20",
+  "BENCH_WARMUP": "5"
+ }
+}

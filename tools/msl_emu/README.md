@@ -10,7 +10,7 @@ python3 tools/msl_emu/check_qwen35.py                   # every case, three thre
 python3 tools/msl_emu/check_qwen35.py -k chunk,score    # cases whose name contains any of these
 python3 tools/msl_emu/check_qwen35.py --fast-math       # Metal-like transcendental error, on-device bounds
 python3 tools/msl_emu/check_qwen35_model.py             # a whole Qwen3_5ForCausalLM vs its own logits
-python3 tools/msl_emu/dialect_lint.py                   # MSL constructs no compiling tessl kernel uses
+rustc --edition 2021 -O -o target/dialect_lint src/bin/dialect_lint.rs && target/dialect_lint   # MSL constructs no compiling tessl kernel uses
 MSL_EMU_SANITIZE=address MSL_EMU_OUT=/tmp/asan python3 tools/msl_emu/check_qwen35.py
 MSL_EMU_SANITIZE=thread  MSL_EMU_OUT=/tmp/tsan python3 tools/msl_emu/check_qwen35.py -k chunk_T65
 ```
@@ -80,11 +80,14 @@ before its `ENCODER_TILED_KERNEL` half: those kernels run on TensorOps through
 `attn_tiled.h`, which the emulator cannot execute, so `encoder_attn_tiled_*` (like
 `qwen35_attn_tiled`) has no off-device numeric check.
 
-`dialect_lint.py` is the stand-in for the one thing the emulator cannot see,
-the Metal compiler. It lists every function, qualified name, attribute, cast
-and language feature the Qwen3.5 kernels use that no other tessl kernel (all
-of which compile on every release build) uses. It fails unless each one is in
-its reviewed list, with the reason it is standard MSL.
+`src/bin/dialect_lint.rs` is the stand-in for the one thing the emulator cannot
+see, the Metal compiler. It lists every function, qualified name, attribute,
+cast and language feature the Qwen3.5 kernels use that no other tessl kernel
+(all of which compile on every release build) uses. It fails unless each one is
+in its reviewed list, with the reason it is standard MSL. It is Rust that uses
+only the standard library, so the Linux job compiles it with a bare `rustc`
+(the crate itself does not build off macOS); `tests/dialect_lint_script.rs`
+holds it to failing on an unreviewed construct, a stale entry and an empty tree.
 
 ## What a pass does and does not mean
 

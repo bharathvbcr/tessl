@@ -1,0 +1,49 @@
+== workload 1x16   (ms per forward; stage alone, min over 3 pass(es))
+  run                             disp   full ms  sum(only)                GEMM          attention         row passes            gelu*up  other elementwise               tail
+  f32 unfused                      369     5.141      5.771      4.328  75.0%      0.355   6.2%      0.538   9.3%      0.263   4.6%      0.210   3.6%      0.077   1.3% 
+  f32 fused                        320     5.112      7.583      5.125  67.6%      0.557   7.3%      0.948  12.5%      0.426   5.6%      0.294   3.9%      0.232   3.1% 
+  bf16 unfused                     419     5.268      7.236      4.374  60.4%      0.509   7.0%      1.378  19.1%      0.342   4.7%      0.477   6.6%      0.156   2.2% 
+  bf16 fused                       322     4.364      7.187      4.596  64.0%      0.527   7.3%      1.005  14.0%      0.405   5.6%      0.502   7.0%      0.151   2.1% 
+
+== workload 64x32   (ms per forward; stage alone, min over 3 pass(es))
+  run                             disp   full ms  sum(only)                GEMM          attention         row passes            gelu*up  other elementwise               tail
+  f32 unfused                      384   104.751    117.890     92.325  78.3%      4.568   3.9%      8.288   7.0%      6.718   5.7%      5.201   4.4%      0.789   0.7% 
+  f32 fused                        330   105.250    118.387     94.400  79.7%      4.653   3.9%      6.652   5.6%      7.308   6.2%      4.971   4.2%      0.403   0.3% 
+  bf16 unfused                     434    46.463     43.779     22.590  51.6%      1.938   4.4%      8.557  19.5%      5.766  13.2%      4.554  10.4%      0.374   0.9% 
+  bf16 fused                       332    35.065     37.656     21.695  57.6%      1.598   4.2%      4.540  12.1%      5.661  15.0%      3.904  10.4%      0.258   0.7% 
+
+== workload 8x1024   (ms per forward; stage alone, min over 3 pass(es))
+  run                             disp   full ms  sum(only)                GEMM          attention         row passes            gelu*up  other elementwise               tail
+  f32 unfused                      438   549.557    556.883    342.472  61.5%    137.608  24.7%     30.380   5.5%     27.953   5.0%     17.219   3.1%      1.250   0.2% 
+  f32 fused                        366   546.079    560.607    346.531  61.8%    140.710  25.1%     24.763   4.4%     30.201   5.4%     16.963   3.0%      1.440   0.3% 
+  bf16 unfused                     488   191.039    201.487     82.244  40.8%     41.975  20.8%     38.429  19.1%     23.358  11.6%     14.368   7.1%      1.112   0.6% 
+  bf16 fused                       368   173.501    178.958     78.545  43.9%     39.014  21.8%     22.801  12.7%     23.168  12.9%     14.342   8.0%      1.087   0.6% 
+
+Row passes (the classes the fusion changed): dispatches, ms (min over passes) and [range of the per-pass sums], share of the sum of stages
+  workload  run                             disp        ms           passes   share   classes (ms)
+  1x16      f32 unfused                      122     0.538    0.54-2.44       9.3%   rms_norm, standalone 0.161; residual add post-attn 0.081; residual add post-ffn 0.108; PLE scale+norm 0.071; residual add*scalar post-ple 0.115; bf16 casts 0.002
+  1x16      f32 fused                         74     0.948    1.04-6.51      12.5%   rms_norm, standalone 0.079; residual add post-attn 0.173; residual add post-ffn 0.213; PLE scale+norm 0.212; residual add*scalar post-ple 0.269; bf16 casts 0.002
+  1x16      bf16 unfused                     172     1.378    1.62-2.87      19.1%   rms_norm, standalone 0.368; residual add post-attn 0.236; residual add post-ffn 0.320; PLE scale+norm 0.145; residual add*scalar post-ple 0.165; bf16 casts 0.145
+  1x16      bf16 fused                        76     1.005    1.14-1.58      14.0%   rms_norm, standalone 0.176; residual add post-attn 0.191; residual add post-ffn 0.197; PLE scale+norm 0.122; residual add*scalar post-ple 0.222; bf16 casts 0.098
+  64x32     f32 unfused                      132     8.288    9.47-11.52      7.0%   rms_norm, standalone 2.421; residual add post-attn 1.229; residual add post-ffn 1.072; PLE scale+norm 2.008; residual add*scalar post-ple 1.549; bf16 casts 0.009
+  64x32     f32 fused                         79     6.652    7.01-11.58      5.6%   rms_norm, standalone 0.492; residual add post-attn 1.772; residual add post-ffn 1.367; PLE scale+norm 1.305; residual add*scalar post-ple 1.707; bf16 casts 0.009
+  64x32     bf16 unfused                     182     8.557    8.76-17.37     19.5%   rms_norm, standalone 1.587; residual add post-attn 0.909; residual add post-ffn 0.912; PLE scale+norm 1.421; residual add*scalar post-ple 1.345; bf16 casts 2.382
+  64x32     bf16 fused                        81     4.540    4.54-17.29     12.1%   rms_norm, standalone 0.151; residual add post-attn 1.299; residual add post-ffn 0.909; PLE scale+norm 0.741; residual add*scalar post-ple 1.296; bf16 casts 0.144
+  8x1024    f32 unfused                      168    30.380   31.53-55.02      5.5%   rms_norm, standalone 7.171; residual add post-attn 5.801; residual add post-ffn 5.701; PLE scale+norm 5.967; residual add*scalar post-ple 5.729; bf16 casts 0.011
+  8x1024    f32 fused                         97    24.763   25.58-31.76      4.4%   rms_norm, standalone 0.526; residual add post-attn 7.356; residual add post-ffn 5.939; PLE scale+norm 3.227; residual add*scalar post-ple 7.703; bf16 casts 0.012
+  8x1024    bf16 unfused                     218    38.429   39.54-50.72     19.1%   rms_norm, standalone 6.388; residual add post-attn 5.955; residual add post-ffn 5.657; PLE scale+norm 5.255; residual add*scalar post-ple 5.741; bf16 casts 9.434
+  8x1024    bf16 fused                        99    22.801   23.39-42.12     12.7%   rms_norm, standalone 0.446; residual add post-attn 6.571; residual add post-ffn 6.106; PLE scale+norm 2.703; residual add*scalar post-ple 6.540; bf16 casts 0.435
+
+Machine: GPU utilization at the start and end of each workload (ioreg, %, first pass), and samples taken with another tessl GPU process seen
+  1x16      f32 unfused                    util 98% -> 97%   contended samples 130 of 130
+  1x16      f32 fused                      util 97% -> 97%   contended samples 130 of 130
+  1x16      bf16 unfused                   util 98% -> 97%   contended samples 130 of 130
+  1x16      bf16 fused                     util 96% -> 97%   contended samples 0 of 130
+  64x32     f32 unfused                    util 98% -> 97%   contended samples 130 of 130
+  64x32     f32 fused                      util 97% -> 96%   contended samples 130 of 130
+  64x32     bf16 unfused                   util 98% -> 97%   contended samples 130 of 130
+  64x32     bf16 fused                     util 96% -> 82%   contended samples 0 of 130
+  8x1024    f32 unfused                    util 98% -> 98%   contended samples 130 of 130
+  8x1024    f32 fused                      util 97% -> 99%   contended samples 130 of 130
+  8x1024    bf16 unfused                   util 98% -> 98%   contended samples 130 of 130
+  8x1024    bf16 fused                     util 96% -> 92%   contended samples 0 of 130

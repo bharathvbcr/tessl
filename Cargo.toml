@@ -144,3 +144,11 @@ path = "src/bin/probe_gdn_scan.rs"
 [[bin]]
 name = "bench_embedgemma2"
 path = "src/bin/bench_embedgemma2.rs"
+
+[[bin]]
+name = "bench_embedgemma2_tok"
+path = "src/bin/bench_embedgemma2_tok.rs"
+
+[[bin]]
+name = "bench_encoder_attn"
+path = "src/bin/bench_encoder_attn.rs"

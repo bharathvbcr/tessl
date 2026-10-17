@@ -202,10 +202,24 @@ pub(crate) fn validate_rms_scalars(dim: u32, eps: f32, what: &str) -> Result<(),
 }
 
 pub fn attn_kv_capacity(k: &GpuBuffer, v: &GpuBuffer, batch: u32, heads_kv: u32, head_dim: u32) -> Result<u32, String> {
-    attn_kv_capacity_for(k, v, batch, heads_kv, head_dim, "attention")
+    attn_kv_capacity_for::<f32>(k, v, batch, heads_kv, head_dim, "attention")
 }
 
-fn attn_kv_capacity_for(
+/// [`attn_kv_capacity`] for K and V held as bf16 (two bytes an element): the
+/// same positions-per-sequence a writer and a reader of the bf16 caches both
+/// derive. Sizing a bf16 buffer as f32 would report half the positions, and
+/// both sides would stride a batch row apart by twice the real amount.
+pub fn attn_kv_capacity_bf16(
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    batch: u32,
+    heads_kv: u32,
+    head_dim: u32,
+) -> Result<u32, String> {
+    attn_kv_capacity_for::<u16>(k, v, batch, heads_kv, head_dim, "attention")
+}
+
+fn attn_kv_capacity_for<T>(
     k: &GpuBuffer,
     v: &GpuBuffer,
     batch: u32,
@@ -223,8 +237,8 @@ fn attn_kv_capacity_for(
     if per_position == 0 {
         return Ok(0);
     }
-    let k_positions = capacity_of::<f32>(k) / per_position;
-    let v_positions = capacity_of::<f32>(v) / per_position;
+    let k_positions = capacity_of::<T>(k) / per_position;
+    let v_positions = capacity_of::<T>(v) / per_position;
     if k_positions != v_positions {
         return Err(format!(
             "{what}: K and V imply different fixed capacities ({k_positions} vs \
@@ -269,7 +283,7 @@ fn validate_attn_storage_for(
     out_bf16: bool,
 ) -> Result<u32, String> {
     validate_attn_dims(dims, d, q, o, what, out_bf16)?;
-    let capacity = attn_kv_capacity_for(k, v, dims.batch, dims.heads_kv, d, what)?;
+    let capacity = attn_kv_capacity_for::<f32>(k, v, dims.batch, dims.heads_kv, d, what)?;
     let has_work = dims.batch != 0 && dims.tq != 0 && dims.heads != 0;
     if !has_work {
         return Ok(capacity);
@@ -2014,7 +2028,7 @@ fn route_attn(
     // `Tkv` is a device value, so route from the complete positions jointly
     // backed by K and V. The selected kernel independently clamps to this same
     // bound before indexing either buffer.
-    let capacity = attn_kv_capacity_for(k, v, dims.batch, dims.heads_kv, head_dim, "flash_attn")?;
+    let capacity = attn_kv_capacity_for::<f32>(k, v, dims.batch, dims.heads_kv, head_dim, "flash_attn")?;
     match attn_kernel_for(dims.tq, capacity as usize) {
         AttnKernel::SplitKv => {
             // The router holds no state between calls, so it sizes a scratch

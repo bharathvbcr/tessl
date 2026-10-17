@@ -91,7 +91,7 @@ use std::sync::Arc;
 
 use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
-use crate::json::{self, Json, Syntax};
+use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
@@ -203,9 +203,11 @@ impl Qwen35Config {
         let field = |k: &str| c.get(k).ok_or_else(|| format!("config.json: missing {k:?}"));
         let uint = |k: &str| -> Result<u32, String> {
             match field(k)? {
-                Json::Num { uint: Some(n), .. } => {
-                    u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32"))
-                }
+                Json::Num {
+                    form: NumForm::Uint,
+                    int: n,
+                    ..
+                } => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
                 v => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
             }
         };

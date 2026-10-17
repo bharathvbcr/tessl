@@ -157,7 +157,7 @@ fn parse_adamw_config(update: u32, seed: u64, moments: u32, what: &str) -> Resul
     Ok(AdamWConfig { update, moments })
 }
 
-fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
+pub(crate) fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
     match code {
         TESSL_OPERANDS_EXACT_F32 => Ok(GemmOperands::ExactF32),
         TESSL_OPERANDS_BF16 => Ok(GemmOperands::Bf16),
@@ -570,7 +570,7 @@ fn check_extent<T>(p: *const T, n: usize, what: &str, name: &str) -> Result<(), 
 /// # Safety
 /// When `n` is non-zero and the checks pass, `p` points to `n` readable `T`s
 /// that nothing writes for `'a`.
-unsafe fn checked_slice<'a, T>(p: *const T, n: usize, what: &str, name: &str) -> Result<&'a [T], String> {
+pub(crate) unsafe fn checked_slice<'a, T>(p: *const T, n: usize, what: &str, name: &str) -> Result<&'a [T], String> {
     check_extent(p, n, what, name)?;
     if n == 0 {
         return Ok(&[]);
@@ -583,7 +583,12 @@ unsafe fn checked_slice<'a, T>(p: *const T, n: usize, what: &str, name: &str) ->
 ///
 /// # Safety
 /// As [`checked_slice`], with `p` writable and unaliased for `'a`.
-unsafe fn checked_slice_mut<'a, T>(p: *mut T, n: usize, what: &str, name: &str) -> Result<&'a mut [T], String> {
+pub(crate) unsafe fn checked_slice_mut<'a, T>(
+    p: *mut T,
+    n: usize,
+    what: &str,
+    name: &str,
+) -> Result<&'a mut [T], String> {
     check_extent(p.cast_const(), n, what, name)?;
     if n == 0 {
         return Ok(&mut []);
@@ -624,7 +629,7 @@ unsafe fn wrap(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<T
 }
 
 /// A thread-affine handle the ABI hands out.
-trait Handle {
+pub(crate) trait Handle {
     /// What the handle is, in messages.
     const KIND: &'static str;
     /// The creating thread, read through a raw pointer so the thread check
@@ -655,7 +660,7 @@ impl Handle for TesslRuntime {
 ///
 /// # Safety
 /// As [`tessl_runtime_free`], for a handle of type `H`.
-unsafe fn free_handle<H: Handle>(handle: *mut H) -> i32 {
+pub(crate) unsafe fn free_handle<H: Handle>(handle: *mut H) -> i32 {
     if handle.is_null() {
         return TESSL_OK;
     }
@@ -722,7 +727,7 @@ unsafe fn refuse_unowned<H: Handle>(handle: *mut H, err: *mut c_char, err_len: u
 /// # Safety
 /// `handle` is null or a live handle from its constructor with no other call
 /// on it running; `err` is null or points to `err_len` writable bytes.
-unsafe fn guarded<H: Handle>(
+pub(crate) unsafe fn guarded<H: Handle>(
     handle: *mut H,
     err: *mut c_char,
     err_len: usize,

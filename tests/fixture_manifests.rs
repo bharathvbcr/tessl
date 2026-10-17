@@ -40,7 +40,12 @@ const OWN_RECORD: [(&str, &str); 3] = [
 
 /// Directories with no generator to record. Nothing that has a generator belongs
 /// here; each entry says why it is not generator-backed.
-const EXEMPT: [(&str, &str); 0] = [];
+const EXEMPT: [(&str, &str); 1] = [(
+    "results_report",
+    "goldens written by the five stdlib report scripts retired in 1b42066 \
+     (bench/results/embedgemma2_*_report.py); src/bin/results_report is held to them byte for byte, \
+     and no generator remains to record",
+)];
 
 const ROLES: [&str; 4] = ["input", "golden", "model", "config"];
 
@@ -71,12 +76,7 @@ fn string<'a>(v: &'a Json, key: &str) -> Result<&'a str, String> {
 /// `Ok` when `text` is a well-formed manifest whose `files` are exactly `present`.
 fn check_manifest(text: &str, present: &BTreeSet<String>, repo: &Path) -> Result<(), String> {
     let m = parse(text)?;
-    if m.get("schema")
-        != Some(&Json::Num {
-            value: 1.0,
-            uint: Some(1),
-        })
-    {
+    if m.get("schema").and_then(Json::exact_int) != Some(1) {
         return Err("schema must be 1".into());
     }
     let generator = string(&m, "generator")?;

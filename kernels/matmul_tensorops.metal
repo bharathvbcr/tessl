@@ -162,6 +162,61 @@ kernel void matmul2d_tensorops_tn_splitk_par_f32(
     op.run(tA, tB, tS);
 }
 
+/// Split-K NN with every K-partition in one dispatch, for a skinny A: the
+/// small-M GEMMs of a latency-bound forward (EmbeddingGemma 2 at 1x16: M 16,
+/// N 512, K 1024 or 2048). One dispatch gives such a C `tiles_n · tiles_m`
+/// threadgroups (16 here), each a single simdgroup walking all of K, and the
+/// time is that walk's latency, not the weight bytes. Threadgroup
+/// `p · tiles + t` computes tile `t` of partition `p` (K from `p · k_tile`)
+/// into slice `p` of a scratch `S` of `partitions` slices `slice` floats
+/// apart; `reduce_partitions_f32` then adds the slices into C in partition
+/// order, so the result is deterministic. The partition views are the
+/// sequential `matmul2d_tensorops_nn_splitk_f32`'s: columns `k0..` of A's
+/// rows (row stride K) and rows `k0..` of B. Every in-bounds element of every
+/// slice is written, so `S` needs no zeroing.
+kernel void matmul2d_tensorops_nn_splitk_par_f32(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *S [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &k_tile [[buffer(6)]],
+    constant uint &tiles_n [[buffer(7)]],
+    constant uint &tiles_m [[buffer(8)]],
+    constant uint &partitions [[buffer(9)]],
+    constant uint &slice [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 32;
+    constexpr int SN = 32;
+    constexpr auto desc =
+        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false,
+                            matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroup> op;
+
+    const uint tiles = tiles_n * tiles_m;
+    if (tiles == 0u) return;
+    const uint p = tgpig / tiles;
+    if (p >= partitions) return;
+    uint2 tile = tile_from_linear(tgpig - p * tiles, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    const ulong k0 = (ulong)p * k_tile;
+    if (k0 >= K) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    uint k_len = (uint)min((ulong)k_tile, (ulong)K - k0);
+    auto mA = tensor(A + k0, dextents<int, 2>{(int)k_len, (int)M}, array<int, 2>{1, (int)K});
+    auto mB = tensor(B + k0 * N, dextents<int, 2>{(int)N, (int)k_len}, array<int, 2>{1, (int)N});
+    auto mS = tensor(S + (ulong)p * slice, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+
+    auto tA = mA.slice(0, ty);
+    auto tB = mB.slice(tx, 0);
+    auto tS = mS.slice(tx, ty);
+    op.run(tA, tB, tS);
+}
+
 /// Split-K NN accumulate for one K-partition: C[M,N] += A[M, k0:k0+len] @
 /// B[k0:k0+len, N], with C zeroed by the host first. For a long K the host
 /// cuts K into partitions whose slice of B fits in cache. One dispatch over

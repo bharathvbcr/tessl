@@ -1,0 +1,12 @@
+HASH f32 1x16 add2c622733cfa49 trunc128 60a738b09624ed68 repeat_stable=true
+HASH f32 64x32 ab2f8973d25ec584 trunc128 6b284562a2a6d011 repeat_stable=true
+HASH f32 32x256 a37be16381616af5 trunc128 f7063f934c021c2f repeat_stable=true
+HASH f32 8x1024 bfa1432d66775a24 trunc128 bbd9d42524567686 repeat_stable=true
+HASH f32 2x4096 87452f717e79b313 trunc128 e71d4bd1ffbed7f0 repeat_stable=true
+HASH f32 1x4096+63x32 64b78e28e233bbc5 trunc128 4fe3d21d1c21d7f0 repeat_stable=true
+HASH bf16 1x16 ce9fe1d156897056 trunc128 1e137d2f44cf97f7 repeat_stable=true
+HASH bf16 64x32 899de415b7e967ca trunc128 ec38a00bb978d789 repeat_stable=true
+HASH bf16 32x256 7e0e2b608c46942f trunc128 90a44c8505a04a65 repeat_stable=true
+HASH bf16 8x1024 274f02bf9af7dcdc trunc128 994829ea67b46c80 repeat_stable=true
+HASH bf16 2x4096 542773be4bc27c88 trunc128 0d6d1857d1ef4167 repeat_stable=true
+HASH bf16 1x4096+63x32 b5c029be1653df84 trunc128 c1e26f7609ea8179 repeat_stable=true

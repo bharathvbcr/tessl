@@ -12,13 +12,14 @@ you changed in the kernel.**
 | `bench_gemm_tnnt_tune` | Interleaved TN/NT/accumulate kernel A/B against the production API. Use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad NN tile/BK ladder (bf16 and exact f32), interleaved the same way. |
 | `bench_gemm_coop_tile` | Paired, interleaved GEMM tile A/B (128×64 vs 64×64). `--family plain` (default) is the GDN fused in-projection through `gemm_tiled`; `--family epilogue` is the output projection's residual-add through `gemm_epilogue_tiled`, which also checks the two tiles agree. |
-| `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, and the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths (`BENCH_LANES=splitk,smallm,batched,epi`). |
+| `bench_gemm_routes` | Paired A/B of the bf16 GEMM routing rules at the shapes they gate on: the split-K lanes of the gated TN dW shapes, the 128×64 vs 64×64 coop tile on the plain, batched and epilogue paths, and the opt-in small-M exact-f32 NN split-K (`gemm_small_m`) against the single dispatch at EmbeddingGemma 2's shapes (`BENCH_LANES=splitk,smallm,nnsmall,batched,epi`). |
 | `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_qwen35_layers` | `Qwen35Model` prefill and decode timings at the 2B's shapes (random bf16 weights, or `--weights=DIR` for a real checkpoint; library-default GDN scan, `--gdn-scan32` for the other): tower, `forward_rows`, `prefill`, and per-layer and per-part tables through `Staged::encode_part`. `--decode[=P]` times `prefill` then `Decode::step` per token with its waits and allocations per token, `--model-forward` the tower as `METRIC` lines. `--paired-attn` times paired prefill attention, `--attn-tiles` one `METRIC` per `attn_prefill_with_tile` geometry (for `bench_paired --format metrics`), `--paired-gdn-recurrent` the 32- vs 16-column decode recurrence and `--paired-gate-up` two gate/up GEMMs vs one packed (async and sync encode). |
 | `bench_nn_kernels` | `nn` kernels batched and solo, with each one's host encode per dispatch; then the host path: pipeline cache hits and a decode-style sample loop. `--host-only` skips the kernel table. |
 | `probe_gdn_scan` | Gated delta net chunk scan probe; `--paired` times paired 32- vs 16-col widths. |
 | `probe_gemm_bits` | Bit snapshot of every production GEMM entry point (FNV-1a per output); diff two builds' snapshots before claiming a kernel change is bit-identical (`bench/results/gemm_coop_header_bits_m5pro.txt`). |
 | `bench_embedgemma2` | EmbeddingGemma 2 `encode` latency and device/process peak memory on the real checkpoint, uniform and ragged batches, JSON out; `--attn-kernel=rows|tiled` times the encoder attention kernel alone at the checkpoint's layer shapes (no weights read), as `METRIC` lines. |
+| `bench_embedgemma2_mm` | EmbeddingGemma 2 multimodal facade `encode` (texts, images and clips in one call) on the real checkpoint: three workloads, JSON out (`bench_paired --format workloads`), a HASH line per workload and the host waits of one call. |
 | `bench_paired` | The one paired-round driver. Alternates any lanes round by round and reports per-round ratios with their spread: `bench_embedgemma2`'s JSON (`--format workloads`), `METRIC name value` lines (`--format metrics`: frozen before/after binaries, `bench_qwen35_train --step` configurations), or JSON rows compared across processes (`--format rows:KEY,VARIANT,VALUE`: tessl against PyTorch MPS / MLX). `--evidence` adds the drift gate, provenance and atomic publication for a quotable artifact. See "Paired rounds" below. |
 | `bench_capi` | What the C ABI's waits cost, through `tessl::capi` itself (one process is one lane, for `bench_paired --format metrics`): `METRIC capi_idle_sync_us`, `capi_forward_us_{label}` and `capi_train_step_ms_{label}` on the tiny training fixture, or `--model=SAFETENSORS --tokens=N` on a checkpoint. `--async` switches the runtime with `tessl_runtime_set_async_encode` (what `tessl_torch` does); without it every kernel is its own waited commit. `bench/capi_torch_overhead.py [--async]` prints the torch half (`torch_mps_sync_idle_us`, `tessl_sync_idle_us`, `ce_call_us`). Results: `bench/results/capi_*`. |
 | `bench_qwen35_train` | Qwen3.5-2B training ops, and with the checkpoint one whole `train_step` (`--step`, `--async`, `--storage=bf16` for the bf16 tower), a clipped optimizer step (`--clip`), one op alone as a `METRIC` (`--op=attn_train_forward`), or a row-by-row batch (`--batch`), each with its host waits and device peak. |
@@ -32,7 +33,7 @@ flowchart TD
         NnBench["bench_nn_kernels<br/>(62 nn entry points · batched vs solo)"]
         Parity["probe_gemm_parity<br/>(Bit-exact TensorOps vs SIMD verification)"]
         
-        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (71 A/B Kernels)"]
+        subgraph TuneGated["Behind TESSL_GEMM_TUNE=1 (152 A/B Kernels)"]
             TnNtTune["bench_gemm_tnnt_tune<br/>(Paired interleaved TN/NT A/B lane)"]
             TileTune["bench_gemm_tile_tune<br/>(Tile geometry &amp; BK ladder search)"]
         end
@@ -49,7 +50,7 @@ flowchart TD
     PyHarness -->|In-Process Dispatch| MLX
 ```
 
-The A/B rig is 71 measurement-only kernels and is **not** in the default
+The A/B rig is 152 measurement-only kernels and is **not** in the default
 metallib — linking it took the shipped artifact from 0.22 MB to 1.09 MB. Opt in:
 
 `TESSL_GEMM_TUNE` changes what build.rs links, so it goes on **every** `cargo`
@@ -332,7 +333,7 @@ target/release/bench_paired --format rows:shape,backend,gflops --compare tensoro
   'py:BENCH_SHAPES=1024x1024x1024=python3 bench/gemm_sweep_mlx.py --lanes torch --dtypes f32 --iters 30 --warmup 10'
 
 # Tile-geometry and TN/NT A/B lanes. These live behind TESSL_GEMM_TUNE because
-# the 71 measurement kernels are excluded from the default metallib; the
+# the 152 measurement kernels are excluded from the default metallib; the
 # variable goes on each command, or build.rs rebuilds the metallib without them.
 TESSL_GEMM_TUNE=1 cargo build --release --bins
 TESSL_GEMM_TUNE=1 cargo run --release --bin bench_gemm_tile_tune
@@ -678,6 +679,29 @@ were measured on that copy's code, which differs from this tree: for example
 and the attention kernels differ between the copies. They are listed in
 [`bench/results/PROVENANCE.md`](../bench/results/PROVENANCE.md). Wherever this
 document presents one of them, it says "imported".
+
+### Rebuilding the EmbedGemma 2 results: `results_report`
+
+The EmbedGemma 2 memory, small-M, stage-profile, vision-profile and
+text-fusion result files in `bench/results/` are written by one tool,
+`cargo run --release --bin results_report -- SUBCOMMAND ...`
+(`src/bin/results_report/`; the module docs of each subcommand name its
+inputs):
+
+| subcommand | writes | from |
+| --- | --- | --- |
+| `memory RAW OUT` | `embedgemma2_memory_m5pro.{json,txt}` | `profile_embedgemma2` memory tables and hashes, `bench_paired --out` lane directories, `bounds.txt` |
+| `small-m RESULTS RAW BEFORE AFTER CONTROL` | `embedgemma2_small_m_m5pro.json` and the printed tables | three `bench_paired` runs and `bench_gemm_routes` lane `nnsmall` |
+| `stage OUT PASS.json... [--gemm ...] [--contended STEM...]` | `embedgemma2_stage_profile_m5pro.json`, `..._tables.txt` | `profile_embedgemma2 PROFILE_MODE=stages` passes and the other modes' files |
+| `vision OUT LABEL=PASS.json...` | `embedgemma2_vision_profile_m5pro.json` and the printed tables | `profile_embedgemma2_vision` passes |
+| `text-fusion OUT LABEL=FILE.json...` | `embedgemma2_text_fusion_profile_m5pro.json`, `..._tables.txt` | `profile_embedgemma2 PROFILE_MODE=stages` runs of the text encoder |
+
+It replaced five stdlib-only Python scripts and reproduces their output byte
+for byte, including Python's `int`/`float` distinction, `repr` of floats and
+`json.dumps` (`tests/results_report.rs` rebuilds the committed JSON files from
+the passes they embed, and checks golden outputs the scripts wrote). The
+`*_plot.py` scripts read the JSON it writes. It stops with a named error where
+a script raised (a missing key, a division by zero).
 
 ## Every recorded result, plotted
 

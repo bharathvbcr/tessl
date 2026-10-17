@@ -1,0 +1,111 @@
+{
+ "mode": "ledger",
+ "workload": "8x1024",
+ "stages": [
+  {
+   "class": "gather+copy",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "rms_norm (input, pre-ffn)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "qkv GEMM sliding",
+   "fresh_mib": 0.25,
+   "kept_mib": 0.25
+  },
+  {
+   "class": "qkv GEMM global",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "qk-norm+rope+kv store",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "attention sliding (hd256)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "attention global (hd512)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "o GEMM sliding",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "o GEMM global",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "norm+residual (post-attn)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "gate|up GEMM",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "gelu*up (mlp)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "down GEMM",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "norm+residual (post-ffn)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "PLE projection GEMM (NT)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "PLE scale+norm",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "ple_gate GEMM",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "ple gelu*input",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "ple_out GEMM",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "norm+residual*scalar (post-ple)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  },
+  {
+   "class": "tail (final norm, pool, proj, l2)",
+   "fresh_mib": 0.0,
+   "kept_mib": 0.0
+  }
+ ]
+}

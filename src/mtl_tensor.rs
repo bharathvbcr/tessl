@@ -110,8 +110,29 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 /// dequantization fused, needing nothing from this module. The header's own
 /// diagnostic lists the supported cooperative source types as
 /// `uint8_t/int8_t/uint4b_format/int4b_format/float/half/bfloat`, so Int4 is
-/// supported by TensorOps too; what is missing there is the shader-side tensor
-/// constructor for a sub-byte element type, not an objc2 binding.
+/// supported by TensorOps too.
+///
+/// Compile-checked (no GPU run) with the macOS 27.0 SDK and `Apple metal
+/// version 32023.921`, `-std=metal4.0` (`tools/probes/int4b/run.sh`): the
+/// shader-side constructor exists and a kernel can build
+/// `tensor<device int4b_format|uint4b_format, dextents<int32_t,2>,
+/// tensor_inline>` from a raw buffer, but the pointer must be the tensor's
+/// `data_handle_type`, which for a numeric-format element is `device uchar *`
+/// (`metal_tensor:253-263`); a typed `device int4b_format *` does not match
+/// any constructor. Extents and strides count 4-bit elements; static
+/// extent(0) must be a multiple of 32 (`metal_tensor:5402`), and a static
+/// descriptor K must be a multiple of 32 for sub-byte types
+/// (`MPPTensorOpsMatMul2dImpl.h:6382-6397`; dynamic K is unconstrained).
+/// `matmul2d` accepts a 4-bit type on the RIGHT operand only, for exactly the
+/// pairs listed at `MPPTensorOpsMatMul2d.h:52-61` (half/bfloat x int4b|uint4b,
+/// int8 x int4b -> int32, uint8 x uint4b -> int32); a 4-bit LHS, or an unlisted
+/// pair such as half x uint4b -> int32, fails with "Unsupported type"
+/// (`MPPTensorOpsMatMul2dImpl.h:13811`). The nibble order inside a byte is not
+/// stated in any header and was not measured; tessl's own order (low nibble
+/// first, unsigned for MLX) must be confirmed on a GPU before any use. The
+/// per-group MLX scale and bias are not part of the operand, so a Q4 prefill
+/// GEMM needs a per-group `matmul2d` plus a register epilogue (the probe's
+/// `MLX_GROUP_LOOP` variant compiles that shape).
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).

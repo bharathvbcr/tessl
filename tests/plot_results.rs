@@ -433,6 +433,17 @@ fn every_figure_is_a_well_formed_svg_with_a_background_a_title_and_a_dark_theme(
             "{name}: a non-finite number reached the SVG"
         );
         assert!(count(&elems, "panel") >= 1, "{name}: no panel");
+        // The ink colour is a class the dark theme redefines; written as a
+        // literal it would vanish on the dark background.
+        for e in &elems {
+            for attr in ["stroke", "fill"] {
+                assert!(
+                    e.attr(attr) != Some("#0b0b0b"),
+                    "{name}: a <{}> has {attr}=\"#0b0b0b\" instead of the ink class",
+                    e.name
+                );
+            }
+        }
     }
 }
 

@@ -86,7 +86,7 @@ pub fn memory(json: &Path) -> R<Output> {
             vec![
                 LegendItem::boxed("16f5190, back-to-back encodes", M_RED),
                 LegendItem::boxed("changed, back-to-back encodes", M_BLUE),
-                LegendItem::line("16f5190, one encode", "#0b0b0b", false),
+                LegendItem::ink_line("16f5190, one encode", false),
             ]
         } else {
             Vec::new()

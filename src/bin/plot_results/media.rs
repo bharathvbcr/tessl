@@ -43,7 +43,7 @@ pub fn media_decode(json: &Path) -> R<Output> {
         LegendItem::boxed("image (megapixels)", ORANGE),
         LegendItem::boxed("audio (seconds of audio)", BLUE),
         LegendItem::boxed("video (frames)", GREEN),
-        LegendItem::line("median", "#0b0b0b", false),
+        LegendItem::ink_line("median", false),
     ];
     let mut fig = Figure::new(
         1100.0,

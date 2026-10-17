@@ -336,7 +336,7 @@ pub fn stage_profile(json: &Path) -> R<Output> {
     let mut ax = Axes::new(
         cells[1],
         "Absolute time; black ticks are the whole replica forward",
-        &[LegendItem::line("full forward (min)", "#0b0b0b", false)],
+        &[LegendItem::ink_line("full forward (min)", false)],
         AxisCfg::categories(&wls, false)?,
         AxisCfg::log(lo, hi)?.labelled("ms per forward (log)"),
     )?;

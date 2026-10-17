@@ -623,6 +623,13 @@ impl LegendItem {
             },
         }
     }
+
+    /// A line in the ink colour, for a mark drawn with [`Stroke::ink`]: it
+    /// follows the theme as that mark does (a literal near-black would vanish
+    /// on the dark background).
+    pub fn ink_line(label: &str, dash: bool) -> LegendItem {
+        LegendItem::line(label, "", dash)
+    }
 }
 
 const LEGEND_ROW: f64 = 17.0;
@@ -681,12 +688,16 @@ fn draw_legend(buf: &mut String, x: f64, y: f64, items: &[LegendItem], rows: &[V
                     esc(color)
                 )),
                 Swatch::Line { color, dash } => buf.push_str(&format!(
-                    "<line class=\"key\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{}\" stroke-width=\"1.6\"{}/>\n",
+                    "<line {} x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke-width=\"1.6\"{}/>\n",
+                    if color.is_empty() {
+                        "class=\"key sk\"".to_string()
+                    } else {
+                        format!("class=\"key\" stroke=\"{}\"", esc(color))
+                    },
                     num(sx),
                     num(cy),
                     num(sx + 14.0),
                     num(cy),
-                    esc(color),
                     if *dash { " stroke-dasharray=\"4 3\"" } else { "" }
                 )),
             }

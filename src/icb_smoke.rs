@@ -533,6 +533,20 @@ mod tests {
         verify_copy(&dst, 64, "after re-encode").unwrap();
     }
 
+    /// An `AsyncScope` batches without the runtime-wide flag; the guard must
+    /// hold there too, and a synchronize releases it.
+    #[test]
+    fn encode_copy_refuses_inside_an_async_scope() {
+        let (rt, src, dst, mut smoke) = rig();
+        assert!(!rt.async_encode_enabled());
+        let _scope = rt.async_scope();
+        smoke.execute(&rt).expect("execute");
+        let err = smoke.encode_copy(&src, &dst).unwrap_err();
+        assert!(err.contains("synchronize"), "{err}");
+        rt.synchronize().unwrap();
+        smoke.encode_copy(&src, &dst).expect("synchronized");
+    }
+
     /// The default synchronous path waits inside `execute`, so nothing is left
     /// in flight and a re-encode needs no extra synchronize.
     #[test]

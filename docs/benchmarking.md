@@ -235,10 +235,17 @@ run it after `cargo build --release --bins`, it measures the binaries in `target
 
 | Exit | Meaning |
 |---|---|
-| 0 | Ran, and every kernel entry point is dispatched by a benchmark. |
-| 1 | Ran and found gaps: undispatched kernels (150 of 266 today, ft-6d88defb), a census that disagrees with the metallib, or a traced kernel absent from the census. |
+| 0 | Ran, and every kernel entry point is dispatched by a benchmark or listed in `bench/kernel_coverage_allowlist.txt`. |
+| 1 | Ran and found gaps: undispatched kernels that are not allowlisted (ft-6d88defb; 150 of 266 at the last GPU run, before the census grew to 298), an allowlist entry that is stale (not a kernel) or redundant (a bench dispatches it), a malformed allowlist, a census that disagrees with the metallib, or a traced kernel absent from the census. |
 | 77 | Could not run: no `xcrun metal` / `metal-nm`, no bench binary (under `CARGO_TARGET_DIR` if set, else `target/`), a binary older than `kernels/*.metal`, `kernels/*.h` or `build.rs`, no metallib, a suite that failed or printed no `KERNEL_TRACE`. 77 is the repo's SKIPPED status and never success. |
 | 2 | Bad command line. |
+
+The allowlist holds kernels that only a test or a diagnostic reaches, one per line as
+`kernel: class: path detail` (`#` comments), the class one of `test-only`, `probe`,
+`one-shot` or `tune-variant` and the detail starting with a repo path that exists (the
+kernel's only caller). A missing file is an empty list. `--allowlist PATH` reads another
+file; `--audit-allowlist` runs no benchmark and checks only that every entry is still a
+kernel of the census, which a runner with the Metal toolchain but no GPU can do.
 
 The kernel census is `xcrun metal -E` over each `kernels/*.metal` with the flags
 `build.rs`'s `metal_args` gives every compile (read from build.rs, not copied),

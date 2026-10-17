@@ -1,0 +1,11 @@
+# Kernels no benchmark dispatches, each with the reason it needs no timing lane.
+# Read by `cargo run --release --bin kernel_coverage -- --check` (src/bin/common/kcov.rs,
+# `load_allowlist`; docs/benchmarking.md, "kernel_coverage exit status").
+#
+# One entry per line:   kernel_name: class: path detail
+#   class   test-only | probe | one-shot | tune-variant
+#   path    a repo path that exists: the kernel's only caller (test, probe or source)
+# `#` starts a comment. An entry that is not a kernel any more, or that a bench now
+# dispatches, fails the check, so the list cannot outlive what it records.
+#
+# Empty until the uncovered kernels are triaged (ft-6d88defb).

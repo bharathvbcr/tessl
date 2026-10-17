@@ -430,7 +430,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
 
 // ======================================================================
 // Coverage lanes: the public `nn::`, `bert::` and `embedgemma2::` ops a
-// consumer calls that the table above did not time. `bench/kernel_coverage.py`
+// consumer calls that the table above did not time. The `kernel_coverage` bin
 // reads which kernels this binary dispatched, so each lane is an entry point's
 // reason to be in the metallib. Shapes are a model's own (a decode step's, a
 // 4096 x 2048 projection, BERT-base's 768); correctness is checked by the

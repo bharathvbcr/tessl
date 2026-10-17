@@ -75,7 +75,7 @@
 //! `qwen35_adamw` has a kernel for, on a random tower at that config's shapes:
 //! an f32 tower under `UpdateRule::F32`, and a bf16 tower under each bf16 rule
 //! with a fresh f32 gradient set and with a bf16 bank. It is what puts every
-//! step kernel in `bench/kernel_coverage.py`'s trace; it times nothing the
+//! step kernel in the `kernel_coverage` bin's trace; it times nothing the
 //! `--clip` lane does not.
 //!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
@@ -1128,7 +1128,7 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Every exit path, an error included, prints the kernel trace (a no-op
-    // unless `TESSL_KERNEL_TRACE` is set; `bench/kernel_coverage.py` reads it).
+    // unless `TESSL_KERNEL_TRACE` is set; the `kernel_coverage` bin reads it).
     let outcome = run();
     common::emit_kernel_trace();
     outcome

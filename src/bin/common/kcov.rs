@@ -23,6 +23,12 @@
 //! look up; `bench_gemm_sweep --dump-metallib PATH` writes those bytes out and
 //! `metal-nm` reads them.
 //!
+//! Kernels that only a test or a diagnostic reaches are listed, each with a
+//! reason, in `bench/kernel_coverage_allowlist.txt` (format and classes:
+//! [`load_allowlist`]). The list fails the check when an entry is stale (no
+//! longer a kernel) or redundant (a bench dispatches it), so it cannot outlive the
+//! fact it records and cannot hide a kernel that gained a lane.
+//!
 //! This is the Rust owner of what `bench/kernel_coverage.py` did. Included with
 //! `#[path]` by the `kernel_coverage` bin and by `tests/kernel_coverage.rs`.
 
@@ -34,7 +40,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use crate::proc::{first_chars, run_bounded};
-use crate::pyjson::{obj, quote_list, Doc};
+use crate::pyjson::{obj, quote, quote_list, Doc};
 
 /// Exit status of a run that found gaps.
 pub const EXIT_GAPS: i32 = 1;
@@ -633,7 +639,8 @@ pub fn dump_embedded_metallib(binary: &Path, directory: &Path) -> Res<PathBuf> {
 // --------------------------------------------------------------------- suites
 
 /// One benchmark invocation: the binary, its arguments (`{tmp}` is the scratch
-/// directory), and the environment that makes it cover its own breadth.
+/// directory, `{crate}` this crate's root), and the environment that makes it
+/// cover its own breadth.
 pub struct Suite {
     pub name: &'static str,
     pub argv: Vec<&'static str>,
@@ -755,6 +762,54 @@ pub fn suites() -> Vec<Suite> {
                 ("BENCH_ROUNDS", "1"),
             ],
         ),
+        // Qwen3.5 inference at the 2B's shapes on random weights (no checkpoint):
+        // prefill (the chunked GDN rule, both attention routes), the other GDN
+        // scan slice, per-token decode, the attention tile variants, the paired
+        // attention and recurrent-rule lanes. T = 256 is past the short-prefix
+        // route, so the tiled prefill attention runs.
+        suite("bench_qwen35_layers", &["256", "--iters=1"], &[]),
+        suite("bench_qwen35_layers", &["--gdn-scan32", "256", "--iters=1"], &[]),
+        suite("bench_qwen35_layers", &["--decode=64", "--iters=1"], &[]),
+        suite("bench_qwen35_layers", &["--attn-tiles", "256"], &[]),
+        suite("bench_qwen35_layers", &["--paired-attn", "256"], &[]),
+        suite("bench_qwen35_layers", &["--paired-gdn-recurrent", "1"], &[]),
+        // Qwen3.5 training: the per-op gate (every forward and backward op at the
+        // 2B's shapes, f32 and bf16 operands), whole steps and a clipped optimizer
+        // step on the test fixture's tiny tower (f32 and bf16 storage), a padded
+        // batch with a span row, and every AdamW step kernel.
+        suite("bench_qwen35_train", &["64", "--check-only"], &[]),
+        suite("bench_qwen35_train", &["64", "--check-only", "--bf16"], &[]),
+        suite(
+            "bench_qwen35_train",
+            &[
+                "64",
+                "--step=64",
+                "--clip=64",
+                "--batch=2,16,1",
+                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
+            ],
+            &[],
+        ),
+        suite(
+            "bench_qwen35_train",
+            &[
+                "64",
+                "--storage=bf16",
+                "--step=64",
+                "--clip=64",
+                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
+            ],
+            &[],
+        ),
+        suite(
+            "bench_qwen35_train",
+            &[
+                "64",
+                "--adamw-matrix",
+                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
+            ],
+            &[],
+        ),
     ]);
     v
 }
@@ -797,7 +852,10 @@ pub fn run_suites(suites: &[Suite], bin: &Path, tmp: &Path, crate_dir: &Path, su
         let argv: Vec<String> = s
             .argv
             .iter()
-            .map(|a| a.replace("{tmp}", &tmp.to_string_lossy()))
+            .map(|a| {
+                a.replace("{tmp}", &tmp.to_string_lossy())
+                    .replace("{crate}", &crate_dir.to_string_lossy())
+            })
             .collect();
         let mut cmd = Command::new(&binary);
         cmd.args(&argv).env("TESSL_KERNEL_TRACE", "1");
@@ -842,16 +900,29 @@ pub fn run_suites(suites: &[Suite], bin: &Path, tmp: &Path, crate_dir: &Path, su
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let key = format!(
+        // Every argument but the scratch paths, before substitution, so two
+        // suites that differ past their first argument keep separate rows.
+        let label = s
+            .argv
+            .iter()
+            .filter(|a| !a.contains("{tmp}"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let key = config_basename(&format!(
             "{}{}{}",
             s.name,
-            argv.first().map_or(String::new(), |a| format!(" {a}")),
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!(" {label}")
+            },
             if tag.is_empty() {
                 String::new()
             } else {
                 format!(" {tag}")
             }
-        );
+        ));
         match t.per_suite.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => slot.1 = got.clone(),
             None => t.per_suite.push((key, got.clone())),
@@ -861,19 +932,132 @@ pub fn run_suites(suites: &[Suite], bin: &Path, tmp: &Path, crate_dir: &Path, su
     t
 }
 
+/// `--random-config=` values in a suite label cut to the file name (Python's
+/// `re.sub(r"--random-config=\S*/", "--random-config=", key)`).
+fn config_basename(key: &str) -> String {
+    const FLAG: &str = "--random-config=";
+    let mut out = String::with_capacity(key.len());
+    let mut rest = key;
+    while let Some(i) = rest.find(FLAG) {
+        let after = i + FLAG.len();
+        out.push_str(&rest[..after]);
+        let value_end = rest[after..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |j| after + j);
+        let value = &rest[after..value_end];
+        out.push_str(value.rfind('/').map_or(value, |j| &value[j + 1..]));
+        rest = &rest[value_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+// ------------------------------------------------------------------ allowlist
+
+/// What may stand in for a bench lane. Each says why no bench dispatches the
+/// kernel; the detail after the class starts with a repo path that exists (the
+/// test, probe, or source file that is the kernel's only caller).
+pub const ALLOW_CLASSES: [&str; 4] = ["test-only", "probe", "one-shot", "tune-variant"];
+
+/// The committed allowlist.
+pub fn allowlist_path() -> PathBuf {
+    crate_root().join("bench/kernel_coverage_allowlist.txt")
+}
+
+fn is_identifier(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && !b[0].is_ascii_digit() && b.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
+}
+
+/// `{kernel: reason}` from the allowlist at `path`.
+///
+/// One entry per line, `kernel: class: path detail`; `#` starts a comment.
+/// `class` is one of [`ALLOW_CLASSES`] and the detail's first word is a path under
+/// `crate_dir` that exists, so a reason names the file that is the kernel's only
+/// caller ("test-only" alone is not a reason). A missing file is an empty
+/// allowlist; a malformed line or a repeated kernel is [`Failure::Found`], never
+/// skipped (so is a file that is not UTF-8). A file that exists but cannot be read
+/// is [`Failure::CannotRun`].
+pub fn load_allowlist(path: &Path, crate_dir: &Path) -> Res<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return found(format!("{}: not UTF-8 text: {e}", path.display()))
+        }
+        Err(e) => return cannot(format!("{}: {e}", path.display())),
+    };
+    let file = path
+        .file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let at = format!("{file}:{}", n + 1);
+        let parsed = line.split_once(':').and_then(|(name, rest)| {
+            let (class, detail) = rest.split_once(':')?;
+            Some((name.trim(), class.trim(), detail.trim()))
+        });
+        let Some((name, class, detail)) = parsed.filter(|(name, _, _)| is_identifier(name)) else {
+            return found(format!(
+                "{at}: expected `kernel: class: path detail`, got {}",
+                quote(line)
+            ));
+        };
+        if !ALLOW_CLASSES.contains(&class) {
+            return found(format!(
+                "{at}: {name}: class {} is not one of ({})",
+                quote(class),
+                ALLOW_CLASSES.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !detail
+            .split_whitespace()
+            .next()
+            .is_some_and(|p| crate_dir.join(p).exists())
+        {
+            return found(format!(
+                "{at}: {name}: the reason must start with a path that exists under the crate, got {}",
+                quote(detail)
+            ));
+        }
+        if out.insert(name.to_string(), format!("{class}: {detail}")).is_some() {
+            return found(format!("{at}: {name} is listed twice"));
+        }
+    }
+    Ok(out)
+}
+
+/// `(stale, redundant)`: allowlisted names that are not kernels, and allowlisted
+/// names a bench dispatches. Either one fails `--check`.
+pub fn audit_allowlist(
+    allowed: &BTreeMap<String, String>,
+    names: &BTreeSet<String>,
+    traced: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let stale = allowed.keys().filter(|k| !names.contains(*k)).cloned().collect();
+    let redundant = allowed.keys().filter(|k| traced.contains(*k)).cloned().collect();
+    (stale, redundant)
+}
+
 // --------------------------------------------------------------------- report
 
 /// The coverage report, as the lines the tool prints and the JSON it writes.
 pub struct Report {
     pub text: String,
     pub doc: Doc,
-    pub missing: usize,
+    /// Kernels neither dispatched nor allowlisted, stale allowlist entries, and
+    /// allowlisted kernels a bench dispatches: one line each kind. Empty is a pass.
+    pub problems: Vec<String>,
 }
 
 /// Compare a trace against the census. A traced name absent from the inventory
 /// means the inventory is wrong, which is exactly the failure this tool exists
 /// to prevent.
-pub fn report(census: &Census, traced: &Traced) -> Res<Report> {
+pub fn report(census: &Census, traced: &Traced, allowed: &BTreeMap<String, String>) -> Res<Report> {
     let stray: Vec<&String> = traced.traced.difference(&census.names).collect();
     if !stray.is_empty() {
         let head: Vec<&str> = stray.iter().take(8).map(|s| s.as_str()).collect();
@@ -886,18 +1070,27 @@ pub fn report(census: &Census, traced: &Traced) -> Res<Report> {
     }
     let covered: Vec<&String> = traced.traced.iter().collect();
     let missing: Vec<&String> = census.names.difference(&traced.traced).collect();
+    let (stale, redundant) = audit_allowlist(allowed, &census.names, &traced.traced);
+    let gaps: Vec<&String> = missing.iter().copied().filter(|k| !allowed.contains_key(*k)).collect();
     let pct = 100.0 * covered.len() as f64 / census.names.len() as f64;
     let mut text = String::new();
     text.push_str(&format!("kernel entry points : {}\n", census.names.len()));
     text.push_str(&format!("dispatched by a bench: {}  ({pct:.0}%)\n", covered.len()));
-    text.push_str(&format!("never dispatched     : {}\n\n", missing.len()));
+    text.push_str(&format!(
+        "allowlisted          : {}\n",
+        allowed.len() - stale.len() - redundant.len()
+    ));
+    text.push_str(&format!("remaining            : {}\n\n", gaps.len()));
     for (suite, got) in &traced.per_suite {
         text.push_str(&format!("  {suite:<40}{:>4} kernels\n", got.len()));
     }
-    if !missing.is_empty() {
-        text.push_str("\nuncovered, by file:\n");
+    if !gaps.is_empty() {
+        text.push_str("\nuncovered and not allowlisted, by file:\n");
         for (f, ks) in &census.by_file {
-            let gap: Vec<&String> = ks.difference(&traced.traced).collect();
+            let gap: Vec<&String> = ks
+                .difference(&traced.traced)
+                .filter(|k| !allowed.contains_key(*k))
+                .collect();
             if !gap.is_empty() {
                 let head: Vec<&str> = gap.iter().take(4).map(|s| s.as_str()).collect();
                 text.push_str(&format!(
@@ -915,6 +1108,18 @@ pub fn report(census: &Census, traced: &Traced) -> Res<Report> {
         ("covered", strs(&covered)),
         ("missing", strs(&missing)),
         (
+            "allowlisted",
+            Doc::Obj(
+                missing
+                    .iter()
+                    .filter_map(|k| allowed.get(*k).map(|why| (k.to_string(), Doc::str(why.as_str()))))
+                    .collect(),
+            ),
+        ),
+        ("unallowlisted_missing", strs(&gaps)),
+        ("stale_allowlist", Doc::strs(&stale)),
+        ("redundant_allowlist", Doc::strs(&redundant)),
+        (
             "per_suite",
             Doc::Obj(
                 traced
@@ -925,9 +1130,27 @@ pub fn report(census: &Census, traced: &Traced) -> Res<Report> {
             ),
         ),
     ]);
-    Ok(Report {
-        text,
-        doc,
-        missing: missing.len(),
-    })
+    let mut problems = Vec::new();
+    if !gaps.is_empty() {
+        problems.push(format!(
+            "{} kernel(s) have no timing lane and are not allowlisted: {}",
+            gaps.len(),
+            quote_list(&gaps)
+        ));
+    }
+    if !stale.is_empty() {
+        problems.push(format!(
+            "{} allowlist entr(ies) are not kernels any more: {}",
+            stale.len(),
+            quote_list(&stale)
+        ));
+    }
+    if !redundant.is_empty() {
+        problems.push(format!(
+            "{} allowlisted kernel(s) are dispatched by a bench; remove them from the allowlist: {}",
+            redundant.len(),
+            quote_list(&redundant)
+        ));
+    }
+    Ok(Report { text, doc, problems })
 }

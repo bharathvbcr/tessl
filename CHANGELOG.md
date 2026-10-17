@@ -8,6 +8,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **`kernel_coverage` is Rust and takes an allowlist.** `bench/kernel_coverage.py`
+  and its tests moved to `src/bin/kernel_coverage.rs` (`src/bin/common/kcov.rs`,
+  `tests/kernel_coverage.rs`). Kernels only a test or a diagnostic reaches can be
+  listed in `bench/kernel_coverage_allowlist.txt` with a class and the path of
+  their only caller; `--check` fails on an undispatched kernel that is not
+  listed and on an entry that is stale or that a bench dispatches.
+  `--audit-allowlist` checks the list against the census with no GPU. The
+  suites gain the Qwen3.5 inference and training benches. The committed
+  allowlist has no entries yet (ft-6d88defb).
 - **EmbeddingGemma 2 multimodal call: one host wait, towers' soft tokens stay on
   the device** (audit gaps G6, G8; `EmbedGemma2Multimodal::encode`, so the C
   `tessl_embedgemma2_{encode_images, encode_audio}` entries and Python's

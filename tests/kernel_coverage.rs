@@ -21,7 +21,7 @@ mod proc;
 mod pyjson;
 
 use kcov::{Census, Failure, Traced};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -490,6 +490,8 @@ fn fake_release(tag: &str, trace: &str) -> kcov::TempDir {
         "bench_nn_kernels",
         "bench_gemm_variants",
         "bench_gemm_routes",
+        "bench_qwen35_layers",
+        "bench_qwen35_train",
     ] {
         fake_bin(
             &d.path().join("release"),
@@ -526,7 +528,44 @@ fn run_one(bin: &Path, s: kcov::Suite) -> Traced {
 }
 
 #[test]
-fn a_suite_is_labelled_by_its_binary_first_argument_and_knobs_and_its_trace_is_the_last_line() {
+fn a_suite_label_keeps_every_argument_but_scratch_paths_and_cuts_a_config_to_its_name() {
+    let d = tmp("label-args");
+    let bin = d.path().join("release");
+    fake_bin(&bin, "bench_qwen35_train", "echo 'KERNEL_TRACE a' >&2");
+    let t = kcov::run_suites(
+        &[
+            one_suite("bench_qwen35_train", &["64", "--check-only"], &[]),
+            one_suite("bench_qwen35_train", &["64", "--check-only", "--bf16"], &[]),
+            one_suite(
+                "bench_qwen35_train",
+                &[
+                    "64",
+                    "--step=64",
+                    "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
+                ],
+                &[],
+            ),
+        ],
+        &bin,
+        &bin,
+        &kcov::crate_root(),
+        60,
+    );
+    assert!(t.failures.is_empty(), "{:?}", t.failures);
+    let labels: Vec<&str> = t.per_suite.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "bench_qwen35_train 64 --check-only",
+            "bench_qwen35_train 64 --check-only --bf16",
+            "bench_qwen35_train 64 --step=64 --random-config=config.json",
+        ],
+        "suites that differ past their first argument keep their own rows"
+    );
+}
+
+#[test]
+fn a_suite_is_labelled_by_its_binary_arguments_and_knobs_and_its_trace_is_the_last_line() {
     let d = tmp("label");
     let bin = d.path().join("release");
     fake_bin(
@@ -623,12 +662,36 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
 fn the_suite_list_reaches_the_breadth_it_claims() {
     let s = kcov::suites();
     // 2 sweep runs, 1 base + 9 decode (R x chunk) + 9 rows (R x SGT) + 1 tiled
-    // attention runs, nn kernels, variants, routes.
-    assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3);
-    assert!(s.iter().all(|x| x
-        .env
-        .iter()
-        .any(|(k, _)| *k == "BENCH_ITERS" || *k == "BENCH_PARITY_SEEDS" || *k == "BENCH_REPS")));
+    // attention runs, nn kernels, variants, routes, 6 Qwen3.5 inference and 5
+    // Qwen3.5 training runs.
+    assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3 + 6 + 5);
+    // Every suite is a probe, not a measurement: bounded by its environment or,
+    // for the Qwen3.5 benches, by its arguments.
+    let bounded_by_args = |a: &str| {
+        a == "--iters=1"
+            || a == "--check-only"
+            || a == "--adamw-matrix"
+            || a == "--attn-tiles"
+            || a.starts_with("--step=")
+            || a.starts_with("--paired-")
+    };
+    for x in &s {
+        assert!(
+            x.env
+                .iter()
+                .any(|(k, _)| *k == "BENCH_ITERS" || *k == "BENCH_PARITY_SEEDS" || *k == "BENCH_REPS")
+                || x.argv.iter().any(|a| bounded_by_args(a)),
+            "{} {:?} is unbounded",
+            x.name,
+            x.argv
+        );
+        // A `{crate}` path names a file that exists.
+        for a in &x.argv {
+            if let Some((_, rel)) = a.split_once("{crate}/") {
+                assert!(kcov::crate_root().join(rel).is_file(), "{a}");
+            }
+        }
+    }
     let attn: Vec<&kcov::Suite> = s.iter().filter(|x| x.name == "bench_flash_attn").collect();
     let combos: BTreeSet<(String, String)> = attn
         .iter()
@@ -685,18 +748,21 @@ fn the_report_counts_names_the_uncovered_by_file_and_truncates_at_four() {
         ("beta", &["b1"]),
     ]);
     let t = traced(&[("bench_x", &["a1", "b1"]), ("bench_y --flag", &["z1", "a1"])]);
-    let r = kcov::report(&c, &t).unwrap();
+    let r = kcov::report(&c, &t, &BTreeMap::new()).unwrap();
     // `print(f"  {suite:<40}{len(got):>4} kernels")` and
     // `print(f"  {f:<24}{len(gap):>3}  {names}")`, spelled out.
     let expected = format!(
-        "kernel entry points : 8\ndispatched by a bench: 3  (38%)\nnever dispatched     : 5\n\n  {:<40}{:>4} kernels\n  {:<40}{:>4} kernels\n\nuncovered, by file:\n  {:<24}{:>3}  a2, a3, a4, a5 ...\n",
+        "kernel entry points : 8\ndispatched by a bench: 3  (38%)\nallowlisted          : 0\nremaining            : 5\n\n  {:<40}{:>4} kernels\n  {:<40}{:>4} kernels\n\nuncovered and not allowlisted, by file:\n  {:<24}{:>3}  a2, a3, a4, a5 ...\n",
         "bench_x", 2, "bench_y --flag", 2, "alpha", 5
     );
     assert_eq!(r.text, expected);
-    assert_eq!(r.missing, 5);
+    assert_eq!(
+        r.problems,
+        ["5 kernel(s) have no timing lane and are not allowlisted: ['a2', 'a3', 'a4', 'a5', 'a6']"]
+    );
     assert_eq!(
         r.doc.dumps().unwrap(),
-        "{\n  \"entry_points\": 8,\n  \"covered\": [\n    \"a1\",\n    \"b1\",\n    \"z1\"\n  ],\n  \"missing\": [\n    \"a2\",\n    \"a3\",\n    \"a4\",\n    \"a5\",\n    \"a6\"\n  ],\n  \"per_suite\": {\n    \"bench_x\": [\n      \"a1\",\n      \"b1\"\n    ],\n    \"bench_y --flag\": [\n      \"a1\",\n      \"z1\"\n    ]\n  }\n}"
+        "{\n  \"entry_points\": 8,\n  \"covered\": [\n    \"a1\",\n    \"b1\",\n    \"z1\"\n  ],\n  \"missing\": [\n    \"a2\",\n    \"a3\",\n    \"a4\",\n    \"a5\",\n    \"a6\"\n  ],\n  \"allowlisted\": {},\n  \"unallowlisted_missing\": [\n    \"a2\",\n    \"a3\",\n    \"a4\",\n    \"a5\",\n    \"a6\"\n  ],\n  \"stale_allowlist\": [],\n  \"redundant_allowlist\": [],\n  \"per_suite\": {\n    \"bench_x\": [\n      \"a1\",\n      \"b1\"\n    ],\n    \"bench_y --flag\": [\n      \"a1\",\n      \"z1\"\n    ]\n  }\n}"
     );
 }
 
@@ -708,7 +774,7 @@ fn the_percentage_rounds_half_to_even_as_python_did() {
     let all: Vec<&str> = names.iter().map(String::as_str).collect();
     let c = census(&[("f", &all)]);
     for (n, want) in [(1, "0%"), (3, "2%"), (5, "2%"), (7, "4%"), (200, "100%")] {
-        let r = kcov::report(&c, &traced(&[("s", &all[..n])])).unwrap();
+        let r = kcov::report(&c, &traced(&[("s", &all[..n])]), &BTreeMap::new()).unwrap();
         assert!(r.text.contains(&format!("({want})")), "{n}/200: {}", r.text);
     }
 }
@@ -717,7 +783,7 @@ fn the_percentage_rounds_half_to_even_as_python_did() {
 fn a_kernel_traced_but_absent_from_the_census_means_the_census_is_wrong() {
     let c = census(&[("f", &["a", "b"])]);
     let t = traced(&[("s", &["a", "ghost"])]);
-    let Err(err) = kcov::report(&c, &t) else {
+    let Err(err) = kcov::report(&c, &t, &BTreeMap::new()) else {
         panic!("accepted")
     };
     assert!(err.message().contains("absent from the source inventory"), "{err:?}");
@@ -728,8 +794,8 @@ fn a_kernel_traced_but_absent_from_the_census_means_the_census_is_wrong() {
 #[test]
 fn a_fully_covered_census_reports_no_gap_section() {
     let c = census(&[("f", &["a", "b"])]);
-    let r = kcov::report(&c, &traced(&[("s", &["a", "b"])])).unwrap();
-    assert_eq!(r.missing, 0);
+    let r = kcov::report(&c, &traced(&[("s", &["a", "b"])]), &BTreeMap::new()).unwrap();
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
     assert!(!r.text.contains("uncovered"), "{}", r.text);
     assert!(r.text.contains("(100%)"));
 }
@@ -793,7 +859,14 @@ fn an_unrunnable_check_has_its_own_exit_status() {
 
 #[test]
 fn a_bad_command_line_exits_2() {
-    for args in [&["--bogus"][..], &["--metallib"], &["--check=1"], &["extra"]] {
+    for args in [
+        &["--bogus"][..],
+        &["--metallib"],
+        &["--check=1"],
+        &["--audit-allowlist=1"],
+        &["--allowlist"],
+        &["extra"],
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_kernel_coverage"))
             .args(args)
             .output()
@@ -824,10 +897,11 @@ fn the_command_line_reports_gaps_with_exit_1_only_under_check_and_writes_the_doc
     );
     assert!(stdout.starts_with("kernel entry points : "), "{stdout}");
     assert!(stdout.contains("dispatched by a bench: 2  ("), "{stdout}");
-    assert!(stdout.contains("uncovered, by file:"), "{stdout}");
+    assert!(stdout.contains("uncovered and not allowlisted, by file:"), "{stdout}");
+    let last = stdout.lines().last().unwrap_or_default();
     assert!(
-        stdout.ends_with("\n\n"),
-        "no PASS line when kernels are uncovered: {stdout:?}"
+        last.contains("kernel(s) have no timing lane and are not allowlisted: [") && last.ends_with(']'),
+        "the gaps end stdout as a problem line: {stdout:?}"
     );
     assert!(!stdout.contains("PASS"), "{stdout}");
     let doc = std::fs::read_to_string(&out_json).unwrap();
@@ -890,4 +964,202 @@ fn the_command_line_refuses_a_stale_bench_binary() {
     let (_, err) = text(&out);
     assert_eq!(out.status.code(), Some(kcov::EXIT_CANNOT_RUN), "{err}");
     assert!(err.contains("older than kernels/*.metal"), "{err}");
+}
+
+// ------------------------------------------------------------------ allowlist
+
+/// The committed allowlist stands in for a bench lane only while it is true.
+fn allow_crate(tag: &str, allowlist_text: &str) -> (kcov::TempDir, PathBuf) {
+    let d = tmp(tag);
+    write(&d.path().join("tests/t.rs"), "// the kernel's only caller\n");
+    let path = d.path().join("allow.txt");
+    write(&path, allowlist_text);
+    (d, path)
+}
+
+fn load(tag: &str, text: &str) -> Result<BTreeMap<String, String>, Failure> {
+    let (d, path) = allow_crate(tag, text);
+    kcov::load_allowlist(&path, d.path())
+}
+
+#[test]
+fn an_allowlist_entry_names_its_class_and_an_existing_file() {
+    let got = load(
+        "allow-ok",
+        "# comment\nk_one: test-only: tests/t.rs the only caller\n\nk_two: probe: tests/t.rs  # trailing comment\n",
+    )
+    .unwrap();
+    let want: BTreeMap<String, String> = [
+        ("k_one", "test-only: tests/t.rs the only caller"),
+        ("k_two", "probe: tests/t.rs"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_bare_allowlist_class_is_not_a_reason() {
+    for line in [
+        "k: test-only\n",
+        "k: test-only:\n",
+        "k:\n",
+        "k\n",
+        "2k: probe: tests/t.rs\n",
+    ] {
+        let err = load("allow-bare", line).expect_err(line);
+        assert_eq!(err.exit_code(), kcov::EXIT_GAPS, "{line:?}: {err:?}");
+    }
+}
+
+#[test]
+fn an_allowlist_reason_must_name_a_file_that_exists() {
+    let err = load("allow-gone", "k: test-only: tests/gone.rs it used to be here\n").unwrap_err();
+    assert!(err.message().contains("exist"), "{err:?}");
+    assert_eq!(err.exit_code(), kcov::EXIT_GAPS);
+}
+
+#[test]
+fn an_unknown_allowlist_class_is_refused() {
+    let err = load("allow-class", "k: whim: tests/t.rs\n").unwrap_err();
+    assert!(err.message().contains("class 'whim'"), "{err:?}");
+}
+
+#[test]
+fn a_kernel_allowlisted_twice_is_refused() {
+    let err = load("allow-twice", "k: probe: tests/t.rs\nk: probe: tests/t.rs\n").unwrap_err();
+    assert!(err.message().contains("allow.txt:2: k is listed twice"), "{err:?}");
+}
+
+#[test]
+fn an_allowlist_that_is_not_utf8_is_malformed() {
+    let (d, path) = allow_crate("allow-bytes", "");
+    std::fs::write(&path, b"k: probe: tests/t.rs \xff\n").unwrap();
+    let err = kcov::load_allowlist(&path, d.path()).unwrap_err();
+    assert_eq!(err.exit_code(), kcov::EXIT_GAPS, "{err:?}");
+    assert!(err.message().contains("not UTF-8"), "{err:?}");
+}
+
+#[test]
+fn the_committed_allowlist_loads() {
+    kcov::load_allowlist(&kcov::allowlist_path(), &kcov::crate_root()).expect("bench/kernel_coverage_allowlist.txt");
+}
+
+#[test]
+fn a_missing_allowlist_is_empty() {
+    let got = kcov::load_allowlist(Path::new("/nonexistent/allow.txt"), &kcov::crate_root()).unwrap();
+    assert!(got.is_empty());
+}
+
+#[test]
+fn stale_and_redundant_allowlist_entries_are_found() {
+    let allowed: BTreeMap<String, String> = ["gone", "b", "c"]
+        .into_iter()
+        .map(|k| (k.to_string(), "x".to_string()))
+        .collect();
+    let (stale, redundant) = kcov::audit_allowlist(&allowed, &set(&["a", "b", "c"]), &set(&["a", "c"]));
+    assert_eq!((stale, redundant), (vec!["gone".to_string()], vec!["c".to_string()]));
+    let consistent: BTreeMap<String, String> = [("b".to_string(), "x".to_string())].into_iter().collect();
+    assert_eq!(
+        kcov::audit_allowlist(&consistent, &set(&["a", "b"]), &set(&["a"])),
+        (vec![], vec![])
+    );
+}
+
+#[test]
+fn the_report_subtracts_the_allowlist_and_names_stale_and_redundant_entries() {
+    let c = census(&[("f", &["a", "b", "c", "d"])]);
+    let t = traced(&[("s", &["a", "c"])]);
+    let allowed: BTreeMap<String, String> = [("b", "test-only: tests/t.rs"), ("c", "probe: x"), ("gone", "probe: x")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let r = kcov::report(&c, &t, &allowed).unwrap();
+    assert!(
+        r.text.contains("allowlisted          : 1\nremaining            : 1\n"),
+        "{}",
+        r.text
+    );
+    assert!(
+        r.text.contains("uncovered and not allowlisted, by file:\n  f"),
+        "{}",
+        r.text
+    );
+    assert!(r.text.contains("  1  d\n"), "only d is a gap: {}", r.text);
+    assert_eq!(
+        r.problems,
+        [
+            "1 kernel(s) have no timing lane and are not allowlisted: ['d']",
+            "1 allowlist entr(ies) are not kernels any more: ['gone']",
+            "1 allowlisted kernel(s) are dispatched by a bench; remove them from the allowlist: ['c']",
+        ]
+    );
+    let doc = r.doc.dumps().unwrap();
+    assert!(
+        doc.contains("\"allowlisted\": {\n    \"b\": \"test-only: tests/t.rs\"\n  }"),
+        "{doc}"
+    );
+    assert!(doc.contains("\"unallowlisted_missing\": [\n    \"d\"\n  ]"), "{doc}");
+
+    // Every gap allowlisted and nothing stale or redundant is a pass.
+    let exact: BTreeMap<String, String> = [("b", "probe: x"), ("d", "probe: x")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let r = kcov::report(&c, &t, &exact).unwrap();
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
+    assert!(!r.text.contains("uncovered"), "{}", r.text);
+}
+
+#[test]
+fn a_malformed_allowlist_stops_the_command_line_before_any_suite_runs() {
+    // An empty target would be "could not run" (77); the allowlist is read first.
+    let empty = tmp("allow-cli-target");
+    let (_d, path) = allow_crate("allow-cli", "k: whim: tests/t.rs\n");
+    let out = tool(empty.path())
+        .arg("--check")
+        .arg("--allowlist")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let (_, err) = text(&out);
+    assert_eq!(out.status.code(), Some(kcov::EXIT_GAPS), "{err}");
+    assert!(err.contains("class 'whim'"), "{err}");
+}
+
+#[test]
+fn the_allowlist_audit_runs_no_suite_and_fails_only_on_a_stale_entry() {
+    // No bench binary at all: the audit needs the census only.
+    let empty = tmp("audit-target");
+    let d = tmp("audit");
+    let good = d.path().join("good.txt");
+    write(
+        &good,
+        "rms_norm_f32: test-only: tests/kernel_coverage.rs the census test\n",
+    );
+    let out = tool(empty.path())
+        .arg("--audit-allowlist")
+        .arg("--allowlist")
+        .arg(&good)
+        .output()
+        .unwrap();
+    let (stdout, err) = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        stdout.starts_with("allowlist: 1 entries, every one a kernel of the "),
+        "{stdout}"
+    );
+
+    let stale = d.path().join("stale.txt");
+    write(&stale, "not_a_kernel_name: probe: tests/kernel_coverage.rs\n");
+    let out = tool(empty.path())
+        .arg("--audit-allowlist")
+        .arg("--allowlist")
+        .arg(&stale)
+        .output()
+        .unwrap();
+    let (_, err) = text(&out);
+    assert_eq!(out.status.code(), Some(kcov::EXIT_GAPS), "{err}");
+    assert!(err.contains("['not_a_kernel_name']"), "{err}");
 }

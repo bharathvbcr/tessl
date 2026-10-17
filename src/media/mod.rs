@@ -41,6 +41,7 @@ pub mod image;
 mod integrity;
 mod mp3;
 mod orient;
+pub mod resample;
 pub mod video;
 
 pub use audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, DecodedAudio, Downmix};

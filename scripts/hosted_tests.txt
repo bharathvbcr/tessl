@@ -37,7 +37,7 @@ bin media_leaks 1
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
-bin plot_results 53
+bin plot_results 55
 bin reader_bounds 12
 bin qwen35_config 8
 bin relaxed_predicate 1

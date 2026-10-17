@@ -24,6 +24,7 @@ mod json;
 
 mod chart;
 mod data;
+mod jpeg;
 mod media;
 mod memory;
 mod paired;

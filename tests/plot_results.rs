@@ -23,6 +23,9 @@ mod chart;
 #[path = "../src/bin/plot_results/data.rs"]
 mod data;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/jpeg.rs"]
+mod jpeg;
+#[allow(dead_code)]
 #[path = "../src/json.rs"]
 mod json;
 #[allow(dead_code)]
@@ -384,6 +387,7 @@ const ALL: &[(&str, &str)] = &[
     ("tok", "embedgemma2_tok_m5pro"),
     ("video", "embedgemma2_video_m5pro"),
     ("media-decode", "media_decode_m5pro"),
+    ("jpeg-decode", "jpeg_decode_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1175,52 @@ fn media_decode_refuses_an_empty_list_and_an_unknown_unit() {
     let r = run(&["media-decode", p.to_str().unwrap()]);
     assert_eq!(r.code, Some(1));
     assert!(r.err.contains("unknown unit \"bytes\""), "{}", r.err);
+    assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn jpeg_decode_draws_a_native_and_an_imageio_bar_and_median_per_file() {
+    let rows = arr(&parse("jpeg_decode_m5pro.json")).len();
+    assert!(rows > 0);
+    let e = elems("jpeg-decode");
+    assert_eq!(count(&e, "bar"), 2 * rows);
+    assert_eq!(count(&e, "median"), 2 * rows);
+    let svg = render("jpeg-decode").svg;
+    assert!(
+        svg.contains("native (tessl::media::jpeg"),
+        "legend names the native decoder"
+    );
+    assert!(svg.contains("ImageIO"), "legend names ImageIO");
+    assert!(
+        svg.contains("Indicative, not a paired comparison"),
+        "the figure says the numbers are indicative"
+    );
+}
+
+#[test]
+fn jpeg_decode_refuses_an_empty_list_a_missing_key_and_a_time_that_cannot_go_on_a_log_axis() {
+    let dir = fresh("jpeg_bad");
+    let p = write_json(&dir, "jpeg_decode_m5pro.json", "[]");
+    let r = run(&["jpeg-decode", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("empty list, nothing to plot"), "{}", r.err);
+    let row = |extra: &str| {
+        format!(
+            "[{{\"workload\":\"x.jpg\",\"megapixels\":2.0,\"native_ms_min\":1.0,\"native_ms_median\":1.5,{extra}\"iters\":3}}]"
+        )
+    };
+    let p = write_json(&dir, "jpeg_decode_m5pro.json", &row(""));
+    let r = run(&["jpeg-decode", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("imageio_ms_min: missing key"), "{}", r.err);
+    let p = write_json(
+        &dir,
+        "jpeg_decode_m5pro.json",
+        &row("\"imageio_ms_min\":0.0,\"imageio_ms_median\":1.0,"),
+    );
+    let r = run(&["jpeg-decode", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("imageio_ms_min"), "{}", r.err);
     assert!(no_svg_in(&dir));
 }
 

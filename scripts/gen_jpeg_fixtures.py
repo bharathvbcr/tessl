@@ -685,76 +685,97 @@ def lossless_cases():
     k = "lossless"
     rng = np.random.default_rng(77)
     g1, c3, c4 = [(1, 1)], [(1, 1)] * 3, [(1, 1)] * 4
+    # libjpeg-turbo's lossless decoder copies samples and converts nothing: RGB (three components, Adobe transform 0 or the
+    # ids R G B) and CMYK decode; one component (gray to RGB), YCbCr and YCCK are refused when the decompressor starts.
+    # So the matrix is RGB, and a few of the others are filed to show the refusal.
     for psv in range(1, 8):
-        case(f"lossless_gray_psv{psv}", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=psv), k, f"13x11 gray, predictor {psv}")
         p3 = ll_planes(rng, c3, 17, 9)
         case(f"lossless_rgb_psv{psv}", write_lossless(17, 9, c3, p3, psv=psv, adobe=0), k, f"17x9 RGB (Adobe 0), predictor {psv}")
-        case(f"lossless_ycc_psv{psv}", write_lossless(17, 9, c3, p3, psv=psv, jfif=True), k, f"17x9 YCbCr (JFIF), predictor {psv}")
-        case(f"lossless_noise_psv{psv}", write_lossless(9, 8, g1, ll_planes(rng, g1, 9, 8, smooth=False), psv=psv), k, f"noise, predictor {psv}")
+        case(f"lossless_rgb_ids_psv{psv}", write_lossless(17, 9, c3, p3, psv=psv, comp_ids=[82, 71, 66]), k, f"17x9 RGB (ids R G B, no Adobe), predictor {psv}")
+        case(f"lossless_noise_psv{psv}", write_lossless(9, 8, c3, ll_planes(rng, c3, 9, 8, smooth=False), psv=psv, adobe=0), k, f"noise, predictor {psv}")
+    for psv in (1, 4):
+        case(f"lossless_refused_gray_psv{psv}", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=psv), k, "one component: gray to RGB is not converted", tessl="either")
+        case(f"lossless_refused_ycc_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, jfif=True), k, "YCbCr to RGB is not converted", tessl="either")
+        case(f"lossless_refused_adobe1_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, adobe=1), k, "Adobe transform 1 (YCbCr)", tessl="either")
+    case("lossless_refused_ids_123", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=2), k, "no marker, ids 1 2 3: YCbCr", tessl="either")
     for pt in (1, 2, 4, 7):
         for psv in (1, 4, 6, 7):
-            case(f"lossless_pt{pt}_psv{psv}", write_lossless(12, 10, g1, ll_planes(rng, g1, 12, 10, pt=pt), psv=psv, pt=pt), k, f"point transform {pt}, predictor {psv}")
+            case(f"lossless_pt{pt}_psv{psv}", write_lossless(12, 10, c3, ll_planes(rng, c3, 12, 10, pt=pt), psv=psv, pt=pt, adobe=0), k, f"point transform {pt}, predictor {psv}")
     for psv in (1, 3, 7):
         pl = ll_planes(rng, c3, 12, 7)
-        case(f"lossless_ycc_noninterleaved_psv{psv}", write_lossless(12, 7, c3, pl, psv=psv, jfif=True, interleave=False), k, "one scan per component")
+        case(f"lossless_rgb_noninterleaved_psv{psv}", write_lossless(12, 7, c3, pl, psv=psv, adobe=0, interleave=False), k, "one scan per component")
     # sizes
     for (h, w) in [(1, 1), (1, 7), (7, 1), (2, 2), (8, 8), (3, 33), (33, 3)]:
-        case(f"lossless_size_{h}x{w}", write_lossless(w, h, g1, ll_planes(rng, g1, w, h), psv=4), k, f"{h}x{w}, predictor 4")
+        case(f"lossless_size_{h}x{w}", write_lossless(w, h, c3, ll_planes(rng, c3, w, h), psv=4, adobe=0), k, f"{h}x{w}, predictor 4")
     # subsampled components: the reference upsamples without the fancy filter
     for tag, comps in (("h2v1", [(2, 1), (1, 1), (1, 1)]), ("h2v2", [(2, 2), (1, 1), (1, 1)]), ("h1v2", [(1, 2), (1, 1), (1, 1)]),
                        ("h4v1", [(4, 1), (1, 1), (1, 1)]), ("h2v2_all", [(2, 2), (2, 1), (1, 2)])):
         for (w, h) in ((16, 12), (13, 9)):
             pl = ll_planes(rng, comps, w, h)
-            case(f"lossless_sub_{tag}_{h}x{w}", write_lossless(w, h, comps, pl, psv=2, jfif=True), k, f"{tag}, {h}x{w}, predictor 2")
+            case(f"lossless_sub_{tag}_{h}x{w}", write_lossless(w, h, comps, pl, psv=2, adobe=0), k, f"{tag}, {h}x{w}, predictor 2")
     pl = ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12)
-    case("lossless_sub_h2v2_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=5, jfif=True, interleave=False), k,
+    case("lossless_sub_h2v2_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=5, adobe=0, interleave=False), k,
          "4:2:0 in three scans")
     # four components
     p4 = ll_planes(rng, c4, 10, 6)
     case("lossless_cmyk", write_lossless(10, 6, c4, p4, psv=1, adobe=0), k, "CMYK (Adobe 0)")
-    case("lossless_ycck", write_lossless(10, 6, c4, p4, psv=3, adobe=2), k, "YCCK (Adobe 2)")
+    case("lossless_refused_ycck", write_lossless(10, 6, c4, p4, psv=3, adobe=2), k, "YCCK (Adobe 2) to CMYK is not converted", tessl="either")
+    case("lossless_cmyk_ids", write_lossless(10, 6, c4, p4, psv=5), k, "four components, no Adobe marker: CMYK")
     # restart intervals, in MCUs, whole MCU rows
     for restart, (w, h) in ((6, (6, 12)), (12, (6, 12)), (9, (9, 8)), (18, (9, 8))):
-        pl = ll_planes(rng, g1, w, h)
+        pl = ll_planes(rng, c3, w, h)
         for psv in (1, 4, 7):
-            case(f"lossless_rst{restart}_{w}x{h}_psv{psv}", write_lossless(w, h, g1, pl, psv=psv, restart=restart), k, f"restart every {restart} MCUs, predictor {psv}")
+            case(f"lossless_rst{restart}_{w}x{h}_psv{psv}", write_lossless(w, h, c3, pl, psv=psv, restart=restart, adobe=0), k, f"restart every {restart} MCUs, predictor {psv}")
     pl = ll_planes(rng, c3, 5, 9)
-    case("lossless_rst_ycc_interleaved", write_lossless(5, 9, c3, pl, psv=6, jfif=True, restart=10), k, "3 components, restart every 2 rows")
-    case("lossless_rst_ycc_noninterleaved", write_lossless(5, 9, c3, pl, psv=6, jfif=True, restart=5, interleave=False), k, "one scan per component, restart every row")
+    case("lossless_rst_rgb_interleaved", write_lossless(5, 9, c3, pl, psv=6, adobe=0, restart=10), k, "3 components, restart every 2 rows")
+    case("lossless_rst_rgb_noninterleaved", write_lossless(5, 9, c3, pl, psv=6, adobe=0, restart=5, interleave=False), k, "one scan per component, restart every row")
+    pl = ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12)
+    case("lossless_rst_sub_interleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16), k, "4:2:0, restart every 2 MCU rows")
+    case("lossless_rst_sub_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16, interleave=False), k,
+         "4:2:0 in three scans with a restart interval (the interval is checked against the last scan's MCU row)", tessl="either")
     # a scan that ends in a marker before the picture does: the rest is zero differences, i.e. prediction only
-    for name, data in (("gray", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=4)),
-                       ("ycc", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=7, jfif=True)),
-                       ("rst", write_lossless(6, 12, g1, ll_planes(rng, g1, 6, 12), psv=2, restart=12)),
-                       ("sub", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12), psv=3, jfif=True))):
+    for name, data in (("rgb", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=4, adobe=0)),
+                       ("ps7", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=7, adobe=0)),
+                       ("rst", write_lossless(6, 12, c3, ll_planes(rng, c3, 6, 12), psv=2, restart=12, adobe=0)),
+                       ("sub", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12), psv=3, adobe=0))):
         sos = data.find(b"\xff\xda")
         body = sos + 2 + struct.unpack(">H", data[sos + 2:sos + 4])[0]
         for third in (1, 2):
             at = body + (len(data) - 2 - body) * third // 3
             case(f"lossless_cut_{name}_{third}", data[:at] + b"\xff\xd9", k, f"{name} cut {third}/3 of the way into the scan + EOI")
     # what the reference does with a restart interval that is not a whole number of MCU rows
-    pl = ll_planes(rng, g1, 6, 12)
-    case("lossless_rst_partial_row", write_lossless(6, 12, g1, pl, psv=1, restart=4, restart_rows=2), k, "restart interval 4 with 6 MCUs per row", tessl="either")
+    pl = ll_planes(rng, c3, 6, 12)
+    case("lossless_rst_partial_row", write_lossless(6, 12, c3, pl, psv=1, restart=4, restart_rows=2, adobe=0), k, "restart interval 4 with 6 MCUs per row", tessl="either")
+    case("lossless_rst_one_mcu", write_lossless(6, 12, c3, pl, psv=1, restart=1, restart_rows=1, adobe=0), k, "restart interval 1 with 6 MCUs per row", tessl="either")
     # hostile differences: wrap-around at 16 bits, the largest category, values the point transform cannot take back
+    zeros = lambda h, w: [np.zeros((h, w), dtype=np.int64)] * 3  # noqa: E731
     for psv in (1, 2, 3, 4, 5, 6, 7):
-        d = rng.integers(-300, 301, (8, 9))
-        case(f"lossless_wild_diffs_psv{psv}", write_lossless(9, 8, g1, [np.zeros((8, 9), dtype=np.int64)], psv=psv, diffs=[d]), k, f"differences of +-300, predictor {psv}")
-        d = rng.integers(-32768, 32769, (6, 7))
-        case(f"lossless_huge_diffs_psv{psv}", write_lossless(7, 6, g1, [np.zeros((6, 7), dtype=np.int64)], psv=psv, diffs=[d]), k, f"differences over the whole 16-bit range, predictor {psv}")
-    d = rng.integers(-300, 301, (8, 9))
-    case("lossless_wild_diffs_pt3", write_lossless(9, 8, g1, [np.zeros((8, 9), dtype=np.int64)], psv=4, pt=3, diffs=[d]), k, "differences of +-300, point transform 3")
+        d = [rng.integers(-300, 301, (8, 9)) for _ in range(3)]
+        case(f"lossless_wild_diffs_psv{psv}", write_lossless(9, 8, c3, zeros(8, 9), psv=psv, diffs=d, adobe=0), k, f"differences of +-300, predictor {psv}")
+        d = [rng.integers(-32768, 32769, (6, 7)) for _ in range(3)]
+        case(f"lossless_huge_diffs_psv{psv}", write_lossless(7, 6, c3, zeros(6, 7), psv=psv, diffs=d, adobe=0), k, f"differences over the whole 16-bit range, predictor {psv}")
+    d = [rng.integers(-300, 301, (8, 9)) for _ in range(3)]
+    case("lossless_wild_diffs_pt3", write_lossless(9, 8, c3, zeros(8, 9), psv=4, pt=3, diffs=d, adobe=0), k, "differences of +-300, point transform 3")
+    d = [rng.integers(-3, 4, (8, 9)) for _ in range(3)]
+    for prec in (2, 5, 7):
+        case(f"lossless_small_diffs_p{prec}", write_lossless(9, 8, c3, zeros(8, 9), psv=4, precision=prec, diffs=d, adobe=0), k,
+             f"{prec}-bit samples driven past their range by differences of +-3")
     # scan parameters
-    pl = ll_planes(rng, g1, 8, 8)
+    pl = ll_planes(rng, c3, 8, 8)
     for name, kw in (("psv0", dict(scan_ss=0)), ("psv8", dict(scan_ss=8)), ("se1", dict(scan_se=1)), ("ah1", dict(scan_ah=1)),
                      ("pt_eq_precision_minus1", dict(pt=7)), ("pt_eq_precision", dict(pt=8)), ("pt_over_precision", dict(pt=9)),
                      ("pt15", dict(pt=15))):
-        case(f"lossless_params_{name}", write_lossless(8, 8, g1, pl, psv=1, **kw), k, f"scan header: {name}", tessl="either")
-    # precisions: the reference's sample type is 8 bits
+        case(f"lossless_params_{name}", write_lossless(8, 8, c3, pl, psv=1, adobe=0, **kw), k, f"scan header: {name}", tessl="either")
+    for pt in (1, 3):
+        case(f"lossless_params_p4_pt{pt}", write_lossless(8, 8, c3, ll_planes(rng, c3, 8, 8, precision=4, pt=pt), psv=1, adobe=0, precision=4, pt=pt), k,
+             f"4-bit samples, point transform {pt}")
+    for pt in (4, 5):
+        case(f"lossless_params_p4_pt{pt}", write_lossless(8, 8, c3, pl, psv=1, adobe=0, precision=4, pt=pt), k, f"4-bit samples, point transform {pt}", tessl="either")
+    # precisions: torchvision refuses above 8 bits
     for prec in range(2, 17):
-        pl = ll_planes(rng, g1, 8, 6, precision=prec)
-        case(f"lossless_precision_{prec}", write_lossless(8, 6, g1, pl, psv=1, precision=prec), k, f"{prec}-bit samples", tessl="either")
-        if prec != 8:
-            pl = ll_planes(rng, c3, 8, 6, precision=prec)
-            case(f"lossless_precision_{prec}_rgb", write_lossless(8, 6, c3, pl, psv=4, precision=prec, adobe=0), k, f"{prec}-bit RGB", tessl="either")
+        pl = ll_planes(rng, c3, 8, 6, precision=prec)
+        case(f"lossless_precision_{prec}_rgb", write_lossless(8, 6, c3, pl, psv=4, precision=prec, adobe=0), k, f"{prec}-bit RGB", tessl="either")
+        case(f"lossless_precision_{prec}_rgb_p1", write_lossless(8, 6, c3, pl, psv=1, precision=prec, adobe=0), k, f"{prec}-bit RGB, predictor 1", tessl="either")
     # cjpeg's own lossless encoder
     def cj_case(name, im, flags, note, klass=k):
         # cjpeg may refuse an option combination (the lossless encoder has its own limits); that is not a case
@@ -772,7 +793,7 @@ def lossless_cases():
     cj_case("lossless_cjpeg_rgb", im, ["-lossless", "6", "-rgb"], "cjpeg -rgb, predictor 6")
     cj_case("lossless_cjpeg_420", im, ["-lossless", "2", "-sample", "2x2,1x1,1x1"], "cjpeg 4:2:0, predictor 2")
     cj_case("lossless_cjpeg_422", im, ["-lossless", "2", "-sample", "2x1,1x1,1x1"], "cjpeg 4:2:2, predictor 2")
-    cj_case("lossless_cjpeg_restart", im, ["-lossless", "4", "-restart", "2B"], "cjpeg restart")
+    cj_case("lossless_cjpeg_restart", im, ["-lossless", "4", "-restart", "2"], "cjpeg restart every 2 rows")
     cj_case("lossless_cjpeg_arith", im, ["-lossless", "4", "-arithmetic"], "SOF11 lossless arithmetic", klass="error")
     for tag, script, extra in (("scans_split", "0: 4 0 0 0;\n1: 4 0 0 0;\n2: 4 0 0 0;\n", []),
                                ("scans_pt", "0 1 2: 5 0 0 2;\n", []),
@@ -1039,10 +1060,10 @@ def fuzz_bases():
     bases["smooth_arith_cut3"] = pa[:scan_offsets(pa)[3]] + b"\xff\xd9"
     lrng = np.random.default_rng(5)
     g1, l3, l420 = [(1, 1)], [(1, 1)] * 3, [(2, 2), (1, 1), (1, 1)]
-    bases["lossless_gray"] = write_lossless(21, 9, g1, ll_planes(lrng, g1, 21, 9), psv=4)
+    bases["lossless_rgb"] = write_lossless(21, 9, l3, ll_planes(lrng, l3, 21, 9), psv=4, adobe=0)
     bases["lossless_rgb_rst"] = write_lossless(8, 10, l3, ll_planes(lrng, l3, 8, 10), psv=6, adobe=0, restart=16)
-    bases["lossless_420_pt"] = write_lossless(18, 10, l420, ll_planes(lrng, l420, 18, 10, pt=2), psv=7, pt=2, jfif=True)
-    bases["lossless_noninterleaved"] = write_lossless(9, 7, l3, ll_planes(lrng, l3, 9, 7), psv=2, jfif=True, interleave=False)
+    bases["lossless_420_pt"] = write_lossless(18, 10, l420, ll_planes(lrng, l420, 18, 10, pt=2), psv=7, pt=2, adobe=0)
+    bases["lossless_noninterleaved"] = write_lossless(9, 7, l3, ll_planes(lrng, l3, 9, 7), psv=2, adobe=0, interleave=False)
     return bases
 
 

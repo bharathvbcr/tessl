@@ -93,17 +93,17 @@ impl Decoder<'_> {
                         }
                     }
                     Store::Coefs(coefs) => {
-                        for k in 0..nb {
+                        for (k, block) in mcu[..nb].iter_mut().enumerate() {
                             let (ci, bx, by) = self.block_pos(k, mx, my);
                             let at = (by * self.comps[ci].blocks_w + bx) * 64;
-                            mcu[k].copy_from_slice(&coefs[ci][at..at + 64]);
+                            block.copy_from_slice(&coefs[ci][at..at + 64]);
                         }
                     }
                 }
                 self.decode_mcu(&mut mcu[..nb])?;
                 match store {
                     Store::Planes(planes) => {
-                        for k in 0..nb {
+                        for (k, block) in mcu[..nb].iter().enumerate() {
                             let (ci, bx, by) = self.block_pos(k, mx, my);
                             let c = &self.comps[ci];
                             if bx < c.width_in_blocks && by < c.height_in_blocks {
@@ -111,15 +111,15 @@ impl Decoder<'_> {
                                     JpegError::Invalid("internal: component without a quantization table".into())
                                 })?;
                                 let stride = c.blocks_w * 8;
-                                idct::islow(&mcu[k], quant, &mut planes[ci][by * 8 * stride + bx * 8..], stride);
+                                idct::islow(block, quant, &mut planes[ci][by * 8 * stride + bx * 8..], stride);
                             }
                         }
                     }
                     Store::Coefs(coefs) => {
-                        for k in 0..nb {
+                        for (k, block) in mcu[..nb].iter().enumerate() {
                             let (ci, bx, by) = self.block_pos(k, mx, my);
                             let at = (by * self.comps[ci].blocks_w + bx) * 64;
-                            coefs[ci][at..at + 64].copy_from_slice(&mcu[k]);
+                            coefs[ci][at..at + 64].copy_from_slice(block);
                         }
                     }
                 }
@@ -173,14 +173,12 @@ impl Decoder<'_> {
             self.process_restart()?;
         }
         if !self.inp.insufficient {
-            for blkn in 0..self.blocks_in_mcu {
-                let slot = self.mcu_membership[blkn];
+            for (block, &slot) in mcu.iter_mut().zip(&self.mcu_membership[..self.blocks_in_mcu]) {
                 let c = &self.comps[self.scan_comps[slot]];
                 let (Some(dt), Some(at)) = (self.dc_derived[c.dc_tbl].as_ref(), self.ac_derived[c.ac_tbl].as_ref())
                 else {
                     return invalid("internal: Huffman table not derived");
                 };
-                let block = &mut mcu[blkn];
                 let inp = &mut self.inp;
                 let mut s = inp.huff_decode(dt)?;
                 if s != 0 {

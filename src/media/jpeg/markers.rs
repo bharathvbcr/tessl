@@ -186,7 +186,7 @@ impl Decoder<'_> {
         }
         let length = self.inp.src.u16()? as i64;
         let n = usize::from(self.inp.src.byte()?);
-        if length != (n * 2 + 6) as i64 || n < 1 || n > MAX_COMPS_IN_SCAN {
+        if length != (n * 2 + 6) as i64 || !(1..=MAX_COMPS_IN_SCAN).contains(&n) {
             return invalid("SOS length does not match its component count (JERR_BAD_LENGTH)");
         }
         self.cur_comp = [None; MAX_COMPS_IN_SCAN];

@@ -38,8 +38,8 @@ impl Decoder<'_> {
         // updated, because block smoothing reads it.
         for &ci in &self.scan_comps {
             let bits = &mut self.coef_bits[ci];
-            for coefi in self.ss..=self.se {
-                bits[coefi] = self.al as i32;
+            for b in &mut bits[self.ss..=self.se] {
+                *b = self.al as i32;
             }
         }
         for k in 0..self.scan_comps.len() {
@@ -74,8 +74,7 @@ impl Decoder<'_> {
     pub(crate) fn decode_mcu_dc_first(&mut self, mcu: &mut [[i16; 64]]) -> R<()> {
         self.restart_if_due()?;
         if !self.inp.insufficient {
-            for blkn in 0..self.blocks_in_mcu {
-                let slot = self.mcu_membership[blkn];
+            for (block, &slot) in mcu.iter_mut().zip(&self.mcu_membership[..self.blocks_in_mcu]) {
                 let c = &self.comps[self.scan_comps[slot]];
                 let Some(tbl) = self.dc_derived[c.dc_tbl].as_ref() else {
                     return invalid("internal: DC Huffman table not derived");
@@ -89,7 +88,7 @@ impl Decoder<'_> {
                 }
                 let dc = s.wrapping_add(self.last_dc[slot]);
                 self.last_dc[slot] = dc;
-                mcu[blkn][0] = dc.wrapping_shl(self.al) as i16;
+                block[0] = dc.wrapping_shl(self.al) as i16;
             }
         }
         self.count_restart();
@@ -144,10 +143,10 @@ impl Decoder<'_> {
     pub(crate) fn decode_mcu_dc_refine(&mut self, mcu: &mut [[i16; 64]]) -> R<()> {
         self.restart_if_due()?;
         let p1 = 1i16 << self.al;
-        for blkn in 0..self.blocks_in_mcu {
+        for block in mcu.iter_mut().take(self.blocks_in_mcu) {
             self.inp.check_bits(1)?;
             if self.inp.get_bits(1) != 0 {
-                mcu[blkn][0] |= p1;
+                block[0] |= p1;
             }
         }
         self.count_restart();

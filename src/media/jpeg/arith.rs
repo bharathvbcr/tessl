@@ -345,21 +345,21 @@ impl Decoder<'_> {
         if self.arith.coder.ct == -1 {
             return Ok(());
         }
-        for blkn in 0..self.blocks_in_mcu {
-            let k = self.mcu_membership[blkn];
+        for (block, blk_slot) in mcu.iter_mut().zip(0..self.blocks_in_mcu) {
+            let k = self.mcu_membership[blk_slot];
             let c = &self.comps[self.scan_comps[k]];
             let (dct, act) = (c.dc_tbl, c.ac_tbl);
             let Some(dc) = self.arith_dc(k, dct)? else {
                 return Ok(());
             };
-            mcu[blkn][0] = dc as i16;
+            block[0] = dc as i16;
             let mut kk = 1usize;
             while kk <= 63 {
                 match self.arith_ac_coef(act, kk, 63)? {
                     AcStep::Eob => break,
                     AcStep::Overflow => return Ok(()),
                     AcStep::Coef(v, at) => {
-                        mcu[blkn][usize::from(NATURAL_ORDER[at])] = v as i16;
+                        block[usize::from(NATURAL_ORDER[at])] = v as i16;
                         kk = at + 1;
                     }
                 }
@@ -372,13 +372,13 @@ impl Decoder<'_> {
         if self.arith.coder.ct == -1 {
             return Ok(());
         }
-        for blkn in 0..self.blocks_in_mcu {
-            let k = self.mcu_membership[blkn];
+        for (block, blk_slot) in mcu.iter_mut().zip(0..self.blocks_in_mcu) {
+            let k = self.mcu_membership[blk_slot];
             let dct = self.comps[self.scan_comps[k]].dc_tbl;
             let Some(dc) = self.arith_dc(k, dct)? else {
                 return Ok(());
             };
-            mcu[blkn][0] = dc.wrapping_shl(self.al) as i16;
+            block[0] = dc.wrapping_shl(self.al) as i16;
         }
         Ok(())
     }

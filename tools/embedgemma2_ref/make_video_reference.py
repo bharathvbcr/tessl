@@ -34,6 +34,13 @@ Cases (`name`: file, timestamps)
                  rotation matrix: the model sees 48x64
   hevc_pc        hevc_601_pc_34x26.mp4, HEVC, BT.601 full range, a width off
                  libswscale's NEON widths
+  hevc_main10    hevc_p10_601_pc_66x38.mp4, HEVC Main 10 (yuv420p10le), BT.601 full
+                 range: the 10-bit planes VideoToolbox decodes, converted with the
+                 bilinear chroma filter the reference is asked for (-sws_flags bilinear)
+  odd_444_10bit  hevc_p410_240m_tv_33x17.mp4, HEVC 4:4:4 10-bit at an odd 33x17,
+                 SMPTE 240M: odd widths and heights exist only in 4:4:4 (and odd
+                 heights in 4:2:2)
+  odd_422        hevc_422_709_tv_64x33.mp4, HEVC 4:2:2 at an odd height of 33
 """
 
 import os
@@ -59,6 +66,9 @@ CASES = [  # (name, fixture, add_timestamps)
     ("e2e_video_ts", "e2e_video", True),
     ("rot90", "h264_709_tv_64x48_rot90", False),
     ("hevc_pc", "hevc_601_pc_34x26", False),
+    ("hevc_main10", "hevc_p10_601_pc_66x38", False),
+    ("odd_444_10bit", "hevc_p410_240m_tv_33x17", False),
+    ("odd_422", "hevc_422_709_tv_64x33", False),
 ]
 
 
@@ -80,7 +90,10 @@ def reference_item(fixture):
     w, h, rot = int(facts["w"]), int(facts["h"]), int(facts["rotation"])
     if rot in (90, 270):
         w, h = h, w
-    raw = np.frombuffer(gen.decode(path, "rgb24"), dtype=np.uint8)
+    # 10-bit 4:2:0 is the one layout whose RGB depends on the scaler's flags (the chroma rows are
+    # resampled vertically); tessl's default is the bilinear filter, so the reference asks for it.
+    flags = "bilinear" if facts["pix_fmt"] == "yuv420p10le" else None
+    raw = np.frombuffer(gen.decode(path, "rgb24", flags=flags), dtype=np.uint8)
     assert raw.size == frames * h * w * 3, (fixture, raw.size, frames, h, w)
     item = {
         "array": raw.reshape(frames, h, w, 3).copy(),

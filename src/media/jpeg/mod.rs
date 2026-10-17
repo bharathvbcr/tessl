@@ -138,9 +138,6 @@ pub struct JpegInfo {
     pub adobe_transform: Option<u8>,
     /// IFD0 `Orientation` (0x0112) of the first Exif APP1 segment, 1..=8.
     pub exif_orientation: Option<u32>,
-    /// Block smoothing was applied (a progressive file that ends before all
-    /// its low-frequency coefficients are known).
-    pub smoothed: bool,
 }
 
 /// A decoded picture: `height * width * 3` bytes of RGB, row-major.
@@ -165,20 +162,6 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> R<JpegImage> {
     d.setup(max_pixels)?;
     d.read_all_scans()?;
     d.finish()
-}
-
-/// The dimensions and component count a JPEG declares, read from its header
-/// without decoding it. Same bounds and refusals as [`decode`] up to the first
-/// scan.
-///
-/// # Errors
-/// See [`JpegError`].
-pub fn read_dimensions(bytes: &[u8], max_pixels: usize) -> R<(usize, usize, usize)> {
-    check_signature(bytes)?;
-    let mut d = Decoder::new(bytes);
-    d.read_header()?;
-    d.setup(max_pixels)?;
-    Ok((d.width as usize, d.height as usize, d.comps.len()))
 }
 
 /// torchvision's `decode_image` hands data to the JPEG decoder only when it
@@ -345,7 +328,6 @@ pub(crate) struct Decoder<'a> {
     pub arith: arith::State,
 
     pub store: Option<Store>,
-    pub smoothed: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -406,7 +388,6 @@ impl<'a> Decoder<'a> {
             ac_derived: [None, None, None, None],
             arith: arith::State::default(),
             store: None,
-            smoothed: false,
         }
     }
 
@@ -565,7 +546,6 @@ impl<'a> Decoder<'a> {
             jfif: self.saw_jfif,
             adobe_transform: self.saw_adobe.then_some(self.adobe_transform),
             exif_orientation: self.exif_orientation,
-            smoothed: self.smoothed,
         }
     }
 }

@@ -309,7 +309,11 @@ impl Decoder<'_> {
         let mut m: i32 = i32::from(a.coder.decode(inp, &mut a.ac_stats[tbl][st])?);
         if m != 0 && a.coder.decode(inp, &mut a.ac_stats[tbl][st])? != 0 {
             m <<= 1;
-            st = if k <= usize::from(self.arith_ac_k[tbl]) { 189 } else { 217 };
+            st = if k <= usize::from(self.arith_ac_k[tbl]) {
+                189
+            } else {
+                217
+            };
             while a.coder.decode(inp, &mut a.ac_stats[tbl][st])? != 0 {
                 m <<= 1;
                 if m == 0x8000 {
@@ -441,11 +445,7 @@ impl Decoder<'_> {
                     break;
                 }
                 if a.coder.decode(inp, &mut a.ac_stats[tbl][st + 1])? != 0 {
-                    *this = if a.coder.decode(inp, &mut 113u8)? != 0 {
-                        m1
-                    } else {
-                        p1
-                    };
+                    *this = if a.coder.decode(inp, &mut 113u8)? != 0 { m1 } else { p1 };
                     break;
                 }
                 st += 3;

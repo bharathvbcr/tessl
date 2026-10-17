@@ -46,23 +46,23 @@ impl Decoder<'_> {
 
     /// Inverse-transform every component of a coefficient store to a plane.
     fn transform_coefficients(&mut self, mut coefs: Vec<Vec<i16>>) -> R<Vec<Vec<u8>>> {
-        let smooth = self.smoothing_ok();
-        self.smoothed = smooth;
+        if self.smoothing_ok() {
+            return Err(JpegError::Unsupported(
+                "progressive JPEG that ends before AC coefficients 1 to 5 are complete: the reference smooths it \
+                 from neighbouring DC values (block smoothing), which this decoder does not reproduce"
+                    .into(),
+            ));
+        }
         let mut planes = Vec::with_capacity(self.comps.len());
-        for ci in 0..self.comps.len() {
-            let c = &self.comps[ci];
+        for (ci, c) in self.comps.iter().enumerate() {
             let stride = c.blocks_w * 8;
             let mut plane = vec![128u8; stride * c.blocks_h * 8];
             if let Some(quant) = c.quant.as_ref() {
-                if smooth {
-                    self.smooth_component(ci, &coefs[ci], &mut plane)?;
-                } else {
-                    for by in 0..c.height_in_blocks {
-                        for bx in 0..c.width_in_blocks {
-                            let at = (by * c.blocks_w + bx) * 64;
-                            let block: &[i16; 64] = coefs[ci][at..at + 64].try_into().expect("64 coefficients");
-                            idct::islow(block, quant, &mut plane[by * 8 * stride + bx * 8..], stride);
-                        }
+                for by in 0..c.height_in_blocks {
+                    for bx in 0..c.width_in_blocks {
+                        let at = (by * c.blocks_w + bx) * 64;
+                        let block: &[i16; 64] = coefs[ci][at..at + 64].try_into().expect("64 coefficients");
+                        idct::islow(block, quant, &mut plane[by * 8 * stride + bx * 8..], stride);
                     }
                 }
             }

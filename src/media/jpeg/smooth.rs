@@ -1,12 +1,22 @@
-//! Block smoothing of progressive files whose low-frequency coefficients are
-//! not all known (`jdcoefct.c` `smoothing_ok` and `decompress_smooth_data`).
+//! Block smoothing (`jdcoefct.c` `smoothing_ok`): libjpeg-turbo estimates the
+//! first AC coefficients from neighbouring DC values when a progressive file
+//! ends before they are fully known, and the reference does so by default.
+//!
+//! That estimator is not reproduced. A file that would trigger it is refused by
+//! name rather than decoded to pixels the reference would not produce. Every
+//! progressive file an encoder writes completes AC coefficients 1 to 5, so it
+//! never reaches here; only a progressive stream cut short and closed with an
+//! EOI (or one whose scans are damaged into that shape) does. A measurement of
+//! how far a plain inverse transform is from the reference's smoothed output
+//! on such files (max 3 to 73 per channel) is in `docs/embedgemma2.md`.
 
-use super::{Decoder, JpegError, R};
+use super::Decoder;
 
 impl Decoder<'_> {
-    /// `smoothing_ok`: libjpeg smooths a progressive image when every
-    /// component's DC is known, the first quantizers are nonzero and at least
-    /// one of AC coefficients 1 to 5 is not yet fully refined.
+    /// `smoothing_ok`: the reference smooths a progressive image when every
+    /// component's quantization table is latched, DC and the first five AC
+    /// quantizers are nonzero, every component's DC is at least partly known and
+    /// at least one of AC coefficients 1 to 5 is not yet fully refined.
     pub(crate) fn smoothing_ok(&self) -> bool {
         if !self.progressive {
             return false;
@@ -28,11 +38,5 @@ impl Decoder<'_> {
             }
         }
         useful
-    }
-
-    pub(crate) fn smooth_component(&self, _ci: usize, _coefs: &[i16], _plane: &mut [u8]) -> R<()> {
-        Err(JpegError::Unsupported(
-            "progressive JPEG that ends before its low-frequency coefficients are complete (block smoothing)".into(),
-        ))
     }
 }

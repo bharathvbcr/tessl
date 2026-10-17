@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use media_support::*;
 use tessl::media::audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, Downmix};
 use tessl::media::image::{
-    decode_image, decode_image_file, ColorHandling, DecodePath, ExifOrientation, Gray16, ImageLayout, ImageOptions,
+    decode_image, decode_image_file, decode_image_imageio, ColorHandling, DecodePath, ExifOrientation, Gray16,
+    ImageLayout, ImageOptions,
 };
 use tessl::media::video::{VideoOptions, VideoSource};
 use tessl::media::MediaError;
@@ -101,15 +102,25 @@ fn every_lossless_case_takes_the_direct_path() {
 }
 
 #[test]
-fn jpeg_differs_from_the_oracle_by_a_measured_bound() {
+fn jpeg_equals_the_oracle_byte_for_byte_and_imageio_does_not() {
     // libjpeg-turbo (torchvision and PIL, identical to each other here) against
-    // Apple's decoder: a different IDCT and chroma upsampling.
-    let mut worst = (0u8, 0usize, String::new());
+    // the native decoder: the same bytes. Against ImageIO's decoder, which uses
+    // a different IDCT and chroma upsampling, the measured gap below.
     for name in ["rgb.jpg", "rgb444.jpg", "gray.jpg"] {
         let want = bytes(&format!("{name}.rgb"));
         let got = decode_image_file(&fixture(name), &ImageOptions::default()).unwrap();
-        let (max, n) = diff_bytes(&got.data, &want);
-        let mean = got
+        assert_eq!(got.info.path, DecodePath::Jpeg, "{name}");
+        assert_eq!(got.info.format, "public.jpeg", "{name}");
+        assert_eq!(
+            diff_bytes(&got.data, &want),
+            (0, 0),
+            "{name}: native decoder vs libjpeg-turbo"
+        );
+
+        // ImageIO is still reachable for comparison, and still not libjpeg-turbo.
+        let io = decode_image_imageio(&bytes(name), &ImageOptions::default()).unwrap();
+        let (max, n) = diff_bytes(&io.data, &want);
+        let mean = io
             .data
             .iter()
             .zip(&want)
@@ -117,25 +128,26 @@ fn jpeg_differs_from_the_oracle_by_a_measured_bound() {
             .sum::<f64>()
             / want.len() as f64;
         eprintln!(
-            "{name:12} max diff {max}, {n} of {} bytes differ, mean abs {mean:.3} ({:?})",
-            want.len(),
-            got.info.path
+            "{name:12} ImageIO vs libjpeg-turbo: max diff {max}, {n} of {} bytes differ, mean abs {mean:.3}",
+            want.len()
         );
-        if max >= worst.0 {
-            worst = (max, n, name.to_string());
-        }
-        assert!(max <= JPEG_MAX, "{name}: max diff {max} over the bound {JPEG_MAX}");
-        assert!(mean <= JPEG_MEAN, "{name}: mean abs diff {mean:.3} over {JPEG_MEAN}");
+        assert!(
+            max <= IMAGEIO_MAX,
+            "{name}: max diff {max} over the bound {IMAGEIO_MAX}"
+        );
+        assert!(
+            mean <= IMAGEIO_MEAN,
+            "{name}: mean abs diff {mean:.3} over {IMAGEIO_MEAN}"
+        );
     }
-    eprintln!("worst JPEG case: {worst:?}");
 }
 
-/// Measured against libjpeg-turbo: 4:2:0 `rgb.jpg` max 43 (3083 of 9216 bytes,
-/// mean 0.745, at the chroma edges of the disc), 4:4:4 max 3 (mean 0.169), gray
-/// max 1 (mean 0.057). The bound leaves a little room for another machine's
-/// decoder (Apple has hardware and software JPEG paths).
-const JPEG_MAX: u8 = 48;
-const JPEG_MEAN: f64 = 1.0;
+/// ImageIO's decoder against libjpeg-turbo: 4:2:0 `rgb.jpg` max 43 (3083 of
+/// 9216 bytes, mean 0.745, at the chroma edges of the disc), 4:4:4 max 3 (mean
+/// 0.169), gray max 1 (mean 0.057). The bound leaves a little room for another
+/// machine's decoder (Apple has hardware and software JPEG paths).
+const IMAGEIO_MAX: u8 = 48;
+const IMAGEIO_MEAN: f64 = 1.0;
 
 #[test]
 fn exif_orientation_is_ignored_by_default_and_applied_on_request() {
@@ -155,8 +167,8 @@ fn check_exif(name: &str, kv: &HashMap<String, String>) {
     assert_eq!((stored.width, stored.height), (p("w"), p("h")), "{name} stored size");
     assert_eq!(stored.info.exif_orientation, orientation, "{name} reported orientation");
     let (max, n) = diff_bytes(&stored.data, &bytes(&format!("{name}.rgb")));
-    // Orientation 1 to 8 JPEGs are 4:4:4 q95: the decoders differ by a little.
-    assert!(max <= 3, "{name} ignore: max {max}, {n} bytes");
+    // JPEG and PNG alike: the stored pixels are the oracle's, byte for byte.
+    assert_eq!((max, n), (0, 0), "{name} ignore: max {max}, {n} bytes");
     // `Apply` is PIL's exif_transpose of the same file.
     let applied = decode_image_file(
         &fixture(name),
@@ -174,11 +186,7 @@ fn check_exif(name: &str, kv: &HashMap<String, String>) {
     let want = bytes(&format!("{name}.exif.rgb"));
     let (max, n) = diff_bytes(&applied.data, &want);
     eprintln!("{name}: orientation {orientation}, Apply vs exif_transpose max diff {max} ({n} bytes)");
-    assert!(max <= 3, "{name} apply: max {max}, {n} bytes");
-    if name.ends_with(".png") {
-        // PNG is lossless: the transposition must be exact.
-        assert_eq!(n, 0, "{name}");
-    }
+    assert_eq!((max, n), (0, 0), "{name} apply: max {max}, {n} bytes");
 }
 
 #[test]
@@ -244,24 +252,25 @@ fn sixteen_bit_gray_follows_pil_unless_told_otherwise() {
 }
 
 #[test]
-fn cmyk_jpeg_takes_the_srgb_context_and_is_close_to_pil() {
+fn cmyk_jpeg_is_converted_the_way_torchvision_does_it_and_equals_pil() {
+    // Quartz converts CMYK through a colour profile and lands near PIL's plain
+    // conversion; the native path applies torchvision's `k * cmy / 255` and
+    // equals it exactly.
     let d = decode_image_file(&fixture("cmyk.jpg"), &ImageOptions::default()).unwrap();
-    assert_eq!(d.info.path, DecodePath::SrgbContext);
+    assert_eq!(d.info.path, DecodePath::Jpeg);
     assert_eq!(d.info.color_model, tessl::media::image::ColorModel::Cmyk);
     let want = bytes("cmyk.jpg.rgb");
-    let (max, n) = diff_bytes(&d.data, &want);
-    let mean = d
-        .data
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| f64::from(a.abs_diff(*b)))
-        .sum::<f64>()
-        / want.len() as f64;
-    eprintln!(
-        "cmyk.jpg: vs PIL max diff {max}, {n} of {} bytes, mean {mean:.2}",
-        want.len()
-    );
-    assert_eq!(d.data.len(), want.len());
+    assert_eq!(diff_bytes(&d.data, &want), (0, 0), "cmyk.jpg vs the oracle");
+    // `ColorHandling::Srgb` is colour management, which stays with Quartz.
+    let q = decode_image_file(
+        &fixture("cmyk.jpg"),
+        &ImageOptions {
+            color: ColorHandling::Srgb,
+            ..ImageOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(q.info.path, DecodePath::SrgbContext);
 }
 
 #[test]

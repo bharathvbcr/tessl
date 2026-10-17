@@ -16,8 +16,13 @@
 //! follow the first (no EXIF transpose, no colour conversion); the second is
 //! [`ExifOrientation::Apply`].
 //!
-//! # Two paths
+//! # Three paths
 //!
+//! * **JPEG** ([`DecodePath::Jpeg`]): [`super::jpeg`], a pure-Rust decoder whose
+//!   RGB is bit-identical to libjpeg-turbo's, so to what the reference path
+//!   returns (ImageIO's JPEG decoder is not libjpeg-turbo). CMYK and YCCK JPEGs
+//!   are converted to RGB the way torchvision does it. HEIC and every other
+//!   format below stay with ImageIO.
 //! * **Direct** (every case measured): the decoded `CGImage` already holds the
 //!   file's samples as 8- or 16-bit gray or RGB with or without alpha, or as an
 //!   8-bit palette. The samples are copied out of the image's data provider
@@ -39,7 +44,7 @@
 use std::path::Path;
 
 use super::cf::{self, CfRef, CfTypeRef};
-use super::{orient, MediaError};
+use super::{jpeg, orient, MediaError};
 use crate::embedgemma2_pre::{RawImage, MAX_IMAGE_PIXELS};
 
 // ---------------------------------------------------------------------------
@@ -216,6 +221,8 @@ pub enum DecodePath {
     Direct,
     /// Drawn into an sRGB RGBA8 bitmap context.
     SrgbContext,
+    /// Decoded by [`super::jpeg`], this crate's libjpeg-turbo-exact decoder.
+    Jpeg,
 }
 
 /// The colour model of the decoded image.
@@ -283,16 +290,95 @@ pub fn decode_image_file(path: &Path, options: &ImageOptions) -> Result<DecodedI
     decode_image(&bytes, options)
 }
 
-/// Decode an image from its encoded bytes (PNG, JPEG, GIF, HEIC, TIFF, BMP, ...
-/// whatever ImageIO reads). Only the first image of a container (the first GIF
-/// frame, the primary HEIC image) is decoded.
+/// Decode an image from its encoded bytes (PNG, JPEG, GIF, HEIC, TIFF, BMP, ...).
+/// Only the first image of a container (the first GIF frame, the primary HEIC
+/// image) is decoded.
+///
+/// A JPEG (bytes starting `FF D8 FF`) is decoded by this crate's own decoder,
+/// [`super::jpeg`], whose output is bit-identical to libjpeg-turbo's, which is
+/// what `torchvision.io.decode_image` returns; [`DecodePath::Jpeg`] says so.
+/// ImageIO's JPEG decoder is not libjpeg-turbo and differs by up to 43 levels on
+/// 4:2:0 pictures. The one JPEG case that still goes to ImageIO is
+/// [`ColorHandling::Srgb`], because colour management is Quartz's. Everything
+/// else is decoded by ImageIO: see [`decode_image_imageio`].
+///
+/// # Errors
+/// [`MediaError::Empty`] for no bytes, [`MediaError::Unrecognized`] when
+/// the system does not know the format, [`MediaError::Limit`] when the image has
+/// more than `options.max_pixels` pixels, [`MediaError::Decode`] when the data is
+/// damaged or truncated, and [`MediaError::Unsupported`] for a JPEG kind the
+/// native decoder names and refuses (12-bit, lossless, progressive with block
+/// smoothing).
+pub fn decode_image(bytes: &[u8], options: &ImageOptions) -> Result<DecodedImage, MediaError> {
+    if jpeg::has_jpeg_signature(bytes) && options.color == ColorHandling::Native {
+        return decode_jpeg_native(bytes, options);
+    }
+    decode_image_imageio(bytes, options)
+}
+
+/// The native JPEG decoder behind [`decode_image`].
+fn decode_jpeg_native(bytes: &[u8], options: &ImageOptions) -> Result<DecodedImage, MediaError> {
+    const WHAT: &str = "image";
+    let img = jpeg::decode(bytes, options.max_pixels).map_err(|e| match e {
+        jpeg::JpegError::Limit(detail) => MediaError::Limit { what: WHAT, detail },
+        jpeg::JpegError::Unsupported(detail) => MediaError::Unsupported { what: WHAT, detail },
+        other => MediaError::Decode {
+            what: WHAT,
+            detail: format!("public.jpeg: {other}"),
+        },
+    })?;
+    let orientation = img.info.exif_orientation.unwrap_or(1);
+    let (width, height) = (img.width, img.height);
+    let (channels, mut data) = match options.layout {
+        ImageLayout::Rgb => (3, img.rgb),
+        ImageLayout::Rgba => {
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for px in img.rgb.chunks_exact(3) {
+                rgba.extend_from_slice(px);
+                rgba.push(255);
+            }
+            (4, rgba)
+        }
+    };
+    let (mut out_w, mut out_h) = (width, height);
+    if options.orientation == ExifOrientation::Apply && orientation != 1 {
+        let (d, nw, nh) = orient::apply(orientation, std::mem::take(&mut data), width, height, channels);
+        data = d;
+        out_w = nw;
+        out_h = nh;
+    }
+    let color_model = match img.info.color_space {
+        jpeg::JpegColorSpace::Grayscale => ColorModel::Gray,
+        jpeg::JpegColorSpace::Cmyk | jpeg::JpegColorSpace::Ycck => ColorModel::Cmyk,
+        _ => ColorModel::Rgb,
+    };
+    Ok(DecodedImage {
+        width: out_w,
+        height: out_h,
+        channels,
+        data,
+        info: ImageInfo {
+            format: "public.jpeg".into(),
+            bits_per_component: 8,
+            color_model,
+            color_space: None,
+            exif_orientation: orientation,
+            has_alpha: false,
+            path: DecodePath::Jpeg,
+        },
+    })
+}
+
+/// Decode an image with ImageIO whatever its format (PNG, JPEG, GIF, HEIC,
+/// TIFF, BMP, ...). [`decode_image`] sends JPEG elsewhere; this is the path for
+/// everything else, and for comparing ImageIO's JPEG decode with the native one.
 ///
 /// # Errors
 /// [`MediaError::Empty`] for no bytes, [`MediaError::Unrecognized`] when
 /// ImageIO does not know the format, [`MediaError::Limit`] when the image has
 /// more than `options.max_pixels` pixels, and [`MediaError::Decode`] when the
 /// data is damaged or truncated (ImageIO's status is anything but complete).
-pub fn decode_image(bytes: &[u8], options: &ImageOptions) -> Result<DecodedImage, MediaError> {
+pub fn decode_image_imageio(bytes: &[u8], options: &ImageOptions) -> Result<DecodedImage, MediaError> {
     const WHAT: &str = "image";
     if bytes.is_empty() {
         return Err(MediaError::Empty { what: WHAT });

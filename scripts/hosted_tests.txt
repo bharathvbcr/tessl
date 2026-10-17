@@ -24,7 +24,7 @@ bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5
 bin embedgemma2_tok_tiny 13
 bin gdn_fixtures 12
-bin fixture_manifests 7
+bin fixture_manifests 8
 bin gdn_gates 22
 bin gdn_state 10
 bin host_access_ban 4

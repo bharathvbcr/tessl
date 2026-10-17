@@ -137,13 +137,26 @@ FIXTURES = [
     ("hevc_p210_709_tv_48x40_rot270", "libx265", 48, 40, 3, 10, "bt709", "tv", 270),
     ("hevc_444_709_tv_48x40_rot90", "libx265", 48, 40, 3, 10, "bt709", "tv", 90),
     ("hevc_p410_709_tv_48x40_rot270", "libx265", 48, 40, 3, 10, "bt709", "tv", 270),
+    # Streams the system decodes and the exact conversion refuses by name (no golden): 12-bit video,
+    # monochrome video and a codec other than H.264 and HEVC. (x265 codes no picture under 16 rows,
+    # so the 10-bit 4:2:0 heights below the chroma filter's measured range are tested on the
+    # converter only.)
+    ("refuse_hevc_12bit_709_tv_64x48", "libx265", 64, 48, 3, 10, "bt709", "tv", 0),
+    ("refuse_hevc_gray_64x48", "libx265", 64, 48, 3, 10, None, "tv", 0),
+    ("refuse_mpeg4_709_tv_64x48", "mpeg4", 64, 48, 3, 10, "bt709", "tv", 0),
 ]
-NO_RGB24_GOLDEN = {"e2e_video"}  # decoded by the reference script, not compared frame by frame
+REFUSED = {f[0] for f in FIXTURES if f[0].startswith("refuse_")}
+# decoded by the reference script, or refused by the exact conversion: no frame-by-frame golden
+NO_RGB24_GOLDEN = {"e2e_video"} | REFUSED
 CRF = {"e2e_video": "24"}
 
 
 def pix_fmt_of(name):
     """The pixel format a fixture is encoded in, from its name."""
+    if "_12bit_" in name:
+        return "yuv420p12le"
+    if "_gray_" in name:
+        return "gray"
     if name.startswith("hevc_main10") or "_p10_" in name:
         return "yuv420p10le"
     if "_p210_" in name:
@@ -260,8 +273,9 @@ def encode(name, codec, w, h, n, fps, matrix, rng_, rot, seed):
     if matrix:
         vf += f"out_color_matrix={MATRIX_OUT[matrix]}:"
     vf += f"out_range={'full' if rng_ == 'pc' else 'limited'},format={pix_fmt_of(name)}"
+    quality = ["-q:v", "2"] if codec == "mpeg4" else ["-crf", CRF.get(name, "12")]
     cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-framerate", str(fps),
-           "-i", "-", "-vf", vf, "-c:v", codec, "-crf", CRF.get(name, "12"), "-g", "5" if n > 3 else "3", "-bf", "2"]
+           "-i", "-", "-vf", vf, "-c:v", codec, *quality, "-g", "5" if n > 3 else "3", "-bf", "2"]
     if matrix:
         cmd += ["-colorspace", matrix, "-color_primaries", PRIMARIES[matrix], "-color_trc", TRC[matrix]]
     if rng_ == "pc":
@@ -414,7 +428,7 @@ def main():
             if pix_fmt_of(name) == "yuv420p10le":
                 with open(os.path.join(OUT, name + ".bilinear.rgb24"), "wb") as f:
                     f.write(decode(path, "rgb24", flags="bilinear"))
-        if name in NV12_GOLDENS:
+        if name in NV12_GOLDENS and name not in NO_RGB24_GOLDEN:
             fmt, ext = PLANES[pix_fmt_of(name)]
             nv = decode(path, fmt, autorotate=False)
             sub_w, sub_h = {"yuv420p": (2, 2), "yuv422p": (2, 1), "yuv444p": (1, 1)}[pix_fmt_of(name)[:7]]
@@ -429,7 +443,8 @@ def main():
             for tag, kw in SAMPLINGS.items()
         }
         facts.append(
-            f"video {name} codec={codec} w={w} h={h} rotation={rot} flip={flip_of(name) or 'none'} frames={frames} "
+            f"video {name} codec={codec} w={w} h={h} rotation={rot} flip={flip_of(name) or 'none'} "
+            f"golden={'no' if name in NO_RGB24_GOLDEN else 'yes'} frames={frames} "
             f"pix_fmt={s['pix_fmt']} color_range={s.get('color_range', 'unspecified')} "
             f"color_space={s.get('color_space', 'unspecified')} "
             f"duration={duration!r} average_fps={avg!r} begin={begin!r} end={end!r} "

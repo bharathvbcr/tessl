@@ -375,7 +375,12 @@ def build_cases():
     img2 = photo(31, 33, 8)
     for s in samples:
         tag = s.replace(",", "_")
-        case(f"samp_{tag}", cj(img2, "-sample", s, "-quality", "80"), "sampling", f"cjpeg -sample {s}")
+        try:
+            data = cj(img2, "-sample", s, "-quality", "80")
+        except RuntimeError as e:  # cjpeg refuses an MCU over 10 blocks; the over-limit ones are covered by the err_mcu_over_10_blocks case
+            print("cjpeg cannot encode", s, "-", e)
+            continue
+        case(f"samp_{tag}", data, "sampling", f"cjpeg -sample {s}")
     for s in ["2x2,1x1,1x1", "1x1,2x2,2x2", "4x2,1x1,1x1", "2x1,1x2,1x1"]:
         case(f"samp_{s.replace(',', '_')}_prog", cj(img2, "-sample", s, "-progressive"), "sampling", f"progressive {s}")
     # --- sizes -----------------------------------------------------------------
@@ -497,15 +502,18 @@ def build_cases():
     case("err_no_eoi", base[:-2], "error", "no EOI: the reference's source manager fails at the end of the data")
     for frac in (0.1, 0.3, 0.5, 0.8, 0.97):
         case(f"err_cut_{int(frac * 100)}", base[:int(len(base) * frac)], "error", f"cut at {int(frac * 100)}%")
-    case("err_cut_progressive_half", pil_enc(img, quality=75, progressive=True)[:2000], "error", "progressive cut in the middle")
+    case("err_cut_progressive_half", (lambda p: p[:len(p) // 2])(pil_enc(img, quality=75, progressive=True)), "error", "progressive cut in the middle")
     case("err_header_only", base[:sosat + 14], "error", "stops after the SOS header")
     for nc in (2, 5, 6, 10):
         comps = [(1, 1, 0)] * nc
         case(f"err_{nc}_components", write_jpeg(W, H, comps, rand_coefs(rng, comps, W, H), QT), "error", f"{nc} components: no RGB conversion")
     case("err_fractional_sampling_3_2_1", write_jpeg(W, H, [(3, 1, 0), (2, 1, 1), (1, 1, 1)], rand_coefs(rng, [(3, 1, 0), (2, 1, 1), (1, 1, 1)], W, H), QT), "error", "3:2 sampling ratio")
-    case("err_mcu_over_10_blocks", write_jpeg(W, H, [(2, 2, 0), (2, 2, 1), (2, 1, 1)], rand_coefs(rng, [(2, 2, 0), (2, 2, 1), (2, 1, 1)], W, H), QT), "error", "13 blocks in an MCU")
-    case("err_sampling_zero", write_jpeg(W, H, [(0, 1, 0), (1, 1, 1), (1, 1, 1)], [np.zeros((2, 3, 64), dtype=np.int32)] * 3, QT), "error", "sampling factor 0")
-    case("err_sampling_5", write_jpeg(W, H, [(5, 1, 0), (1, 1, 1), (1, 1, 1)], [np.zeros((2, 3, 64), dtype=np.int32)] * 3, QT), "error", "sampling factor 5")
+    c12 = [(2, 2, 0), (2, 2, 1), (2, 2, 1)]
+    c10 = [(2, 2, 0), (2, 2, 1), (2, 1, 1)]
+    case("err_mcu_over_10_blocks", write_jpeg(W, H, c12, rand_coefs(rng, c12, W, H), QT), "error", "12 blocks in an MCU")
+    case("layout_mcu_10_blocks", write_jpeg(W, H, c10, rand_coefs(rng, c10, W, H), QT), "layout", "exactly 10 blocks in an MCU")
+    case("err_sampling_zero", write_jpeg(W, H, [(0, 1, 0), (1, 1, 1), (1, 1, 1)], [np.zeros((4, 8, 64), dtype=np.int32)] * 3, QT), "error", "sampling factor 0")
+    case("err_sampling_5", write_jpeg(W, H, [(5, 1, 0), (1, 1, 1), (1, 1, 1)], [np.zeros((4, 8, 64), dtype=np.int32)] * 3, QT), "error", "sampling factor 5")
     case("err_zero_width", write_jpeg(0, H, c3f, rand_coefs(rng, c3f, 8, H), QT), "error", "zero width")
     case("err_missing_dqt", write_jpeg(W, H, c3, rand_coefs(rng, c3, W, H), {0: QT[0]}), "error", "quantizer table 1 undefined")
     case("err_dht_missing_progressive", strip_dht(pil_enc(img, quality=75, progressive=True)), "error", "progressive stream without DHT")

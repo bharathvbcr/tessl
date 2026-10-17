@@ -216,6 +216,43 @@ jobs:
         run: TESSL_GEMM_TUNE=1 scripts/check_kernel_ir.sh
 
   # ---------------------------------------------------------------------------
+  # The Go binding (go/): the umbrella engine archive (gusset plus tessl, so it
+  # needs the Metal toolchain like `check`), the engine's Rust tests, gofmt, go
+  # vet and the Go unit tests, which open no device. `make -C go unit` is the
+  # same command scripts/ci_local.sh runs. The device tier (`make -C go device`,
+  # the Go path against tessl's own C ABI bit for bit) needs a GPU and runs in
+  # the `gpu` job; the real-checkpoint tier needs the snapshot and stays local.
+  # ---------------------------------------------------------------------------
+  go:
+    name: Go binding (unit tier)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The engine builds into its own target dir (go/Makefile --target-dir).
+          workspaces: go/engine -> target
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Install the Metal Toolchain
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler already present: $(xcrun --find metal)"
+          else
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+
+      - name: Engine, gofmt, go vet and the Go unit tests
+        run: make -C go unit
+
+  # ---------------------------------------------------------------------------
   # The GPU suite. Answered by running it, on 2026-08-31.
   #
   # This job was written to gate on `macos-26` because the question could not be
@@ -322,6 +359,18 @@ jobs:
         run: |
           cargo run --release --example nn_layer
           cargo run --release --example epilogue_cost
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Go binding device tests
+        # The Go package against tessl's own C ABI on the tiny checkpoint, bit
+        # for bit (go/Makefile `device`: tests/go_fixtures.rs writes the
+        # fixtures, and TESSL_GO_REQUIRE_DEVICE makes a missing one a failure,
+        # not a skip). Needs the device, so it runs here and not in `go`.
+        run: make -C go device
 
   # ---------------------------------------------------------------------------
   # Cargo.toml claims `rust-version = "1.82"`. Unverified that is just a string

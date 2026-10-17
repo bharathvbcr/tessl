@@ -251,7 +251,7 @@ fn the_real_ci_workflow_guards_gpu_and_bench_and_hosts_the_rest() {
             .unwrap_or_else(|| panic!("job {id} not parsed"));
         assert!(j.guarded && !j.hosted, "{j:?}");
     }
-    for id in ["fmt", "kernel-emulator", "check", "msrv"] {
+    for id in ["fmt", "kernel-emulator", "check", "go", "msrv"] {
         let j = jobs
             .iter()
             .find(|j| j.id == id)

@@ -27,6 +27,7 @@ bin gdn_fixtures 12
 bin fixture_manifests 8
 bin gdn_gates 22
 bin gdn_state 10
+bin go_link_frameworks 2
 bin host_access_ban 4
 bin hosted_selection 6
 bin hosted_tests_script 9

@@ -17,7 +17,7 @@ package embedgemma2
 // CGO_CFLAGS for that reason; a bare `go test` after rebuilding the archive
 // should pass -count=1 -a.
 #cgo LDFLAGS: -L${SRCDIR}/../engine/target/release -lgusset
-#cgo darwin LDFLAGS: -framework AudioToolbox -framework AVFoundation -framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework Metal -lobjc -liconv
+#cgo darwin LDFLAGS: -framework AudioToolbox -framework AVFoundation -framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework Metal -framework VideoToolbox -lobjc -liconv
 #cgo noescape tessl_go_engine_init
 #cgo nocallback tessl_go_engine_init
 #cgo noescape tessl_go_engine_wire_version

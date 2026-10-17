@@ -1,0 +1,54 @@
+image rgb.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image rgba.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image gray.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image graya.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image pal.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image pal_trns.png w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image rgb16.png w=37 h=23 tag=exact oracle=pil torchvision=dtype_uint16
+image gray16.png w=37 h=23 tag=exact oracle=pil torchvision=dtype_uint16
+image rgba16.png w=37 h=23 tag=exact oracle=pil torchvision=dtype_uint16
+image rgb.tiff w=37 h=23 tag=exact oracle=pil
+image rgba.tiff w=37 h=23 tag=exact oracle=pil
+image gray.tiff w=37 h=23 tag=exact oracle=pil
+image rgb.bmp w=37 h=23 tag=exact oracle=pil
+image gray.bmp w=37 h=23 tag=exact oracle=pil
+image rgba.bmp w=37 h=23 tag=exact oracle=pil
+image anim.gif w=37 h=23 tag=exact oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image p3.png w=37 h=23 tag=colour oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image srgb_icc.png w=37 h=23 tag=colour oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image rgb.jpg w=64 h=48 tag=jpeg oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image rgb444.jpg w=64 h=48 tag=jpeg oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image gray.jpg w=64 h=48 tag=jpeg oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+image cmyk.jpg w=64 h=48 tag=jpeg_cmyk oracle=torchvision tv_vs_pil_max=0 tv_vs_pil_differing=0
+exif exif1.jpg orientation=1 h=24 w=40 th=24 tw=40
+exif exif2.jpg orientation=2 h=24 w=40 th=24 tw=40
+exif exif3.jpg orientation=3 h=24 w=40 th=24 tw=40
+exif exif4.jpg orientation=4 h=24 w=40 th=24 tw=40
+exif exif5.jpg orientation=5 h=24 w=40 th=40 tw=24
+exif exif6.jpg orientation=6 h=24 w=40 th=40 tw=24
+exif exif7.jpg orientation=7 h=24 w=40 th=40 tw=24
+exif exif8.jpg orientation=8 h=24 w=40 th=40 tw=24
+exif exif6.png orientation=6 h=24 w=40 th=40 tw=24
+heic photo.heic w=64 h=48 oracle=source_pixels
+audio pcm16_16k_mono.wav tag=exact rate=16000 channels=1 frames=6400
+audio pcm24_16k_mono.wav tag=exact rate=16000 channels=1 frames=6400
+audio pcm32_16k_mono.wav tag=exact rate=16000 channels=1 frames=6400
+audio pcm8_16k_mono.wav tag=exact rate=16000 channels=1 frames=6400
+audio f32_16k_mono.wav tag=exact rate=16000 channels=1 frames=6400
+audio pcm16_16k_mono.aiff tag=exact rate=16000 channels=1 frames=6400
+audio pcm16_16k_mono.caf tag=exact rate=16000 channels=1 frames=6400
+audio pcm16_16k_mono.flac tag=exact rate=16000 channels=1 frames=6400
+audio pcm16_44k_stereo.wav tag=resample rate=44100 channels=2 frames=17640 ffmpeg_frames=6400 torchaudio_frames=6400 truth_frames=6400
+audio pcm16_48k_stereo.wav tag=resample rate=48000 channels=2 frames=19200 ffmpeg_frames=6400 torchaudio_frames=6400 truth_frames=6400
+audio pcm16_22k_mono.wav tag=resample rate=22050 channels=1 frames=8820 ffmpeg_frames=6400 torchaudio_frames=6400 truth_frames=6400
+audio pcm16_8k_mono.wav tag=resample rate=8000 channels=1 frames=3200 ffmpeg_frames=6400 torchaudio_frames=6400 truth_frames=6400
+audio tone_44k_stereo.m4a tag=compressed rate=44100 channels=2 ffmpeg_frames=16000 truth_frames=16000
+audio tone_44k_stereo.mp3 tag=compressed rate=44100 channels=2 ffmpeg_frames=16000 truth_frames=16000
+audio tone_44k_stereo.flac tag=compressed rate=44100 channels=2 ffmpeg_frames=16000 truth_frames=16000
+audio tone_16k_mono.mp3 tag=compressed rate=16000 channels=1 ffmpeg_frames=16000 truth_frames=16000
+audio tone_16k_mono.m4a tag=compressed rate=16000 channels=1 ffmpeg_frames=16000 truth_frames=16000
+audio tone_16k_mono.opus tag=compressed rate=48000 channels=1 ffmpeg_frames=16000 truth_frames=16000
+audio tone_16k_mono.wv tag=unsupported
+video colors.mp4 w=64 h=48 frames=12 fps=10 rotation=0 pts=0.000000,0.100000,0.200000,0.300000,0.400000,0.500000,0.600000,0.700000,0.800000,0.900000,1.000000,1.100000
+video quad_rot90.mp4 w=64 h=48 frames=12 fps=10 rotation=90 pts=0.000000,0.100000,0.200000,0.300000,0.400000,0.500000,0.600000,0.700000,0.800000,0.900000,1.000000,1.100000
+video colors_hevc.mp4 w=64 h=48 frames=12 fps=10 rotation=0 pts=0.000000,0.100000,0.200000,0.300000,0.400000,0.500000,0.600000,0.700000,0.800000,0.900000,1.000000,1.100000

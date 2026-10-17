@@ -1,5 +1,5 @@
 //! Media files on the real checkpoint: a file path through `tessl::media`
-//! (ImageIO / AudioToolbox decoding), `tessl::embedgemma2_pre` and the towers to
+//! (native JPEG, ImageIO and AudioToolbox decoding), `tessl::embedgemma2_pre` and the towers to
 //! the embedding, against sentence-transformers' (transformers 5.x, fp32, sdpa,
 //! CPU). Opt-in:
 //!
@@ -15,11 +15,12 @@
 //! variable or file fails the test rather than skipping it.
 //!
 //! The five inputs and what the reference was given are listed in
-//! `make_media_reference.py`. Two of them decode to exactly what the reference
-//! decoded (`photo.png`: lossless, same bytes; `clip16.wav`: 16 kHz mono PCM16,
-//! same floats), and hold to the bounds of `tests/embedgemma2_e2e_model.rs`:
-//! `1e-4` max abs and cosine `0.99999` per row. The other three differ in the
-//! decode by a measured amount (a JPEG IDCT and chroma upsampler, a different
+//! `make_media_reference.py`. Three of them decode to exactly what the reference
+//! decoded (`photo.png`: lossless, same bytes; `photo.jpg`: the native
+//! libjpeg-turbo-exact decoder, `tessl::media::jpeg`, same bytes; `clip16.wav`:
+//! 16 kHz mono PCM16, same floats), and hold to the bounds of
+//! `tests/embedgemma2_e2e_model.rs`: `1e-4` max abs and cosine `0.99999` per row.
+//! The other two differ in the decode by a measured amount (a different
 //! resampler, a different AAC decoder), and their bounds are the measurements
 //! printed by this test, rounded up.
 
@@ -40,7 +41,7 @@ use tessl::npy::read_npy;
 const CASES: [(&str, f64, f64); 5] = [
     ("photo.png", 1e-4, 0.99999),
     ("clip16.wav", 1e-4, 0.99999),
-    ("photo.jpg", 1e-2, 0.998),
+    ("photo.jpg", 1e-4, 0.99999),
     ("clip44.wav", 2e-2, 0.99),
     ("clip44.m4a", 2e-2, 0.99),
 ];

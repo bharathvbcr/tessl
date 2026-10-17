@@ -173,6 +173,25 @@ def decode(path, pix_fmt, autorotate=True):
     return run(cmd, capture_output=True).stdout
 
 
+# Sampling settings recorded per fixture: the processor's own `sample_frames` is run on the
+# metadata above (fps 1 with a 32 frame cap is processor_config.json's; the others make the cap bite).
+SAMPLINGS = {
+    "sampled": dict(fps=1, max_frames=32, overflow_strategy="uniform"),
+    "sampled_f5m4u": dict(fps=5, max_frames=4, overflow_strategy="uniform"),
+    "sampled_f5m4t": dict(fps=5, max_frames=4, overflow_strategy="truncate"),
+    "sampled_all_m3u": dict(fps=None, max_frames=3, overflow_strategy="uniform"),
+}
+
+
+def sample(total, fps_avg, duration, **kw):
+    """transformers' EmbeddingGemma2VideoProcessor.sample_frames on torchcodec-style metadata."""
+    from transformers.models.embedding_gemma2.video_processing_embedding_gemma2 import EmbeddingGemma2VideoProcessor
+    from transformers.video_utils import VideoMetadata
+
+    meta = VideoMetadata(total_num_frames=total, fps=fps_avg, duration=duration)
+    return EmbeddingGemma2VideoProcessor().sample_frames(meta, **kw)
+
+
 def synthetic(facts):
     for seed, (name, w, h, matrix, rng_) in enumerate(SYNTHETIC, start=100):
         rng = np.random.default_rng(seed)
@@ -181,14 +200,17 @@ def synthetic(facts):
         planes = y.tobytes() + uv.tobytes()
         with open(os.path.join(OUT, name + ".nv12"), "wb") as f:
             f.write(planes)
-        cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "nv12", "-s", f"{w}x{h}"]
-        if matrix:
-            cmd += ["-colorspace", matrix]
-        cmd += ["-color_range", rng_, "-i", "-", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-        rgb = run(cmd, input=planes, capture_output=True).stdout
-        assert len(rgb) == w * h * 3, name
-        with open(os.path.join(OUT, name + ".rgb24"), "wb") as f:
-            f.write(rgb)
+        for suffix, cpu in ((".rgb24", []), (".portable.rgb24", ["-cpuflags", "0"])):
+            # `-cpuflags 0` turns the CPU's assembly off, so libswscale runs its C table
+            # converter at every width (the aarch64 NEON one needs a width multiple of 16).
+            cmd = [FFMPEG, "-v", "error", "-y", *cpu, "-f", "rawvideo", "-pix_fmt", "nv12", "-s", f"{w}x{h}"]
+            if matrix:
+                cmd += ["-colorspace", matrix]
+            cmd += ["-color_range", rng_, "-i", "-", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            rgb = run(cmd, input=planes, capture_output=True).stdout
+            assert len(rgb) == w * h * 3, name
+            with open(os.path.join(OUT, name + suffix), "wb") as f:
+                f.write(rgb)
         facts.append(f"synthetic {name} w={w} h={h} matrix={matrix or 'unspecified'} range={rng_}")
 
 
@@ -214,12 +236,17 @@ def main():
             with open(os.path.join(OUT, name + ".nv12"), "wb") as f:
                 f.write(nv)
         frames, duration, avg, begin, end, pts = torchcodec_exact_metadata(path)
+        sampled = {
+            tag: ",".join(str(int(i)) for i in sample(frames, avg, duration, **kw))
+            for tag, kw in SAMPLINGS.items()
+        }
         facts.append(
             f"video {name} codec={codec} w={w} h={h} rotation={rot} frames={frames} "
             f"pix_fmt={s['pix_fmt']} color_range={s.get('color_range', 'unspecified')} "
             f"color_space={s.get('color_space', 'unspecified')} "
             f"duration={duration!r} average_fps={avg!r} begin={begin!r} end={end!r} "
-            f"pts={','.join(repr(t) for t in pts)}"
+            + " ".join(f"{tag}={v}" for tag, v in sampled.items())
+            + f" pts={','.join(repr(t) for t in pts)}"
         )
         print(facts[-1][:200])
     with open(os.path.join(OUT, "facts.txt"), "w") as f:
@@ -234,6 +261,8 @@ def file_table():
             continue
         if name == "facts.txt":
             role, note = "config", "per fixture: size, rotation, tags and torchcodec's exact-mode frame count, duration and fps"
+        elif name.endswith(".portable.rgb24"):
+            role, note = "golden", "the ffmpeg CLI's conversion of the NV12 input of the same name with the CPU's assembly off (`-cpuflags 0`)"
         elif name.endswith(".rgb24"):
             role, note = "golden", "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
         elif name.startswith("rand_") and name.endswith(".nv12"):

@@ -713,7 +713,9 @@ fn ten_bit_420_filters_against_a_live_ffmpeg_at_many_heights() {
         state ^= state << 17;
         (state >> 33) as u32 % max
     };
-    let mut shapes: Vec<(usize, usize)> = (14..=120).step_by(2).map(|h| (34usize, h)).collect();
+    // From 8 rows: bilinear is exact from there, bicubic from 14 (shorter pictures are refused
+    // by name for the filter that cannot do them, and skipped for that filter here).
+    let mut shapes: Vec<(usize, usize)> = (8..=120).step_by(2).map(|h| (34usize, h)).collect();
     shapes.extend([
         (32, 64),
         (640, 480),
@@ -737,6 +739,13 @@ fn ten_bit_420_filters_against_a_live_ffmpeg_at_many_heights() {
         // Small heights rotate through the twelve (matrix, range) pairs; the big pictures take all.
         let take = if h < 200 { 1 } else { combos.len() };
         for (filter, flags) in [(ChromaFilter::Bilinear, "bilinear"), (ChromaFilter::Bicubic, "bicubic")] {
+            let layout = Layout {
+                chroma: Chroma::C420,
+                depth: 10,
+            };
+            if matches!(check_shape(layout, w, h, filter), Err(YuvError::TooShort { .. })) {
+                continue;
+            }
             for ((matrix, tag), (range, range_tag)) in (0..take).map(|k| combos[(k + h / 2) % combos.len()]) {
                 let out = Command::new("ffmpeg")
                     .args([

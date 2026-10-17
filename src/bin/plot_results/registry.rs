@@ -88,6 +88,11 @@ pub const PLOTS: &[Plot] = &[
         file: "embedgemma2_video_m5pro.json",
         render: crate::tok::video,
     },
+    Plot {
+        name: "media-decode",
+        file: "media_decode_m5pro.json",
+        render: crate::media::media_decode,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Plot> {

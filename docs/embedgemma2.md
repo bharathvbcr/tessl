@@ -2784,8 +2784,8 @@ FFmpeg, not embedding against embedding.
 `bench_media_decode` (inputs from `bench/make_media_bench_inputs.py`; one call per workload,
 minimum of 20 after 3 warm-ups; **the machine was running other agents (load average 27 to
 31 when the run started), so these are
-indicative**; `bench/results/media_decode_m5pro.{txt,json,png}`, plotted by
-`bench/results/media_decode_plot.py`):
+indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
+`plot_results media-decode`):
 
 | workload | ms (min) | per unit |
 |---|---|---|

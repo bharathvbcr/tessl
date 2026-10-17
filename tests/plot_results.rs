@@ -26,6 +26,9 @@ mod data;
 #[path = "../src/json.rs"]
 mod json;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/media.rs"]
+mod media;
+#[allow(dead_code)]
 #[path = "../src/bin/plot_results/memory.rs"]
 mod memory;
 #[allow(dead_code)]
@@ -380,6 +383,7 @@ const ALL: &[(&str, &str)] = &[
     ("small-m", "embedgemma2_small_m_m5pro"),
     ("tok", "embedgemma2_tok_m5pro"),
     ("video", "embedgemma2_video_m5pro"),
+    ("media-decode", "media_decode_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1144,33 @@ fn empty_data_is_refused_for_every_figure_that_reads_a_summary() {
         assert_eq!(r.code, Some(1), "{name}");
         assert!(r.err.contains("empty list, nothing to plot"), "{name}: {}", r.err);
     }
+    assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn media_decode_draws_a_bar_and_a_median_per_workload() {
+    let rows = arr(&parse("media_decode_m5pro.json")).len();
+    assert!(rows > 0);
+    let e = elems("media-decode");
+    assert_eq!(count(&e, "bar"), rows);
+    assert_eq!(count(&e, "median"), rows);
+}
+
+#[test]
+fn media_decode_refuses_an_empty_list_and_an_unknown_unit() {
+    let dir = fresh("media_bad");
+    let p = write_json(&dir, "media_decode_m5pro.json", "[]");
+    let r = run(&["media-decode", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("empty list, nothing to plot"), "{}", r.err);
+    let p = write_json(
+        &dir,
+        "media_decode_m5pro.json",
+        "[{\"workload\":\"x.wav\",\"ms_min\":1.0,\"ms_median\":1.5,\"iters\":3,\"units\":30.0,\"unit\":\"bytes\"}]",
+    );
+    let r = run(&["media-decode", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("unknown unit \"bytes\""), "{}", r.err);
     assert!(no_svg_in(&dir));
 }
 

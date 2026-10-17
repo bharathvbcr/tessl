@@ -3092,11 +3092,12 @@ reference's RGB byte for byte for 8-bit 4:2:0 H.264 and HEVC. AVFoundation's own
   luma, but **different chroma**: the share of Cb/Cr samples that differ from FFmpeg's decode
   depends on the content (52 to 86 percent in the clips measured in this lane, for example
   3843 of 4608 Cb samples of `h264_709_tv_64x48`, by up to 45 levels; an earlier lane
-  measured 8 to 15 percent on other content, which was not re-measured). **The cause is a chroma re-siting**, found by regressing the reader's chroma on
-  FFmpeg's neighbouring chroma samples (see "Why AVAssetReader's chroma differs" below):
-  the reader moves the chroma to the `BottomLeft` location with a smooth three-tap kernel
-  (about 0.06, 0.62, 0.31 for a quarter-sample shift), and a stream already tagged
-  `BottomLeft` comes out with 0 differing samples. Asked for BGRA it
+  measured 8 to 15 percent on other content, which was not re-measured). **Measured, by regressing the reader's chroma on
+  FFmpeg's neighbouring chroma samples** (see "Why AVAssetReader's chroma differs" below):
+  the reader's chroma is a smooth three-tap resampling of the decoder's (about 0.06, 0.62,
+  0.31 for a quarter-sample shift), and a stream already tagged `BottomLeft` comes out with 0
+  differing samples. That this is a re-siting to `BottomLeft` is **inferred**; the `top` and
+  `bottom` streams do not fit it (below). Asked for BGRA it
   differs from the oracle in 39941 of 55296 bytes (largest 151, mean 3.67; `h264_709_tv_64x48`).
 - VideoToolbox itself is exact: FFmpeg's `-hwaccel videotoolbox` equals its software decode, so
   the difference is in what `AVAssetReader` does after it. So `AVAssetReader` with no output
@@ -3466,8 +3467,9 @@ own speed (it is the same algorithm in C with NEON).
   torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
   the last inferred step. What it does with a rotation flag is unverified (the default here
   follows FFmpeg's CLI and OpenCV).
-- `AVAssetReader`'s chroma difference is explained to within a three-tap kernel (a
-  re-siting to `BottomLeft`, above), not reproduced to the byte (96 percent of samples with
+- `AVAssetReader`'s chroma difference is characterised as a three-tap resampling (a
+  re-siting to `BottomLeft` is the inference, with `top`/`bottom` as the open contradiction),
+  not reproduced to the byte (96 percent of samples with
   `(1, 10, 5)/16`); VideoToolbox is driven directly, so nothing depends on it.
 - torchcodec's scaler flags and its rotation order are not established. Only 10-bit 4:2:0 and
   rotated 4:2:0/10-bit streams depend on them (above), and `ChromaFilter` and the rotation

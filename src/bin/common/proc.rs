@@ -71,3 +71,11 @@ pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
 pub fn first_chars(s: &str, n: usize) -> String {
     s.trim().chars().take(n).collect()
 }
+
+/// The last `n` characters of `s`, trimmed: what a diagnostic quotes of a
+/// failed child's stderr, whose cause is usually its final lines.
+pub fn last_chars(s: &str, n: usize) -> String {
+    let s = s.trim();
+    let skip = s.chars().count().saturating_sub(n);
+    s.chars().skip(skip).collect()
+}

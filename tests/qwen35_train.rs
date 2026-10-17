@@ -1660,6 +1660,11 @@ fn real_2b_step_matches_transformers() {
 /// past it is SIGTERMed (exit 143). Metal buffers count toward the footprint.
 const MEMGUARD_CAP_BYTES: u64 = 32 << 30;
 const GIB: f64 = (1u64 << 30) as f64;
+/// What a 2B test process's peak footprint exceeds the device's
+/// `peak_allocated_bytes` by (host buffers, the mapped checkpoint, the
+/// runtime): 32.53 GiB footprint over 30.11 GiB device at the f32 arm of the
+/// loss-curve test (docs/verification.md, 2026-10-17).
+const HOST_FOOTPRINT_OVER_DEVICE_BYTES: u64 = 2_600_000_000;
 
 /// The real 2B checkpoint, in `precision` as `load_tower` loads it (bf16 is
 /// how a bf16 model trains).
@@ -1729,21 +1734,18 @@ fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Ve
 fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
     let rt = GpuRuntime::new().unwrap();
     let ids = text_ids();
-    // Stage 1 holds the f32 model and the two f32 gradient sets (exact and
-    // bf16-operand); stage 2 releases the f32 model and the operand
-    // gradients before the bf16 model and its step are built. A live f32
-    // model, bf16 model and three gradient sets together are 4.5 f32
-    // parameter sets, past memguard's 32 GiB footprint cap on the 2B (the
-    // SIGTERM ft-02b223f0 recorded); no more than three are ever live here.
-    // The f32 model's bf16-operand step is printed beside each storage
-    // figure: how much of the gap operand rounding alone makes on these ids.
+    // The f32 model is released before the bf16 one is built, so at most
+    // the f32 model and its gradients, then those gradients, the bf16 model
+    // and its gradients, are live (measured peak footprint in
+    // docs/verification.md). The previous form also kept the f32 model and a
+    // third gradient set, from a bf16-operand step on the f32 model that
+    // only printed a comparison, and was SIGTERMed at memguard's 32 GiB cap
+    // (ft-02b223f0). That step's extra memory is what a 2B bf16-operand
+    // step on f32 storage costs; its bound lives in
+    // `real_2b_step_on_bf16_operands_stays_near_transformers`.
     let f32_model = real_2b_tower(&rt, Precision::F32);
     let cfg = f32_model.config().clone();
     let exact = f32_model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    let op = {
-        let operands = f32_model.train_step(&ids, GemmOperands::Bf16).unwrap();
-        streamed_rel(&cfg, &operands.grads, &exact.grads)
-    };
     drop(f32_model);
     rt.synchronize().unwrap();
     let bf16_model = real_2b_tower(&rt, Precision::Bf16);
@@ -1755,8 +1757,8 @@ fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
     );
     let results = streamed_rel(&cfg, &step.grads, &exact.grads);
     let worst = results.iter().map(|r| r.1).fold(0.0, f64::max);
-    for ((name, r), (_, o)) in results.iter().zip(&op) {
-        eprintln!("{name}: storage {r:.2e}, operands alone {o:.2e}");
+    for (name, r) in &results {
+        eprintln!("{name}: storage {r:.2e}");
     }
     eprintln!("worst {worst:.3e}");
     assert!(r_loss <= 2f64.powi(-7), "loss {} vs f32 {}", step.loss, exact.loss);
@@ -1945,25 +1947,14 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     };
     // Each step's training loss, and the held-out mean before training and
     // after every EVERY steps.
-    // `Err` names an arm whose live device memory, counted before it starts,
-    // is past memguard's footprint cap: the test then reports SKIPPED rather
-    // than being SIGTERMed mid-run or passing without its bound.
+    // `Err` names an arm whose footprint, read after its first step (every
+    // buffer the step needs exists by then), is past memguard's cap: the test
+    // then reports SKIPPED rather than being SIGTERMed mid-run or passing
+    // without its bound. The first step finishes well inside memguard's
+    // three-sample, ten-second grace.
     let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> Result<(Vec<f64>, Vec<f64>), String> {
+        rt.reset_peak_allocated_bytes();
         let model = real_2b_tower(&rt, precision);
-        let bank_bytes: u64 = model
-            .parameter_table()
-            .unwrap()
-            .iter()
-            .map(|p| p.shape.iter().product::<usize>() as u64 * 4)
-            .sum();
-        let need = rt.current_allocated_bytes() + bank_bytes + AdamW::allocated_bytes_for(&model, config).unwrap();
-        if need > MEMGUARD_CAP_BYTES {
-            return Err(format!(
-                "{precision:?} model, f32 bank and {config} state need {:.1} GiB, over memguard's {} GiB cap",
-                need as f64 / GIB,
-                MEMGUARD_CAP_BYTES / (1 << 30)
-            ));
-        }
         let operands = if precision == Precision::F32 {
             GemmOperands::ExactF32
         } else {
@@ -1987,6 +1978,19 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
                     .unwrap(),
             );
             model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
+            if s == 0 {
+                rt.synchronize().unwrap();
+                let footprint = rt.peak_allocated_bytes() + HOST_FOOTPRINT_OVER_DEVICE_BYTES;
+                if footprint > MEMGUARD_CAP_BYTES {
+                    return Err(format!(
+                        "{precision:?} storage with {} state peaks at {:.2} GiB device + {:.2} GiB host, over memguard's {} GiB cap",
+                        state.describe(),
+                        rt.peak_allocated_bytes() as f64 / GIB,
+                        HOST_FOOTPRINT_OVER_DEVICE_BYTES as f64 / GIB,
+                        MEMGUARD_CAP_BYTES >> 30
+                    ));
+                }
+            }
             if (s + 1) % EVERY == 0 {
                 helds.push(held());
             }

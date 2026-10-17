@@ -13,6 +13,7 @@ reads is built in a scratch directory and not kept.
   cases.csv                      name,channels,in_rate,out_rate for every `<name>.in.f32`
                                  / `<name>.ffmpeg.f32` pair below
   rate_*, layout_*, signal_*     one clip per rate pair, channel count or signal shape
+  special_*                      noise with a NaN, an infinity or negative zeros in it
   train_*                        impulses spaced so that no output sees two of them: the
                                  output samples are filter coefficients, so the pair
                                  exercises the filter bank of that rate pair
@@ -82,6 +83,25 @@ def signal(kind, n, ch, seed):
         return (rng.uniform(-0.9, 0.9, (n, ch))).astype(np.float32)
     if kind == "grid":  # values on the 16-bit grid, as a decoded WAV has them
         return (rng.integers(-32768, 32768, (n, ch)) / 32768.0).astype(np.float32)
+    if kind.startswith("special_"):  # noise with one non-finite or signed-zero sample set
+        x = rng.uniform(-0.9, 0.9, (n, ch)).astype(np.float32)
+        what = kind[len("special_"):]
+        if what == "inf_last_channel":
+            x[n // 6, ch - 1] = np.inf
+        elif what == "nan_last_channel":
+            x[n // 6, ch - 1] = np.nan
+        elif what == "nan_first_channel":
+            x[n // 3, 0] = np.nan
+        elif what == "inf_first_channel":
+            x[n // 3, 0] = np.inf
+        elif what == "opposite_infs":
+            x[n // 6, 0], x[n // 6, 1] = np.inf, -np.inf
+        elif what == "negative_zero":
+            x[:, 0] = -0.0
+            x[:, 1] = 0.0
+        else:
+            raise SystemExit(f"unknown special {what}")
+        return x
     if kind == "tiny":  # subnormal f32 values
         return (rng.uniform(-1, 1, (n, ch)) * 1e-40).astype(np.float32)
     if kind == "square":
@@ -136,6 +156,16 @@ def main():
         for rin in (48000, 22050, 44101, 16000, 8000):
             seed += 1
             case(f"layout_c{ch}_{rin}", "noise", 700, ch, rin, TARGET, seed)
+
+    # Non-finite samples and signed zeros, with and without a resampler; the last channel of 3 and
+    # of 6 channels is the one the default mix gives no weight.
+    for what, ch, rin in (("inf_last_channel", 3, 22050), ("nan_last_channel", 3, 22050),
+                          ("inf_last_channel", 6, 16000), ("nan_first_channel", 1, 48000),
+                          ("inf_first_channel", 1, 48000), ("opposite_infs", 2, 16000),
+                          ("nan_first_channel", 2, 16000), ("negative_zero", 2, 16000),
+                          ("negative_zero", 2, 44100)):
+        seed += 1
+        case(f"special_{what}_c{ch}_{rin}", f"special_{what}", 600, ch, rin, TARGET, seed)
 
     # Impulse trains: each output sees at most one impulse.
     trains = {}

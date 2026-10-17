@@ -3494,5 +3494,9 @@ tried.
 - Bit equality is with the AArch64 NEON build of FFmpeg 9.0.2. An x86 torchcodec sums in
   another order (unverified); and torchcodec itself was never run.
 - A file's own channel mask (WAVE_FORMAT_EXTENSIBLE) is not read: FFmpeg's default layout for
-  the channel count is assumed (1 to 8 channels). The `libswresample` port is LGPL-2.1-or-later
-  code's behaviour in a crate that is MIT OR Apache-2.0: for the owner to settle.
+  the channel count is assumed (1 to 8 channels).
+- Licensing: `src/media/resample.rs` is a clean-room rewrite, derived by black-box comparison
+  with the `ffmpeg` binary and FFmpeg's published option documentation, without FFmpeg's source
+  or the earlier implementation (`docs/media_resample_cleanroom.md` records what was consulted,
+  including the structural hints in the earlier tests' comments, each re-derived by experiment).
+  The earlier implementation remains in this branch's history until it is squashed.

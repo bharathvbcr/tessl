@@ -36,6 +36,7 @@ bin media_jpeg 11
 bin media_leaks 1
 bin media_resample 17
 bin media_yuv_exact 5
+bin media_resample_cr 10
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13

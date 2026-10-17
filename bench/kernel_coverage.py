@@ -440,7 +440,7 @@ def run_suites(tmp):
         r = subprocess.run([binary] + argv, env=e, capture_output=True, text=True)
         if r.returncode != 0:
             failures.append(f"{name} {' '.join(argv)}: exited {r.returncode}\n"
-                            f"{r.stderr.strip()[:400]}")
+                            f"{r.stderr.strip()[-600:]}")
             continue
         line = [x for x in r.stderr.splitlines() if x.startswith("KERNEL_TRACE ")]
         if not line:

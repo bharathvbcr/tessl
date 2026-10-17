@@ -775,20 +775,20 @@ fn decode_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters:
     )?;
     logits.write_f32(&seed_logits);
     let tok = u32_buf(rt, &[u32::MAX])?;
-    let run = || nn::softcap_sample(rt, &logits, &tok, &cap_buf, VOCAB as u32);
+    // One threadgroup reduces the whole row, so `n` is bounded by its lane count
+    // (the full-vocabulary samplers are the multi-pass and one-pass argmax).
+    const SAMPLE_N: usize = 512;
+    let run = || nn::softcap_sample(rt, &logits, &tok, &cap_buf, SAMPLE_N as u32);
     run()?;
     rt.synchronize()?;
     let t = nn::check_argmax_result(&tok)?;
-    assert!(
-        (t as usize) < VOCAB,
-        "softcap_sample: token {t} is outside the vocabulary"
-    );
+    assert!((t as usize) < SAMPLE_N, "softcap_sample: token {t} is outside the row");
     lane(
         rt,
         rows,
         "softcap_sample",
-        &format!("n={VOCAB}"),
-        (VOCAB * 4) as f64,
+        &format!("n={SAMPLE_N}"),
+        (SAMPLE_N * 4) as f64,
         warmup,
         iters,
         run,

@@ -1,0 +1,770 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_media_fixtures.py",
+ "generator_commit": "a2284d1722a42edfde12bf1efa2a6dab5ffc5673",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.3",
+  "python": "3.14.8"
+ },
+ "versions_role": "produced",
+ "inputs_source": "generated: the images are numpy default_rng draws and closed-form gradients encoded by PIL, the audio is synthesised tones encoded by afconvert, ffmpeg and PIL's encoders, and the video is solid and quadrant frames encoded by ffmpeg (libx264, libx265). Encoder output is stable for a given tool version; the goldens are the reference decoders' output for those exact files.",
+ "files": {
+  "anim.gif": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "anim.gif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "anim.gif.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "cmyk.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "cmyk.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "cmyk.jpg.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "colors.mp4": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "colors.mp4.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "colors_hevc.mp4": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif1.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif2.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif3.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif4.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif4.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif4.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif5.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif5.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif5.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif6.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif6.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif6.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif6.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif6.png.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif6.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif7.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif7.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif7.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif8.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "exif8.jpg.exif.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "exif8.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "f32_16k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "f32_16k_mono.wav.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.bmp": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "gray.bmp.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.bmp.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.jpg.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "gray.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.tiff": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "gray.tiff.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray.tiff.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray16.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "gray16.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "gray16.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "graya.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "graya.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "graya.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "manifest.txt": {
+   "role": "config",
+   "published": true,
+   "note": "one line per fixture: kind, name and the facts about it that the tests read"
+  },
+  "p3.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "p3.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "p3.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pal.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pal.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pal.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pal_trns.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pal_trns.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pal_trns.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_16k_mono.aiff": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_16k_mono.aiff.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_16k_mono.caf": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_16k_mono.caf.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_16k_mono.flac": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_16k_mono.flac.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_16k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_16k_mono.wav.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_22k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_22k_mono.wav.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_22k_mono.wav.torchaudio.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_22k_mono.wav.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_44k_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_44k_stereo.wav.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_44k_stereo.wav.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_44k_stereo.wav.torchaudio.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_44k_stereo.wav.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_48k_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_48k_stereo.wav.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_48k_stereo.wav.torchaudio.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_48k_stereo.wav.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_8k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm16_8k_mono.wav.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_8k_mono.wav.torchaudio.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm16_8k_mono.wav.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm24_16k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm24_16k_mono.wav.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm32_16k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm32_16k_mono.wav.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "pcm8_16k_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "pcm8_16k_mono.wav.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "photo.heic": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "photo.heic.src.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "quad_rot90.mp4": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "quad_rot90.mp4.cv2.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "quad_rot90.mp4.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "quad_rot90.mp4.stored.rgb24": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.bmp": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb.bmp.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.bmp.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.jpg.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.tiff": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb.tiff.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb.tiff.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb16.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb16.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb16.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgb444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgb444.jpg.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.bmp": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgba.bmp.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.bmp.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgba.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.tiff": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgba.tiff.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba.tiff.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba16.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "rgba16.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "rgba16.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "srgb_icc.png": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "srgb_icc.png.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "srgb_icc.png.rgba": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_16k_mono.m4a": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_16k_mono.m4a.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_16k_mono.mp3": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_16k_mono.mp3.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_16k_mono.opus": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_16k_mono.opus.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_16k_mono.wv": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_44k_stereo.flac": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_44k_stereo.flac.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_44k_stereo.m4a": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_44k_stereo.m4a.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_44k_stereo.mp3": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded media file the decoders under test are given"
+  },
+  "tone_44k_stereo.mp3.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_mono_long.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  },
+  "tone_stereo_long.truth.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the reference decoder's output for the input of the same name (torchvision/PIL for images, ffmpeg for audio and video; see the generator docstring)"
+  }
+ }
+}

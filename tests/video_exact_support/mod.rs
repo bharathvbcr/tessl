@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use tessl::media::yuv::{Matrix, Range};
+use tessl::media::yuv::{Chroma, Layout, Matrix, Range};
 
 pub fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media_video")
@@ -32,6 +32,11 @@ pub struct Fact {
     pub width: usize,
     pub height: usize,
     pub rotation: u32,
+    /// `h`, `v` or `none`: a display flip (with no rotation).
+    pub flip: String,
+    /// Whether the fixture has frame-by-frame goldens (the end-to-end file and the
+    /// streams the exact conversion refuses do not).
+    pub golden: bool,
     pub frames: usize,
     pub pix_fmt: String,
     pub color_range: String,
@@ -63,12 +68,46 @@ impl Fact {
     pub fn range(&self) -> Range {
         range_named(&self.color_range)
     }
+
+    /// The sample layout the stream is coded in.
+    pub fn layout(&self) -> Layout {
+        layout_of(&self.pix_fmt)
+    }
+
+    /// The extension of the CLI's bi-planar golden of this fixture (`nv12`, `p010`, ...).
+    pub fn planes_ext(&self) -> &'static str {
+        match (self.layout().chroma, self.layout().depth) {
+            (Chroma::C420, 8) => "nv12",
+            (Chroma::C422, 8) => "nv16",
+            (Chroma::C444, 8) => "nv24",
+            (Chroma::C420, _) => "p010",
+            (Chroma::C422, _) => "p210",
+            (Chroma::C444, _) => "p410",
+        }
+    }
+}
+
+/// The layout of an ffmpeg pixel format name (`yuv420p`, `yuvj420p`, `yuv422p10le`, ...).
+pub fn layout_of(pix_fmt: &str) -> Layout {
+    let name = pix_fmt.replace("yuvj", "yuv");
+    let chroma = match &name[3..6] {
+        "420" => Chroma::C420,
+        "422" => Chroma::C422,
+        "444" => Chroma::C444,
+        other => panic!("pixel format {pix_fmt:?} has chroma {other:?}"),
+    };
+    Layout {
+        chroma,
+        depth: if name.contains("10") { 10 } else { 8 },
+    }
 }
 
 pub fn matrix_named(tag: &str) -> Matrix {
     match tag {
         "bt709" => Matrix::Bt709,
         "bt2020nc" => Matrix::Bt2020Nc,
+        "fcc" => Matrix::Fcc,
+        "smpte240m" => Matrix::Smpte240m,
         "smpte170m" | "bt470bg" | "unspecified" => Matrix::Bt601,
         other => panic!("matrix tag {other:?} is not one the fixtures use"),
     }
@@ -113,6 +152,8 @@ pub fn facts() -> Vec<Fact> {
                 width: get("w").parse().unwrap(),
                 height: get("h").parse().unwrap(),
                 rotation: get("rotation").parse().unwrap(),
+                flip: get("flip").to_string(),
+                golden: get("golden") == "yes",
                 frames: get("frames").parse().unwrap(),
                 pix_fmt: get("pix_fmt").to_string(),
                 color_range: get("color_range").to_string(),
@@ -172,6 +213,74 @@ pub fn synthetics() -> Vec<Synthetic> {
             }
         })
         .collect()
+}
+
+/// One `format` line of `facts.txt`: random planar planes of one layout
+/// (`syn_<fmt>_<matrix>_<range>_<w>x<h>.planar`) and the CLI's conversion of them.
+#[derive(Clone, Debug)]
+pub struct FormatCase {
+    pub name: String,
+    pub pix_fmt: String,
+    pub layout: Layout,
+    pub width: usize,
+    pub height: usize,
+    pub matrix: Matrix,
+    pub range: Range,
+}
+
+pub fn format_cases() -> Vec<FormatCase> {
+    facts_text()
+        .lines()
+        .filter(|l| l.starts_with("format "))
+        .map(|l| {
+            let (_, name, m) = kv(l);
+            FormatCase {
+                pix_fmt: m["fmt"].clone(),
+                layout: layout_of(&m["fmt"]),
+                width: m["w"].parse().unwrap(),
+                height: m["h"].parse().unwrap(),
+                matrix: matrix_named(&m["matrix"]),
+                range: range_named(&m["range"]),
+                name,
+            }
+        })
+        .collect()
+}
+
+/// A format case's planes as the converter takes them: luma, and interleaved Cb, Cr.
+pub struct Planes {
+    pub y: Vec<u16>,
+    pub uv: Vec<u16>,
+}
+
+impl FormatCase {
+    /// Width and height of the chroma planes.
+    pub fn chroma_size(&self) -> (usize, usize) {
+        match self.layout.chroma {
+            Chroma::C420 => (self.width.div_ceil(2), self.height.div_ceil(2)),
+            Chroma::C422 => (self.width.div_ceil(2), self.height),
+            Chroma::C444 => (self.width, self.height),
+        }
+    }
+
+    /// The `.planar` file, read and interleaved.
+    pub fn planes(&self) -> Planes {
+        let raw = bytes(&format!("{}.planar", self.name));
+        let samples: Vec<u16> = if self.layout.depth == 8 {
+            raw.iter().map(|&b| u16::from(b)).collect()
+        } else {
+            raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        };
+        let (cw, ch) = self.chroma_size();
+        let (ny, nc) = (self.width * self.height, cw * ch);
+        assert_eq!(samples.len(), ny + 2 * nc, "{}: planar size", self.name);
+        let (y, rest) = samples.split_at(ny);
+        let (cb, cr) = rest.split_at(nc);
+        Planes {
+            y: y.to_vec(),
+            uv: cb.iter().zip(cr).flat_map(|(&b, &r)| [b, r]).collect(),
+        }
+    }
 }
 
 /// `(index of the first differing byte, number of differing bytes, largest difference)`,

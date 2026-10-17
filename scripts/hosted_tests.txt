@@ -35,6 +35,7 @@ bin media_decode 21
 bin media_leaks 1
 bin media_resample 17
 bin media_yuv_exact 5
+bin media_yuv_formats 5
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13

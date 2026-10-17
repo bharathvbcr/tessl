@@ -9,7 +9,7 @@
 
 mod video_exact_support;
 
-use tessl::media::yuv::{nv12_to_rgb24, Flavor, Matrix, Nv12, Range, YuvError};
+use tessl::media::yuv::{nv12_to_rgb24, Chroma, Flavor, Matrix, Nv12, Range, YuvError};
 use video_exact_support::*;
 
 fn convert(w: usize, h: usize, planes: &[u8], m: Matrix, r: Range, flavor: Flavor) -> Vec<u8> {
@@ -34,8 +34,13 @@ fn convert(w: usize, h: usize, planes: &[u8], m: Matrix, r: Range, flavor: Flavo
 fn the_planes_ffmpeg_decodes_convert_to_the_rgb_it_converts() {
     let mut checked = 0;
     for f in facts() {
-        // The goldens of a rotated stream are rotated; rotation is checked on the codec side.
-        if f.name == "e2e_video" || f.rotation != 0 || f.pix_fmt.contains("10") {
+        // The goldens of a rotated or flipped stream are turned; that is checked on the codec side.
+        // The other layouts are `tests/media_yuv_formats.rs`'.
+        if !f.golden || f.rotation != 0 || f.flip != "none" {
+            continue;
+        }
+        let layout = f.layout();
+        if layout.depth != 8 || layout.chroma != Chroma::C420 {
             continue;
         }
         let planes = bytes(&format!("{}.nv12", f.name));
@@ -189,8 +194,11 @@ fn matrices_are_chosen_by_the_h273_code_as_libswscale_does() {
         assert_eq!(Matrix::from_code(code), Some(Matrix::Bt601), "code {code}");
     }
     assert_eq!(Matrix::from_code(9), Some(Matrix::Bt2020Nc));
-    // FCC, SMPTE 240M, YCgCo, BT.2020 constant luminance, identity: not held.
-    for code in [0, 3, 4, 7, 8, 10, 11, 255] {
+    // FCC (4) and SMPTE 240M (7) have their own coefficients.
+    assert_eq!(Matrix::from_code(4), Some(Matrix::Fcc));
+    assert_eq!(Matrix::from_code(7), Some(Matrix::Smpte240m));
+    // Identity, reserved, YCgCo, BT.2020 constant luminance and the rest: not held.
+    for code in [0, 3, 8, 10, 11, 12, 255] {
         assert_eq!(Matrix::from_code(code), None, "code {code}");
     }
 }
@@ -234,6 +242,8 @@ fn exhaustive_against_a_live_ffmpeg() {
         (Matrix::Bt601, "smpte170m"),
         (Matrix::Bt601, "bt470bg"),
         (Matrix::Bt2020Nc, "bt2020nc"),
+        (Matrix::Fcc, "fcc"),
+        (Matrix::Smpte240m, "smpte240m"),
     ] {
         for (range, range_tag) in [(Range::Limited, "tv"), (Range::Full, "pc")] {
             for (flavor, cpu) in [(Flavor::Aarch64, false), (Flavor::Portable, true)] {

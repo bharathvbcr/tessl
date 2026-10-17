@@ -292,17 +292,19 @@ The Python side is marshalling: it flattens the arrays and cuts, and checks only
 what ctypes would wrap silently, the dtype first: uint8 for pixels (a float or
 wider integer cast to `uint8` wraps), floating point for PCM (an `int16` clip
 would need a scale the binding cannot guess), dimensions that fit a `u32`, and
-integer ranges (`truncate_dim`, `sampling_rate`, ids). Everything else (the
+integer ranges (`truncate_dim`, `sampling_rate`, ids). (Files, bytes and
+segment-built items are [the next section](#files-bytes-soft-token-counts-and-text-interleaved-with-media).) Everything else (the
 channel count, a clip too short for a frame, a text over the token limit, an
 unknown prompt, a placeholder count that is not the media's soft-token count,
 fps not positive) is the library's refusal and arrives as its message. The
 prompts-file reader of the previous binding (`_prompt_config`, JSON parsing,
 stat and size checks) and the processor-calling `embed_images` / `embed_audio`
 are gone; the tokenizer path of `encode_texts` fetches the prompt text with
-`tessl_embedgemma2_prompt_get`. `media` needs ids of your own because the
-placeholders and the number of soft tokens each medium makes are the
-checkpoint's (`config.json`, `processor_config.json`); `embed_images` and
-friends build the processor's own sequence.
+`tessl_embedgemma2_prompt_get`. The ids form of `media` needs ids of your own
+because the placeholders and the number of soft tokens each medium makes are the
+checkpoint's (`config.json`, `processor_config.json`); the `*_soft_token_count`
+entries tell the counts, and the segments form of the next section lays the ids
+out; `embed_images` and friends build the processor's own sequence.
 
 `tessl_clip_coef` is `clip_grad_norm_`'s coefficient in torch's f32 arithmetic.
 The Rust side had no such function to reuse (`src/capi.rs` only forms the norm,
@@ -324,6 +326,137 @@ a missing file named and read again. `python/tests/test_embedgemma2_host.py` and
 `..._mm_host.py` hold the marshalling to a recording stand-in;
 `python/tests/test_embedgemma2_raw.py` runs the tiny snapshot and, opt-in, the real
 checkpoint against sentence-transformers.
+
+### Files, bytes, soft-token counts and text interleaved with media
+
+Seven further entries finish the C ABI for callers that hold media as files or
+encoded bytes, or that interleave text with media. They are additive like the
+rest (nothing bumps), sit at the end of `src/capi_embedgemma2.rs`, and go through
+the same `guarded` boundary. The decoders are [`tessl::media`](#media-decoding)'s
+(ImageIO, AudioToolbox, AVFoundation) through
+`embedgemma2_media::{prepare_image, prepare_audio, OpenedVideo}`, which is the
+Rust owner of "file or bytes to tower input": decode with the defaults the
+reference does, preprocess at once, drop the decoded pixels.
+
+| Entry | Takes | Runs |
+|---|---|---|
+| `tessl_embedgemma2_embed_image_sources(model, source, blob, blob_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `source` `TESSL_EMBEDGEMMA2_SOURCE_PATHS` (1: UTF-8 paths) or `_BYTES` (2: whole encoded files), laid end to end in `blob` and cut by `n_images + 1` strictly increasing `u64` offsets from 0 to `blob_len`; `n_images` 1 to 256 | ImageIO, `preprocess_image`, the vision tower; one wait |
+| `tessl_embedgemma2_embed_audio_sources(.. same, n_clips ..)` | the same | AudioToolbox to 16 kHz mono (the channel mean), `AudioFrontEnd::extract`, the audio tower; one wait |
+| `tessl_embedgemma2_embed_video_sources(model, source, blob, blob_len, offsets, n_videos, extension, extension_len, timestamps, truncate_dim, out, out_len, err, err_len)` | as above; `extension` (1 to 8 letters or digits; null with 0 is `mp4`, paths take null with 0) is the type video bytes are sniffed as; `timestamps` 0 or 1 | the sampler's frames decoded, `MmItem::Video` or `MmItem::TimestampedVideo`; one wait |
+| `tessl_embedgemma2_image_soft_token_count(model, image_dims, n_images, out, out_len, err, err_len)` | `[n, 2]` `u32` `(height, width)`; `out` `n` `u64`, `out_len` exactly `n` | the count of placeholders the image makes, from its size alone (`embedgemma2_pre::image_soft_tokens`) |
+| `tessl_embedgemma2_audio_soft_token_count(model, sample_counts, n_clips, sampling_rate, out, out_len, err, err_len)` | `n` sample counts (1 to 2^28) at the extractor's rate | the tower's mask count for the frames the extractor would build, after the 30 s cut (`audio_soft_tokens`, 750 at most); a clip too short for a frame is refused by index |
+| `tessl_embedgemma2_video_soft_token_count(model, video_dims, frame_counts, video_fps, n_videos, out, out_len, err, err_len)` | `[n, 2]` frame sizes, frames per video (1 to 2^20), a finite positive rate each; `out` `[n, 2]` `u64` | `(frames the sampler keeps, soft tokens per frame)` (`video_soft_tokens`); nothing is decoded |
+| `tessl_embedgemma2_embed_segments(model, <texts>, <segments>, <images>, <clips>, <videos>, video_extension, video_extension_len, truncate_dim, out, out_len, err, err_len)` | see below | `MmItem::Segments`; one wait |
+
+The counts work on a text-only handle as well (they read `processor_config.json`,
+not a tower), so a prompt can be budgeted before any media is read. They are what
+`tessl_embedgemma2_embed_media` needed and the ABI never said: the number of
+placeholders per medium. A caller who still lays out ids of their own gets them
+from here; one who does not uses `embed_segments`.
+
+**Segments.** An item is a list of segments, each a text or a medium, and the
+library lays out the processor's sequence for it: the chat template joins the
+pieces with no separator, each medium becomes `<boi> <image> x n <eoi>` (or
+`<boa> <audio> x n <eoa>`, or one `<boi> <video> x n <eoi>` block per sampled
+frame with a `mm:ss` label before it under timestamps), `n` comes from the tower,
+and the tokenizer wraps the whole in `<bos>`/`<eos>`. Added tokens split the
+text, so the text between two blocks is one stretch tokenized on its own;
+adjacent texts merge, and a timestamp label joins the text before it. The Rust
+owner is `EmbedGemma2Config::mixed_sequence` over `LayoutSegment` (the facade's
+`MmItem::Segments` calls it with the towers' counts); `image_sequence` and the
+other sequence builders are unchanged. The layout is verified against the
+processor's own output (below).
+
+The C entry takes the texts (`text_bytes`, `text_offsets`, `n_texts`, as for
+`embed_texts`, no prompt is added: write it in the first text), the segments
+(`segment_kinds` `TESSL_EMBEDGEMMA2_SEGMENT_{TEXT,IMAGE,AUDIO,VIDEO,VIDEO_TIMESTAMPED}`
+= 0 to 4, `segment_refs` indexing the call's texts or media by that kind,
+`item_offsets` cutting at most 65,536 segments into items) and, for each modality,
+a `*_source` (`TESSL_EMBEDGEMMA2_SOURCE_RAW` 0, `_PATHS`, `_BYTES`), a blob with
+its byte cuts and, for raw media, the tables `embed_images`, `embed_audio` and
+`embed_videos` take (`image_dims` `[n, 3]`, native-endian `f32` PCM at
+`sampling_rate` with cuts a multiple of 4, `video_dims` `[n, 2]` and `video_fps`).
+A text or a medium may be named by several segments (decoded and preprocessed
+once, through its tower once per mention); one no segment names, and a reference
+past a table, are refused by index. A modality with no media passes `n = 0`,
+null pointers and 0.
+
+**Bounds and errors.** Every count and cut is checked before anything is read: a
+path is at most 4,096 bytes with no NUL, an image file at most 2^30 bytes, an
+audio file 2^32, a video 2^32; the embedding entries take at most `MAX_BATCH` items
+and the count entries at most `MAX_CALL_IMAGES` / `MAX_CALL_CLIPS`; the call's
+pictures and patches, clips and frames are held to the per-call totals of
+[Pictures and clips past a forward](#pictures-and-clips-past-a-forward) *before any
+file is opened or frame decoded* (a video's first pass reports its sampled
+frames). A failure names the file or bytes by index and the decoder's reason
+(`file 2: cannot read ...`, `bytes 1: image: ...`, `segment 3 names image 5, but
+the call has 2`), and the output is written only on success, in the three count
+entries as in the embedding ones (a refused count call leaves its `out` alone).
+Bytes of video are written to a private temporary file, removed before the call
+returns on every path (the tests count the temporary files).
+
+**From Python.**
+
+```python
+model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)
+emb = model.embed_image_files(["cat.png", "dog.jpg"])         # or embed_image_bytes([data, ...])
+emb = model.embed_audio_files("clip.wav")                      # or embed_audio_bytes
+emb = model.embed_video_files("clip.mp4", timestamps=True)     # or embed_video_bytes(data, extension="mov")
+model.image_soft_token_count([(480, 640)])                     # [n_placeholders]
+model.audio_soft_token_count([16000]); model.video_soft_token_count((48, 64), 12, 10.0)   # [(frames, per_frame)]
+emb = model.media([{"segments": ["a photo of", {"image": "cat.png"}, "on a table"]}])
+```
+
+A segment of `media()` is a `str` or a mapping with exactly one of `image`,
+`audio` and `video` (and `timestamps` with a video); the medium is an array
+(`embed_images`' and `embed_audio`'s; a video is `(frames, fps)`), a path or encoded
+bytes. Within one call each modality uses one of the three, a mix is refused
+naming the two segments that disagree, and the same object named twice is one
+medium. `video_extension` is the type video bytes are sniffed as. The ids form
+(`{"ids": ..., "images": ...}`) is unchanged; one call takes one form. The
+Python side marshals and checks only what ctypes would wrap (types, ranges,
+UTF-8); decoding failures arrive as the library's message.
+
+**Parity.** On the real checkpoint (`tools/embedgemma2_ref/make_segments_reference.py`
+renders each case through the snapshot's chat template and `EmbeddingGemma2Processor`,
+mean-pools and normalizes, and checks its own route against sentence-transformers'
+`encode` on the cases that route can take, to 1e-6):
+
+| Case (message) | Ids vs the processor's | Embedding, max abs | Cosine |
+|---|---|---|---|
+| text, image, text | equal | 1.9e-7 | 1.00000000 |
+| text, clip, text | equal | 1.6e-7 | 1.00000000 |
+| text, video, text | equal | 2.7e-7 | 1.00000000 |
+| image, text | equal | 1.5e-7 | 1.00000000 |
+| text, image, text, clip, text, video | equal | 2.1e-7 | 1.00000000 |
+| video, video | equal | 1.2e-7 | 1.00000000 |
+| text, timestamped video, text | equal | 1.5e-7 | 1.00000000 |
+
+(`tests/embedgemma2_segments_model.rs`, bounds max abs 1e-4 and cosine 0.99999; the
+Python run of the same cases, with the image and clip once as files and once as
+bytes, reports the same figures. Each case alone and the seven in one call agree
+to the last digit shown.) The counts from sizes alone equal the processor's
+placeholder counts (image 224x224, a 1 s clip, the 24-frame video).
+
+**Tests.** `tests/embedgemma2_segments.rs` holds the layout to the tokenizer's
+ids of the processor's whole string for 17 messages on a tiny tokenizer (a
+mutation that flushes the text before a timestamp label fails two of them),
+segments equal the same ids passed as a `Media` item bit for bit with one wait,
+and the soft-count helpers equal preprocessing and the tower's mask across
+boundary lengths. `tests/capi_embedgemma2_media.rs` pins the seven entries the
+way `capi_embedgemma2_raw.rs` pins the raw ones: a null handle, a text-only handle,
+every table refusal (over-limit lengths against tiny buffers, which would fault
+if anything read first), a missing file, garbage bytes and a cut-short image named
+by index, no temporary video file left, a foreign thread, relaxed precision, and
+bit-for-bit equality with the Rust facade for both `operands`. The two Python
+files are `python/tests/test_embedgemma2_media_host.py` (marshalling against a
+stand-in) and `python/tests/test_embedgemma2_media.py` (tiny snapshot: a file, its
+bytes and its array give the same row; opt-in, the real checkpoint against the
+references above).
+
+Regenerating: `EMBEDGEMMA2_SNAPSHOT=... ~/.venvs/ml-2026-10/bin/python
+tools/embedgemma2_ref/make_segments_reference.py` writes
+`target/embedgemma2_seg_ref/` (`EMBEDGEMMA2_SEG_REF_DIR` overrides it).
 
 ## Multimodal input
 

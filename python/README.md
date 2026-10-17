@@ -184,8 +184,30 @@ emb = model.media([{"ids": ids, "images": [rgb], "audio": [pcm], "videos": [(fra
 `encode_images` / `encode_audio` keep taking the arrays of a transformers
 processor. The Python side only checks what ctypes would wrap silently (dtype,
 `u32` ranges); every other refusal is the library's. `embed_images` and
-`embed_audio` no longer take a processor argument. See `docs/embedgemma2.md`
-("From Python / C", "Raw inputs") for the limits and the C entries.
+`embed_audio` no longer take a processor argument.
+
+Media can also be files or encoded bytes, decoded by the system's codecs
+(ImageIO, AudioToolbox, AVFoundation), and an item can interleave text with
+media without counting a placeholder:
+
+```python
+emb = model.embed_image_files(["cat.png", "dog.jpg"])        # paths: str or os.PathLike
+emb = model.embed_image_bytes([png_bytes])                   # whole encoded files in memory
+emb = model.embed_audio_files("clip.wav")                    # and embed_audio_bytes
+emb = model.embed_video_files("clip.mp4", timestamps=True)   # and embed_video_bytes(data, extension="mov")
+emb = model.media([{"segments": ["a photo of", {"image": "cat.png"}, "on a table"]}])
+model.image_soft_token_count([(480, 640)])                   # placeholders an image makes, from its size
+model.audio_soft_token_count([16000])                        # likewise for clips (samples) ...
+model.video_soft_token_count((48, 64), 12, 10.0)             # ... and videos: [(frames, per_frame)]
+```
+
+A segment of `media()` is a `str` or a mapping with one of `image`, `audio`,
+`video` (an array, a path or bytes; a video array is `(frames, fps)`; `"timestamps":
+True` labels a video's frames). Within one call a modality uses one of the three
+forms, and one call takes either segments or ids items. A failure names the file
+or the bytes by index. The counts work on a text-only load. See
+`docs/embedgemma2.md` ("From Python / C", "Raw inputs", "Files, bytes, soft-token
+counts and text interleaved with media") for the limits and the C entries.
 
 ## Handle ownership, closing and errors
 
@@ -294,8 +316,11 @@ replaces the library): `python3 -m unittest python/tests/test_binding_host.py`.
 
 Where they run: `scripts/ci_local.sh` runs `test_binding_host.py` on every
 invocation with the torch oracle python (and fails if there is none). It runs
-the rest of `python/tests` (`test_cross_entropy.py`, `test_gdn.py`,
-`test_qwen35.py`: GPU and MPS, transformers) only under the machine-wide heavy
+the other host-only embedgemma2 tests (`test_embedgemma2_host.py`,
+`test_embedgemma2_mm_host.py`, `test_embedgemma2_media_host.py`) as well, and the rest of `python/tests`
+(`test_clip_coef.py`, `test_cross_entropy.py`, `test_gdn.py`, `test_qwen35.py`,
+`test_embedgemma2.py`, `test_embedgemma2_mm.py`, `test_embedgemma2_raw.py`,
+`test_embedgemma2_media.py`: GPU and MPS, transformers) only under the machine-wide heavy
 lock (`MAC_HEAVY_LABEL` set by `tools/mac_heavy.sh`); otherwise it prints a
 `SKIPPED` line. GitHub's CI does not run `python/tests`.
 

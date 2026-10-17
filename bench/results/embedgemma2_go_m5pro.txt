@@ -1,0 +1,32 @@
+workload            main us    direct us      go us  go-direct us     paired us  go/direct
+texts x1              439.7        463.9      552.2          88.3          32.0      1.190
+texts x4              522.6        486.7      624.2         137.5          39.3      1.283
+texts x16             873.4        804.3      945.4         141.0          47.6      1.175
+texts x64            2266.8       2371.9     2528.2         156.4          73.2      1.066
+texts x256           8586.0       8708.8     8928.8         220.0         112.9      1.025
+images x1             900.9        879.2      950.9          71.7          49.9      1.082
+images x8            2801.1       2848.1     2825.9         -22.2         100.9      0.992
+ping (noop)   min 0.9 us (a round trip with no work)
+
+Recorded by `make -C go bench MAX_LOAD=0 ROUNDS=15 ITERS=200` on an Apple M5 Pro, Go 1.27.2,
+gusset v0.0.3-0.20261010191510-984209b54288, GOMAXPROCS 18. Minimum of 3000 calls per arm and
+workload (15 rounds of 200), all arms in alternating separate processes with bit-identical outputs.
+
+NOT A QUIET-MACHINE RECORDING. The 1-minute load average was 98.6 before and 70.9 after (other
+sessions were building and running GPU tests; a run waiting for a load of 15 with a 45 minute
+budget was stopped after about 11 minutes with the load never below about 70, and `MAX_LOAD=0`
+turned the idle check off for this recording), and the run was not under the machine-wide
+`mac_heavy` lock (the harness refused to run that script from this session). Read it this way:
+
+  paired us    Go wall time minus the engine's own timing of the same call, per call, minimum:
+               the boundary's cost with the GPU time identical on both sides of the difference.
+               The figure to read. The medians in the .json are inflated several-fold by the load.
+  go-direct us difference of the minima of two processes: it also carries the difference between
+               two processes' GPU times, so it is noise of about +-100 us here and is negative once.
+               Do not read it as the cost.
+  main us      tessl's C ABI called on the process's main thread. The "direct" column is the same
+               on a thread of its own with gusset's 8 MiB worker stack, which is what the Go engine's
+               model lives on; use that one as the comparison.
+
+Re-record on an idle machine, under the lock:
+  bash <Lappi-decision>/tools/mac_heavy.sh tessl-go-bench make -C go bench

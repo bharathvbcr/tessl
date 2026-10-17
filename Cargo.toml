@@ -26,6 +26,9 @@ exclude = [
     "assets/concepts/**",
     "assets/build_logo.py",
     "assets/png/*@2048.png",
+    # The Go binding (go/) is its own module and its own Rust crate (go/engine); a
+    # consumer of this crate gets neither from crates.io.
+    "go/**",
 ]
 
 # tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and

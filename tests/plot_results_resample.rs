@@ -7,51 +7,8 @@
 //!
 //! No GPU, no Python.
 
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/chart.rs"]
-mod chart;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/data.rs"]
-mod data;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/jpeg.rs"]
-mod jpeg;
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod json;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/media.rs"]
-mod media;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/memory.rs"]
-mod memory;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/paired.rs"]
-mod paired;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/registry.rs"]
-mod registry;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/resample.rs"]
-mod resample;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/small_m.rs"]
-mod small_m;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/stage.rs"]
-mod stage;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/svg.rs"]
-mod svg;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/tok.rs"]
-mod tok;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/video_color.rs"]
-mod video_color;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/vision.rs"]
-mod vision;
+// The bin's own module list, so this test compiles every figure the registry names.
+include!("../src/bin/plot_results/modules.rs");
 
 use std::fs;
 use std::path::{Path, PathBuf};

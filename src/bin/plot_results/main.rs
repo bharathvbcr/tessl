@@ -16,26 +16,7 @@
 //! that disagree on the token ids) this exits 1 with the reason and writes
 //! nothing.
 
-// The crate's strict parser, shared the way bench_paired shares it; this tool
-// does not use its object lookup.
-#[allow(dead_code)]
-#[path = "../../json.rs"]
-mod json;
-
-mod chart;
-mod data;
-mod jpeg;
-mod media;
-mod memory;
-mod paired;
-mod registry;
-mod resample;
-mod small_m;
-mod stage;
-mod svg;
-mod tok;
-mod video_color;
-mod vision;
+include!("modules.rs");
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

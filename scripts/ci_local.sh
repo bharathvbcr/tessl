@@ -94,6 +94,19 @@ else
   SKIPS+=("python/tests GPU tests")
 fi
 
+echo "==> Go binding unit tests (go/Makefile: engine archive and its tests, gofmt, go vet, go test -run TestUnit; no GPU, no checkpoint)"
+make -C go unit
+
+echo "==> Go binding device tests (go/Makefile: fixtures written by tessl's C ABI, then the Go device tests on the tiny checkpoint)"
+# They run on the Metal device next to the GPU tests above, so they take the same lock, and
+# outside it they are not run: that is printed rather than left to read as a pass.
+if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
+  make -C go device
+else
+  echo "SKIPPED: Go device tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
+  SKIPS+=("Go device tests")
+fi
+
 echo "==> test (release, serialized, every binary even after a failure)"
 # --no-fail-fast runs every test binary so one red binary does not hide the rest; the
 # script then still ends non-zero (below) if any of them failed.

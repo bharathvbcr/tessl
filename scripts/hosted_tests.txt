@@ -41,6 +41,7 @@ bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
 bin plot_results 57
+bin plot_results_go_overhead 8
 bin plot_results_resample 7
 bin reader_bounds 12
 bin qwen35_config 8

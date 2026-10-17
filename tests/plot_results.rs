@@ -16,51 +16,8 @@
 //!
 //! Nothing here needs a GPU or Python.
 
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/chart.rs"]
-mod chart;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/data.rs"]
-mod data;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/jpeg.rs"]
-mod jpeg;
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod json;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/media.rs"]
-mod media;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/memory.rs"]
-mod memory;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/paired.rs"]
-mod paired;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/registry.rs"]
-mod registry;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/resample.rs"]
-mod resample;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/small_m.rs"]
-mod small_m;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/stage.rs"]
-mod stage;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/svg.rs"]
-mod svg;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/tok.rs"]
-mod tok;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/video_color.rs"]
-mod video_color;
-#[allow(dead_code)]
-#[path = "../src/bin/plot_results/vision.rs"]
-mod vision;
+// The bin's own module list, so this test compiles every figure the registry names.
+include!("../src/bin/plot_results/modules.rs");
 
 use chart::{fmt_tick, linear_ticks, log_ticks, nice_ceil, nice_floor, nice_top};
 use json::{Json, Syntax};
@@ -396,6 +353,7 @@ const ALL: &[(&str, &str)] = &[
     ("media-resample", "media_resample_m5pro"),
     ("video-color", "media_video_color_m5pro"),
     ("jpeg-decode", "jpeg_decode_m5pro"),
+    ("go-overhead", "embedgemma2_go_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------

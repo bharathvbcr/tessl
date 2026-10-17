@@ -2502,3 +2502,303 @@ hand-back is defence the pool fix does not replace, it costs nothing, and it is 
 `embedgemma2_audio.rs` `queue_impl`, the facade's `drop((image_soft, clip_soft))`). The
 open-work case was measured for the text encoder only; the towers and the facade use
 the same pattern and were not measured held-back.
+
+## Media decoding
+
+`tessl::media` turns an image, audio or video file (or its bytes) into the raw inputs
+`tessl::embedgemma2_pre` takes, with no Python and no new crates, through the system
+frameworks: ImageIO and CoreGraphics for images, AudioToolbox for audio, AVFoundation for
+video. macOS only. The C declarations are this crate's own, written from the SDK headers;
+AVFoundation goes through `objc2`'s `msg_send!` and `block2`, which the crate already
+depends on.
+
+```rust
+let cfg = PreConfig::from_snapshot(&snapshot)?;
+let img = media::image::decode_image_file(path, &ImageOptions::default())?;
+let prepared = preprocess_image(&cfg.image, &img.raw())?;
+let clip = media::audio::decode_audio_file(path, &AudioOptions::default())?;   // mono f32, 16 kHz
+let features = preprocess_audio(&cfg.audio, &clip.samples, clip.sample_rate)?;
+let video = media::video::decode_video_file(path, &cfg.video, &VideoOptions::default())?;
+let out = media::video::preprocess_decoded_video(&cfg.video, &video)?;         // PreparedVideo
+```
+
+Every function returns a `MediaError`. A file that cannot be decoded is an error, never an
+empty result, and a file that is cut short is an error rather than the part that survived
+(below).
+
+| Framework function (declared by hand) | Header | Used for |
+|---|---|---|
+| `CGImageSourceCreateWithData`, `CGImageSourceCopyPropertiesAtIndex`, `CGImageSourceCreateImageAtIndex`, `CGImageSourceGetStatusAtIndex` | ImageIO `CGImageSource.h` | decode, size and orientation before the decode, completeness after |
+| `CGImageGet*`, `CGDataProviderCopyData`, `CGColorSpace*`, `CGBitmapContextCreate`, `CGContextDrawImage` | CoreGraphics `CGImage.h`, `CGDataProvider.h`, `CGColorSpace.h`, `CGBitmapContext.h` | the direct sample copy; the sRGB fallback |
+| `ExtAudioFileOpenURL`, `ExtAudioFileWrapAudioFileID`, `ExtAudioFileRead`, `ExtAudioFileGetProperty`/`SetProperty`, `ExtAudioFileDispose` | AudioToolbox `ExtendedAudioFile.h` | decode to `f32` at the file's rate |
+| `AudioFileOpenWithCallbacks`, `AudioFileClose` | `AudioFile.h` | decode from bytes |
+| `AudioConverterNew`, `AudioConverterSetProperty`, `AudioConverterFillComplexBuffer`, `AudioConverterDispose` | `AudioConverter.h` | the sample-rate conversion |
+| `AVURLAsset`, `AVAssetReader`, `AVAssetReaderTrackOutput`, `AVAssetTrack` (`loadTracksWithMediaType:completionHandler:`, `preferredTransform`, `nominalFrameRate`), `CMSampleBuffer*`, `CVPixelBuffer*` | AVFoundation, CoreMedia, CoreVideo | video |
+| `CFData*`, `CFURLCreateFromFileSystemRepresentation`, `CFDictionaryGetValue`, `CFNumberGetValue`, `CFRelease` | CoreFoundation | held by `cf::CfRef`, released on every path |
+
+### What the reference decodes, and what this follows
+
+Verified against the installed sentence-transformers 6.1 and transformers 5.19 (the
+`feature-extraction` task of `sentence_bert_config.json`):
+
+- **Image path string.** It reaches the image processor's `fetch_images`, which calls
+  `torchvision.io.decode_image(path, mode=ImageReadMode.RGB)` with
+  `apply_exif_orientation=False`: libpng and libjpeg-turbo, no colour management, no EXIF
+  transpose (traced by wrapping that function while encoding a PNG path). The PIL route with
+  `ImageOps.exif_transpose` and `convert("RGB")` is taken for a PIL image and by
+  `transformers.image_utils.load_image`. The defaults here follow the first;
+  `ExifOrientation::Apply` is the second. torchvision and PIL gave the same bytes on every
+  fixture tried, JPEG and CMYK included.
+- **Audio path string.** `transformers.load_audio` with the default backend uses torchcodec
+  (FFmpeg's libswresample), else librosa. **Neither is installed here, nor soundfile, PyAV or
+  soxr**, and `torchaudio.load` needs torchcodec. So a `.wav` path cannot be given to
+  sentence-transformers in this environment, and the audio oracles are FFmpeg 9.0.2 (the
+  library torchcodec calls; labelled "ffmpeg standing in for torchcodec"),
+  `torchaudio.functional.resample` (the only part of torchaudio that works), and the analytic
+  signal the fixtures are built from. The end-to-end audio test feeds sentence-transformers
+  the array scipy reads from the same file.
+- **Video.** torchcodec is absent and torchvision 0.29 no longer decodes video; the oracles
+  are the `ffmpeg` and `ffprobe` CLIs and OpenCV. What torchcodec does with a rotation flag is
+  **unverified**: the default here applies it (`Rotation::Apply`), which is what FFmpeg's CLI
+  and OpenCV do.
+
+### Images
+
+`ImageOptions::default()`: RGB, EXIF ignored, colour left as stored (`ColorHandling::Native`),
+16-bit gray as PIL turns it into RGB (`Gray16::PilClip`), at most `MAX_IMAGE_PIXELS`
+(checked from the header before anything is decoded).
+
+- **Direct path** (every lossless case measured): the decoded `CGImage` already holds the
+  file's samples, which are copied out of its data provider honouring stride, byte order and
+  alpha placement, with no colour conversion and no resampling. **Result: byte for byte equal
+  to the oracle, 0 differing bytes in all 18 lossless files, as RGB and as RGBA** (PNG 8 and
+  16 bit, palette, gray, gray+alpha, RGBA with alpha 0 keeping its colour, TIFF, BMP, the
+  first GIF frame, a Display-P3 PNG's raw samples).
+- **sRGB context** (CMYK, float, packed or unusual formats, or `ColorHandling::Srgb` on an
+  image that is not sRGB): the image is drawn into an sRGB bitmap context and un-premultiplied.
+  `ImageInfo::path` says which ran. A CMYK JPEG goes this way and is close to PIL's
+  conversion, not equal to it.
+- **16-bit**: PIL takes the high byte (`v >> 8`) of 16-bit RGB, RGBA and gray+alpha; pure
+  16-bit gray (`I;16`) goes through `convert("RGB")`, which clips to `min(v, 255)`. Measured
+  on PIL, reproduced by default; `Gray16::HighByte` takes the high byte of gray too.
+- **JPEG** is the only lossy case with an oracle, and is *not* bit-exact: ImageIO's decoder is
+  not libjpeg-turbo. Against libjpeg-turbo: 4:2:0 `rgb.jpg` max 43, mean 0.745, 3083 of
+  9216 bytes differ; 4:4:4 max 3, mean 0.169; gray max 1, mean 0.057 (bounds fixed in
+  `jpeg_differs_from_the_oracle_by_a_measured_bound`: max 48, mean 1.0). The difference is the
+  chroma upsampling of 4:2:0. End to end it is 0.9986 cosine (below).
+- **HEIC** has no libheif/torchvision oracle here; it is compared with the picture it was
+  made from (`sips`): mean 5.10, max 155 (bound: mean below 6), which is the codec's loss.
+- **EXIF**: all eight orientations are applied by `orient` when asked, checked against PIL's
+  `exif_transpose` on `exif1.jpg`..`exif8.jpg` and a PNG with an orientation tag.
+
+**Cut-short files.** ImageIO decodes cut TIFF and BMP files as complete pictures with
+zeros where the data is missing, and a PNG cut inside its last CRC as complete; an image
+source's status is "complete" for them. `integrity::check_container` compares the sizes a PNG
+(chunks must be whole), BMP (uncompressed pixel array) and TIFF (strip and tile offsets and
+counts of the first IFD, classic and BigTIFF) declare with the bytes present. Sweep over 13
+formats cut at about every 1/97 of their length (`every_truncation_is_an_error_or_the_whole_image`,
+plus HEIC in `media_codecs`): every cut fails, except cuts after a GIF's first frame, which
+decode that frame, and cuts that drop only a trailer. Without that check the sweep found
+zero-filled TIFF and BMP pictures (measured before it was added).
+
+### Audio
+
+`AudioOptions::default()`: 16 kHz, channel mean, at most 1800 s (an error, or the first
+`max_seconds` with `truncate: true`).
+
+1. **Decode** with `ExtAudioFile` to packed `f32` at the file's own rate and channel count.
+   Integer PCM becomes `v / 2^(bits-1)`, so a PCM8, PCM16, PCM24, PCM32 or float file already
+   at 16 kHz mono is **bit for bit** the reference's floats (WAV, AIFF, CAF and FLAC, from a
+   path and from bytes; 0 differing samples).
+2. **Mix to mono** in `f32` before resampling: `Downmix::Mean` (librosa, the torchaudio
+   backend; the default) or `Downmix::Swresample` (torchcodec). They are not the same
+   signal: FFmpeg's default stereo-to-mono mix for float output is `0.7071 * (L + R)`, not the
+   mean, so its output is `sqrt(2)` louder (7.7 dB measured for uncorrelated channels). The
+   Swresample mix matches `ffmpeg -ac 1` at an SNR of 86.0 dB; the mean has an SNR of only
+   10.7 dB against it, which is that gain.
+3. **Resample** with an `AudioConverter` at the maximum quality and the `Mastering`
+   complexity, as a second stage. A first design let `ExtAudioFile` resample as its client
+   rate; AAC and Ogg Opus then came out **0.26 samples (16 us at 16 kHz) late** against
+   FFmpeg (15.6 dB SNR) while the same decode resampled by torchaudio agreed at 46.4 dB.
+   Cause not found (inferred: the codec-priming trim and the file's own rate converter
+   interact); decoding natively and converting separately removed it.
+4. **Gapless**: AAC, MPEG-1 MP3, FLAC and the rest are trimmed by AudioToolbox. MPEG-2 and
+   2.5 Layer III MP3 (16, 22.05, 24 kHz) are **not**: a 1 s, 16 kHz MP3 decoded to 17280
+   frames starting 576 frames early. `mp3.rs` reads the Xing/Info/LAME tag (after an optional
+   ID3v2 tag) and the delay and padding are trimmed here (16000 frames, as FFmpeg).
+
+Resampling differs from every reference by design, and the references differ from one
+another. SNR in dB of the interior (10 ms edges removed; with the edges in brackets), 0.4 s
+fixtures of the signal `tone`, against the analytic truth, FFmpeg's decode (channel mean) and
+`torchaudio.functional.resample` (`sinc_interp_hann`):
+
+| input | this vs truth | this vs ffmpeg | this vs torchaudio | ffmpeg vs truth | torchaudio vs truth |
+|---|---|---|---|---|---|
+| 44.1 kHz stereo | 86.1 (46.7) | 83.8 (42.5) | 66.1 (56.6) | 86.3 | 66.1 |
+| 48 kHz stereo | 86.1 (46.3) | 83.8 (42.2) | 66.1 (56.4) | 86.5 | 66.1 |
+| 22.05 kHz mono | 91.8 (58.9) | 93.0 (52.1) | 66.8 (63.7) | 90.3 | 66.8 |
+| 8 kHz mono | 69.7 (41.1) | 69.8 (36.0) | 51.3 (45.9) | 90.8 | 51.3 |
+
+The output length equals the reference's (6400 samples for 0.4 s; 16000 for 1 s). The edges
+differ by the usual padding conventions. At 8 kHz in, FFmpeg is the closer to the truth; this
+path is 21 dB further from it (both within what a 16-bit file can carry, 69.7 dB).
+
+Lossy and compressed inputs, 1 s fixtures, SNR against FFmpeg's decode and against the signal
+the encoder was given (the codec's own error against the signal is the larger part: FFmpeg's
+own MP3 decode is 26.0 dB from it):
+
+| file | frames | vs ffmpeg | vs the signal |
+|---|---|---|---|
+| 44.1 kHz stereo AAC (m4a) | 16000 | 46.1 | 33.1 |
+| 44.1 kHz stereo MP3 | 16000 | 46.8 | 26.0 |
+| 44.1 kHz stereo FLAC | 16000 | 46.5 | 50.6 |
+| 16 kHz mono MP3 (LAME tag trim) | 16000 | 89.5 | 26.0 |
+| 16 kHz mono AAC | 16000 | 136 | 30.9 |
+| 48 kHz Ogg Opus (16 kHz content) | 16000 | 14.6 | 14.5 |
+
+**Ogg Opus is a known difference, and not this module's.** AudioToolbox's Opus decoder is two
+48 kHz frames behind libopus (FFmpeg) for the first 16000 frames of the fixture and then
+identical to 138 dB; `afconvert` returns the same samples as this module at 48 kHz. After the
+first 6000 samples at 16 kHz the SNR against FFmpeg is 93.9 dB (pinned at 60 dB). The cause
+inside AudioToolbox is **unverified**.
+
+WavPack is rejected by AudioToolbox (`'typ?'`) and is an error here.
+
+**Cut-short files.** AudioToolbox returns what a cut WAV, AIFF or CAF still holds as the
+whole (a WAV cut in half decoded 3189 of 6400 samples with `noErr`). `containers::check_audio`
+compares the declared size of the `data`/`SSND` chunk, the top-level MP4 boxes, and an MP3's
+Xing/Info stream size with the bytes present (streamed WAV `0xFFFFFFFF` and CAF `-1` sizes are
+accepted); FLAC's STREAMINFO sample count is compared with what was decoded (a cut FLAC fails
+with OSStatus -39 anyway). Every cut tried is an error (10 shapes, bytes and path).
+
+### Video
+
+`VideoSource::open` runs two passes. Pass one reads the **compressed** samples (no decoder) and
+returns the exact frame count and each frame's presentation time, in presentation order. Pass
+two decodes to 32BGRA and converts only the frames asked for to RGB, honouring the pixel
+buffer's row stride. `info()` gives `total_frames`, `fps` (the track's nominal rate, else the
+average over the timestamps), `timestamps` and `orientation`. `decode_frames(&indices)`
+returns frames in the order asked (duplicates allowed); `decode_sampled(&VideoConfig)` uses
+`sample_frame_indices` over the exact count and rate. Bounds: `VideoOptions::max_frames`
+(4096), `max_bytes` (4 GiB), the track-load timeout (60 s). Autorelease pools wrap the
+per-frame loops and a `Reader` guard cancels a reader still reading when it is dropped.
+
+- **Timestamps** are track time with the edit list applied, as FFmpeg and OpenCV report: an
+  H.264 file with B-frames has media time starting at +2 frames, which the edit list shifts
+  to 0. Pass one's media times are shifted by the first decoded frame's time, and pass two
+  checks every frame against it to 1e-6 s, so a track whose edit list drops or reorders
+  frames is an error, not a misaligned clip. (An earlier version reported 0.2 s for the first
+  frame of `colors.mp4`; caught by comparing with `ffprobe`.)
+- **Rotation**: `preferredTransform` becomes an EXIF orientation (1 to 8; the fixture's 90
+  degrees counter-clockwise display matrix is 8). `Rotation::Apply` (default) returns upright
+  frames, the same bytes as `ffmpeg` autorotate (mean 4.19, 5.6 % of bytes over 8 off, which is
+  chroma upsampling at hard quadrant edges) and the same orientation as OpenCV;
+  `Rotation::Ignore` returns frames as stored. A transform that is not a right-angle rotation
+  or flip is refused when applying.
+- **Pixels**: `colors.mp4` (H.264, BT.709) against `ffmpeg -pix_fmt rgb24`: max 2, mean 1.67
+  (rounding in the YUV to RGB matrix); the centre colour of each of the 12 frames is within 2
+  of the colour that was encoded, for H.264 and HEVC. OpenCV's own colour conversion is 9.4
+  mean from FFmpeg's on the same file (it maps 255 to 233), so OpenCV serves as a rotation
+  oracle only.
+- **Preprocessing**: `preprocess_decoded_video` runs `preprocess_video` with its own
+  sampling off, so frames sampled while decoding are not sampled twice, and restores the true
+  source indices and `index / fps` timestamps. Equal to preprocessing every decoded frame in
+  one call (`frames`, `indices`, `timestamps`: tested, with fewer frames decoded than the
+  video holds).
+- **Cut-short files**: top-level boxes are checked as for M4A (a cut `mdat` of a file with
+  `moov` first would otherwise decode fewer frames without an error). 1287 cuts of three
+  fixtures, every one an error.
+
+### Hosted job: what runs and what cannot
+
+The hosted job's sandbox denies `iokit-open`. ImageIO's HEIC decoder and AVFoundation's H.264
+and HEVC decoders go through VideoToolbox, which opens IOKit: under the sandbox they fail, loud,
+never silently ("pixel data is shorter than its size", "no frame could be decoded"; verified by
+running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
+and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
+and `tests/media_leaks.rs` are on `scripts/hosted_tests.txt` together with the 13 unit tests
+of `media::`; `tests/media_codecs.rs` (HEIC, H.264, HEVC: 8 tests) and
+`tests/media_codecs_leaks.rs` are local-only (`cargo test --release --test media_codecs`) and
+fail in the sandbox by construction, which is what `hosted_completeness` needs (a test that
+passes there must be listed).
+
+### Leaks
+
+Every Core Foundation object is held by `cf::CfRef` and AudioToolbox objects by `ExtFile` and
+`Converter` guards. `tests/media_leaks.rs` decodes in loops (images from path and bytes, the
+sRGB context, audio resampled, MP3, AAC, and the refusing paths: a cut TIFF, a cut WAV, a
+length-limit error) and bounds the growth of the resident set (`task_info`, since `ps` is
+not allowed in the sandbox) to 256 KiB for the least-growing of three batches of 100 calls,
+after warm-up. First-call growth of 2.5 MiB in a resampling decode is allocator and framework
+cache and is flat afterwards (a plateau, which the minimum over batches tolerates and a leak
+does not). A mutant that skips `CFRelease` fails it at once (2.9 MiB over 100 calls).
+`tests/media_codecs_leaks.rs` does the same for HEIC and video (open, decode 12 frames,
+bytes with a temporary file, a refused file), and asserts that no temporary file is left.
+**`leaks --atExit` reported 0 leaks for 0 bytes** on all four test binaries: `media_decode`
+(21 tests, 12385 nodes malloced), `media_codecs` (8 tests, 13335 nodes), `media_leaks`
+(5135 nodes) and `media_codecs_leaks` (16416 nodes), run with `--test-threads=1`.
+
+### End to end
+
+`tests/media_e2e_model.rs` (`--ignored`, real checkpoint, GPU; reference from
+`tools/embedgemma2_ref/make_media_reference.py`): a file path through `tessl::media`,
+`embedgemma2_pre` and the towers, against sentence-transformers' embedding of the same
+content (fp32, sdpa, CPU):
+
+| file | what the reference was given | max abs | cosine |
+|---|---|---|---|
+| `photo.png` (224x224) | the path | 1.34e-7 | 1.000000000 |
+| `clip16.wav` (16 kHz mono PCM16) | scipy's array | 1.57e-7 | 1.000000000 |
+| `photo.jpg` (4:2:0, q90) | the path | 7.25e-3 | 0.998566 |
+| `clip44.wav` (44.1 kHz stereo) | FFmpeg's 16 kHz channel mean | 1.29e-2 | 0.993142 |
+| `clip44.m4a` (AAC) | FFmpeg's 16 kHz channel mean | 1.09e-2 | 0.995248 |
+
+The two exact decodes hold the bounds of `tests/embedgemma2_e2e_model.rs` (1e-4, 0.99999) with
+three orders of magnitude to spare. The other three do not, and are not meant to: their
+bounds are 1e-2 / 0.998 (JPEG) and 2e-2 / 0.99 (resampled audio), set from the measurements. The
+resampled clips differ by the resampler's transition band. This clip has broadband noise, and
+the two decodes agree below 7 kHz (the error energy is 15 to 34 dB below the signal's in each
+band from 0 to 7 kHz) but not above: in the 7.0 to 7.6 kHz band this module's energy is 1.3 dB
+higher than FFmpeg's, in 7.6 to 7.9 kHz 3.8 dB higher, and in 7.9 to 8 kHz 5.6 dB lower. The
+mel front end reaches 8 kHz, so the embedding moves by 0.5 to 0.7 % (inferred from the band
+analysis, not isolated by an experiment). Natural speech has little energy there. **There is no end-to-end video test**: no video loader that the
+reference would use is installed (torchcodec), so video is checked frame by frame against
+FFmpeg, not embedding against embedding.
+
+### Speed
+
+`bench_media_decode` (inputs from `bench/make_media_bench_inputs.py`; one call per workload,
+minimum of 20 after 3 warm-ups; **the machine was running other agents (load average 27 to
+31 when the run started), so these are
+indicative**; `bench/results/media_decode_m5pro.{txt,json,png}`, plotted by
+`bench/results/media_decode_plot.py`):
+
+| workload | ms (min) | per unit |
+|---|---|---|
+| 1920x1080 PNG | 19.8 | 9.6 ms per Mpixel |
+| 1920x1080 JPEG | 8.9 | 4.3 |
+| 1920x1080 TIFF | 5.0 | 2.4 |
+| 30 s 16 kHz mono WAV | 0.22 | 0.007 ms per audio s |
+| 30 s 44.1 kHz stereo WAV (resampled) | 158 | 5.3 |
+| 30 s 44.1 kHz stereo FLAC | 207 | 6.9 |
+| 30 s 44.1 kHz stereo AAC | 175 | 5.8 |
+| 30 s 44.1 kHz stereo MP3 | 180 | 6.0 |
+| 10 s 720p H.264, `VideoSource::open` (pass one, 300 frames) | 25.3 | 0.084 ms per frame |
+| the same, open plus 9 sampled frames decoded (pass two decodes all 300) | 221 | |
+
+The sample-rate conversion at the `Mastering` setting is most of the audio time (inferred: a
+16 kHz mono file, which skips it, takes 0.23 ms for 30 s, but it is also a file with no codec). No comparison lane (torchvision, librosa) is timed: librosa and
+torchcodec are not installed, and a timing against subprocess FFmpeg would measure process start.
+
+### What is left
+
+- A video end-to-end test needs a reference video loader (torchcodec) in the environment.
+- What torchcodec does with a rotation flag is unverified (the default here follows FFmpeg's
+  CLI and OpenCV).
+- The Opus decoder difference above has no explanation yet; the first 0.37 s of that
+  fixture differ from libopus.
+- HEIC, H.264 and HEVC decoding cannot run in the hosted sandbox, so their tests run locally only.
+- Audio resampling is not FFmpeg's, soxr's or torchaudio's filter: the embeddings of broadband
+  audio at a rate other than 16 kHz differ from the reference's by about 0.5 to 0.7 % (cosine
+  0.993 to 0.995 on the clip above); a native polyphase resampler matching one of them is the
+  way to close that, with a reference oracle and a benchmark.

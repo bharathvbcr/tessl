@@ -13,8 +13,9 @@ gusset v0.0.3-0.20261010191510-984209b54288, GOMAXPROCS 18. Minimum of 3000 call
 workload (15 rounds of 200), all arms in alternating separate processes with bit-identical outputs.
 
 NOT A QUIET-MACHINE RECORDING. The 1-minute load average was 98.6 before and 70.9 after (other
-sessions were building and running GPU tests; `MAX_LOAD=0` turned the idle check off after a
-45 minute wait for a load of 15 never ended), and the run was not under the machine-wide
+sessions were building and running GPU tests; a run waiting for a load of 15 with a 45 minute
+budget was stopped after about 11 minutes with the load never below about 70, and `MAX_LOAD=0`
+turned the idle check off for this recording), and the run was not under the machine-wide
 `mac_heavy` lock (the harness refused to run that script from this session). Read it this way:
 
   paired us    Go wall time minus the engine's own timing of the same call, per call, minimum:

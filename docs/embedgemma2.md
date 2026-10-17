@@ -2648,7 +2648,7 @@ empty result, and a file that is cut short is an error rather than the part that
 | `CGImageGet*`, `CGDataProviderCopyData`, `CGColorSpace*`, `CGBitmapContextCreate`, `CGContextDrawImage` | CoreGraphics `CGImage.h`, `CGDataProvider.h`, `CGColorSpace.h`, `CGBitmapContext.h` | the direct sample copy; the sRGB fallback |
 | `ExtAudioFileOpenURL`, `ExtAudioFileWrapAudioFileID`, `ExtAudioFileRead`, `ExtAudioFileGetProperty`/`SetProperty`, `ExtAudioFileDispose` | AudioToolbox `ExtendedAudioFile.h` | decode to `f32` at the file's rate |
 | `AudioFileOpenWithCallbacks`, `AudioFileClose` | `AudioFile.h` | decode from bytes |
-| `AudioConverterNew`, `AudioConverterSetProperty`, `AudioConverterFillComplexBuffer`, `AudioConverterDispose` | `AudioConverter.h` | the sample-rate conversion |
+| `AudioConverterNew`, `AudioConverterSetProperty`, `AudioConverterFillComplexBuffer`, `AudioConverterDispose` | `AudioConverter.h` | the sample-rate conversion of `Resampler::AudioToolbox` (the default converts in `media::resample`, no framework) |
 | `AVURLAsset`, `AVAssetReader`, `AVAssetReaderTrackOutput`, `AVAssetTrack` (`loadTracksWithMediaType:completionHandler:`, `preferredTransform`, `nominalFrameRate`), `CMSampleBuffer*`, `CVPixelBuffer*` | AVFoundation, CoreMedia, CoreVideo | video |
 | `CFData*`, `CFURLCreateFromFileSystemRepresentation`, `CFDictionaryGetValue`, `CFNumberGetValue`, `CFRelease` | CoreFoundation | held by `cf::CfRef`, released on every path |
 
@@ -2665,14 +2665,36 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
   `transformers.image_utils.load_image`. The defaults here follow the first;
   `ExifOrientation::Apply` is the second. torchvision and PIL gave the same bytes on every
   fixture tried, JPEG and CMYK included.
-- **Audio path string.** `transformers.load_audio` with the default backend uses torchcodec
-  (FFmpeg's libswresample), else librosa. **Neither is installed here, nor soundfile, PyAV or
-  soxr**, and `torchaudio.load` needs torchcodec. So a `.wav` path cannot be given to
-  sentence-transformers in this environment, and the audio oracles are FFmpeg 9.0.2 (the
-  library torchcodec calls; labelled "ffmpeg standing in for torchcodec"),
-  `torchaudio.functional.resample` (the only part of torchaudio that works), and the analytic
-  signal the fixtures are built from. The end-to-end audio test feeds sentence-transformers
-  the array scipy reads from the same file.
+- **Audio path string.** Read from the installed sources: the processor's
+  `prepare_inputs_layout` (`transformers/processing_utils.py:739-740`) calls
+  `feature_extractor.fetch_audio(path, sampling_rate=16000)`
+  (`feature_extraction_sequence_utils.py:385`), which is `load_audio(path, sampling_rate=16000)`
+  with `backend="auto"` (`audio_utils.py:198`). `auto` resolves to **torchcodec** when
+  torchcodec >= 0.3 is installed and to **librosa** otherwise (`:230-233`); the
+  `"torchaudio"` backend (`:269-276`: `waveform.mean(dim=0)`, then
+  `torchaudio.functional.resample`) is reached only when asked for. The Gemma4 audio feature
+  extractor never resamples or checks the rate: its `__call__` takes the array as it is
+  (`models/gemma4/feature_extraction_gemma4.py`). With torchcodec the call is
+  `AudioDecoder(source, sample_rate=16000, num_channels=1).get_all_samples()` (`:267`), and
+  torchcodec builds its `SwrContext` with `swr_alloc_set_opts2` and **no options**
+  (`FFMPEGCommon.cpp`, `create_swr_context_from_layouts`; torchcodec's `main`, read online):
+  libswresample at its defaults, its resampler and its mix to mono. With librosa it is
+  `librosa.load(path, sr=16000)` (`:279`): soundfile, channel mean, `soxr_hq`. **Which one a
+  user gets depends on what is installed**: `sentence-transformers[audio]` is
+  `transformers[audio]`, which lists librosa and torchaudio but not torchcodec, so that
+  install resolves to librosa; installing torchcodec as well switches it to libswresample.
+  **Neither is installed here, nor soundfile, PyAV or soxr** (librosa 0.11, soundfile and
+  soxr 1.1 exist in `~/.venvs/voice-mac`, used only to measure, below). So a `.wav` path
+  cannot be given to sentence-transformers in this environment, and the audio oracles are the
+  `ffmpeg` binary (FFmpeg 9.0.2, the library torchcodec calls; labelled "ffmpeg standing in
+  for torchcodec"), `torchaudio.functional.resample`, and the analytic signal the fixtures
+  are built from. The end-to-end audio test feeds sentence-transformers the array FFmpeg
+  decodes (`-ac 1 -ar 16000`).
+  **This module follows the torchcodec branch**: `auto` prefers it when present; its
+  algorithm has an oracle on disk that can be matched to the bit; the librosa branch's
+  `soxr_hq` cannot be reproduced here (no libsoxr source on disk). That torchcodec adds
+  nothing else for a WAV, FLAC or MP3 file (frame chunking, seeking, flushing) is read from
+  its source, **not run**: torchcodec is not installed.
 - **Video.** torchcodec is absent and torchvision 0.29 no longer decodes video; the oracles
   are the `ffmpeg` and `ffprobe` CLIs and OpenCV. What torchcodec does with a rotation flag is
   **unverified**: the default here applies it (`Rotation::Apply`), which is what FFmpeg's CLI
@@ -2719,66 +2741,170 @@ zero-filled TIFF and BMP pictures (measured before it was added).
 
 ### Audio
 
-`AudioOptions::default()`: 16 kHz, channel mean, at most 1800 s (an error, or the first
-`max_seconds` with `truncate: true`).
+`AudioOptions::default()`: 16 kHz, torchcodec's mix and resampler (libswresample's), at most
+1800 s (an error, or the first `max_seconds` with `truncate: true`).
 
-1. **Decode** with `ExtAudioFile` to packed `f32` at the file's own rate and channel count.
-   Integer PCM becomes `v / 2^(bits-1)`, so a PCM8, PCM16, PCM24, PCM32 or float file already
-   at 16 kHz mono is **bit for bit** the reference's floats (WAV, AIFF, CAF and FLAC, from a
-   path and from bytes; 0 differing samples).
-2. **Mix to mono** in `f32` before resampling: `Downmix::Mean` (librosa, the torchaudio
-   backend; the default) or `Downmix::Swresample` (torchcodec). They are not the same
-   signal: FFmpeg's default stereo-to-mono mix for float output is `0.7071 * (L + R)`, not the
-   mean, so its output is `sqrt(2)` louder (7.7 dB measured for uncorrelated channels). The
-   Swresample mix matches `ffmpeg -ac 1` at an SNR of 86.0 dB; the mean has an SNR of only
-   10.7 dB against it, which is that gain.
-3. **Resample** with an `AudioConverter` at the maximum quality and the `Mastering`
-   complexity, as a second stage. A first design let `ExtAudioFile` resample as its client
-   rate; AAC and Ogg Opus then came out **0.26 samples (16 us at 16 kHz) late** against
-   FFmpeg (15.6 dB SNR) while the same decode resampled by torchaudio agreed at 46.4 dB.
-   Cause not found (inferred: the codec-priming trim and the file's own rate converter
-   interact); decoding natively and converting separately removed it.
-4. **Gapless**: AAC, MPEG-1 MP3, FLAC and the rest are trimmed by AudioToolbox. MPEG-2 and
+1. **Decode** with `ExtAudioFile` to packed `f32` at the file's own rate and channel count,
+   with no rate conversion by Apple. Integer PCM becomes `v / 2^(bits-1)`, so a PCM8, PCM16,
+   PCM24, PCM32 or float file already at 16 kHz mono is **bit for bit** the reference's floats
+   (WAV, AIFF, CAF and FLAC, from a path and from bytes; 0 differing samples).
+2. **Mix and resample** in `media::resample`, a Rust re-implementation of libswresample's
+   default conversion (`Resampler::Swresample`, `Downmix::Swresample`; the defaults). Per
+   channel, then the mix: `swr_init` sets `resample_first` from `out_ch / in_ch - 1 <
+   out_rate / in_rate - 1` with an *integer* channel ratio, which is true for every downmix, so
+   a stereo or 5.1 file is resampled channel by channel and mixed at 16 kHz.
+   `Downmix::Mean` (librosa, the torchaudio backend) takes the mean in `f32` first and
+   resamples the one channel. The two are not the same signal: FFmpeg's default mix for float
+   output is `0.7071 * L + 0.7071 * R` (no normalisation), not the mean, so a stereo clip is
+   `sqrt(2)` louder (7.7 dB for uncorrelated channels). The matrix is `swr_build_matrix2` with
+   `clev = slev = 0.70710678f` and `lfe_mix_level = 0` for FFmpeg's default layout of 1 to 8
+   channels (3 channels is FL FR LFE; 4 is 4.0; 5, 6, 7, 8 are 5.0, 5.1, 6.1, 7.1); more
+   channels, and layouts the file declares itself, are not modelled (an error for more than 8;
+   a file's own channel mask is not read).
+   What it reproduces, each checked against the `ffmpeg` binary: a Kaiser (beta 9) windowed
+   sinc of `ceil(32 / factor)` taps rounded up to even, `factor = min(out * 0.97 / in, 1)`; the
+   reduced ratio's numerator as the phase count when it is at most 1024 (44.1 -> 16 kHz: 92
+   taps, 160 phases; 48 -> 16 kHz: 100 taps, 1 phase), else 1024 phases with linear
+   interpolation (16000/44101, tested); `index`/`frac` integer position arithmetic; the first
+   window centred on sample 0 with the start mirrored about it, and at the end a mirror of
+   `(min(left, taps) + 1) / 2` samples from the last one; and the float sum in the order of
+   FFmpeg's AArch64 NEON routine (four fused-multiply-add lanes, `faddp` twice, a fused scalar
+   tail). A clip too short to fill one window after both mirrors (61 samples at 44.1 kHz) gives
+   **no samples, as FFmpeg's does**, and is an error here ("decoded to no samples").
+3. **Gapless**: AAC, MPEG-1 MP3, FLAC and the rest are trimmed by AudioToolbox. MPEG-2 and
    2.5 Layer III MP3 (16, 22.05, 24 kHz) are **not**: a 1 s, 16 kHz MP3 decoded to 17280
    frames starting 576 frames early. `mp3.rs` reads the Xing/Info/LAME tag (after an optional
    ID3v2 tag) and the delay and padding are trimmed here (16000 frames, as FFmpeg).
+4. `Resampler::AudioToolbox` keeps the earlier design as a comparison: an `AudioConverter` at
+   the maximum quality and the `Mastering` complexity, as a second stage. (A first design let
+   `ExtAudioFile` resample as its client rate; AAC and Ogg Opus then came out 0.26 samples
+   late against FFmpeg, 15.6 dB SNR. Cause not found; decoding natively and converting
+   separately removed it.)
 
-Resampling differs from every reference by design, and the references differ from one
-another. SNR in dB of the interior (10 ms edges removed; with the edges in brackets), 0.4 s
-fixtures of the signal `tone`, against the analytic truth, FFmpeg's decode (channel mean) and
-`torchaudio.functional.resample` (`sinc_interp_hann`):
+**Parity with libswresample** (`tests/media_resample.rs`, fixtures from
+`scripts/gen_resample_fixtures.py`, goldens from `ffmpeg -i x.wav -ac 1 -ar 16000 -f f32le`,
+FFmpeg 9.0.2 on Apple silicon): **44 inputs, 163,513 output samples, 0 differing samples, max
+0 ULP**, for every case below, through `convert_interleaved` and through `decode_audio_file`
+(an AudioToolbox decode at the native rate, from path and from bytes):
 
-| input | this vs truth | this vs ffmpeg | this vs torchaudio | ffmpeg vs truth | torchaudio vs truth |
-|---|---|---|---|---|---|
-| 44.1 kHz stereo | 86.1 (46.7) | 83.8 (42.5) | 66.1 (56.6) | 86.3 | 66.1 |
-| 48 kHz stereo | 86.1 (46.3) | 83.8 (42.2) | 66.1 (56.4) | 86.5 | 66.1 |
-| 22.05 kHz mono | 91.8 (58.9) | 93.0 (52.1) | 66.8 (63.7) | 90.3 | 66.8 |
-| 8 kHz mono | 69.7 (41.1) | 69.8 (36.0) | 51.3 (45.9) | 90.8 | 51.3 |
+| axis | cases (verified, all bit-equal) |
+|---|---|
+| input rate (-> 16 kHz) | 8, 11.025, 22.05, 32, 44.1, 48, 96 kHz mono; 8, 22.05, 44.1, 48, 96 kHz stereo; 44.1 and 48 kHz 5.1; 44.101 kHz (1024 phases, linear interpolation) and 12.345 kHz; 16 kHz (mix only); 8 kHz up to 16 kHz and 44.1 up to 48 kHz |
+| channels | mono, stereo, 3, 4, 5, 5.1, 7, 8 (the mix); `Downmix::Mean` on stereo against FFmpeg's float `pan` mean, and 6 and 8 channels against an f32 sum / n |
+| length | 1, 2, 31, 32, 33, 61, 62, 63, 64, 93, 200, 1001 samples, odd lengths, 0.25 to 3 s |
+| signal | log sine sweeps up to 0.45 of the input Nyquist rate (through the transition band), an impulse, a step, white noise |
+| chunking | the output is identical for any split of the input (random chunk sizes, including empty ones) |
 
-The output length equals the reference's (6400 samples for 0.4 s; 16000 for 1 s). The edges
-differ by the usual padding conventions. At 8 kHz in, FFmpeg is the closer to the truth; this
-path is 21 dB further from it (both within what a 16-bit file can carry, 69.7 dB).
+Bit equality is reached, so there is no ULP bound to state beyond 0. It depends on the
+operation order, and that is measured, not assumed: swapping the NEON order for plain
+C-order sums (what an x86 build of FFmpeg does for its scalar path; **its SIMD order was not
+read or run**) leaves 39,610 of the 48,000 samples of the 3 s noise clip different, up to
+49,427 ULP (at near-zero samples), and the same with fused adds still differs; the NEON order
+with the fused tail is the one that matches. So on x86 FFmpeg's own output differs from this
+module's, and from the machine it ran on, at the last bits; **the torchcodec reference's
+last bits depend on its CPU**. **Unverified**: that torchcodec's own call sequence (frame
+chunking, its output buffers) changes nothing; the output was shown independent of chunking
+here, and `swr_get_out_samples` bounds are loose enough not to truncate the flush.
 
-Lossy and compressed inputs, 1 s fixtures, SNR against FFmpeg's decode and against the signal
-the encoder was given (the codec's own error against the signal is the larger part: FFmpeg's
-own MP3 decode is 26.0 dB from it):
+The earlier tone fixtures (0.4 s of the signal `tone`, all below 5.4 kHz) against the analytic
+truth, FFmpeg's decode with a float channel mean, and `torchaudio.functional.resample`
+(`sinc_interp_hann`), SNR in dB of the interior (10 ms edges removed; with the edges in
+brackets). "ffmpeg" for the stereo files is the earlier golden, whose `pan` stage quantises the
+mix to 16 bits (87.8 dB is that floor; `tests/media_resample.rs` has float goldens); the mono
+ones are equal to the bit. "was" is the AudioToolbox converter, the default before this change:
+
+| input | this vs truth | this vs ffmpeg | this vs torchaudio | was vs truth | was vs ffmpeg | was vs torchaudio |
+|---|---|---|---|---|---|---|
+| 44.1 kHz stereo | 92.0 (48.3) | 87.8 | 66.1 (42.8) | 86.1 (46.7) | 83.8 | 66.1 |
+| 48 kHz stereo | 92.5 (48.2) | 87.8 | 66.1 (42.5) | 86.1 (46.3) | 83.8 | 66.1 |
+| 22.05 kHz mono | 90.3 (52.9) | equal | 66.9 (52.2) | 91.8 (58.9) | 93.0 | 66.8 |
+| 8 kHz mono | 90.8 (42.1) | equal | 51.3 (36.0) | 69.7 (41.1) | 69.8 | 51.3 |
+
+The output length equals FFmpeg's (6400 samples for 0.4 s) and torchaudio's, except that
+torchaudio and `librosa` give one more sample at some rates. The edges are FFmpeg's (mirrors),
+which are farther from the analytic truth than Apple's were at 22.05 kHz (52.9 against 58.9
+dB with the edges), and closer to FFmpeg's, being the same.
+
+**The other loaders, measured** (`tools/embedgemma2_ref/audio_loader_gap.py`; librosa 0.11.0 and
+soxr 1.1.0 from `~/.venvs/voice-mac`, torchaudio 2.11.0 from `ml-2026-10`; not part of any
+test): against this module's output, band-limited tones (stereo against the float-mean
+golden, so 87 dB is the golden's floor), SNR over the interior:
+
+| input | librosa `soxr_hq` | torchaudio |
+|---|---|---|
+| 8 kHz mono | 101.4 (36.1 whole) | 51.3 (36.0) |
+| 22.05 kHz mono | 93.7 (51.1) | 66.9 (52.2) |
+| 44.1 kHz stereo | 86.9 (42.2) | 66.1 (42.8) |
+| 48 kHz stereo | 87.0 (42.3) | 66.1 (42.5) |
+
+On the 10-sweep set of `media_resample/` (which run to 0.45 of the input Nyquist rate, so
+they carry energy above 8 kHz that each converter attenuates or folds differently) the
+agreement is 25 to 38 dB whole-signal for both. So on band-limited material the librosa branch
+(`soxr_hq`) is within about 1e-5 of the swresample output away from the first and last 10 ms
+(different edge conventions), and the torchaudio branch is 51 to 67 dB from it; for
+material with energy near or above 8 kHz, and for the first and last 10 ms, the three differ.
+A user whose install resolves to librosa gets the first row of that table's distance, not
+zero: **this module does not reproduce `soxr_hq`**.
+
+Lossy and compressed inputs, 1 s fixtures decoded with the channel mean (the goldens are
+`pan`-then-resample, hence the 16-bit floor on stereo), SNR against FFmpeg's decode and
+against the signal the encoder was given (the codec's own error against the signal is the
+larger part: FFmpeg's own MP3 decode is 26.0 dB from it). With the resampling now the same as
+FFmpeg's, what remains is the codec decoders' difference:
 
 | file | frames | vs ffmpeg | vs the signal |
 |---|---|---|---|
-| 44.1 kHz stereo AAC (m4a) | 16000 | 46.1 | 33.1 |
-| 44.1 kHz stereo MP3 | 16000 | 46.8 | 26.0 |
-| 44.1 kHz stereo FLAC | 16000 | 46.5 | 50.6 |
+| 44.1 kHz stereo AAC (m4a) | 16000 | 138.8 | 33.2 |
+| 44.1 kHz stereo MP3 | 16000 | 92.6 | 26.0 |
+| 44.1 kHz stereo FLAC | 16000 | 87.7 (the golden's floor) | 52.2 |
 | 16 kHz mono MP3 (LAME tag trim) | 16000 | 89.5 | 26.0 |
-| 16 kHz mono AAC | 16000 | 136 | 30.9 |
-| 48 kHz Ogg Opus (16 kHz content) | 16000 | 14.6 | 14.5 |
+| 16 kHz mono AAC | 16000 | 135.9 | 30.9 |
+| 48 kHz Ogg Opus (16 kHz content) | 16000 | 14.6 (see below) | 14.5 |
 
-**Ogg Opus is a known difference, and not this module's.** AudioToolbox's Opus decoder is two
-48 kHz frames behind libopus (FFmpeg) for the first 16000 frames of the fixture and then
-identical to 138 dB; `afconvert` returns the same samples as this module at 48 kHz. (The 138 dB
-and the `afconvert` comparison were measured on an earlier encode of the fixture; the
-committed one is a re-encode and they were not repeated.) After the first 6000 samples at
-16 kHz the SNR against FFmpeg is 66.9 dB on the committed file (93.9 dB on the earlier
-encode; pinned at 60 dB). The cause inside AudioToolbox is **unverified**.
+**MP3 and AAC stay on Apple's decoders** (the owner's decision), and their bounds against
+FFmpeg's `mp3float` and `aac` decoders, default mix, on the files of
+`media_resample/` (0.5 s of a 44.1 kHz stereo sweep encoded by ffmpeg at 128 kb/s), measured
+after the change and fixed in `aac_and_mp3_meet_their_measured_bounds_against_ffmpegs_decode`:
+
+| codec | whole-signal SNR | interior SNR (1024 samples off each end) | max abs difference |
+|---|---|---|---|
+| MP3 (libmp3lame) | 95.3 dB | 95.4 dB | 3.7e-5 |
+| AAC (ffmpeg `aac`, mp4) | 56.7 dB | 101.8 dB | 1.1e-2 |
+
+The AAC difference is in the first and last frames: at the native 44.1 kHz, before any
+resampling, the first 4410 samples are 59 dB and the last 4410 are 42 dB from FFmpeg's while the
+rest is 96 to 98 dB, so it is the decoders' treatment of the priming and the final frame
+(inferred: the cause inside the two decoders was not isolated), not the resampler. End to
+end, MP3 is 9.7e-6 max abs, cosine 0.999999996; AAC is 7.1e-4, cosine 0.999988 (below).
+
+**Ogg Opus: AudioToolbox does not lag libopus; FFmpeg's native Opus decoder does.** The
+earlier claim in this section (AudioToolbox "two 48 kHz frames behind libopus") compared
+AudioToolbox with FFmpeg's *default* Opus decoder, which is not libopus: `ffmpeg` picks its
+own `opus` decoder ("opus (native)", from the stream mapping line), so that is what torchcodec
+runs too. Measured against `ffmpeg -c:a libopus`, at 48 kHz so that no conversion is involved
+(`tests/media_resample.rs`):
+
+| clip (0.6 s, 48 kHz mono, libopus encode) | AudioToolbox vs libopus | native vs libopus | AudioToolbox vs native |
+|---|---|---|---|
+| SILK, narrow-band (`-application voip -cutoff 4000`) | lag 0, **identical** (3025 dB is the float floor) | 4 samples behind | 15.1 dB |
+| SILK, wide-band (`-cutoff 8000`) | lag 0, **identical** | 2 samples behind | 19.8 dB |
+| CELT (`-application audio`) | lag 0, 82.3 dB | lag 0 | 138.7 dB |
+
+(The committed tone file of `fixtures/media/` is the same: AudioToolbox against libopus is
+lag 0 at 92.8 dB over all 48000 samples; ffmpeg's native decoder is 1 to 2 samples behind it in its
+first 18000 samples (1 to 2 behind) and identical to AudioToolbox's after that.) The length is libopus's (the
+pre-skip is removed: 312 samples in these files, `OpusHead`), the alignment is libopus's, and
+AudioToolbox's SILK is libopus's to the bit while its CELT is FFmpeg's native decoder's
+(138.7 dB) and 82 dB from libopus's. So there is **no pre-skip or priming bug to fix**: the
+2-sample lag the earlier measurement saw is FFmpeg's native decoder's own (its SILK
+resampler out of SILK's internal rate delays the output; 4 samples at narrow-band, 2 at
+wide-band, 0 in CELT; the cause inside FFmpeg is inferred from that pattern, not read). Against the
+reference this means: if the reference is libopus (soundfile via librosa), AudioToolbox is
+exact for SILK and 82 dB for CELT; if it is torchcodec (FFmpeg's native decoder), AudioToolbox
+is exact (138 dB) in CELT frames and 15 to 20 dB from it in SILK frames, because the native
+decoder is late. Reproducing FFmpeg's SILK output would need its decoder, not a shift: the best
+shift gives only 28 dB. An Ogg Opus file in SILK or hybrid mode (speech at low bit rates) is
+therefore the one input of this module that does not match a torchcodec reference closely.
 
 WavPack is rejected by AudioToolbox (`'typ?'`) and is an error here.
 
@@ -2834,7 +2960,7 @@ and HEVC decoders go through VideoToolbox, which opens IOKit: under the sandbox 
 never silently ("pixel data is shorter than its size", "no frame could be decoded"; verified by
 running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
 and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
-and `tests/media_leaks.rs` are on `scripts/hosted_tests.txt` together with the 14 unit tests
+and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter against the `ffmpeg` binary, AAC, MP3 and Opus; no device) and `tests/plot_results_resample.rs` are on `scripts/hosted_tests.txt` together with the 14 unit tests
 of `media::`; `tests/media_codecs.rs` (HEIC, H.264, HEVC: 8 tests) and
 `tests/media_codecs_leaks.rs` are local-only (`cargo test --release --test media_codecs`) and
 fail in the sandbox by construction, which is what `hosted_completeness` needs (a test that
@@ -2880,20 +3006,24 @@ content (fp32, sdpa, CPU):
 | `photo.png` (224x224) | the path | 1.34e-7 | 1.000000000 |
 | `clip16.wav` (16 kHz mono PCM16) | scipy's array | 1.57e-7 | 1.000000000 |
 | `photo.jpg` (4:2:0, q90) | the path | 7.25e-3 | 0.998566 |
-| `clip44.wav` (44.1 kHz stereo) | FFmpeg's 16 kHz channel mean | 1.29e-2 | 0.993142 |
-| `clip44.m4a` (AAC) | FFmpeg's 16 kHz channel mean | 1.09e-2 | 0.995248 |
+| `clip44.wav` (44.1 kHz stereo) | FFmpeg's 16 kHz decode, `-ac 1` (torchcodec's mix and resampler) | 1.74e-7 | 1.000000000 |
+| `clip44.m4a` (AAC) | the same | 7.07e-4 | 0.999987957 |
+| `clip44.mp3` (MP3, libmp3lame 128 kb/s) | the same | 9.69e-6 | 0.999999996 |
 
-The two exact decodes hold the bounds of `tests/embedgemma2_e2e_model.rs` (1e-4, 0.99999) with
-three orders of magnitude to spare. The other three do not, and are not meant to: their
-bounds are 1e-2 / 0.998 (JPEG) and 2e-2 / 0.99 (resampled audio), set from the measurements. The
-resampled clips differ by the resampler's transition band. This clip has broadband noise, and
-the two decodes agree below 7 kHz (the error energy is 15 to 34 dB below the signal's in each
-band from 0 to 7 kHz) but not above: in the 7.0 to 7.6 kHz band this module's energy is 1.3 dB
-higher than FFmpeg's, in 7.6 to 7.9 kHz 3.8 dB higher, and in 7.9 to 8 kHz 5.6 dB lower. The
-mel front end reaches 8 kHz, so the embedding moves by 0.5 to 0.7 % (inferred from the band
-analysis, not isolated by an experiment). Natural speech has little energy there. **There is no end-to-end video test**: no video loader that the
+(Before the Rust resampler `clip44.wav` was 1.29e-2 / 0.993142 and `clip44.m4a` 1.09e-2 /
+0.995248, against FFmpeg's channel *mean*; the reference script now gives sentence-transformers
+FFmpeg's default decode, which is what torchcodec returns.) Three decodes are exact and hold the
+bounds of `tests/embedgemma2_e2e_model.rs` (1e-4, 0.99999) with three orders of magnitude to
+spare, `clip44.wav` among them: the 44.1 kHz stereo file is mixed and resampled to the bit as
+FFmpeg does. The JPEG differs by the IDCT and chroma upsampler (bounds 1e-2 / 0.998). The
+AAC clip differs by AudioToolbox's decoder against FFmpeg's (first and last frame, above);
+its bounds are 1e-3 / 0.99998 and the MP3's 2e-5 / 0.9999999, from the measurements. Natural
+speech has little energy near 8 kHz, where the earlier resamplers differed.
+**There is no end-to-end video test**: no video loader that the
 reference would use is installed (torchcodec), so video is checked frame by frame against
-FFmpeg, not embedding against embedding.
+FFmpeg, not embedding against embedding. The e2e reference mixes like torchcodec and
+resamples like torchcodec; a librosa-branch reference would differ in the last bits of the
+resampler and in the 3 dB mix gain for stereo (not measured end to end).
 
 ### Speed
 
@@ -2916,19 +3046,45 @@ indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
 | 10 s 720p H.264, `VideoSource::open` (pass one, 300 frames) | 25.3 | 0.084 ms per frame |
 | the same, open plus 9 sampled frames decoded (pass two decodes all 300) | 221 | |
 
-The sample-rate conversion at the `Mastering` setting is most of the audio time (inferred: a
-16 kHz mono file, which skips it, takes 0.23 ms for 30 s, but it is also a file with no codec). No comparison lane (torchvision, librosa) is timed: librosa and
-torchcodec are not installed, and a timing against subprocess FFmpeg would measure process start.
+The audio rows above were measured with the `AudioConverter` as the default (before the Rust
+resampler); the sample-rate conversion at the `Mastering` setting was most of the audio time.
+`bench_media_resample` (same inputs; `bench/results/media_resample_m5pro.{txt,json,svg}`,
+plotted by `plot_results media-resample`; minimum of 30 after 2 warm-ups; **again a shared
+machine, other agents running, so indicative**; the repeated runs moved the codec rows by up to
+50 %, the WAV rows by under 10 %) times the same call both ways, `decode_audio_file` of 30 s of
+44.1 kHz stereo to 16 kHz mono:
+
+| file | decode at the file's rate | libswresample in Rust (default) | AudioToolbox converter | Rust converter alone, one channel |
+|---|---|---|---|---|
+| WAV | 1.3 ms | 17.1 ms | 144.5 ms | 10.5 ms |
+| FLAC | 29.9 | 60.2 | 272.2 | 10.5 |
+| AAC (m4a) | 10.8 | 41.8 | 234.5 | 10.8 |
+| MP3 | 33.4 | 56.0 | 170.4 | 8.3 |
+
+The Rust path is 3.0 to 8.4 times faster end to end (WAV 8.4x, MP3 3.0x) and takes 16 to 31 ms more than the
+decode alone for two channels. An earlier, quieter run of the same program measured 7.5 ms for the
+converter alone on 30 s (4000 times real time) and 20.7 ms against 141.6 ms for the WAV. No
+comparison lane (torchvision, librosa) is timed: librosa and torchcodec are not installed, and a
+timing against subprocess FFmpeg would measure process start. Not compared: the `ffmpeg` binary's
+own speed (it is the same algorithm in C with NEON).
 
 ### What is left
 
 - A video end-to-end test needs a reference video loader (torchcodec) in the environment.
 - What torchcodec does with a rotation flag is unverified (the default here follows FFmpeg's
   CLI and OpenCV).
-- The Opus decoder difference above has no explanation yet; the first 0.37 s of that
-  fixture differ from libopus.
+- Ogg Opus in SILK or hybrid mode does not match a torchcodec reference closely (15 to 20 dB
+  from FFmpeg's native decoder, which is itself 2 to 4 samples behind libopus there); matching
+  it needs FFmpeg's SILK decoding, not a shift. AudioToolbox is exact against libopus for
+  SILK. MP3 and AAC stay on Apple's decoders by decision; their bounds are above.
+- The librosa branch's `soxr_hq` is not reproduced (no libsoxr source on disk; measured 87 to
+  101 dB from this module in the interior on band-limited tones, 25 to 40 dB whole-signal where
+  the content reaches 8 kHz). The `torchaudio` branch (`sinc_interp_hann`) is not reproduced
+  either, and is 51 to 67 dB from it on those tones. Each would be its own converter with its
+  own oracle.
 - HEIC, H.264 and HEVC decoding cannot run in the hosted sandbox, so their tests run locally only.
-- Audio resampling is not FFmpeg's, soxr's or torchaudio's filter: the embeddings of broadband
-  audio at a rate other than 16 kHz differ from the reference's by about 0.5 to 0.7 % (cosine
-  0.993 to 0.995 on the clip above); a native polyphase resampler matching one of them is the
-  way to close that, with a reference oracle and a benchmark.
+- Bit equality is with the AArch64 NEON build of FFmpeg 9.0.2. An x86 torchcodec sums in
+  another order (unverified); and torchcodec itself was never run.
+- A file's own channel mask (WAVE_FORMAT_EXTENSIBLE) is not read: FFmpeg's default layout for
+  the channel count is assumed (1 to 8 channels). The `libswresample` port is LGPL-2.1-or-later
+  code's behaviour in a crate that is MIT OR Apache-2.0: for the owner to settle.

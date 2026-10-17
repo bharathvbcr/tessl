@@ -5,7 +5,7 @@
 //! | Media | Framework | Output |
 //! |---|---|---|
 //! | [`image`] | ImageIO + CoreGraphics | 8-bit RGB or RGBA, HWC ([`image::DecodedImage`]) |
-//! | [`audio`] | AudioToolbox `ExtAudioFile` | mono `f32` at 16 kHz ([`audio::DecodedAudio`]) |
+//! | [`audio`] | AudioToolbox `ExtAudioFile`, then [`resample`] | mono `f32` at 16 kHz ([`audio::DecodedAudio`]) |
 //! | [`video`] | AVFoundation `AVAssetReader` | sampled RGB frames, fps, timestamps ([`video::DecodedVideo`]) |
 //!
 //! ```no_run

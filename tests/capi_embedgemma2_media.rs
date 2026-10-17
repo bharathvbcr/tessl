@@ -62,6 +62,10 @@ const DIM: usize = 96;
 /// Written to the output of every call that must leave it alone.
 const SENTINEL: f32 = -7.25;
 
+/// A refusal case: what it is, what the call returned (status, message, output) and the
+/// words the message must hold.
+type Case<'a, Out> = (&'a str, (i32, String, Out), &'a str);
+
 fn msg(err: &[c_char]) -> String {
     unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned()
 }
@@ -506,8 +510,8 @@ fn encoded_table_refusals_leave_the_output_alone_the_handle_usable_and_the_runti
     let (blob, offs) = (good.blob.clone(), good.offsets.clone());
     let blen = blob.len() as u64;
     let two = 2 * DIM as u64;
-    let mut cases: Vec<(&str, (i32, String, Vec<f32>), &str)> = Vec::new();
-    cases.push(("n_images 0", run(paths, &blob, blen, &offs, 0, 0, 0), "n_images is 0"));
+    let mut cases: Vec<Case<'_, Vec<f32>>> =
+        vec![("n_images 0", run(paths, &blob, blen, &offs, 0, 0, 0), "n_images is 0")];
     cases.push((
         "n_images past the batch",
         run(paths, &blob, blen, &offs, 257, 0, 257 * DIM as u64),
@@ -1029,7 +1033,7 @@ fn soft_token_count_refusals_name_the_item_and_leave_the_output_alone() {
     let l = Loaded::new(&dir, Some(TESSL_OPERANDS_EXACT_F32));
     let m = l.model;
     let untouched_u64 = |v: &[u64]| v.iter().all(|&x| x == u64::MAX);
-    let image_cases: Vec<(&str, (i32, String, Vec<u64>), &str)> = vec![
+    let image_cases: Vec<Case<'_, Vec<u64>>> = vec![
         ("n 0", image_counts(m, &[], 0, 0), "n_images is 0"),
         (
             "n past the bound",
@@ -1050,7 +1054,7 @@ fn soft_token_count_refusals_name_the_item_and_leave_the_output_alone() {
         ),
         ("null dims", image_counts(m, &[], 2, 2), "null"),
     ];
-    let audio_cases: Vec<(&str, (i32, String, Vec<u64>), &str)> = vec![
+    let audio_cases: Vec<Case<'_, Vec<u64>>> = vec![
         ("n 0", audio_counts(m, &[], 16000, 0), "n_clips is 0"),
         ("another rate", audio_counts(m, &[16_000], 8000, 1), "8000 Hz audio"),
         (
@@ -1074,7 +1078,7 @@ fn soft_token_count_refusals_name_the_item_and_leave_the_output_alone() {
             "out_len is 1, expected exactly 2",
         ),
     ];
-    let video_cases: Vec<(&str, (i32, String, Vec<u64>), &str)> = vec![
+    let video_cases: Vec<Case<'_, Vec<u64>>> = vec![
         ("n 0", video_counts(m, &[], &[], &[], 0), "n_videos is 0"),
         (
             "out_len wrong",
@@ -1417,7 +1421,7 @@ fn segments_of_files_and_bytes_in_mixed_sources_are_the_facade_bit_for_bit() {
     c.audio_source = TESSL_EMBEDGEMMA2_SOURCE_BYTES;
     c.audio = bytes_table(&clip_names);
     c.video_source = TESSL_EMBEDGEMMA2_SOURCE_RAW;
-    c.video = table(&[frames.clone()]);
+    c.video = table(std::slice::from_ref(&frames));
     c.video_dims = vec![raw_video.1 as u32, raw_video.2 as u32];
     c.video_fps = vec![raw_video.3];
     let c =
@@ -1553,7 +1557,7 @@ fn segment_refusals_leave_the_output_alone_the_handle_usable_and_the_runtime_unp
         f(&mut c);
         c.run(l.model, 0)
     };
-    let mut cases: Vec<(&str, (i32, String, Vec<f32>), &str)> = Vec::new();
+    let mut cases: Vec<Case<'_, Vec<f32>>> = Vec::new();
     cases.push(("no items", edit(&|c| c.n_items = Some(0)), "n_items is 0"));
     cases.push((
         "items past the batch",

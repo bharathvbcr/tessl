@@ -24,6 +24,9 @@ each rule in the module was derived. The working log (every command) was kept in
   `filter_type` kaiser, `kaiser_beta` 9, `clev`/`slev` 0.707107, `lfe_mix_level` 0,
   `rematrix_volume` 1) and `man ffmpeg-resampler` (`cutoff` default 0.97 for the native
   resampler; with `exact_rational` the phase count falls back to `1 << phase_shift`).
+* Repository infrastructure that has nothing to do with the resampler: the fixture-manifest
+  test and writer, the hosted-test script and manifest, the CI workflow's doc step, and the
+  bench driver and its input generator.
 * Published DSP facts: the Kaiser window, the modified Bessel function `I0` and its
   power series, windowed-sinc interpolation.
 * Black-box runs of `/opt/homebrew/bin/ffmpeg` (version 9.0.2) on inputs generated
@@ -37,8 +40,8 @@ describe the resampler.
 
 ### One inadvertent exposure
 
-My first search for callers (`rg "resample|Swr" src`) printed some lines of the module doc
-comment at the top of `src/media/audio.rs` (lines 2 and 16 to 30). They were doc
+My first search for callers (`rg "resample|Swr" src`) printed seven lines of the module doc
+comment at the top of `src/media/audio.rs` (lines 2, 16, 17, 26, 27, 28 and 30). They were doc
 comments about the audio path rather than the resampler's internals, but they said that
 the default downmix is "each channel resampled, then mixed with libswresample's matrix"
 and that the mean downmix mixes first and resamples one channel. The same statements are

@@ -31,28 +31,38 @@ docs/embedgemma2.md "Media decoding"):
   `transformers.video_utils.read_video_torchcodec` opens `VideoDecoder(path,
   seek_mode="exact")`. torchcodec is not installed here and torchvision 0.29 removed
   video decoding, so the oracle is the `ffmpeg` CLI, which runs the same libavcodec and
-  libswscale. torchcodec converts with libswscale (`SwScale.cpp`; the frame's own
-  colorspace and range, flags 0) when input and output widths are multiples of 32 and
-  with an `format=rgb24` filtergraph otherwise, and the two give the same bytes for a
-  same-size YUV 4:2:0 to RGB conversion (checked: bytes from `sws_getContext` flags 0,
-  1, 2 and 4 and the CLI's bicubic are equal on even sizes, 8-bit). The CLI's `-pix_fmt
-  rgb24` is that conversion. (The torchcodec details in this paragraph are from recollection
-  of its documentation and design, not from running it.)
+  libswscale, arranged as torchcodec arranges it. From torchcodec v0.17.0's own source
+  (BSD-3; read by the integrator, copies in the lane's `target/tc_*.cpp`):
 
-  What the scaler flags change, measured on the CLI (docs/embedgemma2.md, "Media
-  decoding"): only 10-bit 4:2:0, whose chroma rows are resampled to luma rows by the
-  scaler (bilinear and bicubic differ in about 65 percent of the bytes of a random
-  picture). The 10-bit 4:2:0 goldens are therefore made with `-sws_flags bilinear` (the
-  flag torchcodec is recalled to set, unverified) as `<name>.bilinear.rgb24` and with the
-  CLI's own default (bicubic) as `<name>.rgb24`. 8-bit 4:2:0 and 4:2:2 and all 4:4:4 are
-  the same under every flag tried.
+    * `SwScale.cpp` makes the colour-conversion context with `swsFlags = 0`; frames whose
+      width is a multiple of 32, with no transform, are converted by it
+      (`CpuDeviceInterface.cpp`, `get_color_conversion_library`);
+    * any other width, and any transform, go through a libavfilter graph whose string starts
+      `format=rgb24,` with no scaler flags set (`FilterGraph.cpp`);
+    * a rotation is a transform (`Transform.cpp`: `transpose=cclock`, `transpose=clock` or
+      `hflip,vflip`), applied after the `format=rgb24,` (Note [Transform and Format
+      Conversion Order]): **convert to RGB at the stored size, then rotate the RGB**, for
+      every layout.
 
-  Rotation: the CLI's autorotate turns 4:2:0 planes before converting (so the converter
-  and, at 10 bits, the vertical chroma filter see the upright picture) and converts 4:2:2
-  and 4:4:4 first, turning the RGB. The goldens are the CLI's autorotated output; tessl
-  follows that order. Whether torchcodec orders the same way is not known; where the two
-  orders give different bytes (4:2:0 turned a quarter, converters chosen by width) the
-  fixtures `*_rot*` and `*_flip` record the CLI's.
+  Black-box checks through the public libswscale/libavfilter API (`target/v2/graph_probe.c`
+  in the lane, not committed; 34 random-plane classes of every format here, odd sizes
+  included): a `format=rgb24` graph fed a frame carrying its own colorspace and range gives
+  the same bytes as `sws_scale` with flags 0 and as the CLI's `-pix_fmt rgb24` (0 differing
+  bytes in all), and the graph `format=rgb24,transpose=...` equals the CLI's conversion
+  rotated afterwards. So the CLI's `-noautorotate -pix_fmt rgb24` (flags unset: libswscale's
+  default, bicubic) followed by a numpy turn of the RGB is torchcodec's output.
+
+  What the scaler flags change: only 10-bit 4:2:0, whose chroma rows are resampled to luma
+  rows by the scaler (bilinear and bicubic differ in about 65 percent of the bytes of a random
+  picture). torchcodec passes no flags, which is the bicubic filter: `<name>.rgb24` is that;
+  `<name>.bilinear.rgb24` is the `-sws_flags bilinear` variant tessl keeps selectable.
+  8-bit 4:2:0 and 4:2:2 and all 4:4:4 are the same under every flag tried.
+
+  Rotation and flips: `<name>.rgb24` is the unrotated conversion with the display rotation
+  or flip applied to the RGB (above). For 4:2:0 fixtures that are rotated or flipped,
+  `<name>.cli_autorotate.rgb24` keeps what the CLI's autorotate gives instead (it turns the
+  4:2:0 planes before converting), which differs; it is the evidence that the order matters.
+  For 4:2:2 and 4:4:4 the CLI converts first as well and this script asserts the two agree.
 
 Frame count, duration and average fps follow torchcodec's exact seek mode
 (`Metadata.cpp`): the number of packets, `max(pts + duration) - min(pts)` in seconds,
@@ -333,6 +343,25 @@ def decode(path, pix_fmt, autorotate=True, flags=None):
     return run(cmd, capture_output=True).stdout
 
 
+def torchcodec_rgb24(path, w, h, n, rot, flip, flags=None):
+    """The frames torchcodec returns: the stored picture converted to rgb24 (flags unset unless
+    asked), then the display rotation or flip applied to the RGB (module docstring)."""
+    frames = np.frombuffer(decode(path, "rgb24", autorotate=False, flags=flags), np.uint8).reshape(n, h, w, 3)
+    if rot == 90:
+        turn = lambda a: np.rot90(a, 1)  # noqa: E731
+    elif rot == 270:
+        turn = lambda a: np.rot90(a, -1)  # noqa: E731
+    elif rot == 180:
+        turn = lambda a: a[::-1, ::-1]  # noqa: E731
+    elif flip == "h":
+        turn = lambda a: a[:, ::-1]  # noqa: E731
+    elif flip == "v":
+        turn = lambda a: a[::-1]  # noqa: E731
+    else:
+        return frames.tobytes()
+    return b"".join(np.ascontiguousarray(turn(f)).tobytes() for f in frames)
+
+
 # Sampling settings recorded per fixture: the processor's own `sample_frames` is run on the
 # metadata above (fps 1 with a 32 frame cap is processor_config.json's; the others make the cap bite).
 SAMPLINGS = {
@@ -423,15 +452,24 @@ def main():
         assert (s.get("color_space") if matrix else None) in (want, None) and s["width"] * s["height"] > 0
         # ffprobe names a full-range 8-bit stream yuvj420p (and so on): the same samples, the range is a tag.
         assert s["pix_fmt"].replace("yuvj", "yuv") == pix_fmt_of(name), (name, s["pix_fmt"])
-        rgb = decode(path, "rgb24")
+        flip = flip_of(name)
+        cli = decode(path, "rgb24")  # the CLI's autorotate
+        rgb = torchcodec_rgb24(path, w, h, n, rot, flip)
         ow, oh = (h, w) if rot in (90, 270) else (w, h)
         assert len(rgb) == ow * oh * 3 * n, (name, len(rgb), ow, oh, n)
         if name not in NO_RGB24_GOLDEN:
+            if pix_fmt_of(name)[:7] != "yuv420p":
+                # The CLI converts 4:2:2 and 4:4:4 first as well: the two orders agree (and this
+                # checks the rotation directions above).
+                assert cli == rgb, name
             with open(os.path.join(OUT, name + ".rgb24"), "wb") as f:
                 f.write(rgb)
+            if (rot or flip) and pix_fmt_of(name)[:7] == "yuv420p":
+                with open(os.path.join(OUT, name + ".cli_autorotate.rgb24"), "wb") as f:
+                    f.write(cli)
             if pix_fmt_of(name) == "yuv420p10le":
                 with open(os.path.join(OUT, name + ".bilinear.rgb24"), "wb") as f:
-                    f.write(decode(path, "rgb24", flags="bilinear"))
+                    f.write(torchcodec_rgb24(path, w, h, n, rot, flip, flags="bilinear"))
         if name in NV12_GOLDENS and name not in NO_RGB24_GOLDEN:
             fmt, ext = PLANES[pix_fmt_of(name)]
             nv = decode(path, fmt, autorotate=False)
@@ -470,10 +508,12 @@ def file_table():
             role, note = "config", "per fixture: size, rotation, tags and torchcodec's exact-mode frame count, duration and fps"
         elif name.endswith(".portable.rgb24"):
             role, note = "golden", "the ffmpeg CLI's conversion of the input of the same name with the CPU's assembly off (`-cpuflags 0`)"
+        elif name.endswith(".cli_autorotate.rgb24"):
+            role, note = "golden", "the ffmpeg CLI's autorotated rgb24 frames of a rotated or flipped 4:2:0 input (it turns the planes before converting; torchcodec converts first, so this is NOT the reference, kept to show the orders differ)"
         elif name.endswith(".bilinear.rgb24"):
             role, note = "golden", "the ffmpeg CLI's rgb24 conversion with `-sws_flags bilinear` (10-bit 4:2:0 depends on the flag)"
         elif name.endswith(".rgb24"):
-            role, note = "golden", "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+            role, note = "golden", "the rgb24 frames torchcodec returns for the input of the same name (converted at the stored size by the ffmpeg CLI, then rotated or flipped as RGB), concatenated"
         elif name.startswith("syn_") and name.endswith(".planar"):
             role, note = "input", "random planar planes of one format (16-bit little-endian at 10 bits) the converter is given"
         elif name.startswith("rand_") and name.endswith(".nv12"):

@@ -42,8 +42,11 @@
 //!
 //! The frames come out as stored; the track's `preferredTransform` is applied
 //! by this module as one of the eight EXIF orientations ([`Rotation::Apply`],
-//! the default), after the colour conversion, as torchcodec does.
-//! [`Rotation::Ignore`] returns the frames as stored.
+//! the default), after the colour conversion, which for even-sized 4:2:0 gives
+//! the same bytes as turning the planes first (a 90 degree turn or flip maps 2x2
+//! chroma blocks to 2x2 blocks); only the width-dependent choice of converter
+//! (see `yuv.rs`) could tell the orders apart. What torchcodec does with a
+//! rotation flag was not run. [`Rotation::Ignore`] returns the frames as stored.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};

@@ -26,9 +26,13 @@ docs/embedgemma2.md "Media decoding"):
   with an `format=rgb24` filtergraph otherwise, and the two give the same bytes for a
   same-size YUV 4:2:0 to RGB conversion (checked: bytes from `sws_getContext` flags 0,
   1, 2 and 4 and the CLI's bicubic are equal on even sizes). The CLI's `-pix_fmt rgb24`
-  is that conversion. A rotated stream is rotated by torchcodec after the colour
-  conversion (`RotationTransform`, `transpose=...`) and by the CLI's autorotate before
-  it; for even sizes the two agree, because the chroma is replicated, not interpolated.
+  is that conversion. (The torchcodec details in this paragraph are from recollection of
+  its documentation and design, not from running it.) A rotated stream is, as recalled,
+  rotated by torchcodec after the colour conversion (`transpose=...`) and by the CLI's
+  autorotate before it; for even sizes the two agree in every pixel, because the chroma is
+  replicated, not interpolated, and a 90 degree turn or flip maps 2x2 blocks to 2x2
+  blocks. The one way the order could show is the converter chosen by the frame width
+  (a multiple of 16 or not), which the rotated fixtures do not separate.
 
 Frame count, duration and average fps follow torchcodec's exact seek mode
 (`Metadata.cpp`): the number of packets, `max(pts + duration) - min(pts)` in seconds,

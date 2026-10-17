@@ -2687,7 +2687,10 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
   with libswscale using the frame's own matrix and range, with chroma replicated 2x2 (the
   scaler flags do not matter when the frame is not resized; the CLI half is verified, the
   torchcodec half is inferred). Whether torchcodec applies a rotation flag, and in what order
-  with the conversion, was **not checked**; the default here applies it. The reference
+  with the conversion, was **not checked**; the default here applies it. For even sizes the
+  order does not change the bytes (a 90 degree turn or flip maps 2x2 chroma blocks to 2x2
+  blocks), except through the width-dependent choice between the two converters (below),
+  which the rotated fixtures do not separate. The reference
   loader's metadata is taken in exact seek mode: `num_frames` is the
   packet count, `duration` is `max(pts + packet duration) - min(pts)` in seconds, and `fps`
   is `num_frames / duration`, which is not the header's rate (the end-to-end fixture:
@@ -3043,12 +3046,14 @@ Wall time of one call, ms, with ms per frame in brackets for the first-30-frames
 | 1270x720 H.264 (table converter) | 5 sampled | 125 | 119 |
 | | first 30 | 127 (4.2) | 117 (3.9) |
 
-Both paths decode every frame up to the last one asked for, so the sampled rows are dominated
-by the decode and the two paths are within the noise of each other (the rows swap order from run
-to run: an earlier, noisier run had 720p HEVC the other way). The first-30 rows show the
-Rust conversion's cost: about 0.2 to 0.3 ms per frame at 720p and, in this run, about 3 ms per
-frame at 1080p (228 against 139 ms), which is the single-threaded conversion of 2 Mpixel
-(inferred; not profiled). The conversion is not threaded. Splitting the rows across threads
+Both paths decode every frame up to the last one asked for, so the rows are dominated by the
+decode. At 720p the two paths are within 0.7 ms per frame of each other in the first-30 rows,
+in either direction (HEVC: exact faster), and the sampled rows swap order from run to run (an
+earlier, noisier run had them the other way). At 1080p the first-30 rows are 89 ms apart
+(228 against 139), but the same clip's sampled rows are 65 ms apart in the opposite direction
+(168 against 233), so this run does not isolate the conversion's cost; a single-threaded
+conversion of 2 Mpixel is a plausible reason for the first-30 gap (inferred, not profiled).
+The conversion is not threaded. Splitting the rows across threads
 would be the way to speed it up and cannot change the bytes, since each pixel is a function of
 its own `(Y, Cb, Cr)`; not done.
 
@@ -3065,7 +3070,7 @@ torchcodec are not installed, and a timing against subprocess FFmpeg would measu
 - Why `AVAssetReader`'s decoded 4:2:0 output has different chroma from the decoder's is not
   found; VideoToolbox is driven directly to avoid it. 10-bit, 4:2:2, 4:4:4 and odd-sized streams
   take AVFoundation's conversion and are not the reference's bytes.
-- The Rust conversion is single-threaded (about 3 ms per 1080p frame in the run above).
+- The Rust conversion is single-threaded; its cost per frame is not isolated by the run above.
 - The Opus decoder difference above has no explanation yet; the first 0.37 s of that
   fixture differ from libopus.
 - HEIC, H.264 and HEVC decoding cannot run in the hosted sandbox, so their tests run locally only.

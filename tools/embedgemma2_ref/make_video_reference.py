@@ -17,8 +17,8 @@ transformers' `fetch_videos` decodes a video path with torchcodec
 (`VideoDecoder(seek_mode="exact")`), which is not installed here. The array
 given to sentence-transformers is the `ffmpeg` CLI's decode of the whole file to
 rgb24 with autorotation (scripts/gen_media_video_exact_fixtures.py documents why
-that equals torchcodec's frames: both are libswscale, the frame's own matrix and
-range, rotation applied after the conversion), and the metadata is torchcodec's
+that equals torchcodec's frames, as far as that is known without running it: both
+are libswscale with the frame's own matrix and range), and the metadata is torchcodec's
 exact-mode figures (`num_frames` = packets, `duration` = last pts + duration -
 first pts, `fps` = num_frames / duration), from the same script. The video
 processor then samples frames from those with `sample_frames`, as it does for a

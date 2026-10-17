@@ -44,6 +44,9 @@ mod svg;
 #[path = "../src/bin/plot_results/tok.rs"]
 mod tok;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/video_color.rs"]
+mod video_color;
+#[allow(dead_code)]
 #[path = "../src/bin/plot_results/vision.rs"]
 mod vision;
 

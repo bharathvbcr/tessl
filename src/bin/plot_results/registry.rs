@@ -98,6 +98,11 @@ pub const PLOTS: &[Plot] = &[
         file: "media_resample_m5pro.json",
         render: crate::resample::resample,
     },
+    Plot {
+        name: "video-color",
+        file: "media_video_color_m5pro.json",
+        render: crate::video_color::video_color,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Plot> {

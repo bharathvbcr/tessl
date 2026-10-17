@@ -43,6 +43,8 @@ mod mp3;
 mod orient;
 pub mod resample;
 pub mod video;
+mod vt;
+pub mod yuv;
 
 pub use audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, DecodedAudio, Downmix};
 pub use image::{decode_image, decode_image_file, DecodedImage, ImageOptions};

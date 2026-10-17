@@ -11,11 +11,17 @@
 //! `bench/make_media_bench_inputs.py` writes. Every file in it is timed by
 //! extension: images (`png`, `jpg`, `tiff`) with `decode_image_file`; audio
 //! (`wav`, `flac`, `m4a`, `mp3`) with `decode_audio_file` to 16 kHz mono; video
-//! (`mp4`) twice, `video_open` (`VideoSource::open`: the first pass, which reads
-//! the compressed samples to count frames and read their times) and
-//! `video_decode_N` (decoding the N frames the processor's 1 fps sampling picks,
-//! N being 9 for the 10 s clip, plus the BGRA to RGB conversion), each from a
-//! freshly opened source.
+//! (`mp4`) as `video_open` (`VideoSource::open`: the first pass, which reads the
+//! compressed samples to count frames and read their times), then twice under
+//! each colour path (`:exact`, the default: VideoToolbox planes converted by
+//! libswscale's arithmetic in Rust; `:bgra`: AVFoundation's own conversion) as
+//! `video_sampled_N` (decoding the N frames the processor's 1 fps sampling
+//! picks, N being 9 for a 10 s clip) and `video_first_K` (decoding the first K
+//! = 30 frames, so the row divides into a cost per frame), each from a freshly
+//! opened source. A run in which a path fell back to the other is refused.
+//! `bench/make_video_bench_inputs.py` writes four clips for these rows
+//! (`BENCH_MEDIA_DIR=target/media_bench_video`), plotted by
+//! `plot_results video-color`.
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 2) are per workload.
 //! Prints a table, then one JSON array on the last stdout line: `{workload,
@@ -31,7 +37,7 @@ use std::time::Instant;
 use tessl::embedgemma2_pre::PreConfig;
 use tessl::media::audio::{decode_audio_file, AudioOptions};
 use tessl::media::image::{decode_image_file, ImageOptions};
-use tessl::media::video::{VideoOptions, VideoSource};
+use tessl::media::video::{ColorPath, Conversion, VideoOptions, VideoSource};
 
 struct Row {
     workload: String,
@@ -68,6 +74,19 @@ fn time(warmup: usize, iters: usize, mut f: impl FnMut() -> Result<(), String>) 
     }
     ms.sort_by(f64::total_cmp);
     Ok((ms[0], ms[ms.len() / 2]))
+}
+
+/// How many leading frames the `video_first_N` rows decode.
+const FIRST_FRAMES: usize = 30;
+
+/// A timing is only a timing of the path it names: refuse a run in which the
+/// exact path fell back to AVFoundation's conversion (a stream it does not
+/// cover) or the other way round.
+fn check_path(got: &Conversion, exact: bool) -> Result<(), String> {
+    match (got, exact) {
+        (Conversion::Swscale { .. }, true) | (Conversion::AvFoundation, false) => Ok(()),
+        _ => Err(format!("the {} path ran {got:?}", if exact { "exact" } else { "bgra" })),
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -149,22 +168,50 @@ fn run() -> Result<(), String> {
                     units: total as f64,
                     unit: "frame",
                 });
-                let mut sampled = 0usize;
-                let (min, med) = time(warmup, iters, || {
-                    let v = VideoSource::open(path, &opts).map_err(|e| e.to_string())?;
-                    let d = v.decode_sampled(&cfg.video).map_err(|e| e.to_string())?;
-                    sampled = d.frames.len();
-                    black_box(d);
-                    Ok(())
-                })?;
-                rows.push(Row {
-                    workload: format!("{name}:video_decode_{sampled}"),
-                    ms_min: min,
-                    ms_median: med,
-                    iters,
-                    units: sampled as f64,
-                    unit: "frame",
-                });
+                // The same two calls under each colour path: `exact` is the
+                // default (VideoToolbox planes, libswscale's arithmetic in Rust),
+                // `bgra` AVFoundation's own conversion. `sampled` decodes the
+                // frames the processor's sampling picks; `first` the first
+                // FIRST_FRAMES, so the rows divide into a cost per frame.
+                let first: Vec<usize> = (0..total.min(FIRST_FRAMES)).collect();
+                for (label, color, conversion_is_exact) in [
+                    ("exact", ColorPath::default(), true),
+                    ("bgra", ColorPath::AvFoundation, false),
+                ] {
+                    let opts = VideoOptions { color, ..opts };
+                    let mut sampled = 0usize;
+                    let (min, med) = time(warmup, iters, || {
+                        let v = VideoSource::open(path, &opts).map_err(|e| e.to_string())?;
+                        let d = v.decode_sampled(&cfg.video).map_err(|e| e.to_string())?;
+                        check_path(&d.conversion, conversion_is_exact)?;
+                        sampled = d.frames.len();
+                        black_box(d);
+                        Ok(())
+                    })?;
+                    rows.push(Row {
+                        workload: format!("{name}:video_sampled_{sampled}:{label}"),
+                        ms_min: min,
+                        ms_median: med,
+                        iters,
+                        units: sampled as f64,
+                        unit: "frame",
+                    });
+                    let (min, med) = time(warmup, iters, || {
+                        let v = VideoSource::open(path, &opts).map_err(|e| e.to_string())?;
+                        let d = v.decode_frames(&first).map_err(|e| e.to_string())?;
+                        check_path(&d.conversion, conversion_is_exact)?;
+                        black_box(d);
+                        Ok(())
+                    })?;
+                    rows.push(Row {
+                        workload: format!("{name}:video_first_{}:{label}", first.len()),
+                        ms_min: min,
+                        ms_median: med,
+                        iters,
+                        units: first.len() as f64,
+                        unit: "frame",
+                    });
+                }
             }
             _ => eprintln!("skipping {name}: not a media extension this bench knows"),
         }

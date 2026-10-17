@@ -1,36 +1,52 @@
-//! Video decoding with AVFoundation (`AVAssetReader`).
+//! Video decoding with AVFoundation and VideoToolbox.
 //!
-//! H.264, HEVC and whatever else AVFoundation decodes in MP4, MOV and M4V
-//! become decoded 8-bit RGB frames, sampled the way
+//! H.264, HEVC and whatever else AVFoundation reads in MP4, MOV and M4V become
+//! decoded 8-bit RGB frames, sampled the way
 //! [`crate::embedgemma2_pre::sample_frame_indices`] samples them, with the
-//! source frame rate and each frame's presentation time.
+//! frame rate and duration the reference loader computes and each frame's
+//! presentation time. For 8-bit 4:2:0 streams the RGB is byte-equal to what
+//! the reference loader (transformers, through torchcodec, which converts with
+//! libswscale) produces; see `tests/media_video_exact.rs`.
 //!
 //! # How the frames are chosen
 //!
-//! The model's video processor needs the frame count and the source rate first
-//! (`int(duration * fps)` frames at `int(i * source_fps / fps)`), then a handful
-//! of frames. [`VideoSource::open`] therefore reads the track twice:
-//!
-//! 1. once **without decoding** (an `AVAssetReaderTrackOutput` with no output
-//!    settings returns the compressed samples): the exact frame count, each
-//!    frame's presentation time in presentation order, and the track's
-//!    `nominalFrameRate` and `preferredTransform`;
-//! 2. once **decoding** to `kCVPixelFormatType_32BGRA`, converting to RGB only
-//!    the frames asked for.
+//! The model's video processor needs the frame count and the rate first
+//! (`int(duration * fps)` frames at `int(i * average_fps / fps)`), then a
+//! handful of frames. [`VideoSource::open`] therefore reads the track without
+//! decoding (an `AVAssetReaderTrackOutput` with no output settings returns the
+//! compressed samples): the exact frame count, each frame's presentation time
+//! in presentation order, and the track's `preferredTransform`. torchcodec's
+//! exact seek mode derives `duration` as the span of the packets (last
+//! presentation time plus its duration, minus the first) and `fps` as the frame
+//! count over that duration, and [`VideoInfo::fps`] and [`VideoInfo::duration`]
+//! are those figures, not the header's `nominalFrameRate` (kept as
+//! [`VideoInfo::nominal_fps`]).
 //!
 //! Decoding still runs through every frame (a P-frame cannot be skipped), but
 //! only the sampled frames are converted and kept, so memory is
 //! `sampled * width * height * 3`, not the whole video.
 //!
-//! # Colour and rotation
+//! # Colour
 //!
-//! The YCbCr to RGB conversion is AVFoundation's, using the matrix and range
-//! the stream is tagged with. The frames come out as stored; the track's
-//! `preferredTransform` is applied by this module as one of the eight EXIF
-//! orientations ([`Rotation::Apply`], the default, as a player and OpenCV's
-//! `cv2.VideoCapture` do). Which one torchcodec's `VideoDecoder` does by default
-//! could not be checked here (it is not installed), so [`Rotation::Ignore`]
-//! returns the frames as stored.
+//! AVFoundation's own decode (`AVAssetReader` with output settings) returns the
+//! right luma but altered chroma, so it is not used for 8-bit 4:2:0 streams
+//! ([`ColorPath::Swscale`], the default). Their compressed samples go to a
+//! `VTDecompressionSession` directly (`vt.rs`), whose planes are byte-equal to
+//! FFmpeg's on H.264 and HEVC, and [`yuv::nv12_to_rgb24`] converts them with
+//! libswscale's arithmetic for the matrix and range the stream is tagged with
+//! (untagged means BT.601 limited, as libswscale does). Anything else
+//! (10-bit, 4:2:2, odd sizes, an unlisted matrix) is converted by AVFoundation
+//! to BGRA ([`Conversion::AvFoundation`] reports which path ran).
+//!
+//! # Rotation
+//!
+//! The frames come out as stored; the track's `preferredTransform` is applied
+//! by this module as one of the eight EXIF orientations ([`Rotation::Apply`],
+//! the default), after the colour conversion, which for even-sized 4:2:0 gives
+//! the same bytes as turning the planes first (a 90 degree turn or flip maps 2x2
+//! chroma blocks to 2x2 blocks); only the width-dependent choice of converter
+//! (see `yuv.rs`) could tell the orders apart. What torchcodec does with a
+//! rotation flag was not run. [`Rotation::Ignore`] returns the frames as stored.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -43,8 +59,9 @@ use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::{NSError, NSString, NSURL};
 
-use super::cf::{CfRef, CfTypeRef};
-use super::{containers, orient, MediaError};
+use super::cf::{CFDataGetBytePtr, CFDataGetLength, CFDictionaryGetValue, CFGetTypeID, CfRef, CfTypeRef};
+use super::yuv::{self, Flavor, Matrix, Nv12, Range};
+use super::{containers, orient, vt, MediaError};
 use crate::embedgemma2_pre::{
     preprocess_video, sample_frame_indices, PreparedVideo, RawImage, VideoConfig, MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES,
 };
@@ -57,9 +74,9 @@ use crate::embedgemma2_pre::{
 /// `CMTime` (`CMTime.h`): `value / timescale` seconds when `flags & 1`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct CmTime {
-    value: i64,
-    timescale: i32,
+pub(super) struct CmTime {
+    pub(super) value: i64,
+    pub(super) timescale: i32,
     flags: u32,
     epoch: i64,
 }
@@ -119,6 +136,11 @@ unsafe impl Encode for CgAffineTransform {
 const CMTIME_VALID: u32 = 1;
 /// `kCVPixelFormatType_32BGRA` ('BGRA').
 const PIXEL_FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+/// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` ('420v'): 8-bit 4:2:0,
+/// Y then interleaved Cb/Cr, luma 16..=235.
+const PIXEL_FORMAT_420V: u32 = u32::from_be_bytes(*b"420v");
+/// `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange` ('420f'): the same, 0..=255.
+const PIXEL_FORMAT_420F: u32 = u32::from_be_bytes(*b"420f");
 /// `kCVPixelBufferLock_ReadOnly`.
 const PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 /// How far a decoded frame's presentation time may be from the first pass's, in
@@ -135,15 +157,31 @@ extern "C" {
 
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
+    static kCMFormatDescriptionExtension_FullRangeVideo: CfTypeRef;
+    static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CfTypeRef;
+
+    fn CMFormatDescriptionGetMediaSubType(desc: CfTypeRef) -> u32;
+
     fn CMSampleBufferGetNumSamples(sbuf: CfTypeRef) -> isize;
     fn CMSampleBufferGetPresentationTimeStamp(sbuf: CfTypeRef) -> CmTime;
+    fn CMSampleBufferGetDuration(sbuf: CfTypeRef) -> CmTime;
     fn CMSampleBufferGetImageBuffer(sbuf: CfTypeRef) -> CfTypeRef;
     fn CMTimeGetSeconds(time: CmTime) -> f64;
+    fn CMFormatDescriptionGetExtension(desc: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFDataGetTypeID() -> usize;
+    fn CFBooleanGetValue(boolean: CfTypeRef) -> u8;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
 extern "C" {
     static kCVPixelBufferPixelFormatTypeKey: *const AnyObject;
+    /// `kCMFormatDescriptionExtension_YCbCrMatrix` is a macro for this key.
+    static kCVImageBufferYCbCrMatrixKey: CfTypeRef;
 
     fn CVPixelBufferLockBaseAddress(pb: CfTypeRef, flags: u64) -> i32;
     fn CVPixelBufferUnlockBaseAddress(pb: CfTypeRef, flags: u64) -> i32;
@@ -152,6 +190,9 @@ extern "C" {
     fn CVPixelBufferGetWidth(pb: CfTypeRef) -> usize;
     fn CVPixelBufferGetHeight(pb: CfTypeRef) -> usize;
     fn CVPixelBufferGetPixelFormatType(pb: CfTypeRef) -> u32;
+    /// The H.273 `matrix_coefficients` code of a `kCVImageBufferYCbCrMatrix_*`
+    /// string; 2 (unspecified) for NULL or one it does not know.
+    fn CVYCbCrMatrixGetIntegerCodePointForString(matrix: CfTypeRef) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +208,49 @@ pub enum Rotation {
     Ignore,
 }
 
+/// How the decoder's YCbCr frames become RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorPath {
+    /// Decode the compressed samples with VideoToolbox into the decoder's own
+    /// 8-bit 4:2:0 planes (see `vt.rs`) and convert them with
+    /// [`yuv::nv12_to_rgb24`], which reproduces libswscale byte for byte (what
+    /// torchcodec and the `ffmpeg` CLI compute), for the given converter
+    /// flavor. A stream that is not 8-bit 4:2:0, has odd dimensions, or whose
+    /// matrix is not one [`Matrix`] holds, is decoded to BGRA by AVFoundation
+    /// instead ([`Conversion::AvFoundation`] in the result says so).
+    Swscale(Flavor),
+    /// AVFoundation's own decode and YCbCr to BGRA conversion (`AVAssetReader`
+    /// and CoreVideo). Its luma equals the decoder's, but its chroma does not
+    /// (8 to 15 percent of the chroma samples differ, by up to about 70, on
+    /// the fixtures), so this is not libswscale and not close to it either.
+    AvFoundation,
+}
+
+impl Default for ColorPath {
+    fn default() -> Self {
+        ColorPath::Swscale(Flavor::Aarch64)
+    }
+}
+
+/// Which conversion produced the frames of a [`DecodedVideo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversion {
+    /// [`yuv::nv12_to_rgb24`] with this matrix, range and flavor.
+    Swscale {
+        matrix: Matrix,
+        range: Range,
+        flavor: Flavor,
+    },
+    /// AVFoundation's BGRA conversion.
+    AvFoundation,
+}
+
 /// Options for opening and decoding a video.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoOptions {
     pub rotation: Rotation,
+    /// How decoded YCbCr becomes RGB.
+    pub color: ColorPath,
     /// The most frames [`VideoSource::decode_frames`] returns.
     pub max_frames: usize,
     /// The most bytes of RGB frames it returns.
@@ -183,6 +263,7 @@ impl Default for VideoOptions {
     fn default() -> Self {
         Self {
             rotation: Rotation::Apply,
+            color: ColorPath::default(),
             max_frames: 4096,
             max_bytes: 1 << 32,
             load_timeout: Duration::from_secs(60),
@@ -190,19 +271,46 @@ impl Default for VideoOptions {
     }
 }
 
+/// What the stream says about its own colour, as FFmpeg reads it: the
+/// matrix (`matrix_coefficients`, an H.273 code) and range the track's format
+/// description carries. `None` where the stream does not say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamTags {
+    pub matrix_code: Option<u8>,
+    pub full_range: Option<bool>,
+}
+
 /// What the first (undecoded) pass found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoInfo {
     /// The exact number of frames in the video track.
     pub total_frames: usize,
-    /// The source frame rate: the track's `nominalFrameRate`, or the average
-    /// rate over the presentation times when the track does not give one.
+    /// The frame rate the reference derives from the track
+    /// (torchcodec's `average_fps` in its exact seek mode, which
+    /// `transformers` asks for): `total_frames / duration`, in `f64`.
     pub fps: f64,
+    /// `max(pts + duration) - min(pts)` over the frames, in seconds
+    /// (torchcodec's `duration_seconds` in exact mode).
+    pub duration: f64,
+    /// The track's `nominalFrameRate`, which is what the header says.
+    pub nominal_fps: f64,
     /// Each frame's presentation time in seconds, in presentation order.
     pub timestamps: Vec<f64>,
     /// The EXIF orientation (1 to 8) the track's `preferredTransform` stands
     /// for; 1 when it is the identity.
     pub orientation: u32,
+    /// The colour tags the stream carries.
+    pub tags: StreamTags,
+    /// Whether the codec configuration says 8-bit 4:2:0 (H.264 Baseline to
+    /// High, HEVC with 8-bit 4:2:0 in its `hvcC`), the only streams
+    /// [`ColorPath::Swscale`] converts exactly.
+    pub eight_bit_420: bool,
+    /// The pixel format (`CVPixelBufferGetPixelFormatType`, a four-character
+    /// code as a number) AVFoundation decodes the track to natively.
+    pub native_format: u32,
+    /// The size of the stored frames, before rotation.
+    pub stored_width: usize,
+    pub stored_height: usize,
 }
 
 /// Decoded frames and where they came from.
@@ -211,6 +319,7 @@ pub struct DecodedVideo {
     /// Width of every frame (after rotation, if applied).
     pub width: usize,
     pub height: usize,
+    /// The reference's average frame rate ([`VideoInfo::fps`]).
     pub fps: f64,
     /// Frames in the whole video.
     pub total_frames: usize,
@@ -220,6 +329,21 @@ pub struct DecodedVideo {
     pub timestamps: Vec<f64>,
     /// One `height * width * 3` RGB buffer per returned frame.
     pub frames: Vec<Vec<u8>>,
+    /// How the frames were converted to RGB.
+    pub conversion: Conversion,
+}
+
+/// A decoded frame's planes as AVFoundation produced them (8-bit 4:2:0),
+/// tightly packed: `width * height` luma bytes, then `(width / 2) * (height /
+/// 2)` interleaved Cb/Cr pairs. Not rotated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nv12Frame {
+    pub width: usize,
+    pub height: usize,
+    /// `true` for `420f` (full range), `false` for `420v`.
+    pub full_range: bool,
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
 }
 
 impl DecodedVideo {
@@ -238,6 +362,9 @@ pub struct VideoSource {
     track: Retained<AnyObject>,
     info: VideoInfo,
     options: VideoOptions,
+    /// The frames' presentation times in media ticks, in presentation order: how a
+    /// decoded sample is told from its time which frame it is.
+    media_pts: Vec<i64>,
     /// A temporary file made from bytes, removed on drop.
     _temp: Option<TempFile>,
 }
@@ -333,40 +460,19 @@ impl VideoSource {
     /// bound, [`MediaError::Decode`] when AVFoundation fails mid-stream or
     /// decodes a different number of frames than the first pass counted.
     pub fn decode_frames(&self, indices: &[usize]) -> Result<DecodedVideo, MediaError> {
-        const WHAT: &str = "video";
-        if indices.is_empty() {
-            return Err(MediaError::Invalid {
-                what: WHAT,
-                detail: "no frame indices asked for".into(),
-            });
-        }
-        if indices.len() > self.options.max_frames {
-            return Err(MediaError::Limit {
-                what: WHAT,
-                detail: format!("{} frames exceeds {}", indices.len(), self.options.max_frames),
-            });
-        }
-        if let Some(&bad) = indices.iter().find(|&&i| i >= self.info.total_frames) {
-            return Err(MediaError::Invalid {
-                what: WHAT,
-                detail: format!("frame {bad} asked for, the video has {}", self.info.total_frames),
-            });
-        }
-        let mut wanted: Vec<usize> = indices.to_vec();
-        wanted.sort_unstable();
-        wanted.dedup();
+        let wanted = self.checked_wanted(indices)?;
         autoreleasepool(|_| self.decode_wanted(&wanted, indices))
     }
 
     /// Decode the frames the model's video processor samples
-    /// ([`sample_frame_indices`] over the exact frame count and source rate);
-    /// with `cfg.do_sample_frames` false, every frame (up to `max_frames`).
+    /// ([`VideoSource::sample_indices`]); with `cfg.do_sample_frames` false,
+    /// every frame (up to `max_frames`).
     ///
     /// # Errors
     /// As [`VideoSource::decode_frames`], and the sampler's own errors.
     pub fn decode_sampled(&self, cfg: &VideoConfig) -> Result<DecodedVideo, MediaError> {
         let indices = if cfg.do_sample_frames {
-            sample_frame_indices(cfg, self.info.total_frames, self.info.fps).map_err(MediaError::Preprocess)?
+            self.sample_indices(cfg)?
         } else {
             if self.info.total_frames > MAX_VIDEO_FRAMES {
                 return Err(MediaError::Limit {
@@ -379,15 +485,216 @@ impl VideoSource {
         self.decode_frames(&indices)
     }
 
-    /// Pass two: decode and convert the sorted, unique `wanted` frames, then lay
-    /// them out in the order of `asked`.
-    fn decode_wanted(&self, wanted: &[usize], asked: &[usize]) -> Result<DecodedVideo, MediaError> {
+    /// The frame indices `EmbeddingGemma2VideoProcessor.sample_frames` picks for
+    /// this video: with a target `fps`, `max(1, int(duration * fps))` frames at
+    /// `min(total - 1, int(i * source_fps / fps))`, where `duration` and
+    /// `source_fps` are the metadata torchcodec reports ([`VideoInfo::duration`]
+    /// and [`VideoInfo::fps`], which are not `total / fps` to the last bit);
+    /// then the `max_frames` cap with the overflow strategy.
+    ///
+    /// # Errors
+    /// [`MediaError::Preprocess`] with the sampler's message.
+    pub fn sample_indices(&self, cfg: &VideoConfig) -> Result<Vec<usize>, MediaError> {
+        let total = self.info.total_frames;
+        let mut indices: Vec<usize> = match cfg.fps {
+            None => (0..total).collect(),
+            Some(fps) => {
+                let step = self.info.fps / fps;
+                let sampled = ((self.info.duration * fps) as usize).max(1);
+                (0..sampled)
+                    .map(|i| ((i as f64 * step) as usize).min(total - 1))
+                    .collect()
+            }
+        };
+        if indices.len() > cfg.max_frames {
+            // The cap chooses positions in the list, as it would in `arange(n)`.
+            let mut cap = cfg.clone();
+            cap.fps = None;
+            let positions = sample_frame_indices(&cap, indices.len(), 1.0).map_err(MediaError::Preprocess)?;
+            indices = positions.into_iter().map(|p| indices[p]).collect();
+        }
+        Ok(indices)
+    }
+
+    /// Decode the frames at `indices` to the decoder's own 8-bit 4:2:0 planes,
+    /// without converting or rotating them (for checking the planes against
+    /// another decoder's). They come from VideoToolbox driven directly (see
+    /// `vt.rs` for why not from `AVAssetReader`'s decoded output).
+    ///
+    /// # Errors
+    /// As [`VideoSource::decode_frames`], and [`MediaError::Unsupported`] when
+    /// the track is not 8-bit 4:2:0 H.264 or HEVC with even sides.
+    pub fn decode_native_planes(&self, indices: &[usize]) -> Result<Vec<Nv12Frame>, MediaError> {
+        let wanted = self.checked_wanted(indices)?;
+        if !self.info.eight_bit_420 || self.info.stored_width % 2 != 0 || self.info.stored_height % 2 != 0 {
+            return Err(MediaError::Unsupported {
+                what: "video",
+                detail: "the track is not 8-bit 4:2:0 with even sides".into(),
+            });
+        }
+        let mut kept = autoreleasepool(|_| self.read_nv12(&wanted))?;
+        indices
+            .iter()
+            .map(|i| {
+                wanted
+                    .binary_search(i)
+                    .ok()
+                    .and_then(|at| kept.get_mut(at))
+                    .map(|slot| slot.clone())
+                    .ok_or_else(|| MediaError::Decode {
+                        what: "video",
+                        detail: "a requested frame was not decoded".into(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Decode the whole track with VideoToolbox and return the planes of the
+    /// sorted, unique `wanted` frames, in that order.
+    fn read_nv12(&self, wanted: &[usize]) -> Result<Vec<Nv12Frame>, MediaError> {
         const WHAT: &str = "video";
-        let settings = bgra_settings()?;
-        let (reader, output) = new_reader(&self.asset, &self.track, Some(&settings))?;
+        let format = if self.info.tags.full_range == Some(true) {
+            vt::FORMAT_420F
+        } else {
+            vt::FORMAT_420V
+        };
+        let total = self.info.total_frames;
+        let mut flags = vec![false; total];
+        for &w in wanted {
+            flags[w] = true;
+        }
+        // Compressed samples, in decode order, with the track's format description.
+        let (reader, output) = new_reader(&self.asset, &self.track, None)?;
         start_reading(&reader)?;
-        let mut kept: Vec<Vec<u8>> = Vec::with_capacity(wanted.len());
-        let mut dims: Option<(usize, usize)> = None;
+        let mut decoder: Option<vt::Decoder> = None;
+        let mut samples = 0usize;
+        loop {
+            let done = autoreleasepool(|_| -> Result<bool, MediaError> {
+                let Some(sample) = next_sample(&output) else {
+                    return Ok(true);
+                };
+                // SAFETY: `sample` is a live CMSampleBuffer.
+                if unsafe { CMSampleBufferGetNumSamples(sample.as_ptr()) } == 0 {
+                    return Ok(false); // a marker-only buffer
+                }
+                if decoder.is_none() {
+                    decoder = Some(vt::Decoder::new(
+                        sample.as_ptr(),
+                        format,
+                        self.media_pts.clone(),
+                        flags.clone(),
+                    )?);
+                }
+                if let Some(d) = decoder.as_mut() {
+                    d.decode(sample.as_ptr(), format)?;
+                }
+                samples += 1;
+                Ok(false)
+            })?;
+            if done {
+                break;
+            }
+        }
+        if reader.status() != READER_STATUS_COMPLETED {
+            return Err(MediaError::Decode {
+                what: WHAT,
+                detail: format!(
+                    "AVAssetReader stopped after {samples} of {total} samples ({})",
+                    reader.error_text()
+                ),
+            });
+        }
+        if samples != total {
+            return Err(MediaError::Decode {
+                what: WHAT,
+                detail: format!("read {samples} samples where the first pass counted {total}"),
+            });
+        }
+        let frames = decoder
+            .ok_or_else(|| MediaError::Decode {
+                what: WHAT,
+                detail: "the track has no samples".into(),
+            })?
+            .finish()?;
+        wanted
+            .iter()
+            .map(|&i| {
+                frames.get(i).cloned().flatten().ok_or_else(|| MediaError::Decode {
+                    what: WHAT,
+                    detail: format!("frame {i} was not decoded"),
+                })
+            })
+            .collect()
+    }
+
+    /// The conversion this source's frames get under its options.
+    fn plan(&self) -> Plan {
+        let ColorPath::Swscale(flavor) = self.options.color else {
+            return Plan::AvFoundation;
+        };
+        let info = &self.info;
+        if !info.eight_bit_420 {
+            return Plan::AvFoundation;
+        }
+        let range = if info.tags.full_range == Some(true) {
+            Range::Full
+        } else {
+            Range::Limited
+        };
+        if info.stored_width % 2 != 0 || info.stored_height % 2 != 0 {
+            return Plan::AvFoundation;
+        }
+        // A stream that does not name its matrix is converted as libswscale
+        // does: with BT.601's, whatever its size.
+        let matrix = match info.tags.matrix_code {
+            None => Matrix::Bt601,
+            Some(code) => match Matrix::from_code(code) {
+                Some(m) => m,
+                None => return Plan::AvFoundation,
+            },
+        };
+        Plan::Swscale { matrix, range, flavor }
+    }
+
+    fn checked_wanted(&self, indices: &[usize]) -> Result<Vec<usize>, MediaError> {
+        if indices.is_empty() {
+            return Err(MediaError::Invalid {
+                what: "video",
+                detail: "no frame indices asked for".into(),
+            });
+        }
+        if indices.len() > self.options.max_frames {
+            return Err(MediaError::Limit {
+                what: "video",
+                detail: format!("{} frames exceeds {}", indices.len(), self.options.max_frames),
+            });
+        }
+        if let Some(&bad) = indices.iter().find(|&&i| i >= self.info.total_frames) {
+            return Err(MediaError::Invalid {
+                what: "video",
+                detail: format!("frame {bad} asked for, the video has {}", self.info.total_frames),
+            });
+        }
+        let mut wanted: Vec<usize> = indices.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        Ok(wanted)
+    }
+
+    /// Decode the whole track with `settings`, handing the pixel buffer of each
+    /// frame in the sorted, unique `wanted` to `visit`, and check the decode
+    /// against the first pass (every frame's time, the frame count, the
+    /// reader's status).
+    fn read_frames<T>(
+        &self,
+        settings: &Retained<AnyObject>,
+        wanted: &[usize],
+        mut visit: impl FnMut(CfTypeRef) -> Result<T, MediaError>,
+    ) -> Result<Vec<T>, MediaError> {
+        const WHAT: &str = "video";
+        let (reader, output) = new_reader(&self.asset, &self.track, Some(settings))?;
+        start_reading(&reader)?;
+        let mut kept: Vec<T> = Vec::with_capacity(wanted.len());
         let mut next = 0usize;
         let mut index = 0usize;
         loop {
@@ -414,23 +721,7 @@ impl VideoSource {
                     }
                 }
                 if next < wanted.len() && wanted[next] == index {
-                    let (rgb, w, h) = convert_frame(image, self.info.orientation, self.options.rotation, dims)?;
-                    if dims.is_none() {
-                        let per = w * h * 3;
-                        let total = per.checked_mul(wanted.len());
-                        if total.is_none_or(|t| t > self.options.max_bytes) {
-                            return Err(MediaError::Limit {
-                                what: WHAT,
-                                detail: format!(
-                                    "{} frames of {w}x{h} exceed {} bytes",
-                                    wanted.len(),
-                                    self.options.max_bytes
-                                ),
-                            });
-                        }
-                        dims = Some((w, h));
-                    }
-                    kept.push(rgb);
+                    kept.push(visit(image)?);
                     next += 1;
                 }
                 index += 1;
@@ -461,6 +752,49 @@ impl VideoSource {
                 ),
             });
         }
+        Ok(kept)
+    }
+
+    /// Pass two: decode and convert the sorted, unique `wanted` frames, then lay
+    /// them out in the order of `asked`.
+    fn decode_wanted(&self, wanted: &[usize], asked: &[usize]) -> Result<DecodedVideo, MediaError> {
+        const WHAT: &str = "video";
+        let plan = self.plan();
+        let mut dims: Option<(usize, usize)> = None;
+        // Checks each converted frame against the first one's size and the byte bound.
+        let mut emit = |convert: &dyn Fn(Option<(usize, usize)>) -> Converted| {
+            let (rgb, w, h) = convert(dims)?;
+            if dims.is_none() {
+                let per = w * h * 3;
+                let total = per.checked_mul(wanted.len());
+                if total.is_none_or(|t| t > self.options.max_bytes) {
+                    return Err(MediaError::Limit {
+                        what: WHAT,
+                        detail: format!(
+                            "{} frames of {w}x{h} exceed {} bytes",
+                            wanted.len(),
+                            self.options.max_bytes
+                        ),
+                    });
+                }
+                dims = Some((w, h));
+            }
+            Ok(rgb)
+        };
+        let (orientation, rotation) = (self.info.orientation, self.options.rotation);
+        let kept: Vec<Vec<u8>> = match plan {
+            Plan::Swscale { matrix, range, flavor } => self
+                .read_nv12(wanted)?
+                .iter()
+                .map(|f| emit(&|expect| convert_nv12(f, (matrix, range, flavor), orientation, rotation, expect)))
+                .collect::<Result<_, _>>()?,
+            Plan::AvFoundation => {
+                let settings = bgra_settings()?;
+                self.read_frames(&settings, wanted, |image| {
+                    emit(&|expect| convert_frame(image, orientation, rotation, expect))
+                })?
+            }
+        };
         let (width, height) = dims.ok_or_else(|| MediaError::Decode {
             what: WHAT,
             detail: "no frame was converted".into(),
@@ -497,8 +831,23 @@ impl VideoSource {
             indices: asked.to_vec(),
             timestamps: asked.iter().map(|&i| self.info.timestamps[i]).collect(),
             frames,
+            conversion: match plan {
+                Plan::Swscale { matrix, range, flavor } => Conversion::Swscale { matrix, range, flavor },
+                Plan::AvFoundation => Conversion::AvFoundation,
+            },
         })
     }
+}
+
+/// The conversion [`VideoSource`] applies, decided once per source.
+#[derive(Clone, Copy, Debug)]
+enum Plan {
+    Swscale {
+        matrix: Matrix,
+        range: Range,
+        flavor: Flavor,
+    },
+    AvFoundation,
 }
 
 /// Decode the sampled frames of a video file, in one call.
@@ -625,53 +974,202 @@ fn open_inner(path: &Path, options: &VideoOptions, temp: Option<TempFile>) -> Re
             // SAFETY: as above, for the `CGAffineTransform` property.
             unsafe { msg_send![&*track, preferredTransform] }
         };
-        let orientation = match orient::orientation_of_transform(transform.a, transform.b, transform.c, transform.d) {
+        let orientation = match orientation_of(&transform) {
             Some(o) => o,
             None if options.rotation == Rotation::Ignore => 1,
             None => {
                 return Err(MediaError::Unsupported {
                     what: "video",
                     detail: format!(
-                        "the track's transform [{} {} {} {}] is not a right-angle rotation or flip",
+                        "the track's transform [{} {} {} {}] is not a rotation or a flip",
                         transform.a, transform.b, transform.c, transform.d
                     ),
                 })
             }
         };
-        let mut timestamps = count_frames(&asset, &track)?;
+        let (tags, eight_bit_420) = stream_format(&track);
+        let first_pass = count_frames(&asset, &track)?;
         // Compressed samples carry media time; decoded frames carry track time,
         // with the edit list applied (an H.264 stream with B-frames starts its
         // media at +2 frames and the edit list shifts it back to 0). Report
         // track time, which is what FFmpeg and OpenCV report, and which
         // `decode_wanted` checks against every decoded frame.
-        let shift = timestamps[0] - first_decoded_time(&asset, &track)?;
-        for t in &mut timestamps {
-            *t -= shift;
-        }
-        let total_frames = timestamps.len();
-        let fps = if track_frame_rate.is_finite() && track_frame_rate > 0.0 {
-            f64::from(track_frame_rate)
-        } else if total_frames > 1 && timestamps[total_frames - 1] > timestamps[0] {
-            (total_frames - 1) as f64 / (timestamps[total_frames - 1] - timestamps[0])
-        } else {
+        let first = first_decoded(&asset, &track, tags, eight_bit_420)?;
+        let timescale = f64::from(first_pass.timescale);
+        let shift_seconds = first_pass.pts[0] as f64 / timescale - first.seconds;
+        let shift = (shift_seconds * timescale).round();
+        if (shift_seconds * timescale - shift).abs() > 1e-3 {
             return Err(MediaError::Decode {
                 what: "video",
-                detail: "the track has no frame rate and too few frames to derive one".into(),
+                detail: format!(
+                    "the edit list moves the first frame by {shift_seconds} s, not a whole number of media ticks"
+                ),
             });
-        };
+        }
+        let shift = shift as i64;
+        let pts: Vec<i64> = first_pass.pts.iter().map(|&p| p - shift).collect();
+        // torchcodec's exact seek mode (`Metadata.cpp`, `transformers` asks for
+        // it): the duration is the span from the earliest presentation time to
+        // the latest end (presentation time plus the frame's duration), in
+        // seconds as `ticks / timescale`, and the rate is frames over duration.
+        let begin = pts[0] as f64 / timescale;
+        let end = pts
+            .iter()
+            .zip(&first_pass.durations)
+            .map(|(&p, &d)| p + d)
+            .max()
+            .map_or(begin, |t| t as f64 / timescale);
+        let duration = end - begin;
+        let total_frames = pts.len();
+        if !(duration.is_finite() && duration > 0.0) {
+            return Err(MediaError::Decode {
+                what: "video",
+                detail: format!("the {total_frames} frames span {duration} s, so the video has no frame rate"),
+            });
+        }
+        let timestamps: Vec<f64> = pts.iter().map(|&p| p as f64 / timescale).collect();
         Ok(VideoSource {
             asset,
             track,
             info: VideoInfo {
                 total_frames,
-                fps,
+                fps: total_frames as f64 / duration,
+                duration,
+                nominal_fps: f64::from(track_frame_rate),
                 timestamps,
                 orientation,
+                tags,
+                eight_bit_420,
+                native_format: first.format,
+                stored_width: first.width,
+                stored_height: first.height,
             },
             options: *options,
+            media_pts: first_pass.pts,
             _temp: temp,
         })
     })
+}
+
+/// The EXIF orientation a `preferredTransform` stands for. A pure rotation
+/// that is not a right angle is rounded to the nearest multiple of 90 degrees,
+/// as torchcodec does (`rotation_from_degrees`); a flip must be exact.
+fn orientation_of(t: &CgAffineTransform) -> Option<u32> {
+    if let Some(o) = orient::orientation_of_transform(t.a, t.b, t.c, t.d) {
+        return Some(o);
+    }
+    // A rotation matrix [a b; -b a] scaled by s: angle = atan2(b, a), in
+    // degrees clockwise on screen (y down); the display matrix's
+    // counter-clockwise angle is its negative.
+    let scale = t.a.hypot(t.b);
+    let rotation_like = scale > 1e-3 && (t.a - t.d).abs() < 1e-3 * scale && (t.b + t.c).abs() < 1e-3 * scale;
+    if !rotation_like {
+        return None;
+    }
+    let ccw = -t.b.atan2(t.a).to_degrees();
+    match (ccw / 90.0).round().rem_euclid(4.0) as i64 {
+        0 => Some(1),
+        1 => Some(8),
+        2 => Some(3),
+        _ => Some(6),
+    }
+}
+
+/// The colour tags of the track's first format description, and whether the
+/// stream is 8-bit 4:2:0 (the only kind [`yuv`] converts as libswscale does).
+///
+/// The bit depth and chroma format are read from the codec configuration the
+/// sample description carries (`avcC` for H.264, `hvcC` for HEVC), because the
+/// pixel format a decoder is *asked* for says nothing about the stream: a 10-bit
+/// stream asked for `420v` is converted to it by the system without complaint.
+fn stream_format(track: &Retained<AnyObject>) -> (StreamTags, bool) {
+    let none = StreamTags {
+        matrix_code: None,
+        full_range: None,
+    };
+    // SAFETY: `formatDescriptions` is an NSArray of CMFormatDescriptionRef (nil
+    // if the track has none); `count` and `objectAtIndex:` are plain reads, and
+    // the element stays alive as long as the track does.
+    unsafe {
+        let descriptions: Option<Retained<AnyObject>> = msg_send![&**track, formatDescriptions];
+        let Some(descriptions) = descriptions else {
+            return (none, false);
+        };
+        let count: usize = msg_send![&*descriptions, count];
+        if count == 0 {
+            return (none, false);
+        }
+        let desc: *const AnyObject = msg_send![&*descriptions, objectAtIndex: 0usize];
+        if desc.is_null() {
+            return (none, false);
+        }
+        let desc: CfTypeRef = desc.cast();
+        let matrix = CMFormatDescriptionGetExtension(desc, kCVImageBufferYCbCrMatrixKey);
+        let matrix_code = if matrix.is_null() {
+            None
+        } else {
+            u8::try_from(CVYCbCrMatrixGetIntegerCodePointForString(matrix)).ok()
+        };
+        let range = CMFormatDescriptionGetExtension(desc, kCMFormatDescriptionExtension_FullRangeVideo);
+        let full_range = if !range.is_null() && CFGetTypeID(range) == CFBooleanGetTypeID() {
+            Some(CFBooleanGetValue(range) != 0)
+        } else {
+            None
+        };
+        (
+            StreamTags {
+                matrix_code,
+                full_range,
+            },
+            is_8bit_420(desc),
+        )
+    }
+}
+
+/// The codec configuration record (`avcC` or `hvcC`) in a format description's
+/// sample description extension atoms, as bytes.
+///
+/// # Safety
+/// `desc` must be a live `CMFormatDescriptionRef`.
+unsafe fn configuration_record(desc: CfTypeRef, atom: &str) -> Option<Vec<u8>> {
+    let atoms = CMFormatDescriptionGetExtension(desc, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    if atoms.is_null() {
+        return None;
+    }
+    // The key is a CFString; an NSString is one (toll-free bridged).
+    let key = NSString::from_str(atom);
+    let data = CFDictionaryGetValue(atoms, (&*key as *const NSString).cast());
+    if data.is_null() || CFGetTypeID(data) != CFDataGetTypeID() {
+        return None;
+    }
+    let len = usize::try_from(CFDataGetLength(data)).ok()?;
+    let ptr = CFDataGetBytePtr(data);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `data` is a live CFData of `len` bytes, owned by the dictionary.
+    Some(std::slice::from_raw_parts(ptr, len).to_vec())
+}
+
+/// Whether the format description is H.264 or HEVC coding 8-bit 4:2:0.
+///
+/// # Safety
+/// `desc` must be a live `CMFormatDescriptionRef`.
+unsafe fn is_8bit_420(desc: CfTypeRef) -> bool {
+    let subtype = CMFormatDescriptionGetMediaSubType(desc);
+    if subtype == u32::from_be_bytes(*b"avc1") || subtype == u32::from_be_bytes(*b"avc3") {
+        // AVCDecoderConfigurationRecord: [version, profile_idc, ...]. Baseline,
+        // Main, Extended and High are 4:2:0 at 8 bits by definition of the
+        // profile; High 10, 4:2:2 and 4:4:4 are not.
+        return configuration_record(desc, "avcC").is_some_and(|r| r.len() >= 4 && matches!(r[1], 66 | 77 | 88 | 100));
+    }
+    if subtype == u32::from_be_bytes(*b"hvc1") || subtype == u32::from_be_bytes(*b"hev1") {
+        // HEVCDecoderConfigurationRecord: chromaFormat at byte 16 (2 bits),
+        // bitDepthLumaMinus8 at 17 and bitDepthChromaMinus8 at 18 (3 bits each).
+        return configuration_record(desc, "hvcC")
+            .is_some_and(|r| r.len() >= 19 && r[16] & 3 == 1 && r[17] & 7 == 0 && r[18] & 7 == 0);
+    }
+    false
 }
 
 /// A value handed from AVFoundation's completion queue to the caller.
@@ -809,13 +1307,13 @@ fn next_sample(output: &Retained<AnyObject>) -> Option<CfRef> {
     }
 }
 
-/// `{kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}`.
-fn bgra_settings() -> Result<Retained<AnyObject>, MediaError> {
+/// `{kCVPixelBufferPixelFormatTypeKey: @(format)}`.
+fn format_settings(format: u32) -> Result<Retained<AnyObject>, MediaError> {
     // SAFETY: `+numberWithUnsignedInt:` and `+dictionaryWithObject:forKey:` are
     // plain Foundation constructors; the key is a CFString constant, which is
     // an NSString.
     unsafe {
-        let number: Retained<AnyObject> = msg_send![class(c"NSNumber")?, numberWithUnsignedInt: PIXEL_FORMAT_32BGRA];
+        let number: Retained<AnyObject> = msg_send![class(c"NSNumber")?, numberWithUnsignedInt: format];
         let dict: Retained<AnyObject> = msg_send![
             class(c"NSDictionary")?,
             dictionaryWithObject: &*number,
@@ -825,12 +1323,27 @@ fn bgra_settings() -> Result<Retained<AnyObject>, MediaError> {
     }
 }
 
+/// `{kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}`.
+fn bgra_settings() -> Result<Retained<AnyObject>, MediaError> {
+    format_settings(PIXEL_FORMAT_32BGRA)
+}
+
+/// What the first (undecoded) pass read: the media-time presentation time and
+/// duration of every frame, in ticks of one timescale, in presentation order.
+struct FirstPass {
+    timescale: i32,
+    pts: Vec<i64>,
+    durations: Vec<i64>,
+}
+
 /// Pass one: read the track's compressed samples (no decoding) and return each
-/// frame's presentation time in presentation order.
-fn count_frames(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Result<Vec<f64>, MediaError> {
+/// frame's presentation time and duration in presentation order.
+fn count_frames(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Result<FirstPass, MediaError> {
     let (reader, output) = new_reader(asset, track, None)?;
     start_reading(&reader)?;
-    let mut times: Vec<f64> = Vec::new();
+    let mut times: Vec<i64> = Vec::new();
+    let mut durations: Vec<i64> = Vec::new();
+    let mut timescale = 0i32;
     loop {
         let stop = autoreleasepool(|_| -> Result<bool, MediaError> {
             let Some(sample) = next_sample(&output) else {
@@ -855,21 +1368,36 @@ fn count_frames(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Res
                     detail: format!("frame {} has no valid presentation time", times.len()),
                 });
             }
-            // SAFETY: `pts` is a valid CMTime by value.
-            let seconds = unsafe { CMTimeGetSeconds(pts) };
-            if !seconds.is_finite() {
+            // SAFETY: as above; the duration is returned by value.
+            let duration = unsafe { CMSampleBufferGetDuration(sample.as_ptr()) };
+            if duration.flags & CMTIME_VALID == 0 || duration.value < 0 {
                 return Err(MediaError::Decode {
                     what: "video",
-                    detail: format!("frame {} has a non-finite presentation time", times.len()),
+                    detail: format!("frame {} has no valid duration", times.len()),
                 });
             }
+            if pts.timescale <= 0
+                || (timescale != 0 && pts.timescale != timescale)
+                || duration.timescale != pts.timescale
+            {
+                return Err(MediaError::Unsupported {
+                    what: "video",
+                    detail: format!(
+                        "frame {} counts time in 1/{} s where the first counted in 1/{timescale} s",
+                        times.len(),
+                        pts.timescale
+                    ),
+                });
+            }
+            timescale = pts.timescale;
             if times.len() >= MAX_VIDEO_FRAMES {
                 return Err(MediaError::Limit {
                     what: "video",
                     detail: format!("more than {MAX_VIDEO_FRAMES} frames"),
                 });
             }
-            times.push(seconds);
+            times.push(pts.value);
+            durations.push(duration.value);
             Ok(false)
         })?;
         if stop {
@@ -892,14 +1420,46 @@ fn count_frames(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Res
             detail: "the video track has no frames".into(),
         });
     }
-    times.sort_by(f64::total_cmp);
-    Ok(times)
+    // Presentation order: by time, equal times in the order read.
+    let mut order: Vec<usize> = (0..times.len()).collect();
+    order.sort_by_key(|&i| times[i]);
+    Ok(FirstPass {
+        timescale,
+        pts: order.iter().map(|&i| times[i]).collect(),
+        durations: order.iter().map(|&i| durations[i]).collect(),
+    })
 }
 
-/// The presentation time (track time, edits applied) of the first decoded
-/// frame; the reader is cancelled afterwards.
-fn first_decoded_time(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Result<f64, MediaError> {
-    let settings = bgra_settings()?;
+/// What the first decoded frame says about the track's decoded form.
+struct FirstDecoded {
+    /// Presentation time (track time, edits applied), seconds.
+    seconds: f64,
+    /// `CVPixelBufferGetPixelFormatType`.
+    format: u32,
+    width: usize,
+    height: usize,
+}
+
+/// Decode the first frame natively and report it; the reader is cancelled
+/// afterwards.
+fn first_decoded(
+    asset: &Retained<AnyObject>,
+    track: &Retained<AnyObject>,
+    tags: StreamTags,
+    eight_bit_420: bool,
+) -> Result<FirstDecoded, MediaError> {
+    // The planes of an 8-bit 4:2:0 stream in the range it is tagged with (an
+    // empty settings dictionary is refused by AVFoundation with an exception);
+    // anything else as BGRA, which `VideoSource::plan` will convert with the system.
+    let settings = if eight_bit_420 {
+        format_settings(if tags.full_range == Some(true) {
+            PIXEL_FORMAT_420F
+        } else {
+            PIXEL_FORMAT_420V
+        })?
+    } else {
+        bgra_settings()?
+    };
     let (reader, output) = new_reader(asset, track, Some(&settings))?;
     start_reading(&reader)?;
     loop {
@@ -910,13 +1470,27 @@ fn first_decoded_time(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) 
             });
         };
         // SAFETY: `sample` is a live CMSampleBuffer.
-        if unsafe { CMSampleBufferGetImageBuffer(sample.as_ptr()) }.is_null() {
+        let image = unsafe { CMSampleBufferGetImageBuffer(sample.as_ptr()) };
+        if image.is_null() {
             continue;
         }
-        // SAFETY: as above; the time is returned by value.
-        let seconds = unsafe { CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample.as_ptr())) };
+        // SAFETY: as above; the time is returned by value, and `image` is the
+        // sample's live CVPixelBuffer.
+        let (seconds, format, width, height) = unsafe {
+            (
+                CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample.as_ptr())),
+                CVPixelBufferGetPixelFormatType(image),
+                CVPixelBufferGetWidth(image),
+                CVPixelBufferGetHeight(image),
+            )
+        };
         return if seconds.is_finite() {
-            Ok(seconds)
+            Ok(FirstDecoded {
+                seconds,
+                format,
+                width,
+                height,
+            })
         } else {
             Err(MediaError::Decode {
                 what: "video",
@@ -926,17 +1500,36 @@ fn first_decoded_time(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) 
     }
 }
 
-/// One decoded BGRA pixel buffer as an RGB frame, rotated per `orientation`
-/// when `rotation` is [`Rotation::Apply`]; `expect` is the size of the frames
-/// before it, which every frame must share.
-fn convert_frame(
-    image: CfTypeRef,
-    orientation: u32,
-    rotation: Rotation,
-    expect: Option<(usize, usize)>,
-) -> Result<(Vec<u8>, usize, usize), MediaError> {
-    // SAFETY: `image` is a live CVPixelBuffer (owned by the sample buffer the
-    // caller holds); the getters only read its description.
+/// A read-only lock on a pixel buffer's base addresses, unlocked when dropped.
+struct PixelLock(CfTypeRef);
+
+impl PixelLock {
+    fn new(image: CfTypeRef) -> Result<PixelLock, MediaError> {
+        // SAFETY: `image` is a live CVPixelBuffer (owned by the sample buffer the
+        // caller holds); locking read-only makes the base addresses valid until
+        // the matching unlock in `Drop`.
+        let locked = unsafe { CVPixelBufferLockBaseAddress(image, PIXEL_BUFFER_LOCK_READ_ONLY) };
+        if locked != 0 {
+            return Err(MediaError::Decode {
+                what: "video",
+                detail: format!("CVPixelBufferLockBaseAddress failed ({locked})"),
+            });
+        }
+        Ok(PixelLock(image))
+    }
+}
+
+impl Drop for PixelLock {
+    fn drop(&mut self) {
+        // SAFETY: unlock the buffer locked in `new`, with the same flags.
+        unsafe { CVPixelBufferUnlockBaseAddress(self.0, PIXEL_BUFFER_LOCK_READ_ONLY) };
+    }
+}
+
+/// The size and pixel format of a pixel buffer, refused when empty or over the
+/// pixel bound.
+fn buffer_shape(image: CfTypeRef) -> Result<(u32, usize, usize), MediaError> {
+    // SAFETY: `image` is a live CVPixelBuffer; the getters only read its description.
     let (format, w, h) = unsafe {
         (
             CVPixelBufferGetPixelFormatType(image),
@@ -944,18 +1537,22 @@ fn convert_frame(
             CVPixelBufferGetHeight(image),
         )
     };
-    if format != PIXEL_FORMAT_32BGRA {
-        return Err(MediaError::Decode {
-            what: "video",
-            detail: format!("AVFoundation returned pixel format {format:#x}, not BGRA"),
-        });
-    }
     if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|p| p > MAX_IMAGE_PIXELS) {
         return Err(MediaError::Limit {
             what: "video",
             detail: format!("a {h}x{w} frame is outside 1..={MAX_IMAGE_PIXELS} pixels"),
         });
     }
+    Ok((format, w, h))
+}
+
+/// Refuse a frame whose size (after rotation) is not the first frame's.
+fn check_size(
+    (w, h): (usize, usize),
+    orientation: u32,
+    rotation: Rotation,
+    expect: Option<(usize, usize)>,
+) -> Result<(), MediaError> {
     if let Some((ew, eh)) = expect {
         let (rw, rh) = if rotation == Rotation::Apply {
             orient::oriented_size(orientation, w, h)
@@ -969,46 +1566,98 @@ fn convert_frame(
             });
         }
     }
-    // SAFETY: locking read-only makes the base address valid until the matching
-    // unlock below, on every path out of this block.
-    let locked = unsafe { CVPixelBufferLockBaseAddress(image, PIXEL_BUFFER_LOCK_READ_ONLY) };
-    if locked != 0 {
-        return Err(MediaError::Decode {
-            what: "video",
-            detail: format!("CVPixelBufferLockBaseAddress failed ({locked})"),
-        });
-    }
-    // SAFETY: the buffer is locked, so the base address and stride are valid.
-    let (base, stride) = unsafe { (CVPixelBufferGetBaseAddress(image), CVPixelBufferGetBytesPerRow(image)) };
-    let mut rgb = Vec::new();
-    if !base.is_null() && stride >= w * 4 {
-        rgb = vec![0u8; w * h * 3];
-        for y in 0..h {
-            // SAFETY: the locked buffer holds `h` rows of `stride >= 4 * w`
-            // bytes starting at `base`; this reads the first `4 * w` of row `y`.
-            let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
-            let dst = &mut rgb[y * w * 3..(y + 1) * w * 3];
-            for (px, out) in row.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
-                out[0] = px[2];
-                out[1] = px[1];
-                out[2] = px[0];
-            }
-        }
-    }
-    // SAFETY: unlock the buffer locked above with the same flags.
-    unsafe { CVPixelBufferUnlockBaseAddress(image, PIXEL_BUFFER_LOCK_READ_ONLY) };
-    if rgb.is_empty() {
-        return Err(MediaError::Decode {
-            what: "video",
-            detail: format!("the pixel buffer has no readable rows (stride {stride} for {w} pixels)"),
-        });
-    }
+    Ok(())
+}
+
+/// An RGB frame and its width and height, or why it could not be made.
+type Converted = Result<(Vec<u8>, usize, usize), MediaError>;
+
+/// One decoded BGRA pixel buffer (AVFoundation's own conversion) as an RGB
+/// frame, rotated per `orientation` when `rotation` is [`Rotation::Apply`];
+/// `expect` is the size of the frames before it, which every frame must share.
+fn convert_frame(image: CfTypeRef, orientation: u32, rotation: Rotation, expect: Option<(usize, usize)>) -> Converted {
+    let (format, w, h) = buffer_shape(image)?;
+    check_size((w, h), orientation, rotation, expect)?;
+    let rgb = bgra_to_rgb(image, format, w, h)?;
     if rotation == Rotation::Apply && orientation != 1 {
         return Ok(orient::apply(orientation, rgb, w, h, 3));
     }
     Ok((rgb, w, h))
 }
 
+/// Decoded planes as an RGB frame by libswscale's arithmetic (`conversion` is
+/// matrix, range and flavor), rotated like [`convert_frame`]'s.
+fn convert_nv12(
+    frame: &Nv12Frame,
+    conversion: (Matrix, Range, Flavor),
+    orientation: u32,
+    rotation: Rotation,
+    expect: Option<(usize, usize)>,
+) -> Converted {
+    let (w, h) = (frame.width, frame.height);
+    if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|p| p > MAX_IMAGE_PIXELS) {
+        return Err(MediaError::Limit {
+            what: "video",
+            detail: format!("a {h}x{w} frame is outside 1..={MAX_IMAGE_PIXELS} pixels"),
+        });
+    }
+    check_size((w, h), orientation, rotation, expect)?;
+    let (matrix, range, flavor) = conversion;
+    let rgb = yuv::nv12_to_rgb24(
+        &Nv12 {
+            width: w,
+            height: h,
+            y: &frame.y,
+            y_stride: w,
+            uv: &frame.uv,
+            uv_stride: w,
+        },
+        matrix,
+        range,
+        flavor,
+    )
+    .map_err(|e| MediaError::Decode {
+        what: "video",
+        detail: e.to_string(),
+    })?;
+    if rotation == Rotation::Apply && orientation != 1 {
+        return Ok(orient::apply(orientation, rgb, w, h, 3));
+    }
+    Ok((rgb, w, h))
+}
+
+/// A locked BGRA pixel buffer as tightly packed RGB.
+fn bgra_to_rgb(image: CfTypeRef, format: u32, w: usize, h: usize) -> Result<Vec<u8>, MediaError> {
+    if format != PIXEL_FORMAT_32BGRA {
+        return Err(MediaError::Decode {
+            what: "video",
+            detail: format!("AVFoundation returned pixel format {format:#x}, not BGRA"),
+        });
+    }
+    let lock = PixelLock::new(image)?;
+    // SAFETY: the buffer is locked (`lock`), so the base address and stride are valid.
+    let (base, stride) = unsafe { (CVPixelBufferGetBaseAddress(image), CVPixelBufferGetBytesPerRow(image)) };
+    if base.is_null() || stride < w * 4 {
+        return Err(MediaError::Decode {
+            what: "video",
+            detail: format!("the pixel buffer has no readable rows (stride {stride} for {w} pixels)"),
+        });
+    }
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        // SAFETY: the locked buffer holds `h` rows of `stride >= 4 * w` bytes
+        // starting at `base`; this reads the first `4 * w` of row `y`.
+        let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
+        let dst = &mut rgb[y * w * 3..(y + 1) * w * 3];
+        for (px, out) in row.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
+            out[0] = px[2];
+            out[1] = px[1];
+            out[2] = px[0];
+        }
+    }
+    drop(lock);
+    Ok(rgb)
+}
 #[cfg(test)]
 mod tests {
     use objc2::encode::Encode;

@@ -2405,6 +2405,11 @@ let frames: Vec<ImageInput<'_>> = video.frames.iter().map(PreparedImage::input).
 let out = model.encode(&[MmItem::Video(&frames)], None)?;                  // one row, one wait
 ```
 
+From a file, `tessl::media::video::decode_video_file` samples and decodes the frames and
+`preprocess_decoded_video` makes the same `PreparedVideo`; for 8-bit 4:2:0 H.264 and HEVC the
+frames are byte-equal to the ones the reference loader produces, and the embedding of an MP4
+equals sentence-transformers' to 8.5e-7 at worst (see "Media decoding", "Video" and "End to end").
+
 ### The token layout
 
 Transformers 5.19 (`embedding_gemma2/processing_embedding_gemma2.py`,
@@ -2783,6 +2788,7 @@ empty result, and a file that is cut short is an error rather than the part that
 | `AudioFileOpenWithCallbacks`, `AudioFileClose` | `AudioFile.h` | decode from bytes |
 | `AudioConverterNew`, `AudioConverterSetProperty`, `AudioConverterFillComplexBuffer`, `AudioConverterDispose` | `AudioConverter.h` | the sample-rate conversion of `Resampler::AudioToolbox` (the default converts in `media::resample`, no framework) |
 | `AVURLAsset`, `AVAssetReader`, `AVAssetReaderTrackOutput`, `AVAssetTrack` (`loadTracksWithMediaType:completionHandler:`, `preferredTransform`, `nominalFrameRate`), `CMSampleBuffer*`, `CVPixelBuffer*` | AVFoundation, CoreMedia, CoreVideo | video |
+| `VTDecompressionSessionCreate`, `VTDecompressionSessionDecodeFrameWithOutputHandler`, `VTDecompressionSessionWaitForAsynchronousFrames`, `VTDecompressionSessionInvalidate`, `CVBufferCopyAttachment` (clean aperture) | VideoToolbox `VTDecompressionSession.h`, CoreVideo | the 8-bit 4:2:0 video decode (`src/media/vt.rs`) |
 | `CFData*`, `CFURLCreateFromFileSystemRepresentation`, `CFDictionaryGetValue`, `CFNumberGetValue`, `CFRelease` | CoreFoundation | held by `cf::CfRef`, released on every path |
 
 ### What the reference decodes, and what this follows
@@ -2828,10 +2834,25 @@ Verified against the installed sentence-transformers 6.1 and transformers 5.19 (
   `soxr_hq` cannot be reproduced here (no libsoxr source on disk). That torchcodec adds
   nothing else for a WAV, FLAC or MP3 file (frame chunking, seeking, flushing) is read from
   its source, **not run**: torchcodec is not installed.
-- **Video.** torchcodec is absent and torchvision 0.29 no longer decodes video; the oracles
-  are the `ffmpeg` and `ffprobe` CLIs and OpenCV. What torchcodec does with a rotation flag is
-  **unverified**: the default here applies it (`Rotation::Apply`), which is what FFmpeg's CLI
-  and OpenCV do.
+- **Video.** `fetch_videos` prefers torchcodec (`VideoDecoder(seek_mode="exact")`); torchvision
+  0.29 no longer decodes video (removed in 0.26) and torchcodec is not installed here, so the
+  oracle is the `ffmpeg` CLI, which wraps the library torchcodec calls. torchcodec is **not
+  installed, so its behaviour below is from its documented design and was not run**; what
+  makes the CLI an equivalent oracle is that for even-sized 8-bit 4:2:0 frames both convert
+  with libswscale using the frame's own matrix and range, with chroma replicated 2x2 (the
+  scaler flags do not matter when the frame is not resized; the CLI half is verified, the
+  torchcodec half is inferred). Whether torchcodec applies a rotation flag, and in what order
+  with the conversion, was **not checked**; the default here applies it. For even sizes the
+  order does not change the bytes (a 90 degree turn or flip maps 2x2 chroma blocks to 2x2
+  blocks), except through the width-dependent choice between the two converters (below),
+  which the rotated fixtures do not separate. The reference
+  loader's metadata is taken in exact seek mode: `num_frames` is the
+  packet count, `duration` is `max(pts + packet duration) - min(pts)` in seconds, and `fps`
+  is `num_frames / duration`, which is not the header's rate (the end-to-end fixture:
+  23.976023976023978 against a nominal 23.976024); the sampler
+  (`EmbeddingGemma2VideoProcessor.sample_frames`) runs on those. An untagged stream is
+  converted as BT.601 limited, as libswscale does. This follows exactly (below). The
+  rotation default (`Rotation::Apply`) is what the CLI and OpenCV do.
 
 ### Images
 
@@ -3050,33 +3071,95 @@ with OSStatus -39 anyway). Every cut tried is an error (10 shapes, bytes and pat
 
 ### Video
 
-`VideoSource::open` runs two passes. Pass one reads the **compressed** samples (no decoder) and
-returns the exact frame count and each frame's presentation time, in presentation order. Pass
-two decodes to 32BGRA and converts only the frames asked for to RGB, honouring the pixel
-buffer's row stride. `info()` gives `total_frames`, `fps` (the track's nominal rate, else the
-average over the timestamps), `timestamps` and `orientation`. `decode_frames(&indices)`
-returns frames in the order asked (duplicates allowed); `decode_sampled(&VideoConfig)` uses
-`sample_frame_indices` over the exact count and rate. Bounds: `VideoOptions::max_frames`
-(4096), `max_bytes` (4 GiB), the track-load timeout (60 s). Autorelease pools wrap the
-per-frame loops and a `Reader` guard cancels a reader still reading when it is dropped.
+`VideoSource::open` reads the **compressed** samples (no decoder) and returns the exact frame
+count and each frame's presentation time, in presentation order, then derives the figures the
+reference loader would (see "What the reference decodes"): `info()` gives `total_frames`, `fps`
+(torchcodec's exact-mode `average_fps`, `total_frames / duration`), `duration`
+(`max(pts + packet duration) - min(pts)`), `nominal_fps` (the header's, kept for reference),
+`timestamps`, `orientation` and the stream's colour tags. `decode_frames(&indices)` returns
+frames in the order asked (duplicates allowed); `decode_sampled(&VideoConfig)` samples as
+`EmbeddingGemma2VideoProcessor.sample_frames` does (`max(1, int(duration * fps))` frames at
+`min(total - 1, int(i * average_fps / fps))`, then the `max_frames` cap with its overflow
+strategy). Bounds: `VideoOptions::max_frames` (4096), `max_bytes` (4 GiB), the track-load
+timeout (60 s). Autorelease pools wrap the per-frame loops and a `Reader` guard cancels a
+reader still reading when it is dropped.
+
+**Colour: why VideoToolbox is driven directly.** `ColorPath::Swscale` (the default) gives the
+reference's RGB byte for byte for 8-bit 4:2:0 H.264 and HEVC. AVFoundation's own decode cannot:
+
+- `AVAssetReader` asked for 420v/420f (the decoder's native planes) returns the decoder's
+  luma, but **different chroma**: 8 to 15 percent of the Cb/Cr samples of the fixtures differ
+  from FFmpeg's decode, by up to about 70 levels. It is not a shift, not a colour-property
+  setting, and the cause is **unexplained** (characterised, not found). Asked for BGRA it
+  differs from the oracle in 39941 of 55296 bytes (largest 151, mean 3.67; `h264_709_tv_64x48`).
+- VideoToolbox itself is exact: FFmpeg's `-hwaccel videotoolbox` equals its software decode, so
+  the difference is in what `AVAssetReader` does after it. So `AVAssetReader` with no output
+  settings supplies the compressed samples in decode order, and `src/media/vt.rs` decodes them
+  with a `VTDecompressionSession` (`VTDecompressionSessionDecodeFrameWithOutputHandler`, one
+  handler block per sample, destination format 420v/420f, the clean aperture applied for
+  cropped streams such as 66x38 coded in 80x48). **The Y, Cb and Cr planes are byte-equal to
+  FFmpeg's on every fixture** (`the_decoders_planes_are_the_planes_ffmpeg_decodes`: H.264 and
+  HEVC, BT.601, BT.709 and untagged, limited and full range, odd sizes, cropped, rotated).
+- The planes are converted by `media::yuv::nv12_to_rgb24` (below), then rotated.
+- The 8-bit 4:2:0 test reads the stream's own `avcC` (profile 66, 77, 88, 100) or `hvcC`
+  (chroma format 1, both depths 8), because a requested pixel format says nothing about the
+  stream. Anything else (10-bit, 4:2:2 and 4:4:4, odd dimensions, a matrix other than
+  BT.601, BT.709 and BT.2020 non-constant) is decoded to BGRA by AVFoundation (`Conversion::AvFoundation`
+  in the result says so; `ColorPath::AvFoundation` forces it). The fallback is not the
+  reference's bytes: a Main 10 HEVC fixture is 4.06 mean abs away from the oracle.
+
+**The conversion (`src/media/yuv.rs`).** For a same-size `yuv420p` to `rgb24` conversion
+libswscale replicates each chroma sample over its 2x2 block (no interpolation, whatever the
+scaler flags) and then has two arithmetics: a table converter (a 1024-entry luma table and
+integer chroma offsets) and, on aarch64, a NEON converter with 13-bit coefficients and 16-bit
+multiply-high, used when the width is a multiple of 16. They differ by up to 3 levels, so
+`Flavor::Aarch64` (default) chooses per frame width as FFmpeg does on Apple silicon and
+`Flavor::Portable` is the table converter for every width. Both start from the 16.16
+coefficients `round(2(1-Kr) * 65536 * 255/224)` and the like for the matrix (FFmpeg 9 values:
+BT.709 117489, 138438, 13975, 34925; BT.601 104597, 132201, 25675, 53279; BT.2020nc
+110014, 140363, 12277, 42626). **Verified exhaustively against the `ffmpeg` binary (9.0.2,
+aarch64): every one of the 2^24 `(Y, Cb, Cr)` triples, both ranges, three matrices, both
+converters, 0 differing bytes** (`exhaustive_against_a_live_ffmpeg`, `--ignored`, needs
+`ffmpeg`); the committed goldens hold the same for random planes of 8 sizes
+(`tests/media_yuv_exact.rs`, hosted). `fcc` and `smpte240m` full range did not match the
+NEON converter's G channel, so those matrices are not supported and fall back to AVFoundation.
+Odd dimensions use libswscale's general scaler, which is not reproduced; H.264 and HEVC 4:2:0
+cannot have them. No libswscale source was read for this (see the module's provenance note).
+
+**Parity per fixture class** (`tests/media_video_exact.rs`, 8 tests, local-only because
+VideoToolbox is not available to the hosted sandbox; frames are compared to the `ffmpeg` CLI's
+decode, `-pix_fmt rgb24`, autorotate; goldens from `scripts/gen_media_video_exact_fixtures.py`
+in `tests/fixtures/media_video/`, 0 differing bytes in all):
+
+| class | fixtures |
+|---|---|
+| H.264, BT.709 limited, NEON width | `h264_709_tv_64x48` |
+| H.264, BT.601 limited, table width, cropped | `h264_601_tv_66x38` |
+| H.264, full range, BT.709 and BT.601 | `h264_709_pc_80x48`, `h264_601_pc_50x34` |
+| H.264, untagged (BT.601 limited) | `h264_untagged_64x48` |
+| HEVC, 709 limited, 709 full NEON width, 601 full table width | `hevc_709_tv_64x48`, `hevc_709_pc_96x64`, `hevc_601_pc_34x26` |
+| rotated: display matrix 90 and 270 | `h264_709_tv_64x48_rot90`, `h264_601_tv_66x38_rot270` |
+| `colors.mp4`, `quad_rot90.mp4` (`media_codecs`) | zero differing bytes (formerly "within 2 levels") |
+
+Sampling and timing agree with the reference too: `total_frames`, `duration`, `fps` and every
+timestamp are bit-equal to the `ffprobe`-derived figures, and the indices for four sampling
+settings (fps 1 with the 32 cap, fps 5 with a 4 cap under `uniform` and under `truncate`, no
+fps with a 3 cap) equal the processor's `sample_frames` run on those figures, on every
+fixture (12 files, 48 settings). The end-to-end file has a nominal 24000/1001 rate whose exact-mode
+`fps` is not the header's to the last bits; sampling at 1 fps picks frames 0, 23, 47 of 80.
 
 - **Timestamps** are track time with the edit list applied, as FFmpeg and OpenCV report: an
   H.264 file with B-frames has media time starting at +2 frames, which the edit list shifts
-  to 0. Pass one's media times are shifted by the first decoded frame's time, and pass two
-  checks every frame against it to 1e-6 s, so a track whose edit list drops or reorders
-  frames is an error, not a misaligned clip. (An earlier version reported 0.2 s for the first
-  frame of `colors.mp4`; caught by comparing with `ffprobe`.)
-- **Rotation**: `preferredTransform` becomes an EXIF orientation (1 to 8; the fixture's 90
-  degrees counter-clockwise display matrix is 8). `Rotation::Apply` (default) returns upright
-  frames, the same bytes as `ffmpeg` autorotate (mean 4.19, 5.6 % of bytes over 8 off, which is
-  chroma upsampling at hard quadrant edges) and the same orientation as OpenCV;
-  `Rotation::Ignore` returns frames as stored. A transform that is not a right-angle rotation
-  or flip is refused when applying.
-- **Pixels**: `colors.mp4` (H.264, BT.709) against `ffmpeg -pix_fmt rgb24`: max 2, mean 1.67
-  (rounding in the YUV to RGB matrix); the centre colour of each of the 12 frames is within 2
-  of the colour that was encoded, for H.264 and HEVC. OpenCV's own colour conversion is 9.4
-  mean from FFmpeg's on the same file (it maps 255 to 233), so OpenCV serves as a rotation
-  oracle only.
+  to 0. The first pass's media times are shifted by the first decoded frame's time, and the
+  decode checks every frame against it to 1e-6 s, so a track whose edit list drops or reorders
+  frames is an error, not a misaligned clip.
+- **Rotation**: `preferredTransform` becomes an EXIF orientation (1 to 8; a 90 degrees
+  counter-clockwise display matrix is 8). `Rotation::Apply` (default) rotates after the colour
+  conversion and returns upright frames, equal to `ffmpeg` autorotate (0 differing bytes on
+  `quad_rot90.mp4` and the two rotated fixtures); `Rotation::Ignore` returns frames as stored,
+  equal to `-noautorotate`. A transform that is not a right-angle rotation or flip is refused
+  when applying. OpenCV's own colour conversion is 9.7 mean from FFmpeg's on the quadrant
+  file, so it serves as a rotation oracle only.
 - **Preprocessing**: `preprocess_decoded_video` runs `preprocess_video` with its own
   sampling off, so frames sampled while decoding are not sampled twice, and restores the true
   source indices and `index / fps` timestamps. Equal to preprocessing every decoded frame in
@@ -3085,6 +3168,9 @@ per-frame loops and a `Reader` guard cancels a reader still reading when it is d
 - **Cut-short files**: top-level boxes are checked as for M4A (a cut `mdat` of a file with
   `moov` first would otherwise decode fewer frames without an error). 1287 cuts of three
   fixtures, every one an error.
+- **Release of CoreVideo / CoreMedia objects**: a `Lock` guard unlocks every pixel buffer, the
+  session is invalidated in `Drop`, and `leaks --atExit` reported 0 leaks for 0 bytes on
+  `media_video_exact` (16127 nodes malloced) and `media_codecs_leaks` (17663 nodes).
 
 ### Hosted job: what runs and what cannot
 
@@ -3093,11 +3179,14 @@ and HEVC decoders go through VideoToolbox, which opens IOKit: under the sandbox 
 never silently ("pixel data is shorter than its size", "no frame could be decoded"; verified by
 running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
 and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
-and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter against the `ffmpeg` binary, AAC, MP3 and Opus; no device) and `tests/plot_results_resample.rs` are on `scripts/hosted_tests.txt` together with the 14 unit tests
-of `media::`; `tests/media_codecs.rs` (HEIC, H.264, HEVC: 8 tests) and
-`tests/media_codecs_leaks.rs` are local-only (`cargo test --release --test media_codecs`) and
-fail in the sandbox by construction, which is what `hosted_completeness` needs (a test that
-passes there must be listed).
+and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter against the `ffmpeg`
+binary, AAC, MP3 and Opus; no device) and `tests/plot_results_resample.rs` are on
+`scripts/hosted_tests.txt` together with the 14 unit tests of `media::`; `tests/media_codecs.rs`
+(HEIC, H.264, HEVC: 8 tests), `tests/media_codecs_leaks.rs` and `tests/media_video_exact.rs`
+(8 tests) are local-only (`cargo test --release --test media_codecs`) and fail in the sandbox by
+construction, which is what `hosted_completeness` needs (a test that passes there must be
+listed). The converter on its own, with no codec, is hosted: `tests/media_yuv_exact.rs` (5
+tests, plus the `--ignored` exhaustive one that runs `ffmpeg`).
 
 ### Leaks
 
@@ -3152,11 +3241,35 @@ FFmpeg does. The JPEG differs by the IDCT and chroma upsampler (bounds 1e-2 / 0.
 AAC clip differs by AudioToolbox's decoder against FFmpeg's (first and last frame, above);
 its bounds are 1e-3 / 0.99998 and the MP3's 2e-5 / 0.9999999, from the measurements. Natural
 speech has little energy near 8 kHz, where the earlier resamplers differed.
-**There is no end-to-end video test**: no video loader that the
-reference would use is installed (torchcodec), so video is checked frame by frame against
-FFmpeg, not embedding against embedding. The e2e reference mixes like torchcodec and
+The e2e reference mixes like torchcodec and
 resamples like torchcodec; a librosa-branch reference would differ in the last bits of the
 resampler and in the 3 dB mix gain for stereo (not measured end to end).
+
+**Video.** `tests/media_e2e_video.rs` (`--ignored`, real checkpoint, GPU; reference from
+`tools/embedgemma2_ref/make_video_reference.py`, written to `target/media_e2e_ref/`): an MP4
+of `tests/fixtures/media_video/` through `decode_video_file`, `preprocess_decoded_video` and the
+facade (`MmItem::Video`, or `MmItem::TimestampedVideo` with the snapshot's tokenizer),
+against sentence-transformers' embedding of the frames and metadata the reference loader would
+produce from the same file. torchcodec is not installed, so the array it is given is the
+`ffmpeg` CLI's decode of the whole file to rgb24 with autorotation and the metadata is
+torchcodec's exact-mode figures (`make_video_reference.py` docstring; the sampler's indices it
+keeps are asserted equal to the fixture's `facts.txt`, and tessl's equal them too). Snapshot
+`914f7f89`, Apple M5 Pro, 2026-10-17, fp32 sdpa goldens, `GemmOperands::ExactF32`; every case
+holds the 1e-4 / 0.99999 bounds of `tests/embedgemma2_e2e_model.rs`:
+
+| case | file | sampled | max abs | cosine |
+|---|---|---|---|---|
+| `e2e_video` | 96x64, 80 frames, 24000/1001 fps, H.264 BT.709 limited | 0, 23, 47 | 1.79e-7 | 1.000000000 |
+| `e2e_video_ts` | the same with `add_timestamps` on (`00:00`, `00:00`, `00:01` labels) | 0, 23, 47 | 1.79e-7 | 1.000000000 |
+| `rot90` | 64x48 stored, display matrix 90 (the model sees 48x64) | 0 | 1.79e-7 | 1.000000000 |
+| `hevc_pc` | HEVC 34x26, BT.601 full range, a width off the NEON widths | 0 | 8.53e-7 | 1.000000000 |
+
+The timestamped case is not redundant: the reference's embedding of the two sequences differs
+by 6.9e-2 max abs (cosine 0.827). A control in the same test decodes the first file again with
+AVFoundation's own conversion (`ColorPath::AvFoundation`): **2.0e-2 max abs, cosine 0.9864**,
+four orders of magnitude from the exact path and outside the bounds, which the test asserts,
+so the bound can tell the two colour paths apart. What this does not show is torchcodec itself:
+it shows that tessl equals the frames and figures its documented behaviour produces.
 
 ### Speed
 
@@ -3177,7 +3290,36 @@ indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
 | 30 s 44.1 kHz stereo AAC | 175 | 5.8 |
 | 30 s 44.1 kHz stereo MP3 | 180 | 6.0 |
 | 10 s 720p H.264, `VideoSource::open` (pass one, 300 frames) | 25.3 | 0.084 ms per frame |
-| the same, open plus 9 sampled frames decoded (pass two decodes all 300) | 221 | |
+| the same, open plus 9 sampled frames decoded with AVFoundation's BGRA conversion (the decode before the exact path; decodes all 300) | 221 | |
+
+**Video to RGB, exact path against the BGRA path** (`BENCH_MEDIA_DIR=target/media_bench_video`,
+clips from `bench/make_video_bench_inputs.py`, minimum of 30 calls after 5 warm-ups, a fresh
+source each; **load average 21 when the run started and the machine ran other agents, so
+indicative**; `bench/results/media_video_color_m5pro.{txt,json,svg}`, plotted by
+`plot_results video-color`; the bench refuses a run in which a path fell back to the other).
+Wall time of one call, ms, with ms per frame in brackets for the first-30-frames rows:
+
+| clip | call | exact (VideoToolbox planes + Rust conversion) | bgra (AVFoundation) |
+|---|---|---|---|
+| 720p H.264 (1280 wide, NEON) | 10 sampled frames | 248 | 222 |
+| | first 30 frames | 235 (7.8) | 229 (7.6) |
+| 720p HEVC | 10 sampled | 152 | 216 |
+| | first 30 | 181 (6.0) | 197 (6.6) |
+| 1080p H.264 | 5 sampled | 168 | 233 |
+| | first 30 | 228 (7.6) | 139 (4.6) |
+| 1270x720 H.264 (table converter) | 5 sampled | 125 | 119 |
+| | first 30 | 127 (4.2) | 117 (3.9) |
+
+Both paths decode every frame up to the last one asked for, so the rows are dominated by the
+decode. At 720p the two paths are within 0.7 ms per frame of each other in the first-30 rows,
+in either direction (HEVC: exact faster), and the sampled rows swap order from run to run (an
+earlier, noisier run had them the other way). At 1080p the first-30 rows are 89 ms apart
+(228 against 139), but the same clip's sampled rows are 65 ms apart in the opposite direction
+(168 against 233), so this run does not isolate the conversion's cost; a single-threaded
+conversion of 2 Mpixel is a plausible reason for the first-30 gap (inferred, not profiled).
+The conversion is not threaded. Splitting the rows across threads
+would be the way to speed it up and cannot change the bytes, since each pixel is a function of
+its own `(Y, Cb, Cr)`; not done.
 
 The audio rows above were measured with the `AudioConverter` as the default (before the Rust
 resampler); the sample-rate conversion at the `Mastering` setting was most of the audio time.
@@ -3203,9 +3345,14 @@ own speed (it is the same algorithm in C with NEON).
 
 ### What is left
 
-- A video end-to-end test needs a reference video loader (torchcodec) in the environment.
-- What torchcodec does with a rotation flag is unverified (the default here follows FFmpeg's
-  CLI and OpenCV).
+- torchcodec itself is not in the environment: the video reference is the `ffmpeg` CLI and
+  torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
+  the last inferred step. What it does with a rotation flag is unverified (the default here
+  follows FFmpeg's CLI and OpenCV).
+- Why `AVAssetReader`'s decoded 4:2:0 output has different chroma from the decoder's is not
+  found; VideoToolbox is driven directly to avoid it. 10-bit, 4:2:2, 4:4:4 and odd-sized streams
+  take AVFoundation's conversion and are not the reference's bytes.
+- The Rust conversion is single-threaded; its cost per frame is not isolated by the run above.
 - Ogg Opus in SILK or hybrid mode does not match a torchcodec reference closely (15 to 20 dB
   from FFmpeg's native decoder, which is itself 2 to 4 samples behind libopus there); matching
   it needs FFmpeg's SILK decoding, not a shift. AudioToolbox is exact against libopus for

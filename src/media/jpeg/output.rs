@@ -160,22 +160,20 @@ impl Decoder<'_> {
                 }
             }
             Upsample::H2V1Fancy => {
+                // `out` holds at least 2 * dw samples (a row is allocated w + 2 wide and
+                // dw = ceil(w / 2)); the first and last pair are the edge cases.
                 let r = row(y);
-                let mut full = |i: usize, v: u8| {
-                    if i < out.len() {
-                        out[i] = v;
-                    }
-                };
-                full(0, r[0]);
-                full(1, ((u32::from(r[0]) * 3 + u32::from(r[1]) + 2) >> 2) as u8);
-                for i in 1..dw - 1 {
-                    let v = u32::from(r[i]) * 3;
-                    full(2 * i, ((v + u32::from(r[i - 1]) + 1) >> 2) as u8);
-                    full(2 * i + 1, ((v + u32::from(r[i + 1]) + 2) >> 2) as u8);
-                }
+                let out = &mut out[..2 * dw];
                 let l = dw - 1;
-                full(2 * l, ((u32::from(r[l]) * 3 + u32::from(r[l - 1]) + 1) >> 2) as u8);
-                full(2 * l + 1, r[l]);
+                out[0] = r[0];
+                out[1] = ((u32::from(r[0]) * 3 + u32::from(r[1]) + 2) >> 2) as u8;
+                for (pair, w3) in out[2..2 * l].chunks_exact_mut(2).zip(r.windows(3)) {
+                    let v = u32::from(w3[1]) * 3;
+                    pair[0] = ((v + u32::from(w3[0]) + 1) >> 2) as u8;
+                    pair[1] = ((v + u32::from(w3[2]) + 2) >> 2) as u8;
+                }
+                out[2 * l] = ((u32::from(r[l]) * 3 + u32::from(r[l - 1]) + 1) >> 2) as u8;
+                out[2 * l + 1] = r[l];
             }
             Upsample::H1V2Fancy => {
                 let inrow = y / 2;
@@ -203,24 +201,23 @@ impl Decoder<'_> {
                     (inrow + 1).min(dh - 1)
                 };
                 let (a, b) = (row(inrow), row(other));
-                for i in 0..dw {
-                    tmp[i] = u16::from(a[i]) * 3 + u16::from(b[i]);
+                let tmp = &mut tmp[..dw];
+                for ((t, &a), &b) in tmp.iter_mut().zip(a).zip(b) {
+                    *t = u16::from(a) * 3 + u16::from(b);
                 }
+                // As in the h2v1 case, `out` holds at least 2 * dw samples.
                 let cs = |i: usize| u32::from(tmp[i]);
-                let mut put = |i: usize, v: u32| {
-                    if i < out.len() {
-                        out[i] = v as u8;
-                    }
-                };
-                put(0, (cs(0) * 4 + 8) >> 4);
-                put(1, (cs(0) * 3 + cs(1) + 7) >> 4);
-                for i in 1..dw - 1 {
-                    put(2 * i, (cs(i) * 3 + cs(i - 1) + 8) >> 4);
-                    put(2 * i + 1, (cs(i) * 3 + cs(i + 1) + 7) >> 4);
-                }
+                let out = &mut out[..2 * dw];
                 let l = dw - 1;
-                put(2 * l, (cs(l) * 3 + cs(l - 1) + 8) >> 4);
-                put(2 * l + 1, (cs(l) * 4 + 7) >> 4);
+                out[0] = ((cs(0) * 4 + 8) >> 4) as u8;
+                out[1] = ((cs(0) * 3 + cs(1) + 7) >> 4) as u8;
+                for (pair, w3) in out[2..2 * l].chunks_exact_mut(2).zip(tmp.windows(3)) {
+                    let v = u32::from(w3[1]) * 3;
+                    pair[0] = ((v + u32::from(w3[0]) + 8) >> 4) as u8;
+                    pair[1] = ((v + u32::from(w3[2]) + 7) >> 4) as u8;
+                }
+                out[2 * l] = ((cs(l) * 3 + cs(l - 1) + 8) >> 4) as u8;
+                out[2 * l + 1] = ((cs(l) * 4 + 7) >> 4) as u8;
             }
             Upsample::Int(hx, vx) => {
                 let r = row(y / vx);

@@ -49,8 +49,8 @@ impl Tables {
     }
 
     pub fn ycc_to_rgb(&self, y: &[u8], cb: &[u8], cr: &[u8], out: &mut [u8]) {
-        for (i, px) in out.chunks_exact_mut(3).enumerate() {
-            px.copy_from_slice(&self.rgb(y[i], cb[i], cr[i]));
+        for (px, ((&y, &cb), &cr)) in out.chunks_exact_mut(3).zip(y.iter().zip(cb).zip(cr)) {
+            px.copy_from_slice(&self.rgb(y, cb, cr));
         }
     }
 

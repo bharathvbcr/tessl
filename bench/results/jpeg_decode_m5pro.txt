@@ -1,8 +1,8 @@
 workload                           MP   native min   native med  ImageIO min  ImageIO med native/ImageIO(min)
-hd_420_baseline.jpg              2.07       11.868       12.082       10.049       11.090     1.18x
-hd_420_progressive.jpg           2.07       20.728       26.946       19.464       24.643     1.06x
-hd_422_baseline.jpg              2.07       14.376       18.098        9.674       10.765     1.49x
-hd_444_baseline.jpg              2.07       16.995       19.224       11.196       12.344     1.52x
-hd_gray_baseline.jpg             2.07        6.906        7.463        5.638        5.879     1.22x
-small_224_420_baseline.jpg       0.05        0.299        0.350        0.264        0.294     1.13x
-uhd_420_baseline.jpg             8.29       54.044       66.679       34.224       38.535     1.58x
+hd_420_baseline.jpg              2.07       11.619       13.808       10.401       12.654     1.12x
+hd_420_progressive.jpg           2.07       19.938       32.517       19.104       31.934     1.04x
+hd_422_baseline.jpg              2.07       12.848       21.433       10.595       13.529     1.21x
+hd_444_baseline.jpg              2.07       18.771       22.849       13.276       14.846     1.41x
+hd_gray_baseline.jpg             2.07        7.251       11.012        6.429        6.740     1.13x
+small_224_420_baseline.jpg       0.05        0.300        0.307        0.292        0.324     1.03x
+uhd_420_baseline.jpg             8.29       49.384       58.857       38.028       44.293     1.30x

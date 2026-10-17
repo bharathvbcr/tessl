@@ -307,7 +307,7 @@ def flat_coefs(vals, w, h, comps):
 # ---------------------------------------------------------------------------
 
 
-def write_progressive_gray(dc, q, scans, qprecision=0, eoi=True):
+def write_progressive_gray(dc, q, scans, qprecision=0, eoi=True, vsamp=1):
     """A grayscale progressive file made of the given scans, in which every AC coefficient is zero.
 
     dc: [block rows, block cols] full-precision DC values. q: 64 quantizers, natural order. scans: ('dc', ah, al) or
@@ -321,7 +321,8 @@ def write_progressive_gray(dc, q, scans, qprecision=0, eoi=True):
         out += seg(0xDB, bytes([0x10]) + b"".join(struct.pack(">H", v) for v in zz))
     else:
         out += seg(0xDB, bytes([0]) + bytes(zz))
-    out += seg(0xC2, bytes([8]) + struct.pack(">HH", h, w) + bytes([1, 1, 0x11, 0]))
+    # vsamp > 1 gives the lone component several block rows per iMCU row, as a luma plane has in 4:2:0 or 4:4:0
+    out += seg(0xC2, bytes([8]) + struct.pack(">HH", h, w) + bytes([1, 1, 0x10 | vsamp, 0]))
     out += dht(0, 0, DC_BITS, DC_VALS) + dht(1, 0, AC_BITS, AC_VALS)
     for s in scans:
         bw = Bits()
@@ -666,6 +667,15 @@ def smoothing_cases():
     case("smoothing_state_no_dc_scan", write_progressive_gray(dc, [64] + [4] * 63, [("ac", 1, 5, 0, 2)]), k, "no DC scan: smoothing is off")
     case("smoothing_state_refined_to_known", write_progressive_gray(dc, [64] + [4] * 63, [("dc", 0, 0), ("ac", 1, 63, 0, 1), ("ac", 1, 63, 1, 0)]),
          k, "every AC coefficient complete: smoothing is off")
+    # one component with several block rows per iMCU row, every height from one block row to a few iMCU rows past two: the
+    # row logic at the top and bottom of the picture and at the iMCU-row boundaries, without a second component in the way
+    for vs in (2, 3, 4):
+        for rows in range(1, 4 * vs + 2):
+            dc = rng.integers(-60, 61, (rows, 5))
+            for tag, scans in (("dc", [("dc", 0, 0)]), ("ac5", [("dc", 0, 0), ("ac", 1, 5, 0, 2)]),
+                               ("ac9", [("dc", 0, 0), ("ac", 1, 9, 0, 1)])):
+                case(f"smoothing_vrows{vs}_{rows:02d}_{tag}", write_progressive_gray(dc, [16] + [5] * 63, scans, vsamp=vs), k,
+                     f"one component, {vs} block rows per iMCU row, {rows} block rows, state {tag}")
     # a zero quantizer in the guarded set switches smoothing off; elsewhere it does not
     dc = rng.integers(-20, 21, (8, 8))
     for nat in (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 4, 5, 25, 63):

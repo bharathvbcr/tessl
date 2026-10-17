@@ -261,6 +261,10 @@ pub struct Tokenizer {
     bos_token: Option<String>,
     placeholders: Vec<String>,
     prompts: Vec<(String, String)>,
+    /// `default_prompt_name` of `config_sentence_transformers.json`: the
+    /// prompt `SentenceTransformer.encode` uses when no name is given. Always
+    /// one of `prompts` when set.
+    default_prompt: Option<String>,
 }
 
 impl std::fmt::Debug for Tokenizer {
@@ -406,10 +410,31 @@ impl Tokenizer {
     /// tokens) and `config_sentence_transformers.json` (the named prompts).
     /// All three must be there.
     pub fn from_snapshot(dir: &Path) -> Result<Self, String> {
+        Self::load_snapshot(dir, true)
+    }
+
+    /// [`Self::from_snapshot`] for a snapshot that may have no
+    /// `config_sentence_transformers.json`: without it the tokenizer has no
+    /// named prompts (and no default one). A file that is there is read as
+    /// strictly as ever, and a file that cannot be read for any reason but
+    /// not existing is an error.
+    pub fn from_snapshot_optional_prompts(dir: &Path) -> Result<Self, String> {
+        Self::load_snapshot(dir, false)
+    }
+
+    fn load_snapshot(dir: &Path, prompts_required: bool) -> Result<Self, String> {
         let tok = Self::from_file(&dir.join("tokenizer.json"))?;
         let cfg = read_bounded(&dir.join("tokenizer_config.json"), MAX_CONFIG_BYTES)?;
-        let st = read_bounded(&dir.join("config_sentence_transformers.json"), MAX_CONFIG_BYTES)?;
-        tok.with_tokenizer_config(&cfg)?.with_prompts(&st)
+        let tok = tok.with_tokenizer_config(&cfg)?;
+        let prompts = dir.join("config_sentence_transformers.json");
+        if !prompts_required {
+            if let Err(e) = std::fs::symlink_metadata(&prompts) {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(tok);
+                }
+            }
+        }
+        tok.with_prompts(&read_bounded(&prompts, MAX_CONFIG_BYTES)?)
     }
 
     /// Read `bos_token` (a string, or an added-token object with `content`)
@@ -443,11 +468,13 @@ impl Tokenizer {
         Ok(self)
     }
 
-    /// Read the named prompts (`"prompts": {name: text}`) from the text of a
-    /// `config_sentence_transformers.json`.
+    /// Read the named prompts (`"prompts": {name: text}`) and the
+    /// `default_prompt_name` (null or absent for none, otherwise it must name
+    /// one of the prompts) from the text of a `config_sentence_transformers.json`.
     pub fn with_prompts(mut self, text: &str) -> Result<Self, String> {
         let root = json::parse(text, CONFIG_SYNTAX)?;
         self.prompts.clear();
+        self.default_prompt = None;
         match get(&root, "prompts") {
             None | Some(Json::Null) => {}
             Some(Json::Object(fields)) => {
@@ -464,7 +491,29 @@ impl Tokenizer {
             }
             Some(_) => return Err("config_sentence_transformers.json: \"prompts\" is not an object".into()),
         }
+        match get(&root, "default_prompt_name") {
+            None | Some(Json::Null) => {}
+            Some(Json::Str(name)) => {
+                if self.prompt(name).is_none() {
+                    return Err(format!(
+                        "config_sentence_transformers.json: default_prompt_name {name:?} is not one of its prompts"
+                    ));
+                }
+                self.default_prompt = Some(name.clone());
+            }
+            Some(_) => {
+                return Err("config_sentence_transformers.json: \"default_prompt_name\" is not a string or null".into())
+            }
+        }
         Ok(self)
+    }
+
+    /// The snapshot's `default_prompt_name`, if it names one: the prompt
+    /// `SentenceTransformer.encode` applies when it is given no name. (The
+    /// `encode*` methods here take the name they are given, `None` meaning no
+    /// prompt; applying this default is the caller's choice.)
+    pub fn default_prompt_name(&self) -> Option<&str> {
+        self.default_prompt.as_deref()
     }
 
     /// The text of the prompt named `name`.
@@ -602,6 +651,7 @@ impl Tokenizer {
             bos_token: None,
             placeholders: Vec::new(),
             prompts: Vec::new(),
+            default_prompt: None,
         };
 
         for id in 0..n {

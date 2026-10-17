@@ -44,7 +44,8 @@ for step, ids in enumerate(batches):  # one sequence of token ids per step
 and both moments by name (torch's `exp_avg` and `exp_avg_sq`); saved with
 `parameters()` and restored with `load_parameters()`, `adamw_init()` and
 `load_adamw_state()`, the run resumes bit for bit. `grad_scale=clip_coef(...)`
-is `clip_grad_norm_` before the step (checked against it); with a head of
+is `clip_grad_norm_` before the step (the coefficient is Rust's `tessl_clip_coef`,
+checked against torch's bit for bit); with a head of
 your own, add its gradients' squares to `grad_sq_norm()` and scale them by
 the same coefficient.
 
@@ -156,15 +157,35 @@ array, rows L2-normalized.
 from tessl_torch.embedgemma2 import EmbedGemma2
 
 model = EmbedGemma2.from_pretrained(snapshot_dir)
-emb = model.encode([[2, 4521, 1], [2, 17, 99, 1]], truncate_dim=256)  # ids from your tokenizer
-emb = model.encode_texts(["how do I ...?"], tokenizer, prompt_name="query")
+emb = model.encode([[2, 4521, 1], [2, 17, 99, 1]], truncate_dim=256)  # ids of your own
+emb = model.encode_texts(["how do I ...?"], prompt_name="query")      # tokenized in Rust
+ids = model.tokenize(["how do I ...?"], prompt_name="query"); text = model.decode(ids[0])
 ```
 
-`encode_texts` takes a `tokenizers.Tokenizer` or a transformers tokenizer you
-built (neither package is imported or required here), prepends the snapshot's
-prompt from `config_sentence_transformers.json`, and tokenizes with special
-tokens. See `docs/embedgemma2.md` ("From Python / C") for the limits and the C
-entries.
+`encode_texts` tokenizes in Rust with the snapshot's own `tokenizer.json`,
+writes the prompt from `config_sentence_transformers.json` in front of each text
+and adds the special tokens, so no tokenizer package is involved
+(`prompts()` and `default_prompt_name` list what the snapshot offers). A
+`tokenizers.Tokenizer` or transformers tokenizer is still accepted as the
+optional `tokenizer=` keyword (never imported here); with it the ids are
+that tokenizer's and only the prompt text is the snapshot's.
+
+For a multimodal handle (`from_pretrained(snapshot_dir, multimodal=True)`) the
+snapshot's image, audio and video preprocessing is Rust's as well, so numpy is
+all a caller needs:
+
+```python
+emb = model.embed_images([rgb_uint8_hwc])                    # [H, W, 1..4] uint8 arrays
+emb = model.embed_audio([pcm_float32], sampling_rate=16000)  # mono PCM in [-1, 1]
+emb = model.embed_video(frames_uint8_thwc, fps=24.0, timestamps=True)
+emb = model.media([{"ids": ids, "images": [rgb], "audio": [pcm], "videos": [(frames, fps)]}])
+```
+
+`encode_images` / `encode_audio` keep taking the arrays of a transformers
+processor. The Python side only checks what ctypes would wrap silently (dtype,
+`u32` ranges); every other refusal is the library's. `embed_images` and
+`embed_audio` no longer take a processor argument. See `docs/embedgemma2.md`
+("From Python / C", "Raw inputs") for the limits and the C entries.
 
 ## Handle ownership, closing and errors
 

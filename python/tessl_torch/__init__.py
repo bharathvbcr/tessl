@@ -208,11 +208,12 @@ def _operands_code(operands: str) -> int:
 
 def clip_coef(total_norm: float, max_norm: float) -> float:
     """``torch.nn.utils.clip_grad_norm_``'s coefficient for a global norm,
-    in its f32 arithmetic: ``max_norm / (total_norm + 1e-6)``, at most 1.
-    Pass it as ``Qwen35.adamw_step(grad_scale=...)`` and scale any gradients
-    outside tessl by it too."""
-    norm = torch.tensor(total_norm, dtype=torch.float32)
-    return torch.clamp(max_norm / (norm + 1e-6), max=1.0).item()
+    in its f32 arithmetic, bit for bit: ``max_norm * (1 / (total_norm + 1e-6))``
+    (torch's ``max_norm / tensor`` multiplies the reciprocal), at most 1. The
+    arithmetic is ``tessl_clip_coef``'s, in Rust. Pass it as
+    ``Qwen35.adamw_step(grad_scale=...)`` and scale any gradients outside
+    tessl by it too."""
+    return float(_load().tessl_clip_coef(float(total_norm), float(max_norm)))
 
 
 class _TensorRef(ctypes.Structure):
@@ -385,6 +386,8 @@ def _load():
         lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64] + err_args
         lib.tessl_qwen35_grad_sq_norm.restype = ctypes.c_int32
         lib.tessl_qwen35_grad_sq_norm.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)] + err_args
+        lib.tessl_clip_coef.restype = ctypes.c_float
+        lib.tessl_clip_coef.argtypes = [ctypes.c_double, ctypes.c_double]
         _lib = lib
         return lib
 

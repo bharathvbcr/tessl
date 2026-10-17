@@ -14,7 +14,7 @@
 //! fault if anything read first); an error names the file or bytes it is about; and a
 //! successful call is the Rust facade (`embedgemma2_media::prepare_*`, `MmItem`) bit for bit on
 //! the same weights. The real checkpoint is `tests/embedgemma2_segments_model.rs` and
-//! `python/tests/test_embedgemma2_segments.py`.
+//! `python/tests/test_embedgemma2_media.py`.
 //!
 //! The tests with a null handle need no device (they are in the hosted selection,
 //! `scripts/hosted_tests.txt`). The video tests decode H.264 through VideoToolbox, which the

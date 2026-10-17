@@ -74,7 +74,20 @@ FIXTURES = [
 ]
 NO_RGB24_GOLDEN = {"e2e_video"}  # decoded by the reference script, not compared frame by frame
 CRF = {"e2e_video": "24"}
-NV12_GOLDENS ={"h264_709_tv_64x48", "h264_601_tv_66x38", "hevc_601_pc_34x26", "hevc_709_pc_96x64"}
+NV12_GOLDENS = {f[0] for f in FIXTURES} - NO_RGB24_GOLDEN
+# Planes with random samples, outside the legal ranges too, run through the CLI as raw NV12
+# input: name, width, height, matrix tag, range. They hold the converter to libswscale for every
+# Y, Cb and Cr that natural pictures leave out, on both converters (width a multiple of 16 or not).
+SYNTHETIC = [
+    ("rand_709_tv_32x16", 32, 16, "bt709", "tv"),
+    ("rand_709_tv_34x16", 34, 16, "bt709", "tv"),
+    ("rand_601_pc_48x8", 48, 8, "smpte170m", "pc"),
+    ("rand_601_pc_50x8", 50, 8, "smpte170m", "pc"),
+    ("rand_2020_tv_16x16", 16, 16, "bt2020nc", "tv"),
+    ("rand_2020_pc_18x12", 18, 12, "bt2020nc", "pc"),
+    ("rand_untagged_16x8", 16, 8, None, "tv"),
+    ("rand_untagged_30x6", 30, 6, None, "tv"),
+]
 
 
 def frame(w, h, k, seed):
@@ -160,10 +173,30 @@ def decode(path, pix_fmt, autorotate=True):
     return run(cmd, capture_output=True).stdout
 
 
+def synthetic(facts):
+    for seed, (name, w, h, matrix, rng_) in enumerate(SYNTHETIC, start=100):
+        rng = np.random.default_rng(seed)
+        y = rng.integers(0, 256, (h, w), dtype=np.uint8)
+        uv = rng.integers(0, 256, (h // 2, w), dtype=np.uint8)  # interleaved Cb, Cr
+        planes = y.tobytes() + uv.tobytes()
+        with open(os.path.join(OUT, name + ".nv12"), "wb") as f:
+            f.write(planes)
+        cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "nv12", "-s", f"{w}x{h}"]
+        if matrix:
+            cmd += ["-colorspace", matrix]
+        cmd += ["-color_range", rng_, "-i", "-", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        rgb = run(cmd, input=planes, capture_output=True).stdout
+        assert len(rgb) == w * h * 3, name
+        with open(os.path.join(OUT, name + ".rgb24"), "wb") as f:
+            f.write(rgb)
+        facts.append(f"synthetic {name} w={w} h={h} matrix={matrix or 'unspecified'} range={rng_}")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(SCRATCH, exist_ok=True)
     facts = []
+    synthetic(facts)
     for seed, (name, codec, w, h, n, fps, matrix, rng_, rot) in enumerate(FIXTURES, start=1):
         path = encode(name, codec, w, h, n, fps, matrix, rng_, rot, seed)
         s = probe_stream(path)
@@ -203,6 +236,8 @@ def file_table():
             role, note = "config", "per fixture: size, rotation, tags and torchcodec's exact-mode frame count, duration and fps"
         elif name.endswith(".rgb24"):
             role, note = "golden", "the ffmpeg CLI's rgb24 frames for the input of the same name (autorotated), concatenated"
+        elif name.startswith("rand_") and name.endswith(".nv12"):
+            role, note = "input", "random NV12 planes the converter is given (its rgb24 golden is the ffmpeg CLI's conversion)"
         elif name.endswith(".nv12"):
             role, note = "golden", "the ffmpeg CLI's nv12 frames for the input of the same name (as stored, not rotated)"
         else:

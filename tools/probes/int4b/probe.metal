@@ -47,7 +47,7 @@ TAIL(int4b_format, int4b_format, int32_t)
 TAIL(half, uint4b_format, int32_t)
 #elif defined(V_MLX_GROUP_LOOP)
 // Design sketch for MLX Q4 (w = scale*q + bias, unsigned nibbles per
-// src/nn.rs:3257, hence uint4b_format; group G along K): W is [N,K]
+// the Q4MlxBank note in src/nn.rs, hence uint4b_format; group G along K): W is [N,K]
 // nibbles, K contiguous (transpose_right), one matmul2d per group into a fresh
 // cooperative destination, then scale/bias applied per element in registers.
 // out[m,n] = sum_g ( s[n,g] * P_g[m,n] + b[n,g] * xsum[m,g] ).

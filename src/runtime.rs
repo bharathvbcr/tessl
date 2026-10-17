@@ -2120,6 +2120,15 @@ impl GpuRuntime {
         Ok(())
     }
 
+    /// Whether a command buffer is open and still recording: work encoded
+    /// since the last commit that no GPU submission references yet. Read-only;
+    /// pair it with [`Self::last_signaled_value`] to name the commit that will
+    /// carry that work (`last_signaled_value() + 1`).
+    pub(crate) fn has_open_batch(&self) -> bool {
+        let guard = self.active_m4.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().is_some_and(|b| b.cb_open)
+    }
+
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
         // Do not call flush_residency here — caller may already hold `active_m4`.
         let m4 = &self.metal4;

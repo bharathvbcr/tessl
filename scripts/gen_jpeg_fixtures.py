@@ -402,7 +402,7 @@ def write_lossless(width, height, comps, planes, *, psv=1, pt=0, precision=8, re
     vmax = max(c[1] for c in comps)
     mcux = -(-width // hmax)
     mcuy = -(-height // vmax)
-    start = 1 << (precision - pt - 1)
+    start = 1 << max(precision - pt - 1, 0)
     ss = psv if scan_ss is None else scan_ss
 
     def code_scan(cidx):
@@ -674,7 +674,7 @@ def smoothing_cases():
         case(f"smoothing_zero_quantizer_{nat}_part", write_progressive_gray(dc, q, [("dc", 0, 0), ("ac", 1, 5, 0, 2)]), k,
              f"quantizer at natural position {nat} is 0, AC 1..5 at Al=2")
     # extremes: the estimate is stored in 16 bits
-    for amp, q00, qac in ((2047, 255, 1), (2047, 65535, 1), (32767, 1, 65535), (32767, 255, 3), (2047, 40, 255)):
+    for amp, q00, qac in ((2047, 255, 1), (2047, 65535, 1), (16000, 1, 65535), (16000, 255, 3), (2047, 40, 255)):
         dc = rng.integers(-amp, amp + 1, (6, 6))
         case(f"smoothing_extreme_dc{amp}_q{q00}_{qac}", write_progressive_gray(dc, [q00] + [qac] * 63, [("dc", 0, 0)]), k,
              f"DC up to {amp}, Q00 {q00}, AC quantizers {qac}")

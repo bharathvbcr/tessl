@@ -75,7 +75,7 @@ def tv_decode(data):
         t = tio.decode_image(torch.frombuffer(bytearray(data), dtype=torch.uint8), mode=tio.ImageReadMode.RGB)
         return t.permute(1, 2, 0).numpy()
     except Exception as e:  # the oracle's refusal is the datum
-        return "ERR " + str(e).splitlines()[0][-120:]
+        return "ERR " + str(e).splitlines()[0].split("decode_jpeg.cpp:171, ")[-1][:100]
 
 
 def pil_decode(data):

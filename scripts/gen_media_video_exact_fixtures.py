@@ -144,6 +144,8 @@ FIXTURES = [
     ("refuse_hevc_12bit_709_tv_64x48", "libx265", 64, 48, 3, 10, "bt709", "tv", 0),
     ("refuse_hevc_gray_64x48", "libx265", 64, 48, 3, 10, None, "tv", 0),
     ("refuse_mpeg4_709_tv_64x48", "mpeg4", 64, 48, 3, 10, "bt709", "tv", 0),
+    # Motion JPEG: a codec AVFoundation does decode and the exact conversion does not take.
+    ("refuse_mjpeg_pc_64x48", "mjpeg", 64, 48, 3, 10, None, "pc", 0),
 ]
 REFUSED = {f[0] for f in FIXTURES if f[0].startswith("refuse_")}
 # decoded by the reference script, or refused by the exact conversion: no frame-by-frame golden
@@ -272,10 +274,12 @@ def encode(name, codec, w, h, n, fps, matrix, rng_, rot, seed):
     vf = "scale="
     if matrix:
         vf += f"out_color_matrix={MATRIX_OUT[matrix]}:"
-    vf += f"out_range={'full' if rng_ == 'pc' else 'limited'},format={pix_fmt_of(name)}"
-    quality = ["-q:v", "2"] if codec == "mpeg4" else ["-crf", CRF.get(name, "12")]
+    # (The Motion JPEG encoder takes only the full-range names of its formats.)
+    vf += f"out_range={'full' if rng_ == 'pc' else 'limited'},format={'yuvj420p' if codec == 'mjpeg' else pix_fmt_of(name)}"
+    quality = ["-q:v", "2"] if codec in ("mpeg4", "mjpeg") else ["-crf", CRF.get(name, "12")]
     cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-framerate", str(fps),
-           "-i", "-", "-vf", vf, "-c:v", codec, *quality, "-g", "5" if n > 3 else "3", "-bf", "2"]
+           "-i", "-", "-vf", vf, "-c:v", codec, *quality, "-g", "5" if n > 3 else "3",
+           "-bf", "0" if codec == "mjpeg" else "2"]
     if matrix:
         cmd += ["-colorspace", matrix, "-color_primaries", PRIMARIES[matrix], "-color_trc", TRC[matrix]]
     if rng_ == "pc":

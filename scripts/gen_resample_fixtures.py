@@ -31,8 +31,8 @@ FFmpeg's:
   <name>.libopus48k.f32   libopus's decode (`-c:a libopus`) to 48 kHz mono
   <name>.native48k.f32    FFmpeg's native Opus decoder to 48 kHz mono
 
-FFmpeg's native Opus decoder runs two samples (at 48 kHz) behind libopus in SILK
-frames; see docs/embedgemma2.md ("Media decoding").
+FFmpeg's native Opus decoder runs behind libopus in SILK frames (4 samples at 48 kHz for a
+narrow-band stream, 2 for wide-band); see docs/embedgemma2.md ("Media decoding").
 """
 
 import os
@@ -168,7 +168,8 @@ def codec_cases():
     wavfile.write(path("opus_src_48000_mono.wav"), sr, quantize(sig))
     note("opus_src_48000_mono.wav", "input", "the clip the Opus files were encoded from")
     for name, args in (
-        ("opus_silk_48000_mono", ["-application", "voip", "-frame_duration", "20", "-b:a", "16k"]),
+        ("opus_silknb_48000_mono", ["-application", "voip", "-frame_duration", "20", "-b:a", "16k", "-cutoff", "4000"]),
+        ("opus_silkwb_48000_mono", ["-application", "voip", "-frame_duration", "20", "-b:a", "16k", "-cutoff", "8000"]),
         ("opus_celt_48000_mono", ["-application", "audio", "-frame_duration", "20", "-b:a", "64k"]),
     ):
         ffmpeg(["-i", path("opus_src_48000_mono.wav"), "-c:a", "libopus"] + args + [path(name + ".opus")])

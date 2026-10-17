@@ -28,7 +28,11 @@ Inputs come from four encoders, so the grid is not shaped by one writer's habits
              progressive, restart rows, lossless and 12-bit streams
   synth      the coefficient-level baseline writer below: exact control of every
              coefficient, quantizer, table, marker and component layout (YCCK, RGB,
-             non-interleaved scans, 16-bit DQT, extreme IDCT inputs, malformed headers)
+             non-interleaved scans, 16-bit DQT, extreme IDCT inputs, malformed headers);
+             a progressive writer whose AC data is all zero and whose scan list sets the
+             progression state (the probes of libjpeg-turbo's block smoothing); and a
+             lossless (SOF3) writer with every predictor, point transform, restart
+             interval and arbitrary differences
   mutation   a seeded byte-level mutator over the files above (the fuzz corpus)
 
 Layout of tests/fixtures/jpeg/:
@@ -47,6 +51,7 @@ import random
 import shutil
 import struct
 import subprocess
+import zlib
 import sys
 
 import numpy as np
@@ -298,6 +303,181 @@ def flat_coefs(vals, w, h, comps):
 
 
 # ---------------------------------------------------------------------------
+# synth: a progressive writer whose AC data is all zero (block smoothing probes)
+# ---------------------------------------------------------------------------
+
+
+def write_progressive_gray(dc, q, scans, qprecision=0, eoi=True):
+    """A grayscale progressive file made of the given scans, in which every AC coefficient is zero.
+
+    dc: [block rows, block cols] full-precision DC values. q: 64 quantizers, natural order. scans: ('dc', ah, al) or
+    ('ac', ss, se, ah, al); an AC scan is one EOB per block, which is a valid first scan or refinement of zeros. What the
+    decoder is left with is the DC image plus a `coef_bits` state chosen by the scan list: exactly what block
+    smoothing reads. Used to measure libjpeg-turbo's estimator one impulse at a time."""
+    h, w = dc.shape[0] * 8, dc.shape[1] * 8
+    out = bytearray(b"\xff\xd8")
+    zz = [q[ZZ[i]] for i in range(64)]
+    if qprecision or max(zz) > 255:
+        out += seg(0xDB, bytes([0x10]) + b"".join(struct.pack(">H", v) for v in zz))
+    else:
+        out += seg(0xDB, bytes([0]) + bytes(zz))
+    out += seg(0xC2, bytes([8]) + struct.pack(">HH", h, w) + bytes([1, 1, 0x11, 0]))
+    out += dht(0, 0, DC_BITS, DC_VALS) + dht(1, 0, AC_BITS, AC_VALS)
+    for s in scans:
+        bw = Bits()
+        if s[0] == "dc":
+            _, ah, al = s
+            out += seg(0xDA, bytes([1, 1, 0x00, 0, 0, (ah << 4) | al]))
+            prev = 0
+            for by in range(dc.shape[0]):
+                for bx in range(dc.shape[1]):
+                    v = int(dc[by, bx])
+                    if ah == 0:
+                        v >>= al
+                        d = v - prev
+                        prev = v
+                        c = abs(d).bit_length()
+                        bw.put(*DC_CODE[c])
+                        if c:
+                            bw.put(d if d > 0 else d + (1 << c) - 1, c)
+                    else:
+                        bw.put((v >> al) & 1, 1)
+        else:
+            _, ss, se, ah, al = s
+            out += seg(0xDA, bytes([1, 1, 0x00, ss, se, (ah << 4) | al]))
+            for _ in range(dc.shape[0] * dc.shape[1]):
+                bw.put(*AC_CODE[0x00])
+        bw.flush()
+        out += bytes(bw.out)
+    if eoi:
+        out += b"\xff\xd9"
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# synth: a lossless (SOF3, T.81 Annex H) writer
+# ---------------------------------------------------------------------------
+
+# Every difference category 0..16 gets a 5-bit code, so any difference can be coded.
+LL_BITS = [0] * 16
+LL_BITS[4] = 17
+LL_VALS = list(range(17))
+LL_CODE = _codes(LL_BITS, LL_VALS)
+
+
+def ll_predict(psv, ra, rb, rc):
+    """Predictor selection value 1..7 (Table H.1), integer arithmetic as the decoder does."""
+    return {1: ra, 2: rb, 3: rc, 4: ra + rb - rc, 5: ra + ((rb - rc) >> 1), 6: rb + ((ra - rc) >> 1), 7: (ra + rb) >> 1}[psv]
+
+
+def ll_put_diff(bw, d):
+    """One difference d (-32768..32768) as a category and its extra bits."""
+    c = abs(d).bit_length()
+    bw.put(*LL_CODE[c])
+    if 0 < c < 16:
+        bw.put(d if d > 0 else d + (1 << c) - 1, c)
+
+
+def write_lossless(width, height, comps, planes, *, psv=1, pt=0, precision=8, restart=0, interleave=True, adobe=None,
+                   jfif=False, comp_ids=None, diffs=None, eoi=True, scan_ss=None, scan_se=0, scan_ah=0, dht_extra=b"",
+                   restart_rows=None):
+    """A lossless JPEG: comps [(h, v)], planes[c] the coded samples (after the point transform), padded to the MCU grid
+    ([mcu rows * v, mcu cols * h]). `diffs[c]`, when given, are the differences written instead of the ones the
+    samples imply (arbitrary values, the decoder's hostile input). `restart` is in MCUs and a multiple of the MCUs per
+    row; the first sample row of every restart interval is predicted from the left only, its first sample from 2^(P-Pt-1)."""
+    out = bytearray(b"\xff\xd8")
+    if jfif:
+        out += seg(0xE0, b"JFIF\0\x01\x01\x00\x00\x01\x00\x01\x00\x00")
+    if adobe is not None:
+        out += seg(0xEE, b"Adobe" + struct.pack(">HHHB", 100, 0, 0, adobe))
+    ids = comp_ids or list(range(1, len(comps) + 1))
+    sofp = bytes([precision]) + struct.pack(">HH", height, width) + bytes([len(comps)])
+    for i, (h, v) in enumerate(comps):
+        sofp += bytes([ids[i], ((h & 15) << 4) | (v & 15), 0])
+    out += seg(0xC3, sofp)
+    out += dht(0, 0, LL_BITS, LL_VALS) + dht_extra
+    if restart:
+        out += seg(0xDD, struct.pack(">H", restart))
+    hmax = max(c[0] for c in comps)
+    vmax = max(c[1] for c in comps)
+    mcux = -(-width // hmax)
+    mcuy = -(-height // vmax)
+    start = 1 << (precision - pt - 1)
+    ss = psv if scan_ss is None else scan_ss
+
+    def code_scan(cidx):
+        hdr = bytes([len(cidx)]) + b"".join(bytes([ids[c], 0x00]) for c in cidx) + bytes([ss, scan_se, (scan_ah << 4) | pt])
+        bw = Bits()
+        if len(cidx) == 1:
+            c = cidx[0]
+            h, v = comps[c]
+            cw = -(-width * h // hmax)
+            ch = -(-height * v // vmax)
+            mcols, mrows = cw, ch
+            geom = {c: (1, 1)}
+        else:
+            mcols, mrows = mcux, mcuy
+            geom = {c: comps[c] for c in cidx}
+        rows_per_interval = restart_rows if restart_rows else ((restart // mcols) if restart else 0)
+        rst = 0
+        first_row = {c: 0 for c in cidx}  # first sample row of the current restart interval, per component
+        for my in range(mrows):
+            if rows_per_interval and my and my % rows_per_interval == 0:
+                bw.flush()
+                bw.out += bytes([0xFF, 0xD0 + (rst & 7)])
+                rst += 1
+                for c in cidx:
+                    first_row[c] = my * geom[c][1]
+            for mx in range(mcols):
+                for c in cidx:
+                    h, v = geom[c]
+                    for dy in range(v):
+                        for dx in range(h):
+                            y, x = my * v + dy, mx * h + dx
+                            p = planes[c]
+                            if diffs is not None:
+                                d = int(diffs[c][y, x])
+                            else:
+                                if y == first_row[c]:
+                                    pred = start if x == 0 else int(p[y, x - 1])
+                                elif x == 0:
+                                    pred = int(p[y - 1, 0])
+                                else:
+                                    pred = ll_predict(psv, int(p[y, x - 1]), int(p[y - 1, x]), int(p[y - 1, x - 1]))
+                                d = (int(p[y, x]) - pred) & 0xFFFF
+                                if d >= 0x8000:
+                                    d -= 0x10000
+                            ll_put_diff(bw, d)
+        bw.flush()
+        return seg(0xDA, hdr) + bytes(bw.out)
+
+    if interleave or len(comps) == 1:
+        out += code_scan(list(range(len(comps))))
+    else:
+        for c in range(len(comps)):
+            out += code_scan([c])
+    if eoi:
+        out += b"\xff\xd9"
+    return bytes(out)
+
+
+def ll_planes(rng, comps, width, height, precision=8, pt=0, smooth=True):
+    """Image-like coded samples for a lossless writer: padded planes of values in [0, 2^(P-Pt))."""
+    hmax = max(c[0] for c in comps)
+    vmax = max(c[1] for c in comps)
+    mcux, mcuy = -(-width // hmax), -(-height // vmax)
+    top = (1 << (precision - pt)) - 1
+    out = []
+    for (h, v) in comps:
+        ph, pw = mcuy * v, mcux * h
+        y, x = np.mgrid[0:ph, 0:pw].astype(np.float64)
+        base = (0.5 + 0.35 * np.sin(x / 5.0 + y / 7.0 + rng.uniform(0, 6))) if smooth else rng.uniform(0, 1, (ph, pw))
+        a = np.clip(np.rint(base * top + (rng.normal(0, 0.02 * top, (ph, pw)) if smooth else 0)), 0, top).astype(np.int64)
+        out.append(a)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Header surgery
 # ---------------------------------------------------------------------------
 
@@ -358,6 +538,253 @@ CASES = []  # (name, bytes, klass, note)
 def case(name, data, klass, note="", tessl="equal"):
     assert name not in {c[0] for c in CASES}, name
     CASES.append((name, data, klass, note, tessl))
+
+
+SCAN_DIR = os.path.join(HERE, "..", "target", "jpeg_scans")
+
+# cjpeg -scans scripts (wizard.txt): "components: Ss Se Ah Al;". Every one is a valid progression.
+SCAN_SCRIPTS = {
+    # No successive approximation: coef_bits ends at 0 for what has arrived and -1 for the rest.
+    "spectral": "0 1 2: 0 0 0 0;\n0: 1 5 0 0;\n1: 1 63 0 0;\n2: 1 63 0 0;\n0: 6 63 0 0;\n",
+    # DC at Al=2 and AC 1..9 at Al=3, refined one bit per scan.
+    "deep": "0 1 2: 0 0 0 2;\n0: 1 9 0 3;\n1: 1 9 0 3;\n2: 1 9 0 3;\n0: 10 63 0 3;\n1: 10 63 0 3;\n2: 10 63 0 3;\n"
+            "0: 1 63 3 2;\n1: 1 63 3 2;\n2: 1 63 3 2;\n0 1 2: 0 0 2 1;\n0: 1 63 2 1;\n1: 1 63 2 1;\n2: 1 63 2 1;\n"
+            "0 1 2: 0 0 1 0;\n0: 1 63 1 0;\n1: 1 63 1 0;\n2: 1 63 1 0;\n",
+    # The high band arrives before the low one.
+    "high_first": "0 1 2: 0 0 0 1;\n0: 6 63 0 2;\n0: 1 5 0 2;\n1: 1 63 0 2;\n2: 1 63 0 2;\n0: 1 63 2 1;\n1: 1 63 2 1;\n"
+                  "2: 1 63 2 1;\n0 1 2: 0 0 1 0;\n0: 1 63 1 0;\n1: 1 63 1 0;\n2: 1 63 1 0;\n",
+    # The chroma planes lag the luma plane by whole bands.
+    "luma_first": "0 1 2: 0 0 0 1;\n0: 1 63 0 2;\n0: 1 63 2 1;\n0: 1 63 1 0;\n1: 1 63 0 0;\n2: 1 63 0 0;\n0 1 2: 0 0 1 0;\n",
+}
+GRAY_SCRIPTS = {
+    "spectral": "0: 0 0 0 0;\n0: 1 5 0 0;\n0: 6 63 0 0;\n",
+    "deep": "0: 0 0 0 2;\n0: 1 9 0 3;\n0: 10 63 0 3;\n0: 1 63 3 2;\n0: 0 0 2 1;\n0: 1 63 2 1;\n0: 0 0 1 0;\n0: 1 63 1 0;\n",
+    "high_first": "0: 0 0 0 1;\n0: 6 63 0 2;\n0: 1 5 0 2;\n0: 1 63 2 1;\n0: 0 0 1 0;\n0: 1 63 1 0;\n",
+}
+
+
+def cj_script(img, script, *flags):
+    """cjpeg with a progression script (-scans)."""
+    os.makedirs(SCAN_DIR, exist_ok=True)
+    p = os.path.join(SCAN_DIR, "s%08x.txt" % zlib.crc32(script.encode()))
+    with open(p, "w") as f:
+        f.write(script)
+    return cj(img, "-scans", p, *flags)
+
+
+def cut_all(name, data, klass, note, ks=None):
+    """The file cut after k scans and closed with an EOI, for every k (or those in ks)."""
+    pos = scan_offsets(data)
+    for k in ks if ks is not None else range(1, len(pos)):
+        case(f"{name}_{k}scans", data[:pos[k]] + b"\xff\xd9", klass, f"{note} cut after {k} of {len(pos)} scans + EOI")
+
+
+def cut_mid(name, data, klass, note, ks=None):
+    """The file cut inside the entropy data of scan k (a third and two thirds of the way), closed with an EOI: the scan runs
+    out of data at a marker, so the rest of it decodes as zeros and libjpeg-turbo falls back to the earlier progression."""
+    pos = scan_offsets(data) + [len(data) - 2]
+    for k in ks if ks is not None else range(len(pos) - 1):
+        # the entropy-coded data starts after the SOS header, whose length is in its second field
+        body = pos[k] + 2 + struct.unpack(">H", data[pos[k] + 2:pos[k] + 4])[0]
+        for third in (1, 2):
+            at = body + (pos[k + 1] - body) * third // 3
+            case(f"{name}_mid{k}_{third}", data[:at] + b"\xff\xd9", klass, f"{note} cut inside scan {k + 1}, {third}/3 of it + EOI")
+
+
+def smoothing_cases():
+    """Progressive files whose scans stop early: libjpeg-turbo smooths them (block smoothing)."""
+    k = "smoothing"
+    img = photo(33, 47, 5)
+    # the real encoders' default script, every prefix, every subsampling
+    cut_all("smoothing_gray", cj(photo(40, 56, 9), "-grayscale", "-progressive"), k, "grayscale 40x56")
+    cut_all("smoothing_420", cj(photo(40, 56, 9), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 40x56")
+    for tag, s in (("444", "1x1,1x1,1x1"), ("422", "2x1,1x1,1x1"), ("420", "2x2,1x1,1x1"), ("411", "4x1,1x1,1x1"),
+                   ("440", "1x2,1x1,1x1"), ("21_12", "2x1,1x2,1x1")):
+        cut_all(f"smoothing_s{tag}", cj(img, "-progressive", "-sample", s), k, f"cjpeg -sample {s}, 33x47")
+    # sizes around the block and MCU edges (the picture's edge rows and columns are replicated)
+    for (h, w) in [(8, 8), (9, 9), (17, 15), (24, 40), (65, 129), (1, 9), (9, 1), (33, 200), (200, 33), (72, 40)]:
+        im = photo(h, w, h * 7 + w)
+        cut_all(f"smoothing_size_{h}x{w}_420", cj(im, "-progressive", "-sample", "2x2,1x1,1x1"), k, f"{h}x{w} 4:2:0", ks=(1, 2, 5))
+        cut_all(f"smoothing_size_{h}x{w}_gray", cj(im, "-progressive", "-grayscale"), k, f"{h}x{w} gray", ks=(1, 2))
+        cut_all(f"smoothing_size_{h}x{w}_440", cj(im, "-progressive", "-sample", "1x2,1x1,1x1"), k, f"{h}x{w} 4:4:0", ks=(1, 5))
+    # progression scripts that leave coef_bits in states the default script never does
+    for tag, s in (("420", "2x2,1x1,1x1"), ("444", "1x1,1x1,1x1")):
+        for name, script in SCAN_SCRIPTS.items():
+            cut_all(f"smoothing_{tag}_{name}", cj_script(img, script, "-sample", s), k, f"script {name}, {tag}")
+    for name, script in GRAY_SCRIPTS.items():
+        cut_all(f"smoothing_gray_{name}", cj_script(img, script, "-grayscale"), k, f"script {name}, gray")
+    # arithmetic coding and restart intervals
+    cut_all("smoothing_arith_420", cj(img, "-arithmetic", "-progressive", "-sample", "2x2,1x1,1x1"), k, "arithmetic 4:2:0")
+    cut_all("smoothing_arith_gray", cj(img, "-arithmetic", "-progressive", "-grayscale"), k, "arithmetic gray", ks=(1, 2, 4))
+    cut_all("smoothing_rst_420", cj(img, "-progressive", "-restart", "2", "-sample", "2x2,1x1,1x1"), k, "restart 2", ks=(1, 3, 5))
+    cut_all("smoothing_rst_arith", cj(img, "-arithmetic", "-progressive", "-restart", "3"), k, "arithmetic, restart 3", ks=(1, 3))
+    # a scan that runs out of data in the middle
+    cut_mid("smoothing_gray", cj(photo(40, 56, 9), "-grayscale", "-progressive"), k, "grayscale 40x56")
+    cut_mid("smoothing_420", cj(photo(40, 56, 9), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 40x56")
+    cut_mid("smoothing_440", cj(photo(65, 40, 3), "-progressive", "-sample", "1x2,1x1,1x1"), k, "4:4:0 65x40", ks=(0, 1, 3, 6))
+    cut_mid("smoothing_arith_gray", cj(photo(40, 56, 9), "-arithmetic", "-progressive", "-grayscale"), k, "arithmetic gray", ks=(0, 2))
+    cut_mid("smoothing_rst", cj(photo(40, 56, 9), "-progressive", "-restart", "2", "-grayscale"), k, "restart 2 gray", ks=(0, 1, 3))
+
+    # --- synthetic: a DC image and a progression state chosen by the scan list ---------------------
+    rng = np.random.default_rng(31)
+    for (h, w), (q00, qac), amp in [((1, 1), (16, 8), 6), ((1, 2), (16, 8), 6), ((2, 1), (16, 8), 6), ((1, 3), (3, 1), 40),
+                                    ((3, 1), (3, 1), 40), ((3, 3), (3, 1), 40), ((4, 7), (40, 17), 40), ((9, 6), (7, 60), 40),
+                                    ((10, 10), (1, 1), 40), ((6, 6), (255, 255), 40), ((8, 8), (16, 40), 600)]:
+        dc = rng.integers(-amp, amp + 1, (h, w))
+        case(f"smoothing_dc_{h}x{w}_q{q00}_{qac}", write_progressive_gray(dc, [q00] + [qac] * 63, [("dc", 0, 0)]),
+             k, f"DC-only, {h}x{w} blocks, Q00 {q00}, AC quantizers {qac}")
+    for d, q00, qac in ((5, 64, 4), (-5, 64, 4), (2, 256, 1), (1, 255, 255), (30, 8, 2)):
+        dc = np.zeros((13, 13), dtype=int)
+        dc[6, 6] = d
+        case(f"smoothing_impulse_d{d}_q{q00}_{qac}", write_progressive_gray(dc, [q00] + [qac] * 63, [("dc", 0, 0)]), k,
+             f"one DC impulse {d}, Q00 {q00}, AC quantizers {qac}")
+    for al in (1, 2, 4):
+        dc = rng.integers(-60, 61, (7, 9))
+        case(f"smoothing_dc_al{al}", write_progressive_gray(dc, [8] + [3] * 63, [("dc", 0, al)]), k, f"DC scan with point transform {al}")
+    dc = rng.integers(-60, 61, (7, 9))
+    case("smoothing_dc_al2_refined_once", write_progressive_gray(dc, [8] + [3] * 63, [("dc", 0, 2), ("dc", 2, 1)]), k, "DC Al=2 then refined to Al=1")
+    # DC plus AC bands in various states: Al = bits not yet sent, the estimate is limited to 2^Al - 1
+    for al, hi in ((1, 2), (2, 5), (3, 5), (5, 5), (6, 9), (4, 9), (7, 3)):
+        dc = rng.integers(-40, 41, (10, 10))
+        case(f"smoothing_state_ac1to{hi}_al{al}", write_progressive_gray(dc, [64] + [4] * 63, [("dc", 0, 0), ("ac", 1, hi, 0, al)]), k,
+             f"DC, then AC 1..{hi} at Al={al}")
+    for zz in range(1, 10):
+        dc = rng.integers(-40, 41, (9, 9))
+        scans = [("dc", 0, 0)] + [("ac", i, i, 0, 0) for i in range(1, 10) if i != zz] + [("ac", zz, zz, 0, 4)]
+        case(f"smoothing_only_zz{zz}", write_progressive_gray(dc, [64] + [4] * 63, scans), k, f"zigzag {zz} the only coefficient still unknown")
+    dc = rng.integers(-40, 41, (9, 9))
+    case("smoothing_state_known_1to5_missing_6to9", write_progressive_gray(dc, [64] + [4] * 63, [("dc", 0, 0), ("ac", 1, 5, 0, 0)]), k,
+         "AC 1..5 complete, 6..9 never sent: smoothing is on and estimates nothing")
+    case("smoothing_state_high_band_only", write_progressive_gray(dc, [64] + [4] * 63, [("dc", 0, 0), ("ac", 6, 63, 0, 0)]), k,
+         "AC 6..63 complete, 1..5 never sent")
+    case("smoothing_state_no_dc_scan", write_progressive_gray(dc, [64] + [4] * 63, [("ac", 1, 5, 0, 2)]), k, "no DC scan: smoothing is off")
+    case("smoothing_state_refined_to_known", write_progressive_gray(dc, [64] + [4] * 63, [("dc", 0, 0), ("ac", 1, 63, 0, 1), ("ac", 1, 63, 1, 0)]),
+         k, "every AC coefficient complete: smoothing is off")
+    # a zero quantizer in the guarded set switches smoothing off; elsewhere it does not
+    dc = rng.integers(-20, 21, (8, 8))
+    for nat in (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 4, 5, 25, 63):
+        q = [6] * 64
+        q[0] = 16
+        q[nat] = 0
+        case(f"smoothing_zero_quantizer_{nat}", write_progressive_gray(dc, q, [("dc", 0, 0)]), k, f"quantizer at natural position {nat} is 0")
+    for nat in (3, 24, 1):
+        q = [6] * 64
+        q[0] = 16
+        q[nat] = 0
+        case(f"smoothing_zero_quantizer_{nat}_part", write_progressive_gray(dc, q, [("dc", 0, 0), ("ac", 1, 5, 0, 2)]), k,
+             f"quantizer at natural position {nat} is 0, AC 1..5 at Al=2")
+    # extremes: the estimate is stored in 16 bits
+    for amp, q00, qac in ((2047, 255, 1), (2047, 65535, 1), (32767, 1, 65535), (32767, 255, 3), (2047, 40, 255)):
+        dc = rng.integers(-amp, amp + 1, (6, 6))
+        case(f"smoothing_extreme_dc{amp}_q{q00}_{qac}", write_progressive_gray(dc, [q00] + [qac] * 63, [("dc", 0, 0)]), k,
+             f"DC up to {amp}, Q00 {q00}, AC quantizers {qac}")
+
+
+def lossless_cases():
+    """Lossless JPEG (SOF3, T.81 Annex H) from this script's writer and from cjpeg -lossless."""
+    k = "lossless"
+    rng = np.random.default_rng(77)
+    g1, c3, c4 = [(1, 1)], [(1, 1)] * 3, [(1, 1)] * 4
+    for psv in range(1, 8):
+        case(f"lossless_gray_psv{psv}", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=psv), k, f"13x11 gray, predictor {psv}")
+        p3 = ll_planes(rng, c3, 17, 9)
+        case(f"lossless_rgb_psv{psv}", write_lossless(17, 9, c3, p3, psv=psv, adobe=0), k, f"17x9 RGB (Adobe 0), predictor {psv}")
+        case(f"lossless_ycc_psv{psv}", write_lossless(17, 9, c3, p3, psv=psv, jfif=True), k, f"17x9 YCbCr (JFIF), predictor {psv}")
+        case(f"lossless_noise_psv{psv}", write_lossless(9, 8, g1, ll_planes(rng, g1, 9, 8, smooth=False), psv=psv), k, f"noise, predictor {psv}")
+    for pt in (1, 2, 4, 7):
+        for psv in (1, 4, 6, 7):
+            case(f"lossless_pt{pt}_psv{psv}", write_lossless(12, 10, g1, ll_planes(rng, g1, 12, 10, pt=pt), psv=psv, pt=pt), k, f"point transform {pt}, predictor {psv}")
+    for psv in (1, 3, 7):
+        pl = ll_planes(rng, c3, 12, 7)
+        case(f"lossless_ycc_noninterleaved_psv{psv}", write_lossless(12, 7, c3, pl, psv=psv, jfif=True, interleave=False), k, "one scan per component")
+    # sizes
+    for (h, w) in [(1, 1), (1, 7), (7, 1), (2, 2), (8, 8), (3, 33), (33, 3)]:
+        case(f"lossless_size_{h}x{w}", write_lossless(w, h, g1, ll_planes(rng, g1, w, h), psv=4), k, f"{h}x{w}, predictor 4")
+    # subsampled components: the reference upsamples without the fancy filter
+    for tag, comps in (("h2v1", [(2, 1), (1, 1), (1, 1)]), ("h2v2", [(2, 2), (1, 1), (1, 1)]), ("h1v2", [(1, 2), (1, 1), (1, 1)]),
+                       ("h4v1", [(4, 1), (1, 1), (1, 1)]), ("h2v2_all", [(2, 2), (2, 1), (1, 2)])):
+        for (w, h) in ((16, 12), (13, 9)):
+            pl = ll_planes(rng, comps, w, h)
+            case(f"lossless_sub_{tag}_{h}x{w}", write_lossless(w, h, comps, pl, psv=2, jfif=True), k, f"{tag}, {h}x{w}, predictor 2")
+    pl = ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12)
+    case("lossless_sub_h2v2_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=5, jfif=True, interleave=False), k,
+         "4:2:0 in three scans")
+    # four components
+    p4 = ll_planes(rng, c4, 10, 6)
+    case("lossless_cmyk", write_lossless(10, 6, c4, p4, psv=1, adobe=0), k, "CMYK (Adobe 0)")
+    case("lossless_ycck", write_lossless(10, 6, c4, p4, psv=3, adobe=2), k, "YCCK (Adobe 2)")
+    # restart intervals, in MCUs, whole MCU rows
+    for restart, (w, h) in ((6, (6, 12)), (12, (6, 12)), (9, (9, 8)), (18, (9, 8))):
+        pl = ll_planes(rng, g1, w, h)
+        for psv in (1, 4, 7):
+            case(f"lossless_rst{restart}_{w}x{h}_psv{psv}", write_lossless(w, h, g1, pl, psv=psv, restart=restart), k, f"restart every {restart} MCUs, predictor {psv}")
+    pl = ll_planes(rng, c3, 5, 9)
+    case("lossless_rst_ycc_interleaved", write_lossless(5, 9, c3, pl, psv=6, jfif=True, restart=10), k, "3 components, restart every 2 rows")
+    case("lossless_rst_ycc_noninterleaved", write_lossless(5, 9, c3, pl, psv=6, jfif=True, restart=5, interleave=False), k, "one scan per component, restart every row")
+    # a scan that ends in a marker before the picture does: the rest is zero differences, i.e. prediction only
+    for name, data in (("gray", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=4)),
+                       ("ycc", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=7, jfif=True)),
+                       ("rst", write_lossless(6, 12, g1, ll_planes(rng, g1, 6, 12), psv=2, restart=12)),
+                       ("sub", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12), psv=3, jfif=True))):
+        sos = data.find(b"\xff\xda")
+        body = sos + 2 + struct.unpack(">H", data[sos + 2:sos + 4])[0]
+        for third in (1, 2):
+            at = body + (len(data) - 2 - body) * third // 3
+            case(f"lossless_cut_{name}_{third}", data[:at] + b"\xff\xd9", k, f"{name} cut {third}/3 of the way into the scan + EOI")
+    # what the reference does with a restart interval that is not a whole number of MCU rows
+    pl = ll_planes(rng, g1, 6, 12)
+    case("lossless_rst_partial_row", write_lossless(6, 12, g1, pl, psv=1, restart=4, restart_rows=2), k, "restart interval 4 with 6 MCUs per row", tessl="either")
+    # hostile differences: wrap-around at 16 bits, the largest category, values the point transform cannot take back
+    for psv in (1, 2, 3, 4, 5, 6, 7):
+        d = rng.integers(-300, 301, (8, 9))
+        case(f"lossless_wild_diffs_psv{psv}", write_lossless(9, 8, g1, [np.zeros((8, 9), dtype=np.int64)], psv=psv, diffs=[d]), k, f"differences of +-300, predictor {psv}")
+        d = rng.integers(-32768, 32769, (6, 7))
+        case(f"lossless_huge_diffs_psv{psv}", write_lossless(7, 6, g1, [np.zeros((6, 7), dtype=np.int64)], psv=psv, diffs=[d]), k, f"differences over the whole 16-bit range, predictor {psv}")
+    d = rng.integers(-300, 301, (8, 9))
+    case("lossless_wild_diffs_pt3", write_lossless(9, 8, g1, [np.zeros((8, 9), dtype=np.int64)], psv=4, pt=3, diffs=[d]), k, "differences of +-300, point transform 3")
+    # scan parameters
+    pl = ll_planes(rng, g1, 8, 8)
+    for name, kw in (("psv0", dict(scan_ss=0)), ("psv8", dict(scan_ss=8)), ("se1", dict(scan_se=1)), ("ah1", dict(scan_ah=1)),
+                     ("pt_eq_precision_minus1", dict(pt=7)), ("pt_eq_precision", dict(pt=8)), ("pt_over_precision", dict(pt=9)),
+                     ("pt15", dict(pt=15))):
+        case(f"lossless_params_{name}", write_lossless(8, 8, g1, pl, psv=1, **kw), k, f"scan header: {name}", tessl="either")
+    # precisions: the reference's sample type is 8 bits
+    for prec in range(2, 17):
+        pl = ll_planes(rng, g1, 8, 6, precision=prec)
+        case(f"lossless_precision_{prec}", write_lossless(8, 6, g1, pl, psv=1, precision=prec), k, f"{prec}-bit samples", tessl="either")
+        if prec != 8:
+            pl = ll_planes(rng, c3, 8, 6, precision=prec)
+            case(f"lossless_precision_{prec}_rgb", write_lossless(8, 6, c3, pl, psv=4, precision=prec, adobe=0), k, f"{prec}-bit RGB", tessl="either")
+    # cjpeg's own lossless encoder
+    def cj_case(name, im, flags, note, klass=k):
+        # cjpeg may refuse an option combination (the lossless encoder has its own limits); that is not a case
+        try:
+            case(name, cj(im, *flags), klass, note, tessl="either")
+        except RuntimeError as e:
+            print("cjpeg cannot encode", name, "-", e)
+
+    for psv in range(1, 8):
+        cj_case(f"lossless_cjpeg_psv{psv}", photo(16, 24, 2 + psv), ["-lossless", str(psv)], f"cjpeg -lossless {psv}")
+    for psv, pt in ((1, 1), (4, 3), (7, 2)):
+        cj_case(f"lossless_cjpeg_psv{psv}_pt{pt}", photo(16, 24, 9), ["-lossless", f"{psv},{pt}"], f"cjpeg -lossless {psv},{pt}")
+    im = photo(17, 23, 4)
+    cj_case("lossless_cjpeg_gray", im, ["-lossless", "5", "-grayscale"], "cjpeg gray, predictor 5")
+    cj_case("lossless_cjpeg_rgb", im, ["-lossless", "6", "-rgb"], "cjpeg -rgb, predictor 6")
+    cj_case("lossless_cjpeg_420", im, ["-lossless", "2", "-sample", "2x2,1x1,1x1"], "cjpeg 4:2:0, predictor 2")
+    cj_case("lossless_cjpeg_422", im, ["-lossless", "2", "-sample", "2x1,1x1,1x1"], "cjpeg 4:2:2, predictor 2")
+    cj_case("lossless_cjpeg_restart", im, ["-lossless", "4", "-restart", "2B"], "cjpeg restart")
+    cj_case("lossless_cjpeg_arith", im, ["-lossless", "4", "-arithmetic"], "SOF11 lossless arithmetic", klass="error")
+    for tag, script, extra in (("scans_split", "0: 4 0 0 0;\n1: 4 0 0 0;\n2: 4 0 0 0;\n", []),
+                               ("scans_pt", "0 1 2: 5 0 0 2;\n", []),
+                               ("scans_pt_split", "0: 3 0 0 1;\n1 2: 3 0 0 1;\n", []),
+                               ("scans_420", "0 1 2: 2 0 0 0;\n", ["-sample", "2x2,1x1,1x1"]),
+                               ("scans_420_split", "0: 2 0 0 0;\n1: 2 0 0 0;\n2: 2 0 0 0;\n", ["-sample", "2x2,1x1,1x1"])):
+        try:
+            case(f"lossless_cjpeg_{tag}", cj_script(im, script, *extra), k, f"cjpeg -scans {tag}", tessl="either")
+        except RuntimeError as e:
+            print("cjpeg cannot encode", tag, "-", e)
+    for prec in (2, 4, 7, 12, 16):
+        cj_case(f"lossless_cjpeg_precision_{prec}", photo(9, 11, 4), ["-lossless", "1", "-precision", str(prec)], f"cjpeg -precision {prec}")
 
 
 def build_cases():
@@ -484,17 +911,9 @@ def build_cases():
             j[p + 5] = cid
         case("scan_order_" + "".join(map(str, order)), bytes(j), "layout", f"non-interleaved scans in component order {order}")
     # --- progressive files that stop early: libjpeg-turbo smooths them ------------------------
-    pg = cj(photo(40, 56, 9), "-grayscale", "-progressive")
-    pos = scan_offsets(pg)
-    for k in (1, 2, 3):
-        case(f"smoothing_gray_{k}scans", pg[:pos[k]] + b"\xff\xd9", "smoothing",
-             f"progressive grayscale cut after {k} scans + EOI: block smoothing", tessl="refused")
-    pc = cj(photo(40, 56, 9), "-progressive", "-sample", "2x2,1x1,1x1")
-    pos = scan_offsets(pc)
-    for k in (1, 4):
-        case(f"smoothing_420_{k}scans", pc[:pos[k]] + b"\xff\xd9", "smoothing", f"4:2:0 cut after {k} scans + EOI", tessl="refused")
-    # --- lossless: the reference decodes it, tessl names the refusal ---------------------------
-    case("lossless_sof3", cj(photo(16, 24, 2), "-lossless", "1"), "lossless", "SOF3, 8-bit, predictor 1", tessl="refused")
+    smoothing_cases()
+    # --- lossless (SOF3): libjpeg-turbo 3.x decodes it ----------------------------------------
+    lossless_cases()
     # --- the reference refuses these, so must tessl ---------------------------------------------
     case("err_12bit_cjpeg", cj(photo(16, 24, 2), "-precision", "12"), "error", "12-bit precision")
     case("err_precision_12_sof0", write_jpeg(W, H, c3, rand_coefs(rng, c3, W, H), QT, precision=12), "error", "SOF0 with 12-bit precision")
@@ -610,6 +1029,20 @@ def fuzz_bases():
     bases["synth_ycck"] = write_jpeg(W, H, c4, rand_coefs(rng, c4, W, H), QT, adobe=2)
     bases["synth_cmyk"] = write_jpeg(W, H, c4, rand_coefs(rng, c4, W, H), QT, adobe=0)
     bases["synth_rst1"] = write_jpeg(W, H, c3, rand_coefs(rng, c3, W, H), QT, restart=1)
+    # progressive files cut short and closed (block smoothing), and lossless streams
+    pg = cj(img, "-grayscale", "-progressive")
+    bases["smooth_gray_cut3"] = pg[:scan_offsets(pg)[3]] + b"\xff\xd9"
+    pc = cj(img, "-progressive", "-sample", "2x2,1x1,1x1")
+    bases["smooth_420_cut2"] = pc[:scan_offsets(pc)[2]] + b"\xff\xd9"
+    bases["smooth_420_cut6"] = pc[:scan_offsets(pc)[6]] + b"\xff\xd9"
+    pa = cj(img, "-arithmetic", "-progressive", "-sample", "2x2,1x1,1x1")
+    bases["smooth_arith_cut3"] = pa[:scan_offsets(pa)[3]] + b"\xff\xd9"
+    lrng = np.random.default_rng(5)
+    g1, l3, l420 = [(1, 1)], [(1, 1)] * 3, [(2, 2), (1, 1), (1, 1)]
+    bases["lossless_gray"] = write_lossless(21, 9, g1, ll_planes(lrng, g1, 21, 9), psv=4)
+    bases["lossless_rgb_rst"] = write_lossless(8, 10, l3, ll_planes(lrng, l3, 8, 10), psv=6, adobe=0, restart=16)
+    bases["lossless_420_pt"] = write_lossless(18, 10, l420, ll_planes(lrng, l420, 18, 10, pt=2), psv=7, pt=2, jfif=True)
+    bases["lossless_noninterleaved"] = write_lossless(9, 7, l3, ll_planes(lrng, l3, 9, 7), psv=2, jfif=True, interleave=False)
     return bases
 
 
@@ -697,17 +1130,20 @@ def main():
     lines, files = [], {}
     n_ok = n_err = 0
     pil_differs = 0
+    problems = []  # reported after everything is written, so one surprise does not cost the whole run
     for name, data, klass, note, tessl in CASES:
         with open(path(name + ".jpg"), "wb") as f:
             f.write(data)
         files[name + ".jpg"] = {"role": "input", "published": True, "note": f"{klass}: {note}" if note else klass}
         t = tv_decode(data)
         if isinstance(t, str):
-            assert klass == "error", f"{name}: the oracle refuses a case not filed under error: {t}"
+            if not (klass == "error" or tessl == "either"):
+                problems.append(f"{name}: the oracle refuses a case not filed under error: {t}")
             lines.append(f"case {name} expect=error class={klass} oracle={t.replace(' ', '_')}")
             n_err += 1
             continue
-        assert klass != "error", f"{name}: filed under error but the oracle decodes it"
+        if not (klass != "error" or tessl == "either"):
+            problems.append(f"{name}: filed under error but the oracle decodes it")
         h, w = t.shape[:2]
         with open(path(name + ".jpg.rgb"), "wb") as f:
             f.write(np.ascontiguousarray(t).tobytes())
@@ -715,7 +1151,7 @@ def main():
         p = pil_decode(data)
         pil = "error" if isinstance(p, str) else ("equal" if np.array_equal(p, t) else "differs")
         pil_differs += pil == "differs"
-        lines.append(f"case {name} expect=ok tessl={tessl} class={klass} w={w} h={h} pil={pil}")
+        lines.append(f"case {name} expect=ok class={klass} w={w} h={h} pil={pil}")
         n_ok += 1
     n_fuzz, stats = build_fuzz_corpus(path("fuzz_corpus.bin"))
     files["fuzz_corpus.bin"] = {"role": "golden", "published": True, "note": "mutated JPEGs with the oracle's verdict and pixels (format in tests/media_jpeg.rs)"}
@@ -734,6 +1170,9 @@ def main():
         files,
         "produced",
     )
+    if problems:
+        print("\n".join(problems))
+        sys.exit(f"{len(problems)} cases are filed against the oracle's verdict")
 
 
 if __name__ == "__main__":

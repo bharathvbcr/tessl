@@ -124,7 +124,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::embedgemma2::{
-    EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, MmTokens, Seq, SoftSegment, SoftSource, MAX_BATCH,
+    EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, LayoutSegment, MmTokens, Seq, SoftSegment, SoftSource, MAX_BATCH,
 };
 use crate::embedgemma2_audio::{AudioConfig, AudioInput, EmbedGemma2Audio, PendingAudio};
 use crate::embedgemma2_tok::Tokenizer;
@@ -203,6 +203,40 @@ pub enum MmItem<'a> {
         /// (what a caller needs to place timestamps between frames: the ids
         /// are theirs).
         videos: &'a [&'a [ImageInput<'a>]],
+    },
+    /// Text interleaved with media, laid out by the library
+    /// ([`crate::embedgemma2::EmbedGemma2Config::mixed_sequence`]): a caller
+    /// writes `[Text("a photo of"), Image(img), Text("on a table")]` and never
+    /// counts a placeholder. The ids are the processor's for that message, built
+    /// with the soft-token counts the towers' checks return and `tokenizer`'s
+    /// text ids; the `j`-th medium of a kind takes the `j`-th soft rows of that
+    /// kind, in segment order.
+    Segments {
+        /// The pieces, in order.
+        segments: &'a [MmSegment<'a>],
+        /// The snapshot's tokenizer, for the text and the timestamp labels.
+        tokenizer: &'a Tokenizer,
+    },
+}
+
+/// One piece of an [`MmItem::Segments`] item.
+#[derive(Clone, Copy, Debug)]
+pub enum MmSegment<'a> {
+    /// Text, tokenized together with the text next to it.
+    Text(&'a str),
+    /// One image, as the processor's patch tensors.
+    Image(ImageInput<'a>),
+    /// One clip, as the processor's features.
+    Audio(&'a AudioInput),
+    /// One video as its sampled frames, laid out as [`MmItem::Video`] lays it out.
+    Video(&'a [ImageInput<'a>]),
+    /// One video under `add_timestamps = true`: `timestamps[f]` is frame `f`'s
+    /// time in seconds ([`MmItem::TimestampedVideo`]).
+    TimestampedVideo {
+        /// The sampled frames, in order.
+        frames: &'a [ImageInput<'a>],
+        /// Each frame's time in seconds.
+        timestamps: &'a [f64],
     },
 }
 
@@ -376,6 +410,30 @@ impl EmbedGemma2Multimodal {
                     clips.extend(au.iter());
                     frames_from
                 }
+                MmItem::Segments { segments, .. } => {
+                    // The images first, then the frames of the videos, as a
+                    // `Media` item lays its lists out; each kind in segment order.
+                    for seg in *segments {
+                        if let MmSegment::Image(img) = seg {
+                            images.push(*img);
+                        }
+                    }
+                    let frames_from = images.len();
+                    for seg in *segments {
+                        match seg {
+                            MmSegment::Video(frames) | MmSegment::TimestampedVideo { frames, .. } => {
+                                images.extend_from_slice(frames);
+                            }
+                            MmSegment::Text(_) | MmSegment::Image(_) | MmSegment::Audio(_) => {}
+                        }
+                    }
+                    for seg in *segments {
+                        if let MmSegment::Audio(clip) = seg {
+                            clips.push(*clip);
+                        }
+                    }
+                    frames_from
+                }
             };
             spans.push(Span {
                 images: i0..frames_from,
@@ -403,6 +461,16 @@ impl EmbedGemma2Multimodal {
                 MmItem::Media { ids, .. } => Cow::Borrowed(*ids),
                 MmItem::Image(_) => Cow::Owned(cfg.image_sequence(image_tokens[span.images.start]).map_err(at)?),
                 MmItem::Audio(_) => Cow::Owned(cfg.audio_sequence(clip_tokens[span.clips.start]).map_err(at)?),
+                MmItem::Segments { segments, tokenizer } => {
+                    let layout = segment_layout(
+                        segments,
+                        &image_tokens[span.images.clone()],
+                        &image_tokens[span.frames.clone()],
+                        &clip_tokens[span.clips.clone()],
+                    )
+                    .map_err(at)?;
+                    Cow::Owned(cfg.mixed_sequence(tokenizer, &layout).map_err(at)?)
+                }
                 MmItem::Video(_) | MmItem::TimestampedVideo { .. } => {
                     let per_frame = &image_tokens[span.frames.clone()];
                     // The processor has one soft-token count per video.
@@ -553,6 +621,56 @@ impl EmbedGemma2Multimodal {
         }
         Ok(out)
     }
+}
+
+/// An [`MmItem::Segments`] item's pieces as the layout builder takes them: the
+/// text as it is, and each medium as the soft-token count the tower's check
+/// returned for it (`images`, `frames` and `clips` are the item's own slices of
+/// the call's counts, in the order [`EmbedGemma2Multimodal::encode`] listed the
+/// media: every image, every video frame, every clip, each in segment order).
+fn segment_layout<'a>(
+    segments: &'a [MmSegment<'a>],
+    images: &'a [usize],
+    frames: &'a [usize],
+    clips: &'a [usize],
+) -> Result<Vec<LayoutSegment<'a>>, String> {
+    let (mut image, mut frame, mut clip) = (0usize, 0usize, 0usize);
+    let mut out = Vec::with_capacity(segments.len());
+    for (s, seg) in segments.iter().enumerate() {
+        out.push(match seg {
+            MmSegment::Text(t) => LayoutSegment::Text(t),
+            MmSegment::Image(_) => {
+                image += 1;
+                LayoutSegment::Image {
+                    soft: images[image - 1],
+                }
+            }
+            MmSegment::Audio(_) => {
+                clip += 1;
+                LayoutSegment::Audio { soft: clips[clip - 1] }
+            }
+            MmSegment::Video(video) | MmSegment::TimestampedVideo { frames: video, .. } => {
+                let per_frame = &frames[frame..frame + video.len()];
+                frame += video.len();
+                // The processor has one soft-token count per video.
+                if let Some(j) = per_frame.iter().position(|&n| n != per_frame[0]) {
+                    return Err(format!(
+                        "segment {s}: frame {j} makes {} soft tokens but frame 0 makes {}; the processor lays out \
+                         one count for a video (MmItem::Media takes frames of different sizes with ids of your own)",
+                        per_frame[j], per_frame[0]
+                    ));
+                }
+                LayoutSegment::Video {
+                    soft_per_frame: per_frame,
+                    timestamps: match seg {
+                        MmSegment::TimestampedVideo { timestamps, .. } => Some(timestamps),
+                        _ => None,
+                    },
+                }
+            }
+        });
+    }
+    Ok(out)
 }
 
 /// An item's soft rows as device segments, in the order of its placeholder

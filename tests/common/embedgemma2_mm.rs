@@ -415,7 +415,7 @@ pub fn clip(cfg: &AudioConfig, frames: usize, seed: u64, valid: impl Fn(usize) -
 /// `eoi_token_id`) and `<|video|>` (62, `video_token_id`) beside `<pad>`,
 /// `<eos>`, `<bos>` and `<unk>`; the other ids are filler entries.
 pub fn timestamp_tokenizer_json() -> String {
-    let added = [
+    tokenizer_json(&[
         (0, "<pad>"),
         (1, "<eos>"),
         (2, "<bos>"),
@@ -423,7 +423,31 @@ pub fn timestamp_tokenizer_json() -> String {
         (40, "<|image>"),
         (41, "<image|>"),
         (62, "<|video|>"),
-    ];
+    ])
+}
+
+/// [`timestamp_tokenizer_json`] with every marker and placeholder of the config
+/// an added token as well: `<|audio>` (42, `boa_token_id`), `<audio|>` (43,
+/// `eoa_token_index`), `<|image|>` (60) and `<|audio|>` (61), so the
+/// processor's whole string for a message with an image or a clip can be
+/// written out and tokenized (`embedgemma2_segments`).
+pub fn full_tokenizer_json() -> String {
+    tokenizer_json(&[
+        (0, "<pad>"),
+        (1, "<eos>"),
+        (2, "<bos>"),
+        (3, "<unk>"),
+        (40, "<|image>"),
+        (41, "<image|>"),
+        (42, "<|audio>"),
+        (43, "<audio|>"),
+        (60, "<|image|>"),
+        (61, "<|audio|>"),
+        (62, "<|video|>"),
+    ])
+}
+
+fn tokenizer_json(added: &[(usize, &str)]) -> String {
     let added_json: Vec<String> = added
         .iter()
         .map(|(id, text)| {
@@ -433,7 +457,7 @@ pub fn timestamp_tokenizer_json() -> String {
         })
         .collect();
     let mut vocab: Vec<String> = (0..63).map(|i| format!("<u{i}>")).collect();
-    for (id, text) in added {
+    for &(id, text) in added {
         vocab[id] = text.to_string();
     }
     for d in 0..10 {

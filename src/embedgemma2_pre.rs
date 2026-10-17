@@ -84,7 +84,7 @@
 
 use std::path::Path;
 
-use crate::embedgemma2_audio::AudioInput;
+use crate::embedgemma2_audio::{out_mask, AudioInput};
 use crate::embedgemma2_mm::read_config_text;
 use crate::embedgemma2_vision::ImageInput;
 use crate::json::{self, Json, NumForm, Syntax};
@@ -561,6 +561,24 @@ pub fn aspect_ratio_preserving_size(
         ));
     }
     Ok((target_height, target_width))
+}
+
+/// The soft tokens (the placeholders of the processor's sequence) an image of
+/// `height x width` pixels makes: the patches of its [`aspect_ratio_preserving_size`]
+/// divided by the pooling cell, which is `PreparedImage::soft_tokens` of
+/// [`preprocess_image`] without resizing anything. The same count for a video
+/// frame under the video's `ImageConfig`.
+pub fn image_soft_tokens(cfg: &ImageConfig, height: usize, width: usize) -> Result<usize, String> {
+    cfg.validate("image_soft_tokens")?;
+    let (th, tw) = aspect_ratio_preserving_size(
+        height,
+        width,
+        cfg.patch_size as usize,
+        cfg.max_patches(),
+        cfg.pooling_kernel as usize,
+    )?;
+    let p = cfg.patch_size as usize;
+    Ok((th / p) * (tw / p) / (cfg.pooling_kernel as usize).pow(2))
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1093,43 @@ fn htk_mel_filters(cfg: &AudioFeatureConfig) -> Vec<f64> {
     out
 }
 
+/// Frames of a clip of `samples` samples (after truncation) and how many of
+/// them are real: `(frames, valid)`.
+fn audio_frame_counts(cfg: &AudioFeatureConfig, samples: usize) -> (usize, usize) {
+    let padded = samples.div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE;
+    let left = cfg.frame_length / 2;
+    let size = cfg.frame_length + 1;
+    let total = padded + left;
+    let frames = if total >= size {
+        (total - size) / cfg.hop_length + 1
+    } else {
+        0
+    };
+    // Frame i is real iff the left-padded sample at i * hop + frame_length
+    // is a real one: i * hop + frame_length - left < samples.
+    let end = cfg.frame_length - left;
+    let valid = if samples > end {
+        ((samples - end - 1) / cfg.hop_length + 1).min(frames)
+    } else {
+        0
+    };
+    (frames, valid)
+}
+
+/// The soft tokens (the placeholders of the processor's sequence) a clip of
+/// `samples` mono samples at the extractor's rate makes: the true entries of
+/// the tower's mask for the frames [`AudioFrontEnd::extract`] would build, after
+/// the clip is cut to `max_samples`. It is that function's frame arithmetic
+/// and [`crate::embedgemma2_audio::out_mask`], not a second formula, and no
+/// feature is computed. 0 for a clip too short for one frame (the tower refuses
+/// it).
+pub fn audio_soft_tokens(cfg: &AudioFeatureConfig, samples: usize) -> usize {
+    let kept = samples.min(cfg.max_samples.div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE);
+    let (frames, valid) = audio_frame_counts(cfg, kept);
+    let mask: Vec<bool> = (0..frames).map(|i| i < valid).collect();
+    out_mask(&mask).into_iter().filter(|&k| k).count()
+}
+
 /// The log-mel front end of `Gemma4AudioFeatureExtractor`, with its window,
 /// filterbank and FFT built once.
 pub struct AudioFrontEnd {
@@ -1117,24 +1172,7 @@ impl AudioFrontEnd {
     /// Frames of a clip of `samples` samples (after truncation) and how many
     /// of them are real: `(frames, valid)`.
     fn frame_counts(&self, samples: usize) -> (usize, usize) {
-        let padded = samples.div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE;
-        let left = self.cfg.frame_length / 2;
-        let size = self.cfg.frame_length + 1;
-        let total = padded + left;
-        let frames = if total >= size {
-            (total - size) / self.cfg.hop_length + 1
-        } else {
-            0
-        };
-        // Frame i is real iff the left-padded sample at i * hop + frame_length
-        // is a real one: i * hop + frame_length - left < samples.
-        let end = self.cfg.frame_length - left;
-        let valid = if samples > end {
-            ((samples - end - 1) / self.cfg.hop_length + 1).min(frames)
-        } else {
-            0
-        };
-        (frames, valid)
+        audio_frame_counts(&self.cfg, samples)
     }
 
     /// The tower's input for one clip of mono f32 PCM at `sampling_rate`. The
@@ -1282,6 +1320,39 @@ pub fn timestamp_label(seconds: f64) -> String {
     let rest = seconds % 60.0;
     let minutes = ((seconds - rest) / 60.0).round();
     format!("{:02}:{:02}", minutes as i64, rest as i64)
+}
+
+/// What a video of `total_frames` frames of `height x width` at `source_fps`
+/// becomes, without decoding or resizing anything: `(sampled frames, soft
+/// tokens a frame)`. The frames are [`sample_frame_indices`]'s (every frame
+/// when `do_sample_frames` is off, up to [`MAX_VIDEO_FRAMES`]) and the count a
+/// frame makes is [`image_soft_tokens`] under the video's image settings, so the
+/// video's placeholders number their product.
+pub fn video_soft_tokens(
+    cfg: &VideoConfig,
+    height: usize,
+    width: usize,
+    total_frames: usize,
+    source_fps: f64,
+) -> Result<(usize, usize), String> {
+    const WHAT: &str = "video_soft_tokens";
+    if total_frames > MAX_VIDEO_FRAMES {
+        return Err(format!(
+            "{WHAT}: {total_frames} frames exceeds the limit of {MAX_VIDEO_FRAMES}"
+        ));
+    }
+    let frames = if cfg.do_sample_frames {
+        sample_frame_indices(cfg, total_frames, source_fps)?.len()
+    } else {
+        if total_frames == 0 {
+            return Err(format!("{WHAT}: the video has no frames"));
+        }
+        if !(source_fps.is_finite() && source_fps > 0.0) {
+            return Err(format!("{WHAT}: source fps must be positive, got {source_fps}"));
+        }
+        total_frames
+    };
+    Ok((frames, image_soft_tokens(&cfg.image, height, width)?))
 }
 
 /// A preprocessed video: the sampled frames and where they came from.

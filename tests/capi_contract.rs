@@ -1779,7 +1779,7 @@ fn eg2_abi() -> (RustAbi, PyAbi) {
     (parse_rust_abi(&read(RS_EG2)), parse_py_abi(&read(PY_EG2)))
 }
 
-const EG2_FNS: [&str; 20] = [
+const EG2_FNS: [&str; 27] = [
     "tessl_embedgemma2_load",
     "tessl_embedgemma2_free",
     "tessl_embedgemma2_embedding_dim",
@@ -1800,6 +1800,13 @@ const EG2_FNS: [&str; 20] = [
     "tessl_embedgemma2_embed_audio",
     "tessl_embedgemma2_embed_videos",
     "tessl_embedgemma2_embed_media",
+    "tessl_embedgemma2_embed_image_sources",
+    "tessl_embedgemma2_embed_audio_sources",
+    "tessl_embedgemma2_embed_video_sources",
+    "tessl_embedgemma2_image_soft_token_count",
+    "tessl_embedgemma2_audio_soft_token_count",
+    "tessl_embedgemma2_video_soft_token_count",
+    "tessl_embedgemma2_embed_segments",
 ];
 
 #[test]
@@ -1952,6 +1959,91 @@ fn a_multimodal_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
     let p = rs_fault("    position_ids: *const i32,\n", "    position_ids: *const u32,\n");
     assert!(
         mentions(&p, "tessl_embedgemma2_encode_images: argument 3 `position_ids`"),
+        "{p:?}"
+    );
+}
+
+/// The same faults for the entries that read files and bytes, count soft tokens and lay
+/// out segments: a pointer to the wrong scalar on either side of a byte-cut table, of the
+/// segment kinds and references, of the frame counts and the rates, an integer width, and
+/// a dropped argument. The unmodified pair is clean and the new entries are all parsed.
+#[test]
+fn a_media_source_or_segment_signature_that_drifts_on_either_side_is_reported() {
+    let (rust, py) = eg2_abi();
+    let py_src = read(PY_EG2);
+    let rs_src = read(RS_EG2);
+    for name in [
+        "tessl_embedgemma2_embed_image_sources",
+        "tessl_embedgemma2_embed_audio_sources",
+        "tessl_embedgemma2_embed_video_sources",
+        "tessl_embedgemma2_image_soft_token_count",
+        "tessl_embedgemma2_audio_soft_token_count",
+        "tessl_embedgemma2_video_soft_token_count",
+        "tessl_embedgemma2_embed_segments",
+    ] {
+        assert!(
+            rust.fns.contains_key(name) && py.fns.contains_key(name),
+            "{name} is not parsed"
+        );
+    }
+    assert_eq!(rust.fns["tessl_embedgemma2_embed_segments"].args.len(), 36);
+    assert_eq!(py.fns["tessl_embedgemma2_embed_segments"].0.len(), 36);
+    assert!(fn_problems(&rust, &py, &[]).is_empty());
+
+    let py_fault = |needle: &str, with: &str| fn_problems(&rust, &parse_py_abi(&fault(&py_src, needle, with)), &[]);
+    let rs_fault = |needle: &str, with: &str| fn_problems(&parse_rust_abi(&fault(&rs_src, needle, with)), &py, &[]);
+
+    // ctypes side.
+    let p = py_fault(
+        "[h, u32, u8p, u64, u64p, u64, u32, f32p, u64] + err_args\n        lib.tessl_embedgemma2_embed_audio_sources.restype",
+        "[h, u32, u8p, u64, u32p, u64, u32, f32p, u64] + err_args\n        lib.tessl_embedgemma2_embed_audio_sources.restype",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_image_sources: argument 4 `offsets`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "            u32p, u64p, u64, u64p, u64,\n",
+        "            u64p, u64p, u64, u64p, u64,\n",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_segments: argument 5 `segment_kinds`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "[h, u32p, u64p, f64p, u64, u64p, u64] + err_args",
+        "[h, u32p, u64p, f32p, u64, u64p, u64] + err_args",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_video_soft_token_count: argument 3 `video_fps`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "[h, u64p, u64, u32, u64p, u64] + err_args",
+        "[h, u64p, u64, u64p, u64] + err_args",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_audio_soft_token_count: C takes"),
+        "{p:?}"
+    );
+
+    // Rust side.
+    let p = rs_fault("    segment_refs: *const u64,\n", "    segment_refs: *const u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_segments: argument 6 `segment_refs`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    extension_len: u64,\n", "    extension_len: u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_video_sources: argument 7 `extension_len`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    frame_counts: *const u64,\n", "    frame_counts: *const u32,\n");
+    assert!(
+        mentions(
+            &p,
+            "tessl_embedgemma2_video_soft_token_count: argument 2 `frame_counts`"
+        ),
         "{p:?}"
     );
 }

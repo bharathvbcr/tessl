@@ -21,10 +21,15 @@ transformers 5.x, fp32, sdpa, CPU, batch size 1.
                 cannot be given to it here.
   clip44.wav    the same clip as 44.1 kHz stereo PCM16 (the second channel
                 half as loud), the array it is given being FFmpeg's decode to
-                16 kHz mono with the channels averaged. FFmpeg's libswresample
-                is the library torchcodec uses; it stands in for it here.
+                16 kHz mono with its default mix (`-ac 1`). FFmpeg's
+                libswresample is the library torchcodec's AudioDecoder(
+                sample_rate=16000, num_channels=1) calls, with these defaults
+                (FFMPEGCommon.cpp create_swr_context); it stands in for it
+                here. tessl::media reproduces it to the bit.
   clip44.m4a    the 44.1 kHz stereo clip as AAC, the array being FFmpeg's
-                decode of that file to 16 kHz mono (channel mean).
+                decode of that file to 16 kHz mono (`-ac 1`).
+  clip44.mp3    the same clip as MP3 (libmp3lame, 128 kb/s), the array again
+                being FFmpeg's decode to 16 kHz mono.
 
 The per-input explanation of what differs from tessl's own decode, and by how
 much, is in docs/embedgemma2.md ("Media decoding").
@@ -49,9 +54,10 @@ FFMPEG = "/opt/homebrew/bin/ffmpeg"
 
 
 def ffmpeg_mono16k(path):
-    """FFmpeg's decode of `path` to 16 kHz mono float32, channels averaged."""
-    cmd = [FFMPEG, "-v", "error", "-i", path, "-af", "pan=mono|c0=0.5*c0+0.5*c1", "-ar", str(SR),
-           "-f", "f32le", "-"]
+    """FFmpeg's decode of `path` to 16 kHz mono float32 with libswresample's
+    defaults: its resampler and its mix (each channel of a stereo pair times
+    1/sqrt(2)), which is what torchcodec's AudioDecoder does."""
+    cmd = [FFMPEG, "-v", "error", "-i", path, "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"]
     return np.frombuffer(subprocess.run(cmd, check=True, capture_output=True).stdout, dtype="<f4").copy()
 
 
@@ -72,6 +78,8 @@ def main():
     wavfile.write(p("clip44.wav"), 44100, np.round(stereo * 32767).astype(np.int16))
     subprocess.run([FFMPEG, "-v", "error", "-y", "-i", p("clip44.wav"), "-c:a", "aac", "-b:a", "128k", p("clip44.m4a")],
                    check=True)
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-i", p("clip44.wav"), "-c:a", "libmp3lame", "-b:a", "128k",
+                    p("clip44.mp3")], check=True)
 
     cases = [
         ("photo.png", p("photo.png")),
@@ -79,6 +87,7 @@ def main():
         ("clip16.wav", {"array": pcm.astype(np.float32) / 32768.0, "sampling_rate": SR}),
         ("clip44.wav", {"array": ffmpeg_mono16k(p("clip44.wav")), "sampling_rate": SR}),
         ("clip44.m4a", {"array": ffmpeg_mono16k(p("clip44.m4a")), "sampling_rate": SR}),
+        ("clip44.mp3", {"array": ffmpeg_mono16k(p("clip44.mp3")), "sampling_rate": SR}),
     ]
     model = SentenceTransformer(snapshot(), device="cpu",
                                 model_kwargs={"attn_implementation": "sdpa", "dtype": torch.float32})

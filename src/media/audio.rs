@@ -1,5 +1,5 @@
-//! Audio decoding with AudioToolbox: `ExtAudioFile` to decode, `AudioConverter`
-//! to resample.
+//! Audio decoding with AudioToolbox (`ExtAudioFile`), then the reference's
+//! channel mix and sample-rate conversion in [`super::resample`].
 //!
 //! WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, Ogg Opus and whatever else the system
 //! decodes become mono `f32` PCM at the sampling rate the preprocessing wants
@@ -7,35 +7,34 @@
 //!
 //! # What the reference does, and what this does
 //!
-//! `transformers.audio_utils.load_audio(path, sampling_rate=16000)` uses
-//! torchcodec's `AudioDecoder(source, sample_rate=16000, num_channels=1)`
-//! (FFmpeg's libswresample) when torchcodec is installed, else
-//! `librosa.load(path, sr=16000)` (soundfile; mean over channels; soxr_hq
-//! resampling), or with `backend="torchaudio"` the mean over channels and
-//! `torchaudio.functional.resample`. None of them is installed in this
-//! repository's Python environment; the oracles in the tests are the `ffmpeg`
-//! CLI (the library torchcodec calls), `torchaudio.functional.resample`, and the
-//! analytic signal the fixtures are made from. This module follows the
-//! semantics, not the bits, of the resampling:
+//! `sentence-transformers` hands an audio path to the processor's
+//! `fetch_audio`, which calls `transformers.audio_utils.load_audio(path,
+//! sampling_rate=16000)` (`feature_extraction_sequence_utils.py:385`). Its
+//! `backend="auto"` uses torchcodec's `AudioDecoder(source, sample_rate=16000,
+//! num_channels=1)` when torchcodec is installed (`audio_utils.py:230-233,
+//! 267`) and `librosa.load(path, sr=16000)` otherwise (`:279`); the
+//! `backend="torchaudio"` branch (`:269-276`) is opt-in. torchcodec resamples
+//! and mixes with a default `SwrContext` (libswresample), created in
+//! `FFMPEGCommon.cpp` by `swr_alloc_set_opts2` with no options set. This module
+//! reproduces that, bit for bit on the machines FFmpeg's AArch64 code runs on:
 //!
 //! * **Decode** at the file's own rate and channel count, to packed `f32`
 //!   (`ExtAudioFile` with a client format equal to the file's rate). Integer
 //!   PCM becomes float as `v / 2^(bits-1)`, as soundfile and FFmpeg do, so a
 //!   PCM16, PCM24, PCM32, PCM8 or float file already at the target rate and
 //!   mono decodes exactly.
-//! * **Channels**: [`Downmix::Mean`] (librosa, torchaudio) by default, or
-//!   [`Downmix::Swresample`] (torchcodec). AudioConverter's own N-to-1 mix
-//!   without a channel map is undocumented, so the mix is done here, in `f32`,
-//!   before resampling (resampling is linear, so the order does not matter).
-//! * **Resampling**: an `AudioConverter` (`AudioConverterNew`,
-//!   `AudioConverterFillComplexBuffer`) at `kAudioConverterQuality_Max` with
-//!   the `Mastering` complexity. It is run as a second stage rather than as the
-//!   `ExtAudioFile` client rate because a codec followed by the file's own
-//!   rate conversion came out 0.26 samples (16 us at 16 kHz) late for AAC and
-//!   Ogg Opus (measured against FFmpeg: 15.6 dB SNR, against 46.4 dB for the
-//!   native decode resampled by torchaudio). Its filter is not FFmpeg's,
-//!   soxr's or torchaudio's; `docs/embedgemma2.md` records how far apart they
-//!   are, measured.
+//! * **Channels and resampling**: [`Resampler::Swresample`] with
+//!   [`Downmix::Swresample`] (the defaults) is [`super::resample::SwrConverter`]:
+//!   each channel resampled, then mixed with libswresample's matrix, which is
+//!   the order `swr_init` picks for a downmix. [`Downmix::Mean`] (what librosa
+//!   and the torchaudio backend do) mixes first and resamples the one channel.
+//! * **[`Resampler::AudioToolbox`]** keeps the system `AudioConverter`
+//!   (`kAudioConverterQuality_Max`, `Mastering` complexity) as a second stage,
+//!   for comparison. Its filter is not FFmpeg's, soxr's or torchaudio's;
+//!   `docs/embedgemma2.md` records how far apart they are, measured. It is run
+//!   as a second stage, not as the `ExtAudioFile` client rate, because a codec
+//!   followed by the file's own rate conversion came out 0.26 samples late for
+//!   AAC and Ogg Opus.
 //! * **Gapless**: AAC (the edit list or `iTunSMPB`), MPEG-1 MP3 and the other
 //!   codecs are trimmed by `ExtAudioFile`; MPEG-2/2.5 MP3 carries its encoder
 //!   delay in a tag it does not read, so `media::mp3` reads it and the
@@ -50,6 +49,7 @@ use std::path::Path;
 
 use super::cf;
 use super::containers::{self, FileSource, Source};
+use super::resample::{self, SwrConverter, SwrMix};
 use super::{os_status_error, MediaError};
 
 // ---------------------------------------------------------------------------
@@ -197,16 +197,28 @@ impl AudioContainer {
 /// How several channels become one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Downmix {
-    /// The mean of the channels: `librosa.load`, soundfile-based loaders and
-    /// the `torchaudio` backend of `transformers.load_audio`.
+    /// The mean of the channels, taken before resampling: `librosa.load`,
+    /// soundfile-based loaders and the `torchaudio` backend of
+    /// `transformers.load_audio`.
     Mean,
     /// libswresample's default mix to mono, which torchcodec's
-    /// `AudioDecoder(num_channels=1)` uses: each channel of a stereo pair times
-    /// `1/sqrt(2)` (no normalisation for float output), so a stereo clip is
-    /// `sqrt(2)` louder than under [`Downmix::Mean`] (measured: FFmpeg's output
-    /// is 7.7 dB below the mean's for uncorrelated channels). Defined for one
-    /// or two channels only; more are refused.
+    /// `AudioDecoder(num_channels=1)` uses ([`super::resample::SwrMix`]): each
+    /// channel of a stereo pair times `1/sqrt(2)` (no normalisation for float
+    /// output), so a stereo clip is `sqrt(2)` louder than under
+    /// [`Downmix::Mean`] (measured: FFmpeg's output is 7.7 dB below the
+    /// mean's for uncorrelated channels). Defined for FFmpeg's default
+    /// layouts of 1 to 8 channels; more are refused.
     Swresample,
+}
+
+/// What converts the file's sampling rate to the requested one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resampler {
+    /// libswresample's default resampler, reproduced in Rust
+    /// ([`super::resample`]): torchcodec's.
+    Swresample,
+    /// The system `AudioConverter` at its best setting, as a second stage.
+    AudioToolbox,
 }
 
 /// Options for [`decode_audio_file`] and [`decode_audio_bytes`].
@@ -221,17 +233,20 @@ pub struct AudioOptions {
     pub truncate: bool,
     /// How multi-channel audio is mixed down.
     pub downmix: Downmix,
+    /// What changes the sampling rate.
+    pub resampler: Resampler,
 }
 
 impl Default for AudioOptions {
-    /// 16 kHz (EmbeddingGemma 2's front end), a limit of 30 minutes, and the
-    /// channel mean.
+    /// 16 kHz (EmbeddingGemma 2's front end), a limit of 30 minutes, and
+    /// torchcodec's mix and resampler (libswresample's).
     fn default() -> Self {
         Self {
             sample_rate: 16_000,
             max_seconds: 1800.0,
             truncate: false,
-            downmix: Downmix::Mean,
+            downmix: Downmix::Swresample,
+            resampler: Resampler::Swresample,
         }
     }
 }
@@ -495,14 +510,18 @@ fn mp3_untrimmed_gapless(file: &ExtFile, source: &dyn Source) -> Result<Option<(
     Ok(containers::mp3_prefix(source).and_then(|p| super::mp3::gapless(&p)))
 }
 
-/// Source-rate frames of a file, read in chunks, trimmed and mixed to mono.
+/// Source-rate frames of a file, read in chunks and trimmed.
 struct Feed<'a> {
     file: &'a ExtFile,
     channels: usize,
     downmix: Downmix,
+    /// The libswresample mix, when `downmix` is [`Downmix::Swresample`].
+    swr_mix: Option<SwrMix>,
     /// Interleaved frames as read.
     raw: Vec<f32>,
-    /// The latest chunk, mixed to mono.
+    /// The latest chunk's range of `raw`, in frames.
+    chunk: std::ops::Range<usize>,
+    /// The latest chunk mixed to mono, once [`Feed::mix_chunk`] has run.
     mono: Vec<f32>,
     /// Source frames still to drop from the front.
     skip: usize,
@@ -514,8 +533,25 @@ struct Feed<'a> {
 }
 
 impl Feed<'_> {
-    /// Read the next chunk of at most `max` frames into `self.mono`. `false` at
-    /// the end of the data (or the first error, left in `self.error`).
+    /// The latest chunk, interleaved.
+    fn chunk_frames(&self) -> &[f32] {
+        &self.raw[self.chunk.start * self.channels..self.chunk.end * self.channels]
+    }
+
+    /// Mix the latest chunk to mono into `self.mono`.
+    fn mix_chunk(&mut self) {
+        let ch = self.channels;
+        let frames = &self.raw[self.chunk.start * ch..self.chunk.end * ch];
+        self.mono.clear();
+        match (&self.swr_mix, self.downmix) {
+            (Some(mix), Downmix::Swresample) => mix.mix_interleaved(frames, &mut self.mono),
+            _ => append_mean(&mut self.mono, frames, ch),
+        }
+    }
+
+    /// Read the next chunk of at most `max` frames into `self.raw`
+    /// ([`Feed::chunk_frames`]). `false` at the end of the data (or the first
+    /// error, left in `self.error`).
     fn next_chunk(&mut self, max: usize) -> bool {
         const CHUNK_FRAMES: usize = 16_384;
         while !self.done && self.keep > 0 {
@@ -550,10 +586,7 @@ impl Feed<'_> {
                 continue;
             }
             self.keep -= take;
-            let ch = self.channels;
-            let slice = &self.raw[dropped * ch..(dropped + take) * ch];
-            self.mono.clear();
-            append_mixed(&mut self.mono, slice, ch, self.downmix);
+            self.chunk = dropped..dropped + take;
             return true;
         }
         false
@@ -575,6 +608,7 @@ unsafe extern "C" fn feed_input(
     let feed = &mut *(user as *mut Feed<'_>);
     let list = &mut *data;
     if feed.next_chunk((*packets) as usize) {
+        feed.mix_chunk();
         list.number_buffers = 1;
         list.buffers[0] = AudioBuffer {
             number_channels: 1,
@@ -609,12 +643,11 @@ fn read_all(file: &ExtFile, options: &AudioOptions, source: &dyn Source) -> Resu
             detail: format!("{channels} channels exceeds {MAX_AUDIO_CHANNELS}"),
         });
     }
-    if options.downmix == Downmix::Swresample && channels > 2 {
-        return Err(MediaError::Unsupported {
-            what: "audio",
-            detail: format!("Downmix::Swresample is defined for one or two channels, the file has {channels}"),
-        });
-    }
+    // The libswresample mix is modelled for FFmpeg's default layouts only.
+    let swr_mix = match options.downmix {
+        Downmix::Swresample => Some(SwrMix::new(channels as usize)?),
+        Downmix::Mean => None,
+    };
     let source_frames = get_prop::<i64>(
         file,
         PROP_FILE_LENGTH_FRAMES,
@@ -678,7 +711,9 @@ fn read_all(file: &ExtFile, options: &AudioOptions, source: &dyn Source) -> Resu
         file,
         channels: channels as usize,
         downmix: options.downmix,
+        swr_mix,
         raw: vec![0f32; 16_384 * channels as usize],
+        chunk: 0..0,
         mono: Vec::new(),
         skip,
         keep,
@@ -686,15 +721,50 @@ fn read_all(file: &ExtFile, options: &AudioOptions, source: &dyn Source) -> Resu
         done: false,
     };
     let mut truncated = false;
-    if (src.sample_rate - f64::from(options.sample_rate)).abs() <= f64::EPSILON {
-        while feed.next_chunk(usize::MAX) {
-            let room = max_samples - mono.len().min(max_samples);
-            if feed.mono.len() > room {
-                mono.extend_from_slice(&feed.mono[..room]);
-                truncated = true;
-                break;
+    let same_rate = (src.sample_rate - f64::from(options.sample_rate)).abs() <= f64::EPSILON;
+    if same_rate || options.resampler == Resampler::Swresample {
+        // The mix and the rate change are libswresample's: per-channel
+        // resampling then the matrix (`Downmix::Swresample`), or the mean
+        // first and one channel resampled (`Downmix::Mean`). Equal rates only
+        // mix.
+        let in_rate = if same_rate {
+            options.sample_rate
+        } else if src.sample_rate.fract() == 0.0 && src.sample_rate <= f64::from(resample::MAX_RATE) {
+            src.sample_rate as u32
+        } else {
+            return Err(MediaError::Unsupported {
+                what: "audio",
+                detail: format!(
+                    "a source rate of {} Hz is not a whole number of Hz within {} Hz; Resampler::AudioToolbox takes it",
+                    src.sample_rate,
+                    resample::MAX_RATE
+                ),
+            });
+        };
+        let mean_first = options.downmix == Downmix::Mean;
+        let mut conv = SwrConverter::new(
+            if mean_first { 1 } else { channels as usize },
+            in_rate,
+            options.sample_rate,
+        )?;
+        let mut produced: Vec<f32> = Vec::new();
+        'read: while feed.next_chunk(usize::MAX) {
+            produced.clear();
+            if mean_first {
+                feed.mix_chunk();
+                conv.push(&feed.mono, &mut produced);
+            } else {
+                conv.push(feed.chunk_frames(), &mut produced);
             }
-            mono.extend_from_slice(&feed.mono);
+            if append_capped(&mut mono, &produced, max_samples) {
+                truncated = true;
+                break 'read;
+            }
+        }
+        if !truncated && feed.error == 0 {
+            produced.clear();
+            conv.finish(&mut produced);
+            truncated = append_capped(&mut mono, &produced, max_samples);
         }
     } else {
         let converter = new_resampler(src.sample_rate, options.sample_rate)?;
@@ -782,22 +852,27 @@ fn read_all(file: &ExtFile, options: &AudioOptions, source: &dyn Source) -> Resu
     })
 }
 
-/// Append one mono sample per interleaved frame of `frames`.
-fn append_mixed(out: &mut Vec<f32>, frames: &[f32], channels: usize, downmix: Downmix) {
+/// Append one mono sample per interleaved frame of `frames`: the mean of the
+/// channels, summed in order in `f32` then divided.
+fn append_mean(out: &mut Vec<f32>, frames: &[f32], channels: usize) {
     if channels == 1 {
         out.extend_from_slice(frames);
         return;
     }
-    match downmix {
-        Downmix::Mean => {
-            let n = channels as f32;
-            out.extend(frames.chunks_exact(channels).map(|f| f.iter().sum::<f32>() / n));
-        }
-        Downmix::Swresample => {
-            // `channels == 2` is checked before decoding starts.
-            let c = std::f32::consts::FRAC_1_SQRT_2;
-            out.extend(frames.chunks_exact(2).map(|f| f[0] * c + f[1] * c));
-        }
+    let n = channels as f32;
+    out.extend(frames.chunks_exact(channels).map(|f| f.iter().sum::<f32>() / n));
+}
+
+/// Append `chunk` to `out` without letting `out` pass `max` samples. `true`
+/// when the chunk had more than fit (the extra is dropped).
+fn append_capped(out: &mut Vec<f32>, chunk: &[f32], max: usize) -> bool {
+    let room = max.saturating_sub(out.len());
+    if chunk.len() > room {
+        out.extend_from_slice(&chunk[..room]);
+        true
+    } else {
+        out.extend_from_slice(chunk);
+        false
     }
 }
 

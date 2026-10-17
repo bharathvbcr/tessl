@@ -28,6 +28,7 @@ mod media;
 mod memory;
 mod paired;
 mod registry;
+mod resample;
 mod small_m;
 mod stage;
 mod svg;

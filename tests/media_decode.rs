@@ -17,12 +17,31 @@ mod media_support;
 use std::collections::HashMap;
 
 use media_support::*;
-use tessl::media::audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, Downmix};
+use tessl::media::audio::{decode_audio_bytes, decode_audio_file, AudioContainer, AudioOptions, Downmix, Resampler};
 use tessl::media::image::{
     decode_image, decode_image_file, ColorHandling, DecodePath, ExifOrientation, Gray16, ImageLayout, ImageOptions,
 };
 use tessl::media::video::{VideoOptions, VideoSource};
 use tessl::media::MediaError;
+
+/// The channel mean, taken before resampling: what the `ffmpeg_mean` goldens
+/// (`pan=mono|c0=0.5*c0+0.5*c1`, then `aresample`) are. The default
+/// [`AudioOptions`] mix like torchcodec instead (libswresample's matrix).
+fn mean() -> AudioOptions {
+    AudioOptions {
+        downmix: Downmix::Mean,
+        ..AudioOptions::default()
+    }
+}
+
+/// The same mean, resampled by the system `AudioConverter`: the path the
+/// bounds of the three tests that use it were measured on.
+fn apple_mean() -> AudioOptions {
+    AudioOptions {
+        resampler: Resampler::AudioToolbox,
+        ..mean()
+    }
+}
 
 fn opts(layout: ImageLayout) -> ImageOptions {
     ImageOptions {
@@ -425,7 +444,7 @@ fn resampled_audio_is_measured_against_three_references() {
         let truth = f32s(&format!("{name}.truth.f32"));
         let ta = f32s(&format!("{name}.torchaudio.f32"));
         let ffm = f32s(&format!("{name}.ffmpeg_mean.f32"));
-        let got = decode_audio_file(&fixture(name), &AudioOptions::default()).unwrap();
+        let got = decode_audio_file(&fixture(name), &apple_mean()).unwrap();
         assert_eq!((got.source_rate as u32, got.source_channels), (rate, ch), "{name}");
         assert_eq!(got.samples.len(), truth.len(), "{name}: output length");
         let s = |r: &[f32]| {
@@ -455,11 +474,12 @@ fn swresample_downmix_matches_ffmpegs_default_and_mean_is_quieter_by_root_two() 
         &fixture(name),
         &AudioOptions {
             downmix: Downmix::Swresample,
+            resampler: Resampler::AudioToolbox,
             ..AudioOptions::default()
         },
     )
     .unwrap();
-    let mean = decode_audio_file(&fixture(name), &AudioOptions::default()).unwrap();
+    let mean = decode_audio_file(&fixture(name), &apple_mean()).unwrap();
     let snr = snr_db(interior(&ffmpeg_default, EDGE), interior(&sw.samples, EDGE));
     eprintln!(
         "Swresample downmix vs ffmpeg -ac 1: {snr:.1} dB; mean vs ffmpeg -ac 1: {:.1} dB",
@@ -499,7 +519,7 @@ fn resampled_audio_is_within_the_measured_bounds() {
         let truth = f32s(&format!("{name}.truth.f32"));
         let ta = f32s(&format!("{name}.torchaudio.f32"));
         let ffm = f32s(&format!("{name}.ffmpeg_mean.f32"));
-        let got = decode_audio_file(&fixture(name), &AudioOptions::default()).unwrap();
+        let got = decode_audio_file(&fixture(name), &apple_mean()).unwrap();
         assert_eq!(got.samples.len(), truth.len(), "{name}: length");
         let g = interior(&got.samples, EDGE);
         let checks = [
@@ -515,17 +535,21 @@ fn resampled_audio_is_within_the_measured_bounds() {
 }
 
 /// `(file, channels, floor of SNR vs ffmpeg, floor of SNR vs the analytic
-/// signal)` of the compressed fixtures. Floors sit a few dB under what was
-/// measured (46.1/33.1, 46.8/26.0, 46.5/50.6, 89.5/26.0, 136/30.9, 14.6/14.5):
-/// the lossy codecs are 26-33 dB from the signal they encoded, FFmpeg's own
-/// decode being as far (mp3: 26.0); Ogg Opus is discussed in the test below.
+/// signal)` of the compressed fixtures, decoded with the channel mean and the
+/// libswresample resampler. Floors sit a few dB under what was measured
+/// (138.8/33.2, 92.6/26.0, 87.7/52.2, 89.5/26.0, 135.9/30.9, 14.6/14.5): the
+/// lossy codecs are 26-33 dB from the signal they encoded, FFmpeg's own decode
+/// being as far (mp3: 26.0). The stereo FLAC's 87.7 dB is the golden's, not the
+/// decode's: `pan` in `gen_media_fixtures.py` quantises the mix to 16 bits
+/// (`tests/media_resample.rs` holds the float mean to the bit). Ogg Opus is
+/// discussed in the test below.
 const COMPRESSED: &[(&str, u32, f64, f64)] = &[
-    ("tone_44k_stereo.m4a", 2, 40.0, 30.0),
-    ("tone_44k_stereo.mp3", 2, 40.0, 23.0),
-    ("tone_44k_stereo.flac", 2, 40.0, 45.0),
-    ("tone_16k_mono.mp3", 1, 80.0, 23.0),
-    ("tone_16k_mono.m4a", 1, 100.0, 28.0),
-    ("tone_16k_mono.opus", 1, 12.0, 12.0),
+    ("tone_44k_stereo.m4a", 2, 130.0, 32.0),
+    ("tone_44k_stereo.mp3", 2, 88.0, 25.0),
+    ("tone_44k_stereo.flac", 2, 84.0, 50.0),
+    ("tone_16k_mono.mp3", 1, 85.0, 25.0),
+    ("tone_16k_mono.m4a", 1, 130.0, 30.0),
+    ("tone_16k_mono.opus", 1, 14.0, 14.0),
 ];
 
 #[test]
@@ -535,8 +559,8 @@ fn compressed_audio_decodes_with_the_expected_length_and_content() {
     for &(name, ch, floor_ffmpeg, floor_truth) in COMPRESSED {
         let ffm = f32s(&format!("{name}.ffmpeg_mean.f32"));
         let truth = if ch == 2 { &truth_st } else { &truth_mo };
-        let got = decode_audio_file(&fixture(name), &AudioOptions::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let bytes_path = decode_audio_bytes(&bytes(name), AudioContainer::Auto, &AudioOptions::default()).unwrap();
+        let got = decode_audio_file(&fixture(name), &mean()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let bytes_path = decode_audio_bytes(&bytes(name), AudioContainer::Auto, &mean()).unwrap();
         // Codec output is float arithmetic whose last bit depends on buffer
         // alignment (the same file differs by ~2e-8 between runs of the test
         // binary that allocate differently), so path and bytes agree to a
@@ -582,15 +606,17 @@ fn compressed_audio_decodes_with_the_expected_length_and_content() {
             "{name}: {vs_truth:.1} dB vs the signal under {floor_truth}"
         );
         if name.ends_with(".opus") {
-            // AudioToolbox's Opus decoder (afconvert returns the same samples)
-            // is two 48 kHz frames behind libopus (FFmpeg) for the first
-            // 16000 frames of this file, then identical to 138 dB; at 16 kHz
-            // that is the first 6000 samples, then 66.9 dB on the committed
-            // encode (93.9 dB on the earlier one).
+            // The golden is FFmpeg's *native* Opus decoder (what `ffmpeg` and
+            // torchcodec run by default), which is two 48 kHz samples behind
+            // libopus in the SILK frames of this file, its first 18000 samples
+            // (6000 at 16 kHz), and identical to AudioToolbox's after that.
+            // AudioToolbox's decode is not behind libopus: it matches it to
+            // the bit in SILK frames (tests/media_resample.rs measures this
+            // against libopus itself).
             let tail = snr_db(&ffm[6000..], &got.samples[6000..]);
             eprintln!("{name}: SNR vs ffmpeg after the first 6000 samples {tail:.1} dB");
             assert!(
-                tail >= 60.0,
+                tail >= 130.0,
                 "{name}: {tail:.1} dB vs ffmpeg after the first 6000 samples"
             );
         }

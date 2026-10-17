@@ -124,11 +124,12 @@ use crate::capi::{
 };
 use crate::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, EncodeOutput, MAX_BATCH};
 use crate::embedgemma2_audio::{AudioConfig, AudioInput, MAX_CALL_CLIPS, MAX_CALL_FRAMES, MAX_FRAMES_PER_FORWARD};
-use crate::embedgemma2_mm::{read_config_text, EmbedGemma2Multimodal, MmItem, TEXT_PREFIX};
+use crate::embedgemma2_media::{prepare_audio, prepare_image, MediaSource, OpenedVideo};
+use crate::embedgemma2_mm::{read_config_text, EmbedGemma2Multimodal, MmItem, MmSegment, TEXT_PREFIX};
 use crate::embedgemma2_pre::{
-    preprocess_image, preprocess_video, sample_frame_indices, AudioFeatureConfig, AudioFrontEnd, ImageConfig,
-    PreConfig, PreparedImage, PreparedVideo, RawImage, VideoConfig, AUDIO_PAD_MULTIPLE, MAX_IMAGE_PIXELS,
-    MAX_VIDEO_FRAMES,
+    audio_soft_tokens, image_soft_tokens, preprocess_image, preprocess_video, sample_frame_indices, video_soft_tokens,
+    AudioFeatureConfig, AudioFrontEnd, ImageConfig, PreConfig, PreparedImage, PreparedVideo, RawImage, VideoConfig,
+    AUDIO_PAD_MULTIPLE, MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES,
 };
 use crate::embedgemma2_tok::{Tokenizer, MAX_TEXT_BYTES};
 use crate::embedgemma2_vision::{ImageInput, VisionConfig, MAX_BATCH_PATCHES, MAX_CALL_IMAGES, MAX_CALL_PATCHES};
@@ -1564,11 +1565,19 @@ fn check_pictures(what: &str, pictures: usize, patches: usize) -> Result<(), Str
 /// extractor's cut, against [`MAX_CALL_FRAMES`] (the tower checks the exact
 /// count; this one bounds the features built).
 fn check_clip_frames(what: &str, cfg: &AudioFeatureConfig, clips: &[&[f32]]) -> Result<(), String> {
+    let frames: usize = clips.iter().map(|c| clip_frames(cfg, c.len())).sum();
+    check_frames(what, frames)
+}
+
+/// The frames a clip of `samples` samples makes, estimated from its length
+/// after the extractor's cut (a bound, not the count).
+fn clip_frames(cfg: &AudioFeatureConfig, samples: usize) -> usize {
     let kept_max = cfg.max_samples.div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE;
-    let frames: usize = clips
-        .iter()
-        .map(|c| c.len().min(kept_max).div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE / cfg.hop_length + 2)
-        .sum();
+    samples.min(kept_max).div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE / cfg.hop_length + 2
+}
+
+/// `frames` against [`MAX_CALL_FRAMES`].
+fn check_frames(what: &str, frames: usize) -> Result<(), String> {
     if frames > MAX_CALL_FRAMES {
         return Err(format!(
             "{what}: the clips would make about {frames} frames; the per-call bound MAX_CALL_FRAMES is \
@@ -2073,6 +2082,1323 @@ unsafe fn raw_videos_or_none<'a>(
     }
     // SAFETY: forwarded from this function's contract.
     unsafe { raw_videos(what, frames, frames_len, dims, frame_offsets, fps, n) }
+}
+
+// ---------------------------------------------------------------------------
+// Files, bytes, and text interleaved with media
+// ---------------------------------------------------------------------------
+
+/// A modality's media passed as raw decoded arrays: pixels (`u8` HWC with an
+/// `[n, 3]` dims table), 32-bit float PCM (native endianness, as bytes) or RGB
+/// video frames (an `[n, 2]` dims table and one rate each).
+pub const TESSL_EMBEDGEMMA2_SOURCE_RAW: u32 = 0;
+/// A modality's media passed as UTF-8 file paths, laid end to end.
+pub const TESSL_EMBEDGEMMA2_SOURCE_PATHS: u32 = 1;
+/// A modality's media passed as whole encoded files in memory, laid end to end.
+pub const TESSL_EMBEDGEMMA2_SOURCE_BYTES: u32 = 2;
+
+/// A segment of [`tessl_embedgemma2_embed_segments`] that is a text: `refs`
+/// indexes the call's texts.
+pub const TESSL_EMBEDGEMMA2_SEGMENT_TEXT: u32 = 0;
+/// A segment that is an image: `refs` indexes the call's images.
+pub const TESSL_EMBEDGEMMA2_SEGMENT_IMAGE: u32 = 1;
+/// A segment that is an audio clip: `refs` indexes the call's clips.
+pub const TESSL_EMBEDGEMMA2_SEGMENT_AUDIO: u32 = 2;
+/// A segment that is a video: `refs` indexes the call's videos.
+pub const TESSL_EMBEDGEMMA2_SEGMENT_VIDEO: u32 = 3;
+/// A segment that is a video laid out with the `mm:ss` timestamp in front of
+/// each frame's block (the processor's `add_timestamps = true`).
+pub const TESSL_EMBEDGEMMA2_SEGMENT_VIDEO_TIMESTAMPED: u32 = 4;
+
+/// Most segments one [`tessl_embedgemma2_embed_segments`] call takes.
+pub const TESSL_EMBEDGEMMA2_MAX_SEGMENTS: u64 = 1 << 16;
+
+/// Most bytes one encoded video may hold (a video is written to a temporary
+/// file for AVFoundation).
+pub const TESSL_EMBEDGEMMA2_MAX_VIDEO_BYTES: u64 = 1 << 32;
+
+/// Longest file extension hint for video bytes.
+pub const TESSL_EMBEDGEMMA2_MAX_EXTENSION_BYTES: u64 = 8;
+
+/// One encoded medium: a file to read or its bytes.
+#[derive(Clone, Copy)]
+enum Piece<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> Piece<'a> {
+    fn source(self) -> MediaSource<'a> {
+        match self {
+            Piece::Path(p) => MediaSource::Path(p),
+            Piece::Bytes(b) => MediaSource::Bytes(b),
+        }
+    }
+
+    /// How the medium is named in a message: the index in its table, and whether
+    /// it is a file or bytes.
+    fn label(self, index: usize) -> String {
+        match self {
+            Piece::Path(_) => format!("file {index}"),
+            Piece::Bytes(_) => format!("bytes {index}"),
+        }
+    }
+}
+
+/// One modality's media of a call: raw decoded arrays, or encoded files.
+enum Table<'a, R> {
+    Raw(Vec<R>),
+    Encoded(Vec<Piece<'a>>),
+}
+
+/// `n` encoded media (`source` [`TESSL_EMBEDGEMMA2_SOURCE_PATHS`] or `_BYTES`)
+/// laid end to end in `blob` and cut by `n + 1` strictly increasing `offsets`
+/// from 0 to `blob_len` (a medium is never empty). Each path is 1 to
+/// [`TESSL_EMBEDGEMMA2_MAX_PATH_BYTES`] bytes of UTF-8 with no NUL; each
+/// encoded medium at most `max_bytes`. Every offset is checked before the blob is
+/// read, and nothing is read from the files here.
+///
+/// # Safety
+/// As [`checked_slice`] for `blob_len` bytes and `n + 1` `u64`s.
+#[allow(clippy::too_many_arguments)]
+unsafe fn encoded_pieces<'a>(
+    what: &str,
+    noun: &str,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    n: usize,
+    max_bytes: u64,
+) -> Result<Vec<Piece<'a>>, String> {
+    let paths = match source {
+        TESSL_EMBEDGEMMA2_SOURCE_PATHS => true,
+        TESSL_EMBEDGEMMA2_SOURCE_BYTES => false,
+        other => {
+            return Err(format!(
+                "{what}: {noun}_source is {other}, expected {TESSL_EMBEDGEMMA2_SOURCE_PATHS} (UTF-8 file paths) or \
+                 {TESSL_EMBEDGEMMA2_SOURCE_BYTES} (encoded bytes); raw arrays go through the entries that take \
+                 them (embed_images, embed_audio, embed_videos, embed_segments)"
+            ))
+        }
+    };
+    let (unit, limit) = if paths {
+        ("path bytes", TESSL_EMBEDGEMMA2_MAX_PATH_BYTES)
+    } else {
+        ("bytes", max_bytes)
+    };
+    // SAFETY: forwarded from this function's contract.
+    let cuts = unsafe { csr_offsets(what, offsets, n, noun, unit, limit, "") }?;
+    if cuts[n] != blob_len {
+        return Err(format!(
+            "{what}: {noun}_offsets end at {} but {noun}_blob_len is {blob_len}",
+            cuts[n]
+        ));
+    }
+    let len = usize::try_from(blob_len).map_err(|_| format!("{what}: {noun}_blob_len overflows usize"))?;
+    // SAFETY: forwarded from this function's contract.
+    let all = unsafe { checked_slice(blob, len, what, &format!("{noun}_blob")) }?;
+    cuts.windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let part = &all[w[0] as usize..w[1] as usize];
+            if !paths {
+                return Ok(Piece::Bytes(part));
+            }
+            let text = std::str::from_utf8(part).map_err(|_| format!("{what}: {noun} {i}: the path is not UTF-8"))?;
+            if text.contains('\0') {
+                return Err(format!("{what}: {noun} {i}: the path contains a NUL byte"));
+            }
+            Ok(Piece::Path(Path::new(text)))
+        })
+        .collect()
+}
+
+/// A video's extension hint: for bytes, 1 to
+/// [`TESSL_EMBEDGEMMA2_MAX_EXTENSION_BYTES`] bytes of UTF-8 (`mp4` when null),
+/// for paths null with length 0 (a file's own name says what it is).
+///
+/// # Safety
+/// As [`checked_slice`] for `len` bytes.
+unsafe fn extension_arg<'a>(what: &str, source: u32, ext: *const c_char, len: u64) -> Result<&'a str, String> {
+    if source != TESSL_EMBEDGEMMA2_SOURCE_BYTES {
+        if !ext.is_null() || len != 0 {
+            return Err(format!(
+                "{what}: an extension hint goes with encoded bytes; pass a null extension and 0 with file paths"
+            ));
+        }
+        return Ok("mp4");
+    }
+    if ext.is_null() {
+        if len != 0 {
+            return Err(format!("{what}: null extension with extension_len {len}"));
+        }
+        return Ok("mp4");
+    }
+    if len == 0 || len > TESSL_EMBEDGEMMA2_MAX_EXTENSION_BYTES {
+        return Err(format!(
+            "{what}: extension_len is {len}, expected 1..={TESSL_EMBEDGEMMA2_MAX_EXTENSION_BYTES}"
+        ));
+    }
+    let n = usize::try_from(len).map_err(|_| format!("{what}: extension_len overflows usize"))?;
+    // SAFETY: forwarded from this function's contract.
+    let bytes = unsafe { checked_slice(ext.cast::<u8>(), n, what, "extension") }?;
+    std::str::from_utf8(bytes).map_err(|_| format!("{what}: extension is not UTF-8"))
+}
+
+fn prepare_encoded_images(what: &str, cfg: &ImageConfig, pieces: &[Piece<'_>]) -> Result<Vec<PreparedImage>, String> {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(i, p)| prepare_image(cfg, p.source()).map_err(|e| format!("{what}: {}: {e}", p.label(i))))
+        .collect()
+}
+
+/// Decode and extract each clip in turn. `refs[k]` is how many times clip `k`
+/// reaches the tower (1 each when every clip is one item); the frames of what
+/// has been prepared so far are checked against [`MAX_CALL_FRAMES`] as they are
+/// built, so a call refuses before it has built much more than the bound.
+fn prepare_encoded_clips(
+    what: &str,
+    front_end: &AudioFrontEnd,
+    pieces: &[Piece<'_>],
+    refs: &[usize],
+) -> Result<Vec<AudioInput>, String> {
+    let mut frames = 0usize;
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let clip = prepare_audio(front_end, p.source()).map_err(|e| format!("{what}: {}: {e}", p.label(i)))?;
+            frames = frames.saturating_add(clip.mask.len().saturating_mul(refs[i]));
+            check_frames(what, frames)?;
+            Ok(clip)
+        })
+        .collect()
+}
+
+/// Open every video's first pass (no pixels), so the call's picture bounds are
+/// checked on the frames the sampler will keep before one is decoded. Returns
+/// the opened videos and the pictures each makes.
+fn open_videos(
+    what: &str,
+    cfg: &VideoConfig,
+    pieces: &[Piece<'_>],
+    extension: &str,
+) -> Result<(Vec<OpenedVideo>, Vec<usize>), String> {
+    let mut opened = Vec::with_capacity(pieces.len());
+    let mut pictures = Vec::with_capacity(pieces.len());
+    for (i, p) in pieces.iter().enumerate() {
+        let at = |e: crate::media::MediaError| format!("{what}: {}: {e}", p.label(i));
+        let video = OpenedVideo::open(p.source(), extension).map_err(at)?;
+        pictures.push(video.sampled_frames(cfg).map_err(at)?);
+        opened.push(video);
+    }
+    Ok((opened, pictures))
+}
+
+fn prepare_opened_videos(
+    what: &str,
+    cfg: &VideoConfig,
+    pieces: &[Piece<'_>],
+    opened: &[OpenedVideo],
+) -> Result<Vec<PreparedVideo>, String> {
+    opened
+        .iter()
+        .zip(pieces)
+        .enumerate()
+        .map(|(i, (v, p))| v.prepare(cfg).map_err(|e| format!("{what}: {}: {e}", p.label(i))))
+        .collect()
+}
+
+/// Embed `n_images` images read from files or given as encoded bytes into `out`,
+/// `[n_images, dim]` row-major f32, each row L2-normalized: [`tessl::media`]'s
+/// decoder (ImageIO: PNG, JPEG, GIF, HEIC, TIFF, BMP, ... the first image of the
+/// file; RGB samples as stored, the EXIF orientation not applied, as
+/// torchvision reads a path), then [`tessl_embedgemma2_embed_images`]'s
+/// preprocessing and the vision tower, in one call and one wait. Needs a handle
+/// from [`tessl_embedgemma2_load_multimodal`].
+///
+/// `source` is [`TESSL_EMBEDGEMMA2_SOURCE_PATHS`] (`blob` holds UTF-8 paths) or
+/// [`TESSL_EMBEDGEMMA2_SOURCE_BYTES`] (`blob` holds encoded files); `blob`
+/// (`blob_len` bytes) is the media laid end to end and `offsets` its
+/// `n_images + 1` strictly increasing cuts from 0 to `blob_len`. A path is at
+/// most [`TESSL_EMBEDGEMMA2_MAX_PATH_BYTES`] bytes, an encoded image at most
+/// [`crate::media::image::MAX_IMAGE_FILE_BYTES`]; all are checked, with the
+/// count (`1..=`[`MAX_BATCH`]) and the call's padded patches
+/// ([`MAX_CALL_PATCHES`], before the first file is opened), before anything is
+/// read. One image at a time is decoded and preprocessed. A file that cannot
+/// be decoded is an error naming its index and the decoder's reason
+/// (`file 2: cannot read ...`, `bytes 1: image: cannot be decoded ...`), and
+/// the output is untouched. `truncate_dim` and `out_len` are as for
+/// [`tessl_embedgemma2_encode`].
+///
+/// # Safety
+/// As [`tessl_embedgemma2_encode`]; `blob` points to `blob_len` readable bytes and
+/// `offsets` to `n_images + 1` readable `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_embed_image_sources(
+    model: *mut TesslEmbedGemma2,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    n_images: u64,
+    truncate_dim: u32,
+    out: *mut f32,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_embed_image_sources";
+            let TesslEmbedGemma2 {
+                engine,
+                snapshot,
+                front,
+                ..
+            } = h;
+            let mm = engine.multimodal(WHAT)?;
+            let n = count_arg(WHAT, "n_images", n_images, MAX_BATCH)?;
+            let want_out = output_shape(WHAT, mm.text().config(), n, truncate_dim, out_len)?;
+            let pieces = encoded_pieces(
+                WHAT,
+                "image",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                crate::media::image::MAX_IMAGE_FILE_BYTES,
+            )?;
+            let out = checked_slice_mut(out, want_out, WHAT, "out")?;
+            let pre = front.pre(snapshot, WHAT)?;
+            check_image_config(WHAT, "image_processor", &pre.image, mm.vision().config())?;
+            check_pictures(WHAT, n, n.saturating_mul(pre.image.max_patches()))?;
+            let prepared = prepare_encoded_images(WHAT, &pre.image, &pieces)?;
+            let items: Vec<MmItem<'_>> = prepared.iter().map(|p| MmItem::Image(p.input())).collect();
+            let enc = mm.encode(&items, (truncate_dim != 0).then_some(truncate_dim))?;
+            copy_embeddings(WHAT, &enc, out)
+        })
+    }
+}
+
+/// Embed `n_clips` audio files or encoded clips into `out`, `[n_clips, dim]`
+/// row-major f32, each row L2-normalized: [`tessl::media`]'s decoder
+/// (AudioToolbox: WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, ...; mono by the mean of
+/// the channels, resampled to the extractor's 16 kHz), then
+/// [`tessl_embedgemma2_embed_audio`]'s feature extraction (a clip is cut to the
+/// extractor's 30 s) and the audio tower, in one call and one wait. Needs a handle
+/// from [`tessl_embedgemma2_load_multimodal`].
+///
+/// `source`, `blob`, `blob_len` and `offsets` are as for
+/// [`tessl_embedgemma2_embed_image_sources`], with an encoded clip at most
+/// [`crate::media::audio::MAX_AUDIO_FILE_BYTES`]; a clip longer than 30 minutes
+/// is refused by the decoder. The frames built so far are checked against
+/// [`MAX_CALL_FRAMES`] after each clip. Errors name the clip's index and the
+/// decoder's reason.
+///
+/// # Safety
+/// As [`tessl_embedgemma2_embed_image_sources`], with `n_clips + 1` offsets.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_embed_audio_sources(
+    model: *mut TesslEmbedGemma2,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    n_clips: u64,
+    truncate_dim: u32,
+    out: *mut f32,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_embed_audio_sources";
+            let TesslEmbedGemma2 {
+                engine,
+                snapshot,
+                front,
+                ..
+            } = h;
+            let mm = engine.multimodal(WHAT)?;
+            let n = count_arg(WHAT, "n_clips", n_clips, MAX_BATCH)?;
+            let want_out = output_shape(WHAT, mm.text().config(), n, truncate_dim, out_len)?;
+            let pieces = encoded_pieces(
+                WHAT,
+                "audio",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                crate::media::audio::MAX_AUDIO_FILE_BYTES,
+            )?;
+            let out = checked_slice_mut(out, want_out, WHAT, "out")?;
+            let front_end = front.audio(snapshot, WHAT)?;
+            check_audio_config(WHAT, front_end.config(), mm.audio().config())?;
+            let features = prepare_encoded_clips(WHAT, front_end, &pieces, &vec![1; n])?;
+            let items: Vec<MmItem<'_>> = features.iter().map(MmItem::Audio).collect();
+            let enc = mm.encode(&items, (truncate_dim != 0).then_some(truncate_dim))?;
+            copy_embeddings(WHAT, &enc, out)
+        })
+    }
+}
+
+/// Embed `n_videos` video files or encoded videos into `out`, `[n_videos, dim]`
+/// row-major f32, each row L2-normalized: [`tessl::media`]'s decoder
+/// (AVFoundation: MP4, MOV, ... H.264, HEVC; upright frames), the processor's
+/// frame sampling (the snapshot's `fps` and `max_frames`, over the exact frame
+/// count and source rate the file reports) decoding only the sampled frames,
+/// [`tessl_embedgemma2_embed_videos`]'s per-frame resize, and the vision tower,
+/// in one call and one wait. Needs a handle from
+/// [`tessl_embedgemma2_load_multimodal`].
+///
+/// `source`, `blob`, `blob_len` and `offsets` are as for
+/// [`tessl_embedgemma2_embed_image_sources`], with an encoded video at most
+/// [`TESSL_EMBEDGEMMA2_MAX_VIDEO_BYTES`]. `extension` (`extension_len` bytes,
+/// 1 to [`TESSL_EMBEDGEMMA2_MAX_EXTENSION_BYTES`] of letters and digits: `mp4`,
+/// `mov`) is the type AVFoundation sniffs encoded bytes as, since it reads
+/// files and the bytes are written to a private temporary file (removed
+/// before the call returns); null with 0 means `mp4`, and paths take null with 0.
+/// `timestamps` 1 writes each frame's `mm:ss` time (`index / fps`, the
+/// processor's) in front of its block (it needs `tokenizer.json`), 0 does not,
+/// anything else is refused. Every video's first pass (no pixels decoded) runs
+/// and the sampled pictures are checked against [`MAX_CALL_IMAGES`] and
+/// [`MAX_CALL_PATCHES`] before any frame is decoded. Errors name the video's
+/// index and the decoder's reason.
+///
+/// # Safety
+/// As [`tessl_embedgemma2_embed_image_sources`], with `n_videos + 1` offsets and
+/// `extension` null or pointing to `extension_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_embed_video_sources(
+    model: *mut TesslEmbedGemma2,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    n_videos: u64,
+    extension: *const c_char,
+    extension_len: u64,
+    timestamps: u32,
+    truncate_dim: u32,
+    out: *mut f32,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_embed_video_sources";
+            let TesslEmbedGemma2 {
+                engine,
+                snapshot,
+                front,
+                ..
+            } = h;
+            let mm = engine.multimodal(WHAT)?;
+            let n = count_arg(WHAT, "n_videos", n_videos, MAX_BATCH)?;
+            if timestamps > 1 {
+                return Err(format!("{WHAT}: timestamps is {timestamps}, expected 0 or 1"));
+            }
+            let want_out = output_shape(WHAT, mm.text().config(), n, truncate_dim, out_len)?;
+            let ext = extension_arg(WHAT, source, extension, extension_len)?;
+            let pieces = encoded_pieces(
+                WHAT,
+                "video",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                TESSL_EMBEDGEMMA2_MAX_VIDEO_BYTES,
+            )?;
+            let out = checked_slice_mut(out, want_out, WHAT, "out")?;
+            let video_cfg = front.pre(snapshot, WHAT)?.video.clone();
+            check_image_config(WHAT, "video_processor", &video_cfg.image, mm.vision().config())?;
+            let (opened, sampled) = open_videos(WHAT, &video_cfg, &pieces, ext)?;
+            let pictures: usize = sampled.iter().sum();
+            check_pictures(WHAT, pictures, pictures.saturating_mul(video_cfg.image.max_patches()))?;
+            if timestamps == 1 {
+                front.tokenizer(snapshot, WHAT)?;
+            }
+            let prepared = prepare_opened_videos(WHAT, &video_cfg, &pieces, &opened)?;
+            drop(opened);
+            let inputs: Vec<Vec<ImageInput<'_>>> = prepared
+                .iter()
+                .map(|p| p.frames.iter().map(PreparedImage::input).collect())
+                .collect();
+            let items: Vec<MmItem<'_>> = match (timestamps, front.tokenizer.as_ref()) {
+                (1, Some(tokenizer)) => prepared
+                    .iter()
+                    .zip(&inputs)
+                    .map(|(p, frames)| MmItem::TimestampedVideo {
+                        frames,
+                        timestamps: &p.timestamps,
+                        tokenizer,
+                    })
+                    .collect(),
+                (1, None) => return Err(format!("{WHAT}: the tokenizer is not loaded")),
+                _ => inputs.iter().map(|frames| MmItem::Video(frames)).collect(),
+            };
+            let enc = mm.encode(&items, (truncate_dim != 0).then_some(truncate_dim))?;
+            copy_embeddings(WHAT, &enc, out)
+        })
+    }
+}
+
+/// How many soft tokens (placeholders in the processor's sequence) each of
+/// `n_images` images makes, written to `out` (`n_images` `u64`s, `out_len`
+/// exactly that), so a caller who lays out ids of their own
+/// ([`tessl_embedgemma2_embed_media`]) need not guess. `image_dims` is
+/// `[n_images, 2]` `u32` `(height, width)`, no dimension zero and at most
+/// [`MAX_IMAGE_PIXELS`] pixels each; the count is
+/// [`crate::embedgemma2_pre::image_soft_tokens`], the processor's resize target
+/// divided by the pooling cell, and no pixel is touched. `n_images` is
+/// `1..=`[`MAX_CALL_IMAGES`]. Works on a handle from either load entry (it reads
+/// the snapshot's `processor_config.json`).
+///
+/// # Safety
+/// As [`tessl_embedgemma2_embedding_dim`]; `image_dims` points to `2 * n_images`
+/// readable `u32`s and `out` to `out_len` writable `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_image_soft_token_count(
+    model: *mut TesslEmbedGemma2,
+    image_dims: *const u32,
+    n_images: u64,
+    out: *mut u64,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_image_soft_token_count";
+            let TesslEmbedGemma2 { snapshot, front, .. } = h;
+            let n = count_arg(WHAT, "n_images", n_images, MAX_CALL_IMAGES)?;
+            if out_len != n as u64 {
+                return Err(format!(
+                    "{WHAT}: out_len is {out_len}, expected exactly {n} (one count per image)"
+                ));
+            }
+            let dims = checked_slice(image_dims, 2 * n, WHAT, "image_dims")?;
+            let out = checked_slice_mut(out, n, WHAT, "out")?;
+            let pre = front.pre(snapshot, WHAT)?;
+            let mut counts = Vec::with_capacity(n);
+            for (i, d) in dims.chunks_exact(2).enumerate() {
+                let (height, width) = (d[0], d[1]);
+                if height == 0 || width == 0 {
+                    return Err(format!("{WHAT}: image {i} is {height}x{width}, which has no pixels"));
+                }
+                if u64::from(height) * u64::from(width) > MAX_IMAGE_PIXELS as u64 {
+                    return Err(format!(
+                        "{WHAT}: image {i} is {height}x{width}, above the {MAX_IMAGE_PIXELS}-pixel limit"
+                    ));
+                }
+                counts.push(
+                    image_soft_tokens(&pre.image, height as usize, width as usize)
+                        .map_err(|e| format!("{WHAT}: image {i}: {e}"))? as u64,
+                );
+            }
+            out.copy_from_slice(&counts);
+            Ok(())
+        })
+    }
+}
+
+/// How many soft tokens each of `n_clips` audio clips makes, written to `out`
+/// (`n_clips` `u64`s, `out_len` exactly that): the true entries of the audio
+/// tower's mask for the frames the extractor would build from a clip of that
+/// many samples ([`crate::embedgemma2_pre::audio_soft_tokens`]; a clip is cut to the
+/// extractor's 30 s first, so 750 at most), with no feature computed.
+/// `sample_counts` is `n_clips` `u64`s, each `1..=`[`TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES`];
+/// `sampling_rate` must be the extractor's (16000: what the file decoders
+/// resample to), as for [`tessl_embedgemma2_embed_audio`]. A clip too short for
+/// one frame is refused by index, as the tower would. `n_clips` is
+/// `1..=`[`MAX_CALL_CLIPS`]. Works on either kind of handle.
+///
+/// # Safety
+/// As [`tessl_embedgemma2_embedding_dim`]; `sample_counts` points to `n_clips`
+/// readable `u64`s and `out` to `out_len` writable `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_audio_soft_token_count(
+    model: *mut TesslEmbedGemma2,
+    sample_counts: *const u64,
+    n_clips: u64,
+    sampling_rate: u32,
+    out: *mut u64,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_audio_soft_token_count";
+            let TesslEmbedGemma2 { snapshot, front, .. } = h;
+            let n = count_arg(WHAT, "n_clips", n_clips, MAX_CALL_CLIPS)?;
+            if out_len != n as u64 {
+                return Err(format!(
+                    "{WHAT}: out_len is {out_len}, expected exactly {n} (one count per clip)"
+                ));
+            }
+            let counts = checked_slice(sample_counts, n, WHAT, "sample_counts")?;
+            let out = checked_slice_mut(out, n, WHAT, "out")?;
+            let cfg = &front.pre(snapshot, WHAT)?.audio;
+            if sampling_rate != cfg.sampling_rate {
+                return Err(format!(
+                    "{WHAT}: {sampling_rate} Hz audio; the extractor takes {} Hz and does not resample",
+                    cfg.sampling_rate
+                ));
+            }
+            let mut softs = Vec::with_capacity(n);
+            for (i, &samples) in counts.iter().enumerate() {
+                if samples == 0 || samples > TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES {
+                    return Err(format!(
+                        "{WHAT}: clip {i} has {samples} samples, expected 1..={TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES}"
+                    ));
+                }
+                let soft = audio_soft_tokens(cfg, samples as usize);
+                if soft == 0 {
+                    return Err(format!(
+                        "{WHAT}: clip {i} ({samples} samples) is too short for one frame"
+                    ));
+                }
+                softs.push(soft as u64);
+            }
+            out.copy_from_slice(&softs);
+            Ok(())
+        })
+    }
+}
+
+/// What each of `n_videos` videos becomes, written to `out` as `[n_videos, 2]`
+/// `u64` (`out_len` exactly `2 * n_videos`): the frames the processor's
+/// sampler keeps and the soft tokens each makes, so a video's placeholders
+/// number their product ([`crate::embedgemma2_pre::video_soft_tokens`]); nothing
+/// is decoded. `video_dims` is `[n_videos, 2]` `u32` `(height, width)` of the
+/// frames (after any rotation), `frame_counts` the frames in each video (`1..=`
+/// [`MAX_VIDEO_FRAMES`]) and `video_fps` each source rate (finite, positive).
+/// `n_videos` is `1..=`[`MAX_CALL_IMAGES`]. Works on either kind of handle.
+///
+/// # Safety
+/// As [`tessl_embedgemma2_embedding_dim`]; `video_dims` points to `2 * n_videos`
+/// readable `u32`s, `frame_counts` to `n_videos` readable `u64`s, `video_fps` to
+/// `n_videos` readable `f64`s and `out` to `out_len` writable `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_video_soft_token_count(
+    model: *mut TesslEmbedGemma2,
+    video_dims: *const u32,
+    frame_counts: *const u64,
+    video_fps: *const f64,
+    n_videos: u64,
+    out: *mut u64,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_video_soft_token_count";
+            let TesslEmbedGemma2 { snapshot, front, .. } = h;
+            let n = count_arg(WHAT, "n_videos", n_videos, MAX_CALL_IMAGES)?;
+            if out_len != 2 * n as u64 {
+                return Err(format!(
+                    "{WHAT}: out_len is {out_len}, expected exactly {} (= {n} videos x 2: sampled frames, soft tokens a frame)",
+                    2 * n
+                ));
+            }
+            let dims = checked_slice(video_dims, 2 * n, WHAT, "video_dims")?;
+            let frames = checked_slice(frame_counts, n, WHAT, "frame_counts")?;
+            let fps = checked_slice(video_fps, n, WHAT, "video_fps")?;
+            let out = checked_slice_mut(out, 2 * n, WHAT, "out")?;
+            let cfg = &front.pre(snapshot, WHAT)?.video;
+            let mut pairs = Vec::with_capacity(2 * n);
+            for i in 0..n {
+                let (height, width) = (dims[2 * i], dims[2 * i + 1]);
+                if height == 0 || width == 0 {
+                    return Err(format!("{WHAT}: video {i} is {height}x{width}, which has no pixels"));
+                }
+                if u64::from(height) * u64::from(width) > MAX_IMAGE_PIXELS as u64 {
+                    return Err(format!(
+                        "{WHAT}: video {i} has {height}x{width} frames, above the {MAX_IMAGE_PIXELS}-pixel limit"
+                    ));
+                }
+                if frames[i] == 0 || frames[i] > MAX_VIDEO_FRAMES as u64 {
+                    return Err(format!(
+                        "{WHAT}: video {i} has {} frames, expected 1..={MAX_VIDEO_FRAMES}",
+                        frames[i]
+                    ));
+                }
+                let (sampled, per_frame) =
+                    video_soft_tokens(cfg, height as usize, width as usize, frames[i] as usize, fps[i])
+                        .map_err(|e| format!("{WHAT}: video {i}: {e}"))?;
+                pairs.extend([sampled as u64, per_frame as u64]);
+            }
+            out.copy_from_slice(&pairs);
+            Ok(())
+        })
+    }
+}
+
+/// One segment of an item, resolved: which of the call's texts or media it names.
+#[derive(Clone, Copy)]
+enum SegRef {
+    Text(usize),
+    Image(usize),
+    Audio(usize),
+    Video { index: usize, timestamps: bool },
+}
+
+/// The segment table of a [`tessl_embedgemma2_embed_segments`] call, checked:
+/// each item's segments, and how many times each text and medium is named.
+struct SegPlan {
+    items: Vec<Vec<SegRef>>,
+    image_refs: Vec<usize>,
+    clip_refs: Vec<usize>,
+    video_refs: Vec<usize>,
+}
+
+/// `n_items` items' segments from `kinds`/`refs`, cut by `n_items + 1`
+/// strictly increasing `item_offsets` (an item has at least one segment) that
+/// end at `n_segments`; `lens` the byte lengths of the texts and
+/// `n_images`/`n_clips`/`n_videos` the media counts the references are checked
+/// against. A reference past its table, a kind that is not one of the five, a
+/// text or medium no segment names, and more text than a call may tokenize are
+/// refused by index.
+///
+/// # Safety
+/// As [`checked_slice`] for `n_segments` `u32`s and `u64`s and `n_items + 1` `u64`s.
+#[allow(clippy::too_many_arguments)]
+unsafe fn segment_plan(
+    what: &str,
+    kinds: *const u32,
+    refs: *const u64,
+    n_segments: u64,
+    item_offsets: *const u64,
+    n_items: usize,
+    lens: &[usize],
+    counts: [usize; 3],
+) -> Result<SegPlan, String> {
+    let n_seg = count_arg(what, "n_segments", n_segments, TESSL_EMBEDGEMMA2_MAX_SEGMENTS as usize)?;
+    // SAFETY: forwarded from this function's contract.
+    let cuts = unsafe {
+        csr_offsets(
+            what,
+            item_offsets,
+            n_items,
+            "item",
+            "segments",
+            TESSL_EMBEDGEMMA2_MAX_SEGMENTS,
+            "",
+        )
+    }?;
+    if cuts[n_items] != n_segments {
+        return Err(format!(
+            "{what}: item_offsets end at {} but n_segments is {n_segments}",
+            cuts[n_items]
+        ));
+    }
+    // SAFETY: forwarded from this function's contract.
+    let (kinds, refs) = unsafe {
+        (
+            checked_slice(kinds, n_seg, what, "segment_kinds")?,
+            checked_slice(refs, n_seg, what, "segment_refs")?,
+        )
+    };
+    let [n_images, n_clips, n_videos] = counts;
+    let mut plan = SegPlan {
+        items: Vec::with_capacity(n_items),
+        image_refs: vec![0; n_images],
+        clip_refs: vec![0; n_clips],
+        video_refs: vec![0; n_videos],
+    };
+    let mut text_refs = vec![0usize; lens.len()];
+    let mut text_bytes = 0u64;
+    for w in cuts.windows(2) {
+        let mut item = Vec::with_capacity((w[1] - w[0]) as usize);
+        for s in w[0] as usize..w[1] as usize {
+            let (kind, r) = (kinds[s], refs[s]);
+            let bad = |noun: &str, len: usize| format!("{what}: segment {s} names {noun} {r}, but the call has {len}");
+            let at = |len: usize| usize::try_from(r).ok().filter(|&i| i < len);
+            item.push(match kind {
+                TESSL_EMBEDGEMMA2_SEGMENT_TEXT => {
+                    let i = at(lens.len()).ok_or_else(|| bad("text", lens.len()))?;
+                    text_refs[i] += 1;
+                    text_bytes += lens[i] as u64;
+                    SegRef::Text(i)
+                }
+                TESSL_EMBEDGEMMA2_SEGMENT_IMAGE => {
+                    let i = at(n_images).ok_or_else(|| bad("image", n_images))?;
+                    plan.image_refs[i] += 1;
+                    SegRef::Image(i)
+                }
+                TESSL_EMBEDGEMMA2_SEGMENT_AUDIO => {
+                    let i = at(n_clips).ok_or_else(|| bad("clip", n_clips))?;
+                    plan.clip_refs[i] += 1;
+                    SegRef::Audio(i)
+                }
+                TESSL_EMBEDGEMMA2_SEGMENT_VIDEO | TESSL_EMBEDGEMMA2_SEGMENT_VIDEO_TIMESTAMPED => {
+                    let i = at(n_videos).ok_or_else(|| bad("video", n_videos))?;
+                    plan.video_refs[i] += 1;
+                    SegRef::Video {
+                        index: i,
+                        timestamps: kind == TESSL_EMBEDGEMMA2_SEGMENT_VIDEO_TIMESTAMPED,
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "{what}: segment {s} has kind {other}, expected {TESSL_EMBEDGEMMA2_SEGMENT_TEXT} (text), \
+                         {TESSL_EMBEDGEMMA2_SEGMENT_IMAGE} (image), {TESSL_EMBEDGEMMA2_SEGMENT_AUDIO} (clip), \
+                         {TESSL_EMBEDGEMMA2_SEGMENT_VIDEO} (video) or {TESSL_EMBEDGEMMA2_SEGMENT_VIDEO_TIMESTAMPED} \
+                         (video with timestamps)"
+                    ))
+                }
+            });
+        }
+        plan.items.push(item);
+    }
+    if text_bytes >= MAX_TEXT_BYTES as u64 {
+        return Err(format!(
+            "{what}: the segments name {text_bytes} bytes of text; a call tokenizes less than {MAX_TEXT_BYTES}"
+        ));
+    }
+    for (noun, refs) in [
+        ("text", &text_refs),
+        ("image", &plan.image_refs),
+        ("clip", &plan.clip_refs),
+        ("video", &plan.video_refs),
+    ] {
+        if let Some(i) = refs.iter().position(|&c| c == 0) {
+            return Err(format!("{what}: {noun} {i} is not named by any segment"));
+        }
+    }
+    Ok(plan)
+}
+
+/// The images of a [`tessl_embedgemma2_embed_segments`] call: `n` raw
+/// images (`blob` the pixels, `dims` the `[n, 3]` table, `offsets` the byte
+/// cuts, which must be the sizes `dims` imply) or encoded ones.
+///
+/// # Safety
+/// As [`raw_images`] or [`encoded_pieces`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn image_table<'a>(
+    what: &str,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    dims: *const u32,
+    n: usize,
+) -> Result<Table<'a, RawImage<'a>>, String> {
+    if n == 0 {
+        return empty_table(what, "image", blob_len);
+    }
+    if source != TESSL_EMBEDGEMMA2_SOURCE_RAW {
+        // SAFETY: forwarded from this function's contract.
+        let pieces = unsafe {
+            encoded_pieces(
+                what,
+                "image",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                crate::media::image::MAX_IMAGE_FILE_BYTES,
+            )
+        }?;
+        return Ok(Table::Encoded(pieces));
+    }
+    // SAFETY: forwarded from this function's contract.
+    let raws = unsafe { raw_images(what, blob, blob_len, dims, n) }?;
+    // SAFETY: forwarded from this function's contract.
+    let cuts = unsafe { checked_slice(offsets, n + 1, what, "image_offsets") }?;
+    let mut at = 0u64;
+    for (i, r) in raws.iter().enumerate() {
+        if cuts[i] != at {
+            return Err(format!(
+                "{what}: image_offsets[{i}] is {}, expected {at} (where the sizes in image_dims put image {i})",
+                cuts[i]
+            ));
+        }
+        at += (r.height * r.width * r.channels) as u64;
+    }
+    if cuts[n] != at {
+        return Err(format!(
+            "{what}: image_offsets end at {} but the images end at {at}",
+            cuts[n]
+        ));
+    }
+    Ok(Table::Raw(raws))
+}
+
+/// The clips of a call: `n` raw clips (`blob` holds native-endian f32 PCM,
+/// `offsets` the byte cuts, each a multiple of 4) or encoded ones.
+///
+/// # Safety
+/// As [`encoded_pieces`], and `blob` readable for `blob_len` bytes.
+#[allow(clippy::too_many_arguments)]
+unsafe fn clip_table<'a>(
+    what: &str,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    sampling_rate: u32,
+    n: usize,
+) -> Result<Table<'a, &'a [u8]>, String> {
+    if n == 0 {
+        return empty_table(what, "audio", blob_len);
+    }
+    if source != TESSL_EMBEDGEMMA2_SOURCE_RAW {
+        if sampling_rate != 0 {
+            return Err(format!(
+                "{what}: sampling_rate is {sampling_rate}; it describes raw PCM, so pass 0 with files or encoded bytes \
+                 (the decoder resamples to the extractor's rate)"
+            ));
+        }
+        // SAFETY: forwarded from this function's contract.
+        let pieces = unsafe {
+            encoded_pieces(
+                what,
+                "audio",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                crate::media::audio::MAX_AUDIO_FILE_BYTES,
+            )
+        }?;
+        return Ok(Table::Encoded(pieces));
+    }
+    // SAFETY: forwarded from this function's contract.
+    let cuts = unsafe {
+        csr_offsets(
+            what,
+            offsets,
+            n,
+            "clip",
+            "bytes",
+            4 * TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES,
+            "",
+        )
+    }?;
+    if cuts[n] != blob_len {
+        return Err(format!(
+            "{what}: audio_offsets end at {} but audio_blob_len is {blob_len}",
+            cuts[n]
+        ));
+    }
+    if let Some(i) = cuts.windows(2).position(|w| (w[1] - w[0]) % 4 != 0) {
+        return Err(format!(
+            "{what}: clip {i} is {} bytes, not a whole number of 4-byte f32 samples",
+            cuts[i + 1] - cuts[i]
+        ));
+    }
+    let len = usize::try_from(blob_len).map_err(|_| format!("{what}: audio_blob_len overflows usize"))?;
+    // SAFETY: forwarded from this function's contract.
+    let all = unsafe { checked_slice(blob, len, what, "audio_blob") }?;
+    Ok(Table::Raw(
+        cuts.windows(2).map(|w| &all[w[0] as usize..w[1] as usize]).collect(),
+    ))
+}
+
+/// The videos of a call: `n` raw videos (`blob` the RGB frames, `dims` the
+/// `[n, 2]` table, `fps` each rate, `offsets` the byte cuts, each a whole number
+/// of frames) or encoded ones (`dims` and `fps` are not read).
+///
+/// # Safety
+/// As [`raw_videos`] or [`encoded_pieces`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn video_table<'a>(
+    what: &str,
+    source: u32,
+    blob: *const u8,
+    blob_len: u64,
+    offsets: *const u64,
+    dims: *const u32,
+    fps: *const f64,
+    n: usize,
+) -> Result<Table<'a, RawVideo<'a>>, String> {
+    if n == 0 {
+        return empty_table(what, "video", blob_len);
+    }
+    if source != TESSL_EMBEDGEMMA2_SOURCE_RAW {
+        // SAFETY: forwarded from this function's contract.
+        let pieces = unsafe {
+            encoded_pieces(
+                what,
+                "video",
+                source,
+                blob,
+                blob_len,
+                offsets,
+                n,
+                TESSL_EMBEDGEMMA2_MAX_VIDEO_BYTES,
+            )
+        }?;
+        return Ok(Table::Encoded(pieces));
+    }
+    // SAFETY: forwarded from this function's contract.
+    let (cuts, dims_s) = unsafe {
+        (
+            csr_offsets(what, offsets, n, "video", "bytes", u64::MAX, "")?,
+            checked_slice(dims, 2 * n, what, "video_dims")?,
+        )
+    };
+    // Byte cuts to the frame cuts `raw_videos` takes: each video a whole number
+    // of its frames.
+    let mut frame_cuts = vec![0u64];
+    for (i, (w, d)) in cuts.windows(2).zip(dims_s.chunks_exact(2)).enumerate() {
+        let frame = u64::from(d[0]) * u64::from(d[1]) * 3;
+        if frame == 0 || (w[1] - w[0]) % frame != 0 {
+            return Err(format!(
+                "{what}: video {i} is {} bytes, not a whole number of {}x{} RGB frames",
+                w[1] - w[0],
+                d[0],
+                d[1]
+            ));
+        }
+        frame_cuts.push(frame_cuts[i] + (w[1] - w[0]) / frame);
+    }
+    // SAFETY: `frame_cuts` is a live vector of `n + 1` entries; the rest is forwarded.
+    let videos = unsafe { raw_videos(what, blob, blob_len, dims, frame_cuts.as_ptr(), fps, n) }?;
+    Ok(Table::Raw(videos))
+}
+
+/// A modality with none: no bytes, and its pointers are not read.
+fn empty_table<'a, R>(what: &str, noun: &str, blob_len: u64) -> Result<Table<'a, R>, String> {
+    if blob_len != 0 {
+        return Err(format!(
+            "{what}: {noun}_blob_len is {blob_len} but the call has no {noun} media"
+        ));
+    }
+    Ok(Table::Encoded(Vec::new()))
+}
+
+/// The first `keep` samples of native-endian f32 PCM in `bytes`.
+fn pcm_from_bytes(bytes: &[u8], keep: usize) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .take(keep)
+        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Embed `n_items` items that interleave text with media into `out`,
+/// `[n_items, dim]` row-major f32, each row L2-normalized, **without the caller
+/// counting a placeholder**: item `i` is a list of segments (text, image,
+/// clip, video), and the library lays out the processor's sequence for it
+/// ([`MmItem::Segments`], [`crate::embedgemma2::EmbedGemma2Config::mixed_sequence`]):
+/// the text pieces joined in order, each medium written as its `<boi> <image>
+/// x n <eoi>` (or audio, or one block per video frame) with `n` from the
+/// tower, the whole wrapped in `<bos>` and `<eos>`, which is what
+/// sentence-transformers' structured messages produce through the processor.
+/// `[text "a photo of", image 0, text "on a table"]` is one item. Needs a
+/// handle from [`tessl_embedgemma2_load_multimodal`] and `tokenizer.json`.
+///
+/// **Texts.** `text_bytes` (`text_bytes_len` bytes) is the UTF-8 texts laid
+/// end to end and cut by `text_offsets` (`n_texts + 1` entries, as for
+/// [`tessl_embedgemma2_embed_texts`]); no prompt is added (a prompt is text:
+/// write it in the first segment). `n_texts` may be 0, with null pointers and 0.
+///
+/// **Segments.** `segment_kinds[s]` is one of the `TESSL_EMBEDGEMMA2_SEGMENT_*`
+/// codes and `segment_refs[s]` indexes the call's texts, images, clips or videos
+/// by it; `item_offsets` (`n_items + 1` strictly increasing cuts from 0 to
+/// `n_segments`) cuts the `n_segments` (at most
+/// [`TESSL_EMBEDGEMMA2_MAX_SEGMENTS`]) segments into items. A text or medium
+/// may be named by several segments (it is read, decoded and preprocessed once,
+/// and goes through its tower once for each time it is named); one that no
+/// segment names is refused, as is a reference past a table. An item's text is
+/// tokenized as the processor does: the text between two media is one stretch.
+///
+/// **Media.** Each modality is its own table, with its own `*_source`:
+/// [`TESSL_EMBEDGEMMA2_SOURCE_RAW`] (decoded arrays), `_PATHS` (UTF-8 paths) or
+/// `_BYTES` (encoded files); a modality with no media passes `n = 0`, null
+/// pointers and 0. In every case `*_blob` (`*_blob_len` bytes) is the media laid end
+/// to end and `*_offsets` has `n + 1` strictly increasing byte cuts from 0 to
+/// the blob's length. Raw images are `u8` HWC with `image_dims` `[n, 3]` `u32`
+/// `(height, width, channels)` as for [`tessl_embedgemma2_embed_images`] (the
+/// cuts must be the sizes the dims imply); raw clips are native-endian `f32`
+/// PCM at `sampling_rate` (the extractor's, as for
+/// [`tessl_embedgemma2_embed_audio`]; 0 when the clips are files or bytes) with
+/// each cut a multiple of 4; raw videos are RGB `u8` frames with `video_dims`
+/// `[n, 2]` `u32` `(height, width)` and `video_fps` one source rate each (null
+/// for files and bytes, whose rates the decoder reports), each cut a whole number of
+/// frames. The image and clip entries
+/// ([`tessl_embedgemma2_embed_image_sources`] and its siblings) say what the
+/// decoders accept and do; `video_extension` is as there (null with 0 for `mp4`,
+/// bytes only). Every count and cut is checked before anything is read; the
+/// call's pictures (images and the sampled frames of videos, once for each
+/// name) are checked against [`MAX_CALL_IMAGES`] and [`MAX_CALL_PATCHES`]
+/// before any file is decoded and any frame resized, and its clips' frames
+/// against [`MAX_CALL_FRAMES`] (before any is built for raw clips, as each is
+/// built for files). Errors name the file or the segment.
+///
+/// `truncate_dim` and `out_len` are as for [`tessl_embedgemma2_encode`]; one wait.
+///
+/// # Safety
+/// As [`tessl_embedgemma2_encode`]; `text_bytes` points to `text_bytes_len`
+/// readable bytes and `text_offsets` to `n_texts + 1` `u64`s (both may be null
+/// with `n_texts` 0); `segment_kinds` to `n_segments` `u32`s; `segment_refs` to
+/// `n_segments` `u64`s; `item_offsets` to `n_items + 1` `u64`s; each modality's
+/// `*_blob` to its `*_blob_len` readable bytes, `*_offsets` to its `n + 1`
+/// `u64`s, `image_dims` to `3 * n_images` `u32`s, `video_dims` to
+/// `2 * n_videos` `u32`s and `video_fps` to `n_videos` `f64`s when the source is raw
+/// (a modality with `n = 0` reads none of them); `video_extension` is null or
+/// points to `video_extension_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_embedgemma2_embed_segments(
+    model: *mut TesslEmbedGemma2,
+    text_bytes: *const u8,
+    text_bytes_len: u64,
+    text_offsets: *const u64,
+    n_texts: u64,
+    segment_kinds: *const u32,
+    segment_refs: *const u64,
+    n_segments: u64,
+    item_offsets: *const u64,
+    n_items: u64,
+    image_source: u32,
+    image_blob: *const u8,
+    image_blob_len: u64,
+    image_offsets: *const u64,
+    image_dims: *const u32,
+    n_images: u64,
+    audio_source: u32,
+    audio_blob: *const u8,
+    audio_blob_len: u64,
+    audio_offsets: *const u64,
+    sampling_rate: u32,
+    n_clips: u64,
+    video_source: u32,
+    video_blob: *const u8,
+    video_blob_len: u64,
+    video_offsets: *const u64,
+    video_dims: *const u32,
+    video_fps: *const f64,
+    n_videos: u64,
+    video_extension: *const c_char,
+    video_extension_len: u64,
+    truncate_dim: u32,
+    out: *mut f32,
+    out_len: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_embedgemma2_embed_segments";
+            let TesslEmbedGemma2 {
+                engine,
+                snapshot,
+                front,
+                ..
+            } = h;
+            let mm = engine.multimodal(WHAT)?;
+            let n = count_arg(WHAT, "n_items", n_items, MAX_BATCH)?;
+            let want_out = output_shape(WHAT, mm.text().config(), n, truncate_dim, out_len)?;
+            // The counts bound every array before any is sized or read.
+            let bounded = |name: &str, v: u64, max: usize| {
+                usize::try_from(v)
+                    .ok()
+                    .filter(|&c| c <= max)
+                    .ok_or_else(|| format!("{WHAT}: {name} is {v}, expected at most {max}"))
+            };
+            let n_text = bounded("n_texts", n_texts, TESSL_EMBEDGEMMA2_MAX_SEGMENTS as usize)?;
+            let n_img = bounded("n_images", n_images, MAX_CALL_IMAGES)?;
+            let n_clip = bounded("n_clips", n_clips, MAX_CALL_CLIPS)?;
+            let n_vid = bounded("n_videos", n_videos, MAX_CALL_IMAGES)?;
+            if out.is_null() {
+                return Err(format!("{WHAT}: null out"));
+            }
+            let texts: Vec<&str> = if n_text == 0 {
+                if text_bytes_len != 0 {
+                    return Err(format!("{WHAT}: text_bytes_len is {text_bytes_len} but n_texts is 0"));
+                }
+                Vec::new()
+            } else {
+                text_layout(WHAT, text_bytes, text_bytes_len, text_offsets, n_text)?
+            };
+            let lens: Vec<usize> = texts.iter().map(|t| t.len()).collect();
+            let plan = segment_plan(
+                WHAT,
+                segment_kinds,
+                segment_refs,
+                n_segments,
+                item_offsets,
+                n,
+                &lens,
+                [n_img, n_clip, n_vid],
+            )?;
+            let image_tbl = image_table(
+                WHAT,
+                image_source,
+                image_blob,
+                image_blob_len,
+                image_offsets,
+                image_dims,
+                n_img,
+            )?;
+            let clip_tbl = clip_table(
+                WHAT,
+                audio_source,
+                audio_blob,
+                audio_blob_len,
+                audio_offsets,
+                sampling_rate,
+                n_clip,
+            )?;
+            let video_tbl = video_table(
+                WHAT,
+                video_source,
+                video_blob,
+                video_blob_len,
+                video_offsets,
+                video_dims,
+                video_fps,
+                n_vid,
+            )?;
+            let video_ext = if n_vid > 0 {
+                extension_arg(WHAT, video_source, video_extension, video_extension_len)?
+            } else if video_extension.is_null() && video_extension_len == 0 {
+                "mp4"
+            } else {
+                return Err(format!(
+                    "{WHAT}: an extension hint goes with encoded videos; the call has none"
+                ));
+            };
+            let out = checked_slice_mut(out, want_out, WHAT, "out")?;
+
+            // Everything the media would build, bounded before anything is built.
+            let pre = front.pre(snapshot, WHAT)?.clone();
+            if n_img > 0 {
+                check_image_config(WHAT, "image_processor", &pre.image, mm.vision().config())?;
+            }
+            let mut opened: Vec<OpenedVideo> = Vec::new();
+            let mut video_pics = vec![0usize; n_vid];
+            if n_vid > 0 {
+                check_image_config(WHAT, "video_processor", &pre.video.image, mm.vision().config())?;
+                match &video_tbl {
+                    Table::Raw(videos) => {
+                        for (i, v) in videos.iter().enumerate() {
+                            video_pics[i] =
+                                video_pictures(&pre.video, v).map_err(|e| format!("{WHAT}: video {i}: {e}"))?;
+                        }
+                    }
+                    Table::Encoded(pieces) => {
+                        let (o, pics) = open_videos(WHAT, &pre.video, pieces, video_ext)?;
+                        opened = o;
+                        video_pics = pics;
+                    }
+                }
+            }
+            let image_pictures: usize = plan.image_refs.iter().sum();
+            let video_pictures_total: usize = video_pics.iter().zip(&plan.video_refs).map(|(p, r)| p * r).sum();
+            check_pictures(
+                WHAT,
+                image_pictures + video_pictures_total,
+                image_pictures
+                    .saturating_mul(pre.image.max_patches())
+                    .saturating_add(video_pictures_total.saturating_mul(pre.video.image.max_patches())),
+            )?;
+            if n_clip > 0 {
+                if let Table::Raw(pcms) = &clip_tbl {
+                    let frames: usize = pcms
+                        .iter()
+                        .zip(&plan.clip_refs)
+                        .map(|(p, r)| clip_frames(&pre.audio, p.len() / 4).saturating_mul(*r))
+                        .fold(0, usize::saturating_add);
+                    check_frames(WHAT, frames)?;
+                }
+            }
+            // The tokenizer is loaded now (a mutable use of the handle's front ends)
+            // and borrowed once the audio front end is done with.
+            front.tokenizer(snapshot, WHAT)?;
+
+            let images: Vec<PreparedImage> = match &image_tbl {
+                Table::Raw(raws) => prepare_images(WHAT, &pre.image, raws)?,
+                Table::Encoded(pieces) => prepare_encoded_images(WHAT, &pre.image, pieces)?,
+            };
+            let clips: Vec<AudioInput> = if n_clip == 0 {
+                Vec::new()
+            } else {
+                let fe = front.audio(snapshot, WHAT)?;
+                check_audio_config(WHAT, fe.config(), mm.audio().config())?;
+                match &clip_tbl {
+                    Table::Raw(pcms) => {
+                        let keep = pre.audio.max_samples.div_ceil(AUDIO_PAD_MULTIPLE) * AUDIO_PAD_MULTIPLE;
+                        pcms.iter()
+                            .enumerate()
+                            .map(|(i, p)| {
+                                fe.extract(&pcm_from_bytes(p, keep), sampling_rate)
+                                    .map_err(|e| format!("{WHAT}: clip {i}: {e}"))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    }
+                    Table::Encoded(pieces) => prepare_encoded_clips(WHAT, fe, pieces, &plan.clip_refs)?,
+                }
+            };
+            let videos: Vec<PreparedVideo> = match &video_tbl {
+                Table::Raw(raws) => prepare_videos(WHAT, &pre.video, raws)?,
+                Table::Encoded(pieces) => prepare_opened_videos(WHAT, &pre.video, pieces, &opened)?,
+            };
+            drop(opened);
+            let tokenizer = front
+                .tokenizer
+                .as_ref()
+                .ok_or_else(|| format!("{WHAT}: the tokenizer is not loaded"))?;
+
+            let image_inputs: Vec<ImageInput<'_>> = images.iter().map(PreparedImage::input).collect();
+            let frame_inputs: Vec<Vec<ImageInput<'_>>> = videos
+                .iter()
+                .map(|v| v.frames.iter().map(PreparedImage::input).collect())
+                .collect();
+            let segments: Vec<Vec<MmSegment<'_>>> = plan
+                .items
+                .iter()
+                .map(|item| {
+                    item.iter()
+                        .map(|seg| match *seg {
+                            SegRef::Text(i) => MmSegment::Text(texts[i]),
+                            SegRef::Image(i) => MmSegment::Image(image_inputs[i]),
+                            SegRef::Audio(i) => MmSegment::Audio(&clips[i]),
+                            SegRef::Video {
+                                index,
+                                timestamps: false,
+                            } => MmSegment::Video(&frame_inputs[index]),
+                            SegRef::Video {
+                                index,
+                                timestamps: true,
+                            } => MmSegment::TimestampedVideo {
+                                frames: &frame_inputs[index],
+                                timestamps: &videos[index].timestamps,
+                            },
+                        })
+                        .collect()
+                })
+                .collect();
+            let items: Vec<MmItem<'_>> = segments
+                .iter()
+                .map(|segments| MmItem::Segments { segments, tokenizer })
+                .collect();
+            let enc = mm.encode(&items, (truncate_dim != 0).then_some(truncate_dim))?;
+            copy_embeddings(WHAT, &enc, out)
+        })
+    }
 }
 
 /// Test hook: the text encoder behind a handle, so a test can compare the C

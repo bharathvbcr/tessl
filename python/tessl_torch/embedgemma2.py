@@ -23,6 +23,15 @@ Images, audio and video need the towers, so load with ``multimodal=True``::
     emb = model.embed_video(frames_uint8_thwc, fps=24.0, timestamps=True)
     emb = model.media([{"ids": ids, "images": [rgb], "audio": [pcm]}])   # ids of your own
 
+Media can also be files or encoded bytes, decoded by the system's codecs, and an
+item can interleave text with media without counting a placeholder::
+
+    emb = model.embed_image_files(["cat.png", "dog.jpg"])
+    emb = model.embed_audio_bytes([wav_bytes])
+    emb = model.embed_video_files("clip.mp4", timestamps=True)
+    emb = model.media([{"segments": ["a photo of", {"image": "cat.png"}, "on a table"]}])
+    model.image_soft_token_count((480, 640))      # the placeholders an image makes
+
 ``tokenize`` and ``decode`` expose the tokenizer, ``prompts()`` the named task
 prompts. A tokenizer or processor of your own is still welcome: ``encode_texts``
 takes ``tokenizer=``, and ``encode_images`` / ``encode_audio`` take a
@@ -187,6 +196,60 @@ def _declare_front_ends(lib) -> None:
             f"it was built before they existed: run `cargo build --release`"
         ) from None
     lib._tessl_embedgemma2_raw_declared = True
+
+
+def _declare_media(lib) -> None:
+    """Give ctypes the signatures of the entries that read media files and bytes,
+    count soft tokens and lay out text interleaved with media, once per library.
+    A library without them is named as such."""
+    if not isinstance(lib, ctypes.CDLL) or getattr(lib, "_tessl_embedgemma2_media_declared", False):
+        return
+    err_args = [ctypes.c_char_p, ctypes.c_size_t]
+    f32p = ctypes.POINTER(ctypes.c_float)
+    f64p = ctypes.POINTER(ctypes.c_double)
+    u8p = ctypes.POINTER(ctypes.c_uint8)
+    u32p = ctypes.POINTER(ctypes.c_uint32)
+    u64p = ctypes.POINTER(ctypes.c_uint64)
+    h = ctypes.c_void_p
+    u64 = ctypes.c_uint64
+    u32 = ctypes.c_uint32
+    try:
+        lib.tessl_embedgemma2_embed_image_sources.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_embed_image_sources.argtypes = [h, u32, u8p, u64, u64p, u64, u32, f32p, u64] + err_args
+        lib.tessl_embedgemma2_embed_audio_sources.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_embed_audio_sources.argtypes = [h, u32, u8p, u64, u64p, u64, u32, f32p, u64] + err_args
+        lib.tessl_embedgemma2_embed_video_sources.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_embed_video_sources.argtypes = [
+            h, u32, u8p, u64, u64p, u64, ctypes.c_char_p, u64, u32, u32, f32p, u64,
+        ] + err_args
+        lib.tessl_embedgemma2_image_soft_token_count.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_image_soft_token_count.argtypes = [h, u32p, u64, u64p, u64] + err_args
+        lib.tessl_embedgemma2_audio_soft_token_count.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_audio_soft_token_count.argtypes = [h, u64p, u64, u32, u64p, u64] + err_args
+        lib.tessl_embedgemma2_video_soft_token_count.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_video_soft_token_count.argtypes = [h, u32p, u64p, f64p, u64, u64p, u64] + err_args
+        lib.tessl_embedgemma2_embed_segments.restype = ctypes.c_int32
+        lib.tessl_embedgemma2_embed_segments.argtypes = [
+            h, u8p, u64, u64p, u64,
+            u32p, u64p, u64, u64p, u64,
+            u32, u8p, u64, u64p, u32p, u64,
+            u32, u8p, u64, u64p, u32, u64,
+            u32, u8p, u64, u64p, u32p, f64p, u64,
+            ctypes.c_char_p, u64,
+            u32, f32p, u64,
+        ] + err_args
+    except AttributeError:
+        raise TesslError(
+            f"{lib._name} has no tessl_embedgemma2_embed_image_sources / _embed_segments / _soft_token_count "
+            f"entry points; it was built before they existed: run `cargo build --release`"
+        ) from None
+    lib._tessl_embedgemma2_media_declared = True
+
+
+# How a modality's media are passed (the C ABI's TESSL_EMBEDGEMMA2_SOURCE_*) and the kinds of segment
+# (TESSL_EMBEDGEMMA2_SEGMENT_*).
+_SOURCE_RAW, _SOURCE_PATHS, _SOURCE_BYTES = 0, 1, 2
+_SEGMENT_TEXT, _SEGMENT_IMAGE, _SEGMENT_AUDIO, _SEGMENT_VIDEO, _SEGMENT_VIDEO_TIMESTAMPED = 0, 1, 2, 3, 4
 
 
 def _numpy():
@@ -540,6 +603,211 @@ def _fps_list(fps, n: int) -> list:
     return out
 
 
+def _optr(array, ctype):
+    """``array``'s data as a ``POINTER(ctype)``, or ``None`` when it is empty (the C
+    ABI reads no pointer of a modality that has no media)."""
+    return None if array.size == 0 else _ptr(array, ctype)
+
+
+def _is_path(x) -> bool:
+    return isinstance(x, (str, os.PathLike))
+
+
+def _is_blob(x) -> bool:
+    return isinstance(x, (bytes, bytearray, memoryview))
+
+
+def _blob_table(parts: list):
+    """``parts`` (bytes-like) laid end to end as a uint8 array with uint64 byte cuts."""
+    np = _numpy()
+    lengths = [memoryview(p).nbytes for p in parts]
+    flat = np.frombuffer(b"".join(parts), dtype=np.uint8) if parts else np.empty(0, dtype=np.uint8)
+    return flat, _csr_offsets(lengths)
+
+
+def _path_bytes(path, name: str) -> bytes:
+    """One file path as UTF-8 bytes. Bytes are not a path here (they are a file's
+    contents); the length bound is the library's."""
+    if not _is_path(path):
+        raise TesslError(f"{name} must be a str or a path, not {type(path).__name__}")
+    text = os.fspath(path)
+    if not isinstance(text, str):
+        raise TesslError(f"{name} must be a str path, not {type(text).__name__}")
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise TesslError(f"{name} is not valid UTF-8 (a lone surrogate)") from None
+
+
+def _encoded_list(items, name: str, source: int) -> list:
+    """``items`` as a non-empty list: one path or encoded file, or a list of them."""
+    if isinstance(items, (str, os.PathLike)) or _is_blob(items):
+        items = [items]
+    elif isinstance(items, dict) or not hasattr(items, "__iter__"):
+        what = "paths" if source == _SOURCE_PATHS else "encoded files (bytes)"
+        raise TesslError(f"{name} must be a list of {what}, not {type(items).__name__}")
+    items = list(items)
+    if not items:
+        raise TesslError(f"{name} is empty: there is nothing to embed")
+    return items
+
+
+def _encoded_table(items: list, name: str, source: int):
+    """A list of file paths (``source`` paths) or of whole encoded files (``source``
+    bytes) as the C ABI's blob and byte cuts."""
+    if source == _SOURCE_PATHS:
+        return _blob_table([_path_bytes(p, f"{name}[{i}]") for i, p in enumerate(items)])
+    for i, b in enumerate(items):
+        if not _is_blob(b):
+            raise TesslError(f"{name}[{i}] must be bytes (a whole encoded file), not {type(b).__name__}")
+    return _blob_table(items)
+
+
+def _extension_arg(extension):
+    """A video byte stream's file extension as ``(bytes or None, length)``; the
+    library holds it to its short ASCII bound."""
+    if extension is None:
+        return None, 0
+    if not isinstance(extension, str):
+        raise TesslError(f"extension must be a str such as 'mp4' or None, not {type(extension).__name__}")
+    try:
+        raw = extension.encode("utf-8")
+    except UnicodeEncodeError:
+        raise TesslError("extension is not valid UTF-8 (a lone surrogate)") from None
+    return raw, len(raw)
+
+
+def _size_pairs(sizes, name: str):
+    """``sizes`` (one ``(height, width)`` or a list of them) as an ``[n, 2]`` uint32 array."""
+    np = _numpy()
+    try:
+        arr = np.asarray(sizes)
+    except (ValueError, TypeError) as e:
+        raise TesslError(f"{name} must be (height, width) pairs: {e}") from None
+    if arr.ndim == 1 and arr.size == 2:
+        arr = arr.reshape(1, 2)
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] == 0 or arr.dtype.kind not in "iu":
+        raise TesslError(
+            f"{name} must be a (height, width) pair or a non-empty list of them, "
+            f"got dtype {arr.dtype} with shape {arr.shape}"
+        )
+    if arr.min() < 0 or arr.max() >= 1 << 32:
+        raise TesslError(f"{name} has a value outside [0, 2**32)")
+    return np.ascontiguousarray(arr, dtype=np.uint32)
+
+
+def _count_list(values, name: str, bits: int = 64):
+    """``values`` (one integer or a non-empty list of them) as a uint64 array."""
+    np = _numpy()
+    try:
+        arr = np.asarray(values)
+    except (ValueError, TypeError) as e:
+        raise TesslError(f"{name} must be integers: {e}") from None
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim != 1 or arr.size == 0 or arr.dtype.kind not in "iu":
+        raise TesslError(
+            f"{name} must be an integer or a non-empty list of integers, "
+            f"got dtype {arr.dtype} with shape {arr.shape}"
+        )
+    if arr.min() < 0 or (arr.max() >= 1 << bits):
+        raise TesslError(f"{name} has a value outside [0, 2**{bits})")
+    return np.ascontiguousarray(arr, dtype=np.uint64)
+
+
+class _MediaSet:
+    """The media of one modality named by the segments of one call: each distinct
+    object once (named again, it is the same reference), and the kind they share."""
+
+    def __init__(self, noun: str):
+        self.noun = noun
+        self.objects: list = []
+        self.where: list = []
+        self._index: dict = {}
+
+    def add(self, obj, where: str) -> int:
+        key = id(obj)
+        if key not in self._index:
+            self._index[key] = len(self.objects)
+            self.objects.append(obj)
+            self.where.append(where)
+        return self._index[key]
+
+    def source(self) -> int:
+        """The one source of the objects: arrays (anything that is neither a path nor
+        bytes), paths or encoded bytes. A mix is refused, naming the first two that
+        disagree."""
+        kinds = [_SOURCE_PATHS if _is_path(o) else _SOURCE_BYTES if _is_blob(o) else _SOURCE_RAW for o in self.objects]
+        first: dict = {}
+        for kind, where in zip(kinds, self.where):
+            first.setdefault(kind, where)
+        if len(first) > 1:
+            names = {_SOURCE_RAW: "an array", _SOURCE_PATHS: "a path", _SOURCE_BYTES: "encoded bytes"}
+            a, b = sorted(first)[:2]
+            raise TesslError(
+                f"the {self.noun}s of one call must all be arrays, all paths or all encoded bytes: "
+                f"{first[a]} is {names[a]} but {first[b]} is {names[b]}"
+            )
+        return kinds[0] if kinds else _SOURCE_RAW
+
+
+def _segment_plan(items: list):
+    """The segments of ``items`` as the C ABI's tables: ``(texts, kinds, refs,
+    item_cuts, images, clips, videos)`` with the media gathered into one
+    :class:`_MediaSet` per modality. A segment is a ``str`` (text) or a mapping
+    with exactly one of ``image``, ``audio`` and ``video`` (and ``timestamps`` with
+    a video)."""
+    texts: list = []
+    text_index: dict = {}
+    kinds: list = []
+    refs: list = []
+    cuts = [0]
+    images, clips, videos = _MediaSet("image"), _MediaSet("audio clip"), _MediaSet("video")
+    for i, item in enumerate(items):
+        segments = item["segments"]
+        if isinstance(segments, (str, bytes, dict)) or not hasattr(segments, "__iter__"):
+            raise TesslError(f"items[{i}]['segments'] must be a list of segments")
+        segments = list(segments)
+        if not segments:
+            raise TesslError(f"items[{i}]['segments'] is empty: an item needs at least one segment")
+        for j, seg in enumerate(segments):
+            where = f"items[{i}]['segments'][{j}]"
+            if isinstance(seg, str):
+                if seg not in text_index:
+                    text_index[seg] = len(texts)
+                    texts.append(seg)
+                kinds.append(_SEGMENT_TEXT)
+                refs.append(text_index[seg])
+                continue
+            if not hasattr(seg, "keys") or not hasattr(seg, "get"):
+                raise TesslError(
+                    f"{where} must be a str (text) or a mapping with 'image', 'audio' or 'video', "
+                    f"not {type(seg).__name__}"
+                )
+            keys = set(seg.keys())
+            unknown = keys - {"image", "audio", "video", "timestamps"}
+            if unknown:
+                raise TesslError(f"{where} has unknown keys {sorted(unknown)}; expected image, audio, video, timestamps")
+            media = keys & {"image", "audio", "video"}
+            if len(media) != 1:
+                raise TesslError(f"{where} must name exactly one of 'image', 'audio' and 'video', not {sorted(media)}")
+            if "timestamps" in keys and "video" not in keys:
+                raise TesslError(f"{where} has 'timestamps' but is not a video")
+            (which,) = media
+            if which == "image":
+                kinds.append(_SEGMENT_IMAGE)
+                refs.append(images.add(seg["image"], f"{where}['image']"))
+            elif which == "audio":
+                kinds.append(_SEGMENT_AUDIO)
+                refs.append(clips.add(seg["audio"], f"{where}['audio']"))
+            else:
+                stamped = _flag(f"{where}['timestamps']", seg.get("timestamps", False))
+                kinds.append(_SEGMENT_VIDEO_TIMESTAMPED if stamped else _SEGMENT_VIDEO)
+                refs.append(videos.add(seg["video"], f"{where}['video']"))
+        cuts.append(len(kinds))
+    return texts, kinds, refs, cuts, images, clips, videos
+
+
 def _token_ids(tokenizer, texts: list) -> list:
     """The token ids of ``texts`` with the tokenizer's special tokens, from a
     ``tokenizers.Tokenizer`` (which has ``encode_batch``) or a ``transformers``
@@ -595,6 +863,7 @@ class EmbedGemma2(_Owned):
         rt = _runtime()
         _declare(rt.lib)
         _declare_front_ends(rt.lib)
+        _declare_media(rt.lib)
         if multimodal:
             _declare_multimodal(rt.lib)
         err = ctypes.create_string_buffer(_ERR_LEN)
@@ -977,9 +1246,192 @@ class EmbedGemma2(_Owned):
         rate. Returns ``[1, truncate_dim or embedding_dim]``."""
         return self.embed_videos([frames], fps, timestamps=timestamps, truncate_dim=truncate_dim)
 
-    def media(self, items, sampling_rate: int = _SAMPLING_RATE, truncate_dim=None):
-        """Embed items of token ids of your own and the raw media their placeholders
-        stand for, one row per item. Each item is a mapping::
+    # -- files and bytes -----------------------------------------------------------------
+
+    def _embed_sources(self, what: str, entry: str, items, source: int, noun: str, truncate_dim):
+        """Images or clips from files (``source`` paths) or encoded bytes: decoded,
+        preprocessed and embedded in one call (one GPU wait) by ``entry``."""
+        handle = self._multimodal_handle(what)
+        listed = _encoded_list(items, noun, source)
+        blob, cuts = _encoded_table(listed, noun, source)
+        fn = getattr(self._rt.lib, entry)
+        return self._embed(
+            lambda code, out, out_len, err, err_len: fn(
+                handle, source, _optr(blob, ctypes.c_uint8), blob.size, _ptr(cuts, ctypes.c_uint64), len(listed),
+                code, out, out_len, err, err_len,
+            ),
+            len(listed),
+            truncate_dim,
+        )
+
+    def embed_image_files(self, paths, truncate_dim=None):
+        """Embed image files, one row each (float32 ``[n, truncate_dim or
+        embedding_dim]``, rows L2-normalized): ``paths`` is a path or a list of
+        paths (``str`` or ``os.PathLike``). Each file is decoded by the system's
+        ImageIO (PNG, JPEG, TIFF, BMP, GIF, HEIC and the like; the EXIF orientation
+        is ignored, as torchvision reads a path), then preprocessed and embedded
+        exactly as :meth:`embed_images` does, in one call with one GPU wait. A
+        path is at most 4096 bytes and an image at most 2**30 bytes and 2**28
+        pixels; a call takes 1 to 256 images. A failure names the file's index and
+        the decoder's reason (``file 2: image: ...``). Needs ``multimodal=True``."""
+        return self._embed_sources(
+            "embed_image_files", "tessl_embedgemma2_embed_image_sources", paths, _SOURCE_PATHS, "paths", truncate_dim
+        )
+
+    def embed_image_bytes(self, data, truncate_dim=None):
+        """:meth:`embed_image_files` for whole encoded image files in memory:
+        ``data`` is a ``bytes`` (or ``bytearray``, ``memoryview``) or a list of them.
+        A failure names the index (``bytes 1: image: ...``)."""
+        return self._embed_sources(
+            "embed_image_bytes", "tessl_embedgemma2_embed_image_sources", data, _SOURCE_BYTES, "data", truncate_dim
+        )
+
+    def embed_audio_files(self, paths, truncate_dim=None):
+        """Embed audio files, one row each: every file is decoded by AudioToolbox
+        (WAV, FLAC, MP3, AAC, M4A, Opus, ...), mixed to mono as the channel mean,
+        resampled to the extractor's 16 kHz, cut to its 30 s and run through
+        :meth:`embed_audio`'s feature extraction and tower, in one call with one
+        GPU wait. ``paths`` is a path or a list of paths. Limits as
+        :meth:`embed_image_files` (a file at most 2**32 bytes). Needs
+        ``multimodal=True``."""
+        return self._embed_sources(
+            "embed_audio_files", "tessl_embedgemma2_embed_audio_sources", paths, _SOURCE_PATHS, "paths", truncate_dim
+        )
+
+    def embed_audio_bytes(self, data, truncate_dim=None):
+        """:meth:`embed_audio_files` for whole encoded audio files in memory."""
+        return self._embed_sources(
+            "embed_audio_bytes", "tessl_embedgemma2_embed_audio_sources", data, _SOURCE_BYTES, "data", truncate_dim
+        )
+
+    def _embed_video_sources(self, what: str, items, source: int, noun: str, extension, timestamps, truncate_dim):
+        handle = self._multimodal_handle(what)
+        listed = _encoded_list(items, noun, source)
+        blob, cuts = _encoded_table(listed, noun, source)
+        ext, ext_len = _extension_arg(extension)
+        stamps = 1 if _flag("timestamps", timestamps) else 0
+        return self._embed(
+            lambda code, out, out_len, err, err_len: self._rt.lib.tessl_embedgemma2_embed_video_sources(
+                handle, source, _optr(blob, ctypes.c_uint8), blob.size, _ptr(cuts, ctypes.c_uint64), len(listed),
+                ext, ext_len, stamps, code, out, out_len, err, err_len,
+            ),
+            len(listed),
+            truncate_dim,
+        )
+
+    def embed_video_files(self, paths, timestamps: bool = False, truncate_dim=None):
+        """Embed video files, one row each: AVFoundation decodes the frames the
+        processor's sampler keeps (the snapshot's ``fps`` and ``max_frames``, the
+        file's own rate and the upright orientation), which are preprocessed and
+        embedded as :meth:`embed_videos` does, with ``timestamps=True`` writing each
+        frame's ``mm:ss`` time in front of its block. ``paths`` is a path or a list
+        of paths; a file is at most 2**32 bytes. Needs ``multimodal=True``."""
+        return self._embed_video_sources(
+            "embed_video_files", paths, _SOURCE_PATHS, "paths", None, timestamps, truncate_dim
+        )
+
+    def embed_video_bytes(self, data, extension: str = "mp4", timestamps: bool = False, truncate_dim=None):
+        """:meth:`embed_video_files` for whole encoded videos in memory (each is
+        written to a private temporary file for AVFoundation and removed). ``extension``
+        (such as ``"mp4"`` or ``"mov"``, at most 8 ASCII bytes) is the type the
+        bytes are sniffed as."""
+        return self._embed_video_sources(
+            "embed_video_bytes", data, _SOURCE_BYTES, "data", extension, timestamps, truncate_dim
+        )
+
+    # -- how many soft tokens a medium makes ------------------------------------------------
+
+    def _count_query(self, call, n: int, per: int) -> list:
+        """The ``n * per`` counts ``call(out_pointer, out_len, err, err_len)`` writes."""
+        np = _numpy()
+        out = np.empty(n * per, dtype=np.uint64)
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        self._check(call(_ptr(out, ctypes.c_uint64), out.size, err, _ERR_LEN), err)
+        return out.tolist()
+
+    def image_soft_token_count(self, sizes) -> list:
+        """How many soft tokens (``<image>`` placeholders) each image makes, from its
+        size alone: ``sizes`` is a ``(height, width)`` pair or a list of them (the
+        pixels of the image as decoded). The count is the processor's resize followed
+        by the vision tower's pooling, with no pixel read, so a prompt can be
+        budgeted before the image is. Works on either kind of load."""
+        handle = self._live()
+        dims = _size_pairs(sizes, "sizes")
+        return self._count_query(
+            lambda out, out_len, err, err_len: self._rt.lib.tessl_embedgemma2_image_soft_token_count(
+                handle, _ptr(dims, ctypes.c_uint32), len(dims), out, out_len, err, err_len
+            ),
+            len(dims),
+            1,
+        )
+
+    def audio_soft_token_count(self, samples, sampling_rate: int = _SAMPLING_RATE) -> list:
+        """How many soft tokens each clip makes, from its length: ``samples`` is a
+        sample count or a list of them at ``sampling_rate`` (the extractor's 16000
+        only). A clip is cut to the extractor's 30 s first, so 750 is the most; a
+        clip too short for one frame is refused by index. Works on either kind of
+        load."""
+        handle = self._live()
+        counts = _count_list(samples, "samples")
+        rate = _check_uint("sampling_rate", sampling_rate, 32)
+        return self._count_query(
+            lambda out, out_len, err, err_len: self._rt.lib.tessl_embedgemma2_audio_soft_token_count(
+                handle, _ptr(counts, ctypes.c_uint64), len(counts), rate, out, out_len, err, err_len
+            ),
+            len(counts),
+            1,
+        )
+
+    def video_soft_token_count(self, sizes, frames, fps) -> list:
+        """What each video becomes, as a list of ``(sampled_frames, soft_tokens_per_frame)``:
+        ``sizes`` a ``(height, width)`` pair or a list of them (the frames, upright),
+        ``frames`` the frames in each video (an integer or one per video) and ``fps``
+        its source rate (a number or one per video). A video's placeholders number the
+        product of the pair, and ``timestamps`` adds no soft token. Nothing is
+        decoded. Works on either kind of load."""
+        handle = self._live()
+        np = _numpy()
+        dims = _size_pairs(sizes, "sizes")
+        n = len(dims)
+        counts = _count_list(frames, "frames")
+        if len(counts) == 1 and n > 1:
+            counts = np.repeat(counts, n)
+        if len(counts) != n:
+            raise TesslError(f"{len(counts)} frame counts for {n} videos")
+        rates = np.array(_fps_list(fps, n), dtype=np.float64)
+        flat = self._count_query(
+            lambda out, out_len, err, err_len: self._rt.lib.tessl_embedgemma2_video_soft_token_count(
+                handle, _ptr(dims, ctypes.c_uint32), _ptr(counts, ctypes.c_uint64), _ptr(rates, ctypes.c_double),
+                n, out, out_len, err, err_len,
+            ),
+            n,
+            2,
+        )
+        return [(flat[2 * i], flat[2 * i + 1]) for i in range(n)]
+
+    def media(self, items, sampling_rate: int = _SAMPLING_RATE, truncate_dim=None, video_extension: str = "mp4"):
+        """Embed items that mix text and media, one row per item. An item is a
+        mapping of one of two forms.
+
+        **Segments** (no placeholder is counted)::
+
+            {"segments": ["a photo of", {"image": img}, "on a table"]}
+
+        a list of segments, each a ``str`` (text) or a mapping with exactly one of
+        ``"image"``, ``"audio"`` and ``"video"``. The library lays out the
+        processor's sequence for the item: the texts joined in order, each medium
+        written as its ``<boi> <image> x n <eoi>`` (``<boa> <audio> x n <eoa>``, or
+        one block per sampled frame for a video) with ``n`` from the tower, the whole
+        wrapped in ``<bos>`` and ``<eos>``. A medium is an array (as
+        :meth:`embed_images`, :meth:`embed_audio`; a video is ``(frames, fps)`` as
+        :meth:`embed_videos`), a file path (``str`` or ``os.PathLike``) or encoded
+        bytes. Within one call each modality uses one of the three, and an object
+        named by several segments is decoded once. A video segment takes
+        ``"timestamps": True`` for the processor's ``mm:ss`` labels in front of each
+        frame; ``video_extension`` is the type video *bytes* are sniffed as. There is
+        no prompt: write it in the first text.
+
+        **Ids** (the placeholders are yours)::
 
             {"ids": [...],            # token ids, placeholders included
              "images": [array, ...],  # as embed_images
@@ -989,10 +1441,13 @@ class EmbedGemma2(_Owned):
         ``images``, ``audio`` and ``videos`` may be left out. The ``j``-th image,
         audio or video placeholder id of an item's ids takes the ``j``-th soft token
         row of its images, clips or video frames (a video's sampled frames), and
-        the counts must match exactly or the call is refused. The ids are yours: the
-        placeholder ids and the number of soft tokens each medium makes are the
-        checkpoint's (``config.json``, ``processor_config.json``). Needs
-        ``multimodal=True``."""
+        the counts must match exactly or the call is refused. The placeholder ids and
+        the number of soft tokens each medium makes are the checkpoint's
+        (``config.json``, ``processor_config.json``); :meth:`image_soft_token_count`,
+        :meth:`audio_soft_token_count` and :meth:`video_soft_token_count` tell the
+        counts.
+
+        One call takes one form. Needs ``multimodal=True``."""
         np = _numpy()
         handle = self._multimodal_handle("media")
         if isinstance(items, (str, bytes, dict)) or not hasattr(items, "__iter__"):
@@ -1000,6 +1455,21 @@ class EmbedGemma2(_Owned):
         items = list(items)
         if not items:
             raise TesslError("items is empty: there is nothing to embed")
+        for i, item in enumerate(items):
+            if not hasattr(item, "get") or not hasattr(item, "keys"):
+                raise TesslError(f"items[{i}] must be a mapping, not {type(item).__name__}")
+        forms = {"segments" in item for item in items}
+        if forms == {True}:
+            for i, item in enumerate(items):
+                extra = set(item.keys()) - {"segments"}
+                if extra:
+                    raise TesslError(f"items[{i}] has 'segments' and also {sorted(extra)}; use one form")
+            return self._embed_segments(handle, items, sampling_rate, truncate_dim, video_extension)
+        if forms == {True, False}:
+            first = next(i for i, item in enumerate(items) if "segments" in item)
+            raise TesslError(
+                f"items[{first}] has 'segments' but other items have ids: one call takes one form"
+            )
         rate = _check_uint("sampling_rate", sampling_rate, 32)
         ids, images, clips, videos, rates = [], [], [], [], []
         counts = {"images": [0], "audio": [0], "videos": [0]}
@@ -1044,6 +1514,82 @@ class EmbedGemma2(_Owned):
                 _ptr(flat_fr, ctypes.c_uint8), flat_fr.size, _ptr(vdims, ctypes.c_uint32),
                 _ptr(frame_cuts, ctypes.c_uint64), _ptr(fps_arr, ctypes.c_double), len(videos),
                 _ptr(video_cuts, ctypes.c_uint64),
+                code, out, out_len, err, err_len,
+            ),
+            len(items),
+            truncate_dim,
+        )
+
+    def _embed_segments(self, handle, items: list, sampling_rate, truncate_dim, video_extension):
+        """:meth:`media` for items of segments: the tables of
+        ``tessl_embedgemma2_embed_segments``, one source per modality."""
+        np = _numpy()
+        lib = self._rt.lib
+        texts, kinds, refs, cuts, images, clips, videos = _segment_plan(items)
+
+        def opt(array, ctype, n):
+            return None if n == 0 else _ptr(array, ctype)
+
+        text_bytes, text_cuts = _utf8_texts(texts)
+        kind_arr = np.array(kinds, dtype=np.uint32)
+        ref_arr = np.array(refs, dtype=np.uint64)
+        item_cuts = np.array(cuts, dtype=np.uint64)
+
+        image_source = images.source()
+        if image_source == _SOURCE_RAW:
+            arrays = _raw_image_list(images.objects, "images")
+            image_blob, image_dims = _image_buffers(arrays)
+            image_cuts = _csr_offsets([a.size for a in arrays])
+        else:
+            image_blob, image_cuts = _encoded_table(images.objects, "images", image_source)
+            image_dims = np.empty((0, 3), dtype=np.uint32)
+
+        clip_source = clips.source()
+        rate = 0
+        if clip_source == _SOURCE_RAW:
+            arrays = _raw_clip_list(clips.objects, "audio")
+            pcm, sample_cuts = _clip_buffers(arrays)
+            clip_blob, clip_cuts = pcm.view(np.uint8), sample_cuts * np.uint64(4)
+            if arrays:
+                rate = _check_uint("sampling_rate", sampling_rate, 32)
+        else:
+            clip_blob, clip_cuts = _encoded_table(clips.objects, "audio", clip_source)
+
+        video_source = videos.source()
+        extension, extension_len = None, 0
+        video_dims = np.empty((0, 2), dtype=np.uint32)
+        video_fps = np.empty(0, dtype=np.float64)
+        if video_source == _SOURCE_RAW:
+            frames, rates = [], []
+            for k, obj in enumerate(videos.objects):
+                if not isinstance(obj, (tuple, list)) or len(obj) != 2:
+                    raise TesslError(f"{videos.where[k]} must be a (frames, fps) pair, a path or encoded bytes")
+                frames.append(_raw_video(obj[0], videos.where[k]))
+                rates.extend(_fps_list(obj[1], 1))
+            video_blob, video_dims, _, video_fps = _video_buffers(frames, rates)
+            video_cuts = _csr_offsets([v.size for v in frames])
+        else:
+            video_blob, video_cuts = _encoded_table(videos.objects, "videos", video_source)
+            if video_source == _SOURCE_BYTES:
+                extension, extension_len = _extension_arg(video_extension)
+
+        n_texts, n_images, n_clips, n_videos = len(texts), len(images.objects), len(clips.objects), len(videos.objects)
+        return self._embed(
+            lambda code, out, out_len, err, err_len: lib.tessl_embedgemma2_embed_segments(
+                handle,
+                opt(text_bytes, ctypes.c_uint8, text_bytes.size), text_bytes.size,
+                opt(text_cuts, ctypes.c_uint64, n_texts), n_texts,
+                _ptr(kind_arr, ctypes.c_uint32), _ptr(ref_arr, ctypes.c_uint64), len(kinds),
+                _ptr(item_cuts, ctypes.c_uint64), len(items),
+                image_source, opt(image_blob, ctypes.c_uint8, image_blob.size), image_blob.size,
+                opt(image_cuts, ctypes.c_uint64, n_images), opt(image_dims, ctypes.c_uint32, image_dims.size),
+                n_images,
+                clip_source, opt(clip_blob, ctypes.c_uint8, clip_blob.size), clip_blob.size,
+                opt(clip_cuts, ctypes.c_uint64, n_clips), rate, n_clips,
+                video_source, opt(video_blob, ctypes.c_uint8, video_blob.size), video_blob.size,
+                opt(video_cuts, ctypes.c_uint64, n_videos), opt(video_dims, ctypes.c_uint32, video_dims.size),
+                opt(video_fps, ctypes.c_double, video_fps.size), n_videos,
+                extension, extension_len,
                 code, out, out_len, err, err_len,
             ),
             len(items),

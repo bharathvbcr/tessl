@@ -1,0 +1,11 @@
+workload                                         ms min  ms median    units ms/unit(min)
+audio_30s_16k_mono.wav                            0.218      0.254    30.00        0.007  audio_s
+audio_30s_44k_stereo.flac                       207.022    218.516    30.00        6.901  audio_s
+audio_30s_44k_stereo.m4a                        174.841    186.334    30.00        5.828  audio_s
+audio_30s_44k_stereo.mp3                        180.222    192.105    30.00        6.007  audio_s
+audio_30s_44k_stereo.wav                        158.312    167.648    30.00        5.277  audio_s
+photo_1080p.jpg                                   8.916      9.756     2.07        4.300  megapixel
+photo_1080p.png                                  19.834     20.618     2.07        9.565  megapixel
+photo_1080p.tiff                                  4.983      5.435     2.07        2.403  megapixel
+video_10s_720p_h264.mp4:video_open               25.331     32.630   300.00        0.084  frame
+video_10s_720p_h264.mp4:video_decode_9          221.308    232.564     9.00       24.590  frame

@@ -1,0 +1,1251 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_resample_cr_fixtures.py",
+ "generator_commit": "d4badc78c90aeb58f1335b2e70b0b24e56839106",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.3",
+  "python": "3.14.8"
+ },
+ "versions_role": "produced",
+ "inputs_source": "generated: numpy default_rng draws and closed-form signals written as raw f32; the goldens are the `ffmpeg` binary's output for those exact samples (see the generator docstring)",
+ "files": {
+  "cases.csv": {
+   "role": "config",
+   "published": true,
+   "note": "name,channels,in_rate,out_rate of every .in.f32/.ffmpeg.f32 pair that is not a lens sweep"
+  },
+  "layout_c1_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c1_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 1 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c1_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c1_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 1 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c1_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c1_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c1_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c1_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c1_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c1_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c2_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c2_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 2 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c2_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c2_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 2 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c2_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c2_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 2 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c2_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c2_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 2 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c2_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c2_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 2 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c3_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c3_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 3 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c3_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c3_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 3 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c3_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c3_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 3 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c3_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c3_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 3 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c3_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c3_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 3 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c4_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c4_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 4 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c4_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c4_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 4 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c4_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c4_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 4 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c4_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c4_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 4 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c4_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c4_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 4 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c5_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c5_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 5 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c5_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c5_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 5 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c5_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c5_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 5 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c5_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c5_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 5 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c5_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c5_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 5 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c6_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c6_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 6 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c6_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c6_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 6 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c6_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c6_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 6 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c6_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c6_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 6 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c6_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c6_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 6 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c7_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c7_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 7 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c7_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c7_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 7 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c7_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c7_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 7 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c7_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c7_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 7 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c7_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c7_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 7 channel(s) at 8000 Hz, raw f32"
+  },
+  "layout_c8_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c8_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 8 channel(s) at 16000 Hz, raw f32"
+  },
+  "layout_c8_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c8_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 8 channel(s) at 22050 Hz, raw f32"
+  },
+  "layout_c8_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c8_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 8 channel(s) at 44101 Hz, raw f32"
+  },
+  "layout_c8_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c8_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 8 channel(s) at 48000 Hz, raw f32"
+  },
+  "layout_c8_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "layout_c8_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 700 frames of 8 channel(s) at 8000 Hz, raw f32"
+  },
+  "lens_11025_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_11025_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 11025 Hz; length n runs the first n"
+  },
+  "lens_11025_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_12345_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_12345_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 12345 Hz; length n runs the first n"
+  },
+  "lens_12345_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_16000_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_16000_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 16000 Hz; length n runs the first n"
+  },
+  "lens_16000_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_16000_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 48000 for each n of the .lens.csv, back to back"
+  },
+  "lens_16000_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 16000 Hz; length n runs the first n"
+  },
+  "lens_16000_48000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_22050_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_22050_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 22050 Hz; length n runs the first n"
+  },
+  "lens_22050_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_32000_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_32000_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 32000 Hz; length n runs the first n"
+  },
+  "lens_32000_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_44100_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_44100_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 44100 Hz; length n runs the first n"
+  },
+  "lens_44100_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_44100_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 48000 for each n of the .lens.csv, back to back"
+  },
+  "lens_44100_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 44100 Hz; length n runs the first n"
+  },
+  "lens_44100_48000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_44101_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_44101_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 44101 Hz; length n runs the first n"
+  },
+  "lens_44101_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_48000_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_48000_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 48000 Hz; length n runs the first n"
+  },
+  "lens_48000_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_8000_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_8000_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 8000 Hz; length n runs the first n"
+  },
+  "lens_8000_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "lens_96000_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 for each n of the .lens.csv, back to back"
+  },
+  "lens_96000_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "2049 noise samples at 96000 Hz; length n runs the first n"
+  },
+  "lens_96000_16000.lens.csv": {
+   "role": "config",
+   "published": true,
+   "note": "the lengths run and the number of samples ffmpeg made for each"
+  },
+  "rate_1000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_1000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 1000 Hz, raw f32"
+  },
+  "rate_11025_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_11025_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 11025 Hz, raw f32"
+  },
+  "rate_12345_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_12345_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 12345 Hz, raw f32"
+  },
+  "rate_16000_to_1000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 1000, default resampler options, raw f32"
+  },
+  "rate_16000_to_1000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 16000 Hz, raw f32"
+  },
+  "rate_16000_to_15999.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 15999, default resampler options, raw f32"
+  },
+  "rate_16000_to_15999.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 16000 Hz, raw f32"
+  },
+  "rate_16000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_16000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 16000 Hz, raw f32"
+  },
+  "rate_16000_to_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 48000, default resampler options, raw f32"
+  },
+  "rate_16000_to_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 16000 Hz, raw f32"
+  },
+  "rate_192000_to_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 8000, default resampler options, raw f32"
+  },
+  "rate_192000_to_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 192000 Hz, raw f32"
+  },
+  "rate_22050_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_22050_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 22050 Hz, raw f32"
+  },
+  "rate_22050_to_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 44100, default resampler options, raw f32"
+  },
+  "rate_22050_to_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 22050 Hz, raw f32"
+  },
+  "rate_32000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_32000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 32000 Hz, raw f32"
+  },
+  "rate_3_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_3_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 40 frames of 1 channel(s) at 3 Hz, raw f32"
+  },
+  "rate_44100_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_44100_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "rate_44100_to_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 44100, default resampler options, raw f32"
+  },
+  "rate_44100_to_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "rate_44100_to_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 48000, default resampler options, raw f32"
+  },
+  "rate_44100_to_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "rate_44101_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_44101_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "rate_48000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_48000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "rate_48000_to_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 44100, default resampler options, raw f32"
+  },
+  "rate_48000_to_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "rate_7999_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_7999_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 7999 Hz, raw f32"
+  },
+  "rate_8000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_8000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "rate_96000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "rate_96000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 96000 Hz, raw f32"
+  },
+  "rate_97000_to_32000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 32000, default resampler options, raw f32"
+  },
+  "rate_97000_to_32000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 97000 Hz, raw f32"
+  },
+  "rate_97000_to_50000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 50000, default resampler options, raw f32"
+  },
+  "rate_97000_to_50000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2200 frames of 1 channel(s) at 97000 Hz, raw f32"
+  },
+  "signal_dc_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_dc_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "dc, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_dc_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_dc_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "dc, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_dc_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_dc_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "dc, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_dc_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_dc_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "dc, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "signal_grid_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_grid_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "grid, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_grid_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_grid_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "grid, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_grid_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_grid_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "grid, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_grid_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_grid_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "grid, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "signal_square_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_square_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "square, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_square_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_square_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "square, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_square_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_square_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "square, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_square_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_square_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "square, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "signal_step_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_step_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "step, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_step_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_step_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "step, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_step_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_step_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "step, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_step_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_step_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "step, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "signal_sweep_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_sweep_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_sweep_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_sweep_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_sweep_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_sweep_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_sweep_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_sweep_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "signal_tiny_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_tiny_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "tiny, 2500 frames of 1 channel(s) at 44100 Hz, raw f32"
+  },
+  "signal_tiny_44101.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_tiny_44101.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "tiny, 2500 frames of 1 channel(s) at 44101 Hz, raw f32"
+  },
+  "signal_tiny_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_tiny_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "tiny, 2500 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "signal_tiny_8000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "signal_tiny_8000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "tiny, 2500 frames of 1 channel(s) at 8000 Hz, raw f32"
+  },
+  "special_inf_first_channel_c1_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_inf_first_channel_c1_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_inf_first_channel, 600 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "special_inf_last_channel_c3_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_inf_last_channel_c3_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_inf_last_channel, 600 frames of 3 channel(s) at 22050 Hz, raw f32"
+  },
+  "special_inf_last_channel_c6_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_inf_last_channel_c6_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_inf_last_channel, 600 frames of 6 channel(s) at 16000 Hz, raw f32"
+  },
+  "special_nan_first_channel_c1_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_nan_first_channel_c1_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_nan_first_channel, 600 frames of 1 channel(s) at 48000 Hz, raw f32"
+  },
+  "special_nan_first_channel_c2_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_nan_first_channel_c2_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_nan_first_channel, 600 frames of 2 channel(s) at 16000 Hz, raw f32"
+  },
+  "special_nan_last_channel_c3_22050.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_nan_last_channel_c3_22050.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_nan_last_channel, 600 frames of 3 channel(s) at 22050 Hz, raw f32"
+  },
+  "special_negative_zero_c2_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_negative_zero_c2_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_negative_zero, 600 frames of 2 channel(s) at 16000 Hz, raw f32"
+  },
+  "special_negative_zero_c2_44100.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_negative_zero_c2_44100.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_negative_zero, 600 frames of 2 channel(s) at 44100 Hz, raw f32"
+  },
+  "special_opposite_infs_c2_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000, default resampler options, raw f32"
+  },
+  "special_opposite_infs_c2_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "special_opposite_infs, 600 frames of 2 channel(s) at 16000 Hz, raw f32"
+  },
+  "train_11025_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_11025_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 11025 Hz"
+  },
+  "train_12345_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_12345_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 12345 Hz"
+  },
+  "train_22050_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_22050_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 22050 Hz"
+  },
+  "train_44100_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_44100_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 44100 Hz"
+  },
+  "train_44100_to_48000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 48000 of the impulse train: filter coefficients"
+  },
+  "train_44100_to_48000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 44100 Hz"
+  },
+  "train_44101_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_44101_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 44101 Hz"
+  },
+  "train_48000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_48000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 48000 Hz"
+  },
+  "train_8000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_8000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 8000 Hz"
+  },
+  "train_96000_to_16000.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000 of the impulse train: filter coefficients"
+  },
+  "train_96000_to_16000.in.f32": {
+   "role": "input",
+   "published": true,
+   "note": "220 impulses of 0.75, spaced beyond the filter length, at 96000 Hz"
+  }
+ },
+ "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers"
+}

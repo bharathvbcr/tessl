@@ -22,11 +22,12 @@ Two layers (argument handling against a stand-in library is
 
   The bounds are ``tests/embedgemma2_e2e_model.rs``'s, fixed before the first
   run: max abs ``1e-4`` and cosine ``>= 0.99999`` against ``emb_f32``; an
-  input alone vs in a batch within ``1e-5``; the processor path
-  (``embed_images`` / ``embed_audio``, which needs transformers and PIL and
-  rebuilds the generator's synthetic inputs) must hand the model the saved
-  ``pixel_values`` and ``input_features`` to ``1e-6``, and then embeds to the
-  same bounds.
+  input alone vs in a batch within ``1e-5``; the processor path (which needs
+  transformers and PIL and rebuilds the generator's synthetic inputs) must hand
+  the model the saved ``pixel_values`` and ``input_features`` to ``1e-6``, and
+  ``encode_images`` / ``encode_audio`` on its output embed to the same bounds.
+  (Raw arrays through ``embed_images`` / ``embed_audio`` / ``embed_video``, with
+  no processor, are ``test_embedgemma2_raw.py``.)
 """
 
 import importlib.util
@@ -290,9 +291,9 @@ class RealCheckpoint(unittest.TestCase):
             self.assertLessEqual(d, INPUT_ABS, f"image {i} pixel_values")
             np.testing.assert_array_equal(out["image_position_ids"][i], im["image_position_ids"][0])
         want = np.stack([im["emb_f32"] for im in self.images])
-        got = self.model.embed_images(pics, processor)
+        got = self.model.encode_images(out["pixel_values"], out["image_position_ids"])
         err, cos = max_abs_and_cosine(got, want)
-        eprint(f"embed_images: max abs {err:.3e}, cosine {cos:.9f}")
+        eprint(f"encode_images on the processor's output: max abs {err:.3e}, cosine {cos:.9f}")
         self.assertLessEqual(err, EMB_ABS)
         self.assertGreaterEqual(cos, EMB_COS)
 
@@ -307,9 +308,9 @@ class RealCheckpoint(unittest.TestCase):
                 feats["input_features_mask"][i, :n].astype(np.int64), c["input_features_mask"][0]
             )
         want = np.stack([c["emb_f32"] for c in self.clips])
-        got = self.model.embed_audio(wavs, processor)
+        got = self.model.encode_audio(feats["input_features"], feats["input_features_mask"])
         err, cos = max_abs_and_cosine(got, want)
-        eprint(f"embed_audio: max abs {err:.3e}, cosine {cos:.9f}")
+        eprint(f"encode_audio on the processor's output: max abs {err:.3e}, cosine {cos:.9f}")
         # Batched clips are padded to the longest, which the saved (alone) ones
         # are not; the mask makes that no difference to the embedding.
         self.assertLessEqual(err, EMB_ABS)

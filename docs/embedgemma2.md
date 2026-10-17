@@ -100,28 +100,33 @@ and 256 and runs a 30-token forward in buffers sized for a 4000-token one.
 
 The C ABI in `src/capi_embedgemma2.rs` (a module of its own beside
 `src/capi.rs`, whose handle, thread and status conventions it reuses) and
-`python/tessl_torch/embedgemma2.py` put the encoder behind the tokenizer the
-caller already holds. Build the library once (`cargo build --release`, or point
-`TESSL_LIB` at a `libtessl.dylib`):
+`python/tessl_torch/embedgemma2.py` put the encoder behind Python. The
+tokenizer, the task prompts and the image, audio and video preprocessing are
+Rust's, read from the snapshot ([Raw inputs](#raw-inputs-texts-images-audio-video-and-media)),
+so a caller needs numpy and the built library and nothing else. Build the
+library once (`cargo build --release`, or point `TESSL_LIB` at a
+`libtessl.dylib`):
 
 ```python
-from tokenizers import Tokenizer            # or transformers.AutoTokenizer
 from tessl_torch.embedgemma2 import EmbedGemma2
 
 model = EmbedGemma2.from_pretrained(snapshot_dir)   # a local snapshot directory
-tok = Tokenizer.from_file(f"{snapshot_dir}/tokenizer.json")
-q = model.encode_texts(["how do I speed up attention?"], tok, prompt_name="query")
-d = model.encode_texts(["Sliding-window attention ..."], tok, prompt_name="document")
+q = model.encode_texts(["how do I speed up attention?"], prompt_name="query")
+d = model.encode_texts(["Sliding-window attention ..."], prompt_name="document")
 scores = q @ d.T                                    # rows are L2-normalized float32
-small = model.encode(ids, truncate_dim=256)         # token ids you tokenized yourself
+ids = model.tokenize(["a text"])                    # the ids the model is given
+small = model.encode(ids, truncate_dim=256)         # or ids you tokenized yourself
 ```
 
-`encode_texts` prepends the snapshot's own prompt (the `prompts` of
-`config_sentence_transformers.json`) to each text and asks the tokenizer for
-special tokens, which is what sentence-transformers' `encode(prompt_name=...)`
-does. The Python test checks that the ids it produces equal the reference's
-for both a `tokenizers.Tokenizer` and a transformers tokenizer. It duck-types the
-tokenizer and imports neither package, so neither is a dependency.
+`encode_texts` writes the snapshot's own prompt (the `prompts` of
+`config_sentence_transformers.json`) in front of each text and wraps it in
+`<bos>`/`<eos>`, which is what sentence-transformers' `encode(prompt_name=...)`
+does; the tokenizer is [`Tokenizer`](#tokenizer), checked against the reference
+ids. A tokenizer of your own is still accepted, as the optional keyword
+`tokenizer=` (a `tokenizers.Tokenizer` or a transformers tokenizer, duck-typed
+and never imported): it is asked for the ids and the prompt text still comes
+from the snapshot. It stays because `encode_texts(texts, tokenizer, ...)` was
+this method's documented form.
 
 The C entries, each returning a status with its message in a caller buffer, as
 the training entries do:
@@ -190,24 +195,135 @@ imported and not a dependency):
 model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)    # operands="bf16" for the text encoder and the vision tower
 out = processor(images=images, return_tensors="np")                   # your transformers processor
 emb = model.encode_images(out["pixel_values"], out["image_position_ids"])   # float32 [n, 768]
-emb = model.embed_images(images, processor)                           # the same two lines in one call
-emb = model.embed_audio(waveforms, processor)                         # or encode_audio(input_features, input_features_mask)
+emb = model.encode_audio(feats["input_features"], feats["input_features_mask"])   # likewise for audio
 ```
 
+(With no processor of your own, `embed_images` / `embed_audio` take the raw
+arrays: [Raw inputs](#raw-inputs-texts-images-audio-video-and-media).)
 `encode_images` / `encode_audio` take the processor's arrays or tensors
 (`[N, P, 768]` / `[N, F, 128]`, one item without the leading axis, or a list of
 per-item arrays of different lengths; numpy or torch, recognised by their
 methods and never imported; bf16 widened first), check dtype, shape, counts and
 the int32 and 0/1 ranges, and hand flat arrays to the library.
-`embed_images` / `embed_audio` call a processor you pass in with
-`processor(images=list(images), return_tensors="np")` /
-`processor(audio=list(clips), return_tensors="np")` (checked against
-transformers 5.19: a list of images is one sample of several images, so only
-`pixel_values` are used, one embedding per image) and require the two output
-keys. `python/tests/test_embedgemma2_mm_host.py` holds the argument handling to
+(`embed_images` / `embed_audio` used to call a processor passed in; they take
+raw arrays now and the processor path is `encode_images` / `encode_audio` on its
+output, which `test_embedgemma2_mm.py` still holds to the saved tensors.)
+`python/tests/test_embedgemma2_mm_host.py` holds the argument handling to
 a recording stand-in library; `python/tests/test_embedgemma2_mm.py` runs the
 tiny checkpoint, and with `EMBEDGEMMA2_SNAPSHOT` and `EMBEDGEMMA2_MM_REF_DIR`
 the real one (see Observed below).
+
+### Raw inputs: texts, images, audio, video and media
+
+Eleven further entries run the snapshot's own front ends in Rust, so the
+caller hands over UTF-8, pixels, PCM and frames and needs no tokenizer, no
+processor and no `transformers`. They are additive like the entries above (ABI
+12 is unreleased: `CHANGELOG.md` lists it under `[Unreleased]` and no tag
+contains the C ABI at all, so nothing bumps), they live at the end of
+`src/capi_embedgemma2.rs`, and every one of them goes through the same
+`guarded` boundary: a null or foreign-thread handle is refused before a
+reference is formed, a panic is caught, the output is written only on
+success.
+
+| Entry | Takes | Runs |
+|---|---|---|
+| `tessl_embedgemma2_embed_texts(model, text_bytes, text_bytes_len, text_offsets, n_texts, prompt_name, prompt_name_len, truncate_dim, out, out_len, err, err_len)` | one UTF-8 byte array and `n_texts + 1` `u64` offsets (starting at 0, never decreasing, ending at `text_bytes_len`; an empty text is `<bos> <eos>`), a prompt name or null for the snapshot's default one | `Tokenizer::encode_with_prompt` per text, then `encode`; works on either kind of handle |
+| `tessl_embedgemma2_tokenize(model, text_bytes, .., prompt_name, prompt_name_len, ids_out, ids_cap, id_offsets_out, n_ids_out, err, err_len)` | the texts as above | the ids end to end plus `n_texts + 1` offsets; called first with a null `ids_out` and capacity 0 it writes only the total |
+| `tessl_embedgemma2_decode(model, ids, n_ids, skip_special_tokens, buf, buf_len, out_len, err, err_len)` | up to 2^24 ids, skip flag 0 or 1 | the library's `decode`, UTF-8 into `buf`, its length in `*out_len` (a null `buf` and 0 asks for the length; a short buffer is refused with the length set) |
+| `tessl_embedgemma2_prompt_count` / `_prompt_name(index, buf, ..)` / `_prompt_get(name, name_len, buf, ..)` / `_default_prompt(&index)` | the snapshot's `config_sentence_transformers.json` | the count, a name by index, a prompt's text, and the default's index (-1 for none) |
+| `tessl_embedgemma2_embed_images(model, pixels, pixels_len, image_dims, n_images, truncate_dim, out, out_len, err, err_len)` | `u8` HWC images laid end to end, `image_dims` `[n, 3]` `u32` `(height, width, channels)`, channels 1 to 4 (alpha dropped as PIL's `convert("RGB")` does) | `preprocess_image`, the vision tower |
+| `tessl_embedgemma2_embed_audio(model, samples, samples_len, sample_offsets, n_clips, sampling_rate, truncate_dim, out, out_len, err, err_len)` | mono `f32` PCM, clips end to end with `n_clips + 1` strictly increasing offsets; any rate but the extractor's is refused | `AudioFrontEnd::extract`, the audio tower |
+| `tessl_embedgemma2_embed_videos(model, frames, frames_len, video_dims, frame_offsets, video_fps, n_videos, timestamps, truncate_dim, out, out_len, err, err_len)` | decoded RGB `u8` frames end to end, `[n, 2]` `(height, width)` per video, frame offsets, one source fps each, `timestamps` 0 or 1 | `preprocess_video`, then `MmItem::Video` or `MmItem::TimestampedVideo` |
+| `tessl_embedgemma2_embed_media(model, ids, n_ids, id_offsets, n_items, <images>, <clips>, sampling_rate, <videos>, truncate_dim, out, out_len, err, err_len)` | caller ids per item with the raw media their placeholders stand for, each modality laid out as above plus `n_items + 1` per-item cuts into it | `MmItem::Media` |
+| `tessl_clip_coef(total_norm, max_norm) -> f32` | two `f64` | `torch.nn.utils.clip_grad_norm_`'s coefficient; see below |
+
+The tokenizer, `processor_config.json` and the log-mel front end are read from
+the snapshot directory the handle was loaded from, on the first call that needs
+them, and kept on the handle. A file that is missing is refused naming it and is
+read again by the next call (nothing failed is cached); a snapshot without any of
+them still loads and `encode`s ids. `config_sentence_transformers.json` is
+optional (no prompts, no default); a `processor_config.json` whose patch size,
+pooling cell or mel bins do not fit the loaded towers is refused naming both.
+
+**Bounds.** Every count is bounded before it sizes a slice, and every raw entry
+bounds what the preprocessing *would* build before it builds anything. The
+output has one row per item, so `n_texts`, `n_images`, `n_clips`, `n_videos` and
+`n_items` are at most `MAX_BATCH` (256); `MAX_IMAGES` and `MAX_CLIPS` are the size
+of one tower forward and bound nothing here any more (the image and clip entries
+of the previous section had them as their count caps; they are `MAX_BATCH` now
+and the call is bounded by the totals). What a call may hold is the per-call
+totals of [Pictures and clips past a forward](#pictures-and-clips-past-a-forward):
+`MAX_CALL_IMAGES` pictures (images and video frames) and `MAX_CALL_PATCHES`
+padded patches, `MAX_CALL_CLIPS` clips and `MAX_CALL_FRAMES` frames. A raw image
+becomes `max_soft_tokens * pooling_kernel²` patches of 3 KiB whatever its size,
+so `n_images * max_patches` is compared with `MAX_CALL_PATCHES` before the first
+image is resized, and a video counts the frames it samples
+(`sample_frame_indices`). A text is below `MAX_TEXT_BYTES` (2^28) and a
+tokenized one is refused as soon as it passes `max_tokens`; a clip is at most
+`TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES` (2^28) samples before the extractor cuts it
+to 30 s; a call takes at most `MAX_VIDEO_FRAMES` (2^20) decoded frames. The
+over-limit tests pass buffers four elements long with lengths in the millions.
+
+**Precision.** An `operands` bf16 handle accepts a runtime with relaxed f32
+GEMMs switched on, for every call, clips and videos included: none of its GEMMs
+is an f32 one, so the switch changes nothing (the test shows the embeddings of
+texts, images, clips, videos and timestamped videos equal bit for bit with it on
+and off). An exact-f32 handle refuses it by name on every call that runs a
+model. Nothing in the C ABI turns relaxed precision on; `tests/capi_embedgemma2_raw.rs`
+reaches the runtime through a test hook to pin both.
+
+**Safety contract.** Each entry's `# Safety` section says what a pointer must
+hold; the common rule is that a pointer is null (refused, or accepted where its
+length is 0) or addresses exactly its stated number of elements, aligned for its
+type, and that nothing writes the input arrays during the call. The string
+queries (`prompt_name`, `prompt_get`, `decode`, `tokenize`) write their length
+cell before anything else and the bytes only to a buffer that holds them.
+
+```python
+model = EmbedGemma2.from_pretrained(snapshot_dir, multimodal=True)
+emb = model.embed_images([rgb_uint8_hwc, gray_uint8_hw])        # [H, W, 1..4] uint8 arrays, a PIL image works
+emb = model.embed_audio([pcm_float32_16khz])                     # mono clips, PCM in [-1, 1]
+emb = model.embed_video(frames_uint8_thwc, fps=24.0, timestamps=True)    # embed_videos([..], fps=[..]) for several
+emb = model.media([{"ids": ids, "images": [rgb], "audio": [pcm], "videos": [(frames, fps)]}])
+ids = model.tokenize(["a text"], prompt_name="document"); text = model.decode(ids[0])
+```
+
+The Python side is marshalling: it flattens the arrays and cuts, and checks only
+what ctypes would wrap silently, the dtype first: uint8 for pixels (a float or
+wider integer cast to `uint8` wraps), floating point for PCM (an `int16` clip
+would need a scale the binding cannot guess), dimensions that fit a `u32`, and
+integer ranges (`truncate_dim`, `sampling_rate`, ids). Everything else (the
+channel count, a clip too short for a frame, a text over the token limit, an
+unknown prompt, a placeholder count that is not the media's soft-token count,
+fps not positive) is the library's refusal and arrives as its message. The
+prompts-file reader of the previous binding (`_prompt_config`, JSON parsing,
+stat and size checks) and the processor-calling `embed_images` / `embed_audio`
+are gone; the tokenizer path of `encode_texts` fetches the prompt text with
+`tessl_embedgemma2_prompt_get`. `media` needs ids of your own because the
+placeholders and the number of soft tokens each medium makes are the
+checkpoint's (`config.json`, `processor_config.json`); `embed_images` and
+friends build the processor's own sequence.
+
+`tessl_clip_coef` is `clip_grad_norm_`'s coefficient in torch's f32 arithmetic.
+The Rust side had no such function to reuse (`src/capi.rs` only forms the norm,
+`tessl_qwen35_grad_sq_norm`, and the benchmark's own `1 / sqrt(sq).max(1)` is a
+different formula), and the arithmetic is not `max_norm / (norm + 1e-6)` as an f32
+division: torch's `max_norm / tensor` multiplies the reciprocal, so a division
+differs in the last bit for about one input in eight. The function is
+`(1 / (norm + 1e-6)) * max_norm` in f32 after rounding both inputs to f32,
+clamped to at most 1, NaN kept. `python/tests/test_clip_coef.py` checks it
+against torch over 200,000 pairs bit for bit, and `tests/capi_contract.rs` holds
+golden values (eight of which a division gets wrong). `tessl_torch.clip_coef`
+calls it.
+
+**Tests.** `tests/capi_embedgemma2_raw.rs` (tiny checkpoint, tokenizer, prompts
+and a processor config for the tiny towers) pins every entry bit for bit against
+the Rust facade on the same weights, both `operands`, and every refusal: the
+output untouched, the handle usable, a declared length bounded before it is read,
+a missing file named and read again. `python/tests/test_embedgemma2_host.py` and
+`..._mm_host.py` hold the marshalling to a recording stand-in;
+`python/tests/test_embedgemma2_raw.py` runs the tiny snapshot and, opt-in, the real
+checkpoint against sentence-transformers.
 
 ## Multimodal input
 

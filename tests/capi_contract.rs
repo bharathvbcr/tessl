@@ -1963,7 +1963,7 @@ fn a_multimodal_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
 /// in torch, which is not a division: the last eight of these are inputs where
 /// the plain f32 quotient differs from torch's value (the second assert pins
 /// that, so the formula cannot be "simplified"). Python sweeps 400,000 more
-/// against torch (`python/tests/test_qwen35.py`).
+/// against torch (`python/tests/test_clip_coef.py`).
 #[test]
 fn the_clip_coefficient_is_torchs_f32_arithmetic_bit_for_bit() {
     let golden: [(f64, f64, u32); 26] = [

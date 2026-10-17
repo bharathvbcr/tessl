@@ -1897,7 +1897,7 @@ casts and the bf16 attention output). The replica equals `encode` bit for bit, 7
 values at 1x16 and 49152 of 49152 at 64x32, in all four modes, and the stage classes are
 renamed for the fused passes ("residual add post-attn (+ pre-ffn norm)" and so on).
 `results_report text-fusion` (`src/bin/results_report/`) tabulates its output and
-`bench/results/embedgemma2_text_fusion_profile_plot.py` plots it.
+`plot_results text-fusion bench/results/embedgemma2_text_fusion_profile_m5pro.json` (`src/bin/plot_results/`) plots it.
 
 ### Profile (text-encoder fusion)
 
@@ -1907,7 +1907,7 @@ other dispatch of the forward skipped) in the replica above, on the real checkpo
 the modes), and a class's time is its minimum over all of them. The tables are in
 `bench/results/embedgemma2_text_fusion_profile_tables.txt`, the data in
 `bench/results/embedgemma2_text_fusion_profile_m5pro.json`, the plot in
-`bench/results/embedgemma2_text_fusion_profile_m5pro.png`.
+`bench/results/embedgemma2_text_fusion_profile_m5pro.svg`.
 
 **These are not clean timings.** The GPU was shared with other jobs throughout (1-minute
 load average 77 to 97, `ioreg` utilisation 82 to 99 % at every workload's start and end),

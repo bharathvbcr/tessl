@@ -1,12 +1,31 @@
-//! The C ABI's EmbeddingGemma 2 entries, so a caller that holds the
-//! tokenizer or the processor (Python) can embed text, images and audio
-//! without a Rust toolchain: [`tessl_embedgemma2_load`] reads a snapshot
-//! directory and [`tessl_embedgemma2_encode`] turns token ids into
-//! L2-normalized embeddings ([`EmbedGemma2Model::encode`]);
+//! The C ABI's EmbeddingGemma 2 entries, so a caller with no Rust toolchain
+//! (Python) can embed text, images, audio and video: [`tessl_embedgemma2_load`]
+//! reads a snapshot directory and [`tessl_embedgemma2_encode`] turns token ids
+//! into L2-normalized embeddings ([`EmbedGemma2Model::encode`]);
 //! [`tessl_embedgemma2_load_multimodal`] loads the towers too, and
 //! [`tessl_embedgemma2_encode_images`] and [`tessl_embedgemma2_encode_audio`]
 //! turn a processor's `pixel_values` / `input_features` into embeddings
 //! ([`EmbedGemma2Multimodal::encode`]).
+//!
+//! The entries that need no transformers processor and no Python tokenizer run
+//! the snapshot's own front ends in Rust:
+//!
+//! | Entry | Takes | Front end |
+//! |---|---|---|
+//! | [`tessl_embedgemma2_embed_texts`] | UTF-8 texts, an optional prompt name | [`crate::embedgemma2_tok::Tokenizer`] |
+//! | [`tessl_embedgemma2_tokenize`], [`tessl_embedgemma2_decode`] | texts / ids | the tokenizer |
+//! | [`tessl_embedgemma2_prompt_count`], [`tessl_embedgemma2_prompt_name`], [`tessl_embedgemma2_prompt_get`] | | the snapshot's named prompts |
+//! | [`tessl_embedgemma2_embed_images`] | raw `u8` HWC images, 1 to 4 channels | [`crate::embedgemma2_pre::preprocess_image`] |
+//! | [`tessl_embedgemma2_embed_audio`] | mono `f32` PCM at the extractor's rate | [`crate::embedgemma2_pre::AudioFrontEnd`] |
+//! | [`tessl_embedgemma2_embed_videos`] | decoded RGB frames, source fps, a timestamps flag | [`crate::embedgemma2_pre::preprocess_video`] |
+//! | [`tessl_embedgemma2_embed_media`] | caller ids and raw images, clips and videos ([`MmItem::Media`]) | all of the above |
+//!
+//! The tokenizer and the processor settings are read from the snapshot
+//! directory the handle was loaded from, on the first call that needs them
+//! (`tokenizer.json`, `tokenizer_config.json`, `config_sentence_transformers.json`
+//! when present; `processor_config.json`), and cached on the handle. A snapshot
+//! without them loads and encodes ids as before; a call that needs a missing
+//! file is refused naming it, and the next call tries again.
 //!
 //! The handle, thread-affinity, status-code and error-message conventions are
 //! `src/capi.rs`'s (see its module docs): every entry runs through the same
@@ -41,9 +60,12 @@
 //! or sent to the GPU, and every caller-supplied length is bounded before it
 //! sizes a slice: `n_seqs` by [`MAX_BATCH`], each sequence by the model's
 //! `max_tokens`, so `n_ids` is bounded by their product and never taken on
-//! trust; `n_images` by [`MAX_IMAGES`] and each image's `P` by
-//! [`MAX_BATCH_PATCHES`]; `n_clips` by [`MAX_CLIPS`] and each clip's `F` by
-//! [`MAX_FRAMES_PER_FORWARD`]; every array length must equal exactly what its
+//! trust; `n_images` and `n_clips` by [`MAX_BATCH`] (one output row each) and
+//! the patch rows of all the images by [`MAX_CALL_PATCHES`] and the frames of
+//! all the clips by [`MAX_CALL_FRAMES`] (the calls' bounds, which the tower
+//! checks again after the copy this avoids); each image's `P` by
+//! [`MAX_BATCH_PATCHES`] and each clip's `F` by [`MAX_FRAMES_PER_FORWARD`];
+//! every array length must equal exactly what its
 //! offsets imply, and `out_len` must equal `n * dim`. The output buffer is
 //! written only when the whole batch has succeeded, so a refused or failed call
 //! leaves it as it was. Token ids beyond the vocabulary are refused by
@@ -52,14 +74,52 @@
 //! clip's features are copied into the host memory the tower takes them in
 //! (`AudioInput` owns its rows) after its length was bounded.
 //!
-//! The runtime must not have relaxed precision switched on (`encode` refuses
-//! it by name, unless the handle holds `operands` bf16: the text encoder and
-//! both towers then run no f32 GEMM); nothing in the C ABI turns it on. The
-//! handle's `operands` applies to the text encoder and both towers.
+//! The raw entries lay their inputs out the same way. Texts are one UTF-8 byte
+//! array and `n_texts + 1` offsets (starting at 0, never decreasing, ending at
+//! the byte count: an empty text is the two-token sequence `<bos> <eos>`).
+//! Raw images are one `u8` array of the images laid end to end, each row-major
+//! HWC, and a `[n_images, 3]` `u32` table of `(height, width, channels)` whose
+//! products must sum to exactly the array's length. Raw clips are one `f32`
+//! array and `n_clips + 1` offsets over samples. Videos are one `u8` array of
+//! RGB frames laid end to end, a `[n_videos, 2]` `u32` table of `(height,
+//! width)`, `n_videos + 1` offsets over frames and one `f64` source rate each.
+//!
+//! # Bounds
+//!
+//! The output rows of every embed entry are the batch the text encoder takes
+//! at once, so the number of items (texts, images, clips, videos, media items)
+//! is bounded by [`MAX_BATCH`] (256). What one item may hold is bounded
+//! separately by the tower calls' own limits, which are per call and not per
+//! forward since the facade cuts a call into forwards behind its one wait:
+//! pictures (images and video frames) by [`MAX_CALL_IMAGES`] and padded patches
+//! by [`MAX_CALL_PATCHES`], clips by [`MAX_CALL_CLIPS`] and frames by
+//! [`MAX_CALL_FRAMES`]. [`MAX_IMAGES`] and [`MAX_CLIPS`] are the size of one
+//! forward and bound nothing here. A raw entry checks those against what the
+//! preprocessing *would* build before it builds anything (a raw image becomes
+//! `max_soft_tokens * pooling_kernel²` patches of 3 KiB whatever its size), so
+//! the host memory a call asks for is bounded by them and not by the caller's
+//! counts. A clip is at most [`TESSL_EMBEDGEMMA2_MAX_CLIP_SAMPLES`] samples
+//! (the extractor cuts it to 30 s after that), a text less than
+//! [`MAX_TEXT_BYTES`] bytes, a name [`TESSL_EMBEDGEMMA2_MAX_NAME_BYTES`].
+//!
+//! # Precision
+//!
+//! The runtime must not have relaxed precision switched on for an `operands`
+//! exact-f32 handle (the entries that run a model refuse it by name). A handle
+//! holding `operands` bf16 accepts it, calls with clips and videos included:
+//! the text encoder, the vision tower and the audio tower then run no f32 GEMM
+//! (`tests/capi_embedgemma2_raw.rs` pins both). Nothing in the C ABI turns
+//! relaxed precision on. The handle's `operands` applies to the text encoder
+//! and both towers.
+
+#[allow(unused_imports)]
+use crate::embedgemma2_audio::MAX_CLIPS;
+#[allow(unused_imports)]
+use crate::embedgemma2_vision::MAX_IMAGES;
 
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::ThreadId;
 
@@ -67,9 +127,14 @@ use crate::capi::{
     checked_slice, checked_slice_mut, free_handle, guarded, parse_operands, Handle, TesslRuntime, TESSL_OK,
 };
 use crate::embedgemma2::{EmbedGemma2Config, EmbedGemma2Model, MAX_BATCH};
-use crate::embedgemma2_audio::{AudioInput, MAX_CLIPS, MAX_FRAMES_PER_FORWARD};
+use crate::embedgemma2_audio::{AudioInput, MAX_CALL_CLIPS, MAX_CALL_FRAMES, MAX_FRAMES_PER_FORWARD};
 use crate::embedgemma2_mm::{read_config_text, EmbedGemma2Multimodal, MmItem, TEXT_PREFIX};
-use crate::embedgemma2_vision::{ImageInput, MAX_BATCH_PATCHES, MAX_IMAGES};
+use crate::embedgemma2_pre::{
+    preprocess_image, preprocess_video, sample_frame_indices, AudioFrontEnd, PreConfig, PreparedImage, PreparedVideo,
+    RawImage, MAX_VIDEO_FRAMES,
+};
+use crate::embedgemma2_tok::{Tokenizer, MAX_TEXT_BYTES};
+use crate::embedgemma2_vision::{ImageInput, MAX_BATCH_PATCHES, MAX_CALL_IMAGES, MAX_CALL_PATCHES};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 

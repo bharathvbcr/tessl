@@ -458,6 +458,77 @@ Regenerating: `EMBEDGEMMA2_SNAPSHOT=... ~/.venvs/ml-2026-10/bin/python
 tools/embedgemma2_ref/make_segments_reference.py` writes
 `target/embedgemma2_seg_ref/` (`EMBEDGEMMA2_SEG_REF_DIR` overrides it).
 
+## Go
+
+`go/embedgemma2` (module `github.com/bharathvbcr/tessl/go`) is the same C ABI
+from Go, in-process, with no Python: `Load`, `Close`, `Prompts`, `EmbedTexts`,
+`Tokenize`, `Decode`, `Encode`, `EmbedImages` / `EmbedImageFiles` /
+`EmbedImageBytes`, the audio and video siblings (video with a `timestamps`
+flag), `EmbedMixed` over `Segment`s, `ImageSoftTokens` / `AudioSoftTokens` /
+`VideoSoftTokens`, and `Ping`. Operands are exact f32 or bf16 (`Options`), or a
+text-only load. The package is documented in [go/README.md](../go/README.md);
+this section is what it adds to the C ABI above.
+
+**One archive, one worker per model.** Gusset carries the call across the
+boundary, and a Go binary links exactly one gusset archive, so `go/engine` is an
+umbrella crate whose `libgusset.a` is gusset and tessl and nothing else
+(`tessl_go_engine_init` registers its operations on gusset's opcode dispatch).
+tessl's handles are bound to the thread that made them, so each `Model` owns one
+gusset handle with one worker thread, and the runtime and model live in a
+`thread_local` on it. Goroutines queue on gusset's semaphore: 64 goroutines cost
+one worker thread, and a goroutine whose context ends while it queues never
+reaches the device.
+
+**What a context cancels.** A queued call is cancelled at once, and its deadline
+also reaches the engine, which refuses a job that expired in the queue. A call
+the worker has begun cannot be interrupted, because the C ABI's entries are one
+synchronous GPU wait: the caller is released at its deadline with `ctx.Err()`,
+the result is discarded, and the worker is free again only when the work ends, so
+abandoned work is at most one call per model. `Close` waits for it.
+
+**Frames.** The schema is the package's, over gusset's bytes and an opcode:
+64-bit words, blobs padded to 8, typed arrays as blobs, and a reply of a 16-byte
+header (status, flags, the Rust-side time of the tessl call) and a payload or
+tessl's message. The Go and Rust halves decode one committed byte string. A
+request over 4096 bytes goes in a Rust-owned buffer; the frame is capped at
+gusset's 1 GiB buffer limit, below the C ABI's 4 GiB encoded-video cap, so a
+video that large is passed by path.
+
+**Errors.** `*ArgError` for what Go refuses before it crosses (a count, a length
+against its buffer, a range, an encoding, a source mixed within one modality of an
+`EmbedMixed` call), `*Error` carrying tessl's message verbatim with its status and
+whether the runtime is poisoned, and sentinels (`ErrPanic`, `ErrPoisoned`,
+`ErrNoModel`, `ErrClosed`, `ErrInvalidArgument`, `ErrProtocol`) that `errors.Is`
+matches. After a panic or a poisoned runtime the model refuses every call.
+
+**What it does not contain.** A tessl panic is caught at the C ABI boundary and by
+gusset's firewall. A segmentation fault, an abort or a Metal driver fault takes
+the Go process with it, which gusset's own guidance says belongs in a separate
+process; the binding is in-process by the repository owner's decision.
+
+**Checked.** `go/embedgemma2` has unit tests that need no GPU (argument
+validation, error mapping, the frames, engine containment and cancellation with
+a no-work operation), device tests that compare every entry bit for bit with the
+C ABI called from Rust on the tiny checkpoint (`tests/go_fixtures.rs` writes the
+snapshot, the raw inputs and the expected rows), and real-checkpoint tests
+against the sentence-transformers references of this document (opt-in with
+`EMBEDGEMMA2_SNAPSHOT`, `EMBEDGEMMA2_REF_DIR` and `EMBEDGEMMA2_MM_REF_DIR`; opted
+in, a missing reference is a failure). On the real checkpoint every case is within
+4e-7 max abs and cosine 1.000000000 of the reference: texts, Matryoshka 512, 256
+and 128, images, audio, video, and timestamped video; the tokenizer ids equal the
+reference's, and the bf16 model stays within the floors of
+`tests/embedgemma2_mm_model.rs`. `make -C go test` builds the archive and runs
+them; `scripts/ci_local.sh` runs the unit tests always and the device tests under
+the heavy-job lock.
+
+**Speed.** `make -C go bench` times the same tessl calls from Go and from Rust
+(`go/cmd/bench_overhead` and the engine's direct arm), min of N, and
+`plot_results go-overhead` draws
+[`bench/results/embedgemma2_go_m5pro.svg`](../bench/results/embedgemma2_go_m5pro.svg).
+The boundary's own cost is measured per call, as the Go wall time minus the
+engine's timing of the same call, so the GPU time cancels; the figure's numbers
+and what they say are in [go/README.md](../go/README.md#results).
+
 ## Multimodal input
 
 The vision and audio towers are other modules (`embedgemma2_vision`,

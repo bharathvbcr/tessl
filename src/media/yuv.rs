@@ -3,7 +3,7 @@
 //!
 //! This is the conversion the reference loader of EmbeddingGemma 2 runs.
 //! `transformers` decodes a video file with torchcodec, and torchcodec turns
-//! each decoded frame into RGB with libswscale (`SwScale.cpp`: the frame's own
+//! each decoded frame into RGB with libswscale (the frame's own
 //! colorspace and range, no scaling) or with the filter graph `format=rgb24`,
 //! whose automatically inserted scaler is the same library. For a frame the
 //! size of its output, libswscale does not filter: each luma sample takes the
@@ -15,13 +15,12 @@
 //! libswscale has two implementations of that function, and which one runs
 //! depends on the CPU and the width:
 //!
-//! * the **table** converter (`yuv2rgb.c`, `yuv2rgb_c_24_rgb`): a 1024-entry
-//!   luma table, indexed by `Y` plus an integer chroma offset per `Cb`/`Cr`
-//!   value. It is the C reference and the only one on CPUs without an assembly
-//!   version;
-//! * the **aarch64 NEON** converter (`aarch64/yuv2rgb_neon.S`): 16-bit
-//!   `sqdmulh` arithmetic with 13-bit coefficients, which FFmpeg uses on arm64
-//!   when the width is a multiple of 16. The two differ by up to 3 levels.
+//! * the **table** converter: a 1024-entry luma table, indexed by `Y` plus an
+//!   integer chroma offset per `Cb`/`Cr` value. It is the plain C path and the
+//!   only one on CPUs without a vector version (`ffmpeg -cpuflags 0` selects it);
+//! * the **aarch64 NEON** converter: 16-bit multiply-high (`sqdmulh`)
+//!   arithmetic with 13-bit coefficients, which FFmpeg uses on arm64 when the
+//!   width is a multiple of 16. The two differ by up to 3 levels.
 //!
 //! [`Flavor::Aarch64`] picks per frame width as FFmpeg does on arm64 (and so
 //! as the `ffmpeg` CLI and torchcodec do on Apple silicon); [`Flavor::Portable`]
@@ -34,10 +33,23 @@
 //! `2Kb(1-Kb)/Kg` and `2Kr(1-Kr)/Kg`, times `65536 * 255 / 224` (chroma
 //! excursion), rounded; [`Matrix::coefficients`] holds the integers. The NEON
 //! coefficients are those `/ 8` rounded, the table converter's are the
-//! coefficients divided by the luma gain. The arithmetic and the constants were
-//! recovered from the `ffmpeg` binary (9.0.2, aarch64) and checked against it
-//! for **every** `(Y, Cb, Cr)` triple of every matrix and range listed here, in
-//! both modes (`tests/media_video_exact.rs`, `exhaustive_*`, needs `ffmpeg`).
+//! coefficients divided by the luma gain.
+//!
+//! # Provenance (licensing)
+//!
+//! libswscale is LGPL-2.1+; this module is not a port of it. No libswscale
+//! source file was read while writing it (none is installed here; the Homebrew
+//! build ships only the public headers, which hold no conversion code). The
+//! matrices are the public ITU-R BT.601, BT.709 and BT.2020 definitions with
+//! the limited-range scaling of H.273. The shape of the two paths (a luma table
+//! plus integer chroma offsets; 13-bit coefficients through a 16-bit
+//! multiply-high) was written from a general recollection of how libswscale is
+//! organised, which the author cannot rule out came from having seen its source
+//! at some earlier time, and every constant and rounding step was then fixed by
+//! black-box comparison with the `ffmpeg` binary (9.0.2, aarch64): for **every**
+//! `(Y, Cb, Cr)` triple of every matrix and range listed here, in both modes
+//! (`tests/media_yuv_exact.rs`, `exhaustive_against_a_live_ffmpeg`, which runs
+//! `ffmpeg`).
 
 use std::fmt;
 
@@ -146,9 +158,8 @@ pub struct Nv12<'a> {
     pub uv_stride: usize,
 }
 
-/// The 16.16 values both converters start from, for a matrix and range
-/// (`ff_yuv2rgb_c_init_tables`): the luma gain and the four chroma
-/// coefficients, scaled for the range.
+/// The 16.16 values both converters start from, for a matrix and range: the
+/// luma gain and the four chroma coefficients, scaled for the range.
 struct Scaled {
     cy: i64,
     crv: i64,

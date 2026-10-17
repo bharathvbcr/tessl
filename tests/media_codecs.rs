@@ -135,8 +135,10 @@ fn rotation_metadata_is_applied_or_ignored_as_asked() {
         "(max, mean, share > 8): rotated vs ffmpeg autorotate {:?}; stored vs ffmpeg -noautorotate {:?}; rotated vs OpenCV {:?}; ffmpeg vs OpenCV {:?}",
         worst[0], worst[1], worst[2], worst[3]
     );
-    for (what, (_, mean, big)) in [("rotated/ffmpeg", worst[0]), ("stored/ffmpeg", worst[1])] {
-        assert!(mean < 6.0 && big < 0.12, "{what}: mean {mean}, share over 8 {big}");
+    // The default colour path is libswscale's arithmetic on VideoToolbox's planes
+    // (src/media/yuv.rs), so against the ffmpeg CLI it is equal, not close.
+    for (what, w) in [("rotated/ffmpeg", worst[0]), ("stored/ffmpeg", worst[1])] {
+        assert_eq!(w, (0, 0.0, 0.0), "{what}: (max, mean, share over 8)");
     }
     // OpenCV's colour conversion is its own (it maps 255 to 233 and 200 to 226 on
     // these frames, 9.4 mean from FFmpeg's), so it is an oracle for the rotation

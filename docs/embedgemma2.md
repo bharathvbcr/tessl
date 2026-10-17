@@ -3156,8 +3156,8 @@ mismatch (81106 and 97789 bytes of 2^24).
 - the committed goldens: random planes of 34 format x matrix x range x size classes,
   including odd sizes (`tests/media_yuv_formats.rs`, hosted).
 
-Run on 2026-10-17: the five `--ignored` tests above and `exhaustive_against_a_live_ffmpeg`
-passed, 0 differing bytes.
+Run on 2026-10-17: the five `--ignored` tests (`exhaustive_against_a_live_ffmpeg` and the four
+of `media_yuv_formats`) passed, 0 differing bytes.
 
 **The 10-bit 4:2:0 filter.** The scaler resamples the half-height chroma to luma rows with a
 filter that depends on its flags: bilinear `(3072, 1024)/4096`, or the `ffmpeg` CLI's default,
@@ -3238,8 +3238,9 @@ The Y, Cb and Cr planes VideoToolbox returns equal FFmpeg's for all six HEVC lay
 their value in the high ten bits, and the low six are checked to be zero).
 **VideoToolbox on this machine (M5 Pro) does not decode H.264 High 10, 4:2:2 or 4:4:4** (it
 refuses at open), so those H.264 shapes are not decodable here by this path and are not in the
-tests; the HEVC ones are. 12-bit and monochrome HEVC and MPEG-4 Part 2 are refused (MPEG-4: by
-AVFoundation, which cannot decode it under either colour path).
+tests; the HEVC ones are. 12-bit and monochrome HEVC and Motion JPEG (a codec AVFoundation
+decodes) are refused by name; MPEG-4 Part 2 is refused by AVFoundation itself, which cannot
+decode it under either colour path.
 
 Sampling and timing agree with the reference too: `total_frames`, `duration`, `fps` and every
 timestamp are bit-equal to the `ffprobe`-derived figures, and the indices for four sampling

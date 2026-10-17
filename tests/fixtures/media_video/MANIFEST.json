@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_media_video_exact_fixtures.py",
- "generator_commit": "7520266f186fd834ff7e616bd4afd6dc1eef0b3b",
+ "generator_commit": "719cf6e5d316173858b3cb0e8ff354da18fcac4b",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",
@@ -807,6 +807,11 @@
    "note": "an encoded video the decoders under test are given"
   },
   "refuse_hevc_p10_709_tv_64x12.mp4": {
+   "role": "input",
+   "published": true,
+   "note": "an encoded video the decoders under test are given"
+  },
+  "refuse_mjpeg_pc_64x48.mp4": {
    "role": "input",
    "published": true,
    "note": "an encoded video the decoders under test are given"

@@ -523,6 +523,9 @@ fn streams_that_cannot_be_exact_are_refused_by_name_and_converted_only_on_reques
     for (name, reason) in [
         ("refuse_hevc_12bit_709_tv_64x48", "12-bit HEVC"),
         ("refuse_hevc_gray_64x48", "monochrome (4:0:0) HEVC"),
+        // A codec AVFoundation decodes and the conversion is not held to (the check on the
+        // codec of a decodable stream; MPEG-4 Part 2 never gets this far, below).
+        ("refuse_mjpeg_pc_64x48", "is not H.264 or HEVC"),
     ] {
         let src = open(name, &VideoOptions::default());
         let layout_error = src.info().layout.clone().expect_err(name);

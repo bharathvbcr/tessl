@@ -50,6 +50,9 @@ mod svg;
 #[path = "../src/bin/plot_results/tok.rs"]
 mod tok;
 #[allow(dead_code)]
+#[path = "../src/bin/plot_results/video_color.rs"]
+mod video_color;
+#[allow(dead_code)]
 #[path = "../src/bin/plot_results/vision.rs"]
 mod vision;
 
@@ -384,6 +387,7 @@ const ALL: &[(&str, &str)] = &[
     ("tok", "embedgemma2_tok_m5pro"),
     ("video", "embedgemma2_video_m5pro"),
     ("media-decode", "media_decode_m5pro"),
+    ("video-color", "media_video_color_m5pro"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1175,66 @@ fn media_decode_refuses_an_empty_list_and_an_unknown_unit() {
     let r = run(&["media-decode", p.to_str().unwrap()]);
     assert_eq!(r.code, Some(1));
     assert!(r.err.contains("unknown unit \"bytes\""), "{}", r.err);
+    assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn video_color_draws_a_bar_and_a_median_per_path_of_every_call() {
+    let doc = parse("media_video_color_m5pro.json");
+    let drawn = arr(&doc)
+        .iter()
+        .filter(|r| !s(at(r, "workload")).ends_with(":video_open"))
+        .count();
+    assert!(drawn > 0 && drawn % 2 == 0);
+    let e = elems("video-color");
+    assert_eq!(count(&e, "bar"), drawn);
+    assert_eq!(count(&e, "median"), drawn);
+}
+
+#[test]
+fn video_color_refuses_what_it_cannot_pair_or_name() {
+    let dir = fresh("video_color_bad");
+    let row = |workload: &str, unit: &str| {
+        format!("{{\"workload\":\"{workload}\",\"ms_min\":1.0,\"ms_median\":1.5,\"iters\":3,\"units\":30.0,\"unit\":\"{unit}\"}}")
+    };
+    let cases = [
+        ("[]".to_string(), "empty list, nothing to plot"),
+        (
+            format!("[{}]", row("a.mp4:video_open", "frame")),
+            "no video_sampled/video_first workloads",
+        ),
+        (
+            format!("[{}]", row("a.mp4:video_first_30:exact", "frame")),
+            "needs both an exact and a bgra row",
+        ),
+        (
+            format!(
+                "[{},{}]",
+                row("a.mp4:video_first_30:exact", "frame"),
+                row("a.mp4:video_first_30:cv2", "frame")
+            ),
+            "unknown colour path \"cv2\"",
+        ),
+        (
+            format!(
+                "[{},{}]",
+                row("a.mp4:video_first_30:exact", "frame"),
+                row("a.mp4:video_first_30:exact", "frame")
+            ),
+            "appears twice",
+        ),
+        (
+            format!("[{}]", row("a.mp4:video_first_30:exact", "megapixel")),
+            "a video workload counts frames",
+        ),
+        (format!("[{}]", row("a.mp4", "frame")), "expected FILE:video_CALL:PATH"),
+    ];
+    for (json, reason) in cases {
+        let p = write_json(&dir, "media_video_color_m5pro.json", &json);
+        let r = run(&["video-color", p.to_str().unwrap()]);
+        assert_eq!(r.code, Some(1), "{json}");
+        assert!(r.err.contains(reason), "{json}: {}", r.err);
+    }
     assert!(no_svg_in(&dir));
 }
 

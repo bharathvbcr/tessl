@@ -32,6 +32,7 @@ mod small_m;
 mod stage;
 mod svg;
 mod tok;
+mod video_color;
 mod vision;
 
 use std::path::{Path, PathBuf};

@@ -827,6 +827,26 @@ pub struct SpecialTokens {
     pub eoa: Option<u32>,
 }
 
+/// One piece of an item that interleaves text with media, for
+/// [`EmbedGemma2Config::mixed_sequence`]: what the placeholder layout needs of
+/// it and nothing more (the soft-token counts, not the media).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LayoutSegment<'a> {
+    /// Text, tokenized together with the text next to it.
+    Text(&'a str),
+    /// An image of `soft` soft tokens.
+    Image { soft: usize },
+    /// A clip of `soft` soft tokens.
+    Audio { soft: usize },
+    /// A video: the soft tokens of each of its frames, and with `timestamps`
+    /// (one time in seconds per frame) the `mm:ss` labels the processor writes
+    /// under `add_timestamps = true`.
+    Video {
+        soft_per_frame: &'a [usize],
+        timestamps: Option<&'a [f64]>,
+    },
+}
+
 /// The ids [`EmbedGemma2Model::encode_multimodal`] works with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MmTokens {
@@ -847,11 +867,18 @@ impl SpecialTokens {
     /// Every id of `named`, or an error naming each missing one by its
     /// `config.json` key.
     fn all<const N: usize>(what: &str, named: [(&str, Option<u32>); N]) -> Result<[u32; N], String> {
+        Self::require(what, &named)?;
+        Ok(named.map(|(_, v)| v.unwrap_or_default()))
+    }
+
+    /// `Ok` when every id of `named` is present, else the error naming each
+    /// missing one by its `config.json` key.
+    fn require(what: &str, named: &[(&str, Option<u32>)]) -> Result<(), String> {
         let missing: Vec<&str> = named.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| *k).collect();
         if !missing.is_empty() {
             return Err(format!("{what}: config.json has no {}", missing.join(", ")));
         }
-        Ok(named.map(|(_, v)| v.unwrap_or_default()))
+        Ok(())
     }
 
     /// What the multimodal entry needs: `pad_token_id`, the three
@@ -964,76 +991,218 @@ impl EmbedGemma2Config {
         )
     }
 
-    /// The one builder of a video's ids, with or without the timestamps'
-    /// labels in front of the blocks.
+    /// A video's ids, with or without the timestamps' labels in front of the
+    /// blocks: a mixed layout of that one video ([`Self::layout`]).
     fn video_layout(
         &self,
         what: &str,
         soft_per_frame: &[usize],
         labels: Option<(&Tokenizer, &[f64])>,
     ) -> Result<Vec<u32>, String> {
+        let segment = LayoutSegment::Video {
+            soft_per_frame,
+            timestamps: labels.map(|(_, stamps)| stamps),
+        };
+        self.layout(what, labels.map(|(tokenizer, _)| tokenizer), &[segment])
+    }
+
+    /// The ids of an item that interleaves text with media, built the way the
+    /// processor builds them. The snapshot's chat template joins the text
+    /// pieces and the media (as the processor's placeholder tokens) in order
+    /// with nothing between them; the processor expands each placeholder to its
+    /// block (an image's `<boi> <image> x n <eoi>`, a clip's `<boa> <audio> x n
+    /// <eoa>`, a video's one such block per frame) and the tokenizer wraps the
+    /// whole in `<bos>` and `<eos>`. The tokenizer splits the text at those
+    /// added tokens, so the text between two blocks is tokenized as one stretch
+    /// on its own: adjacent text segments are one stretch, and a timestamp's
+    /// label and its spaces ([`Self::video_sequence_with_timestamps`]) join the
+    /// text before them. `soft` counts are the towers' (the caller gets them
+    /// from the vision and audio towers' `check_images` / `check_clips`, or
+    /// from [`crate::embedgemma2_pre::image_soft_tokens`],
+    /// [`crate::embedgemma2_pre::audio_soft_tokens`] and
+    /// [`crate::embedgemma2_pre::video_soft_tokens`] before anything runs), so
+    /// a caller never counts placeholders.
+    ///
+    /// `[Text("a photo of"), Image { soft: 256 }, Text("on a table")]` is
+    /// `[<bos>, ids("a photo of"), <boi>, <image> x 256, <eoi>, ids("on a
+    /// table"), <eos>]`. Refused: no segments, a medium of no soft tokens, a
+    /// video of no frames, timestamps that are not one per frame or not times
+    /// in `0..=`[`MAX_TIMESTAMP_SECONDS`], a stretch of text of
+    /// [`crate::embedgemma2_tok::MAX_TEXT_BYTES`] bytes or more, and a config
+    /// that lacks an id a segment places (naming each key).
+    pub fn mixed_sequence(&self, tokenizer: &Tokenizer, segments: &[LayoutSegment<'_>]) -> Result<Vec<u32>, String> {
+        self.layout("mixed_sequence", Some(tokenizer), segments)
+    }
+
+    /// The one builder of an interleaved item's ids ([`Self::mixed_sequence`]);
+    /// `tokenizer` is needed only by text and timestamp labels.
+    fn layout(
+        &self,
+        what: &str,
+        tokenizer: Option<&Tokenizer>,
+        segments: &[LayoutSegment<'_>],
+    ) -> Result<Vec<u32>, String> {
         let t = &self.special_tokens;
-        let [bos, boi, video, eoi, eos] = SpecialTokens::all(
-            what,
-            [
-                ("text_config.bos_token_id", t.bos),
-                ("boi_token_id", t.boi),
-                ("video_token_id", t.video),
-                ("eoi_token_id", t.eoi),
-                ("text_config.eos_token_id", t.eos),
-            ],
-        )?;
-        if soft_per_frame.is_empty() {
-            return Err(format!("{what}: the video has no frames"));
+        if segments.is_empty() {
+            return Err(format!("{what}: no segments"));
         }
-        if let Some(f) = soft_per_frame.iter().position(|&n| n == 0) {
-            return Err(format!("{what}: frame {f} has no soft tokens"));
-        }
-        let len = soft_per_frame
-            .iter()
-            .try_fold(2usize, |acc, &n| acc.checked_add(n)?.checked_add(2))
-            .ok_or_else(|| format!("{what}: the sequence length overflows"))?;
-        if let Some((_, stamps)) = labels {
-            if stamps.len() != soft_per_frame.len() {
-                return Err(format!(
-                    "{what}: {} timestamps for {} frames; one per frame",
-                    stamps.len(),
-                    soft_per_frame.len()
-                ));
+        // The ids the segments place, every missing one named at once.
+        let mut need: Vec<(&str, Option<u32>)> =
+            vec![("text_config.bos_token_id", t.bos), ("text_config.eos_token_id", t.eos)];
+        let mut want = |keys: [(&'static str, Option<u32>); 3]| {
+            for key in keys {
+                if !need.iter().any(|(name, _)| *name == key.0) {
+                    need.push(key);
+                }
             }
-            if let Some(f) = stamps
-                .iter()
-                .position(|s| !(s.is_finite() && (0.0..=MAX_TIMESTAMP_SECONDS).contains(s)))
-            {
-                return Err(format!(
-                    "{what}: frame {f}'s timestamp {} is not a time in 0..={MAX_TIMESTAMP_SECONDS} seconds",
-                    stamps[f]
-                ));
+        };
+        for seg in segments {
+            match seg {
+                LayoutSegment::Text(_) => {}
+                LayoutSegment::Image { .. } => want([
+                    ("boi_token_id", t.boi),
+                    ("image_token_id", t.image),
+                    ("eoi_token_id", t.eoi),
+                ]),
+                LayoutSegment::Audio { .. } => want([
+                    ("boa_token_id", t.boa),
+                    ("audio_token_id", t.audio),
+                    ("eoa_token_index", t.eoa),
+                ]),
+                LayoutSegment::Video { .. } => want([
+                    ("boi_token_id", t.boi),
+                    ("video_token_id", t.video),
+                    ("eoi_token_id", t.eoi),
+                ]),
             }
         }
+        SpecialTokens::require(what, &need)?;
+        let (bos, eos) = (t.bos.unwrap_or_default(), t.eos.unwrap_or_default());
+        // Every other refusal comes before the first token is written.
+        let mut len = 2usize;
+        for (s, seg) in segments.iter().enumerate() {
+            let at = |e: String| format!("{what}: segment {s}: {e}");
+            match *seg {
+                LayoutSegment::Text(_) => {}
+                LayoutSegment::Image { soft } | LayoutSegment::Audio { soft } => {
+                    len = Self::block_len(len, soft).map_err(at)?;
+                }
+                LayoutSegment::Video {
+                    soft_per_frame,
+                    timestamps,
+                } => {
+                    if soft_per_frame.is_empty() {
+                        return Err(at("the video has no frames".into()));
+                    }
+                    if let Some(f) = soft_per_frame.iter().position(|&n| n == 0) {
+                        return Err(at(format!("frame {f} has no soft tokens")));
+                    }
+                    for &n in soft_per_frame {
+                        len = Self::block_len(len, n).map_err(at)?;
+                    }
+                    if let Some(stamps) = timestamps {
+                        if tokenizer.is_none() {
+                            return Err(at("timestamp labels need the tokenizer".into()));
+                        }
+                        if stamps.len() != soft_per_frame.len() {
+                            return Err(at(format!(
+                                "{} timestamps for {} frames; one per frame",
+                                stamps.len(),
+                                soft_per_frame.len()
+                            )));
+                        }
+                        if let Some(f) = stamps
+                            .iter()
+                            .position(|s| !(s.is_finite() && (0.0..=MAX_TIMESTAMP_SECONDS).contains(s)))
+                        {
+                            return Err(at(format!(
+                                "frame {f}'s timestamp {} is not a time in 0..={MAX_TIMESTAMP_SECONDS} seconds",
+                                stamps[f]
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        // Text between two blocks, written as one stretch and tokenized when the
+        // next block (or the end) arrives.
+        let mut stretch = String::new();
         let mut ids = Vec::with_capacity(len);
         ids.push(bos);
-        for (f, &n) in soft_per_frame.iter().enumerate() {
-            if let Some((tokenizer, stamps)) = labels {
-                // The text between two added tokens: the label and the
-                // spaces that join it to the neighbouring blocks.
-                let label = crate::embedgemma2_pre::timestamp_label(stamps[f]);
-                let stretch = if f == 0 {
-                    format!("{label} ")
-                } else {
-                    format!(" {label} ")
-                };
-                ids.extend(tokenizer.encode_raw(&stretch, false));
+        let flush = |stretch: &mut String, ids: &mut Vec<u32>| -> Result<(), String> {
+            if stretch.is_empty() {
+                return Ok(());
             }
-            ids.push(boi);
-            ids.resize(ids.len() + n, video);
-            ids.push(eoi);
+            let tokenizer = tokenizer.ok_or_else(|| format!("{what}: text needs the tokenizer"))?;
+            ids.extend(tokenizer.encode_raw(stretch, false));
+            stretch.clear();
+            Ok(())
+        };
+        let push = |stretch: &mut String, s: usize, text: &str| -> Result<(), String> {
+            // `encode_raw` panics on a text this long, and a caller's text is theirs.
+            if stretch.len().saturating_add(text.len()) >= crate::embedgemma2_tok::MAX_TEXT_BYTES {
+                return Err(format!(
+                    "{what}: segment {s}: the text between two media reaches {} bytes; it must stay under {}",
+                    stretch.len().saturating_add(text.len()),
+                    crate::embedgemma2_tok::MAX_TEXT_BYTES
+                ));
+            }
+            stretch.push_str(text);
+            Ok(())
+        };
+        for (s, seg) in segments.iter().enumerate() {
+            match *seg {
+                LayoutSegment::Text(text) => push(&mut stretch, s, text)?,
+                LayoutSegment::Image { soft } => {
+                    flush(&mut stretch, &mut ids)?;
+                    ids.push(t.boi.unwrap_or_default());
+                    ids.resize(ids.len() + soft, t.image.unwrap_or_default());
+                    ids.push(t.eoi.unwrap_or_default());
+                }
+                LayoutSegment::Audio { soft } => {
+                    flush(&mut stretch, &mut ids)?;
+                    ids.push(t.boa.unwrap_or_default());
+                    ids.resize(ids.len() + soft, t.audio.unwrap_or_default());
+                    ids.push(t.eoa.unwrap_or_default());
+                }
+                LayoutSegment::Video {
+                    soft_per_frame,
+                    timestamps,
+                } => {
+                    for (f, &n) in soft_per_frame.iter().enumerate() {
+                        if let Some(stamps) = timestamps {
+                            // The label and the spaces that join it to the
+                            // neighbouring blocks, one stretch with the text before it.
+                            let label = crate::embedgemma2_pre::timestamp_label(stamps[f]);
+                            let spaced = if f == 0 {
+                                format!("{label} ")
+                            } else {
+                                format!(" {label} ")
+                            };
+                            push(&mut stretch, s, &spaced)?;
+                        }
+                        flush(&mut stretch, &mut ids)?;
+                        ids.push(t.boi.unwrap_or_default());
+                        ids.resize(ids.len() + n, t.video.unwrap_or_default());
+                        ids.push(t.eoi.unwrap_or_default());
+                    }
+                }
+            }
         }
+        flush(&mut stretch, &mut ids)?;
         ids.push(eos);
-        if labels.is_none() {
-            debug_assert_eq!(ids.len(), len);
-        }
         Ok(ids)
+    }
+
+    /// `len` plus a block of `soft` placeholders and its two markers; a block
+    /// of none is refused.
+    fn block_len(len: usize, soft: usize) -> Result<usize, String> {
+        if soft == 0 {
+            return Err("the medium has no soft tokens".into());
+        }
+        len.checked_add(soft)
+            .and_then(|l| l.checked_add(2))
+            .ok_or_else(|| format!("the sequence length overflows with {soft} soft tokens"))
     }
 
     fn framed(what: &str, head: [u32; 2], placeholder: u32, tail: [u32; 2], n_soft: usize) -> Result<Vec<u32>, String> {

@@ -585,8 +585,10 @@ fn compressed_audio_decodes_with_the_expected_length_and_content() {
             // AudioToolbox's Opus decoder (afconvert returns the same samples)
             // is two 48 kHz frames behind libopus (FFmpeg) for the first
             // 16000 frames of this file, then identical to 138 dB; at 16 kHz
-            // that is the first 6000 samples, then 93.9 dB.
+            // that is the first 6000 samples, then 66.9 dB on the committed
+            // encode (93.9 dB on the earlier one).
             let tail = snr_db(&ffm[6000..], &got.samples[6000..]);
+            eprintln!("{name}: SNR vs ffmpeg after the first 6000 samples {tail:.1} dB");
             assert!(
                 tail >= 60.0,
                 "{name}: {tail:.1} dB vs ffmpeg after the first 6000 samples"

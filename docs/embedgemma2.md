@@ -2658,9 +2658,11 @@ own MP3 decode is 26.0 dB from it):
 
 **Ogg Opus is a known difference, and not this module's.** AudioToolbox's Opus decoder is two
 48 kHz frames behind libopus (FFmpeg) for the first 16000 frames of the fixture and then
-identical to 138 dB; `afconvert` returns the same samples as this module at 48 kHz. After the
-first 6000 samples at 16 kHz the SNR against FFmpeg is 93.9 dB (pinned at 60 dB). The cause
-inside AudioToolbox is **unverified**.
+identical to 138 dB; `afconvert` returns the same samples as this module at 48 kHz. (The 138 dB
+and the `afconvert` comparison were measured on an earlier encode of the fixture; the
+committed one is a re-encode and they were not repeated.) After the first 6000 samples at
+16 kHz the SNR against FFmpeg is 66.9 dB on the committed file (93.9 dB on the earlier
+encode; pinned at 60 dB). The cause inside AudioToolbox is **unverified**.
 
 WavPack is rejected by AudioToolbox (`'typ?'`) and is an error here.
 

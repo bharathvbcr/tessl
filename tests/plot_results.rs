@@ -1213,9 +1213,11 @@ fn video_color_draws_a_bar_and_a_median_per_path_of_every_call() {
     let e = elems("video-color");
     assert_eq!(count(&e, "bar"), drawn);
     assert_eq!(count(&e, "median"), drawn);
+    video_color_draws_three_bars_per_call_when_the_single_thread_path_was_timed();
 }
 
-#[test]
+/// A run that also timed the single-threaded converter draws three bars per call (called from
+/// `video_color_draws_a_bar_and_a_median_per_path_of_every_call`, which keeps the test count).
 fn video_color_draws_three_bars_per_call_when_the_single_thread_path_was_timed() {
     let dir = fresh("video_color_three");
     let row = |workload: &str| {

@@ -1,0 +1,194 @@
+case sub_444_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
+case sub_444_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
+case sub_422_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
+case sub_422_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
+case sub_420_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
+case sub_420_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
+case sub_411_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
+case sub_411_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
+case sub_440_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
+case sub_440_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
+case samp_2x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_1x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_4x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_1x4_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_4x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x4_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_3x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_1x1_2x2_2x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x1_1x2_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x2_2x1_1x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x2_1x1_2x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_3x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_1x3_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x2_1x1_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_1x1_2x2_2x2_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_4x2_1x1_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case samp_2x1_1x2_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
+case size_1x1_420 expect=ok tessl=equal class=size w=1 h=1 pil=equal
+case size_1x1_444 expect=ok tessl=equal class=size w=1 h=1 pil=equal
+case size_1x1_prog expect=ok tessl=equal class=size w=1 h=1 pil=equal
+case size_1x1_gray expect=ok tessl=equal class=size w=1 h=1 pil=equal
+case size_1x9_420 expect=ok tessl=equal class=size w=9 h=1 pil=equal
+case size_1x9_444 expect=ok tessl=equal class=size w=9 h=1 pil=equal
+case size_1x9_prog expect=ok tessl=equal class=size w=9 h=1 pil=equal
+case size_1x9_gray expect=ok tessl=equal class=size w=9 h=1 pil=equal
+case size_9x1_420 expect=ok tessl=equal class=size w=1 h=9 pil=equal
+case size_9x1_444 expect=ok tessl=equal class=size w=1 h=9 pil=equal
+case size_9x1_prog expect=ok tessl=equal class=size w=1 h=9 pil=equal
+case size_9x1_gray expect=ok tessl=equal class=size w=1 h=9 pil=equal
+case size_2x2_420 expect=ok tessl=equal class=size w=2 h=2 pil=equal
+case size_2x2_444 expect=ok tessl=equal class=size w=2 h=2 pil=equal
+case size_2x2_prog expect=ok tessl=equal class=size w=2 h=2 pil=equal
+case size_2x2_gray expect=ok tessl=equal class=size w=2 h=2 pil=equal
+case size_3x3_420 expect=ok tessl=equal class=size w=3 h=3 pil=equal
+case size_3x3_444 expect=ok tessl=equal class=size w=3 h=3 pil=equal
+case size_3x3_prog expect=ok tessl=equal class=size w=3 h=3 pil=equal
+case size_3x3_gray expect=ok tessl=equal class=size w=3 h=3 pil=equal
+case size_7x13_420 expect=ok tessl=equal class=size w=13 h=7 pil=equal
+case size_7x13_444 expect=ok tessl=equal class=size w=13 h=7 pil=equal
+case size_7x13_prog expect=ok tessl=equal class=size w=13 h=7 pil=equal
+case size_7x13_gray expect=ok tessl=equal class=size w=13 h=7 pil=equal
+case size_13x7_420 expect=ok tessl=equal class=size w=7 h=13 pil=equal
+case size_13x7_444 expect=ok tessl=equal class=size w=7 h=13 pil=equal
+case size_13x7_prog expect=ok tessl=equal class=size w=7 h=13 pil=equal
+case size_13x7_gray expect=ok tessl=equal class=size w=7 h=13 pil=equal
+case size_8x8_420 expect=ok tessl=equal class=size w=8 h=8 pil=equal
+case size_8x8_444 expect=ok tessl=equal class=size w=8 h=8 pil=equal
+case size_8x8_prog expect=ok tessl=equal class=size w=8 h=8 pil=equal
+case size_8x8_gray expect=ok tessl=equal class=size w=8 h=8 pil=equal
+case size_9x9_420 expect=ok tessl=equal class=size w=9 h=9 pil=equal
+case size_9x9_444 expect=ok tessl=equal class=size w=9 h=9 pil=equal
+case size_9x9_prog expect=ok tessl=equal class=size w=9 h=9 pil=equal
+case size_9x9_gray expect=ok tessl=equal class=size w=9 h=9 pil=equal
+case size_17x15_420 expect=ok tessl=equal class=size w=15 h=17 pil=equal
+case size_17x15_444 expect=ok tessl=equal class=size w=15 h=17 pil=equal
+case size_17x15_prog expect=ok tessl=equal class=size w=15 h=17 pil=equal
+case size_17x15_gray expect=ok tessl=equal class=size w=15 h=17 pil=equal
+case size_65x129_420 expect=ok tessl=equal class=size w=129 h=65 pil=equal
+case size_65x129_444 expect=ok tessl=equal class=size w=129 h=65 pil=equal
+case size_65x129_prog expect=ok tessl=equal class=size w=129 h=65 pil=equal
+case size_65x129_gray expect=ok tessl=equal class=size w=129 h=65 pil=equal
+case size_3x4097_420 expect=ok tessl=equal class=size w=4097 h=3 pil=equal
+case size_3x4097_444 expect=ok tessl=equal class=size w=4097 h=3 pil=equal
+case size_3x4097_prog expect=ok tessl=equal class=size w=4097 h=3 pil=equal
+case size_3x4097_gray expect=ok tessl=equal class=size w=4097 h=3 pil=equal
+case size_4097x3_420 expect=ok tessl=equal class=size w=3 h=4097 pil=equal
+case size_4097x3_444 expect=ok tessl=equal class=size w=3 h=4097 pil=equal
+case size_4097x3_prog expect=ok tessl=equal class=size w=3 h=4097 pil=equal
+case size_4097x3_gray expect=ok tessl=equal class=size w=3 h=4097 pil=equal
+case rst_1_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_2_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_3_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_7_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_rows_cjpeg expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_progressive expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_arith expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case rst_arith_progressive expect=ok tessl=equal class=restart w=47 h=33 pil=equal
+case gray_baseline expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
+case gray_progressive expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
+case gray_arith expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
+case quality_1_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_5_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_10_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_25_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_50_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_75_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_90_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_95_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_100_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case quality_100_444 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
+case optimized_tables expect=ok tessl=equal class=tables w=47 h=33 pil=equal
+case std_tables_only expect=ok tessl=equal class=tables w=47 h=33 pil=equal
+case std_tables_only_gray expect=ok tessl=equal class=tables w=47 h=33 pil=equal
+case sof1_extended expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case arith_sequential_420 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
+case arith_sequential_444 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
+case arith_progressive expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
+case arith_progressive_gray expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
+case arith_422 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
+case cmyk_pil_adobe expect=ok tessl=equal class=colour w=47 h=33 pil=equal
+case cmyk4_adobe_None expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_2 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_3 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_None_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_None_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_0_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_0_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_1_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_1_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_2_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_2_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_9_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_adobe_9_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_ids_RGB expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case rgb3_ids_other expect=ok tessl=equal class=colour w=24 h=16 pil=equal
+case ycc_cube_y0 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
+case ycc_cube_y128 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
+case ycc_cube_y255 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
+case ycck_flat expect=ok tessl=equal class=colour w=128 h=128 pil=equal
+case cmyk_flat expect=ok tessl=equal class=colour w=128 h=128 pil=equal
+case noninterleaved_scans expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case dqt_16bit expect=ok tessl=equal class=tables w=24 h=16 pil=equal
+case synth_rst_1 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
+case synth_rst_2 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
+case synth_rst_5 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
+case idct_dense32767_q255 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
+case idct_dense32767_q1 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
+case idct_dense2000_q40 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
+case idct_dense1023_q200 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
+case idct_q65535 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
+case idct_dc_ramp_q16 expect=ok tessl=equal class=idct w=64 h=32 pil=equal
+case marker_com_app_before_sof expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_fill_ff expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_trailing_garbage expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_garbage_before_eoi expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_dnl expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_dri_zero expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case marker_dup_eoi expect=ok tessl=equal class=markers w=47 h=33 pil=equal
+case scan_order_123 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case scan_order_132 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case scan_order_213 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case scan_order_231 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case scan_order_312 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case scan_order_321 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case smoothing_gray_1scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_2scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_3scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
+case smoothing_420_1scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
+case smoothing_420_4scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
+case lossless_sof3 expect=ok tessl=refused class=lossless w=24 h=16 pil=equal
+case err_12bit_cjpeg expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_12
+case err_precision_12_sof0 expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_12
+case err_precision_16 expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_16
+case err_no_eoi expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_10 expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_30 expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_50 expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_80 expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_97 expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_cut_progressive_half expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_header_only expect=error class=error oracle=ERR_Image_is_incomplete_or_truncated
+case err_2_components expect=error class=error oracle=ERR_Unsupported_color_conversion_request
+case err_5_components expect=error class=error oracle=ERR_Bogus_marker_length
+case err_6_components expect=error class=error oracle=ERR_Bogus_marker_length
+case err_10_components expect=error class=error oracle=ERR_Bogus_marker_length
+case err_fractional_sampling_3_2_1 expect=error class=error oracle=ERR_Fractional_sampling_not_implemented_yet
+case err_mcu_over_10_blocks expect=error class=error oracle=ERR_Sampling_factors_too_large_for_interleaved_scan
+case layout_mcu_10_blocks expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case err_sampling_zero expect=error class=error oracle=ERR_Bogus_sampling_factors
+case err_sampling_5 expect=error class=error oracle=ERR_Bogus_sampling_factors
+case err_zero_width expect=error class=error oracle=ERR_Empty_JPEG_image_(DNL_not_supported)
+case err_missing_dqt expect=error class=error oracle=ERR_Quantization_table_0x01_was_not_defined
+case err_dht_missing_progressive expect=error class=error oracle=ERR_Huffman_table_0x00_was_not_defined
+case err_bad_signature expect=error class=error oracle=ERR_decode_image,_/Users/ec2-user/runner/_work/vision/vision/pytorch/vision/torchvision/csrc/io/image/cp
+case err_png_signature expect=error class=error oracle=ERR_decode_png,_/Users/ec2-user/runner/_work/vision/vision/pytorch/vision/torchvision/csrc/io/image/cpu/
+case err_unknown_marker_f0 expect=error class=error oracle=ERR_Unsupported_marker_type_0xf0
+case err_second_sof expect=error class=error oracle=ERR_Invalid_JPEG_file_structure:_two_SOF_markers
+case err_scan_before_sof expect=error class=error oracle=ERR_Invalid_JPEG_file_structure:_SOS_before_SOF
+case err_sof_hierarchical_c5 expect=error class=error oracle=ERR_Unsupported_JPEG_process:_SOF_type_0xc5
+case err_sof11_lossless_arith expect=error class=error oracle=ERR_Unsupported_color_conversion_request
+case err_dht_overfull expect=error class=error oracle=ERR_Bogus_Huffman_table_definition
+case err_dqt_bad_len expect=error class=error oracle=ERR_Bogus_marker_length
+case err_progression_bad_params expect=error class=error oracle=ERR_Invalid_progressive/lossless_parameters_Ss=9_Se=3_Ah=0_Al=2

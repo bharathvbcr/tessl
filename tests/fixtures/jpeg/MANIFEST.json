@@ -1,0 +1,1805 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_jpeg_fixtures.py",
+ "generator_commit": "40bc06a9a98d87e877b4c9c1b0092c8230db8fa7",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.3",
+  "python": "3.14.8"
+ },
+ "versions_role": "produced",
+ "inputs_source": "generated: images are numpy default_rng draws and closed-form gradients encoded by PIL 12.3 (libjpeg-turbo 3.1.4.1), cjpeg 3.2.0 (libjpeg-turbo) and this script's coefficient-level writer; the fuzz corpus is a seeded byte mutator over those files (random.Random, seed 2026). Encoder output is stable for a given tool version; every golden is torchvision 0.29.1's decode (libjpeg-turbo 3.1.3) of the exact input file.",
+ "files": {
+  "arith_422.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "arithmetic"
+  },
+  "arith_422.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "arith_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "arithmetic"
+  },
+  "arith_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "arith_progressive_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "arithmetic"
+  },
+  "arith_progressive_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "arith_sequential_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "arithmetic"
+  },
+  "arith_sequential_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "arith_sequential_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "arithmetic"
+  },
+  "arith_sequential_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk4_adobe_0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 4 components, Adobe transform 0"
+  },
+  "cmyk4_adobe_0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk4_adobe_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 4 components, Adobe transform 2"
+  },
+  "cmyk4_adobe_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk4_adobe_3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 4 components, Adobe transform 3"
+  },
+  "cmyk4_adobe_3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk4_adobe_None.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 4 components, Adobe transform None"
+  },
+  "cmyk4_adobe_None.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk_flat.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: flat CMYK blocks"
+  },
+  "cmyk_flat.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "cmyk_pil_adobe.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: Adobe CMYK from PIL"
+  },
+  "cmyk_pil_adobe.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "dqt_16bit.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "tables: 16-bit quantizers"
+  },
+  "dqt_16bit.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "err_10_components.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 10 components: no RGB conversion"
+  },
+  "err_12bit_cjpeg.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 12-bit precision"
+  },
+  "err_2_components.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 2 components: no RGB conversion"
+  },
+  "err_5_components.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 5 components: no RGB conversion"
+  },
+  "err_6_components.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 6 components: no RGB conversion"
+  },
+  "err_bad_signature.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: FF D8 then not FF: not handed to libjpeg"
+  },
+  "err_cut_10.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: cut at 10%"
+  },
+  "err_cut_30.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: cut at 30%"
+  },
+  "err_cut_50.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: cut at 50%"
+  },
+  "err_cut_80.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: cut at 80%"
+  },
+  "err_cut_97.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: cut at 97%"
+  },
+  "err_cut_progressive_half.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: progressive cut in the middle"
+  },
+  "err_dht_missing_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: progressive stream without DHT"
+  },
+  "err_dht_overfull.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: Huffman table with more codes than symbols"
+  },
+  "err_dqt_bad_len.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: DQT length wrong"
+  },
+  "err_fractional_sampling_3_2_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 3:2 sampling ratio"
+  },
+  "err_header_only.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: stops after the SOS header"
+  },
+  "err_mcu_over_10_blocks.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: 12 blocks in an MCU"
+  },
+  "err_missing_dqt.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: quantizer table 1 undefined"
+  },
+  "err_no_eoi.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: no EOI: the reference's source manager fails at the end of the data"
+  },
+  "err_png_signature.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: not a JPEG"
+  },
+  "err_precision_12_sof0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: SOF0 with 12-bit precision"
+  },
+  "err_precision_16.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: precision 16"
+  },
+  "err_progression_bad_params.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: progressive scan with Ss > Se"
+  },
+  "err_sampling_5.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: sampling factor 5"
+  },
+  "err_sampling_zero.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: sampling factor 0"
+  },
+  "err_scan_before_sof.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: SOS before SOF"
+  },
+  "err_second_sof.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: two SOF segments"
+  },
+  "err_sof11_lossless_arith.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: SOF11"
+  },
+  "err_sof_hierarchical_c5.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: differential sequential SOF5"
+  },
+  "err_unknown_marker_f0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: marker F0 (JPG0)"
+  },
+  "err_zero_width.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "error: zero width"
+  },
+  "fuzz_corpus.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mutated JPEGs with the oracle's verdict and pixels (format in tests/media_jpeg.rs)"
+  },
+  "gray_arith.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "grayscale"
+  },
+  "gray_arith.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "gray_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "grayscale"
+  },
+  "gray_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "gray_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "grayscale"
+  },
+  "gray_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_dc_ramp_q16.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: DC ramp whose dequantized value saturates and wraps"
+  },
+  "idct_dc_ramp_q16.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_dense1023_q200.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: 1023 coefficients, quantizer 200"
+  },
+  "idct_dense1023_q200.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_dense2000_q40.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: 2000 coefficients, quantizer 40"
+  },
+  "idct_dense2000_q40.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_dense32767_q1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: 32767 coefficients, quantizer 1"
+  },
+  "idct_dense32767_q1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_dense32767_q255.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: 32767 coefficients, quantizer 255"
+  },
+  "idct_dense32767_q255.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "idct_q65535.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "idct: 16-bit quantizers up to 65535"
+  },
+  "idct_q65535.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "layout_mcu_10_blocks.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: exactly 10 blocks in an MCU"
+  },
+  "layout_mcu_10_blocks.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_sof3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: SOF3, 8-bit, predictor 1"
+  },
+  "lossless_sof3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "manifest.txt": {
+   "role": "config",
+   "published": true,
+   "note": "one line per case: expectation, class, size"
+  },
+  "marker_com_app_before_sof.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: COM and unknown APPn segments"
+  },
+  "marker_com_app_before_sof.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_dnl.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: DNL after the scan"
+  },
+  "marker_dnl.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_dri_zero.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: DRI 0"
+  },
+  "marker_dri_zero.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_dup_eoi.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: two EOIs"
+  },
+  "marker_dup_eoi.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_fill_ff.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: FF fill bytes before SOS"
+  },
+  "marker_fill_ff.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_garbage_before_eoi.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: extraneous bytes before the EOI"
+  },
+  "marker_garbage_before_eoi.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "marker_trailing_garbage.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: bytes after the EOI"
+  },
+  "marker_trailing_garbage.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "noninterleaved_scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: one scan per component"
+  },
+  "noninterleaved_scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "optimized_tables.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "tables: per-image Huffman tables"
+  },
+  "optimized_tables.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_100_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_100_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_100_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_100_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_10_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_10_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_1_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_1_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_25_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_25_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_50_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_50_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_5_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_5_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_75_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_75_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_90_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_90_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "quality_95_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "quality"
+  },
+  "quality_95_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_0_jfif0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 0, JFIF False"
+  },
+  "rgb3_adobe_0_jfif0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_0_jfif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 0, JFIF True"
+  },
+  "rgb3_adobe_0_jfif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_1_jfif0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 1, JFIF False"
+  },
+  "rgb3_adobe_1_jfif0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_1_jfif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 1, JFIF True"
+  },
+  "rgb3_adobe_1_jfif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_2_jfif0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 2, JFIF False"
+  },
+  "rgb3_adobe_2_jfif0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_2_jfif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 2, JFIF True"
+  },
+  "rgb3_adobe_2_jfif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_9_jfif0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 9, JFIF False"
+  },
+  "rgb3_adobe_9_jfif0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_9_jfif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe 9, JFIF True"
+  },
+  "rgb3_adobe_9_jfif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_None_jfif0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe None, JFIF False"
+  },
+  "rgb3_adobe_None_jfif0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_adobe_None_jfif1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: 3 components, Adobe None, JFIF True"
+  },
+  "rgb3_adobe_None_jfif1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_ids_RGB.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: component ids R G B"
+  },
+  "rgb3_ids_RGB.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rgb3_ids_other.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: unrecognised ids"
+  },
+  "rgb3_ids_other.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_1_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 1 MCUs"
+  },
+  "rst_1_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_2_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 2 MCUs"
+  },
+  "rst_2_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_3_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 3 MCUs"
+  },
+  "rst_3_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_7_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 7 MCUs"
+  },
+  "rst_7_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_arith.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: arithmetic + DRI"
+  },
+  "rst_arith.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_arith_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: arithmetic progressive + DRI"
+  },
+  "rst_arith_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: progressive + DRI"
+  },
+  "rst_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "rst_rows_cjpeg.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: cjpeg -restart 1B"
+  },
+  "rst_rows_cjpeg.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_1x1_2x2_2x2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 1x1,2x2,2x2"
+  },
+  "samp_1x1_2x2_2x2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_1x1_2x2_2x2_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: progressive 1x1,2x2,2x2"
+  },
+  "samp_1x1_2x2_2x2_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_1x2_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 1x2,1x1,1x1"
+  },
+  "samp_1x2_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_1x3_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 1x3,1x1,1x1"
+  },
+  "samp_1x3_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_1x4_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 1x4,1x1,1x1"
+  },
+  "samp_1x4_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x1_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 2x1,1x1,1x1"
+  },
+  "samp_2x1_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x1_1x2_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 2x1,1x2,1x1"
+  },
+  "samp_2x1_1x2_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x1_1x2_1x1_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: progressive 2x1,1x2,1x1"
+  },
+  "samp_2x1_1x2_1x1_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x2_1x1_1x1_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: progressive 2x2,1x1,1x1"
+  },
+  "samp_2x2_1x1_1x1_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x2_1x1_2x2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 2x2,1x1,2x2"
+  },
+  "samp_2x2_1x1_2x2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x2_2x1_1x2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 2x2,2x1,1x2"
+  },
+  "samp_2x2_2x1_1x2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_2x4_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 2x4,1x1,1x1"
+  },
+  "samp_2x4_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_3x1_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 3x1,1x1,1x1"
+  },
+  "samp_3x1_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_3x2_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 3x2,1x1,1x1"
+  },
+  "samp_3x2_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_4x1_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 4x1,1x1,1x1"
+  },
+  "samp_4x1_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_4x2_1x1_1x1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: cjpeg -sample 4x2,1x1,1x1"
+  },
+  "samp_4x2_1x1_1x1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "samp_4x2_1x1_1x1_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "sampling: progressive 4x2,1x1,1x1"
+  },
+  "samp_4x2_1x1_1x1_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_123.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (1, 2, 3)"
+  },
+  "scan_order_123.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_132.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (1, 3, 2)"
+  },
+  "scan_order_132.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_213.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (2, 1, 3)"
+  },
+  "scan_order_213.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_231.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (2, 3, 1)"
+  },
+  "scan_order_231.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_312.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (3, 1, 2)"
+  },
+  "scan_order_312.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "scan_order_321.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "layout: non-interleaved scans in component order (3, 2, 1)"
+  },
+  "scan_order_321.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_13x7_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 13x7 4:2:0"
+  },
+  "size_13x7_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_13x7_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 13x7 4:4:4"
+  },
+  "size_13x7_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_13x7_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 13x7 gray"
+  },
+  "size_13x7_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_13x7_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 13x7 progressive"
+  },
+  "size_13x7_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_17x15_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 17x15 4:2:0"
+  },
+  "size_17x15_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_17x15_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 17x15 4:4:4"
+  },
+  "size_17x15_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_17x15_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 17x15 gray"
+  },
+  "size_17x15_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_17x15_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 17x15 progressive"
+  },
+  "size_17x15_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x1_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x1 4:2:0"
+  },
+  "size_1x1_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x1_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x1 4:4:4"
+  },
+  "size_1x1_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x1_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x1 gray"
+  },
+  "size_1x1_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x1_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x1 progressive"
+  },
+  "size_1x1_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x9_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x9 4:2:0"
+  },
+  "size_1x9_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x9_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x9 4:4:4"
+  },
+  "size_1x9_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x9_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x9 gray"
+  },
+  "size_1x9_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_1x9_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 1x9 progressive"
+  },
+  "size_1x9_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_2x2_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 2x2 4:2:0"
+  },
+  "size_2x2_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_2x2_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 2x2 4:4:4"
+  },
+  "size_2x2_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_2x2_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 2x2 gray"
+  },
+  "size_2x2_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_2x2_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 2x2 progressive"
+  },
+  "size_2x2_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x3_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x3 4:2:0"
+  },
+  "size_3x3_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x3_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x3 4:4:4"
+  },
+  "size_3x3_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x3_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x3 gray"
+  },
+  "size_3x3_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x3_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x3 progressive"
+  },
+  "size_3x3_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x4097_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x4097 4:2:0"
+  },
+  "size_3x4097_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x4097_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x4097 4:4:4"
+  },
+  "size_3x4097_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x4097_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x4097 gray"
+  },
+  "size_3x4097_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_3x4097_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 3x4097 progressive"
+  },
+  "size_3x4097_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_4097x3_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 4097x3 4:2:0"
+  },
+  "size_4097x3_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_4097x3_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 4097x3 4:4:4"
+  },
+  "size_4097x3_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_4097x3_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 4097x3 gray"
+  },
+  "size_4097x3_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_4097x3_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 4097x3 progressive"
+  },
+  "size_4097x3_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_65x129_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 65x129 4:2:0"
+  },
+  "size_65x129_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_65x129_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 65x129 4:4:4"
+  },
+  "size_65x129_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_65x129_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 65x129 gray"
+  },
+  "size_65x129_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_65x129_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 65x129 progressive"
+  },
+  "size_65x129_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_7x13_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 7x13 4:2:0"
+  },
+  "size_7x13_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_7x13_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 7x13 4:4:4"
+  },
+  "size_7x13_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_7x13_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 7x13 gray"
+  },
+  "size_7x13_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_7x13_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 7x13 progressive"
+  },
+  "size_7x13_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_8x8_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 8x8 4:2:0"
+  },
+  "size_8x8_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_8x8_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 8x8 4:4:4"
+  },
+  "size_8x8_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_8x8_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 8x8 gray"
+  },
+  "size_8x8_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_8x8_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 8x8 progressive"
+  },
+  "size_8x8_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x1_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x1 4:2:0"
+  },
+  "size_9x1_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x1_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x1 4:4:4"
+  },
+  "size_9x1_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x1_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x1 gray"
+  },
+  "size_9x1_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x1_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x1 progressive"
+  },
+  "size_9x1_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x9_420.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x9 4:2:0"
+  },
+  "size_9x9_420.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x9_444.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x9 4:4:4"
+  },
+  "size_9x9_444.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x9_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x9 gray"
+  },
+  "size_9x9_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "size_9x9_prog.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "size: 9x9 progressive"
+  },
+  "size_9x9_prog.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_420_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 cut after 1 scans + EOI"
+  },
+  "smoothing_420_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_420_4scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 cut after 4 scans + EOI"
+  },
+  "smoothing_420_4scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_gray_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: progressive grayscale cut after 1 scans + EOI: block smoothing"
+  },
+  "smoothing_gray_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_gray_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: progressive grayscale cut after 2 scans + EOI: block smoothing"
+  },
+  "smoothing_gray_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_gray_3scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: progressive grayscale cut after 3 scans + EOI: block smoothing"
+  },
+  "smoothing_gray_3scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sof1_extended.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "markers: SOF1 marker on an 8-bit stream"
+  },
+  "sof1_extended.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "std_tables_only.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "tables: DHT removed: libjpeg-turbo installs the standard tables"
+  },
+  "std_tables_only.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "std_tables_only_gray.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "tables: gray, DHT removed"
+  },
+  "std_tables_only_gray.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_411_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "subsampling: 4:1:1"
+  },
+  "sub_411_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_411_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "progressive: 4:1:1"
+  },
+  "sub_411_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_420_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "subsampling: 4:2:0"
+  },
+  "sub_420_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_420_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "progressive: 4:2:0"
+  },
+  "sub_420_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_422_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "subsampling: 4:2:2"
+  },
+  "sub_422_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_422_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "progressive: 4:2:2"
+  },
+  "sub_422_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_440_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "subsampling: 4:4:0 (cjpeg)"
+  },
+  "sub_440_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_440_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "progressive: 4:4:0"
+  },
+  "sub_440_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_444_baseline.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "subsampling: 4:4:4"
+  },
+  "sub_444_baseline.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "sub_444_progressive.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "progressive: 4:4:4"
+  },
+  "sub_444_progressive.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "synth_rst_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 1 MCUs (synth)"
+  },
+  "synth_rst_1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "synth_rst_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 2 MCUs (synth)"
+  },
+  "synth_rst_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "synth_rst_5.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "restart: 5 MCUs (synth)"
+  },
+  "synth_rst_5.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "ycc_cube_y0.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: flat blocks, Y=0, Cb and Cr on a 20x20 grid"
+  },
+  "ycc_cube_y0.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "ycc_cube_y128.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: flat blocks, Y=128, Cb and Cr on a 20x20 grid"
+  },
+  "ycc_cube_y128.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "ycc_cube_y255.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: flat blocks, Y=255, Cb and Cr on a 20x20 grid"
+  },
+  "ycc_cube_y255.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "ycck_flat.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "colour: flat YCCK blocks"
+  },
+  "ycck_flat.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  }
+ }
+}

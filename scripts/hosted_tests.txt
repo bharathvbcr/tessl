@@ -32,6 +32,7 @@ bin hosted_selection 6
 bin hosted_tests_script 9
 bin kernel_fast_math 13
 bin media_decode 21
+bin media_jpeg 11
 bin media_leaks 1
 bin metallib_clean_time_script 18
 bin npy_hardening 4

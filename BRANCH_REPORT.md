@@ -115,12 +115,20 @@ Semantic conflicts that git did not flag, found by building and testing:
 
 ### Final CI run
 
-This is `scripts/ci_local.sh` up to the GPU `cargo test`, with the emulator cases included, run on `1b900ec` in `tessl-merge-all`. The run uses `set -e`, so reaching a step means every earlier step passed. At the time of this commit:
-- **Passed:** fmt, release build, clippy ×2, doc.
-- **Passed:** `hosted_tests.sh` (86 invocations, 1008 tests, device hidden) and `--outside` completeness.
-- **Passed:** dialect lint, kernel IR check, emulator host contract ("all checks passed").
-- **Still running:** the emulator kernel cases. So far 168 `[ok]` and no failure; they include the chunked GDN kernels against f64.
-- **Not yet reached:** comparator lanes and torch binding host tests. Both passed on `e26ceae` and on the uncommitted port tree, but not yet on `1b900ec` in this run.
+**Every device-free step of `scripts/ci_local.sh` passed on `1b900ec`.** That commit's code is
+what `main` carries; the later commits only add this report. The steps:
+- fmt, release build, clippy ×2, doc;
+- `hosted_tests.sh` (86 invocations, 1008 tests, device hidden) and `--outside` completeness;
+- dialect lint, kernel IR check, emulator host contract;
+- **emulator kernel cases**: exact, whole model and fast-math, 505 `[ok]`, no failure,
+  including the chunked GDN kernels against f64;
+- comparator lanes (15 tests) and the torch binding host tests (70).
+
+The emulator cases ran in one run. The last two steps passed in a rerun with the emulator
+skipped, because the first run's copy of the step list predated the a457 merge and called the
+deleted `bench/test_parity_harness.py`. **Still not run:** the GPU part (`cargo test --release`,
+the GPU Python tests, examples, release gate). Run `tools/mac_heavy.sh scripts/ci_local.sh` on
+`main` when the lock frees.
 
 ## Branches deleted (25)
 

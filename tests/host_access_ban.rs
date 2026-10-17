@@ -24,15 +24,111 @@ const BANNED: &[&str] = &[
     ".write_bytes(",
 ];
 
-/// `SafeTensors::read_f32` / `read_u32` share two banned names but return
-/// `Result` (they read a file, not a mapping); the loaders call them on a
-/// receiver named `st`.
-fn is_safetensors_receiver(line: &str, at: usize) -> bool {
+/// Types whose `read_f32` / `read_u32` return `Result` (a file read, not a
+/// `GpuBuffer` mapping): `SafeTensors` and the checkpoint traits.
+const SAFE_TYPES: &[&str] = &["SafeTensors", "CheckpointSource", "TensorSource"];
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte offsets of every whole-word occurrence of `word` in `s`.
+fn word_positions<'a>(s: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+    s.match_indices(word)
+        .map(|(i, _)| i)
+        .filter(move |&i| !s[..i].ends_with(is_ident_char) && !s[i + word.len()..].starts_with(is_ident_char))
+}
+
+/// A type or initializer expression: up to the first `,` `=` `;` `{` at depth
+/// zero, or the first unbalanced closer.
+fn clause(s: &str) -> &str {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return &s[..i];
+                }
+            }
+            ',' | '=' | ';' | '{' if depth == 0 => return &s[..i],
+            _ => {}
+        }
+    }
+    s
+}
+
+fn mentions_safe_type(text: &str) -> bool {
+    SAFE_TYPES.iter().any(|t| word_positions(text, t).next().is_some())
+}
+
+/// Does the file declare `fn name` with a safe type in its return type?
+fn fn_returns_safe_type(stripped: &str, name: &str) -> bool {
+    word_positions(stripped, name).any(|i| {
+        stripped[..i].trim_end().ends_with("fn") && {
+            let sig = stripped[i..].split(['{', ';']).next().unwrap_or("");
+            sig.split_once("->").is_some_and(|(_, ret)| mentions_safe_type(ret))
+        }
+    })
+}
+
+/// Is `ident` bound to a safe type everywhere this file binds it? A binding is
+/// `ident: Type` (parameter, field, typed `let`), `let [mut] ident = init`, or a
+/// `for` / closure-parameter binding. Safe means: the type mentions a safe
+/// type, or names a generic whose own bound does (`S: CheckpointSource`); an
+/// initializer is `SafeTensors::...` or a call to a file-local `fn` returning
+/// one. One non-safe binding anywhere in the file revokes the exemption
+/// (shadowing is not resolved by text scanning), and so does having no
+/// recognisable binding. `depth` bounds the generic-bound recursion.
+fn is_safe_binding(stripped: &str, ident: &str, depth: u8) -> bool {
+    let mut found = false;
+    for i in word_positions(stripped, ident) {
+        let before = stripped[..i].trim_end();
+        let before = before
+            .strip_suffix("mut")
+            .filter(|r| !r.ends_with(is_ident_char))
+            .map_or(before, str::trim_end);
+        let after = stripped[i + ident.len()..].trim_start();
+        let is_let = before.ends_with("let") && !before[..before.len() - 3].ends_with(is_ident_char);
+        let safe = if after.starts_with(':') && !after.starts_with("::") {
+            let ty = clause(&after[1..]);
+            mentions_safe_type(ty)
+                || (depth < 2
+                    && ty
+                        .split(|c: char| !is_ident_char(c))
+                        .filter(|t| *t != ident && t.starts_with(char::is_uppercase))
+                        .any(|t| is_safe_binding(stripped, t, depth + 1)))
+        } else if is_let {
+            let init = after.strip_prefix('=').unwrap_or("").split(';').next().unwrap_or("");
+            let init = init.trim_start_matches(|c: char| c == '&' || c.is_whitespace());
+            let init = init.strip_prefix("self.").unwrap_or(init);
+            let callee = init.split('(').next().unwrap_or("").trim();
+            init.contains("SafeTensors::")
+                || (!callee.is_empty() && callee.chars().all(is_ident_char) && fn_returns_safe_type(stripped, callee))
+        } else if before.ends_with("for") || before.ends_with('|') {
+            false
+        } else {
+            continue;
+        };
+        if !safe {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
+/// `SafeTensors::read_f32` / `read_u32` (and the `CheckpointSource` /
+/// `TensorSource` trait methods) share two banned names but return `Result`.
+/// The exemption applies only when the receiver is a plain identifier (or
+/// `self.ident`) that this file binds to such a type. A chained receiver such
+/// as `checkpoint().read_f32(` or `a[0].read_f32(` has no identifier and is
+/// flagged.
+fn is_safetensors_receiver(stripped: &str, line: &str, at: usize) -> bool {
     let before = &line[..at];
-    let ident_start = before
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .map_or(0, |p| p + 1);
-    &before[ident_start..] == "st"
+    let ident = &before[before.rfind(|c: char| !is_ident_char(c)).map_or(0, |p| p + 1)..];
+    !ident.is_empty() && is_safe_binding(stripped, ident, 0)
 }
 
 /// Blank out comments, string and char literals (keeping newlines so line
@@ -179,7 +275,7 @@ fn violations(file: &str, src: &str) -> Vec<String> {
     for (n, line) in stripped.lines().enumerate() {
         for pat in BANNED {
             for (at, _) in line.match_indices(pat) {
-                if !is_safetensors_receiver(line, at) {
+                if !is_safetensors_receiver(&stripped, line, at) {
                     out.push(format!("{file}:{}: {}", n + 1, pat.trim_end_matches('(')));
                 }
             }
@@ -318,9 +414,61 @@ fn after_tests(b: &GpuBuffer) {
 "##;
     let v = violations("x.rs", src);
     assert_eq!(v, vec!["x.rs:20: .contents_u8".to_string()], "{v:?}");
-    // A SafeTensors read (a `Result`-returning file read) is not a mapping.
-    assert!(violations("y.rs", "fn f() { self.st.read_f32(&n)?; }").is_empty());
-    assert_eq!(violations("y.rs", "fn f() { self.st2.read_f32(&n)?; }").len(), 1);
+}
+
+/// A checkpoint read (a `Result`-returning file read) is not a mapping, but the
+/// exemption follows the receiver's declared type, never its name.
+#[test]
+fn the_safetensors_exemption_follows_the_receiver_type_not_its_name() {
+    let flagged = |src: &str| violations("y.rs", src).len();
+    // `st` bound to a GpuBuffer is a panicking accessor (regression: the old
+    // scanner exempted any receiver literally named `st`).
+    assert_eq!(flagged("fn f(st: &GpuBuffer) { st.read_f32(); }"), 1);
+    assert_eq!(flagged("fn f(rt: &R) { let st = rt.alloc(4); st.read_f32(); }"), 1);
+    assert_eq!(
+        flagged("struct L { st: GpuBuffer }\nfn f(l: &L) { l.st.read_u32(); }"),
+        1
+    );
+    // Unbound receiver names are flagged, including the old `st`.
+    assert_eq!(flagged("fn f() { st.read_f32(&n)?; }"), 1);
+    assert_eq!(flagged("fn f() { self.st.read_f32(&n)?; }"), 1);
+    // SafeTensors / CheckpointSource receivers pass under any name.
+    assert_eq!(flagged("fn f(ckpt: &SafeTensors) { ckpt.read_f32(&n)?; }"), 0);
+    assert_eq!(flagged("fn f(c: &dyn CheckpointSource) { c.read_u32(&n)?; }"), 0);
+    assert_eq!(flagged("fn f(c: &impl CheckpointSource) { c.read_f32(&n)?; }"), 0);
+    assert_eq!(flagged("fn f<S: CheckpointSource>(c: &S) { c.read_f32(&n)?; }"), 0);
+    assert_eq!(
+        flagged("fn f<S>(c: &S) where S: CheckpointSource { c.read_f32(&n)?; }"),
+        0
+    );
+    assert_eq!(
+        flagged("fn f() { let st = SafeTensors::open(p)?; st.read_f32(&n)?; }"),
+        0
+    );
+    assert_eq!(
+        flagged("struct L<'a> { st: &'a dyn TensorSource }\nfn f(l: &L) { l.st.read_f32(&n)?; }"),
+        0
+    );
+    assert_eq!(
+        flagged("fn shard(&self) -> Result<&SafeTensors, String> { x }\nfn f(&self) { let st = self.shard(n)?; st.read_f32(n) }"),
+        0
+    );
+    // A chained receiver has no identifier to resolve: flagged.
+    assert_eq!(flagged("fn f() { checkpoint().read_f32(&n)?; }"), 1);
+    assert_eq!(flagged("fn f(v: &[SafeTensors]) { v[0].read_f32(&n)?; }"), 1);
+    // Shadowing is not resolved: one non-safe binding in the file revokes the
+    // exemption for every use of that name (conservative, may over-flag).
+    assert_eq!(
+        flagged("fn a(st: &SafeTensors) { st.read_f32(&n)?; }\nfn b(st: &GpuBuffer) { st.read_f32(); }"),
+        2
+    );
+    // Several calls on one line are judged independently.
+    assert_eq!(
+        flagged(
+            "fn f(st: &SafeTensors, b: &GpuBuffer) { st.read_f32(&n)?; b.read_f32(); st.read_u32(&n)?; b.read_u32(); }"
+        ),
+        2
+    );
 }
 
 #[test]

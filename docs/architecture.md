@@ -325,9 +325,11 @@ That exactness has a bound: a full-range dot product can wrap `int32` past
 `k = 131_072`, so larger `k` is refused rather than silently returning a wrapped
 sum.
 
-TensorOps itself accepts `int4b_format` — the reason there is no Int4 GEMM here
-is the shader-side tensor constructor for a sub-byte element type, not the host
-binding. An earlier version of this document and the README both blamed
+TensorOps itself accepts `int4b_format`, and the shader-side tensor constructor
+for it exists (compile-checked, not run: `device uchar *` handle, right operand
+only; see the `QUANT_PREFILL_GEMM_WIRED` doc in `src/mtl_tensor.rs` and
+`tools/probes/int4b/`). There is no Int4 GEMM here because none has been built
+and measured, not because of the host binding. An earlier version of this document and the README both blamed
 `MTLTensorDataType::Int4` being unbound in objc2-metal 0.3. That is true and
 irrelevant: it gates host-created `MTLTensor` descriptors, and every kernel here
 builds tensors from raw device pointers.

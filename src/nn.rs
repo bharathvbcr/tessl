@@ -4656,7 +4656,9 @@ fn row_reduce(
 /// irrelevant here — that binding is for descriptors this path never creates.
 /// The same is true of Int4: `metal::int4b_format` exists in the shading
 /// language and TensorOps accepts it, and what is actually missing is the
-/// tensor constructor for a sub-byte element type, not an objc2 binding.
+/// shader-side tensor constructor does exist (it takes a `device uchar *`
+/// handle, right operand only); see `QUANT_PREFILL_GEMM_WIRED` in
+/// `mtl_tensor` for the compile-checked facts. What is not built is the GEMM.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_i8_dequant(
     rt: &Arc<GpuRuntime>,

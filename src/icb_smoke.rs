@@ -71,6 +71,10 @@ pub struct IcbCopySmoke {
     execute_count: u64,
     /// Whether the most recent `execute` was suppressed by binder-encode-nop.
     last_execute_was_nop: bool,
+    /// Lifetime-event value whose completion proves the latest recorded
+    /// `execute` is done with command 0 (see [`Self::execute`]); `None` until
+    /// one has recorded. A nop execute records nothing and leaves it alone.
+    in_flight_until: Option<u64>,
 }
 
 impl Drop for IcbCopySmoke {
@@ -147,6 +151,7 @@ impl IcbCopySmoke {
             optimized: false,
             execute_count: 0,
             last_execute_was_nop: false,
+            in_flight_until: None,
         })
     }
 
@@ -184,10 +189,23 @@ impl IcbCopySmoke {
     /// Refuses, before touching the ICB, a buffer owned by another runtime or
     /// shorter than `n * 4` bytes: the kernel copies `n` floats unchecked.
     ///
-    /// Re-encoding rewrites command 0 in place, so the caller must not do it
-    /// while an earlier [`Self::execute`] may still be in flight; synchronize
-    /// the runtime first.
+    /// Re-encoding rewrites command 0 in place, so it is refused with `Err`
+    /// while an earlier [`Self::execute`] may still be in flight: recorded into
+    /// a batch that is not committed yet, or committed but not known complete.
+    /// Call `GpuRuntime::synchronize` first. It never blocks. On a poisoned
+    /// runtime the batch may have been aborted and never completes, so the
+    /// refusal is the poison error instead.
     pub fn encode_copy(&mut self, src: &GpuBuffer, dst: &GpuBuffer) -> Result<(), String> {
+        if let (Some(until), Some(rt)) = (self.in_flight_until, self.rt.upgrade()) {
+            rt.ensure_not_poisoned()?;
+            if rt.last_completed_value() < until {
+                return Err(format!(
+                    "icb smoke: an earlier execute may still be in flight (completes at commit {until}, \
+                     {} completed); synchronize the runtime before re-encoding",
+                    rt.last_completed_value()
+                ));
+            }
+        }
         let need = self.n * 4;
         for (name, b) in [("src", src), ("dst", dst)] {
             if !b.belongs_to_addr(self.rt_addr) {
@@ -270,6 +288,9 @@ impl IcbCopySmoke {
             }
             Ok(())
         })?;
+        // The commit that carries this execute, read atomically against
+        // concurrent commits. Completion of that value ends the hazard.
+        self.in_flight_until = Some(rt.pending_commit_value());
         if need_opt {
             self.optimized = true;
         }
@@ -447,6 +468,143 @@ mod tests {
         );
         assert!(rt.with_binder(|_| Ok(())).is_err());
         assert_eq!(smoke.execute_count(), 0);
+    }
+
+    /// A runtime, two 64-float buffers (`src[i] = i + 0.5`, `dst` zeroed) and an
+    /// encoded smoke over them.
+    fn rig() -> (Arc<GpuRuntime>, GpuBuffer, GpuBuffer, IcbCopySmoke) {
+        let rt = GpuRuntime::new().expect("runtime");
+        let src = rt.alloc_buffer(64 * 4).unwrap();
+        let dst = rt.alloc_buffer(64 * 4).unwrap();
+        // SAFETY: both buffers were just allocated at 64 * 4 bytes, are
+        // shared-storage and have no GPU work against them yet.
+        unsafe {
+            let p = src.metal().contents().as_ptr() as *mut f32;
+            for i in 0..64 {
+                *p.add(i) = i as f32 + 0.5;
+            }
+            std::ptr::write_bytes(dst.metal().contents().as_ptr() as *mut u8, 0, 64 * 4);
+        }
+        let mut smoke = IcbCopySmoke::new(&rt, 64).expect("smoke");
+        smoke.encode_copy(&src, &dst).expect("encode");
+        (rt, src, dst, smoke)
+    }
+
+    /// Re-encoding rewrites command 0 in place, so it is refused while an
+    /// execute recorded into the still-open batch has not been committed and
+    /// completed. Against the pre-fix code `encode_copy` returns `Ok` here.
+    #[test]
+    fn encode_copy_refuses_while_an_execute_is_in_flight() {
+        let (rt, src, dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        smoke.execute(&rt).expect("execute");
+        assert_eq!(
+            rt.pending_commit_value(),
+            rt.last_signaled_value() + 1,
+            "async execute leaves its batch open"
+        );
+        let err = smoke.encode_copy(&src, &dst).unwrap_err();
+        assert!(err.contains("synchronize"), "{err}");
+        // Committed but not waited on is still not known complete: either the
+        // GPU has not finished (refused) or it has (accepted); never a crash.
+        rt.commit(false).unwrap();
+        if let Err(err) = smoke.encode_copy(&src, &dst) {
+            assert!(err.contains("synchronize"), "{err}");
+        }
+        rt.synchronize().unwrap();
+        smoke.encode_copy(&src, &dst).expect("synchronized");
+    }
+
+    /// After a synchronize the re-encode is accepted and the ICB still copies.
+    #[test]
+    fn encode_copy_after_synchronize_then_execute_copies() {
+        let (rt, src, dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        smoke.execute(&rt).expect("execute");
+        rt.synchronize().unwrap();
+        verify_copy(&dst, 64, "first").unwrap();
+        smoke.encode_copy(&src, &dst).expect("re-encode after synchronize");
+        // SAFETY: synchronized above, so no GPU work touches `dst`.
+        unsafe {
+            std::ptr::write_bytes(dst.metal().contents().as_ptr() as *mut u8, 0xFF, 64 * 4);
+        }
+        smoke.execute(&rt).expect("second execute");
+        rt.synchronize().unwrap();
+        verify_copy(&dst, 64, "after re-encode").unwrap();
+    }
+
+    /// An `AsyncScope` batches without the runtime-wide flag; the guard must
+    /// hold there too, and a synchronize releases it.
+    #[test]
+    fn encode_copy_refuses_inside_an_async_scope() {
+        let (rt, src, dst, mut smoke) = rig();
+        assert!(!rt.async_encode_enabled());
+        let _scope = rt.async_scope();
+        smoke.execute(&rt).expect("execute");
+        let err = smoke.encode_copy(&src, &dst).unwrap_err();
+        assert!(err.contains("synchronize"), "{err}");
+        rt.synchronize().unwrap();
+        smoke.encode_copy(&src, &dst).expect("synchronized");
+    }
+
+    /// The default synchronous path waits inside `execute`, so nothing is left
+    /// in flight and a re-encode needs no extra synchronize.
+    #[test]
+    fn encode_copy_after_a_synchronous_execute_is_accepted() {
+        let (rt, src, dst, mut smoke) = rig();
+        assert!(!rt.async_encode_enabled());
+        smoke.execute(&rt).expect("execute");
+        smoke.encode_copy(&src, &dst).expect("sync execute already completed");
+    }
+
+    /// A nop execute records nothing, so it never marks the smoke in flight.
+    #[test]
+    fn a_nop_execute_does_not_block_a_re_encode() {
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        let (rt, src, dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        {
+            let _nop = crate::BinderEncodeNopGuard::enter();
+            smoke.execute(&rt).expect("nop execute");
+        }
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
+        smoke.encode_copy(&src, &dst).expect("nothing was recorded");
+    }
+
+    /// `pending_commit_value` names the commit that carries what is recorded:
+    /// the next one while a batch is open, the last one after a commit, and the
+    /// completed value after a synchronize. The race it closes (a commit
+    /// between two separate reads) cannot be forced deterministically from a
+    /// test, so none is attempted.
+    #[test]
+    fn pending_commit_value_tracks_the_carrying_commit() {
+        let (rt, _src, _dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
+        smoke.execute(&rt).expect("execute");
+        let open = rt.pending_commit_value();
+        assert_eq!(open, rt.last_signaled_value() + 1);
+        rt.commit(false).unwrap();
+        assert_eq!(rt.pending_commit_value(), rt.last_signaled_value());
+        assert_eq!(rt.pending_commit_value(), open);
+        rt.synchronize().unwrap();
+        assert_eq!(rt.last_completed_value(), open);
+        assert_eq!(rt.pending_commit_value(), open);
+    }
+
+    /// A poisoned runtime aborts its open batch, which never commits, so an
+    /// in-flight check would refuse forever. It refuses with the poison error.
+    #[test]
+    fn encode_copy_on_a_poisoned_runtime_reports_the_poison() {
+        let (rt, src, dst, mut smoke) = rig();
+        rt.set_async_encode(true).unwrap();
+        smoke.execute(&rt).expect("execute");
+        assert!(rt.with_binder(|_| Err("injected encode failure".into())).is_err());
+        assert!(rt.is_poisoned());
+        let err = smoke.encode_copy(&src, &dst).unwrap_err();
+        assert!(err.contains("poisoned"), "{err}");
+        assert!(!err.contains("in flight"), "{err}");
     }
 
     /// A dropped smoke leaves the residency set: 100 build-and-drops return the

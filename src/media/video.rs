@@ -567,7 +567,7 @@ impl VideoSource {
     /// # Errors
     /// As [`VideoSource::decode_frames`], and [`MediaError::Unsupported`] when
     /// the track is not an H.264 or HEVC stream of a layout VideoToolbox decodes
-    /// to one of the formats [`vt`] knows (8 or 10 bits; 4:2:0, 4:2:2, 4:4:4).
+    /// to one of the formats `vt` knows (8 or 10 bits; 4:2:0, 4:2:2, 4:4:4).
     pub fn decode_native_planes(&self, indices: &[usize]) -> Result<Vec<NativeFrame>, MediaError> {
         let wanted = self.checked_wanted(indices)?;
         let layout = self.exact_layout()?;

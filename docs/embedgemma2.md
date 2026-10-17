@@ -2406,8 +2406,9 @@ let out = model.encode(&[MmItem::Video(&frames)], None)?;                  // on
 ```
 
 From a file, `tessl::media::video::decode_video_file` samples and decodes the frames and
-`preprocess_decoded_video` makes the same `PreparedVideo`; for 8-bit 4:2:0 H.264 and HEVC the
-frames are byte-equal to the ones the reference loader produces, and the embedding of an MP4
+`preprocess_decoded_video` makes the same `PreparedVideo`; for the H.264 and HEVC streams
+VideoToolbox decodes (8 and 10 bit, 4:2:0, 4:2:2, 4:4:4) the frames are byte-equal to the `ffmpeg`
+CLI's, which the reference loader's converter is (torchcodec's own flags are unverified), and the embedding of an MP4
 equals sentence-transformers' to 8.5e-7 at worst (see "Media decoding", "Video" and "End to end").
 
 ### The token layout
@@ -3088,9 +3089,14 @@ reader still reading when it is dropped.
 reference's RGB byte for byte for 8-bit 4:2:0 H.264 and HEVC. AVFoundation's own decode cannot:
 
 - `AVAssetReader` asked for 420v/420f (the decoder's native planes) returns the decoder's
-  luma, but **different chroma**: 8 to 15 percent of the Cb/Cr samples of the fixtures differ
-  from FFmpeg's decode, by up to about 70 levels. It is not a shift, not a colour-property
-  setting, and the cause is **unexplained** (characterised, not found). Asked for BGRA it
+  luma, but **different chroma**: the share of Cb/Cr samples that differ from FFmpeg's decode
+  depends on the content (52 to 86 percent in the clips measured in this lane, for example
+  3843 of 4608 Cb samples of `h264_709_tv_64x48`, by up to 45 levels; an earlier lane
+  measured 8 to 15 percent on other content, which was not re-measured). **The cause is a chroma re-siting**, found by regressing the reader's chroma on
+  FFmpeg's neighbouring chroma samples (see "Why AVAssetReader's chroma differs" below):
+  the reader moves the chroma to the `BottomLeft` location with a smooth three-tap kernel
+  (about 0.06, 0.62, 0.31 for a quarter-sample shift), and a stream already tagged
+  `BottomLeft` comes out with 0 differing samples. Asked for BGRA it
   differs from the oracle in 39941 of 55296 bytes (largest 151, mean 3.67; `h264_709_tv_64x48`).
 - VideoToolbox itself is exact: FFmpeg's `-hwaccel videotoolbox` equals its software decode, so
   the difference is in what `AVAssetReader` does after it. So `AVAssetReader` with no output
@@ -3101,45 +3107,139 @@ reference's RGB byte for byte for 8-bit 4:2:0 H.264 and HEVC. AVFoundation's own
   FFmpeg's on every fixture** (`the_decoders_planes_are_the_planes_ffmpeg_decodes`: H.264 and
   HEVC, BT.601, BT.709 and untagged, limited and full range, odd sizes, cropped, rotated).
 - The planes are converted by `media::yuv::nv12_to_rgb24` (below), then rotated.
-- The 8-bit 4:2:0 test reads the stream's own `avcC` (profile 66, 77, 88, 100) or `hvcC`
-  (chroma format 1, both depths 8), because a requested pixel format says nothing about the
-  stream. Anything else (10-bit, 4:2:2 and 4:4:4, odd dimensions, a matrix other than
-  BT.601, BT.709 and BT.2020 non-constant) is decoded to BGRA by AVFoundation (`Conversion::AvFoundation`
-  in the result says so; `ColorPath::AvFoundation` forces it). The fallback is not the
-  reference's bytes: a Main 10 HEVC fixture is 4.06 mean abs away from the oracle.
+- The stream's layout (chroma format and bit depths) is read from its own `avcC` (the first
+  SPS) or `hvcC`, because a requested pixel format says nothing about the stream
+  (`src/media/codec_config.rs`). The decoder is asked for the matching one of the twelve
+  bi-planar formats (8-bit `420v/420f/422v/422f/444v/444f`, 10-bit `x420/xf20/x422/xf22/x444/xf44`).
+- **There is no silent fallback any more.** A stream that cannot be converted exactly is
+  refused by name with `MediaError::Unsupported`, which says why and points to
+  `ColorPath::AvFoundation`; only that explicit request decodes with AVFoundation's own
+  conversion (`Conversion::AvFoundation` in the result says so). Refused: a codec other than H.264
+  and HEVC (MPEG-4 Part 2), 12-bit and monochrome video, a matrix other than BT.601, BT.709,
+  BT.2020 non-constant, FCC and SMPTE 240M, and shapes libswscale does not define (below).
+  Before, those decoded to BGRA by AVFoundation: a Main 10 HEVC fixture was 4.06 mean abs away from
+  the oracle (still measured, `ten_bit_through_avfoundation_is_not_the_oracle_and_is_never_the_default`).
 
-**The conversion (`src/media/yuv.rs`).** For a same-size `yuv420p` to `rgb24` conversion
-libswscale replicates each chroma sample over its 2x2 block (no interpolation, whatever the
-scaler flags) and then has two arithmetics: a table converter (a 1024-entry luma table and
-integer chroma offsets) and, on aarch64, a NEON converter with 13-bit coefficients and 16-bit
-multiply-high, used when the width is a multiple of 16. They differ by up to 3 levels, so
-`Flavor::Aarch64` (default) chooses per frame width as FFmpeg does on Apple silicon and
-`Flavor::Portable` is the table converter for every width. Both start from the 16.16
-coefficients `round(2(1-Kr) * 65536 * 255/224)` and the like for the matrix (FFmpeg 9 values:
-BT.709 117489, 138438, 13975, 34925; BT.601 104597, 132201, 25675, 53279; BT.2020nc
-110014, 140363, 12277, 42626). **Verified exhaustively against the `ffmpeg` binary (9.0.2,
-aarch64): every one of the 2^24 `(Y, Cb, Cr)` triples, both ranges, three matrices, both
-converters, 0 differing bytes** (`exhaustive_against_a_live_ffmpeg`, `--ignored`, needs
-`ffmpeg`); the committed goldens hold the same for random planes of 8 sizes
-(`tests/media_yuv_exact.rs`, hosted). `fcc` and `smpte240m` full range did not match the
-NEON converter's G channel, so those matrices are not supported and fall back to AVFoundation.
-Odd dimensions use libswscale's general scaler, which is not reproduced; H.264 and HEVC 4:2:0
-cannot have them. No libswscale source was read for this (see the module's provenance note).
+**The conversion (`src/media/yuv.rs`).** libswscale reaches `rgb24` through different routines
+depending on the sample format, and each was found by black-box comparison with the `ffmpeg`
+binary (the module's provenance note lists the experiments in order; no libswscale source was
+read):
 
-**Parity per fixture class** (`tests/media_video_exact.rs`, 8 tests, local-only because
+| input | what libswscale computes | notes |
+|---|---|---|
+| 8-bit 4:2:0 and 4:2:2 | chroma replicated over 2 luma samples (and 2 rows for 4:2:0), then a table converter, or on aarch64 a NEON one when the width is a multiple of 16 and the height is even | `Flavor::Aarch64` (default) chooses as FFmpeg does on Apple silicon, `Flavor::Portable` is the table converter always; the two differ by up to 3 levels |
+| 8-bit 4:4:4 | a direct sum of 13-bit coefficients in 32-bit integers at 22 fractional bits, which **wraps** (a blue of 512 or more comes out 0) | no table, no NEON, no flavor |
+| 10-bit 4:4:4 | the same at ten bits | |
+| 10-bit 4:2:2 | luma `(v+2)>>2` (not clipped, so it can be 256) and chroma `min((v+2)>>2, 255)`, then the 8-bit table converter | |
+| 10-bit 4:2:0 | the chroma rows are first resampled vertically to luma rows by the scaler's filter, then as 4:2:2 | the only class that depends on the scaler's flags: `ChromaFilter` |
+
+All start from the 16.16 coefficients `round(k * 65536 * 255 / 224)` of the matrix's public
+`Kr`, `Kb` (BT.709 117489, 138438, 13975, 34925; BT.601 104597, 132201, 25675, 53279; BT.2020nc
+110014, 140363, 12277, 42626; FCC 104448, 132798, 24759, 53109; SMPTE 240M 117579, 136230,
+16907, 35559) and use their 13-bit rounding. FCC and SMPTE 240M, which lane V had to refuse, are
+exact once the NEON converter's two negative green coefficients are rounded as signed values
+(half up) and not as the negation of the rounded magnitude: that tie rule was the full-range G
+mismatch (81106 and 97789 bytes of 2^24).
+
+**Verified against the `ffmpeg` binary (9.0.2, aarch64)**, all with 0 differing bytes:
+
+- every one of the 2^24 `(Y, Cb, Cr)` triples, both ranges, five matrices, 8-bit 4:2:0 on both
+  converters, 4:2:2 and 4:4:4 (`exhaustive_against_a_live_ffmpeg`,
+  `exhaustive_8_bit_422_and_444_against_a_live_ffmpeg`, `--ignored`, need `ffmpeg`);
+- **every one of the 2^30 ten-bit `(Y, Cb, Cr)` triples** for 4:4:4 (3,221,225,472 bytes per
+  matrix and range, 12 combinations: `exhaustive_10_bit_444_against_a_live_ffmpeg`), and for
+  10-bit 4:2:2 every distinct combination of the rounded 8-bit values the converter sees
+  (`exhaustive_10_bit_422_against_a_live_ffmpeg`, 12 combinations);
+- 10-bit 4:2:0 under both filters at every even height from 8 (bilinear) or 14 (bicubic) to 120 at width 34, and at
+  32x64, 640x480, 1280x720, 1920x1080, 1918x1080 and 3840x2160
+  (`ten_bit_420_filters_against_a_live_ffmpeg_at_many_heights`);
+- the committed goldens: random planes of 34 format x matrix x range x size classes,
+  including odd sizes (`tests/media_yuv_formats.rs`, hosted).
+
+Run on 2026-10-17: the five `--ignored` tests above and `exhaustive_against_a_live_ffmpeg`
+passed, 0 differing bytes.
+
+**The 10-bit 4:2:0 filter.** The scaler resamples the half-height chroma to luma rows with a
+filter that depends on its flags: bilinear `(3072, 1024)/4096`, or the `ffmpeg` CLI's default,
+bicubic `(-115, 985, 3572, -346)/4096` and its mirror, both with edge rows measured. Both are
+exact against the CLI run with the matching `-sws_flags`, for even heights from 14 (bicubic)
+or 8 (bilinear); below that the scaler's filter shrinks and the picture is refused by name
+(`YuvError::TooShort`). **Which flags torchcodec passes is not established**: its source was not
+read (the brief forbids it for FFmpeg and it was not downloaded, and it is not installed), and
+the only thing written down here is a recollection that it asks for bilinear scaling, which is
+unverified. `VideoOptions::chroma_filter` defaults to `Bilinear` on that recollection and
+`Bicubic` selects the CLI's own; the reference decode in the end-to-end script passes
+`-sws_flags bilinear` to agree with that default, so the end-to-end case shows tessl equals
+the CLI under the chosen flag, not that torchcodec uses it. If torchcodec's flag is bicubic,
+only 10-bit 4:2:0 changes (about 65 percent of its bytes differ between the two filters), and
+`ChromaFilter::Bicubic` is already exact.
+
+**Odd sizes.** H.264 and HEVC cannot code an odd width or height in 4:2:0, or an odd width in
+4:2:2 (the conformance window crops in chroma units), so odd shapes occur only in 4:4:4 (any
+size) and 4:2:2 (odd height), and both are exact. libswscale leaves the last output column of
+an odd-width 8-bit 4:2:0 or 4:2:2 picture **unwritten** (a destination pre-filled with 0xAB keeps
+it) and uses a non-periodic vertical filter for odd-height 4:2:0; neither is a defined output,
+so the converter refuses those shapes by name (`YuvError::Size`).
+
+**Rotation order.** The CLI's autorotation turns a 4:2:0 picture's planes before the
+conversion (the converter's width rule, and the 10-bit filter, see the upright picture) and a
+4:2:2 or 4:4:4 picture's RGB after it. On the 48x40 rotated fixture the two orders differ in
+11185 of 11520 bytes of 8-bit 4:2:0, so `media::video` follows the CLI. torchcodec's order is
+unknown.
+
+**Why AVAssetReader's chroma differs.** Found in this lane. With the reader asked for
+`420v`, luma is the decoder's (0 differing samples) and chroma differs in 52 to 86 percent of
+samples of the clips measured, with the pixel buffer tagged `CVImageBufferChromaLocation = Left`
+(the stream's own). Regressing the reader's Cb on FFmpeg's Cb in a 3x3 window gives vertical
+weights `(0.062, 0.625, 0.312)` and zero horizontal weights, residual rms 0.31 to 0.39 (about
+the rounding noise of an 8-bit result); `(1, 10, 5)/16` with truncation reproduces 96 percent
+of the samples exactly (243 of 6144 differ; the remaining arithmetic was not found). The
+centroid is 0.25 chroma rows, half a luma row: the move from `Left` (vertically between two
+luma rows) to `BottomLeft` (vertically on the lower one). The same experiment on x264 streams
+tagged each chroma location:
+
+| stream tagged | reader's chroma against FFmpeg's |
+|---|---|
+| `bottomleft` | 0 differing samples |
+| `left` | vertical shift of a quarter chroma row, kernel above, no horizontal change |
+| `center`, `topleft` (the reader reports `Center` for both) | the same kernel on both axes |
+| `top`, `bottom` | horizontal shift only |
+
+So the reader (inferred: in its pixel-transfer step behind `AVAssetReader`) resamples chroma to
+the `BottomLeft` siting; the VideoToolbox session driven directly does not. Verified: the
+relation above, on H.264 and HEVC (`target/v2` scratch scripts, not committed). Inferred: that
+this is a siting conversion rather than another filter; not reproduced: the reader's exact
+arithmetic, and why `top`/`bottom` shift only horizontally. Earlier lanes ruled out whole-sample
+shifts, deblocking, intra-only streams and `AVVideoColorPropertiesKey`; this is the fractional
+shift they could not see. It does not change the design: decoding through VideoToolbox is
+exact without needing the reader's resampling modelled.
+
+**Parity per fixture class** (`tests/media_video_exact.rs`, 13 tests, local-only because
 VideoToolbox is not available to the hosted sandbox; frames are compared to the `ffmpeg` CLI's
 decode, `-pix_fmt rgb24`, autorotate; goldens from `scripts/gen_media_video_exact_fixtures.py`
-in `tests/fixtures/media_video/`, 0 differing bytes in all):
+in `tests/fixtures/media_video/`, 0 differing bytes in all; 10-bit 4:2:0 against the
+`-sws_flags bilinear` golden, and again against the CLI's default under
+`ChromaFilter::Bicubic`):
 
 | class | fixtures |
 |---|---|
-| H.264, BT.709 limited, NEON width | `h264_709_tv_64x48` |
-| H.264, BT.601 limited, table width, cropped | `h264_601_tv_66x38` |
-| H.264, full range, BT.709 and BT.601 | `h264_709_pc_80x48`, `h264_601_pc_50x34` |
-| H.264, untagged (BT.601 limited) | `h264_untagged_64x48` |
-| HEVC, 709 limited, 709 full NEON width, 601 full table width | `hevc_709_tv_64x48`, `hevc_709_pc_96x64`, `hevc_601_pc_34x26` |
-| rotated: display matrix 90 and 270 | `h264_709_tv_64x48_rot90`, `h264_601_tv_66x38_rot270` |
-| `colors.mp4`, `quad_rot90.mp4` (`media_codecs`) | zero differing bytes (formerly "within 2 levels") |
+| H.264 8-bit 4:2:0: BT.709/601 limited, full range, untagged, NEON and table widths, cropped | `h264_709_tv_64x48`, `h264_601_tv_66x38`, `h264_709_pc_80x48`, `h264_601_pc_50x34`, `h264_untagged_64x48` |
+| HEVC 8-bit 4:2:0 | `hevc_709_tv_64x48`, `hevc_709_pc_96x64`, `hevc_601_pc_34x26` |
+| HEVC 10-bit 4:2:0 (Main 10): 709, 601 full, 2020, FCC | `hevc_main10_64x48`, `hevc_p10_601_pc_66x38`, `hevc_p10_2020_tv_64x32`, `hevc_p10_fcc_pc_50x34` |
+| HEVC 4:2:2, 8 and 10 bit, odd heights (33, 17) | `hevc_422_*`, `hevc_p210_*` |
+| HEVC 4:4:4, 8 and 10 bit, odd 33x17 | `hevc_444_*`, `hevc_p410_*` |
+| FCC and SMPTE 240M, both ranges | `hevc_fcc_*`, `hevc_240m_*`, `hevc_444_fcc_pc_33x17`, `hevc_p410_240m_tv_33x17` |
+| rotation 90, 180, 270 and horizontal and vertical flips of every layout | `*_rot90`, `*_rot180`, `*_rot270`, `*_hflip`, `*_vflip` |
+| `colors.mp4`, `quad_rot90.mp4` (`media_codecs`) | zero differing bytes |
+
+The Y, Cb and Cr planes VideoToolbox returns equal FFmpeg's for all six HEVC layouts
+(`the_decoders_planes_are_the_planes_ffmpeg_decodes`: 8-bit `nv12`, `nv16`, `nv24` and 10-bit
+`p010`, `p210`, `p410` against the `ffmpeg` CLI, 0 differing samples; the 10-bit planes carry
+their value in the high ten bits, and the low six are checked to be zero).
+**VideoToolbox on this machine (M5 Pro) does not decode H.264 High 10, 4:2:2 or 4:4:4** (it
+refuses at open), so those H.264 shapes are not decodable here by this path and are not in the
+tests; the HEVC ones are. 12-bit and monochrome HEVC and MPEG-4 Part 2 are refused (MPEG-4: by
+AVFoundation, which cannot decode it under either colour path).
 
 Sampling and timing agree with the reference too: `total_frames`, `duration`, `fps` and every
 timestamp are bit-equal to the `ffprobe`-derived figures, and the indices for four sampling
@@ -3154,9 +3254,10 @@ fixture (12 files, 48 settings). The end-to-end file has a nominal 24000/1001 ra
   decode checks every frame against it to 1e-6 s, so a track whose edit list drops or reorders
   frames is an error, not a misaligned clip.
 - **Rotation**: `preferredTransform` becomes an EXIF orientation (1 to 8; a 90 degrees
-  counter-clockwise display matrix is 8). `Rotation::Apply` (default) rotates after the colour
-  conversion and returns upright frames, equal to `ffmpeg` autorotate (0 differing bytes on
-  `quad_rot90.mp4` and the two rotated fixtures); `Rotation::Ignore` returns frames as stored,
+  counter-clockwise display matrix is 8). `Rotation::Apply` (default) returns upright frames,
+  turning 4:2:0 planes before the conversion and 4:2:2 and 4:4:4 frames after it, as the
+  `ffmpeg` CLI's autorotate does (0 differing bytes on `quad_rot90.mp4` and the rotated and
+  flipped fixtures of every layout); `Rotation::Ignore` returns frames as stored,
   equal to `-noautorotate`. A transform that is not a right-angle rotation or flip is refused
   when applying. OpenCV's own colour conversion is 9.7 mean from FFmpeg's on the quadrant
   file, so it serves as a rotation oracle only.
@@ -3170,7 +3271,8 @@ fixture (12 files, 48 settings). The end-to-end file has a nominal 24000/1001 ra
   fixtures, every one an error.
 - **Release of CoreVideo / CoreMedia objects**: a `Lock` guard unlocks every pixel buffer, the
   session is invalidated in `Drop`, and `leaks --atExit` reported 0 leaks for 0 bytes on
-  `media_video_exact` (16127 nodes malloced) and `media_codecs_leaks` (17663 nodes).
+  `media_video_exact` (13 tests, 19411 nodes malloced) and `media_codecs_leaks` (19750 nodes),
+  both run with `--test-threads=1`.
 
 ### Hosted job: what runs and what cannot
 
@@ -3183,10 +3285,11 @@ and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter a
 binary, AAC, MP3 and Opus; no device) and `tests/plot_results_resample.rs` are on
 `scripts/hosted_tests.txt` together with the 14 unit tests of `media::`; `tests/media_codecs.rs`
 (HEIC, H.264, HEVC: 8 tests), `tests/media_codecs_leaks.rs` and `tests/media_video_exact.rs`
-(8 tests) are local-only (`cargo test --release --test media_codecs`) and fail in the sandbox by
+(13 tests) are local-only (`cargo test --release --test media_codecs`) and fail in the sandbox by
 construction, which is what `hosted_completeness` needs (a test that passes there must be
 listed). The converter on its own, with no codec, is hosted: `tests/media_yuv_exact.rs` (5
-tests, plus the `--ignored` exhaustive one that runs `ffmpeg`).
+tests, 8-bit 4:2:0) and `tests/media_yuv_formats.rs` (5 tests, every other format), plus their
+`--ignored` exhaustive ones that run `ffmpeg`.
 
 ### Leaks
 
@@ -3263,6 +3366,9 @@ holds the 1e-4 / 0.99999 bounds of `tests/embedgemma2_e2e_model.rs`:
 | `e2e_video_ts` | the same with `add_timestamps` on (`00:00`, `00:00`, `00:01` labels) | 0, 23, 47 | 1.79e-7 | 1.000000000 |
 | `rot90` | 64x48 stored, display matrix 90 (the model sees 48x64) | 0 | 1.79e-7 | 1.000000000 |
 | `hevc_pc` | HEVC 34x26, BT.601 full range, a width off the NEON widths | 0 | 8.53e-7 | 1.000000000 |
+| `hevc_main10` | HEVC Main 10 (`yuv420p10le`) 66x38, BT.601 full range; the reference decode is given `-sws_flags bilinear` (see "The 10-bit 4:2:0 filter") | 0 | 1.79e-7 | 1.000000000 |
+| `odd_444_10bit` | HEVC 4:4:4 10-bit at an odd 33x17, SMPTE 240M | 0 | 1.38e-7 | 1.000000000 |
+| `odd_422` | HEVC 4:2:2 at an odd height of 33 | 0 | 2.98e-7 | 1.000000000 |
 
 The timestamped case is not redundant: the reference's embedding of the two sequences differs
 by 6.9e-2 max abs (cosine 0.827). A control in the same test decodes the first file again with
@@ -3317,9 +3423,19 @@ earlier, noisier run had them the other way). At 1080p the first-30 rows are 89 
 (228 against 139), but the same clip's sampled rows are 65 ms apart in the opposite direction
 (168 against 233), so this run does not isolate the conversion's cost; a single-threaded
 conversion of 2 Mpixel is a plausible reason for the first-30 gap (inferred, not profiled).
-The conversion is not threaded. Splitting the rows across threads
-would be the way to speed it up and cannot change the bytes, since each pixel is a function of
-its own `(Y, Cb, Cr)`; not done.
+**The conversion is now threaded** (`Params::threads`, `Threads::Auto` by default: row bands
+over `std::thread::scope`, one band per available core up to eight, pictures under 65,536
+pixels single). It
+cannot change the bytes, since each output pixel is a function of its own samples (and, for
+10-bit 4:2:0, of fixed neighbouring chroma rows), and the tests hold that:
+`threading_never_changes_a_byte` (every format, many sizes and thread counts) and
+`the_thread_count_never_changes_the_frames` (through the whole decode). **Its speed was not
+measured**: the benchmark (`bench_media_decode` with `BENCH_YUV=1`, which now also times the
+converter alone, `yuv:LAYOUT_WxH:single|threads`, and the whole call with one thread,
+`exact1`) was not run, because the machine's load average was 130 to 190 for the whole lane
+and a timing taken then would measure the other agents, so `bench/results/media_video_color_m5pro.*`
+above are still the pre-threading numbers. `plot_results video-color` draws the third bar once a run
+contains `exact1` rows.
 
 The audio rows above were measured with the `AudioConverter` as the default (before the Rust
 resampler); the sample-rate conversion at the `Mastering` setting was most of the audio time.
@@ -3349,10 +3465,17 @@ own speed (it is the same algorithm in C with NEON).
   torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
   the last inferred step. What it does with a rotation flag is unverified (the default here
   follows FFmpeg's CLI and OpenCV).
-- Why `AVAssetReader`'s decoded 4:2:0 output has different chroma from the decoder's is not
-  found; VideoToolbox is driven directly to avoid it. 10-bit, 4:2:2, 4:4:4 and odd-sized streams
-  take AVFoundation's conversion and are not the reference's bytes.
-- The Rust conversion is single-threaded; its cost per frame is not isolated by the run above.
+- `AVAssetReader`'s chroma difference is explained to within a three-tap kernel (a
+  re-siting to `BottomLeft`, above), not reproduced to the byte (96 percent of samples with
+  `(1, 10, 5)/16`); VideoToolbox is driven directly, so nothing depends on it.
+- torchcodec's scaler flags and its rotation order are not established. Only 10-bit 4:2:0 and
+  rotated 4:2:0/10-bit streams depend on them (above), and `ChromaFilter` and the rotation
+  order are the two places to change if a run with torchcodec shows otherwise.
+- VideoToolbox does not decode H.264 High 10, 4:2:2 or 4:4:4 on this machine, so those H.264
+  shapes cannot be decoded by this path (VideoToolbox answered "Cannot Decode" when a session was
+  created for them, checked in this lane with a scratch program and not kept as a test), and
+  MPEG-4 Part 2 fails to open under both colour paths (a test). 12-bit and monochrome HEVC are refused by name. Odd-width 4:2:0 and 4:2:2 and
+  odd-height 4:2:0 cannot be coded by either codec and are refused by the converter.
 - Ogg Opus in SILK or hybrid mode does not match a torchcodec reference closely (15 to 20 dB
   from FFmpeg's native decoder, which is itself 2 to 4 samples behind libopus there); matching
   it needs FFmpeg's SILK decoding, not a shift. AudioToolbox is exact against libopus for

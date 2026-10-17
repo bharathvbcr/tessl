@@ -1443,7 +1443,9 @@ impl Qwen35Model {
     /// from one attention layer to the next, both counted whole; or the
     /// cross-entropy's workspace and GEMM temporaries), plus the freelist's
     /// cap (`pool_cache_cap`), which is how far recycled buffers can grow
-    /// the pool past the step's own. It reads the runtime's encode mode and
+    /// the pool past the step's own. It reads the runtime's encode mode
+    /// ([`GpuRuntime::dispatch_batching`]: async encode or an open
+    /// [`GpuRuntime::async_scope`] batch, serialized dispatch does not) and
     /// cap when called. [`Self::train_forward`] refuses a step whose bound
     /// and the device's current allocation exceed its recommended working
     /// set.
@@ -1531,10 +1533,11 @@ impl Qwen35Model {
             }
             most.max(run)
         };
-        // Without async encode every dispatch is a waited commit, so a
-        // layer's buffers are recycled once the next layer's first kernel
-        // runs; with it, only at an attention layer's deliberate wait.
-        let batched = self.rt.async_encode_enabled();
+        // Unbatched, every dispatch is a waited commit, so a layer's buffers
+        // are recycled once the next layer's first kernel runs; batched
+        // (async encode or an open async_scope, unless serialized), only at
+        // an attention layer's deliberate wait.
+        let batched = self.rt.dispatch_batching();
         let is_attn = |l: &Layer| !batched || matches!(l.mixer, Mixer::Attn(_));
         let fwd_most = between_waits(&mut self.layers.iter().map(is_attn).zip(fwd.iter().copied()));
         let bwd_most = between_waits(

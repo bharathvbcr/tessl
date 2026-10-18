@@ -88,6 +88,7 @@ fn rms_bwd(
     (dx.read_f32()[..rows * d].to_vec(), dw.read_f32()[..d].to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gated_fwd(
     rt: &std::sync::Arc<GpuRuntime>,
     x: &[f32],

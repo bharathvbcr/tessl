@@ -29,8 +29,8 @@ use std::sync::Arc;
 use common::{buf, random_f32, seeded, with_gpu};
 use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, OutCols};
 use tessl::qwen35_bwd::{
-    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd,
-    rms_norm_bwd_part_len, AttnQkvGrads,
+    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len,
+    rms_norm_bwd, rms_norm_bwd_part_len, AttnQkvGrads,
 };
 use tessl::tensor::DType;
 use tessl::GpuRuntime;
@@ -402,7 +402,10 @@ fn qk_fwd(rt: &Arc<GpuRuntime>, proj: &[f32], qw: &[f32], kw: &[f32], rot: usize
     )
     .unwrap();
     rt.synchronize().unwrap();
-    (q.read_f32()[..QK_T * QK_D].to_vec(), k.read_f32()[..QK_T * QK_D].to_vec())
+    (
+        q.read_f32()[..QK_T * QK_D].to_vec(),
+        k.read_f32()[..QK_T * QK_D].to_vec(),
+    )
 }
 
 /// Backward: `dproj` (`[QK_T, 4 * QK_D]`) and the two norm-weight gradients.
@@ -561,8 +564,14 @@ fn collect_qk(rt: &Arc<GpuRuntime>) -> Vec<(String, Vec<f32>)> {
         )
         .unwrap();
         rt.synchronize().unwrap();
-        out.push((format!("qk packed w-bias 0 q eps={eps:e}"), q.read_f32()[..QK_T * QK_D].to_vec()));
-        out.push((format!("qk packed w-bias 0 k eps={eps:e}"), k.read_f32()[..QK_T * QK_D].to_vec()));
+        out.push((
+            format!("qk packed w-bias 0 q eps={eps:e}"),
+            q.read_f32()[..QK_T * QK_D].to_vec(),
+        ));
+        out.push((
+            format!("qk packed w-bias 0 k eps={eps:e}"),
+            k.read_f32()[..QK_T * QK_D].to_vec(),
+        ));
     }
     out
 }

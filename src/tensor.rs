@@ -172,6 +172,27 @@ impl GpuBuffer {
         std::ptr::eq(self.metal(), other.metal())
     }
 
+    /// [`Self::map_host`] for the test/bench `contents_*` conveniences, which
+    /// panic on a busy or poisoned runtime.
+    fn contents_expect<T>(&self) -> HostMapping<'_, T> {
+        self.map_host::<T>().expect("exclusive host mapping failed")
+    }
+
+    /// Overwrite the whole buffer, viewed as `T`, with `data`. `label` names
+    /// the public writer in the length-mismatch error.
+    fn write_exact<T: Copy>(&self, label: &str, data: &[T]) -> Result<(), String> {
+        let mut dst = self.map_host::<T>()?;
+        if dst.len() != data.len() {
+            return Err(format!(
+                "{label}: {} elements for a buffer of {}",
+                data.len(),
+                dst.len()
+            ));
+        }
+        dst.copy_from_slice(data);
+        Ok(())
+    }
+
     fn map_host<T>(&self) -> Result<HostMapping<'_, T>, String> {
         // Checked before `contents()` is called at all: for private or
         // memoryless storage Metal returns nil from a method the bindings
@@ -234,7 +255,7 @@ impl GpuBuffer {
     /// Test/bench convenience: panics on a busy or poisoned runtime. Library
     /// code uses [`Self::try_contents_f32`].
     pub fn contents_f32(&self) -> HostMapping<'_, f32> {
-        self.try_contents_f32().expect("exclusive host mapping failed")
+        self.contents_expect::<f32>()
     }
 
     pub fn try_contents_u16(&self) -> Result<HostMapping<'_, u16>, String> {
@@ -244,7 +265,7 @@ impl GpuBuffer {
     /// Test/bench convenience: panics on a busy or poisoned runtime. Library
     /// code uses [`Self::try_contents_u16`].
     pub fn contents_u16(&self) -> HostMapping<'_, u16> {
-        self.try_contents_u16().expect("exclusive host mapping failed")
+        self.contents_expect::<u16>()
     }
 
     /// Test/bench convenience: panics on a busy or poisoned runtime and on a
@@ -256,16 +277,7 @@ impl GpuBuffer {
     /// [`Self::write_f32`] without panicking: a poisoned or busy runtime, and a
     /// length that is not the buffer's logical `f32` count, are `Err`.
     pub fn try_write_f32(&self, data: &[f32]) -> Result<(), String> {
-        let mut dst = self.try_contents_f32()?;
-        if dst.len() != data.len() {
-            return Err(format!(
-                "write_f32: {} elements for a buffer of {}",
-                data.len(),
-                dst.len()
-            ));
-        }
-        dst.copy_from_slice(data);
-        Ok(())
+        self.write_exact("write_f32", data)
     }
 
     /// Write into the leading `data.len()` floats (buffer may be oversized scratch).
@@ -310,16 +322,7 @@ impl GpuBuffer {
 
     /// [`Self::write_bf16_bits`] without panicking.
     pub fn try_write_bf16_bits(&self, data: &[u16]) -> Result<(), String> {
-        let mut dst = self.try_contents_u16()?;
-        if dst.len() != data.len() {
-            return Err(format!(
-                "write_bf16_bits: {} elements for a buffer of {}",
-                data.len(),
-                dst.len()
-            ));
-        }
-        dst.copy_from_slice(data);
-        Ok(())
+        self.write_exact("write_bf16_bits", data)
     }
 
     /// Write raw IEEE binary16 elements.
@@ -340,7 +343,7 @@ impl GpuBuffer {
     /// Test/bench convenience: panics on a busy or poisoned runtime. Library
     /// code uses [`Self::try_contents_u8`].
     pub fn contents_u8(&self) -> HostMapping<'_, u8> {
-        self.try_contents_u8().expect("exclusive host mapping failed")
+        self.contents_expect::<u8>()
     }
 
     /// Test/bench convenience: panics on a busy or poisoned runtime and on
@@ -370,7 +373,7 @@ impl GpuBuffer {
     /// Test/bench convenience: panics on a busy or poisoned runtime. Library
     /// code uses [`Self::try_contents_u32`].
     pub fn contents_u32(&self) -> HostMapping<'_, u32> {
-        self.try_contents_u32().expect("exclusive host mapping failed")
+        self.contents_expect::<u32>()
     }
 
     /// Test/bench convenience: panics on a busy or poisoned runtime and on a
@@ -385,16 +388,7 @@ impl GpuBuffer {
     /// logical `u32` count, are `Err`. [`Self::write_u32`] still panics on
     /// those same failures.
     pub fn try_write_u32(&self, data: &[u32]) -> Result<(), String> {
-        let mut dst = self.try_contents_u32()?;
-        if dst.len() != data.len() {
-            return Err(format!(
-                "write_u32: {} elements for a buffer of {}",
-                data.len(),
-                dst.len()
-            ));
-        }
-        dst.copy_from_slice(data);
-        Ok(())
+        self.write_exact("write_u32", data)
     }
 
     /// Test/bench convenience: panics on a busy or poisoned runtime. Library
@@ -1002,6 +996,34 @@ mod contract_tests {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    /// The whole-buffer writers share one length check; each keeps its own
+    /// name in the error, and a right-sized write round-trips through the
+    /// matching `contents_*` view.
+    #[test]
+    fn exact_writers_check_length_and_round_trip() {
+        let rt = GpuRuntime::new().unwrap();
+        let b = rt.alloc_buffer(16).unwrap();
+        assert_eq!(
+            b.try_write_f32(&[1.0]).unwrap_err(),
+            "write_f32: 1 elements for a buffer of 4"
+        );
+        assert_eq!(
+            b.try_write_bf16_bits(&[1, 2, 3]).unwrap_err(),
+            "write_bf16_bits: 3 elements for a buffer of 8"
+        );
+        assert_eq!(
+            b.try_write_u32(&[]).unwrap_err(),
+            "write_u32: 0 elements for a buffer of 4"
+        );
+        b.try_write_u32(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(b.contents_u32().to_vec(), vec![1, 2, 3, 4]);
+        b.try_write_bf16_bits(&[9; 8]).unwrap();
+        assert_eq!(b.contents_u16().to_vec(), vec![9; 8]);
+        b.try_write_f32(&[0.5; 4]).unwrap();
+        assert_eq!(b.contents_f32().to_vec(), vec![0.5; 4]);
+        assert_eq!(b.contents_u8().len(), 16);
+    }
 
     /// A rejected wrap must not take residency away from a live wrap of the
     /// same MTLBuffer. It used to register residency, build the wrapper, then

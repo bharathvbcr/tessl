@@ -30,6 +30,16 @@ use crate::runtime::GpuRuntime;
 use crate::safetensors::TensorSource;
 use crate::tensor::{GpuBuffer, Tensor};
 
+/// A whole-tensor read's `(shape, elements)` with the shape checked against
+/// the one the model expects: the single owner of the loader's shape error.
+fn shape_checked<T>(name: &str, shape: &[usize], read: Result<(Vec<usize>, Vec<T>), String>) -> Result<Vec<T>, String> {
+    let (got, data) = read?;
+    if got != shape {
+        return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
+    }
+    Ok(data)
+}
+
 pub(crate) struct Loader<'a> {
     st: &'a dyn TensorSource,
     prefix: &'a str,
@@ -57,7 +67,12 @@ impl<'a> Loader<'a> {
 
     /// `rest`'s full name, recorded as read.
     fn take(&self, rest: &str) -> String {
-        self.take_root(&format!("{}{rest}", self.prefix))
+        self.take_root(&self.prefixed(rest))
+    }
+
+    /// `rest` under this loader's prefix.
+    fn prefixed(&self, rest: &str) -> String {
+        format!("{}{rest}", self.prefix)
     }
 
     /// `name` as the checkpoint spells it (no prefix), recorded as read.
@@ -76,11 +91,7 @@ impl<'a> Loader<'a> {
     /// [`Self::bf16`] for a tensor named `name` as the checkpoint spells it.
     pub(crate) fn bf16_root(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
         let name = self.take_root(name);
-        let (got, bits) = self.st.read_bf16_bits(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(bits)
+        shape_checked(&name, shape, self.st.read_bf16_bits(&name))
     }
 
     /// [`Self::f32_into`] for a tensor named `name` as the checkpoint spells it.
@@ -99,11 +110,7 @@ impl<'a> Loader<'a> {
     /// A tensor widened to f32, with its shape checked.
     pub(crate) fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let name = self.take(rest);
-        let (got, data) = self.st.read_f32(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(data)
+        shape_checked(&name, shape, self.st.read_f32(&name))
     }
 
     /// [`Self::f32`], refusing a non-finite element by index.
@@ -117,27 +124,19 @@ impl<'a> Loader<'a> {
 
     /// A bf16 tensor's bit patterns, with its shape checked.
     pub(crate) fn bf16(&self, rest: &str, shape: &[usize]) -> Result<Vec<u16>, String> {
-        let name = self.take(rest);
-        let (got, bits) = self.st.read_bf16_bits(&name)?;
-        if got != shape {
-            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
-        }
-        Ok(bits)
+        self.bf16_root(&self.prefixed(rest), shape)
     }
 
     /// A tensor widened to f32 straight into `t`'s shared storage, with no
     /// host copy. `t` must be an f32 tensor of exactly `shape`'s elements.
     pub(crate) fn f32_into(&self, rest: &str, shape: &[usize], t: &Tensor) -> Result<(), String> {
-        let name = self.take(rest);
-        self.st.read_f32_into(&name, shape, &mut t.buffer.try_contents_f32()?)
+        self.f32_into_root(&self.prefixed(rest), shape, t)
     }
 
     /// A bf16 tensor's bits straight into `t`'s shared storage, with no host
     /// copy. `t` must be a bf16 tensor of exactly `shape`'s elements.
     pub(crate) fn bf16_into(&self, rest: &str, shape: &[usize], t: &Tensor) -> Result<(), String> {
-        let name = self.take(rest);
-        self.st
-            .read_bf16_bits_into(&name, shape, &mut t.buffer.try_contents_u16()?)
+        self.bf16_into_root(&self.prefixed(rest), shape, t)
     }
 
     /// One finite value (a `[1]` or scalar tensor).
@@ -272,6 +271,46 @@ mod tests {
         out.extend(header.into_bytes());
         out.extend(data);
         SafeTensors::from_bytes("loader test", out).unwrap()
+    }
+
+    /// The f32/bf16 readers (host `Vec` and straight-into-tensor, prefixed and
+    /// root) each return the data when the shape matches and the same shape
+    /// error, naming the full tensor name, when it does not.
+    #[test]
+    fn readers_agree_on_data_and_shape_errors() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let st = checkpoint(&[
+            ("m.a", "F32", vec![2], vec![1.0, 2.0]),
+            ("m.b", "BF16", vec![2], vec![3.0, 4.0]),
+        ]);
+        let ld = Loader::new(&rt, &st, "m.");
+        assert_eq!(ld.f32("a", &[2]).unwrap(), vec![1.0, 2.0]);
+        assert_eq!(ld.bf16("b", &[2]).unwrap(), vec![0x4040, 0x4080]);
+        assert_eq!(ld.bf16_root("m.b", &[2]).unwrap(), vec![0x4040, 0x4080]);
+        assert_eq!(ld.f32("a", &[3]).unwrap_err(), "m.a: shape [2], expected [3]");
+        assert_eq!(ld.bf16("b", &[3]).unwrap_err(), "m.b: shape [2], expected [3]");
+        assert_eq!(ld.bf16_root("m.b", &[3]).unwrap_err(), "m.b: shape [2], expected [3]");
+        let ta = rt.alloc_tensor_f32(&[2]).unwrap();
+        ld.f32_into("a", &[2], &ta).unwrap();
+        assert_eq!(ta.buffer.read_f32(), vec![1.0, 2.0]);
+        assert_eq!(ld.f32_into("a", &[3], &ta).unwrap_err(), "m.a: shape [2], expected [3]");
+        assert_eq!(
+            ld.f32_into_root("m.a", &[3], &ta).unwrap_err(),
+            "m.a: shape [2], expected [3]"
+        );
+        let tb = rt.alloc_tensor_bf16(&[2]).unwrap();
+        ld.bf16_into("b", &[2], &tb).unwrap();
+        assert_eq!(tb.buffer.contents_u16().to_vec(), vec![0x4040, 0x4080]);
+        assert_eq!(
+            ld.bf16_into("b", &[3], &tb).unwrap_err(),
+            "m.b: shape [2], expected [3]"
+        );
+        assert_eq!(
+            ld.bf16_into_root("m.b", &[3], &tb).unwrap_err(),
+            "m.b: shape [2], expected [3]"
+        );
+        // Every name read, success or not, is recorded.
+        assert!(ld.refuse_unread().is_ok());
     }
 
     /// Part `p`'s element `[r, k]`: distinct everywhere, exact in bf16.

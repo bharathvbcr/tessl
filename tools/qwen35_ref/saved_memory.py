@@ -85,20 +85,9 @@ def measure(model, tokens, vocab):
     return by, peak_fwd, peak_all
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", type=int, nargs="+", default=[512, 1024])
-    ap.add_argument("--tessl", action="store_true", help="run the chunked GDN on tessl (tessl_torch)")
-    args = ap.parse_args()
-    if args.tessl:
-        import sys
-        from pathlib import Path
-
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
-        import tessl_torch
-
-        tessl_torch.patch_transformers_qwen3_5()
-    cfg = Qwen3_5TextConfig(
+def cut_2b_config():
+    """Qwen3.5-2B's text config cut to one repeat of its layer pattern."""
+    return Qwen3_5TextConfig(
         hidden_size=2048,
         intermediate_size=6144,
         num_hidden_layers=4,
@@ -114,6 +103,22 @@ def main():
         vocab_size=248_320,
         tie_word_embeddings=True,
     )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tokens", type=int, nargs="+", default=[512, 1024])
+    ap.add_argument("--tessl", action="store_true", help="run the chunked GDN on tessl (tessl_torch)")
+    args = ap.parse_args()
+    if args.tessl:
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
+        import tessl_torch
+
+        tessl_torch.patch_transformers_qwen3_5()
+    cfg = cut_2b_config()
     for name in ("torch_chunk_gated_delta_rule", "causal_conv1d_fn"):
         wrap_fn(name)
     torch.manual_seed(0)

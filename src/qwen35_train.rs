@@ -707,13 +707,7 @@ struct RaggedRef<'a> {
 /// A ragged backward's per-sequence scratch, each at its sequence's length.
 struct RaggedScratch {
     spans: Vec<(usize, usize)>,
-    scratch: Vec<Scratch>,
-}
-
-/// Rows `[start, start + n)` of the f32 matrix `t`, as a [`Part`].
-fn rows_part(t: &Tensor, start: usize, n: usize) -> Part<'_> {
-    let h = t.shape()[1];
-    (&t.buffer, t.byte_offset() + start * h * 4, n * h, DType::F32)
+    scratch: Vec<MixerScratch>,
 }
 
 /// What a ragged step's [`PendingStep`] keeps of its sequences.
@@ -803,15 +797,22 @@ struct Saved {
 
 /// The scratch every layer's backward reuses.
 struct Scratch {
+    mx: MixerScratch,
+    d_mid: Tensor,
+    d_gate: Tensor,
+    d_up: Tensor,
+    norm_part: GpuBuffer,
+}
+
+/// What a mixer's backward reads and writes: the residual stream's gradient
+/// in and its input's out, and the mixer's own scratch. A ragged step's
+/// per-sequence ones hold views of the packed step's `dresid` and `dx`.
+struct MixerScratch {
     t: u32,
     /// The residual stream's gradient.
     dresid: Tensor,
     /// A norm input's gradient before it joins `dresid`.
     dx: Tensor,
-    d_mid: Tensor,
-    d_gate: Tensor,
-    d_up: Tensor,
-    norm_part: GpuBuffer,
     gdn: Option<GdnScratch>,
     attn: Option<AttnScratch>,
 }
@@ -1151,9 +1152,10 @@ impl Qwen35Model {
         // A waited commit: what earlier work freed is recycled, so the
         // allocation read next is what the step really starts from.
         id_buf.try_write_u32(ids)?;
+        let lens: Option<Vec<u32>> = ragged.map(|s| s.iter().map(|&(_, n)| n as u32).collect());
         let (have, need) = (
             rt.current_allocated_bytes(),
-            self.step_bytes(t, operands, fresh, head.kind()),
+            self.step_bytes(t, operands, fresh, head.kind(), lens.as_deref()),
         );
         let limit = rt.memory_info().recommended_working_set;
         if have.saturating_add(need) > limit {
@@ -1428,14 +1430,26 @@ impl Qwen35Model {
                 if bank.is_none() {
                     return Err("Qwen35Model::train_step_ragged_into: a ragged step delivers into a bank".into());
                 }
+                let sc = self.scratch(t, None, false)?;
+                // Each sequence's mixer reads and writes its own rows of the
+                // packed gradient streams in place: no copy, no second set
+                // of row-wise buffers.
                 let scratch = r
                     .spans
                     .iter()
                     .zip(r.attn_ws)
-                    .map(|(&(_, n), ws)| self.scratch(n as u32, ws, true))
+                    .map(|(&(start, n), ws)| {
+                        self.mixer_scratch(
+                            n as u32,
+                            ws,
+                            true,
+                            sc.mx.dresid.view(&[n, h], start * h),
+                            sc.mx.dx.view(&[n, h], start * h),
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 (
-                    self.scratch(t, None, false)?,
+                    sc,
                     Some(RaggedScratch {
                         spans: r.spans,
                         scratch,
@@ -1449,7 +1463,7 @@ impl Qwen35Model {
             &resid.buffer,
             &self.final_norm,
             &dxf.buffer,
-            &sc.dresid.buffer,
+            &sc.mx.dresid.buffer,
             &final_norm,
             &sc.norm_part,
             t,
@@ -1480,7 +1494,7 @@ impl Qwen35Model {
             };
             let s = match &rscratch {
                 None => {
-                    let ws = sc.attn.as_ref().map(|a| &a.ws);
+                    let ws = sc.mx.attn.as_ref().map(|a| &a.ws);
                     self.train_layer_forward(layer, resid_in, t, false, operands, ws, None)?
                         .0
                 }
@@ -1576,7 +1590,7 @@ impl Qwen35Model {
                 embed_rows_bwd_once(
                     rt,
                     &rows.compact,
-                    &sc.dresid.buffer,
+                    &sc.mx.dresid.buffer,
                     &rows.side.buffer,
                     rows.n_uniq,
                     cfg.hidden,
@@ -1593,7 +1607,7 @@ impl Qwen35Model {
         };
         // A one-call grouping: fresh exact-size buffers written without a
         // wait, rather than a workspace filled by staged uploads and copies.
-        embed_rows_bwd_once(rt, &ids, &sc.dresid.buffer, &dw.buffer, cfg.vocab, cfg.hidden)?;
+        embed_rows_bwd_once(rt, &ids, &sc.mx.dresid.buffer, &dw.buffer, cfg.vocab, cfg.hidden)?;
         if let Some((b, add)) = bank {
             if !direct {
                 deliver(rt, &[tensor_part(&dw)], &[tensor_part(&b.embed)], add)?;
@@ -1626,6 +1640,29 @@ impl Qwen35Model {
     fn scratch(&self, t: u32, attn_ws: Option<AttnTrainWorkspace>, mixers: bool) -> Result<Scratch, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
+        let mx = self.mixer_scratch(t, attn_ws, mixers, tensor(rt, &[tu, h])?, tensor(rt, &[tu, h])?)?;
+        Ok(Scratch {
+            mx,
+            d_mid: tensor(rt, &[tu, i])?,
+            d_gate: tensor(rt, &[tu, i])?,
+            d_up: tensor(rt, &[tu, i])?,
+            norm_part: f32s(rt, rms_norm_bwd_part_len(t, cfg.hidden))?,
+        })
+    }
+
+    /// The mixer scratch for `t` rows over `dresid` and `dx` (`[t, hidden]`,
+    /// the caller's: views of the packed step's in a ragged one), with the
+    /// GDN and attention scratch when `mixers`.
+    fn mixer_scratch(
+        &self,
+        t: u32,
+        attn_ws: Option<AttnTrainWorkspace>,
+        mixers: bool,
+        dresid: Tensor,
+        dx: Tensor,
+    ) -> Result<MixerScratch, String> {
+        let (rt, cfg) = (&self.rt, &self.cfg);
+        let tu = t as usize;
         let (g, a) = (cfg.gdn, cfg.attn);
         let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
         let gdn = if mixers && has(crate::qwen35_model::LayerKind::LinearAttention) {
@@ -1667,14 +1704,10 @@ impl Qwen35Model {
         } else {
             None
         };
-        Ok(Scratch {
+        Ok(MixerScratch {
             t,
-            dresid: tensor(rt, &[tu, h])?,
-            dx: tensor(rt, &[tu, h])?,
-            d_mid: tensor(rt, &[tu, i])?,
-            d_gate: tensor(rt, &[tu, i])?,
-            d_up: tensor(rt, &[tu, i])?,
-            norm_part: f32s(rt, rms_norm_bwd_part_len(t, cfg.hidden))?,
+            dresid,
+            dx,
             gdn,
             attn,
         })
@@ -1710,7 +1743,28 @@ impl Qwen35Model {
     /// and the device's current allocation exceed its recommended working
     /// set.
     pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
-        self.step_bytes(t, operands, false, HeadKind::Fresh)
+        self.step_bytes(t, operands, false, HeadKind::Fresh, None)
+    }
+
+    /// [`Self::train_step_bytes`] for [`Self::train_step_ragged_into`] on
+    /// `cu_seqlens` (as [`check_cu_seqlens`] reads it), into a bank whose
+    /// head gradient goes `in_place` (an f32 embedding that is a whole
+    /// buffer) or a chunk at a time: what the ragged step allocates, each
+    /// sequence's mixer counted at its own length.
+    ///
+    /// # Errors
+    /// `cu_seqlens` is malformed for `total` tokens.
+    pub fn train_step_ragged_bytes(
+        &self,
+        cu_seqlens: &[u32],
+        total: usize,
+        operands: GemmOperands,
+        in_place: bool,
+    ) -> Result<u64, String> {
+        let ranges = check_cu_seqlens(cu_seqlens, total)?;
+        let lens: Vec<u32> = ranges.iter().map(|r| r.len() as u32).collect();
+        let head = if in_place { HeadKind::InPlace } else { HeadKind::ByChunk };
+        Ok(self.step_bytes(total as u32, operands, false, head, Some(&lens)))
     }
 
     /// [`Self::train_step_bytes`]; `fresh` adds every layer's gradients held
@@ -1721,7 +1775,12 @@ impl Qwen35Model {
     /// nothing beyond the bank ([`Head::InPlace`]), or one `[chunk, hidden]`
     /// chunk through the cross-entropy and the token rows held to the end
     /// ([`Head::ByChunk`]).
-    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: HeadKind) -> u64 {
+    ///
+    /// `lens` are a ragged step's sequence lengths (summing to `t`): every
+    /// mixer's forward, backward and scratch, and the attention workspace,
+    /// are counted once per sequence at its own length (each buffer at the
+    /// pool's rounding), the row-wise parts once over `t` rows.
+    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: HeadKind, lens: Option<&[u32]>) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -1740,10 +1799,14 @@ impl Qwen35Model {
         // final norm's output and its gradient, the head gradient, and the
         // step's attention workspace.
         let attn_ws = if cfg.layers.contains(&crate::qwen35_model::LayerKind::FullAttention) {
-            AttnTrainWorkspace::allocated_bytes_for(self.attn_dims(t))
+            lens.unwrap_or(&[t]).iter().fold(0u64, |a, &n| {
+                a.saturating_add(AttnTrainWorkspace::allocated_bytes_for(self.attn_dims(n)))
+            })
         } else {
             0
         };
+        // A mixer's bytes over the step's sequences (one, unless ragged).
+        let over = |per: &dyn Fn(u32) -> u64| lens.unwrap_or(&[t]).iter().fold(0u64, |a, &n| a.saturating_add(per(n)));
         // At most `t` distinct tokens: their f32 rows and their ids.
         let head_held = match head {
             // Untied, the gather's gradient is a second [vocab, hidden] tensor.
@@ -1761,20 +1824,27 @@ impl Qwen35Model {
             head_held,
             attn_ws,
         ]);
-        let fwd: Vec<u64> = self
-            .layers
-            .iter()
-            .map(|l| self.layer_fwd_bytes(l, t, mm, true))
-            .collect();
+        // A layer's forward: the row-wise part over `t` rows and the mixer
+        // over each sequence (the whole layer's, with `lens` of one).
+        let layer_fwd = |l: &Layer, output: bool| {
+            self.layer_fwd_bytes(l, t, mm, output)
+                .saturating_sub(self.mixer_fwd_bytes(l, t, mm))
+                .saturating_add(over(&|n| self.mixer_fwd_bytes(l, n, mm)))
+        };
+        let fwd: Vec<u64> = self.layers.iter().map(|l| layer_fwd(l, true)).collect();
         let bwd: Vec<(u64, u64)> = self
             .layers
             .iter()
             .map(|l| {
                 let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
-                (
-                    grads,
-                    sum(&[self.layer_fwd_bytes(l, t, mm, false), grads, temps, widened]),
-                )
+                let (mg, mt) = self.mixer_bwd_bytes(l, t, mm);
+                let grads = grads
+                    .saturating_sub(mg)
+                    .saturating_add(over(&|n| self.mixer_bwd_bytes(l, n, mm).0));
+                let temps = temps
+                    .saturating_sub(mt)
+                    .saturating_add(over(&|n| self.mixer_bwd_bytes(l, n, mm).1));
+                (grads, sum(&[layer_fwd(l, false), grads, temps, widened]))
             })
             .collect();
         let fresh_grads = if fresh {
@@ -1822,8 +1892,16 @@ impl Qwen35Model {
         } else {
             0
         };
+        let scratch = match lens {
+            None => self.scratch_bytes(t),
+            // The packed scratch holds the row-wise buffers alone; each
+            // sequence's mixer scratch views its rows of `dresid` and `dx`.
+            Some(_) => self
+                .rowwise_scratch_bytes(t)
+                .saturating_add(over(&|n| self.mixer_scratch_bytes(n))),
+        };
         let backward_held = sum(&[
-            self.scratch_bytes(t),
+            scratch,
             zero_chunk,
             f(h),
             EmbedBwdWorkspace::allocated_bytes_for(t),
@@ -1853,6 +1931,18 @@ impl Qwen35Model {
         if output {
             b.push(mm.nn_scratch_bytes(tu, h, i, wd));
         }
+        b.push(self.mixer_fwd_bytes(layer, t, mm));
+        b.iter().fold(0, |a, &x| a.saturating_add(x))
+    }
+
+    /// [`Self::layer_fwd_bytes`]'s mixer part on `t` rows: a ragged step
+    /// runs it once per sequence, each at its own length.
+    fn mixer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands) -> u64 {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let h = cfg.hidden as usize;
+        let wd = self.embed.dtype;
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
+        let mut b = Vec::new();
         match &layer.mixer {
             Mixer::Gdn(_) => {
                 let g = cfg.gdn;
@@ -1914,6 +2004,23 @@ impl Qwen35Model {
             2 * mm.tn_scratch_bytes(tc, h, i, tu),
             2 * mm.nt_scratch_bytes(tc, tu, h, i, wd),
         ];
+        let (mg, mt) = self.mixer_bwd_bytes(layer, t, mm);
+        grads.push(mg);
+        temps.push(mt);
+        let total = |v: &[u64]| v.iter().fold(0u64, |a, &b| a.saturating_add(b));
+        (total(&grads), total(&temps))
+    }
+
+    /// [`Self::layer_bwd_bytes`]'s mixer part on `t` rows (gradients,
+    /// temporaries): a ragged step runs it once per sequence.
+    fn mixer_bwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands) -> (u64, u64) {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let h = cfg.hidden as usize;
+        let tc = self.rt.has_tensorops();
+        let wd = self.embed.dtype;
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
+        let mut grads = Vec::new();
+        let mut temps = Vec::new();
         let (width, y_cols) = match &layer.mixer {
             Mixer::Gdn(_) => {
                 let g = cfg.gdn;
@@ -1946,15 +2053,32 @@ impl Qwen35Model {
 
     /// The backward's scratch ([`Self::scratch`]).
     fn scratch_bytes(&self, t: u32) -> u64 {
+        self.rowwise_scratch_bytes(t)
+            .saturating_add(self.mixer_scratch_bytes(t))
+    }
+
+    /// [`Self::scratch_bytes`]'s row-wise buffers (a ragged step's packed
+    /// scratch, which holds the per-sequence mixers' `dresid` and `dx` rows).
+    fn rowwise_scratch_bytes(&self, t: u32) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold);
-        let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
-        let mut b = vec![
+        [
             2 * f(tu * h), // dresid, dx
             3 * f(tu * i), // d_mid, d_gate, d_up
             f(rms_norm_bwd_part_len(t, cfg.hidden)),
-        ];
+        ]
+        .iter()
+        .fold(0, |a, &x| a.saturating_add(x))
+    }
+
+    /// [`Self::scratch_bytes`]'s mixer scratch on `t` rows: a ragged step
+    /// holds one per sequence, each at its own length.
+    fn mixer_scratch_bytes(&self, t: u32) -> u64 {
+        let (cfg, tu) = (&self.cfg, t as usize);
+        let f = |n: usize| GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold);
+        let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
+        let mut b: Vec<u64> = Vec::new();
         if has(crate::qwen35_model::LayerKind::LinearAttention) {
             let g = cfg.gdn;
             let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
@@ -2075,9 +2199,22 @@ impl Qwen35Model {
     fn residual(&self, resid: &Tensor, y: &Tensor, w_out: &Tensor, t: u32, mm: GemmOperands) -> Result<Tensor, String> {
         let (rt, h) = (&self.rt, self.cfg.hidden);
         let out = tensor(rt, &[t as usize, h as usize])?;
-        deliver(rt, &[tensor_part(resid)], &[tensor_part(&out)], false)?;
-        mm.nn_acc(y, w_out, &out)?;
+        self.residual_into(resid, y, w_out, &out, mm)?;
         Ok(out)
+    }
+
+    /// [`Self::residual`] into `out` (a view of a larger stream, in a ragged
+    /// step: the rows of one sequence).
+    fn residual_into(
+        &self,
+        resid: &Tensor,
+        y: &Tensor,
+        w_out: &Tensor,
+        out: &Tensor,
+        mm: GemmOperands,
+    ) -> Result<(), String> {
+        deliver(&self.rt, &[tensor_part(resid)], &[tensor_part(out)], false)?;
+        mm.nn_acc(y, w_out, out)
     }
 
     /// One layer's forward from `resid_in`, keeping what its backward reads;
@@ -2179,39 +2316,38 @@ impl Qwen35Model {
             let nu = n as u32;
             let x_k = xs.view(&[n, h], start * h);
             let rin = resid_in.view(&[n, h], start * h);
-            let (sv, rk) = match mixer {
+            let out_k = out.view(&[n, h], start * h);
+            let sv = match mixer {
                 Mixer::Gdn(w) => {
                     let s = self.gdn_forward(w, &x_k, nu, mm)?;
-                    let rk = self.residual(&rin, op(&s.y, &s.y16), &w.w_out, nu, mm)?;
-                    (SavedMixer::Gdn(Box::new(s)), rk)
+                    self.residual_into(&rin, op(&s.y, &s.y16), &w.w_out, &out_k, mm)?;
+                    SavedMixer::Gdn(Box::new(s))
                 }
                 Mixer::Attn(w) => {
                     let ws = r.attn_ws.get(k).copied().flatten().ok_or(
                         "Qwen35Model::train_step_ragged_into: an attention layer without a sequence's workspace",
                     )?;
                     let s = self.attn_forward(w, &x_k, nu, mm, ws)?;
-                    let rk = self.residual(&rin, op(&s.y, &s.y16), &w.w_out, nu, mm)?;
-                    (SavedMixer::Attn(s), rk)
+                    self.residual_into(&rin, op(&s.y, &s.y16), &w.w_out, &out_k, mm)?;
+                    SavedMixer::Attn(s)
                 }
             };
-            deliver(rt, &[tensor_part(&rk)], &[rows_part(&out, start, n)], false)?;
             saved.push(sv);
         }
         Ok((SavedMixer::Ragged(saved), out))
     }
 
-    /// A ragged step's mixer backward from `sc.dresid` (packed): each
+    /// A ragged step's mixer backward from the packed `dresid`: each
     /// sequence's rows through [`Self::gdn_backward`] or
     /// [`Self::attn_backward`] on a scratch of its own length, its weight
     /// gradients delivered into the layer's bank as they are made (the first
     /// sequence over the bank unless `add`, every later one added), and its
-    /// input gradient into its rows of `sc.dx`. Returns the last sequence's
+    /// input gradient into its rows of the packed `dx` (the scratch holds views of both). Returns the last sequence's
     /// gradients, already delivered.
     fn ragged_mixer_backward(
         &self,
         layer: &Layer,
         s: &Saved,
-        sc: &mut Scratch,
         mm: GemmOperands,
         bank: Option<(&LayerGrads, bool)>,
         rs: &mut RaggedScratch,
@@ -2227,12 +2363,6 @@ impl Qwen35Model {
         for (k, (&(start, n), sv)) in rs.spans.iter().zip(saved).enumerate() {
             let sck = rs.scratch.get_mut(k).ok_or(MISMATCH)?;
             let add_k = add || k > 0;
-            deliver(
-                rt,
-                &[rows_part(&sc.dresid, start, n)],
-                &[tensor_part(&sck.dresid)],
-                false,
-            )?;
             let x_k = x1.view(&[n, h], start * h);
             let g = match (&layer.mixer, sv, &bank_layer.mixer) {
                 (Mixer::Gdn(w), SavedMixer::Gdn(svk), MixerGrads::Gdn(b)) => {
@@ -2244,7 +2374,6 @@ impl Qwen35Model {
                 _ => return Err(MISMATCH.into()),
             };
             deliver(rt, &g.parts(), &bank_layer.mixer.parts(), add_k)?;
-            deliver(rt, &[tensor_part(&sck.dx)], &[rows_part(&sc.dx, start, n)], false)?;
             last = Some(g);
         }
         last.ok_or_else(|| MISMATCH.to_string())
@@ -2443,15 +2572,15 @@ impl Qwen35Model {
         ragged: Option<&mut RaggedScratch>,
     ) -> Result<LayerGrads, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
-        let (t, h, i) = (sc.t, cfg.hidden, cfg.intermediate);
+        let (t, h, i) = (sc.mx.t, cfg.hidden, cfg.intermediate);
         let hu = h as usize;
         let eps = cfg.rms_norm_eps;
 
         // MLP: resid_out = resid_mid + swiglu(x2 @ gate, x2 @ up) @ down.
         let into = |pick: fn(&LayerGrads) -> &Tensor| bank.map(|(b, add)| (pick(b), add));
-        let dresid16 = bf16_twin(mm, &sc.dresid)?;
-        let down = self.weight_grad(mm, &s.m_mid, op(&sc.dresid, &dresid16), into(|b| &b.down))?;
-        mm.nt(op(&sc.dresid, &dresid16), &layer.down, &sc.d_mid)?;
+        let dresid16 = bf16_twin(mm, &sc.mx.dresid)?;
+        let down = self.weight_grad(mm, &s.m_mid, op(&sc.mx.dresid, &dresid16), into(|b| &b.down))?;
+        mm.nt(op(&sc.mx.dresid, &dresid16), &layer.down, &sc.d_mid)?;
         swiglu_bwd(
             rt,
             Cols::dense(&s.m_gate.buffer, i),
@@ -2467,15 +2596,15 @@ impl Qwen35Model {
         let gate = self.weight_grad(mm, x2, op(&sc.d_gate, &d_gate16), into(|b| &b.gate))?;
         let up = self.weight_grad(mm, x2, op(&sc.d_up, &d_up16), into(|b| &b.up))?;
         // dx = d_gate @ gate^T + d_up @ up^T, the second added in its GEMM.
-        mm.nt(op(&sc.d_gate, &d_gate16), &layer.gate, &sc.dx)?;
-        mm.nt_acc(op(&sc.d_up, &d_up16), &layer.up, &sc.dx)?;
+        mm.nt(op(&sc.d_gate, &d_gate16), &layer.gate, &sc.mx.dx)?;
+        mm.nt_acc(op(&sc.d_up, &d_up16), &layer.up, &sc.mx.dx)?;
         let post_norm = vec_grad(rt, hu, bank.map(|(b, add)| (&b.post_norm, add)))?;
         rms_norm_bwd(
             rt,
             &s.resid_mid.buffer,
             &layer.post_norm,
-            &sc.dx.buffer,
-            &sc.dresid.buffer,
+            &sc.mx.dx.buffer,
+            &sc.mx.dresid.buffer,
             &post_norm,
             &sc.norm_part,
             t,
@@ -2489,7 +2618,7 @@ impl Qwen35Model {
         let mixer = match (&layer.mixer, &s.mixer, bank.map(|(b, add)| (&b.mixer, add))) {
             _ if ragged.is_some() => {
                 let rs = ragged.ok_or(MISMATCH)?;
-                self.ragged_mixer_backward(layer, s, sc, mm, bank, rs)?
+                self.ragged_mixer_backward(layer, s, mm, bank, rs)?
             }
             (Mixer::Gdn(w), SavedMixer::Gdn(sv), into) => {
                 let into = match into {
@@ -2497,7 +2626,7 @@ impl Qwen35Model {
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
-                MixerGrads::Gdn(self.gdn_backward(w, sv, op(&s.x1, &s.x1_16), sc, mm, into)?)
+                MixerGrads::Gdn(self.gdn_backward(w, sv, op(&s.x1, &s.x1_16), &mut sc.mx, mm, into)?)
             }
             (Mixer::Attn(w), SavedMixer::Attn(sv), into) => {
                 let into = match into {
@@ -2505,7 +2634,7 @@ impl Qwen35Model {
                     Some(_) => return Err(MISMATCH.into()),
                     None => None,
                 };
-                MixerGrads::Attn(self.attn_backward(w, sv, op(&s.x1, &s.x1_16), sc, mm, into)?)
+                MixerGrads::Attn(self.attn_backward(w, sv, op(&s.x1, &s.x1_16), &mut sc.mx, mm, into)?)
             }
             _ => return Err(MISMATCH.into()),
         };
@@ -2514,8 +2643,8 @@ impl Qwen35Model {
             rt,
             &s.resid_in.buffer,
             &layer.input_norm,
-            &sc.dx.buffer,
-            &sc.dresid.buffer,
+            &sc.mx.dx.buffer,
+            &sc.mx.dresid.buffer,
             &input_norm,
             &sc.norm_part,
             t,
@@ -2533,8 +2662,8 @@ impl Qwen35Model {
         })
     }
 
-    /// The GDN mixer's backward from `sc.dresid`; leaves the gradient of its
-    /// input `x1` in `sc.dx`.
+    /// The GDN mixer's backward from `sc.mx.dresid`; leaves the gradient of its
+    /// input `x1` in `sc.mx.dx`.
     /// `bank` is the layer's `(w_in, w_out)` bank gradients (and whether to
     /// add into them), as [`Self::train_layer_backward`] takes them.
     fn gdn_backward(
@@ -2542,7 +2671,7 @@ impl Qwen35Model {
         w: &GdnWeights,
         s: &SavedGdn,
         x1: &Tensor,
-        sc: &mut Scratch,
+        sc: &mut MixerScratch,
         mm: GemmOperands,
         bank: Option<(&GdnGrads, bool)>,
     ) -> Result<GdnGrads, String> {
@@ -2674,7 +2803,7 @@ impl Qwen35Model {
         w: &AttnWeights,
         s: &SavedAttn,
         x1: &Tensor,
-        sc: &mut Scratch,
+        sc: &mut MixerScratch,
         mm: GemmOperands,
         bank: Option<(&AttnGrads, bool)>,
     ) -> Result<AttnGrads, String> {

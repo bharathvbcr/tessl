@@ -18,11 +18,22 @@ fn fixture() -> PathBuf {
 }
 
 fn load() -> Qwen35Model {
+    load_rt(false).1
+}
+
+/// The fixture with its runtime: f32 as `Qwen35Model::load`, or bf16 as the
+/// tower a bf16 model is trained from (`load_tower`).
+fn load_rt(bf16_tower: bool) -> (std::sync::Arc<GpuRuntime>, Qwen35Model) {
     let dir = fixture();
     let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
     let rt = GpuRuntime::new().unwrap();
     let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
-    Qwen35Model::load(&rt, &st, "model.", cfg, Precision::F32).unwrap()
+    let model = if bf16_tower {
+        Qwen35Model::load_tower(&rt, &st, "model.", cfg, Precision::Bf16).unwrap()
+    } else {
+        Qwen35Model::load(&rt, &st, "model.", cfg, Precision::F32).unwrap()
+    };
+    (rt, model)
 }
 
 fn buf_bits(b: &GpuBuffer) -> Vec<u32> {
@@ -322,6 +333,130 @@ fn a_ragged_step_accumulates_into_a_bank() {
         worst <= GRAD_BOUND,
         "accumulating the same step twice is {worst:.3e} from double"
     );
+}
+
+/// `accumulate = false` writes over the bank, whatever it held: the first
+/// sequence's mixer gradients (and the vectors, and the MLP's) replace the
+/// bank's, only the later sequences add. Run twice on one bank, and on a bank
+/// another ragged step filled first, the result is the zero bank's, bit for
+/// bit.
+#[test]
+fn a_ragged_step_without_accumulate_overwrites_the_bank() {
+    let model = load();
+    let seqs = [seq(0, 9), seq(1, 6), seq(2, 13)];
+    let (ids, cu) = pack(&seqs);
+    let step = |bank: &Qwen35Grads, ids: &[u32], cu: &[u32]| {
+        model
+            .train_step_ragged_into(ids, cu, GemmOperands::ExactF32, bank, false)
+            .unwrap();
+    };
+    let clean = Qwen35Grads::zeros_like(&model).unwrap();
+    step(&clean, &ids, &cu);
+    let want = all_bits(&clean);
+    assert!(want.iter().flatten().any(|&b| f32::from_bits(b) != 0.0));
+
+    // Twice on the same bank: the second overwrites the first.
+    step(&clean, &ids, &cu);
+    assert_eq!(all_bits(&clean), want, "a second step into the same bank added to it");
+
+    // A bank holding another step's gradients, different in every tensor.
+    let dirty = Qwen35Grads::zeros_like(&model).unwrap();
+    let other = [seq(5, 7), seq(6, 11)];
+    let (oids, ocu) = pack(&other);
+    step(&dirty, &oids, &ocu);
+    assert_ne!(all_bits(&dirty), want);
+    step(&dirty, &ids, &cu);
+    assert_eq!(
+        all_bits(&dirty),
+        want,
+        "a bank's old gradients leaked into an overwriting step"
+    );
+}
+
+/// The step's memory bound counts what a ragged step allocates (each
+/// sequence's mixer at its own length, the row-wise buffers once), and the
+/// measured peak stays under it, on the f32 model (head in place) and the bf16
+/// tower (a bf16 bank, head by chunk).
+#[test]
+fn a_ragged_steps_peak_stays_under_its_bound() {
+    let seqs = [seq(0, 40), seq(1, 17), seq(2, 70), seq(3, 33)];
+    let (ids, cu) = pack(&seqs);
+    for (bf16, mm) in [(false, GemmOperands::ExactF32), (true, GemmOperands::Bf16)] {
+        let (rt, model) = load_rt(bf16);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let in_place = !bf16;
+        let bound = model.train_step_ragged_bytes(&cu, ids.len(), mm, in_place).unwrap();
+        let packed_only = model.train_step_bytes(ids.len() as u32, mm);
+        rt.synchronize().unwrap();
+        let before = rt.current_allocated_bytes();
+        rt.reset_peak_allocated_bytes();
+        model.train_step_ragged_into(&ids, &cu, mm, &bank, false).unwrap();
+        let peak = rt.peak_allocated_bytes().saturating_sub(before);
+        eprintln!("bf16 {bf16}: peak {peak} B, ragged bound {bound} B, one-sequence bound {packed_only} B");
+        assert!(peak <= bound, "peak {peak} over the ragged bound {bound}");
+        // The bound's last term is the pool's freelist cap, which dwarfs this
+        // tiny step; the peak is also under the bound without it, so the
+        // step's own bytes are what is counted, not the cap's slack.
+        let cap = rt.memory_info().pool_cache_cap as u64;
+        assert!(
+            peak <= bound - cap,
+            "peak {peak} over the bound's own part {}",
+            bound - cap
+        );
+        // Many short sequences cost more than one long one: the bound says so.
+        let one = model
+            .train_step_ragged_bytes(&[0, ids.len() as u32], ids.len(), mm, in_place)
+            .unwrap();
+        assert!(bound > one, "{bound} not over the single-sequence bound {one}");
+    }
+}
+
+/// The bf16 tower on bf16 operands: a bf16 bank holds each gradient rounded
+/// to bf16 (relative step 2^-8, error at most 2^-9 of the element) and every
+/// delivery rounds again. The packed step rounds each mixer tensor once per
+/// sequence (S deliveries) and the rest once; the singles' bank rounds
+/// everything S times. Each side's element is within S roundings of its f32
+/// sum, plus one for a last-bit f32 difference flipping a rounding, so the two
+/// banks differ by at most (2S + 1) * 2^-9 of the tensor's peak. Losses
+/// involve no bank: same bound as f32.
+#[test]
+fn a_ragged_step_on_a_bf16_tower_stays_within_bf16_roundings_of_the_singles() {
+    let (_rt, model) = load_rt(true);
+    let seqs = [seq(0, 9), seq(1, 6), seq(2, 13)];
+    let (ids, cu) = pack(&seqs);
+    let n: usize = seqs.iter().map(|s| s.len() - 1).sum();
+    let mm = GemmOperands::Bf16;
+    let want = Qwen35Grads::zeros_like(&model).unwrap();
+    let mut alone = Vec::new();
+    for (k, s) in seqs.iter().enumerate() {
+        let pos: Vec<u32> = (0..s.len() as u32 - 1).collect();
+        model
+            .train_step_into(
+                s,
+                mm,
+                Supervise::Rows {
+                    positions: &pos,
+                    targets: &s[1..],
+                    scale: 1.0 / n as f32,
+                },
+                &want,
+                k > 0,
+            )
+            .unwrap();
+        alone.push(model.train_step(s, mm).unwrap().loss);
+    }
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let got = model.train_step_ragged_into(&ids, &cu, mm, &bank, false).unwrap();
+    for (k, (g, a)) in got.per_sequence.iter().zip(&alone).enumerate() {
+        assert!(
+            (g - a).abs() <= LOSS_BOUND * a.abs(),
+            "sequence {k}: {g} against {a} alone"
+        );
+    }
+    let bound = (2 * seqs.len() + 1) as f64 * 2f64.powi(-9);
+    let rel = worst_rel(&bank, &want);
+    eprintln!("bf16 tower: worst gradient rel {rel:.3e}, bound {bound:.3e}");
+    assert!(rel <= bound, "{rel:.3e} over the derived bound {bound:.3e}");
 }
 
 #[test]

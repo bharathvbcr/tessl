@@ -103,11 +103,13 @@ class Qwen35Training(unittest.TestCase):
         cu = torch.tensor([0] + [sum(lens[:k + 1]) for k in range(len(lens))], dtype=torch.int32)
         predictions = sum(n - 1 for n in lens)
         m = self.model()
-        alone, want = [], None
-        for s, n in zip(seqs, lens):
-            alone.append(m.train_step(s))
-            g = {k: v.double() * ((n - 1) / predictions) for k, v in m.grads().items()}
-            want = g if want is None else {k: want[k] + g[k] for k in g}
+        # The references, as tests/qwen35_train_ragged.rs's `singles`: every
+        # sequence alone with the batch's 1 / predictions scale, accumulated.
+        for k, (s, n) in enumerate(zip(seqs, lens)):
+            m.train_forward(s, positions=list(range(n - 1)), targets=s[1:], scale=1.0 / predictions)
+            m.train_backward(accumulate=k > 0)
+        want = {k: v.cpu().clone() for k, v in m.grads().items()}
+        alone = [m.train_step(s) for s in seqs]
         loss, per = m.train_step_ragged(packed, cu)
         self.assertEqual(len(per), len(lens))
         for got, a in zip(per, alone):
@@ -120,7 +122,7 @@ class Qwen35Training(unittest.TestCase):
         # Accumulating the same step again doubles the bank.
         m.train_step_ragged(packed, cu, accumulate=True)
         twice = m.grads()
-        self.assertLessEqual(max(rel_err(twice[n], 2 * grads[n].double()) for n in want), 1e-6)
+        self.assertLessEqual(max(rel_err(twice[n], 2 * grads[n].cpu().double()) for n in want), 1e-6)
 
     def test_a_bad_cu_seqlens_is_refused_by_the_library(self):
         m = self.model()

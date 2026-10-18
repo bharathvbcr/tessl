@@ -51,10 +51,10 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
+use crate::config_json;
 use crate::dispatch::{dispatch_1d, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{encoder_attn, EncoderAttnDims};
 use crate::gemm::{gemm, gemm_nt_f32, GemmBackend};
-use crate::json::{self, Json, NumForm, Syntax};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35;
@@ -439,34 +439,9 @@ impl BertConfig {
     /// head dim with no attention kernel — is refused by name rather than
     /// computed as something else.
     pub fn from_config_json(text: &str) -> Result<Self, String> {
-        const SYNTAX: Syntax = Syntax {
-            what: "config.json",
-            max_depth: 16,
-            uints_only: false,
-            literals: true,
-        };
-        let c = json::parse(text, SYNTAX)?;
-        if !matches!(c, Json::Object(_)) {
-            return Err("config.json: the root is not an object".into());
-        }
-        let uint = |k: &str| -> Result<u32, String> {
-            match c.get(k) {
-                Some(Json::Num {
-                    form: NumForm::Uint,
-                    int: n,
-                    ..
-                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
-                Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
-        let string = |k: &str| -> Result<Option<&str>, String> {
-            match c.get(k) {
-                None | Some(Json::Null) => Ok(None),
-                Some(Json::Str(s)) => Ok(Some(s.as_str())),
-                Some(v) => Err(format!("config.json: {k} must be a string, got {v:?}")),
-            }
-        };
+        let c = config_json::parse_object(text)?;
+        let uint = |k: &str| config_json::uint(&c, k);
+        let string = |k: &str| config_json::string(&c, k);
         let family = match string("model_type")? {
             Some("bert") => BertFamily::Bert,
             Some("distilbert") => BertFamily::DistilBert,
@@ -504,15 +479,11 @@ impl BertConfig {
                         ))
                     }
                 }
-                let eps = match c.get("layer_norm_eps") {
-                    Some(Json::Num { value, .. }) => *value,
-                    Some(v) => return Err(format!("config.json: layer_norm_eps must be a number, got {v:?}")),
-                    None => return Err("config.json: missing \"layer_norm_eps\"".into()),
-                };
+                let eps = config_json::float(config_json::field(&c, "layer_norm_eps")?, "layer_norm_eps")?;
                 (uint("type_vocab_size")?, eps)
             }
             BertFamily::DistilBert => {
-                if let Some(Json::Bool(true)) = c.get("sinusoidal_pos_embds") {
+                if config_json::flag(&c, "sinusoidal_pos_embds")? == Some(true) {
                     return Err("config.json: sinusoidal_pos_embds is not supported".into());
                 }
                 // transformers' DistilBERT hard-codes LayerNorm(eps=1e-12).

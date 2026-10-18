@@ -1171,8 +1171,11 @@ def mutate(rng, b):
     return bytes(b)
 
 
-def fuzz_bases():
-    """Small bases covering every coding and layout."""
+def fuzz_bases(live=False):
+    """Small bases covering every coding and layout. `live` adds bases only the live fuzz mutates (the committed
+    corpus is drawn from one random stream over the sorted bases, so adding to it would redraw all of it): lossless
+    frames in several scans with a restart interval and components of different sizes, and larger progressive
+    pictures at three and four block rows per iMCU row."""
     img = photo(24, 40, 6)
     g = np.asarray(Image.fromarray(img).convert("L"))
     bases = {}
@@ -1212,13 +1215,23 @@ def fuzz_bases():
     bases["lossless_rgb_rst"] = write_lossless(8, 10, l3, ll_planes(lrng, l3, 8, 10), psv=6, adobe=0, restart=16)
     bases["lossless_420_pt"] = write_lossless(18, 10, l420, ll_planes(lrng, l420, 18, 10, pt=2), psv=7, pt=2, adobe=0)
     bases["lossless_noninterleaved"] = write_lossless(9, 7, l3, ll_planes(lrng, l3, 9, 7), psv=2, adobe=0, interleave=False)
+    if live:
+        w, h = 18, 11  # the restart interval of 18 MCUs is one row of the first component, whatever the scan
+        for tag, comps, scans in (("420_sep", l420, [[0], [1], [2]]), ("420_pair", l420, [[0], [1, 2]]),
+                                  ("v3_sep", [(1, 3), (1, 1), (1, 1)], [[0], [1], [2]]),
+                                  ("mixed_rev", [(2, 2), (2, 1), (1, 2)], [[2], [1], [0]])):
+            bases["lossless_rstsub_" + tag] = write_lossless(w, h, comps, ll_planes(lrng, comps, w, h), psv=4, adobe=0,
+                                                              restart=w, scans=scans)
+        for tag, s in (("v3", "1x3,1x1,1x1"), ("420", "2x2,1x1,1x1"), ("v4", "1x4,1x1,1x1")):
+            pj = cj(photo(104, 40, 23), "-progressive", "-sample", s)
+            bases["smooth_large_" + tag] = pj[:scan_offsets(pj)[2]] + b"\xff\xd9"
     return bases
 
 
 def fuzz_stream(seed):
     """Yield (base name, mutant bytes) forever, round-robin over the bases."""
     rng = random.Random(seed)
-    bases = fuzz_bases()
+    bases = fuzz_bases(live=True)
     names = sorted(bases)
     while True:
         for n in names:

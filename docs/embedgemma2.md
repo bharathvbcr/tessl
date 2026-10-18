@@ -2986,7 +2986,7 @@ behaves as before: the tag is read from the first Exif APP1 segment (bounded par
 `ImageInfo::exif_orientation`, and applied only for `ExifOrientation::Apply`.
 
 **The reference** (established by reading what torchvision's `decode_jpeg` does and probing
-it, and held by 998 fixtures; the fixture generator's docstring repeats it): libjpeg-turbo 3.1.3 (the
+it, and held by 1241 fixtures; the fixture generator's docstring repeats it): libjpeg-turbo 3.1.3 (the
 library bundled in the installed torchvision 0.29.1 wheel; libjpeg API 8; NEON SIMD on this
 arm64 machine), called as `jpeg_read_header`, `out_color_space = JCS_RGB` (for CMYK and YCCK,
 `JCS_CMYK`, then torchvision's own `v = k * cmy + 128; ((v >> 8) + v) >> 8`),
@@ -3015,19 +3015,32 @@ libjpeg and decode, and decode here to the same pixels.
 **Block smoothing** (`smooth.rs`). libjpeg-turbo 3.1 smooths a progressive image whose scans
 stop before AC coefficients 1 to 5 (or 1 to 9) are complete (a truncated progressive file that
 still has its EOI, or a scan that runs out of data) from the neighbouring DC values, a 5x5
-window per block. The source was not on this machine, so nothing here is copied: the 25-weight
-tables, the rounding and the limit by the point transform (T.81 K.8 extended), the guard on
-the quantizers, the "previous scan" record (`prev_bits`, 0 for components first seen in the
-first scan), `last_good_iMCU_row` (the iMCU row of the last MCU decoded while its segment had
-data) and the block rows read at the top, bottom and iMCU-row edges were each measured with
-the oracle, on cjpeg's own cuts of real pictures and on one-component files with chosen DC
-images, quantizers and progression states written by the generator, and then held by the
-fixtures (the row rule by one-component pictures of every height from one block row to
-past two iMCU rows, at 2, 3 and 4 block rows per iMCU row). Where a rule could not be told
-from another on the fixtures it is the simplest one that fits. The limit of "byte for
-byte" is what the fixtures hold: 3 or 4 block rows per iMCU row are covered by the
-one-component files and by a few cjpeg `-sample 1x3`/`1x4`/`2x3` pictures, not by large real
-pictures.
+window per block. The rules were first measured with the oracle: the 25-weight tables, the
+rounding and the limit by the point transform (T.81 K.8 extended), the guard on the
+quantizers, the "previous scan" record (`prev_bits`, 0 for components first seen in the first
+scan), `last_good_iMCU_row` (the iMCU row of the last MCU decoded while its segment had data)
+and the block rows read at the top, bottom and iMCU-row edges, on cjpeg's own cuts of real
+pictures and on one-component files with chosen DC images, quantizers and progression states
+written by the generator. They were then **compared with libjpeg-turbo 3.1.3's source** (IJG
+licence; read, not copied) and agree with it, so what the fixtures measured is also what the
+library's code says. Verified against the source (`jdcoefct.c` line numbers as the fetched
+file numbers them): `smoothing_ok` 355-417 (quantizer guard, latched `coef_bits`, the previous
+record is -1 in the first scan, useful only while some of coefficients 1 to 9 is not final);
+the choice of the previous-scan record for iMCU rows after `last_good_iMCU_row` 515-519, which
+is assigned `input_iMCU_row` before every MCU decoded from a segment that still has data
+(232-233); `change_dc` 522-525; the five block rows 543-570, which count with the current iMCU
+row's own `block_rows` (the partial count in the last one: `image_block_row = output_iMCU_row *
+block_rows + block_row`, `image_block_rows = block_rows * total_iMCU_rows`), held to
+`neighbour_rows` for 1 to 4 block rows per iMCU row and every height to nine iMCU rows by the unit test
+`the_neighbour_rows_equal_the_librarys_formulas`; the 5x5 window and its edge replication
+571-596; all nine AC weight sums, the DC sum, the rounding and the `(1 << Al) - 1` limit
+607-778 (every table in `smooth.rs` equals them); and `jdphuff.c` 126-141 (`prev_coef_bits`,
+0 in the first scan). The library was read through a fetch tool that returns the file text
+with line numbers, not from a local checkout, so a line number is only as good as that
+transcription; the weights and conditions were compared one by one, not by hash. Large real
+pictures at 2 to 4 block rows per iMCU row are fixtures too (`smoothing_large_*`: six full
+iMCU rows plus 1 to v block rows, 4:2:0, 4:4:0, 1x3, 1x4, 2x3 and 2x4 luma, cut after 1, 2
+and 5 scans; `smoothing_big_*`: 288x96 4:2:0 and 290x64 1x3), and agree byte for byte.
 
 **Lossless JPEG (SOF3)** (`lossless.rs`). Predictors 1 to 7, the point transform, restart
 intervals (whole MCU rows), precisions 2 to 8, one to four components, RGB and CMYK as
@@ -3039,16 +3052,39 @@ DHT (the standard-table fallback belongs to the DCT decoder), a frame with a com
 scan, a restart interval that is not a whole number of MCU rows, and invalid predictor and point
 transform parameters.
 
+*The rule that was open.* A lossless scan is undifferenced one iMCU row at a time
+(`jddiffct.c` `decompress_data`, 175-226): the entropy decoder first fills the difference
+buffer for the whole iMCU row, a non-interleaved scan of a component with `v_samp_factor` Vi
+taking Vi MCU rows of one sample row each (`start_iMCU_row`, 70-85), restart markers being
+honoured between those MCU rows (178-183, `process_restart` 124-138 and `jdlhuff.c` 166-188),
+and only then are the rows undifferenced together. Both a restart and a row decoded from an
+exhausted segment (`jdlhuff.c` 231-237) end in the undifferencer's `start_pass`
+(`jdlossls.c` 239-269), which sets every component back to the "first row" function
+(`jdlossls.c` 173-210: predict from `2^(P-Pt-1)` then from the left, and switch to the scan's
+predictor for the rows after it). A reset anywhere in an iMCU row therefore takes effect at
+the iMCU row's *first* row. In the old fixture (Y 2x2, restart every Y row) every second Y row
+is such a restart, which the row-by-row decoder placed one row late. The restart interval
+itself is checked per scan against that scan's MCUs per row (`jddiffct.c` 104-112 and
+`jdinput.c` 169-193), so the check in this decoder was already right; the earlier diagnosis
+("the reference counts the restart rows over the last scan's MCU rows when it undifferences
+the whole frame") was wrong: the frame is not undifferenced after the last scan, each scan
+is undifferenced as it is read (`consume_data` 264-283 passes the whole-image buffer to the
+same `decompress_data`). **Verified** against the source and by 177 new byte-equal fixtures
+(`lossless_rstsub_*`: component v of 1 to 4, restart intervals of 1 to 3 rows of the first
+component, five scan orderings and groupings, sizes off the MCU grid, a point transform, scans
+cut short with and without later scans kept, invalid intervals refused by both) plus the old
+`lossless_rst_sub_noninterleaved`. The other lossless rules (predictors, 16-bit modulo, `Al`
+shift, category 16 = 32768, precision 2 to 8, `JERR_BAD_PROGRESSION` for Ss/Se/Ah/Al) were
+compared with `jdlossls.c`, `jdlhuff.c` and `jddiffct.c` and agree.
+
 **Refused by name** (`JpegError::Unsupported`, `MediaError::Unsupported`):
 
 - *12-bit.* The reference's 8-bit build refuses it too, so this is agreement, not a gap.
 - *Lossless samples of another width than 8*, and the lossless colour spaces above: the
   reference refuses them too (agreement).
-- *One lossless shape the reference decodes and this decoder does not reproduce*: several scans
-  with a restart interval and components of different sizes (`lossless_rst_sub_noninterleaved`).
-  The reference counts the restart rows over the last scan's MCU rows when it undifferences the
-  whole frame; that diagnosis is inferred from the one fixture, not verified, and the shape is
-  refused rather than guessed.
+- *Nothing the reference decodes.* The one shape that used to be refused here (lossless, several
+  scans, a restart interval, components of different sizes) is decoded byte for byte now; see
+  "The rule that was open". Every `Unsupported` left is a case the reference refuses too.
 
 **Own bounds** (not the format's; each is checked before anything is allocated):
 `options.max_pixels` against the header's size, a working-memory ceiling of 6 GiB for
@@ -3058,7 +3094,7 @@ costs a pass over every block, so a file spending 14 bytes per scan could otherw
 minutes). Hostile input is a named error (`Truncated`, `NotJpeg`, `Invalid`, `Unsupported`,
 `Limit`), never a panic.
 
-**Evidence** (`tests/media_jpeg.rs`, 12 tests plus one ignored; fixtures and the oracle's
+**Evidence** (`tests/media_jpeg.rs`, 13 tests plus one ignored; fixtures and the oracle's
 bytes in `tests/fixtures/jpeg/`, made by `scripts/gen_jpeg_fixtures.py` with PIL, `cjpeg`
 3.2.0 and the generator's own coefficient-level writer):
 
@@ -3073,21 +3109,25 @@ bytes in `tests/fixtures/jpeg/`, made by `scripts/gen_jpeg_fixtures.py` with PIL
 | quality 1 to 100 | 10 |
 | arithmetic (sequential, progressive, 4:4:4, 4:2:0, 4:2:2) | 5 |
 | IDCT extremes, layout (non-interleaved scans, every scan order, 10-block MCU), header oddities, tables (standard tables with no DHT, 16-bit DQT) | 26 |
-| block smoothing: cjpeg's own cuts (every prefix of the default script for 6 subsamplings and gray, 14 sizes with odd and even block-row counts, 7 progression scripts), scans cut short with and without later scans kept, restarts, arithmetic, one-component files at 2 to 4 block rows per iMCU row for every height, DC images and progression states chosen to hit each estimate, zero quantizers, 16-bit extremes | 572 |
-| lossless: predictors 1 to 7, point transforms, precisions 2 to 8, RGB and CMYK, 4:2:0 and 4:2:2 replication, restarts, non-interleaved and mixed scan lists, cjpeg's own encoder, wild differences | 146 byte-equal |
-| refused by both the oracle and this decoder (12-bit, no EOI, cuts, 2/5/6/10 components, bad sampling, bad tables, bad signature, lossless gray/YCbCr/YCCK, precisions 9 to 16, bad lossless parameters, no DHT, a component in no scan, ...) | 123 |
-| the one named refusal, decoded by the oracle (`lossless_rst_sub_noninterleaved`) | 1 |
+| block smoothing: cjpeg's own cuts (every prefix of the default script for 6 subsamplings and gray, 14 sizes with odd and even block-row counts, 7 progression scripts), scans cut short with and without later scans kept, restarts, arithmetic, one-component files at 2 to 4 block rows per iMCU row for every height, DC images and progression states chosen to hit each estimate, zero quantizers, 16-bit extremes, large pictures (six or more iMCU rows) at 2 to 4 block rows per iMCU row with 1 to v block rows in the last | 635 |
+| lossless: predictors 1 to 7, point transforms, precisions 2 to 8, RGB and CMYK, 4:2:0 and 4:2:2 replication, restarts, non-interleaved and mixed scan lists, cjpeg's own encoder, wild differences, and 177 of several scans with a restart interval and components of different sizes (v of 1 to 4, intervals of 1 to 3 rows, five scan orders, cuts) | 324 byte-equal |
+| refused by both the oracle and this decoder (12-bit, no EOI, cuts, 2/5/6/10 components, bad sampling, bad tables, bad signature, lossless gray/YCbCr/YCCK, precisions 9 to 16, bad lossless parameters, no DHT, a component in no scan, restart intervals that are no whole number of a scan's rows, ...) | 126 |
+| a named refusal of something the oracle decodes | 0 |
 
-All 998 fixtures agree: 874 are byte-equal, 123 are refused by both and 1 is the named
-refusal above. A corpus of 612 mutated JPEGs (deterministic mutator, smoothing and lossless
+All 1241 fixtures agree: 1115 are byte-equal and 126 are refused by both; none is a named
+refusal of something the reference decodes. A corpus of 612 mutated JPEGs (deterministic mutator, smoothing and lossless
 bases included) holds the oracle's verdict and pixels: 408 byte-equal, 204 refused by both, 0
 named refusals, 0 disagreements. The ignored `live_fuzz_against_the_oracle` regenerates mutants
 against torchvision (`scripts/gen_jpeg_fixtures.py --live-fuzz DIR COUNT SEED`): 4000 fresh
 mutants (seed 777): 2224 byte-equal, 1776 refused by both, 0 disagreements; 6000 more (seed
-4242): 3243 byte-equal, 2757 refused by both, 0 disagreements. The first run, before the final
+4242): 3243 byte-equal, 2757 refused by both, 0 disagreements; after the iMCU-row change, with
+live-only bases added for the new lossless shape (four layouts of several scans with a restart
+interval) and for large progressive pictures at 3 and 4 block rows per iMCU row: 6000 mutants
+(seed 31337): 3295 byte-equal, 2705 refused by both, 0 disagreements; 8000 (seed 90210): 4388
+byte-equal, 3612 refused by both, 0 disagreements. The first run, before the final
 fixes, found five disagreements (a lossless stream with no DHT decoding with the standard
 tables, a lossless component in no scan, and `last_good_iMCU_row` not following later scans),
-each now a fixture. `mutated_inputs_never_panic` decodes 34920 in-process mutants of 873
+each now a fixture. `mutated_inputs_never_panic` decodes 44520 in-process mutants of 1113
 fixtures in release and in the debug profile (overflow checks on); every strict prefix of
 seven valid files is an error.
 That the oracle is torchvision's and that PIL agrees is held by
@@ -3714,13 +3754,19 @@ tried.
 
 ### What is left
 
-- JPEG: block smoothing and lossless SOF3 are decoded byte for byte on all 998 fixtures; see
-  JPEG decoding. What is left is one lossless shape refused by name (several scans, a restart
-  interval and components of different sizes; the reference decodes it, the cause of the
-  difference is inferred), and the smoothing and lossless rules being measured against the
-  oracle rather than read from the library source, which was not on this machine: shapes the
-  fixtures do not contain (large real pictures with 3 or 4 block rows per iMCU row) are
-  unverified; reading the library source would settle them.
+- JPEG: block smoothing and lossless SOF3 are decoded byte for byte on all 1241 fixtures (1115
+  byte-equal, 126 refused by both, no named refusal of anything the reference decodes); see
+  JPEG decoding. The lossless shape that used to be refused (several scans, a restart interval,
+  components of different sizes) was an iMCU-row effect, now implemented and verified against
+  the library source and 177 fixtures; the smoothing and lossless rules were read against
+  libjpeg-turbo 3.1.3's source and agree (the large-picture shapes included, as fixtures).
+  Still unverified: the source was read through a fetch tool that transcribes files with line
+  numbers, not from a local checkout, so a citation may be off by a line or two and a
+  transcription error would not be caught by anything but the oracle fixtures; lossless frames
+  larger than 33 in either direction (the fixtures are small) run the same row logic but are
+  not fixtures; and the jdcoefct.c window
+  sizes for pictures big enough for libjpeg's virtual-array manager to swap strips to disk
+  (the library's memory limit) were not exercised.
 - torchcodec itself is not in the environment and was never run: the video reference is the
   `ffmpeg` CLI arranged as torchcodec's source (v0.17.0) arranges libswscale, with its
   exact-mode figures, so a run with torchcodec installed would close the last inferred step.

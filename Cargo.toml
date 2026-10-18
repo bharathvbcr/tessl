@@ -26,6 +26,7 @@ exclude = [
     "assets/concepts/**",
     "assets/build_logo.py",
     "assets/png/*@2048.png",
+    "tasks/**",
 ]
 
 # tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and

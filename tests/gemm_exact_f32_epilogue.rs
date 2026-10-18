@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use common::{random_f32, with_gpu};
 use tessl::bert::bias_add;
-use tessl::gemm::{gemm, gemm_epilogue, Activation, Epilogue, GemmBackend};
+use tessl::gemm::{gemm, gemm_epilogue, gemm_epilogue_tiled, Activation, EpiTile, Epilogue, GemmBackend};
 use tessl::nn::{mlp_gelu_tanh, mlp_silu, scale_f32_inplace};
 use tessl::tensor::Tensor;
 use tessl::GpuRuntime;
@@ -108,9 +108,15 @@ const SCALARS: &[(f32, f32)] = &[
     (-0.9, 1.1),
 ];
 
-#[test]
-fn exact_f32_fused_epilogue_is_bit_identical_to_the_separate_passes() {
-    with_gpu(|rt| {
+/// Shapes with N > 512, which the production rule (`coop_narrow`, f32) sends to
+/// the 128x64 kernel. K stays small so `gemm` runs one dispatch.
+const WIDE_SHAPES: &[(usize, usize, usize)] = &[(33, 520, 40), (130, 600, 70), (128, 576, 64)];
+
+/// Every shape x alpha/beta x activation x bias through `gemm_epilogue` (the
+/// production tile rule) or, with `tile`, `gemm_epilogue_tiled`; the identity
+/// epilogue is skipped there, since it is the plain GEMM and has no tile.
+fn sweep(rt: &Arc<GpuRuntime>, shapes: &[(usize, usize, usize)], tile: Option<EpiTile>) {
+    {
         rt.set_relaxed_precision(false);
         let acts = [
             Activation::None,
@@ -119,7 +125,7 @@ fn exact_f32_fused_epilogue_is_bit_identical_to_the_separate_passes() {
             Activation::Silu,
         ];
         let mut cases = 0usize;
-        for &(m, n, k) in SHAPES {
+        for &(m, n, k) in shapes {
             let a_h = random_f32(m * k, 0x11 + k as u64);
             let b_h = random_f32(k * n, 0x22 + n as u64);
             let c_h = random_f32(m * n, 0x33 + m as u64);
@@ -144,9 +150,16 @@ fn exact_f32_fused_epilogue_is_bit_identical_to_the_separate_passes() {
                             bias: bias_t,
                             activation: act,
                         };
-                        let tag = format!("{m}x{n}x{k} alpha={alpha} beta={beta} bias={with_bias} act={act:?}");
-                        gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi)
-                            .unwrap_or_else(|e| panic!("{tag}: gemm_epilogue refused: {e}"));
+                        if tile.is_some() && epi.is_identity() {
+                            continue;
+                        }
+                        let tag =
+                            format!("{m}x{n}x{k} tile={tile:?} alpha={alpha} beta={beta} bias={with_bias} act={act:?}");
+                        match tile {
+                            None => gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi),
+                            Some(t) => gemm_epilogue_tiled(&a, &b, &c, GemmBackend::TensorOps, epi, t),
+                        }
+                        .unwrap_or_else(|e| panic!("{tag}: epilogue refused: {e}"));
                         let got = read(rt, &c, m * n);
                         let want = unfused(rt, (&a, &b), &c_h, bias_t, (m, n), (alpha, beta, act));
                         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -163,7 +176,31 @@ fn exact_f32_fused_epilogue_is_bit_identical_to_the_separate_passes() {
                 }
             }
         }
-        assert_eq!(cases, SHAPES.len() * SCALARS.len() * acts.len() * 2);
+        let identity = usize::from(tile.is_some()); // (1, 0) x no bias x None, once per shape
+        assert_eq!(cases, shapes.len() * (SCALARS.len() * acts.len() * 2 - identity));
+    }
+}
+
+#[test]
+fn exact_f32_fused_epilogue_is_bit_identical_to_the_separate_passes() {
+    with_gpu(|rt| sweep(rt, SHAPES, None));
+}
+
+/// The production rule's wide pick (N > 512): the 128x64 exact kernel.
+#[test]
+fn exact_f32_wide_tile_by_the_production_rule_is_bit_identical() {
+    with_gpu(|rt| sweep(rt, WIDE_SHAPES, None));
+}
+
+/// Both tiles forced on every shape, so the 128x64 kernel runs interior and
+/// edge tiles of the small shapes too.
+#[test]
+fn exact_f32_forced_tiles_are_bit_identical() {
+    with_gpu(|rt| {
+        for tile in [EpiTile::Wide, EpiTile::Narrow] {
+            sweep(rt, SHAPES, Some(tile));
+            sweep(rt, WIDE_SHAPES, Some(tile));
+        }
     });
 }
 

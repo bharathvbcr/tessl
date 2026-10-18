@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="492.8" viewBox="0 0 1100 492.8" role="img">
+<title>tessl::media native decoding, one call per workload (Apple M5 Pro, shared machine)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">tessl::media native decoding, one call per workload (Apple M5 Pro, shared machine)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">Bars are the minimum of N; the tick is the median. Indicative, not a paired comparison.</text>
+<rect class="key" x="14" y="54.3" width="14" height="10" fill="#eb6834"/>
+<text class="mut" x="34" y="63.3" font-size="11">image (megapixels)</text>
+<rect class="key" x="149.02" y="54.3" width="14" height="10" fill="#2a78d6"/>
+<text class="mut" x="169.02" y="63.3" font-size="11">audio (seconds of audio)</text>
+<rect class="key" x="307.58" y="54.3" width="14" height="10" fill="#1f9e6e"/>
+<text class="mut" x="327.58" y="63.3" font-size="11">video (frames)</text>
+<line class="key sk" x1="416.42" y1="59.3" x2="430.42" y2="59.3" stroke-width="1.6"/>
+<text class="mut" x="436.42" y="63.3" font-size="11">median</text>
+<g class="panel">
+<line class="axis" x1="298.71" y1="102.22" x2="302.71" y2="102.22"/>
+<text class="mut" x="295.71" y="106.07" font-size="11" text-anchor="end">audio_30s_16k_mono.wav  (30 audio s)</text>
+<line class="axis" x1="298.71" y1="137.06" x2="302.71" y2="137.06"/>
+<text class="mut" x="295.71" y="140.91" font-size="11" text-anchor="end">audio_30s_44k_stereo.flac  (30 audio s)</text>
+<line class="axis" x1="298.71" y1="171.9" x2="302.71" y2="171.9"/>
+<text class="mut" x="295.71" y="175.75" font-size="11" text-anchor="end">audio_30s_44k_stereo.m4a  (30 audio s)</text>
+<line class="axis" x1="298.71" y1="206.74" x2="302.71" y2="206.74"/>
+<text class="mut" x="295.71" y="210.59" font-size="11" text-anchor="end">audio_30s_44k_stereo.mp3  (30 audio s)</text>
+<line class="axis" x1="298.71" y1="241.58" x2="302.71" y2="241.58"/>
+<text class="mut" x="295.71" y="245.43" font-size="11" text-anchor="end">audio_30s_44k_stereo.wav  (30 audio s)</text>
+<line class="axis" x1="298.71" y1="276.42" x2="302.71" y2="276.42"/>
+<text class="mut" x="295.71" y="280.27" font-size="11" text-anchor="end">photo_1080p.jpg  (2.0736 megapixel)</text>
+<line class="axis" x1="298.71" y1="311.26" x2="302.71" y2="311.26"/>
+<text class="mut" x="295.71" y="315.11" font-size="11" text-anchor="end">photo_1080p.png  (2.0736 megapixel)</text>
+<line class="axis" x1="298.71" y1="346.1" x2="302.71" y2="346.1"/>
+<text class="mut" x="295.71" y="349.95" font-size="11" text-anchor="end">photo_1080p.tiff  (2.0736 megapixel)</text>
+<line class="axis" x1="298.71" y1="380.94" x2="302.71" y2="380.94"/>
+<text class="mut" x="295.71" y="384.79" font-size="11" text-anchor="end">video_10s_720p_h264.mp4:video_open  (300 frame)</text>
+<line class="axis" x1="298.71" y1="415.78" x2="302.71" y2="415.78"/>
+<text class="mut" x="295.71" y="419.63" font-size="11" text-anchor="end">video_10s_720p_h264.mp4:video_decode_9  (9 frame)</text>
+<line class="grid" x1="302.71" y1="84.8" x2="302.71" y2="433.2"/>
+<line class="axis" x1="302.71" y1="433.2" x2="302.71" y2="437.2"/>
+<text class="mut" x="302.71" y="450" font-size="11" text-anchor="middle">0.1</text>
+<line class="grid" x1="482.04" y1="84.8" x2="482.04" y2="433.2"/>
+<line class="axis" x1="482.04" y1="433.2" x2="482.04" y2="437.2"/>
+<text class="mut" x="482.04" y="450" font-size="11" text-anchor="middle">1</text>
+<line class="grid" x1="661.36" y1="84.8" x2="661.36" y2="433.2"/>
+<line class="axis" x1="661.36" y1="433.2" x2="661.36" y2="437.2"/>
+<text class="mut" x="661.36" y="450" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="840.69" y1="84.8" x2="840.69" y2="433.2"/>
+<line class="axis" x1="840.69" y1="433.2" x2="840.69" y2="437.2"/>
+<text class="mut" x="840.69" y="450" font-size="11" text-anchor="middle">100</text>
+<line class="grid" x1="1020.02" y1="84.8" x2="1020.02" y2="433.2"/>
+<line class="axis" x1="1020.02" y1="433.2" x2="1020.02" y2="437.2"/>
+<text class="mut" x="1020.02" y="450" font-size="11" text-anchor="middle">1000</text>
+<line class="axis" x1="302.71" y1="433.2" x2="1074" y2="433.2"/>
+<line class="axis" x1="302.71" y1="84.8" x2="302.71" y2="433.2"/>
+<text class="mut" x="688.35" y="472.8" font-size="12" text-anchor="middle">wall time per call, ms (min of N; tick = median)</text>
+<rect x="302.71" y="91.42" width="60.77" height="21.6" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="375.43" y1="91.42" x2="375.43" y2="113.02" class="median sk" stroke-width="2"/>
+<text class="mut" x="383.43" y="105.9" font-size="10.5">0.2 ms</text>
+<rect x="302.71" y="126.26" width="594.65" height="21.6" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="901.57" y1="126.26" x2="901.57" y2="147.86" class="median sk" stroke-width="2"/>
+<text class="mut" x="909.57" y="140.74" font-size="10.5">207.0 ms</text>
+<rect x="302.71" y="161.1" width="581.49" height="21.6" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="889.16" y1="161.1" x2="889.16" y2="182.7" class="median sk" stroke-width="2"/>
+<text class="mut" x="897.16" y="175.58" font-size="10.5">174.8 ms</text>
+<rect x="302.71" y="195.94" width="583.85" height="21.6" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="891.54" y1="195.94" x2="891.54" y2="217.54" class="median sk" stroke-width="2"/>
+<text class="mut" x="899.54" y="210.42" font-size="10.5">180.2 ms</text>
+<rect x="302.71" y="230.78" width="573.76" height="21.6" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="880.93" y1="230.78" x2="880.93" y2="252.38" class="median sk" stroke-width="2"/>
+<text class="mut" x="888.93" y="245.25" font-size="10.5">158.3 ms</text>
+<rect x="302.71" y="265.62" width="349.72" height="21.6" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="659.44" y1="265.62" x2="659.44" y2="287.22" class="median sk" stroke-width="2"/>
+<text class="mut" x="667.44" y="280.09" font-size="10.5">8.9 ms</text>
+<rect x="302.71" y="300.46" width="411.99" height="21.6" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="717.72" y1="300.46" x2="717.72" y2="322.06" class="median sk" stroke-width="2"/>
+<text class="mut" x="725.72" y="314.94" font-size="10.5">19.8 ms</text>
+<rect x="302.71" y="335.3" width="304.41" height="21.6" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="613.87" y1="335.3" x2="613.87" y2="356.9" class="median sk" stroke-width="2"/>
+<text class="mut" x="621.87" y="349.78" font-size="10.5">5.0 ms</text>
+<rect x="302.71" y="370.14" width="431.04" height="21.6" class="bar" fill="#1f9e6e" fill-opacity="0.85"/>
+<line x1="753.47" y1="370.14" x2="753.47" y2="391.74" class="median sk" stroke-width="2"/>
+<text class="mut" x="761.47" y="384.62" font-size="10.5">25.3 ms</text>
+<rect x="302.71" y="404.98" width="599.85" height="21.6" class="bar" fill="#1f9e6e" fill-opacity="0.85"/>
+<line x1="906.42" y1="404.98" x2="906.42" y2="426.58" class="median sk" stroke-width="2"/>
+<text class="mut" x="914.42" y="419.45" font-size="10.5">221.3 ms</text>
+</g>
+</svg>

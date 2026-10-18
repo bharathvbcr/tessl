@@ -1,0 +1,249 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="979" viewBox="0 0 1400 979" role="img">
+<title>EmbeddingGemma 2 text encoder, stage profile (Apple M5 Pro, async, each stage alone on real shapes and weights)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">EmbeddingGemma 2 text encoder, stage profile (Apple M5 Pro, async, each stage alone on real shapes and weights)</text>
+<rect class="key" x="14" y="40.5" width="14" height="10" fill="#4c72b0"/>
+<text class="mut" x="34" y="49.5" font-size="11">GEMMs, exact f32</text>
+<rect class="key" x="143.41" y="40.5" width="14" height="10" fill="#dd8452"/>
+<text class="mut" x="163.41" y="49.5" font-size="11">attention sliding (hd256)</text>
+<rect class="key" x="300.32" y="40.5" width="14" height="10" fill="#c44e52"/>
+<text class="mut" x="320.32" y="49.5" font-size="11">attention global (hd512)</text>
+<rect class="key" x="454.04" y="40.5" width="14" height="10" fill="#8c8c8c"/>
+<text class="mut" x="474.04" y="49.5" font-size="11">elementwise: norms, residual adds, gelu, rope, scale, gather, tail</text>
+<g class="panel">
+<line class="grid" x1="64.88" y1="474.8" x2="677" y2="474.8"/>
+<line class="axis" x1="60.88" y1="474.8" x2="64.88" y2="474.8"/>
+<text class="mut" x="57.88" y="478.65" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="64.88" y1="412.1" x2="677" y2="412.1"/>
+<line class="axis" x1="60.88" y1="412.1" x2="64.88" y2="412.1"/>
+<text class="mut" x="57.88" y="415.95" font-size="11" text-anchor="end">20</text>
+<line class="grid" x1="64.88" y1="349.4" x2="677" y2="349.4"/>
+<line class="axis" x1="60.88" y1="349.4" x2="64.88" y2="349.4"/>
+<text class="mut" x="57.88" y="353.25" font-size="11" text-anchor="end">40</text>
+<line class="grid" x1="64.88" y1="286.7" x2="677" y2="286.7"/>
+<line class="axis" x1="60.88" y1="286.7" x2="64.88" y2="286.7"/>
+<text class="mut" x="57.88" y="290.55" font-size="11" text-anchor="end">60</text>
+<line class="grid" x1="64.88" y1="224" x2="677" y2="224"/>
+<line class="axis" x1="60.88" y1="224" x2="64.88" y2="224"/>
+<text class="mut" x="57.88" y="227.85" font-size="11" text-anchor="end">80</text>
+<line class="grid" x1="64.88" y1="161.3" x2="677" y2="161.3"/>
+<line class="axis" x1="60.88" y1="161.3" x2="64.88" y2="161.3"/>
+<text class="mut" x="57.88" y="165.15" font-size="11" text-anchor="end">100</text>
+<line class="grid" x1="64.88" y1="98.6" x2="677" y2="98.6"/>
+<line class="axis" x1="60.88" y1="98.6" x2="64.88" y2="98.6"/>
+<text class="mut" x="57.88" y="102.45" font-size="11" text-anchor="end">120</text>
+<line class="axis" x1="126.09" y1="474.8" x2="126.09" y2="478.8"/>
+<text class="mut" x="126.09" y="491.6" font-size="11" text-anchor="middle">1x16</text>
+<line class="axis" x1="248.52" y1="474.8" x2="248.52" y2="478.8"/>
+<text class="mut" x="248.52" y="491.6" font-size="11" text-anchor="middle">64x32</text>
+<line class="axis" x1="370.94" y1="474.8" x2="370.94" y2="478.8"/>
+<text class="mut" x="370.94" y="491.6" font-size="11" text-anchor="middle">32x256</text>
+<line class="axis" x1="493.36" y1="474.8" x2="493.36" y2="478.8"/>
+<text class="mut" x="493.36" y="491.6" font-size="11" text-anchor="middle">8x1024</text>
+<line class="axis" x1="615.79" y1="474.8" x2="615.79" y2="478.8"/>
+<text class="mut" x="615.79" y="491.6" font-size="11" text-anchor="middle">2x4096</text>
+<line class="axis" x1="64.88" y1="474.8" x2="677" y2="474.8"/>
+<line class="axis" x1="64.88" y1="98.6" x2="64.88" y2="474.8"/>
+<text class="mut" x="31.52" y="286.7" font-size="12" text-anchor="middle" transform="rotate(-90 31.52 286.7)">% of the full forward (stage alone, summed)</text>
+<text class="ink" x="64.88" y="84.26" font-size="13" font-weight="600">Where a forward&apos;s GPU time goes (async; each stage alone, real shapes and weights)</text>
+<rect x="77.12" y="197.36" width="97.94" height="277.44" class="seg" fill="#4c72b0"/>
+<rect x="199.55" y="198.76" width="97.94" height="276.04" class="seg" fill="#4c72b0"/>
+<rect x="321.97" y="241.28" width="97.94" height="233.52" class="seg" fill="#4c72b0"/>
+<rect x="444.39" y="277.95" width="97.94" height="196.85" class="seg" fill="#4c72b0"/>
+<rect x="566.82" y="310.35" width="97.94" height="164.45" class="seg" fill="#4c72b0"/>
+<rect x="77.12" y="187.01" width="97.94" height="10.35" class="seg" fill="#dd8452"/>
+<rect x="199.55" y="191.93" width="97.94" height="6.83" class="seg" fill="#dd8452"/>
+<rect x="321.97" y="220.64" width="97.94" height="20.64" class="seg" fill="#dd8452"/>
+<rect x="444.39" y="229.63" width="97.94" height="48.32" class="seg" fill="#dd8452"/>
+<rect x="566.82" y="260.96" width="97.94" height="49.39" class="seg" fill="#dd8452"/>
+<rect x="77.12" y="182.42" width="97.94" height="4.59" class="seg" fill="#c44e52"/>
+<rect x="199.55" y="187.79" width="97.94" height="4.14" class="seg" fill="#c44e52"/>
+<rect x="321.97" y="211.44" width="97.94" height="9.21" class="seg" fill="#c44e52"/>
+<rect x="444.39" y="201.61" width="97.94" height="28.02" class="seg" fill="#c44e52"/>
+<rect x="566.82" y="175.46" width="97.94" height="85.5" class="seg" fill="#c44e52"/>
+<rect x="77.12" y="141.21" width="97.94" height="41.21" class="seg" fill="#8c8c8c"/>
+<rect x="199.55" y="130.17" width="97.94" height="57.61" class="seg" fill="#8c8c8c"/>
+<rect x="321.97" y="165.14" width="97.94" height="46.3" class="seg" fill="#8c8c8c"/>
+<rect x="444.39" y="162.12" width="97.94" height="39.49" class="seg" fill="#8c8c8c"/>
+<rect x="566.82" y="142.8" width="97.94" height="32.66" class="seg" fill="#8c8c8c"/>
+</g>
+<g class="panel">
+<line class="grid" x1="768.04" y1="474.8" x2="1374" y2="474.8"/>
+<line class="axis" x1="764.04" y1="474.8" x2="768.04" y2="474.8"/>
+<text class="mut" x="761.04" y="478.65" font-size="11" text-anchor="end">5</text>
+<line class="grid" x1="768.04" y1="427.81" x2="1374" y2="427.81"/>
+<line class="axis" x1="764.04" y1="427.81" x2="768.04" y2="427.81"/>
+<text class="mut" x="761.04" y="431.66" font-size="11" text-anchor="end">10</text>
+<line class="grid" x1="768.04" y1="380.82" x2="1374" y2="380.82"/>
+<line class="axis" x1="764.04" y1="380.82" x2="768.04" y2="380.82"/>
+<text class="mut" x="761.04" y="384.67" font-size="11" text-anchor="end">20</text>
+<line class="grid" x1="768.04" y1="318.7" x2="1374" y2="318.7"/>
+<line class="axis" x1="764.04" y1="318.7" x2="768.04" y2="318.7"/>
+<text class="mut" x="761.04" y="322.55" font-size="11" text-anchor="end">50</text>
+<line class="grid" x1="768.04" y1="271.7" x2="1374" y2="271.7"/>
+<line class="axis" x1="764.04" y1="271.7" x2="768.04" y2="271.7"/>
+<text class="mut" x="761.04" y="275.55" font-size="11" text-anchor="end">100</text>
+<line class="grid" x1="768.04" y1="224.71" x2="1374" y2="224.71"/>
+<line class="axis" x1="764.04" y1="224.71" x2="768.04" y2="224.71"/>
+<text class="mut" x="761.04" y="228.56" font-size="11" text-anchor="end">200</text>
+<line class="grid" x1="768.04" y1="162.59" x2="1374" y2="162.59"/>
+<line class="axis" x1="764.04" y1="162.59" x2="768.04" y2="162.59"/>
+<text class="mut" x="761.04" y="166.44" font-size="11" text-anchor="end">500</text>
+<line class="grid" x1="768.04" y1="115.6" x2="1374" y2="115.6"/>
+<line class="axis" x1="764.04" y1="115.6" x2="768.04" y2="115.6"/>
+<text class="mut" x="761.04" y="119.45" font-size="11" text-anchor="end">1000</text>
+<line class="axis" x1="828.64" y1="474.8" x2="828.64" y2="478.8"/>
+<text class="mut" x="828.64" y="491.6" font-size="11" text-anchor="middle">1x16</text>
+<line class="axis" x1="949.83" y1="474.8" x2="949.83" y2="478.8"/>
+<text class="mut" x="949.83" y="491.6" font-size="11" text-anchor="middle">64x32</text>
+<line class="axis" x1="1071.02" y1="474.8" x2="1071.02" y2="478.8"/>
+<text class="mut" x="1071.02" y="491.6" font-size="11" text-anchor="middle">32x256</text>
+<line class="axis" x1="1192.21" y1="474.8" x2="1192.21" y2="478.8"/>
+<text class="mut" x="1192.21" y="491.6" font-size="11" text-anchor="middle">8x1024</text>
+<line class="axis" x1="1313.4" y1="474.8" x2="1313.4" y2="478.8"/>
+<text class="mut" x="1313.4" y="491.6" font-size="11" text-anchor="middle">2x4096</text>
+<line class="axis" x1="768.04" y1="474.8" x2="1374" y2="474.8"/>
+<line class="axis" x1="768.04" y1="115.6" x2="768.04" y2="474.8"/>
+<text class="mut" x="728.52" y="295.2" font-size="12" text-anchor="middle" transform="rotate(-90 728.52 295.2)">ms per forward (log)</text>
+<text class="ink" x="768.04" y="84.26" font-size="13" font-weight="600">Absolute time; black ticks are the whole replica forward</text>
+<line class="key sk" x1="768.04" y1="98.1" x2="782.04" y2="98.1" stroke-width="1.6"/>
+<text class="mut" x="788.04" y="102.1" font-size="11">full forward (min)</text>
+<rect x="780.16" y="457.47" width="96.95" height="17.33" class="seg" fill="#4c72b0"/>
+<rect x="901.35" y="278.38" width="96.95" height="196.42" class="seg" fill="#4c72b0"/>
+<rect x="1022.54" y="187.33" width="96.95" height="287.47" class="seg" fill="#4c72b0"/>
+<rect x="1143.74" y="185.62" width="96.95" height="289.18" class="seg" fill="#4c72b0"/>
+<rect x="1264.93" y="185.44" width="96.95" height="289.36" class="seg" fill="#4c72b0"/>
+<rect x="780.16" y="454.98" width="96.95" height="2.48" class="seg" fill="#dd8452"/>
+<rect x="901.35" y="276.72" width="96.95" height="1.66" class="seg" fill="#dd8452"/>
+<rect x="1022.54" y="181.59" width="96.95" height="5.74" class="seg" fill="#dd8452"/>
+<rect x="1143.74" y="170.74" width="96.95" height="14.88" class="seg" fill="#dd8452"/>
+<rect x="1264.93" y="167.63" width="96.95" height="17.81" class="seg" fill="#dd8452"/>
+<rect x="780.16" y="453.91" width="96.95" height="1.07" class="seg" fill="#c44e52"/>
+<rect x="901.35" y="275.74" width="96.95" height="0.99" class="seg" fill="#c44e52"/>
+<rect x="1022.54" y="179.17" width="96.95" height="2.41" class="seg" fill="#c44e52"/>
+<rect x="1143.74" y="163.4" width="96.95" height="7.34" class="seg" fill="#c44e52"/>
+<rect x="1264.93" y="144.83" width="96.95" height="22.8" class="seg" fill="#c44e52"/>
+<rect x="780.16" y="444.97" width="96.95" height="8.94" class="seg" fill="#8c8c8c"/>
+<rect x="901.35" y="263.33" width="96.95" height="12.4" class="seg" fill="#8c8c8c"/>
+<rect x="1022.54" y="168.19" width="96.95" height="10.98" class="seg" fill="#8c8c8c"/>
+<rect x="1143.74" y="154.25" width="96.95" height="9.15" class="seg" fill="#8c8c8c"/>
+<rect x="1264.93" y="137.81" width="96.95" height="7.02" class="seg" fill="#8c8c8c"/>
+<line x1="808.64" y1="449.18" x2="848.64" y2="449.18" class="marker sk" stroke-width="2.5"/>
+<line x1="929.83" y1="269.75" x2="969.83" y2="269.75" class="marker sk" stroke-width="2.5"/>
+<line x1="1051.02" y1="167.36" x2="1091.02" y2="167.36" class="marker sk" stroke-width="2.5"/>
+<line x1="1172.21" y1="154.07" x2="1212.21" y2="154.07" class="marker sk" stroke-width="2.5"/>
+<line x1="1293.4" y1="141.7" x2="1333.4" y2="141.7" class="marker sk" stroke-width="2.5"/>
+</g>
+<g class="panel">
+<line class="grid" x1="76.23" y1="912.4" x2="677" y2="912.4"/>
+<line class="axis" x1="72.23" y1="912.4" x2="76.23" y2="912.4"/>
+<text class="mut" x="69.23" y="916.25" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="76.23" y1="833.2" x2="677" y2="833.2"/>
+<line class="axis" x1="72.23" y1="833.2" x2="76.23" y2="833.2"/>
+<text class="mut" x="69.23" y="837.05" font-size="11" text-anchor="end">10</text>
+<line class="grid" x1="76.23" y1="754" x2="677" y2="754"/>
+<line class="axis" x1="72.23" y1="754" x2="76.23" y2="754"/>
+<text class="mut" x="69.23" y="757.85" font-size="11" text-anchor="end">20</text>
+<line class="grid" x1="76.23" y1="674.8" x2="677" y2="674.8"/>
+<line class="axis" x1="72.23" y1="674.8" x2="76.23" y2="674.8"/>
+<text class="mut" x="69.23" y="678.65" font-size="11" text-anchor="end">30</text>
+<line class="grid" x1="76.23" y1="595.6" x2="677" y2="595.6"/>
+<line class="axis" x1="72.23" y1="595.6" x2="76.23" y2="595.6"/>
+<text class="mut" x="69.23" y="599.45" font-size="11" text-anchor="end">40</text>
+<line class="axis" x1="113.78" y1="912.4" x2="113.78" y2="916.4"/>
+<text class="mut" x="116.78" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 116.78 926.4)">qkv sliding</text>
+<line class="axis" x1="188.87" y1="912.4" x2="188.87" y2="916.4"/>
+<text class="mut" x="191.87" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 191.87 926.4)">qkv global</text>
+<line class="axis" x1="263.97" y1="912.4" x2="263.97" y2="916.4"/>
+<text class="mut" x="266.97" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 266.97 926.4)">o sliding</text>
+<line class="axis" x1="339.07" y1="912.4" x2="339.07" y2="916.4"/>
+<text class="mut" x="342.07" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 342.07 926.4)">o global</text>
+<line class="axis" x1="414.16" y1="912.4" x2="414.16" y2="916.4"/>
+<text class="mut" x="417.16" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 417.16 926.4)">gate|up</text>
+<line class="axis" x1="489.26" y1="912.4" x2="489.26" y2="916.4"/>
+<text class="mut" x="492.26" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 492.26 926.4)">down</text>
+<line class="axis" x1="564.36" y1="912.4" x2="564.36" y2="916.4"/>
+<text class="mut" x="567.36" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 567.36 926.4)">ple_gate</text>
+<line class="axis" x1="639.45" y1="912.4" x2="639.45" y2="916.4"/>
+<text class="mut" x="642.45" y="926.4" font-size="11" text-anchor="end" transform="rotate(-30 642.45 926.4)">ple_out</text>
+<line class="axis" x1="76.23" y1="912.4" x2="677" y2="912.4"/>
+<line class="axis" x1="76.23" y1="595.6" x2="76.23" y2="912.4"/>
+<text class="mut" x="31.52" y="754" font-size="12" text-anchor="middle" transform="rotate(-90 31.52 754)">TFLOP/s</text>
+<text class="ink" x="76.23" y="547.26" font-size="13" font-weight="600">The forward&apos;s GEMM shapes at 8192 rows, a distinct weight per layer</text>
+<rect class="key" x="76.23" y="556.1" width="14" height="10" fill="#4c72b0"/>
+<text class="mut" x="96.23" y="565.1" font-size="11">exact f32 (what runs today)</text>
+<rect class="key" x="248.98" y="556.1" width="14" height="10" fill="#55a868"/>
+<text class="mut" x="268.98" y="565.1" font-size="11">bf16 operands, f32 accumulate (not in the forward)</text>
+<line class="key" stroke="#4c72b0" x1="536.35" y1="561.1" x2="550.35" y2="561.1" stroke-width="1.6" stroke-dasharray="4 3"/>
+<text class="mut" x="556.35" y="565.1" font-size="11">f32 4096^3 (measured)</text>
+<line class="key" stroke="#55a868" x1="76.23" y1="578.1" x2="90.23" y2="578.1" stroke-width="1.6" stroke-dasharray="4 3"/>
+<text class="mut" x="96.23" y="582.1" font-size="11">bf16 4096^3 (measured)</text>
+<rect x="83.74" y="863.11" width="30.04" height="49.29" class="bar" fill="#4c72b0"/>
+<rect x="113.78" y="698.82" width="30.04" height="213.58" class="bar" fill="#55a868"/>
+<rect x="158.83" y="864.04" width="30.04" height="48.36" class="bar" fill="#4c72b0"/>
+<rect x="188.87" y="690.89" width="30.04" height="221.51" class="bar" fill="#55a868"/>
+<rect x="233.93" y="861.11" width="30.04" height="51.29" class="bar" fill="#4c72b0"/>
+<rect x="263.97" y="691.06" width="30.04" height="221.34" class="bar" fill="#55a868"/>
+<rect x="309.03" y="859.31" width="30.04" height="53.09" class="bar" fill="#4c72b0"/>
+<rect x="339.07" y="702.83" width="30.04" height="209.57" class="bar" fill="#55a868"/>
+<rect x="384.12" y="861.89" width="30.04" height="50.51" class="bar" fill="#4c72b0"/>
+<rect x="414.16" y="695.79" width="30.04" height="216.61" class="bar" fill="#55a868"/>
+<rect x="459.22" y="858.22" width="30.04" height="54.18" class="bar" fill="#4c72b0"/>
+<rect x="489.26" y="695" width="30.04" height="217.39" class="bar" fill="#55a868"/>
+<rect x="534.32" y="865.98" width="30.04" height="46.42" class="bar" fill="#4c72b0"/>
+<rect x="564.36" y="699.11" width="30.04" height="213.29" class="bar" fill="#55a868"/>
+<rect x="609.41" y="865.8" width="30.04" height="46.6" class="bar" fill="#4c72b0"/>
+<rect x="639.45" y="698.26" width="30.04" height="214.14" class="bar" fill="#55a868"/>
+<line x1="76.23" y1="854.14" x2="677" y2="854.14" class="ref" stroke="#4c72b0" stroke-width="1" stroke-dasharray="5 4"/>
+<line x1="76.23" y1="673.8" x2="677" y2="673.8" class="ref" stroke="#55a868" stroke-width="1" stroke-dasharray="5 4"/>
+</g>
+<g class="panel">
+<line class="grid" x1="768.04" y1="924.6" x2="1374" y2="924.6"/>
+<line class="axis" x1="764.04" y1="924.6" x2="768.04" y2="924.6"/>
+<text class="mut" x="761.04" y="928.45" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="768.04" y1="833.85" x2="1374" y2="833.85"/>
+<line class="axis" x1="764.04" y1="833.85" x2="768.04" y2="833.85"/>
+<text class="mut" x="761.04" y="837.7" font-size="11" text-anchor="end">500</text>
+<line class="grid" x1="768.04" y1="743.1" x2="1374" y2="743.1"/>
+<line class="axis" x1="764.04" y1="743.1" x2="768.04" y2="743.1"/>
+<text class="mut" x="761.04" y="746.95" font-size="11" text-anchor="end">1000</text>
+<line class="grid" x1="768.04" y1="652.35" x2="1374" y2="652.35"/>
+<line class="axis" x1="764.04" y1="652.35" x2="768.04" y2="652.35"/>
+<text class="mut" x="761.04" y="656.2" font-size="11" text-anchor="end">1500</text>
+<line class="grid" x1="768.04" y1="561.6" x2="1374" y2="561.6"/>
+<line class="axis" x1="764.04" y1="561.6" x2="768.04" y2="561.6"/>
+<text class="mut" x="761.04" y="565.45" font-size="11" text-anchor="end">2000</text>
+<line class="axis" x1="828.64" y1="924.6" x2="828.64" y2="928.6"/>
+<text class="mut" x="828.64" y="941.4" font-size="11" text-anchor="middle"><tspan x="828.64" dy="0">2a7cb8b</tspan><tspan x="828.64" dy="13.2">set</tspan></text>
+<line class="axis" x1="949.83" y1="924.6" x2="949.83" y2="928.6"/>
+<text class="mut" x="949.83" y="941.4" font-size="11" text-anchor="middle"><tspan x="949.83" dy="0">HEAD</tspan><tspan x="949.83" dy="13.2">set</tspan></text>
+<line class="axis" x1="1071.02" y1="924.6" x2="1071.02" y2="928.6"/>
+<text class="mut" x="1071.02" y="941.4" font-size="11" text-anchor="middle"><tspan x="1071.02" dy="0">HEAD set,</tspan><tspan x="1071.02" dy="13.2">PLE run 16 MiB</tspan></text>
+<line class="axis" x1="1192.21" y1="924.6" x2="1192.21" y2="928.6"/>
+<text class="mut" x="1192.21" y="941.4" font-size="11" text-anchor="middle"><tspan x="1192.21" dy="0">HEAD,</tspan><tspan x="1192.21" dy="13.2">encode;encode</tspan></text>
+<line class="axis" x1="1313.4" y1="924.6" x2="1313.4" y2="928.6"/>
+<text class="mut" x="1313.4" y="941.4" font-size="11" text-anchor="middle"><tspan x="1313.4" dy="0">bench table</tspan><tspan x="1313.4" dy="13.2">(after 1x16, 64x32)</tspan></text>
+<line class="axis" x1="768.04" y1="924.6" x2="1374" y2="924.6"/>
+<line class="axis" x1="768.04" y1="561.6" x2="768.04" y2="924.6"/>
+<text class="mut" x="728.52" y="743.1" font-size="12" text-anchor="middle" transform="rotate(-90 728.52 743.1)">MiB above the loaded model, 8192 rows</text>
+<text class="ink" x="768.04" y="547.26" font-size="13" font-weight="600">Device memory: one activation set, and what the bench table measured</text>
+<rect x="780.16" y="820.02" width="96.95" height="104.58" class="bar" fill="#8c8c8c"/>
+<text class="ink" x="828.64" y="816.02" font-size="10.5" text-anchor="middle">576</text>
+<rect x="901.35" y="790.98" width="96.95" height="133.62" class="bar" fill="#4c72b0"/>
+<text class="ink" x="949.83" y="786.98" font-size="10.5" text-anchor="middle">736</text>
+<rect x="1022.54" y="834.52" width="96.95" height="90.08" class="bar" fill="#55a868"/>
+<text class="ink" x="1071.02" y="830.52" font-size="10.5" text-anchor="middle">496</text>
+<rect x="1143.74" y="657.36" width="96.95" height="267.24" class="bar" fill="#c44e52"/>
+<text class="ink" x="1192.21" y="653.36" font-size="10.5" text-anchor="middle">1472</text>
+<rect x="1264.93" y="624.69" width="96.95" height="299.91" class="bar" fill="#c44e52"/>
+<text class="ink" x="1313.4" y="620.69" font-size="10.5" text-anchor="middle">1652</text>
+</g>
+</svg>

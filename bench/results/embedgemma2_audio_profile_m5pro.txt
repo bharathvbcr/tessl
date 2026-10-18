@@ -14,7 +14,7 @@ three workloads. The two small clips were therefore 1.3-1.5x slowed by load in t
 taken inside one run) and the interleaved benchmark (embedgemma2_audio_speed_m5pro.txt), not the absolute
 milliseconds across the two runs. The stage ranking inside a run is what the profile is for.
 
-Grouped, from embedgemma2_audio_profile_plot.py (also drawn in embedgemma2_audio_profile_m5pro.png):
+Grouped, printed by `plot_results audio-profile` (also drawn in embedgemma2_audio_profile_m5pro.svg):
 workload      side         GEMMs (exact f32)             attention     subsampling convs            row passes   encode ms  other/GEMM
 clip_1.0s     before                   12.63                  0.49                  0.58                  2.46       12.51       0.279
 clip_1.0s     after                    19.18                  0.74                  1.06                  3.05       20.00       0.253

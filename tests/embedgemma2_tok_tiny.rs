@@ -194,6 +194,37 @@ fn a_prompt_is_text_in_front_of_the_text() {
     );
 }
 
+/// `default_prompt_name` is what `SentenceTransformer.encode` applies when it
+/// is given no name. The tokenizer reports it and refuses a file whose default
+/// is not one of its prompts, as the Python binding did before this moved here.
+#[test]
+fn the_default_prompt_name_is_read_and_must_name_a_prompt() {
+    let t = configured();
+    assert_eq!(t.default_prompt_name(), None);
+    let named = |default: &str| {
+        format!(r#"{{"prompts": {{"query": "hello ", "empty": ""}}, "default_prompt_name": {default}}}"#)
+    };
+    let t = load("tiny_gemma").with_prompts(&named("\"query\"")).unwrap();
+    assert_eq!(t.default_prompt_name(), Some("query"));
+    // The encode methods take the name they are given: the default is the caller's to apply.
+    assert_eq!(t.encode("world").unwrap(), t.encode_raw("world", true));
+    let t = load("tiny_gemma").with_prompts(&named("null")).unwrap();
+    assert_eq!(t.default_prompt_name(), None);
+    // Absent is none, and a later file replaces an earlier default.
+    let t = t.with_prompts(r#"{"prompts": {"q": "a "}}"#).unwrap();
+    assert_eq!(t.default_prompt_name(), None);
+    for (bad, pattern) in [
+        ("\"nope\"", "default_prompt_name \"nope\" is not one of its prompts"),
+        ("5", "default_prompt_name\" is not a string or null"),
+        ("[]", "default_prompt_name\" is not a string or null"),
+    ] {
+        let e = load("tiny_gemma")
+            .with_prompts(&named(bad))
+            .expect_err("a bad default_prompt_name was accepted");
+        assert!(e.contains(pattern), "{bad}: {e}");
+    }
+}
+
 #[test]
 fn the_placeholder_tokens_of_the_config_are_refused() {
     let t = configured();

@@ -637,6 +637,43 @@ fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
     }
 }
 
+/// The step bound counts what is held between waits, so it follows whether a
+/// dispatch now batches, not the `async_encode` flag alone: an open
+/// `async_scope` batches as the flag does, and serialized dispatch does not
+/// batch whatever the flag says.
+#[test]
+fn the_step_bound_follows_whether_dispatches_batch() {
+    // Batching changes the bound only past two adjacent layers: three linear
+    // layers before the attention layer's wait.
+    let mut cfg = tiny_config();
+    cfg.layers = vec![
+        LayerKind::LinearAttention,
+        LayerKind::LinearAttention,
+        LayerKind::LinearAttention,
+        LayerKind::FullAttention,
+    ];
+    let rt = GpuRuntime::new().unwrap();
+    let model = Qwen35Model::random_tower(&rt, cfg, Precision::Bf16, 7).unwrap();
+    let t = 512;
+    let waited = model.train_step_bytes(t, GemmOperands::Bf16);
+    rt.set_async_encode(true).unwrap();
+    let flagged = model.train_step_bytes(t, GemmOperands::Bf16);
+    rt.set_serialized_dispatch(true).unwrap();
+    let serialized = model.train_step_bytes(t, GemmOperands::Bf16);
+    rt.set_serialized_dispatch(false).unwrap();
+    rt.set_async_encode(false).unwrap();
+    let scoped = {
+        let _scope = rt.async_scope();
+        model.train_step_bytes(t, GemmOperands::Bf16)
+    };
+    assert!(
+        flagged > waited,
+        "a batched step holds more between waits: {flagged} vs {waited}"
+    );
+    assert_eq!(serialized, waited, "serialized dispatch does not batch");
+    assert_eq!(scoped, flagged, "an open async_scope batches as the flag does");
+}
+
 /// A bank embedding the cross-entropy cannot write in place takes the
 /// head's gradient a chunk at a time, the step's token rows held back in f32
 /// until the embedding gather has added to them, so each element is still

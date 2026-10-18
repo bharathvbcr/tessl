@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="950" height="707.8" viewBox="0 0 950 707.8" role="img">
+<title>EmbeddingGemma 2 audio tower, per-stage GPU time (Apple M5 Pro, shared GPU)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">EmbeddingGemma 2 audio tower, per-stage GPU time (Apple M5 Pro, shared GPU)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">The GEMM kernels did not change (q|k|v is one wider GEMM): read the other bars against the GEMM bar of the same row.</text>
+<rect class="key" x="14" y="54.3" width="14" height="10" fill="#2a78d6"/>
+<text class="mut" x="34" y="63.3" font-size="11">GEMMs (exact f32)</text>
+<rect class="key" x="146.6" y="54.3" width="14" height="10" fill="#eb6834"/>
+<text class="mut" x="166.6" y="63.3" font-size="11">attention</text>
+<rect class="key" x="227.06" y="54.3" width="14" height="10" fill="#1baf7a"/>
+<text class="mut" x="247.06" y="63.3" font-size="11">subsampling convs</text>
+<rect class="key" x="361.09" y="54.3" width="14" height="10" fill="#eda100"/>
+<text class="mut" x="381.09" y="63.3" font-size="11">row passes</text>
+<g class="panel">
+<line class="axis" x1="59.02" y1="139.52" x2="63.02" y2="139.52"/>
+<text class="mut" x="56.02" y="143.37" font-size="11" text-anchor="end">before</text>
+<line class="axis" x1="59.02" y1="193.75" x2="63.02" y2="193.75"/>
+<text class="mut" x="56.02" y="197.6" font-size="11" text-anchor="end">after</text>
+<line class="grid" x1="63.02" y1="112.4" x2="63.02" y2="220.87"/>
+<line class="axis" x1="63.02" y1="220.87" x2="63.02" y2="224.87"/>
+<text class="mut" x="63.02" y="237.67" font-size="11" text-anchor="middle">0</text>
+<line class="grid" x1="343.13" y1="112.4" x2="343.13" y2="220.87"/>
+<line class="axis" x1="343.13" y1="220.87" x2="343.13" y2="224.87"/>
+<text class="mut" x="343.13" y="237.67" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="623.24" y1="112.4" x2="623.24" y2="220.87"/>
+<line class="axis" x1="623.24" y1="220.87" x2="623.24" y2="224.87"/>
+<text class="mut" x="623.24" y="237.67" font-size="11" text-anchor="middle">20</text>
+<line class="grid" x1="903.36" y1="112.4" x2="903.36" y2="220.87"/>
+<line class="axis" x1="903.36" y1="220.87" x2="903.36" y2="224.87"/>
+<text class="mut" x="903.36" y="237.67" font-size="11" text-anchor="middle">30</text>
+<line class="axis" x1="63.02" y1="220.87" x2="924" y2="220.87"/>
+<line class="axis" x1="63.02" y1="112.4" x2="63.02" y2="220.87"/>
+<text class="mut" x="493.51" y="260.47" font-size="12" text-anchor="middle">stage time alone, ms (min over rounds, harness floor removed)</text>
+<text class="ink" x="63.02" y="98.06" font-size="13" font-weight="600">clip 1.0s</text>
+<rect x="63.02" y="122.7" width="353.82" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="416.84" y="122.7" width="13.81" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="430.65" y="122.7" width="16.2" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="446.86" y="122.7" width="68.87" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="523.73" y="143.19" font-size="10.5">16.2 ms (sum of stages)</text>
+<rect x="63.02" y="176.94" width="537.22" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="600.24" y="176.94" width="20.79" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="621.03" y="176.94" width="29.65" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="650.69" y="176.94" width="85.44" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="744.13" y="197.43" font-size="10.5">24.0 ms (sum of stages)</text>
+</g>
+<g class="panel">
+<line class="axis" x1="59.02" y1="353.18" x2="63.02" y2="353.18"/>
+<text class="mut" x="56.02" y="357.03" font-size="11" text-anchor="end">before</text>
+<line class="axis" x1="59.02" y1="407.42" x2="63.02" y2="407.42"/>
+<text class="mut" x="56.02" y="411.27" font-size="11" text-anchor="end">after</text>
+<line class="grid" x1="63.02" y1="326.07" x2="63.02" y2="434.53"/>
+<line class="axis" x1="63.02" y1="434.53" x2="63.02" y2="438.53"/>
+<text class="mut" x="63.02" y="451.33" font-size="11" text-anchor="middle">0</text>
+<line class="grid" x1="344.37" y1="326.07" x2="344.37" y2="434.53"/>
+<line class="axis" x1="344.37" y1="434.53" x2="344.37" y2="438.53"/>
+<text class="mut" x="344.37" y="451.33" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="625.73" y1="326.07" x2="625.73" y2="434.53"/>
+<line class="axis" x1="625.73" y1="434.53" x2="625.73" y2="438.53"/>
+<text class="mut" x="625.73" y="451.33" font-size="11" text-anchor="middle">20</text>
+<line class="grid" x1="907.08" y1="326.07" x2="907.08" y2="434.53"/>
+<line class="axis" x1="907.08" y1="434.53" x2="907.08" y2="438.53"/>
+<text class="mut" x="907.08" y="451.33" font-size="11" text-anchor="middle">30</text>
+<line class="axis" x1="63.02" y1="434.53" x2="924" y2="434.53"/>
+<line class="axis" x1="63.02" y1="326.07" x2="63.02" y2="434.53"/>
+<text class="mut" x="493.51" y="474.13" font-size="12" text-anchor="middle">stage time alone, ms (min over rounds, harness floor removed)</text>
+<text class="ink" x="63.02" y="311.73" font-size="13" font-weight="600">clip 3.3s</text>
+<rect x="63.02" y="336.37" width="412.15" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="475.17" y="336.37" width="16.91" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="492.09" y="336.37" width="40.13" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="532.21" y="336.37" width="116.37" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="656.58" y="356.86" font-size="10.5">20.8 ms (sum of stages)</text>
+<rect x="63.02" y="390.6" width="540.34" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="603.36" y="390.6" width="21.54" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="624.9" y="390.6" width="32.47" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="657.36" y="390.6" width="78.77" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="744.13" y="411.09" font-size="10.5">23.9 ms (sum of stages)</text>
+</g>
+<g class="panel">
+<line class="axis" x1="59.02" y1="566.85" x2="63.02" y2="566.85"/>
+<text class="mut" x="56.02" y="570.7" font-size="11" text-anchor="end">before</text>
+<line class="axis" x1="59.02" y1="621.08" x2="63.02" y2="621.08"/>
+<text class="mut" x="56.02" y="624.93" font-size="11" text-anchor="end">after</text>
+<line class="grid" x1="63.02" y1="539.73" x2="63.02" y2="648.2"/>
+<line class="axis" x1="63.02" y1="648.2" x2="63.02" y2="652.2"/>
+<text class="mut" x="63.02" y="665" font-size="11" text-anchor="middle">0</text>
+<line class="grid" x1="231.17" y1="539.73" x2="231.17" y2="648.2"/>
+<line class="axis" x1="231.17" y1="648.2" x2="231.17" y2="652.2"/>
+<text class="mut" x="231.17" y="665" font-size="11" text-anchor="middle">200</text>
+<line class="grid" x1="399.32" y1="539.73" x2="399.32" y2="648.2"/>
+<line class="axis" x1="399.32" y1="648.2" x2="399.32" y2="652.2"/>
+<text class="mut" x="399.32" y="665" font-size="11" text-anchor="middle">400</text>
+<line class="grid" x1="567.47" y1="539.73" x2="567.47" y2="648.2"/>
+<line class="axis" x1="567.47" y1="648.2" x2="567.47" y2="652.2"/>
+<text class="mut" x="567.47" y="665" font-size="11" text-anchor="middle">600</text>
+<line class="grid" x1="735.62" y1="539.73" x2="735.62" y2="648.2"/>
+<line class="axis" x1="735.62" y1="648.2" x2="735.62" y2="652.2"/>
+<text class="mut" x="735.62" y="665" font-size="11" text-anchor="middle">800</text>
+<line class="grid" x1="903.77" y1="539.73" x2="903.77" y2="648.2"/>
+<line class="axis" x1="903.77" y1="648.2" x2="903.77" y2="652.2"/>
+<text class="mut" x="903.77" y="665" font-size="11" text-anchor="middle">1000</text>
+<line class="axis" x1="63.02" y1="648.2" x2="924" y2="648.2"/>
+<line class="axis" x1="63.02" y1="539.73" x2="63.02" y2="648.2"/>
+<text class="mut" x="493.51" y="687.8" font-size="12" text-anchor="middle">stage time alone, ms (min over rounds, harness floor removed)</text>
+<text class="ink" x="63.02" y="525.39" font-size="13" font-weight="600">batch 8x30s</text>
+<rect x="63.02" y="550.04" width="478.05" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="541.07" y="550.04" width="18.03" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="559.11" y="550.04" width="68.16" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="627.27" y="550.04" width="108.86" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="744.13" y="570.52" font-size="10.5">800.6 ms (sum of stages)</text>
+<rect x="63.02" y="604.27" width="437.1" height="33.62" class="seg edge" fill="#2a78d6" stroke-width="2"/>
+<rect x="500.12" y="604.27" width="17.35" height="33.62" class="seg edge" fill="#eb6834" stroke-width="2"/>
+<rect x="517.47" y="604.27" width="22.03" height="33.62" class="seg edge" fill="#1baf7a" stroke-width="2"/>
+<rect x="539.5" y="604.27" width="51.23" height="33.62" class="seg edge" fill="#eda100" stroke-width="2"/>
+<text class="mut" x="598.73" y="624.76" font-size="10.5">627.7 ms (sum of stages)</text>
+</g>
+</svg>

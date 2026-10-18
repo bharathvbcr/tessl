@@ -15,9 +15,11 @@
 //! The directories are discovered, not listed: every directory under
 //! `tests/fixtures/` must carry `MANIFEST.json` in this format, or be named in
 //! [`OWN_RECORD`] (a directory whose generator predates this format and writes a
-//! record of its own, which must exist and parse), or in [`EXEMPT`] (not
-//! generator-backed, with the reason). A new directory with none of the three
-//! fails, so a fixture cannot arrive without its provenance.
+//! record of its own, which must exist and parse), in [`SPLIT_RECORDS`] (several
+//! generators, each with its own record and its own file-name prefix, every file
+//! owned by exactly one), or in [`EXEMPT`] (not generator-backed, with the
+//! reason). A new directory with none of the four fails, so a fixture cannot
+//! arrive without its provenance.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -30,13 +32,68 @@ use json::{Json, Syntax};
 
 /// Directories whose generator writes its own record, in its own format. Each file
 /// must exist and parse; moving them onto `MANIFEST.json` is a change to their
-/// generators (`scripts/gen_bert_fixtures.py`, `scripts/gen_embedgemma2_fixtures.py`)
-/// and to the nanolab corpus manifest, not to this test.
-const OWN_RECORD: [(&str, &str); 3] = [
-    ("bert_tiny", "manifest.json"),
-    ("embedgemma2", "provenance.json"),
-    ("gdn", "gdn_published_MANIFEST.json"),
-];
+/// generator (`scripts/gen_bert_fixtures.py`) and to the nanolab corpus manifest,
+/// not to this test.
+const OWN_RECORD: [(&str, &str); 2] = [("bert_tiny", "manifest.json"), ("gdn", "gdn_published_MANIFEST.json")];
+
+/// Directories that several generators write into, each its own family of files
+/// (`(record, file-name prefix, generator)`) with a record of its own. Every record
+/// must exist, parse and name its generator, which must exist in the repo, and
+/// every other file must start with exactly one family's prefix, so a file no
+/// generator accounts for cannot arrive unnoticed.
+type Family = (&'static str, &'static str, &'static str);
+const SPLIT_RECORDS: [(&str, &[Family]); 1] = [(
+    "embedgemma2",
+    &[
+        ("provenance.json", "eg2_", "scripts/gen_embedgemma2_fixtures.py"),
+        (
+            "eg2a_audio_provenance.json",
+            "eg2a_",
+            "scripts/gen_embedgemma2_audio_fixtures.py",
+        ),
+        (
+            "eg2p_provenance.json",
+            "eg2p_",
+            "scripts/gen_embedgemma2_pre_fixtures.py",
+        ),
+    ],
+)];
+
+/// [`SPLIT_RECORDS`]' rule for one directory: `files` is every file in it and
+/// `read` returns a record's text.
+fn check_split(
+    files: &BTreeSet<String>,
+    families: &[Family],
+    read: impl Fn(&str) -> Result<String, String>,
+    repo: &Path,
+) -> Result<(), String> {
+    for (record, _, generator) in families {
+        if !files.contains(*record) {
+            return Err(format!("its record {record} is missing"));
+        }
+        let doc = parse(&read(record)?).map_err(|e| format!("{record} does not parse: {e}"))?;
+        match doc.get("generator") {
+            Some(Json::Str(g)) if g == generator => {}
+            other => return Err(format!("{record} must name generator {generator:?}, found {other:?}")),
+        }
+        if !repo.join(generator).is_file() {
+            return Err(format!("{record} names {generator}, which is not in the repo"));
+        }
+    }
+    for f in files {
+        if families.iter().any(|(record, _, _)| record == f) {
+            continue;
+        }
+        let owners = families.iter().filter(|(_, prefix, _)| f.starts_with(prefix)).count();
+        if owners != 1 {
+            return Err(format!(
+                "{f} belongs to {owners} generator families (prefixes {:?}); it needs exactly one",
+                families.iter().map(|(_, p, _)| *p).collect::<Vec<_>>()
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Directories with no generator to record. Nothing that has a generator belongs
 /// here; each entry says why it is not generator-backed.
@@ -175,6 +232,11 @@ fn every_fixture_directory_has_a_manifest_that_lists_every_file() {
             if let Err(e) = check_manifest(&text, &files_in(&dir), repo) {
                 panic!("tests/fixtures/{d}/MANIFEST.json: {e}");
             }
+        } else if let Some((_, families)) = SPLIT_RECORDS.iter().find(|(n, _)| n == d) {
+            let read = |r: &str| std::fs::read_to_string(dir.join(r)).map_err(|e| format!("{r}: {e}"));
+            if let Err(e) = check_split(&files_in(&dir), families, read, repo) {
+                panic!("tests/fixtures/{d}: {e}");
+            }
         } else if let Some((_, record)) = OWN_RECORD.iter().find(|(n, _)| n == d) {
             let text = std::fs::read_to_string(dir.join(record))
                 .unwrap_or_else(|e| panic!("tests/fixtures/{d} names {record} as its record: {e}"));
@@ -187,12 +249,73 @@ fn every_fixture_directory_has_a_manifest_that_lists_every_file() {
         }
     }
     // A stale table entry would hide a removed or renamed directory.
-    for (n, _) in OWN_RECORD.iter().chain(EXEMPT.iter()) {
+    for n in OWN_RECORD
+        .iter()
+        .chain(EXEMPT.iter())
+        .map(|(n, _)| *n)
+        .chain(SPLIT_RECORDS.iter().map(|(n, _)| *n))
+    {
         assert!(
             dirs.iter().any(|d| d == n),
             "the table names tests/fixtures/{n}, which does not exist"
         );
     }
+}
+
+/// The split-record rule refuses a missing record, a record naming another or no
+/// generator, a generator not in the repo, and a file that no family (or two)
+/// owns, so the green run above is not vacuous.
+#[test]
+fn the_split_record_check_refuses_an_unrecorded_file_or_a_bad_record() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fams: &[Family] = &[
+        ("provenance.json", "eg2_", "scripts/gen_embedgemma2_fixtures.py"),
+        ("eg2a_rec.json", "eg2a_", "scripts/gen_embedgemma2_audio_fixtures.py"),
+    ];
+    let files = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+    let ok = |r: &str| {
+        Ok(match r {
+            "provenance.json" => r#"{"generator":"scripts/gen_embedgemma2_fixtures.py"}"#,
+            _ => r#"{"generator":"scripts/gen_embedgemma2_audio_fixtures.py"}"#,
+        }
+        .to_string())
+    };
+    let all = files(&["provenance.json", "eg2a_rec.json", "eg2_x.npy", "eg2a_y.npy"]);
+    check_split(&all, fams, ok, repo).unwrap();
+
+    let e = check_split(&files(&["provenance.json", "eg2_x.npy"]), fams, ok, repo).unwrap_err();
+    assert!(e.contains("eg2a_rec.json is missing"), "{e}");
+
+    let mut stray = all.clone();
+    stray.insert("other.npy".into());
+    let e = check_split(&stray, fams, ok, repo).unwrap_err();
+    assert!(e.contains("other.npy belongs to 0"), "{e}");
+
+    let overlap: &[Family] = &[
+        ("provenance.json", "eg2", "scripts/gen_embedgemma2_fixtures.py"),
+        ("eg2a_rec.json", "eg2a_", "scripts/gen_embedgemma2_audio_fixtures.py"),
+    ];
+    let e = check_split(&all, overlap, ok, repo).unwrap_err();
+    assert!(e.contains("eg2a_y.npy belongs to 2"), "{e}");
+
+    let wrong = |r: &str| {
+        Ok(if r == "provenance.json" {
+            r#"{"generator":"scripts/elsewhere.py"}"#.to_string()
+        } else {
+            ok(r)?
+        })
+    };
+    let e = check_split(&all, fams, wrong, repo).unwrap_err();
+    assert!(e.contains("must name generator"), "{e}");
+
+    let unnamed = |r: &str| Ok(if r == "eg2a_rec.json" { "{}".to_string() } else { ok(r)? });
+    let e = check_split(&all, fams, unnamed, repo).unwrap_err();
+    assert!(e.contains("found None"), "{e}");
+
+    let gone: &[Family] = &[("provenance.json", "eg2_", "scripts/no_such_generator.py")];
+    let gone_read = |_: &str| Ok(r#"{"generator":"scripts/no_such_generator.py"}"#.to_string());
+    let e = check_split(&files(&["provenance.json", "eg2_x.npy"]), gone, gone_read, repo).unwrap_err();
+    assert!(e.contains("not in the repo"), "{e}");
 }
 
 /// The checker refuses what it exists to catch, so a green run above is not vacuous.

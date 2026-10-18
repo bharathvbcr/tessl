@@ -9,7 +9,6 @@ The built library and the real checkpoint are ``test_embedgemma2.py``.
 """
 
 import ctypes
-import json
 import sys
 import tempfile
 import threading
@@ -42,6 +41,99 @@ class FakeEg2Lib(FakeLib):
         self.max_tokens = 8192
         self.encoded = []
         self.loaded = []
+        # The snapshot's prompts, in file order, and the index of the default one (-1: none).
+        self.prompts = {}
+        self.default_prompt = -1
+        self.front_status = 0
+        self.embedded_texts = []
+        self.tokenized = []
+        self.decoded = []
+
+    @staticmethod
+    def _give(data, buf, buf_len, needed, err):
+        """The size-first protocol of the string entries: the length is always
+        written, the bytes only to a buffer that holds them."""
+        needed._obj.value = len(data)
+        if buf is None:
+            return 0
+        if buf_len < len(data):
+            err.value = b"buffer too short"
+            return 1
+        for i, b in enumerate(data):
+            buf[i] = b
+        return 0
+
+    @staticmethod
+    def _split(flat, offsets, n):
+        """The texts of the CSR pair, decoded."""
+        raw = bytes(flat[i] for i in range(offsets[n]))
+        return [raw[offsets[i] : offsets[i + 1]].decode("utf-8") for i in range(n)]
+
+    def tessl_embedgemma2_prompt_count(self, h, out, err, n):
+        if self.front_status:
+            err.value = b"front end failed"
+            return self.front_status
+        out._obj.value = len(self.prompts)
+        return 0
+
+    def tessl_embedgemma2_prompt_name(self, h, index, buf, buf_len, needed, err, n):
+        names = list(self.prompts)
+        if index >= len(names):
+            err.value = b"index past the prompts"
+            return 1
+        return self._give(names[index].encode(), buf, buf_len, needed, err)
+
+    def tessl_embedgemma2_prompt_get(self, h, name, name_len, buf, buf_len, needed, err, n):
+        key = name[:name_len].decode()
+        if key not in self.prompts:
+            err.value = f"no prompt named {key!r} (the snapshot has {list(self.prompts)})".encode()
+            return 1
+        return self._give(self.prompts[key].encode(), buf, buf_len, needed, err)
+
+    def tessl_embedgemma2_default_prompt(self, h, out, err, n):
+        out._obj.value = self.default_prompt
+        return 0
+
+    def tessl_embedgemma2_tokenize(self, h, flat, flat_len, offs, n, name, name_len, ids, cap, cuts, total, err, nn):
+        texts = self._split(flat, offs, n)
+        self.tokenized.append({"texts": texts, "prompt": None if name is None else name[:name_len].decode()})
+        if self.front_status:
+            err.value = b"tokenize failed"
+            return self.front_status
+        rows = [[2, *[ord(c) % 50 for c in t], 1] for t in texts]
+        total._obj.value = sum(len(r) for r in rows)
+        if ids is None:
+            return 0
+        at = 0
+        for i, row in enumerate(rows):
+            cuts[i] = at
+            for v in row:
+                ids[at] = v
+                at += 1
+        cuts[n] = at
+        return 0
+
+    def tessl_embedgemma2_decode(self, h, ids, n_ids, skip, buf, buf_len, needed, err, n):
+        self.decoded.append({"ids": [ids[i] for i in range(n_ids)], "skip": skip})
+        return self._give("".join(chr(97 + ids[i] % 26) for i in range(n_ids)).encode(), buf, buf_len, needed, err)
+
+    def tessl_embedgemma2_embed_texts(self, h, flat, flat_len, offs, n, name, name_len, trunc, out, out_len, err, nn):
+        self.embedded_texts.append(
+            {
+                "texts": self._split(flat, offs, n),
+                "offsets": [offs[i] for i in range(n + 1)],
+                "prompt": None if name is None else name[:name_len].decode(),
+                "prompt_len": name_len,
+                "truncate_dim": trunc,
+                "out_len": out_len,
+            }
+        )
+        if self.encode_status:
+            err.value = b"embed_texts failed"
+            return self.encode_status
+        for i in range(out_len):
+            out[i] = float(i)
+        return 0
 
     def tessl_embedgemma2_load(self, rt, path, n, out, err, nn):
         self.loaded.append((path, n))
@@ -107,10 +199,6 @@ class HostCase(unittest.TestCase):
 
     def calls(self, name):
         return [c for c in self.lib.calls if c[0] == name]
-
-    def write_prompts(self, prompts, default=None, raw=None):
-        text = raw if raw is not None else json.dumps({"default_prompt_name": default, "prompts": prompts})
-        (self.snapshot / "config_sentence_transformers.json").write_text(text)
 
 
 class Loading(HostCase):
@@ -294,26 +382,55 @@ class FakeTransformersTokenizer:
 
 
 class Texts(HostCase):
+    """``encode_texts`` marshals UTF-8 and a prompt name into the library, which
+    owns the tokenizer, the prompts and the snapshot's files: the stand-in
+    library is the only thing these tests give a prompt, and the snapshot
+    directory they load is empty."""
+
     PROMPTS = {"query": "task: search result | query: ", "document": "title: none | text: "}
 
-    def test_both_tokenizer_kinds_are_asked_for_special_tokens_and_agree(self):
-        self.write_prompts(self.PROMPTS)
+    def setUp(self):
+        super().setUp()
+        self.lib.prompts = dict(self.PROMPTS)
+
+    def test_texts_reach_the_library_as_utf8_with_offsets_and_need_no_tokenizer_or_file(self):
+        with self.model() as model:
+            out = model.encode_texts(["hi", "", "héllo 中文 \U0001f389", "yo!"])
+        self.assertEqual((out.shape, out.dtype), ((4, FakeEg2Lib.dim), np.float32))
+        self.assertEqual(out.ravel().tolist(), [float(i) for i in range(4 * FakeEg2Lib.dim)])
+        (call,) = self.lib.embedded_texts
+        self.assertEqual(call["texts"], ["hi", "", "héllo 中文 \U0001f389", "yo!"])
+        self.assertEqual(call["offsets"], [0, 2, 2, 2 + len("héllo 中文 \U0001f389".encode()), call["offsets"][-1]])
+        self.assertEqual((call["prompt"], call["prompt_len"], call["truncate_dim"]), (None, 0, 0))
+        self.assertEqual(self.lib.encoded, [], "the ids path was not used")
+        self.assertEqual(list(self.snapshot.iterdir()), [], "nothing was read from or written to the snapshot")
+
+    def test_the_prompt_name_and_truncate_dim_reach_the_library(self):
+        with self.model() as model:
+            out = model.encode_texts(["a"], prompt_name="query", truncate_dim=3)
+            model.encode_texts(["a"], prompt_name="déjà")
+        self.assertEqual(out.shape, (1, 3))
+        a, b = self.lib.embedded_texts
+        self.assertEqual((a["prompt"], a["prompt_len"], a["truncate_dim"], a["out_len"]), ("query", 5, 3, 3))
+        self.assertEqual((b["prompt"], b["prompt_len"]), ("déjà", len("déjà".encode())))
+
+    def test_both_caller_tokenizer_kinds_are_asked_for_special_tokens_and_agree(self):
         with self.model() as model:
             hf, tr = FakeTokenizersTokenizer(), FakeTransformersTokenizer()
-            a = model.encode_texts(["hi", "yo!"], hf)
-            b = model.encode_texts(["hi", "yo!"], tr)
+            a = model.encode_texts(["hi", "yo!"], tokenizer=hf)
+            b = model.encode_texts(["hi", "yo!"], tokenizer=tr)
         np.testing.assert_array_equal(a, b)
         self.assertEqual(hf.seen, [["hi", "yo!"]])
         self.assertEqual(self.lib.encoded[0]["ids"], self.lib.encoded[1]["ids"])
         self.assertEqual(self.lib.encoded[0]["offsets"], [0, 4, 9])
+        self.assertEqual(self.lib.embedded_texts, [], "a caller's tokenizer means the id entry")
 
-    def test_the_named_prompt_is_prepended_as_text_before_tokenizing(self):
-        self.write_prompts(self.PROMPTS)
+    def test_a_caller_tokenizer_gets_the_snapshots_prompt_text_from_the_library(self):
         with self.model() as model:
             tok = FakeTokenizersTokenizer()
-            model.encode_texts(["a", "b"], tok, prompt_name="query")
-            model.encode_texts(["a"], tok, prompt_name="document")
-            model.encode_texts(["a"], tok)
+            model.encode_texts(["a", "b"], tokenizer=tok, prompt_name="query")
+            model.encode_texts(["a"], tokenizer=tok, prompt_name="document")
+            model.encode_texts(["a"], tokenizer=tok)
             self.assertEqual(model.prompts(), self.PROMPTS)
         self.assertEqual(
             tok.seen,
@@ -323,52 +440,106 @@ class Texts(HostCase):
                 ["a"],
             ],
         )
-
-    def test_the_snapshots_default_prompt_applies_when_none_is_named(self):
-        self.write_prompts(self.PROMPTS, default="document")
+        self.lib.default_prompt = 1
         with self.model() as model:
             tok = FakeTokenizersTokenizer()
-            model.encode_texts(["a"], tok)
-        self.assertEqual(tok.seen, [[self.PROMPTS["document"] + "a"]])
+            model.encode_texts(["a"], tokenizer=tok)
+        self.assertEqual(tok.seen, [[self.PROMPTS["document"] + "a"]], "the snapshot's default prompt applies")
 
-    def test_prompt_problems_are_named_and_nothing_is_embedded(self):
-        tok = FakeTokenizersTokenizer()
+    def test_an_unknown_prompt_is_the_librarys_refusal_and_nothing_is_embedded(self):
         with self.model() as model:
-            # No prompts file: texts embed unprompted, a prompt name is an error.
-            model.encode_texts(["a"], tok)
-            with self.assertRaisesRegex(TesslError, "no config_sentence_transformers.json"):
-                model.encode_texts(["a"], tok, prompt_name="query")
-            with self.assertRaisesRegex(TesslError, "no config_sentence_transformers.json"):
-                model.prompts()
-        self.assertEqual(len(self.lib.encoded), 1)
-        for raw, pattern in (
-            ("{not json", "not JSON"),
-            ("[]", 'no "prompts"'),
-            ('{"prompts": {"q": 5}}', 'no "prompts"'),
-            ('{"prompts": {"q": "x"}, "default_prompt_name": "zzz"}', "default_prompt_name"),
-        ):
-            with self.subTest(raw):
-                self.write_prompts(None, raw=raw)
-                with self.model() as model, self.assertRaisesRegex(TesslError, pattern):
-                    model.encode_texts(["a"], tok)
-        self.write_prompts(self.PROMPTS)
-        with self.model() as model, self.assertRaisesRegex(TesslError, r"unknown prompt_name 'nope'.*document.*query"):
-            model.encode_texts(["a"], tok, prompt_name="nope")
-        self.assertEqual(len(self.lib.encoded), 1)
+            with self.assertRaisesRegex(TesslError, "no prompt named 'nope'"):
+                model.encode_texts(["a"], tokenizer=FakeTokenizersTokenizer(), prompt_name="nope")
+        self.assertEqual((self.lib.encoded, self.lib.embedded_texts), ([], []))
 
-    def test_bad_texts_and_tokenizers_are_refused(self):
-        class Padded(FakeTokenizersTokenizer):
-            padding = {"direction": "right"}
-
+    def test_prompts_lists_the_librarys_and_none_is_an_empty_dict(self):
         with self.model() as model:
-            for name, texts in {"a bare string": "abc", "bytes": b"abc", "an empty list": [], "a non-str": ["a", 5]}.items():
+            self.assertEqual(model.prompts(), self.PROMPTS)
+            self.assertIsNone(model.default_prompt_name)
+            self.lib.default_prompt = 1
+            self.assertEqual(model.default_prompt_name, "document")
+            self.lib.prompts = {}
+            self.lib.default_prompt = -1
+            self.assertEqual(model.prompts(), {})
+        self.lib.front_status = 1
+        with self.model() as model, self.assertRaisesRegex(TesslError, "front end failed"):
+            model.prompts()
+
+    def test_tokenize_asks_for_the_size_then_the_ids_and_splits_them_per_text(self):
+        with self.model() as model:
+            ids = model.tokenize(["ab", "", "c"], prompt_name="query")
+        self.assertEqual(ids, [[2, 97 % 50, 98 % 50, 1], [2, 1], [2, 99 % 50, 1]])
+        self.assertTrue(all(isinstance(i, int) for row in ids for i in row))
+        self.assertEqual(len(self.lib.tokenized), 2, "a size query, then the ids")
+        self.assertEqual(self.lib.tokenized[0]["texts"], ["ab", "", "c"])
+        self.assertEqual(self.lib.tokenized[1]["prompt"], "query")
+
+    def test_decode_asks_for_the_size_then_the_text(self):
+        with self.model() as model:
+            self.assertEqual(model.decode([0, 1, 2]), "abc")
+            self.assertEqual(model.decode(np.array([3, 4], dtype=np.int64), skip_special_tokens=False), "de")
+            self.assertEqual(model.decode([]), "")
+        self.assertEqual(
+            [(d["ids"], d["skip"]) for d in self.lib.decoded],
+            [([0, 1, 2], 1)] * 2 + [([3, 4], 0)] * 2 + [([], 1)] * 2,
+        )
+
+    def test_bad_decode_arguments_are_refused_before_the_library_is_called(self):
+        big = 1 << 32
+        with self.model() as model:
+            for name, ids in {
+                "nested": [[1, 2]],
+                "a float": [1.5],
+                "negative": [-1],
+                "past u32": [big],
+                "a string": "abc",
+                "a bool": [True],
+            }.items():
                 with self.subTest(name), self.assertRaises(TesslError):
-                    model.encode_texts(texts, FakeTokenizersTokenizer())
+                    model.decode(ids)
+            with self.assertRaises(TesslError):
+                model.decode([1], skip_special_tokens=2)
+        self.assertEqual(self.lib.decoded, [])
+
+    def test_bad_texts_are_refused_before_the_library_is_called(self):
+        with self.model() as model:
+            for name, texts in {
+                "a bare string": "abc",
+                "bytes": b"abc",
+                "an empty list": [],
+                "a non-str": ["a", 5],
+                "a lone surrogate": ["a\ud800"],
+            }.items():
+                with self.subTest(name):
+                    for call in (model.encode_texts, model.tokenize):
+                        with self.assertRaises(TesslError):
+                            call(texts)
+            for bad in (5, b"query", ["query"]):
+                with self.subTest(f"prompt_name {bad!r}"), self.assertRaises(TesslError):
+                    model.encode_texts(["a"], prompt_name=bad)
+            with self.assertRaisesRegex(TesslError, "optional tokenizer"):
+                model.encode_texts(["a"], "query")
             with self.assertRaisesRegex(TesslError, "pads"):
-                model.encode_texts(["a"], Padded())
+                model.encode_texts(["a"], tokenizer=type("P", (FakeTokenizersTokenizer,), {"padding": {"d": 1}})())
             with self.assertRaisesRegex(TesslError, "tokenizer must be"):
-                model.encode_texts(["a"], object())
-        self.assertEqual(self.lib.encoded, [])
+                model.encode_texts(["a"], tokenizer=object())
+            for dim in (0, -1, True, 1 << 32, "8"):
+                with self.subTest(f"truncate_dim {dim!r}"), self.assertRaises(TesslError):
+                    model.encode_texts(["a"], truncate_dim=dim)
+        self.assertEqual((self.lib.encoded, self.lib.embedded_texts, self.lib.tokenized), ([], [], []))
+
+    def test_a_refusal_raises_and_leaves_the_model_open_a_panic_closes_it(self):
+        model = self.model()
+        self.lib.encode_status = 1
+        with self.assertRaisesRegex(TesslError, "embed_texts failed") as caught:
+            model.encode_texts(["a"])
+        self.assertNotIsInstance(caught.exception, TesslPanic)
+        self.assertFalse(model.closed)
+        self.lib.encode_status = 2
+        with self.assertRaises(TesslPanic):
+            model.encode_texts(["a"])
+        self.assertTrue(model.closed)
+        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
 
     def test_importing_the_module_imports_neither_tokenizers_nor_transformers(self):
         # Checked in a fresh interpreter: this process may have imported them already.
@@ -382,4 +553,7 @@ class Texts(HostCase):
         done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
 
-
+    def test_the_front_end_declarations_skip_a_stand_in_and_name_a_library_without_the_entries(self):
+        eg2._declare_front_ends(self.lib)
+        with self.assertRaisesRegex(TesslError, "tessl_embedgemma2_embed_texts.*cargo build"):
+            eg2._declare_front_ends(ctypes.CDLL(None))

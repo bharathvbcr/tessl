@@ -27,6 +27,9 @@ exclude = [
     "assets/build_logo.py",
     "assets/png/*@2048.png",
     "tasks/**",
+    # The Go binding (go/) is its own module and its own Rust crate (go/engine); a
+    # consumer of this crate gets neither from crates.io.
+    "go/**",
 ]
 
 # tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and
@@ -149,6 +152,18 @@ path = "src/bin/bench_embedgemma2.rs"
 [[bin]]
 name = "bench_embedgemma2_tok"
 path = "src/bin/bench_embedgemma2_tok.rs"
+
+[[bin]]
+name = "bench_media_decode"
+path = "src/bin/bench_media_decode.rs"
+
+[[bin]]
+name = "bench_media_resample"
+path = "src/bin/bench_media_resample.rs"
+
+[[bin]]
+name = "bench_jpeg_decode"
+path = "src/bin/bench_jpeg_decode.rs"
 
 [[bin]]
 name = "bench_encoder_attn"

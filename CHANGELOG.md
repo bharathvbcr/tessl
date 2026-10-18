@@ -87,6 +87,301 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **JPEG: block smoothing and lossless JPEG, byte for byte** (`tessl::media::jpeg`).
+  The decoder no longer refuses a progressive stream that libjpeg-turbo 3.1.3
+  smooths (scans cut short, or a scan that runs out of data): the 5x5 estimator,
+  the previous-scan record, `last_good_iMCU_row` and the block rows read at the
+  picture and iMCU-row edges were measured with the oracle
+  (`torchvision.io.decode_image`, mode RGB) and are held by 572 smoothing fixtures.
+  Lossless JPEG (SOF3: predictors 1-7, point transform, restart rows, precisions
+  2-8, RGB and CMYK) decodes to the reference's bytes (146 fixtures); what the
+  reference refuses (gray, YCbCr and YCCK lossless, precisions above 8, a stream
+  with no DHT, a component in no scan, bad parameters) is a named error here too,
+  and one shape it decodes (several scans, a restart interval, components of
+  different sizes) stays a named `Unsupported`. 998 fixtures agree with the
+  oracle (874 byte-equal, 123 refused by both, 1 named refusal); 10000 live-fuzz
+  mutants, 0 disagreements.
+- **JPEG: a pure-Rust decoder, byte for byte libjpeg-turbo's**
+  (`tessl::media::jpeg`, `src/media/jpeg/`: no dependency, no `unsafe`).
+  `decode_image` hands data that starts `FF D8 FF` to it (with the default
+  `ColorHandling::Native`), so a JPEG embeds as sentence-transformers embeds
+  the same file: the pixels are those of `torchvision.io.decode_image(path,
+  mode=RGB)`, which is libjpeg-turbo 3.1.3 (`JDCT_ISLOW`, fancy upsampling,
+  8-bit samples). ImageIO's JPEG decoder is not that library (a 4:2:0 file:
+  max 43, 3083 of 9216 bytes differ) and cost a JPEG embedding cosine
+  0.998566; `photo.jpg` through the towers is now 2.09e-7 max abs, cosine
+  1.000000000 against sentence-transformers (was 7.25e-3). ImageIO's decoder
+  stays reachable as `decode_image_imageio`. It decodes baseline and extended
+  sequential (SOF0, SOF1), progressive (SOF2) and arithmetic-coded (SOF9,
+  SOF10) streams, restart intervals, any sampling factors libjpeg takes, 1, 3
+  and 4 components with JFIF and Adobe APP14 (CMYK and YCCK too), the accurate
+  integer IDCT as libjpeg-turbo's NEON code computes it, and fancy h2v1 and
+  h2v2 upsampling. The structure follows libjpeg's control flow because
+  equality has to hold on damaged files: what libjpeg warns about decodes to
+  the same pixels, and what it refuses is a named error here (12-bit, a stream
+  with no EOI). Own bounds, each checked before anything is allocated: the
+  caller's `max_pixels`, a 6 GiB working-memory ceiling, 65500 pixels a side
+  and 256 scans; hostile input is a named `JpegError`, never a panic
+  (`mutated_inputs_never_panic`, in the release and the debug profile). The
+  reference bytes are in `tests/fixtures/jpeg/` (`scripts/gen_jpeg_fixtures.py`
+  runs torchvision), held by `tests/media_jpeg.rs`, which is hosted: the
+  decoder needs no framework. It costs 4 to 41 % more wall time than ImageIO on
+  one thread (1080p 4:2:0 baseline 11.6 against 10.4 ms; a shared machine, so
+  indicative: `bench_jpeg_decode`, `bench/results/jpeg_decode_m5pro.*`).
+  `THIRD_PARTY_NOTICES.md` carries the Independent JPEG Group License, from
+  libjpeg-turbo's `README.ijg`, unaltered: the decoder holds no libjpeg source
+  but is based in part on the IJG's work.
+- **Video frames through VideoToolbox, converted to RGB as libswscale does,
+  byte for byte** (`src/media/vt.rs`, `yuv.rs`, `codec_config.rs`;
+  `tessl::media::video`). AVFoundation's own conversion cannot match the
+  reference: `AVAssetReader` returns the decoder's luma but different chroma
+  (52 to 86 percent of the Cb and Cr samples in the clips measured), and asked
+  for BGRA it differs from the `ffmpeg` binary in 39941 of 55296 bytes. So
+  `VideoSource::open` reads the compressed samples and a
+  `VTDecompressionSession` decodes them into the decoder's own planes, which
+  are byte-equal to FFmpeg's on every fixture
+  (`the_decoders_planes_are_the_planes_ffmpeg_decodes`), and `yuv::to_rgb24`
+  converts them. Every layout is exact: 8- and 10-bit
+  4:2:0, 4:2:2 and 4:4:4 (the stream's own `avcC` / `hvcC` says which), limited
+  and full range, five matrices (BT.601, BT.709, BT.2020 non-constant, FCC,
+  SMPTE 240M). Each conversion (a table converter or NEON for 8-bit 4:2:0 and
+  4:2:2, 32-bit sums that wrap for 4:4:4, a chroma resampling for 10-bit
+  4:2:0) was found by black-box comparison with the `ffmpeg` binary (9.0.2,
+  aarch64), and is held with 0 differing bytes against it: all 2^24 8-bit
+  `(Y, Cb, Cr)` triples on both converters, every one of the 2^30 ten-bit
+  4:4:4 triples (12 matrix and range combinations), 10-bit 4:2:0 under both
+  chroma filters at every even height from 8 or 14 to 120 and at six picture
+  sizes up to 3840x2160 (the `--ignored` tests that run `ffmpeg`, passed on
+  2026-10-17). **torchcodec's arrangement**, read from its source (v0.17.0;
+  torchcodec itself was never run): its scaler flags are unset, which is
+  bicubic for the one class that depends on them (`VideoOptions::chroma_filter`
+  defaults to `Bicubic`, `Bilinear` stays selectable), and it converts the
+  stored picture, then turns the RGB (`Rotation::Apply`), for every layout.
+  The `ffmpeg` CLI's autorotate turns the 4:2:0 planes first and differs on
+  the rotated fixture in 11185 of 11520 bytes; the filter graph torchcodec
+  builds, `sws_scale` with flags 0 and the CLI's `-pix_fmt rgb24` agree in all
+  34 random-plane classes and a rotated graph equals convert-then-turn in 102
+  checks (`scripts/ffmpeg_graph_probe.py`). **There is no silent fallback:** a
+  stream that cannot be converted exactly is a `MediaError::Unsupported`
+  naming why and pointing to `ColorPath::AvFoundation`, the only way to
+  AVFoundation's conversion (`Conversion::AvFoundation` in the result says it
+  ran). Refused: codecs other than H.264 and HEVC, 12-bit and monochrome
+  video, other matrices, and shapes libswscale leaves undefined (an odd width
+  in 4:2:0 and 4:2:2, an odd height in 4:2:0, a 10-bit 4:2:0 picture too short
+  for the scaler's filter: `YuvError::Size`, `TooShort`). VideoToolbox on the
+  M5 Pro does not decode H.264 High 10, 4:2:2 or 4:4:4, so those are not
+  decodable by this path. `tests/media_video_exact.rs` (13 tests) is local
+  only, VideoToolbox being unavailable to the hosted sandbox;
+  `tests/media_yuv_exact.rs` and `media_yuv_formats.rs` run the converter
+  without a codec and are hosted. End to end against sentence-transformers
+  (`tests/media_e2e_video.rs`, opt-in, real checkpoint): 7 cases (H.264 BT.709
+  and the same timestamped, a rotated file, HEVC full range, Main 10, 4:4:4
+  10-bit at 33x17, 4:2:2 at an odd height) at 1.38e-7 to 8.53e-7 max abs,
+  cosine 1.000000000; the first file through
+  `ColorPath::AvFoundation` is 2.0e-2 max abs, cosine 0.9864, outside the
+  bound. The conversion runs on row bands (`Threads::Auto`, byte-identical to
+  one thread: `threading_never_changes_a_byte`); **no speedup is claimed**:
+  its bench was not run, every run of that lane ran at a load average above
+  100, and `bench/results/media_video_color_m5pro.*` predates it.
+- **`media::resample`: the `ffmpeg` binary's default resampler and channel
+  downmix, 0 ULP** (`src/media/resample.rs`). A clean-room implementation
+  derived by black-box comparison with the ffmpeg 9.0.2 binary (`ffmpeg -ac 1
+  -ar R -f f32le`); `docs/media_resample_cleanroom.md` records what was
+  consulted and the 19 experiments each rule comes from. It matches on 44 clips
+  (`tests/media_resample.rs`: 163,513 samples) and 105 clips
+  (`tests/media_resample_cr.rs`: 23 rate pairs, all eight layouts at five
+  rates, impulse trains over the filter banks of nine pairs, subnormals, NaN,
+  infinity, negative zero), and its output length and every sample equal
+  `ffmpeg`'s for 2,003 clip lengths over 12 rate pairs; any split of the input
+  into chunks gives the same output. **Bit equality is with the AArch64 NEON
+  build:** the float sums follow its order, an x86 build is not expected to
+  match and was not available, and only FFmpeg 9.0.2 was tried. Audio decoding
+  now reads the file at its own rate and channel count (`ExtAudioFile`, with no
+  rate conversion by Apple) and converts here: `Downmix::Swresample` and
+  `Resampler::Swresample` are the defaults, resampling each channel then
+  mixing with FFmpeg's `0.7071 * L + 0.7071 * R` matrix (1 to 8 channels, more
+  are refused; a file's own channel mask is not read), which is `sqrt(2)`
+  louder than the channel mean `Downmix::Mean` takes (librosa's, torchaudio's).
+  `Resampler::AudioToolbox` stays as a comparison. Integer PCM or float at
+  16 kHz mono is bit for bit the reference's floats. librosa's `soxr_hq` and
+  torchaudio's resampler are not reproduced. 30 s of 44.1 kHz stereo to 16 kHz
+  mono takes 17.1 ms (WAV) and 56.0 ms (MP3) end to end, against 144.5 and
+  170.4 ms through AudioToolbox's converter, 8.4x and 3.0x (a shared machine,
+  so indicative: `bench_media_resample`,
+  `bench/results/media_resample_m5pro.*`).
+  End to end, the 44.1 kHz stereo WAV is 1.74e-7 max abs, cosine 1.000000000
+  against sentence-transformers given FFmpeg's decode (`-ac 1 -ar 16000`).
+- **`tessl::media`: images, audio and video files decoded by the system
+  frameworks** (`src/media/`: ImageIO and CoreGraphics, AudioToolbox,
+  AVFoundation; macOS only; no new crate: the C declarations are written from
+  the SDK headers and AVFoundation goes through the `objc2` and `block2` the
+  crate already depends on). `media::{image, audio, video}` turn a file or its
+  bytes into what `embedgemma2_pre` takes. A file that cannot be decoded, or
+  that is cut short, is a `MediaError`, never an empty or partial result:
+  ImageIO returns a cut TIFF or BMP as a whole picture with zeros, and
+  AudioToolbox a cut WAV, AIFF or CAF as the whole, so `integrity` and
+  `containers` compare the sizes a file declares with the bytes present (13
+  image formats cut at about every 1/97 of their length: every cut fails except
+  those after a GIF's first frame and those that drop only a trailer; 10 audio
+  shapes; 1287 cuts of three video
+  fixtures). **Images** default to `torchvision.io.decode_image(path,
+  mode=RGB)`: EXIF ignored, colour as stored, 16-bit gray as PIL turns it into
+  RGB. A lossless file's samples are copied out of the decoded `CGImage` with
+  no colour conversion: 0 differing bytes in all 18 lossless files, as RGB and
+  as RGBA. All eight EXIF orientations are applied on request, checked against
+  PIL; HEIC has no oracle here and is compared with the picture it was made
+  from (mean 5.10, bound 6). JPEG takes the decoder above. **Audio** decodes to
+  packed `f32` (WAV, AIFF, CAF, FLAC, MP3, AAC/M4A, Opus); MPEG-2 and 2.5
+  Layer III MP3, which AudioToolbox does not trim, have their delay and padding
+  trimmed from the Xing, Info or LAME tag (`mp3.rs`); WavPack is an error. MP3
+  and AAC stay on Apple's decoders by decision: against FFmpeg's decoders the
+  whole-signal SNR is 95.3 dB (MP3) and 56.7 dB (AAC; the difference is in the
+  first and last frames), and end to end MP3 is 9.69e-6 max abs, cosine
+  0.999999996, AAC 7.07e-4, cosine 0.999987957. Ogg Opus in SILK or hybrid
+  mode does not match a torchcodec reference closely (15 to 20 dB from
+  FFmpeg's native decoder, itself 2 to 4 samples behind libopus there).
+  **Video**: `VideoSource::open` reads the compressed samples for the exact
+  frame count and each frame's presentation time, with torchcodec's exact-mode
+  `fps` and `duration`, and `decode_sampled` picks the frames the processor's
+  sampler does (indices equal on 12 files and 48 settings); timestamps are
+  track time with the edit list applied; the upright orientation comes from
+  `preferredTransform`. The frames come from the entry above. Bounds: 1800 s of
+  audio, `VideoOptions::max_frames` 4096, 4 GiB of video, a 60 s track-load
+  timeout, an image's pixels read from the header before the decode. A
+  decoded picture, clip or video held against sentence-transformers
+  (`tests/media_e2e_model.rs`, opt-in): a PNG 1.34e-7 max abs, a 16 kHz WAV
+  1.57e-7, cosine 1.000000000. `leaks --atExit` reports 0 leaks for 0 bytes on
+  `media_decode`, `media_codecs`, `media_leaks` and `media_codecs_leaks`. The
+  hosted job's sandbox denies `iokit-open`, which ImageIO's HEIC decoder and
+  AVFoundation's H.264 and HEVC decoders need, so `tests/media_codecs.rs`,
+  `media_codecs_leaks.rs` and `media_video_exact.rs` fail there by
+  construction and run locally; the rest is on `scripts/hosted_tests.txt`.
+  `bench_media_decode` times it (indicative, a shared machine:
+  `bench/results/media_decode_m5pro.*`). See `docs/embedgemma2.md`, Media
+  decoding.
+- **EmbeddingGemma 2's own front ends in the C ABI and Python: texts, token
+  ids, prompts, raw images, audio and video** (`src/capi_embedgemma2.rs`,
+  `python/tessl_torch/embedgemma2.py`). Eleven entries run
+  `embedgemma2_tok` and `embedgemma2_pre` on the snapshot's own files, so a
+  caller hands over UTF-8, uint8 pixels, PCM and decoded frames and needs no
+  tokenizer, processor or `transformers`: `tessl_embedgemma2_{embed_texts,
+  tokenize, decode, prompt_count, prompt_name, prompt_get, default_prompt,
+  embed_images, embed_audio, embed_videos, embed_media}`. Additive (ABI 12 is
+  unreleased, so nothing bumps). Every count is bounded before it sizes a slice
+  (at most 256 items a call, and what the preprocessing would build is bounded
+  before it builds anything), a null or foreign-thread handle is refused, a
+  panic is caught, and the output is written only on success. The tokenizer,
+  `processor_config.json` and the log-mel front end load on the first call
+  that needs them; a missing file is named and read again by the next call. A
+  bf16 handle accepts a runtime with relaxed f32 GEMMs on, since none of its
+  GEMMs is an f32 one; an exact-f32 handle refuses it by name. Python gains
+  `tokenize`, `decode`, `default_prompt_name`, `embed_video` / `embed_videos`
+  (with `timestamps=`) and `media` over items of caller ids with raw media;
+  `prompts()` and `encode_texts` read the prompts and tokenize in Rust, and
+  `encode_texts` keeps a `tokenizer` of your own as an optional argument.
+  `tessl_clip_coef(total_norm, max_norm)` is
+  `torch.nn.utils.clip_grad_norm_`'s coefficient in torch's f32 arithmetic
+  (`(1 / (norm + 1e-6)) * max_norm`, at most 1; a division differs in the last
+  bit for about one input in eight), and `tessl_torch.clip_coef` calls it
+  instead of computing through torch: bit for bit torch's over 200,000
+  `(norm, bound)` pairs (`python/tests/test_clip_coef.py`), with golden values
+  in `tests/capi_contract.rs`. `tests/capi_embedgemma2_raw.rs` pins every
+  entry bit for bit to the Rust facade on the tiny checkpoint, both `operands`,
+  and every refusal; the Python files are `test_embedgemma2_host.py` and
+  `test_embedgemma2_raw.py`. The Python `embed_images` / `embed_audio`
+  signatures changed (see Changed (breaking)).
+- **EmbeddingGemma 2 from files and bytes, soft-token counts, and text
+  interleaved with media, in the C ABI and Python** (seven entries:
+  `tessl_embedgemma2_{embed_image_sources, embed_audio_sources,
+  embed_video_sources, image_soft_token_count, audio_soft_token_count,
+  video_soft_token_count, embed_segments}`; additive, nothing bumps). The
+  `*_sources` entries take UTF-8 paths or whole encoded files, decode them with
+  `tessl::media` and the reference's defaults, preprocess at once and drop the
+  decoded pixels (`embedgemma2_media::{prepare_image, prepare_audio,
+  OpenedVideo}`, one wait a call): Python `embed_image_files` /
+  `embed_image_bytes`, `embed_audio_files` / `embed_audio_bytes`,
+  `embed_video_files` / `embed_video_bytes(extension=)`. Video bytes go to a
+  private temporary file, removed before the call returns on every path (the
+  tests count them). A path is at most 4096 bytes, an image file 2^30 bytes,
+  an audio or video file 2^32, and a failure names the file or bytes by index
+  (`file 2: ...`, `bytes 1: image: ...`). The three counts give the
+  placeholders a medium makes from its size or length alone, on a text-only
+  handle too, so a prompt can be budgeted before any media is read, and equal
+  the processor's counts. `embed_segments` (Python
+  `media([{"segments": [...]}])`, facade `MmItem::Segments`,
+  `EmbedGemma2Config::mixed_sequence` over `LayoutSegment`) takes an item as a list of texts and media and lays out the
+  processor's sequence itself, with no placeholder counted by the caller: the
+  chat template's pieces joined with no separator, each medium as its
+  `<boi> <image> x n <eoi>` block (a video's one per sampled frame, with a
+  `mm:ss` label under timestamps), the whole wrapped in `<bos>` and `<eos>`.
+  The layout equals the tokenizer's ids of the processor's string for 17
+  messages on a tiny tokenizer (`tests/embedgemma2_segments.rs`), and on the
+  real checkpoint seven cases (text, image, text; text, clip, text; text,
+  video, text; image, text; a six-segment mix; video, video; a timestamped
+  video) have equal ids and embeddings within 1.2e-7 to 2.7e-7 max abs of
+  sentence-transformers, cosine 1.00000000
+  (`tests/embedgemma2_segments_model.rs`, opt-in; the Python run, with the
+  image and clip as files and as bytes, reports the same figures). See
+  `docs/embedgemma2.md`, Files, bytes, soft-token counts and text interleaved
+  with media.
+- **EmbeddingGemma 2 from Go** (`go/embedgemma2`, module
+  `github.com/bharathvbcr/tessl/go`; a binding over the C ABI, in process, with
+  no Python): `Load`, `EmbedTexts`, `Tokenize`, `Decode`, `Encode`, the image,
+  audio and video entries (raw, files and bytes), `EmbedMixed` over `Segment`s,
+  the three soft-token counts and `Ping`, with exact f32, bf16 or text-only
+  loads. The call crosses the boundary through gusset
+  (`github.com/bharathvbcr/gusset`, pinned at commit `984209b` in
+  `go/engine/Cargo.toml` and as the pseudo-version in `go/go.mod`; moving it
+  changes what this repository builds against). A Go
+  binary links exactly one gusset archive, so `go/engine` is an umbrella crate
+  whose `libgusset.a` is gusset and tessl and nothing else. Each `Model` owns
+  one gusset handle with one worker thread, because tessl's handles are bound
+  to the thread that made them: 8, 64 and 256 goroutines issuing the same 384
+  calls peaked at 9-10, 9-10 and 15-16 OS threads over two runs against 6 idle,
+  every result equal to the serial one bit for bit. A context cancels a queued
+  call at once (its deadline also reaches the engine); a call the worker has
+  begun cannot be interrupted, since a tessl entry is one synchronous GPU wait,
+  so the caller is released at its deadline and the abandoned work is at most
+  one call per model, which `Close` waits for. Errors are `*ArgError` (refused
+  in Go), `*Error` (tessl's message verbatim, with its status and whether the
+  runtime is poisoned) and sentinels. A segmentation fault, an abort or a Metal
+  driver fault takes the Go process with it (gusset contains a Rust panic, not
+  those); in process is the repository owner's decision. `make -C go
+  unit|device|real|bench|test`: `unit` opens no device (engine tests, gofmt, `go
+  vet`, the Go unit tests); `device` writes fixtures with tessl's C ABI
+  (`tests/go_fixtures.rs`) and compares every entry bit for bit on the tiny
+  checkpoint; `real` holds the real checkpoint to sentence-transformers (opt-in
+  by `EMBEDGEMMA2_SNAPSHOT`, `EMBEDGEMMA2_REF_DIR` and
+  `EMBEDGEMMA2_MM_REF_DIR`): texts, Matryoshka 512 / 256 / 128, images, audio,
+  video and timestamped video within 3.725e-7 max abs, cosine 1.000000000, and
+  the tokenizer's 7949 ids for 8 texts equal. The boundary costs, per call, the
+  Go wall time minus the engine's own timing of the same call: 32.0 us for one
+  text, 49.9 us for one image, 112.9 us for 256 texts, 100.9 us for 8 images,
+  0.9 us for a `Ping` (`bench/results/embedgemma2_go_m5pro.*`, drawn by
+  `plot_results go-overhead`). **Not a quiet-machine recording** (load average
+  98.6 before, 70.9 after, not under the `mac_heavy` lock): read the paired
+  minima, not the medians. CI: a `go` job on `macos-26` runs `make -C go unit`
+  and the `gpu` job runs `make -C go device`; `scripts/ci_local.sh` runs both.
+  `tests/go_link_frameworks.rs` (hosted) holds the `-framework` list of
+  `go/embedgemma2/engine.go` to the frameworks `src/` links, since a static
+  archive records none. `Cargo.toml` excludes `go/**` from the published
+  package. See `docs/embedgemma2.md`, Go, and `go/README.md`.
+- **`plot_results`: the benchmark figures are Rust SVG**
+  (`src/bin/plot_results`, no plotting dependency). It draws 17 figures to
+  `bench/results/*.svg` from the JSON beside them (`plot_results NAME
+  RESULT.json`, or `all DIR`) and replaces the thirteen matplotlib `*_plot.py`
+  scripts and their PNGs. Every module is listed once, in
+  `src/bin/plot_results/modules.rs`, which `main.rs` and each test that drives
+  the figures `include!`, and `registry.rs` names every figure, so a module
+  missing from that list does not compile. A figure refuses to draw, and
+  writes nothing, where its script would have raised (a missing key,
+  an empty list, a time that cannot go on a log axis, an unknown stage or
+  workload unit). The ink legend lines follow the theme (`LegendItem::ink_line`,
+  used by the median, minimum and one-encode keys): a literal near-black key
+  vanished on the dark background. `tests/plot_results.rs` renders every
+  committed JSON and checks the SVG is well formed and holds the JSON's bars,
+  dots and series; `plot_results_resample` and `plot_results_go_overhead` are
+  the two figures with tests of their own.
 - **C ABI 12** (additive; `TESSL_ABI_VERSION` 11 → 12):
   `tessl_runtime_set_async_encode`, and `tessl_qwen35_read_parameter_host` /
   `tessl_qwen35_write_parameter_host` for one parameter-table entry. A per-entry
@@ -141,8 +436,10 @@ All notable changes to `tessl` are recorded here. The format follows
   norms, RoPE arithmetic, pool and embedder norm f32; new kernel
   `vision_qkv_norm_rope_bf16` stores bf16 with the f32 kernel's rounding (bit
   equal to rounding its output). The facade's one `GemmOperands` now covers the
-  text encoder and the vision tower (the audio tower stays exact f32; the C ABI
-  `operands` and Python `operands=` documentation say so). Held to the f64
+  text encoder and the vision tower (the audio tower was exact f32 then and took
+  the mode later, `EmbedGemma2Audio::load_with`: `docs/embedgemma2.md`, Audio
+  tower bf16 and speed; the C ABI `operands` documentation says it covers all
+  three). Held to the f64
   forward over the same bf16 weights on a tiny checkpoint (relative bounds
   `2e-2` patch embedder, `5e-2` layers and soft tokens, token cosine `0.999`,
   fixed before the first run; observed `9.5e-4`, `6.7e-3`, `5.7e-3`, `0.99998`;
@@ -180,17 +477,19 @@ All notable changes to `tessl` are recorded here. The format follows
   with media waited twice (the towers, then the text encoder: the soft tokens
   crossed the host), a call of texts once, three for the by-hand composition;
   the GPU-resident hand-off that made it one was a later change, recorded in
-  Changed above. `GemmOperands`
-  applies to the text encoder and, from the vision-tower bf16 entry below, the vision tower; the audio tower stays exact f32.
-  C ABI, additive (no version bump of its own; this release ships them at ABI 12, see C ABI 12): `tessl_embedgemma2_load_multimodal` and
+  Changed above. `GemmOperands` applies to the text encoder and, from the
+  vision-tower bf16 entry below, the vision tower (the audio tower took it
+  later, `EmbedGemma2Audio::load_with`: `docs/embedgemma2.md`, Audio tower bf16
+  and speed). C ABI, additive (no version bump of its own; this release ships them at ABI 12, see C ABI 12): `tessl_embedgemma2_load_multimodal` and
   `tessl_embedgemma2_{encode_images, encode_audio}` take a processor's
   `pixel_values` / `image_position_ids` / `input_features` / mask as flat
   arrays with CSR offsets, bound every length before it sizes a slice, and
   write the output only on success; `tests/capi_contract.rs` holds them to the
   signature rules (it learned `c_uint8`). Python: `EmbedGemma2.from_pretrained(dir,
   multimodal=True)`, `encode_images`, `encode_audio` (numpy or torch, duck-typed,
-  never imported) and `embed_images` / `embed_audio` (a processor you pass in);
-  no new dependency. Bit for bit the by-hand composition on a tiny checkpoint;
+  never imported) and `embed_images` / `embed_audio` (in this entry they took a
+  processor you passed in; they take raw images and PCM now, see Changed
+  (breaking)); no new dependency. Bit for bit the by-hand composition on a tiny checkpoint;
   on the real one (opt-in) texts, images and clips in one call within 3.8e-7 of
   sentence-transformers, cosine 1.000000000, in Rust and Python. See
   `docs/embedgemma2.md`, One call.
@@ -817,6 +1116,18 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed (breaking)
 
+- **Python `EmbedGemma2.embed_images` and `embed_audio` take raw inputs, not a
+  processor.** `embed_images(images, processor, truncate_dim=None)` is now
+  `embed_images(images, truncate_dim=None)`: `images` are uint8 arrays `[H, W,
+  C]` (C 1 to 4; a PIL image works through `numpy.asarray`), resized, rescaled
+  and patchified in Rust with the snapshot's `processor_config.json`.
+  `embed_audio(clips, processor, truncate_dim=None)` is now
+  `embed_audio(clips, sampling_rate=16000, truncate_dim=None)`: `clips` are
+  mono float PCM in `[-1, 1]` and the log-mel features are computed in Rust; a
+  rate other than the extractor's 16000 is refused, never resampled. A call
+  that passed `processor` positionally now passes it as `truncate_dim` (or, for
+  `embed_audio`, `sampling_rate`): drop the argument. A caller that still wants a processor of its own calls `encode_images` /
+  `encode_audio`, which take its output tensors and are unchanged.
 - **ICB stub scaffold removed**: `IcbReplayStub`, `IcbStubPhase`,
   `ArgTableSlotPlan`, `ArgTableSlot`, `IcbCommandTypeHint`,
   `PingPongCbReplay::{icb_stub, icb_stub_mut}`, `from_commands_ex`,
@@ -1693,6 +2004,31 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **The Qwen3.5 training step bound reads `dispatch_batching()`.**
+  `Qwen35Model::train_step_bytes` counted a step as batched whenever the
+  runtime's async-encode flag was on. Whether dispatches batch is
+  `GpuRuntime::dispatch_batching` (async encode or an open `async_scope`,
+  and not under serialized dispatch), so the bound over-counted a serialized
+  runtime and under-counted a step inside an `async_scope` with the flag off:
+  the bytes held between waits, which `train_forward`'s pre-flight gate trusts.
+  `the_step_bound_follows_whether_dispatches_batch` (`tests/qwen35_train.rs`;
+  a four-layer random tower, three linear layers before the attention layer's
+  wait, where batching changes the bound) asserts the flag, an open scope and
+  serialized dispatch each give the bound of the dispatch mode in effect.
+- **`tests/fixture_manifests.rs` checks EmbeddingGemma 2's three provenance
+  records.** `tests/fixtures/embedgemma2/` holds three generators' files
+  (`eg2_` text, `eg2a_` audio, `eg2p_` preprocessing), each with a record of
+  its own, and the gate read only `provenance.json`. `SPLIT_RECORDS` now
+  requires each record to exist, parse and name its generator, which must be in
+  the repository, and every other file to start with exactly one family's
+  prefix (`the_split_record_check_refuses_an_unrecorded_file_or_a_bad_record`).
+- **The Go binding's link line lacked VideoToolbox.** `src/media/vt.rs` links
+  the framework, and the `#cgo darwin LDFLAGS` line of
+  `go/embedgemma2/engine.go` at the merge of the Go binding did not name it, so
+  the archive would not have linked into a Go binary (inferred from the missing
+  flag; that link was not run). It names it now, and
+  `tests/go_link_frameworks.rs` fails when a framework `src/` links is missing
+  from that line.
 - The emulator's `--fast-math` bound for `encoder_attn_rows` is the on-device
   bound (`2e-5·max|want|`); hosted run 38739221987 failed on the old 2e-6.
 - The CI workflow gate is an allowlist, and every self-hosted job carries it.

@@ -42,4 +42,4 @@ What this does not show: single-thread speed (both lanes are multi-threaded; nei
 processors' cost with other kernels running on the same cores in a serving process. A speedup over transformers is the
 claim, bounded by the spread above; no absolute number should be quoted from a shared host.
 
-Plot: embedgemma2_pre_m5pro.png (bench/results/embedgemma2_pre_plot.py, uv run --no-project --with matplotlib).
+Plot: embedgemma2_pre_m5pro.svg (`plot_results pre`, src/bin/plot_results).

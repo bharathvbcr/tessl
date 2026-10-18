@@ -710,8 +710,31 @@ It replaced five stdlib-only Python scripts and reproduces their output byte
 for byte, including Python's `int`/`float` distinction, `repr` of floats and
 `json.dumps` (`tests/results_report.rs` rebuilds the committed JSON files from
 the passes they embed, and checks golden outputs the scripts wrote). The
-`*_plot.py` scripts read the JSON it writes. It stops with a named error where
+figures drawn by `plot_results` (below) read the JSON it writes. It stops with a named error where
 a script raised (a missing key, a division by zero).
+
+### EmbedGemma 2 figures: `plot_results`
+
+`src/bin/plot_results` draws the seventeen EmbedGemma 2, media and Go-binding benchmark figures in
+`bench/results/*.svg` from the JSON beside them, with no plotting dependency
+(it replaced thirteen matplotlib scripts and their PNGs):
+
+```text
+cargo run --release --bin plot_results -- NAME bench/results/RESULT.json [--out-dir DIR]
+cargo run --release --bin plot_results -- all bench/results [--out-dir DIR]
+```
+
+`NAME` is one of `final`, `audio-speed`, `mm-onewait`, `pre`, `vision-speed`,
+`audio-profile`, `stage-profile`, `text-fusion`, `memory`, `small-m`, `tok`,
+`video`, `media-decode`, `media-resample`, `video-color`, `jpeg-decode`, `go-overhead`. The figure is written as `<stem of RESULT.json>.svg` next to the JSON.
+The same data is the same bytes. A figure refuses to draw, writes nothing and
+names the reason where its script would have raised: a missing key, an empty
+list, a time that cannot go on a log axis, lanes that disagree on the token ids
+(`tok`), an unknown workload unit (`media-decode`), an unknown stage (`media-resample`) or colour path (`video-color`), an unknown stage class (`stage-profile`, `text-fusion`), a memory
+itemisation that does not add up (`memory`). `audio-profile` also prints the
+grouped table its results file quotes. `tests/plot_results.rs` renders every
+committed JSON and checks the SVG is well formed and holds the JSON's bars,
+dots and series.
 
 ## Every recorded result, plotted
 

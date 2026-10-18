@@ -16,24 +16,35 @@ bin bench_env_validation 2
 bin bench_paired_cli 29
 bin bench_attn_cli 2
 bin build_artifact_contract 2
-bin capi_contract 77
+bin capi_contract 80
 bin check_kernel_ir_planted 6
 bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5
-bin embedgemma2_tok_tiny 12
+bin embedgemma2_tok_tiny 13
 bin gdn_fixtures 12
-bin fixture_manifests 7
+bin fixture_manifests 8
 bin gdn_gates 22
 bin gdn_state 10
+bin go_link_frameworks 2
 bin host_access_ban 6
 bin hosted_selection 6
 bin hosted_tests_script 9
 bin kernel_fast_math 13
+bin media_decode 21
+bin media_jpeg 12
+bin media_leaks 1
+bin media_resample 17
+bin media_yuv_exact 5
+bin media_resample_cr 10
+bin media_yuv_formats 5
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
+bin plot_results 57
+bin plot_results_go_overhead 8
+bin plot_results_resample 7
 bin reader_bounds 12
 bin qwen35_config 8
 bin relaxed_predicate 1
@@ -58,6 +69,9 @@ exact bench_qwen35_layers_cli a_later_bad_weights_flag_wins_over_nothing_and_a_l
 exact bert_kernels the_config_parser_reads_both_families_and_refuses_what_it_cannot_run the_erfc_reference_matches_known_values
 exact capi_embedgemma2 a_null_model_handle_is_refused_by_every_entry freeing_a_null_handle_is_a_no_op loading_on_a_null_runtime_is_refused_and_leaves_out_null
 exact capi_embedgemma2_multimodal a_null_handle_is_refused_by_the_multimodal_entries loading_multimodal_on_a_null_runtime_is_refused_and_leaves_out_null
+exact capi_embedgemma2_media a_null_handle_is_refused_by_every_media_entry
+exact capi_embedgemma2_raw a_null_handle_is_refused_by_every_front_end_entry
+exact embedgemma2_segments mixed_sequence_is_the_tokenizers_ids_of_the_processors_whole_string mixed_sequence_ids_written_out a_video_alone_is_the_video_sequences mixed_sequence_refusals_are_named image_soft_tokens_are_what_preprocessing_makes audio_soft_tokens_are_the_towers_mask video_soft_tokens_are_what_preprocessing_makes
 exact embedgemma2_kernels attention_reference_matches_transformers config_reads_the_checkpoint config_refuses_what_the_forward_does_not_implement ple_reference_matches_transformers pool_reference_matches_transformers qkv_norm_rope_reference_matches_transformers rope_inv_freq_matches_the_models_tables
 exact embedgemma2_audio_tiny the_bounds_bite
 exact embedgemma2_mm_tiny config_keeps_the_ids_and_the_builders_lay_out_the_processor_ids
@@ -82,7 +96,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 256
+bins 260
 
 # Library tests.
 lib ab_flags::tests:: 10
@@ -94,6 +108,7 @@ lib embedgemma2_tok::tests:: 4
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib json::tests:: 4
+lib media:: 18
 lib parser_mutation:: 16
 lib qwen35::tests:: 6
 lib qwen35_adamw::step_kernel_tests:: 2

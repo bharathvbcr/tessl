@@ -24,4 +24,4 @@ a quiet machine it is the larger of the two; here the bf16 tower's best run (791
 call's best run (1488 ms) were not taken in equally loaded periods (load 80 against 98), and the
 difference between them is not the text encoder's cost.
 
-Figure: embedgemma2_video_m5pro.png (embedgemma2_video_plot.py). Data: embedgemma2_video_m5pro.json.
+Figure: embedgemma2_video_m5pro.svg (`plot_results video`). Data: embedgemma2_video_m5pro.json.

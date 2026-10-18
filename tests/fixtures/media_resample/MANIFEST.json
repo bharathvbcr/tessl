@@ -1,0 +1,586 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_resample_fixtures.py",
+ "generator_commit": "4b16578448de49104254bd0a1da7aef55f647f98",
+ "versions": {
+  "torch": "2.14.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.3",
+  "python": "3.14.8"
+ },
+ "versions_role": "produced",
+ "inputs_source": "generated: closed-form signals and numpy default_rng draws quantised to 16-bit PCM WAV; the goldens are the ffmpeg binary's output for those exact files (see the generator docstring); the AAC, MP3 and Opus files are ffmpeg's encodes, stable for a given FFmpeg version",
+ "files": {
+  "codec_44100_stereo.m4a": {
+   "role": "input",
+   "published": true,
+   "note": "m4a encode of codec_src_44100_stereo.wav by ffmpeg"
+  },
+  "codec_44100_stereo.m4a.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's decode of the file to 16 kHz mono (default mix)"
+  },
+  "codec_44100_stereo.mp3": {
+   "role": "input",
+   "published": true,
+   "note": "mp3 encode of codec_src_44100_stereo.wav by ffmpeg"
+  },
+  "codec_44100_stereo.mp3.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's decode of the file to 16 kHz mono (default mix)"
+  },
+  "codec_src_44100_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "the sweep the AAC and MP3 files were encoded from"
+  },
+  "impulse_44100_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "impulse_44100_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "impulse, 4410 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "impulse_44100_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "impulse_44100_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "impulse_44100_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "impulse, 4410 frames at 44100 Hz, stereo, 16-bit PCM"
+  },
+  "impulse_48000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "impulse_48000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "impulse, 4800 frames at 48000 Hz, mono, 16-bit PCM"
+  },
+  "impulse_8000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "impulse_8000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "impulse, 800 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n1.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n1.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 1 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n1001.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n1001.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 1001 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n2.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n2.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n200.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n200.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 200 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n61.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n61.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 61 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n62.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n62.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 62 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n63.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n63.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 63 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_44100_mono_n93.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_44100_mono_n93.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 93 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "noise_48000_mono_long.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_48000_mono_long.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 144000 frames at 48000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n1.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n1.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 1 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n2.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n2.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 2 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n31.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n31.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 31 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n32.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n32.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 32 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n33.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n33.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 33 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "noise_8000_mono_n64.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "noise_8000_mono_n64.wav": {
+   "role": "input",
+   "published": true,
+   "note": "noise, 64 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "opus_celt_48000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's default decoder (native opus) to 16 kHz mono"
+  },
+  "opus_celt_48000_mono.libopus48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "libopus's decode at 48 kHz, pre-skip removed"
+  },
+  "opus_celt_48000_mono.native48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's native opus decoder at 48 kHz, pre-skip removed"
+  },
+  "opus_celt_48000_mono.opus": {
+   "role": "input",
+   "published": true,
+   "note": "libopus encode of opus_src_48000_mono.wav (-application audio -frame_duration 20 -b:a 64k)"
+  },
+  "opus_silknb_48000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's default decoder (native opus) to 16 kHz mono"
+  },
+  "opus_silknb_48000_mono.libopus48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "libopus's decode at 48 kHz, pre-skip removed"
+  },
+  "opus_silknb_48000_mono.native48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's native opus decoder at 48 kHz, pre-skip removed"
+  },
+  "opus_silknb_48000_mono.opus": {
+   "role": "input",
+   "published": true,
+   "note": "libopus encode of opus_src_48000_mono.wav (-application voip -frame_duration 20 -b:a 16k -cutoff 4000)"
+  },
+  "opus_silkwb_48000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's default decoder (native opus) to 16 kHz mono"
+  },
+  "opus_silkwb_48000_mono.libopus48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "libopus's decode at 48 kHz, pre-skip removed"
+  },
+  "opus_silkwb_48000_mono.native48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg's native opus decoder at 48 kHz, pre-skip removed"
+  },
+  "opus_silkwb_48000_mono.opus": {
+   "role": "input",
+   "published": true,
+   "note": "libopus encode of opus_src_48000_mono.wav (-application voip -frame_duration 20 -b:a 16k -cutoff 8000)"
+  },
+  "opus_src_48000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "the clip the Opus files were encoded from"
+  },
+  "step_44100_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "step_44100_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "step, 4410 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "sweep_11025_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_11025_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2757 frames at 11025 Hz, mono, 16-bit PCM"
+  },
+  "sweep_12345_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_12345_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 6000 frames at 12345 Hz, mono, 16-bit PCM"
+  },
+  "sweep_16000_51.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_16000_51.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4000 frames at 16000 Hz, 51, 16-bit PCM"
+  },
+  "sweep_16000_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_16000_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4000 frames at 16000 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_22050_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_22050_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 5513 frames at 22050 Hz, mono, 16-bit PCM"
+  },
+  "sweep_22050_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_22050_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_22050_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4410 frames at 22050 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_32000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_32000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 8001 frames at 32000 Hz, mono, 16-bit PCM"
+  },
+  "sweep_44100_51.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_44100_51.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 5512 frames at 44100 Hz, 51, 16-bit PCM"
+  },
+  "sweep_44100_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_44100_mono.ffmpeg48k.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "the same to 48 kHz"
+  },
+  "sweep_44100_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 11026 frames at 44100 Hz, mono, 16-bit PCM"
+  },
+  "sweep_44100_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_44100_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_44100_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 8820 frames at 44100 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_44100_stereo_long.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_44100_stereo_long.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_44100_stereo_long.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 88200 frames at 44100 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_44101_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_44101_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 8000 frames at 44101 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_48000_51.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_51.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 6000 frames at 48000 Hz, 51, 16-bit PCM"
+  },
+  "sweep_48000_c3.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_c3.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4800 frames at 48000 Hz, c3, 16-bit PCM"
+  },
+  "sweep_48000_c4.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_c4.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4800 frames at 48000 Hz, c4, 16-bit PCM"
+  },
+  "sweep_48000_c5.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_c5.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4800 frames at 48000 Hz, c5, 16-bit PCM"
+  },
+  "sweep_48000_c7.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_c7.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4800 frames at 48000 Hz, c7, 16-bit PCM"
+  },
+  "sweep_48000_c8.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_c8.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 4800 frames at 48000 Hz, c8, 16-bit PCM"
+  },
+  "sweep_48000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 12001 frames at 48000 Hz, mono, 16-bit PCM"
+  },
+  "sweep_48000_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_48000_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_48000_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 9600 frames at 48000 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_8000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_8000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 2001 frames at 8000 Hz, mono, 16-bit PCM"
+  },
+  "sweep_8000_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_8000_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_8000_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 1600 frames at 8000 Hz, stereo, 16-bit PCM"
+  },
+  "sweep_96000_mono.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_96000_mono.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 24001 frames at 96000 Hz, mono, 16-bit PCM"
+  },
+  "sweep_96000_stereo.ffmpeg.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "ffmpeg -ac 1 -ar 16000: libswresample's defaults, f32 little endian"
+  },
+  "sweep_96000_stereo.ffmpeg_mean.f32": {
+   "role": "golden",
+   "published": true,
+   "note": "channel mean in float, then libswresample's resampler"
+  },
+  "sweep_96000_stereo.wav": {
+   "role": "input",
+   "published": true,
+   "note": "sweep, 19200 frames at 96000 Hz, stereo, 16-bit PCM"
+  }
+ },
+ "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers"
+}

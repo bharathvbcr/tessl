@@ -6,7 +6,7 @@ other lanes' benchmarks ran on the same GPU during these rounds, so some rounds 
 round of every lane, the summary, the lane argv, the env; bench_paired --out also keeps the lanes'
 stdout and stderr). embedgemma2_vision_speed_m5pro_run1.json is an earlier 6-round run of the same
 lanes at BENCH_ITERS=6, kept because it was worse (spreads 0.18 to 0.80) and the figures below do
-not rest on it. Plot: embedgemma2_vision_speed_m5pro.png (embedgemma2_vision_speed_plot.py).
+not rest on it. Plot: embedgemma2_vision_speed_m5pro.svg (`plot_results vision-speed`; it also reads embedgemma2_vision_profile_m5pro.json).
 
 What is timed: one EmbedGemma2VisionModel::encode_images call on the real checkpoint, host pixels
 and positions to host soft tokens (pixel packing, upload, the forwards, readback); not the load.

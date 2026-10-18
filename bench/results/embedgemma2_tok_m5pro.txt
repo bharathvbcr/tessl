@@ -14,7 +14,7 @@ process; each lane's number for a round is the fastest of 7 passes; load: of 5 l
     tessl=target/release/bench_embedgemma2_tok \
     hf_loop="~/.venvs/ml-2026-10/bin/python bench/embedgemma2_tok_hf.py" \
     hf_batch:BENCH_TOK_HF_MODE=batch="~/.venvs/ml-2026-10/bin/python bench/embedgemma2_tok_hf.py"
-  uv run --no-project --with matplotlib python bench/results/embedgemma2_tok_plot.py bench/results
+  cargo run --release --bin plot_results -- tok bench/results/embedgemma2_tok_m5pro.json
 
 (`~` written out as an absolute path in the real command: bench_paired splits on whitespace and
 does not expand it.) The corpus is the file the first command writes (2701 records, 770900 bytes,

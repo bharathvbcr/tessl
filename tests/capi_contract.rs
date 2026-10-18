@@ -1779,7 +1779,7 @@ fn eg2_abi() -> (RustAbi, PyAbi) {
     (parse_rust_abi(&read(RS_EG2)), parse_py_abi(&read(PY_EG2)))
 }
 
-const EG2_FNS: [&str; 9] = [
+const EG2_FNS: [&str; 27] = [
     "tessl_embedgemma2_load",
     "tessl_embedgemma2_free",
     "tessl_embedgemma2_embedding_dim",
@@ -1789,6 +1789,24 @@ const EG2_FNS: [&str; 9] = [
     "tessl_embedgemma2_load_multimodal",
     "tessl_embedgemma2_encode_images",
     "tessl_embedgemma2_encode_audio",
+    "tessl_embedgemma2_prompt_count",
+    "tessl_embedgemma2_prompt_name",
+    "tessl_embedgemma2_prompt_get",
+    "tessl_embedgemma2_default_prompt",
+    "tessl_embedgemma2_tokenize",
+    "tessl_embedgemma2_decode",
+    "tessl_embedgemma2_embed_texts",
+    "tessl_embedgemma2_embed_images",
+    "tessl_embedgemma2_embed_audio",
+    "tessl_embedgemma2_embed_videos",
+    "tessl_embedgemma2_embed_media",
+    "tessl_embedgemma2_embed_image_sources",
+    "tessl_embedgemma2_embed_audio_sources",
+    "tessl_embedgemma2_embed_video_sources",
+    "tessl_embedgemma2_image_soft_token_count",
+    "tessl_embedgemma2_audio_soft_token_count",
+    "tessl_embedgemma2_video_soft_token_count",
+    "tessl_embedgemma2_embed_segments",
 ];
 
 #[test]
@@ -1943,6 +1961,227 @@ fn a_multimodal_embedgemma2_signature_that_drifts_on_either_side_is_reported() {
         mentions(&p, "tessl_embedgemma2_encode_images: argument 3 `position_ids`"),
         "{p:?}"
     );
+}
+
+/// The same faults for the entries that read files and bytes, count soft tokens and lay
+/// out segments: a pointer to the wrong scalar on either side of a byte-cut table, of the
+/// segment kinds and references, of the frame counts and the rates, an integer width, and
+/// a dropped argument. The unmodified pair is clean and the new entries are all parsed.
+#[test]
+fn a_media_source_or_segment_signature_that_drifts_on_either_side_is_reported() {
+    let (rust, py) = eg2_abi();
+    let py_src = read(PY_EG2);
+    let rs_src = read(RS_EG2);
+    for name in [
+        "tessl_embedgemma2_embed_image_sources",
+        "tessl_embedgemma2_embed_audio_sources",
+        "tessl_embedgemma2_embed_video_sources",
+        "tessl_embedgemma2_image_soft_token_count",
+        "tessl_embedgemma2_audio_soft_token_count",
+        "tessl_embedgemma2_video_soft_token_count",
+        "tessl_embedgemma2_embed_segments",
+    ] {
+        assert!(
+            rust.fns.contains_key(name) && py.fns.contains_key(name),
+            "{name} is not parsed"
+        );
+    }
+    assert_eq!(rust.fns["tessl_embedgemma2_embed_segments"].args.len(), 36);
+    assert_eq!(py.fns["tessl_embedgemma2_embed_segments"].0.len(), 36);
+    assert!(fn_problems(&rust, &py, &[]).is_empty());
+
+    let py_fault = |needle: &str, with: &str| fn_problems(&rust, &parse_py_abi(&fault(&py_src, needle, with)), &[]);
+    let rs_fault = |needle: &str, with: &str| fn_problems(&parse_rust_abi(&fault(&rs_src, needle, with)), &py, &[]);
+
+    // ctypes side.
+    let p = py_fault(
+        "[h, u32, u8p, u64, u64p, u64, u32, f32p, u64] + err_args\n        lib.tessl_embedgemma2_embed_audio_sources.restype",
+        "[h, u32, u8p, u64, u32p, u64, u32, f32p, u64] + err_args\n        lib.tessl_embedgemma2_embed_audio_sources.restype",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_image_sources: argument 4 `offsets`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "            u32p, u64p, u64, u64p, u64,\n",
+        "            u64p, u64p, u64, u64p, u64,\n",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_segments: argument 5 `segment_kinds`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "[h, u32p, u64p, f64p, u64, u64p, u64] + err_args",
+        "[h, u32p, u64p, f32p, u64, u64p, u64] + err_args",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_video_soft_token_count: argument 3 `video_fps`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "[h, u64p, u64, u32, u64p, u64] + err_args",
+        "[h, u64p, u64, u64p, u64] + err_args",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_audio_soft_token_count: C takes"),
+        "{p:?}"
+    );
+
+    // Rust side.
+    let p = rs_fault("    segment_refs: *const u64,\n", "    segment_refs: *const u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_segments: argument 6 `segment_refs`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    extension_len: u64,\n", "    extension_len: u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_video_sources: argument 7 `extension_len`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    frame_counts: *const u64,\n", "    frame_counts: *const u32,\n");
+    assert!(
+        mentions(
+            &p,
+            "tessl_embedgemma2_video_soft_token_count: argument 2 `frame_counts`"
+        ),
+        "{p:?}"
+    );
+}
+
+/// `tessl_clip_coef` is `torch.nn.utils.clip_grad_norm_`'s coefficient in its f32
+/// arithmetic, bit for bit: these are `torch.clamp(max_norm / (norm_f32 + 1e-6),
+/// max=1.0)` as torch 2.x computes them (`target/clip_goldens.py`, generated
+/// with the oracle venv). `max_norm / tensor` is `reciprocal(tensor) * max_norm`
+/// in torch, which is not a division: the last eight of these are inputs where
+/// the plain f32 quotient differs from torch's value (the second assert pins
+/// that, so the formula cannot be "simplified"). Python sweeps 400,000 more
+/// against torch (`python/tests/test_clip_coef.py`).
+#[test]
+fn the_clip_coefficient_is_torchs_f32_arithmetic_bit_for_bit() {
+    let golden: [(f64, f64, u32); 26] = [
+        (31.6506, 3.0, 0x3dc2_1e9a),
+        (466.3061, 10.0, 0x3caf_adb8),
+        (50.7927, 3.0, 0x3d71_ecae),
+        (174.6254, 3.0, 0x3c8c_bc4c),
+        (148.6259, 3.0, 0x3ca5_5ad1),
+        (21.019, 10.0, 0x3ef3_96d0),
+        (769.5606, 3.0, 0x3b7f_7b1a),
+        (182.3422, 10.0, 0x3d60_a1f1),
+        (0.1, 1.0, 0x3f80_0000),
+        (1.0, 1.0, 0x3f7f_fff0),
+        (3.0, 1.0, 0x3eaa_aaa7),
+        (7.5, 0.5, 0x3d88_8887),
+        (123.456, 1.0, 0x3c04_b614),
+        (1e-6, 1.0, 0x3f80_0000),
+        (0.999999, 1.0, 0x3f80_0000),
+        (2.0, 1.0, 0x3eff_fff8),
+        (31.4159, 2.5, 0x3da2_f98c),
+        (1e5, 1.0, 0x3727_c5ac),
+        (1e-3, 0.01, 0x3f80_0000),
+        (5.0, 3.0, 0x3f19_9998),
+        (0.3, 0.3, 0x3f7f_ffc8),
+        (1e30, 1.0, 0x0da2_4260),
+        (f64::INFINITY, 1.0, 0),
+        (f64::NAN, 1.0, 0x7fc0_0000),
+        (0.0, 1.0, 0x3f80_0000),
+        (4.0, 0.0, 0),
+    ];
+    for (norm, max, want) in golden {
+        let got = tessl::capi::tessl_clip_coef(norm, max);
+        assert_eq!(
+            got.to_bits(),
+            want,
+            "clip_coef({norm}, {max}) = {got} ({:#010x})",
+            got.to_bits()
+        );
+    }
+    // Not a division: the plain f32 quotient differs from torch's on these.
+    let divided = |norm: f64, max: f64| (max as f32 / (norm as f32 + 1e-6f32)).min(1.0).to_bits();
+    let differing = golden
+        .iter()
+        .filter(|&&(n, m, w)| w != 0x7fc0_0000 && divided(n, m) != w)
+        .count();
+    assert!(
+        differing >= 8,
+        "{differing}: the golden set no longer tells a division from torch's formula"
+    );
+}
+
+/// The same faults for the entries that run the front ends: a byte pointer read
+/// as words, a scalar read wider, a cut array of the wrong width, a dropped
+/// argument, on either side of the pair; and the pointer to bytes the string
+/// entries write.
+#[test]
+fn a_front_end_signature_that_drifts_on_either_side_is_reported() {
+    let (rust, py) = eg2_abi();
+    let py_src = read(PY_EG2);
+    let rs_src = read(RS_EG2);
+    assert!(fn_problems(&rust, &py, &[]).is_empty());
+    let buf = &rust.fns["tessl_embedgemma2_prompt_name"].args[2];
+    assert_eq!(buf.0, "buf");
+    assert_eq!(buf.1, Ty::Ptr(Some(Box::new(Ty::Scalar("u8".into())))));
+    assert!(py.fns["tessl_embedgemma2_prompt_name"].0[2].agrees(&buf.1));
+    let fps = &rust.fns["tessl_embedgemma2_embed_videos"].args[5];
+    assert_eq!(fps.0, "video_fps");
+    assert_eq!(fps.1, Ty::Ptr(Some(Box::new(Ty::Scalar("f64".into())))));
+
+    let py_fault = |needle: &str, with: &str| fn_problems(&rust, &parse_py_abi(&fault(&py_src, needle, with)), &[]);
+    let rs_fault = |needle: &str, with: &str| fn_problems(&parse_rust_abi(&fault(&rs_src, needle, with)), &py, &[]);
+
+    // ctypes side.
+    let p = py_fault(
+        "tessl_embedgemma2_prompt_name.argtypes = [h, u32, u8p, u64, u64p]",
+        "tessl_embedgemma2_prompt_name.argtypes = [h, u32, u32p, u64, u64p]",
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_prompt_name: argument 2 `buf`"), "{p:?}");
+    let p = py_fault(
+        "tessl_embedgemma2_embed_audio.argtypes = [h, f32p, u64, u64p, u64, u32, u32, f32p, u64]",
+        "tessl_embedgemma2_embed_audio.argtypes = [h, f32p, u64, u64p, u64, u64, u32, f32p, u64]",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_audio: argument 5 `sampling_rate`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "h, u8p, u64, u32p, u64p, f64p, u64, u32, u32, f32p, u64,",
+        "h, u8p, u64, u32p, u64p, f32p, u64, u32, u32, f32p, u64,",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_videos: argument 5 `video_fps`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "u8p, u64, u32p, u64p, f64p, u64, u64p,\n",
+        "u8p, u64, u32p, u64p, f64p, u64, u32p,\n",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_media: argument 22 `video_offsets`"),
+        "{p:?}"
+    );
+    let p = py_fault(
+        "tessl_embedgemma2_default_prompt.argtypes = [h, i32p] + err_args",
+        "tessl_embedgemma2_default_prompt.argtypes = [h] + err_args",
+    );
+    assert!(mentions(&p, "tessl_embedgemma2_default_prompt: C takes"), "{p:?}");
+
+    // Rust side.
+    let p = rs_fault(
+        "    n_clips: u64,\n    sampling_rate: u32,\n",
+        "    n_clips: u64,\n    sampling_rate: u64,\n",
+    );
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_audio: argument 5 `sampling_rate`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    video_offsets: *const u64,\n", "    video_offsets: *const u32,\n");
+    assert!(
+        mentions(&p, "tessl_embedgemma2_embed_media: argument 22 `video_offsets`"),
+        "{p:?}"
+    );
+    let p = rs_fault("    text_offsets: *const u64,\n", "    text_offsets: *const u32,\n");
+    assert!(mentions(&p, "`text_offsets`"), "{p:?}");
+    let p = rs_fault("    out_len: *mut u64,\n", "    out_len: *mut u32,\n");
+    assert!(mentions(&p, "`out_len`"), "{p:?}");
 }
 
 /// Every module that exports `tessl_*` entry points, found by scanning `src/`.

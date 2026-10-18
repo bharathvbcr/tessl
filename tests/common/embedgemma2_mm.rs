@@ -415,7 +415,7 @@ pub fn clip(cfg: &AudioConfig, frames: usize, seed: u64, valid: impl Fn(usize) -
 /// `eoi_token_id`) and `<|video|>` (62, `video_token_id`) beside `<pad>`,
 /// `<eos>`, `<bos>` and `<unk>`; the other ids are filler entries.
 pub fn timestamp_tokenizer_json() -> String {
-    let added = [
+    tokenizer_json(&[
         (0, "<pad>"),
         (1, "<eos>"),
         (2, "<bos>"),
@@ -423,7 +423,31 @@ pub fn timestamp_tokenizer_json() -> String {
         (40, "<|image>"),
         (41, "<image|>"),
         (62, "<|video|>"),
-    ];
+    ])
+}
+
+/// [`timestamp_tokenizer_json`] with every marker and placeholder of the config
+/// an added token as well: `<|audio>` (42, `boa_token_id`), `<audio|>` (43,
+/// `eoa_token_index`), `<|image|>` (60) and `<|audio|>` (61), so the
+/// processor's whole string for a message with an image or a clip can be
+/// written out and tokenized (`embedgemma2_segments`).
+pub fn full_tokenizer_json() -> String {
+    tokenizer_json(&[
+        (0, "<pad>"),
+        (1, "<eos>"),
+        (2, "<bos>"),
+        (3, "<unk>"),
+        (40, "<|image>"),
+        (41, "<image|>"),
+        (42, "<|audio>"),
+        (43, "<audio|>"),
+        (60, "<|image|>"),
+        (61, "<|audio|>"),
+        (62, "<|video|>"),
+    ])
+}
+
+fn tokenizer_json(added: &[(usize, &str)]) -> String {
     let added_json: Vec<String> = added
         .iter()
         .map(|(id, text)| {
@@ -433,7 +457,7 @@ pub fn timestamp_tokenizer_json() -> String {
         })
         .collect();
     let mut vocab: Vec<String> = (0..63).map(|i| format!("<u{i}>")).collect();
-    for (id, text) in added {
+    for &(id, text) in added {
         vocab[id] = text.to_string();
     }
     for d in 0..10 {
@@ -463,5 +487,47 @@ pub fn timestamp_tokenizer_json() -> String {
 }}"#,
         added = added_json.join(", "),
         vocab = vocab_json.join(", "),
+    )
+}
+
+/// The `tokenizer_config.json` that goes with [`timestamp_tokenizer_json`]:
+/// `<bos>` switches the sentence-transformers rule off, and the three
+/// placeholder tokens are refused in a text.
+pub const TOKENIZER_CONFIG: &str =
+    r#"{"bos_token": "<bos>", "image_token": "<|image|>", "video_token": "<|video|>", "audio_token": "<|audio|>"}"#;
+
+/// A `config_sentence_transformers.json` with two prompts (digits and a colon,
+/// which the tiny tokenizer has ids for) and `default` as its
+/// `default_prompt_name` (`null` or a quoted name).
+pub fn sentence_transformers_json(default: &str) -> String {
+    format!(r#"{{"prompts": {{"query": "00 ", "document": "1: "}}, "default_prompt_name": {default}}}"#)
+}
+
+/// A `processor_config.json` for the tiny towers: patch 4 and a 2x2 pooling
+/// cell as the tiny vision tower has them, 32 mel bins as the tiny audio
+/// tower takes, otherwise the checkpoint's settings (fps 1, at most 4 frames
+/// so a test video stays small). `max_soft_tokens` is the image and video
+/// budget (70 to 1120, `SUPPORTED_SOFT_TOKENS`).
+pub fn processor_config_json(add_timestamps: bool, max_soft_tokens: u32) -> String {
+    format!(
+        r#"{{
+      "audio_ms_per_token": 40, "audio_seq_length": 280,
+      "feature_extractor": {{"dither": 0.0, "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+        "feature_size": 32, "fft_length": 512, "fft_overdrive": false, "frame_length": 320,
+        "hop_length": 160, "input_scale_factor": 1.0, "max_frequency": 8000.0, "mel_floor": 0.001,
+        "min_frequency": 0.0, "padding_side": "right", "padding_value": 0.0, "per_bin_mean": null,
+        "per_bin_stddev": null, "preemphasis": 0.0, "preemphasis_htk_flavor": true,
+        "return_attention_mask": true, "sampling_rate": 16000}},
+      "image_processor": {{"do_convert_rgb": true, "do_normalize": false, "do_rescale": true,
+        "do_resize": true, "image_mean": [0.0, 0.0, 0.0], "image_processor_type": "Gemma4ImageProcessor",
+        "image_seq_length": 70, "image_std": [1.0, 1.0, 1.0], "max_soft_tokens": {max_soft_tokens}, "patch_size": 4,
+        "pooling_kernel_size": 2, "resample": 3, "rescale_factor": 0.00392156862745098}},
+      "video_processor": {{"add_timestamps": {add_timestamps}, "do_convert_rgb": true, "do_normalize": false,
+        "do_rescale": true, "do_resize": true, "do_sample_frames": true, "fps": 1,
+        "image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0], "max_frames": 4,
+        "max_soft_tokens": {max_soft_tokens}, "overflow_strategy": "uniform", "patch_size": 4,
+        "pooling_kernel_size": 2, "resample": 3, "rescale_factor": 0.00392156862745098,
+        "return_metadata": false, "video_processor_type": "EmbeddingGemma2VideoProcessor"}}
+    }}"#
     )
 }

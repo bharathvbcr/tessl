@@ -235,6 +235,27 @@ pub extern "C" fn tessl_abi_version() -> u32 {
     TESSL_ABI_VERSION
 }
 
+/// `torch.nn.utils.clip_grad_norm_`'s coefficient for a global gradient norm
+/// `total_norm` (the square root of [`tessl_qwen35_grad_sq_norm`]'s value) and
+/// a bound `max_norm`, in torch's f32 arithmetic: both inputs rounded to f32,
+/// `reciprocal(total_norm + 1e-6) * max_norm` (what `max_norm / tensor` is in
+/// torch: `Tensor.__rtruediv__` multiplies the reciprocal, which differs from a
+/// division in the last bit for about one input in eight), clamped to at
+/// most one. A NaN norm gives NaN, as `torch.clamp` does. Pass the result as
+/// [`tessl_qwen35_adamw_step`]'s `grad_scale` and scale any gradients outside
+/// tessl by it too. No handle, no failure: a pure function, like
+/// [`tessl_abi_version`].
+#[no_mangle]
+pub extern "C" fn tessl_clip_coef(total_norm: f64, max_norm: f64) -> f32 {
+    let norm = total_norm as f32;
+    let coef = (1.0f32 / (norm + 1e-6f32)) * (max_norm as f32);
+    if coef > 1.0 {
+        1.0
+    } else {
+        coef
+    }
+}
+
 /// Whether the runtime is poisoned (an encode, submit or GPU fault latched
 /// it; every later call on it is refused), written as 1 or 0 to `*out`.
 ///

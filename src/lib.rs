@@ -82,8 +82,10 @@
 //! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
 //! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
 //! | [`embedgemma2_tok`] | EmbeddingGemma 2's tokenizer in Rust: the snapshot's BPE `tokenizer.json`, the ids sentence-transformers feeds the model, decode |
+//! | [`media`] | Native image, audio and video decoding for EmbeddingGemma 2 through ImageIO, AudioToolbox and AVFoundation: a file or its bytes to the raw inputs `embedgemma2_pre` takes |
+//! | [`embedgemma2_media`] | An image, audio or video file (or its bytes) to the towers' inputs: `media` decoding then `embedgemma2_pre` preprocessing, one medium at a time |
 //! | [`capi`] | The C ABI (`libtessl.dylib`) that `python/tessl_torch` calls through `ctypes` |
-//! | [`capi_embedgemma2`] | The C ABI's EmbeddingGemma 2 entries: load a snapshot, embed token ids |
+//! | [`capi_embedgemma2`] | The C ABI's EmbeddingGemma 2 entries: load a snapshot, embed text, token ids, raw media, files and bytes, and text interleaved with media |
 //!
 //! # Encode model
 //!
@@ -242,6 +244,7 @@ pub mod decode_icb;
 pub mod dispatch;
 pub mod embedgemma2;
 pub mod embedgemma2_audio;
+pub mod embedgemma2_media;
 pub mod embedgemma2_mm;
 pub mod embedgemma2_pre;
 pub mod embedgemma2_tok;
@@ -252,6 +255,7 @@ pub mod icb_smoke;
 pub mod infer_trace;
 mod json;
 mod loader;
+pub mod media;
 #[cfg(feature = "quant-prep")]
 pub mod mtl_tensor;
 pub mod nn;

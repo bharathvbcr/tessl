@@ -39,8 +39,16 @@ const MEASURED_INT4_SIGNED: bool = true;
 
 /// Compile `source` to a metallib with the flags `build.rs` uses (no -Werror).
 fn compile_metallib(tag: &str, source: &str) -> Vec<u8> {
+    /// Removes the scratch dir on every exit path, including a panic.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let dir = std::env::temp_dir().join(format!("tessl-int4b-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let _cleanup = RemoveOnDrop(dir.clone());
     let src = dir.join("k.metal");
     let air = dir.join("k.air");
     let lib = dir.join("k.metallib");
@@ -75,9 +83,7 @@ fn compile_metallib(tag: &str, source: &str) -> Vec<u8> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let bytes = std::fs::read(&lib).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    bytes
+    std::fs::read(&lib).unwrap()
 }
 
 fn load_kernels(rt: &GpuRuntime, tag: &str, source: &str) {
@@ -274,50 +280,20 @@ struct Case {
     n: usize,
     k: usize,
     group: usize,
+    /// Seeded random f32 activations instead of multiples of 1/64.
+    random: bool,
 }
 
-#[derive(Default)]
-struct Stats {
-    max_abs: f64,
-    max_rel: f64,
-    /// Largest `err / (gamma_n * S)`: 1.0 means the derived bound is exactly met.
-    max_bound_frac: f64,
-}
-
-impl Stats {
-    fn add(&mut self, got: f64, want: f64, bound: f64) {
-        let e = (got - want).abs();
-        self.max_abs = self.max_abs.max(e);
-        self.max_rel = self.max_rel.max(e / want.abs().max(1.0));
-        self.max_bound_frac = self.max_bound_frac.max(e / bound);
-    }
-}
-
-fn run_case(rt: &std::sync::Arc<GpuRuntime>, c: &Case) -> (Stats, Stats, Stats) {
-    let &Case { m, n, k, group } = c;
+/// f64 reference for activations `x` (what one path actually loads): the
+/// product, the per-output magnitude `S = sum_g |s| sum|q x| + |b| sum|x|`,
+/// and the per-group `xsum` (rounded to f32 as the TensorOps kernel reads it).
+fn reference(
+    x: &[f32],
+    nibbles: &[u8],
+    sb: &[f32],
+    (m, n, k, group): (usize, usize, usize, usize),
+) -> (Vec<f64>, Vec<f64>, Vec<f32>) {
     let groups = k / group;
-    let mut rng = SplitMix::new(0x4b17 ^ (m * 1000003 + n * 4099 + k * 17 + group) as u64);
-
-    // Activations: multiples of 1/64 in [-1, 1]. 7 significant bits, so exact in
-    // both half (11) and bf16 (8): the TensorOps path and the simd path read
-    // bit-identical operands, and every product x*q (q <= 15) is exact in f32.
-    let x: Vec<f32> = (0..m * k).map(|_| (rng.unit() * 64.0).round() / 64.0).collect();
-    let nibbles: Vec<u8> = (0..n * k).map(|_| (rng.range(0, 15)) as u8).collect();
-    // bf16-valued scale in ~[0.01, 0.05], bias in ~[-0.5, 0.1]; rounded through
-    // bf16 so the CPU reference sees the loaded values.
-    let sb_f32: Vec<f32> = (0..n * groups * 2)
-        .map(|i| {
-            let u = (rng.unit() + 1.0) * 0.5;
-            if i % 2 == 0 {
-                0.01 + 0.04 * u
-            } else {
-                -0.5 + 0.6 * u
-            }
-        })
-        .collect();
-    let sb = round_trip_bf16(&sb_f32);
-
-    // CPU f64 reference and the magnitude S that drives the error bound.
     let mut want = vec![0.0f64; m * n];
     let mut s_mag = vec![0.0f64; m * n];
     let mut xsum = vec![0.0f32; m * groups];
@@ -348,6 +324,78 @@ fn run_case(rt: &std::sync::Arc<GpuRuntime>, c: &Case) -> (Stats, Stats, Stats) 
             s_mag[mi * n + ni] = mag;
         }
     }
+    (want, s_mag, xsum)
+}
+
+#[derive(Default)]
+struct Stats {
+    max_abs: f64,
+    max_rel: f64,
+    /// Largest `err / (gamma_n * S)`: 1.0 means the derived bound is exactly met.
+    max_bound_frac: f64,
+}
+
+impl Stats {
+    fn add(&mut self, got: f64, want: f64, bound: f64) {
+        let e = (got - want).abs();
+        self.max_abs = self.max_abs.max(e);
+        self.max_rel = self.max_rel.max(e / want.abs().max(1.0));
+        self.max_bound_frac = self.max_bound_frac.max(e / bound);
+    }
+}
+
+fn run_case(rt: &std::sync::Arc<GpuRuntime>, c: &Case) -> (Stats, Stats, Stats) {
+    let &Case { m, n, k, group, random } = c;
+    let groups = k / group;
+    let mut rng = SplitMix::new(0x4b17 ^ (m * 1000003 + n * 4099 + k * 17 + group) as u64);
+
+    // Exact cases: multiples of 1/64 in [-1, 1]. 7 significant bits, so exact in
+    // both half (11) and bf16 (8): the TensorOps path and the simd path read
+    // bit-identical operands, and every product x*q (q <= 15) is exact in f32.
+    // Random case: f32 in [-1, 1), pushed away from zero to |x| >= 2^-10 so the
+    // half rounding stays in its normal range (relative error u_h, no subnormal
+    // absolute term). The TensorOps path loads x rounded to half, the simd path
+    // (gemm_q4_mlx takes a bf16 activation buffer) loads x rounded to bf16.
+    let x: Vec<f32> = (0..m * k)
+        .map(|_| {
+            let v = rng.unit();
+            if !random {
+                (v * 64.0).round() / 64.0
+            } else if v.abs() < 2f32.powi(-10) {
+                2f32.powi(-10).copysign(v)
+            } else {
+                v
+            }
+        })
+        .collect();
+    let x_half: Vec<f32> = f32_slice_to_f16(&x)
+        .into_iter()
+        .map(tessl::tensor::f16_bits_to_f32)
+        .collect();
+    let x_bf16 = round_trip_bf16(&x);
+    let nibbles: Vec<u8> = (0..n * k).map(|_| (rng.range(0, 15)) as u8).collect();
+    // bf16-valued scale in ~[0.01, 0.05], bias in ~[-0.5, 0.1]; rounded through
+    // bf16 so the CPU reference sees the loaded values.
+    let sb_f32: Vec<f32> = (0..n * groups * 2)
+        .map(|i| {
+            let u = (rng.unit() + 1.0) * 0.5;
+            if i % 2 == 0 {
+                0.01 + 0.04 * u
+            } else {
+                -0.5 + 0.6 * u
+            }
+        })
+        .collect();
+    let sb = round_trip_bf16(&sb_f32);
+
+    // f64 references over the exact values each path loads, the magnitudes S
+    // that drive the error bounds, and S over the unrounded x for the operand
+    // term below. The TensorOps kernel reads `xsum` from the host: it is the
+    // sum of the half-rounded activations.
+    let dims = (m, n, k, group);
+    let (want_h, s_h, xsum) = reference(&x_half, &nibbles, &sb, dims);
+    let (want_b, s_b, _) = reference(&x_bf16, &nibbles, &sb, dims);
+    let (_, s_x, _) = reference(&x, &nibbles, &sb, dims);
 
     // Shared bank bytes: tessl's row-major Q4MlxBank, low nibble first.
     let packed = pack_nibbles(&nibbles);
@@ -358,6 +406,7 @@ fn run_case(rt: &std::sync::Arc<GpuRuntime>, c: &Case) -> (Stats, Stats, Stats) 
     // TensorOps path.
     let a = rt.alloc_buffer(m * k * 2).unwrap();
     a.write_f16_bits(&f32_slice_to_f16(&x));
+    // (f32_slice_to_f16 of x is exactly `x_half`, which the reference used.)
     let xs = common::buf(rt, &xsum);
     let c_buf = seeded(rt, m * n, -7.7e28);
     let p = rt.pipeline(&format!("int4b_mlx_g{group}")).unwrap();
@@ -417,16 +466,30 @@ fn run_case(rt: &std::sync::Arc<GpuRuntime>, c: &Case) -> (Stats, Stats, Stats) 
     // gamma_t = t*u / (1 - t*u), u = 2^-24, whatever the summation order
     // (simd_sum tree, matmul2d internal order, fma contraction). The operand
     // products are exact (7-bit x times 4-bit q fit f32; bf16 s,b are f32
-    // values), so no operand-rounding term enters.
+    // values), so no operand-rounding term enters against a reference built
+    // from the values that path loads (half x for TensorOps, bf16 x for simd):
+    // a half x has 11 significant bits and a bf16 x 8, times q <= 15 (4 bits),
+    // so each product still fits f32's 24.
+    //
+    // TensorOps vs simd read DIFFERENT roundings of x, so the two f64 targets
+    // differ by more than float noise. With u_h = 2^-11 (half) and u_b = 2^-8
+    // (bf16), |x_h - x| <= u_h |x| and |x_b - x| <= u_b |x| (x >= 2^-10, normal
+    // half range), hence |x_h - x_b| <= (u_h + u_b) |x|. Since the products
+    // are linear in x, |want_h - want_b| <= sum_g (|s| sum|q| |x_h - x_b|
+    // + |b| sum|x_h - x_b|) <= (u_h + u_b) * S_x. Then
+    //   |TO - simd| <= gamma S_h + gamma S_b + (u_h + u_b) S_x.
+    // For the exact cases x_h = x_b = x, the last term is dropped and
+    // S_h = S_b, which is the previous 2 * gamma * S.
     let terms = (k + 2 * groups) as f64;
     let u = 2f64.powi(-24);
     let gamma = terms * u / (1.0 - terms * u);
+    let (u_h, u_b) = (2f64.powi(-11), 2f64.powi(-8));
     let (mut t_ref, mut s_ref, mut t_s) = (Stats::default(), Stats::default(), Stats::default());
     for i in 0..m * n {
-        let b1 = gamma * s_mag[i];
-        t_ref.add(tensorops[i] as f64, want[i], b1);
-        s_ref.add(simd[i] as f64, want[i], b1);
-        t_s.add(tensorops[i] as f64, simd[i] as f64, 2.0 * b1);
+        t_ref.add(tensorops[i] as f64, want_h[i], gamma * s_h[i]);
+        s_ref.add(simd[i] as f64, want_b[i], gamma * s_b[i]);
+        let operand = if random { (u_h + u_b) * s_x[i] } else { 0.0 };
+        t_s.add(tensorops[i] as f64, simd[i] as f64, gamma * (s_h[i] + s_b[i]) + operand);
     }
     (t_ref, s_ref, t_s)
 }
@@ -441,7 +504,16 @@ fn tensorops_mlx_q4_matches_gemm_q4_mlx_and_the_f64_reference() {
             for m in [1usize, 8, 33] {
                 for n in [32usize, 64] {
                     for k in [64usize, 128] {
-                        let (t_ref, s_ref, t_s) = run_case(rt, &Case { m, n, k, group });
+                        let (t_ref, s_ref, t_s) = run_case(
+                            rt,
+                            &Case {
+                                m,
+                                n,
+                                k,
+                                group,
+                                random: false,
+                            },
+                        );
                         let line = format!(
                             "M={m} N={n} K={k} G={group}: TO-vs-f64 abs {:.3e} rel {:.3e} ({:.3} of bound); \
                              simd-vs-f64 abs {:.3e} rel {:.3e} ({:.3}); TO-vs-simd abs {:.3e} rel {:.3e} ({:.3} of 2x bound)",
@@ -465,6 +537,47 @@ fn tensorops_mlx_q4_matches_gemm_q4_mlx_and_the_f64_reference() {
             assert!(*a <= 1.0, "TensorOps exceeds the f32 error bound vs f64: {line}");
             assert!(*b <= 1.0, "simd path exceeds the f32 error bound vs f64: {line}");
             assert!(*c <= 1.0, "TensorOps vs simd exceeds twice the f32 bound: {line}");
+        }
+    });
+}
+
+/// Random f32 activations: half rounding on the TensorOps side, bf16 on the
+/// simd side. Each path is checked against an f64 reference built from the
+/// values it loads (within gamma_n * S); the two paths against each other
+/// within gamma (S_h + S_b) plus the derived operand-rounding term.
+#[test]
+fn tensorops_mlx_q4_with_random_activations_stays_within_the_derived_bounds() {
+    with_gpu(|rt| {
+        load_kernels(rt, "mlx32r", &mlx_group_src(32));
+        load_kernels(rt, "mlx64r", &mlx_group_src(64));
+        for group in [32usize, 64] {
+            let (t_ref, s_ref, t_s) = run_case(
+                rt,
+                &Case {
+                    m: 33,
+                    n: 64,
+                    k: 128,
+                    group,
+                    random: true,
+                },
+            );
+            eprintln!(
+                "random x M=33 N=64 K=128 G={group}: TO-vs-f64 abs {:.3e} ({:.3e} of bound); \
+                 simd-vs-f64 abs {:.3e} ({:.3e}); TO-vs-simd abs {:.3e} ({:.3e} of bound)",
+                t_ref.max_abs,
+                t_ref.max_bound_frac,
+                s_ref.max_abs,
+                s_ref.max_bound_frac,
+                t_s.max_abs,
+                t_s.max_bound_frac
+            );
+            assert!(t_ref.max_bound_frac <= 1.0, "TensorOps vs f64, G={group}");
+            assert!(s_ref.max_bound_frac <= 1.0, "simd vs f64, G={group}");
+            assert!(t_s.max_bound_frac <= 1.0, "TensorOps vs simd, G={group}");
+            assert!(
+                t_s.max_abs > 0.0,
+                "random activations must differ between half and bf16"
+            );
         }
     });
 }

@@ -651,7 +651,10 @@ fn qwen35_adamw_offsets_are_widened() {
             "const uint n = min(QWEN35_SQ_PIECE, s.width - c0);",
             "squared-norm piece length",
         ),
-        ("const float x = float(g[base + c]);", "squared-norm element"),
+        (
+            "const float x = c < n ? float(g[base + c]) : 0.0f;",
+            "squared-norm element",
+        ),
     ] {
         require(QWEN35_ADAMW, needle, what);
     }

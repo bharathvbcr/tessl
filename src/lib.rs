@@ -268,6 +268,7 @@ pub mod qwen35_params;
 pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
+pub mod sq_norm;
 pub mod tensor;
 
 pub use cb_replay::{

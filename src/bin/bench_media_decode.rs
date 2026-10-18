@@ -14,14 +14,18 @@
 //! (`mp4`) as `video_open` (`VideoSource::open`: the first pass, which reads the
 //! compressed samples to count frames and read their times), then twice under
 //! each colour path (`:exact`, the default: VideoToolbox planes converted by
-//! libswscale's arithmetic in Rust; `:bgra`: AVFoundation's own conversion) as
+//! libswscale's arithmetic in Rust on as many threads as the frame warrants;
+//! `:exact1`, the same on one thread; `:bgra`: AVFoundation's own conversion) as
 //! `video_sampled_N` (decoding the N frames the processor's 1 fps sampling
 //! picks, N being 9 for a 10 s clip) and `video_first_K` (decoding the first K
 //! = 30 frames, so the row divides into a cost per frame), each from a freshly
-//! opened source. A run in which a path fell back to the other is refused.
-//! `bench/make_video_bench_inputs.py` writes four clips for these rows
+//! opened source. A run in which a path ran the other's conversion is refused.
+//! `bench/make_video_bench_inputs.py` writes the clips for these rows
 //! (`BENCH_MEDIA_DIR=target/media_bench_video`), plotted by
-//! `plot_results video-color`.
+//! `plot_results video-color`. With `BENCH_YUV=1` the converter alone is timed too,
+//! on random 720p and 1080p planes of four layouts, single-threaded and threaded
+//! (`yuv:LAYOUT_WxH:single|threads`, one frame each; the threaded output is
+//! checked equal to the single-threaded one first); `video-color` does not draw those.
 //!
 //! `BENCH_ITERS` (default 10) and `BENCH_WARMUP` (default 2) are per workload.
 //! Prints a table, then one JSON array on the last stdout line: `{workload,
@@ -38,6 +42,7 @@ use tessl::embedgemma2_pre::PreConfig;
 use tessl::media::audio::{decode_audio_file, AudioOptions};
 use tessl::media::image::{decode_image_file, ImageOptions};
 use tessl::media::video::{ColorPath, Conversion, VideoOptions, VideoSource};
+use tessl::media::yuv::{to_rgb24, Chroma, Layout, Matrix, Params, Picture, Range, Sample, Threads};
 
 struct Row {
     workload: String,
@@ -80,13 +85,100 @@ fn time(warmup: usize, iters: usize, mut f: impl FnMut() -> Result<(), String>) 
 const FIRST_FRAMES: usize = 30;
 
 /// A timing is only a timing of the path it names: refuse a run in which the
-/// exact path fell back to AVFoundation's conversion (a stream it does not
-/// cover) or the other way round.
+/// exact path ran AVFoundation's conversion or the other way round (the exact path
+/// refuses streams it cannot convert exactly, so this guards the `bgra` rows).
 fn check_path(got: &Conversion, exact: bool) -> Result<(), String> {
     match (got, exact) {
         (Conversion::Swscale { .. }, true) | (Conversion::AvFoundation, false) => Ok(()),
         _ => Err(format!("the {} path ran {got:?}", if exact { "exact" } else { "bgra" })),
     }
+}
+
+/// The converter alone (no decode) on random planes of one layout and size: the
+/// single-threaded converter and the threaded one, rows `yuv:LAYOUT_WxH:single` and
+/// `yuv:LAYOUT_WxH:threads`, one frame each. The two must give the same bytes.
+fn convert_rows(warmup: usize, iters: usize, rows: &mut Vec<Row>) -> Result<(), String> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |max: u32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 33) as u32 % max
+    };
+    for (w, h) in [(1280usize, 720usize), (1920, 1080)] {
+        for (label, chroma, depth) in [
+            ("420_8bit", Chroma::C420, 8u8),
+            ("420_10bit", Chroma::C420, 10),
+            ("422_10bit", Chroma::C422, 10),
+            ("444_8bit", Chroma::C444, 8),
+        ] {
+            let (cw, ch) = match chroma {
+                Chroma::C420 => (w / 2, h / 2),
+                Chroma::C422 => (w / 2, h),
+                Chroma::C444 => (w, h),
+            };
+            let (luma, pairs) = (w * h, 2 * cw * ch);
+            let max = 1u32 << depth;
+            let name = format!("yuv:{label}_{w}x{h}");
+            if depth == 8 {
+                let y: Vec<u8> = (0..luma).map(|_| next(max) as u8).collect();
+                let uv: Vec<u8> = (0..pairs).map(|_| next(max) as u8).collect();
+                time_converter(&name, (w, h, chroma, depth), (&y, &uv), (warmup, iters), rows)?;
+            } else {
+                let y: Vec<u16> = (0..luma).map(|_| next(max) as u16).collect();
+                let uv: Vec<u16> = (0..pairs).map(|_| next(max) as u16).collect();
+                time_converter(&name, (w, h, chroma, depth), (&y, &uv), (warmup, iters), rows)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One picture under both thread settings: the rows `NAME:single` and `NAME:threads`.
+fn time_converter<T: Sample>(
+    name: &str,
+    (w, h, chroma, depth): (usize, usize, Chroma, u8),
+    (y, uv): (&[T], &[T]),
+    (warmup, iters): (usize, usize),
+    rows: &mut Vec<Row>,
+) -> Result<(), String> {
+    let picture = Picture {
+        width: w,
+        height: h,
+        layout: Layout { chroma, depth },
+        y,
+        y_stride: w,
+        uv,
+        uv_stride: if chroma == Chroma::C444 { 2 * w } else { w },
+    };
+    let run = |threads| {
+        to_rgb24(
+            &picture,
+            &Params {
+                threads,
+                ..Params::new(Matrix::Bt709, Range::Limited)
+            },
+        )
+    };
+    let reference = run(Threads::Single).map_err(|e| e.to_string())?;
+    if run(Threads::Auto).map_err(|e| e.to_string())? != reference {
+        return Err(format!("{name}: the threaded converter changed a byte"));
+    }
+    for (path, threads) in [("single", Threads::Single), ("threads", Threads::Auto)] {
+        let (min, med) = time(warmup, iters, || {
+            black_box(run(threads).map_err(|e| e.to_string())?);
+            Ok(())
+        })?;
+        rows.push(Row {
+            workload: format!("{name}:{path}"),
+            ms_min: min,
+            ms_median: med,
+            iters,
+            units: 1.0,
+            unit: "frame",
+        });
+    }
+    Ok(())
 }
 
 fn run() -> Result<(), String> {
@@ -174,11 +266,12 @@ fn run() -> Result<(), String> {
                 // frames the processor's sampling picks; `first` the first
                 // FIRST_FRAMES, so the rows divide into a cost per frame.
                 let first: Vec<usize> = (0..total.min(FIRST_FRAMES)).collect();
-                for (label, color, conversion_is_exact) in [
-                    ("exact", ColorPath::default(), true),
-                    ("bgra", ColorPath::AvFoundation, false),
+                for (label, color, threads, conversion_is_exact) in [
+                    ("exact1", ColorPath::default(), Threads::Single, true),
+                    ("exact", ColorPath::default(), Threads::Auto, true),
+                    ("bgra", ColorPath::AvFoundation, Threads::Auto, false),
                 ] {
-                    let opts = VideoOptions { color, ..opts };
+                    let opts = VideoOptions { color, threads, ..opts };
                     let mut sampled = 0usize;
                     let (min, med) = time(warmup, iters, || {
                         let v = VideoSource::open(path, &opts).map_err(|e| e.to_string())?;
@@ -215,6 +308,9 @@ fn run() -> Result<(), String> {
             }
             _ => eprintln!("skipping {name}: not a media extension this bench knows"),
         }
+    }
+    if std::env::var_os("BENCH_YUV").is_some() {
+        convert_rows(warmup, iters, &mut rows)?;
     }
     println!(
         "{:44} {:>10} {:>10} {:>8} {:>12}",

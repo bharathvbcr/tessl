@@ -1,16 +1,20 @@
 //! Decoding a track's compressed samples with VideoToolbox, to the decoder's own
-//! 8-bit 4:2:0 planes.
+//! planes: 8 or 10 bits, 4:2:0, 4:2:2 or 4:4:4 (the six bi-planar formats of each
+//! depth in `CVPixelBuffer.h`; the stream's own, never a converted one).
 //!
 //! # Why not `AVAssetReader` for this
 //!
 //! `AVAssetReaderTrackOutput` can vend decoded `420v`/`420f` pixel buffers, and
 //! their luma is the decoder's. Their chroma is not: against FFmpeg's decode of
-//! the same file (and against the source of a lossless stream), 8 to 15 percent
-//! of the chroma samples differ, by up to 70 levels at colour edges and by one or
-//! two in gradients, for H.264 and HEVC, with deblocking off, on intra-only
-//! streams, and with `AVVideoColorPropertiesKey` set. The reader post-processes
-//! the decoder's output (it is not siting: no whole-sample shift lines the planes
-//! up). The same decoder driven directly returns FFmpeg's bytes: FFmpeg's own
+//! the same file (and against the source of a lossless stream), many chroma
+//! samples differ, by up to 45 levels at colour edges and by one or two in
+//! gradients, for H.264 and HEVC, with deblocking off, on intra-only streams, and
+//! with `AVVideoColorPropertiesKey` set. The reader resamples the chroma to the
+//! `BottomLeft` location (measured: a stream tagged `BottomLeft` comes out
+//! unchanged, one tagged `Left` is moved a quarter chroma row by a three-tap kernel
+//! of about 0.06, 0.62, 0.31; `Center` moves in both directions; see "Why
+//! AVAssetReader's chroma differs" in `docs/embedgemma2.md`). The same decoder
+//! driven directly returns FFmpeg's bytes: FFmpeg's own
 //! `-hwaccel videotoolbox` output is byte-identical to its software decode, and so
 //! is this module's (`tests/media_video_exact.rs`).
 //!
@@ -29,18 +33,40 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 
 use super::cf::{CFDictionaryGetValue, CFGetTypeID, CFNumberGetTypeID, CFNumberGetValue, CfRef, CfTypeRef};
-use super::video::{CmTime, Nv12Frame};
+use super::video::{CmTime, NativeFrame, Samples};
+use super::yuv::{Chroma, Layout};
 use super::MediaError;
 
 /// `kCFNumberFloat64Type`.
 const CF_NUMBER_FLOAT64_TYPE: isize = 6;
 /// `kCVPixelBufferLock_ReadOnly`.
 const LOCK_READ_ONLY: u64 = 1;
-/// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` ('420v') and `FullRange` ('420f').
-pub(super) const FORMAT_420V: u32 = u32::from_be_bytes(*b"420v");
-pub(super) const FORMAT_420F: u32 = u32::from_be_bytes(*b"420f");
 /// `kVTDecodeInfo_FrameDropped`.
 const INFO_FRAME_DROPPED: u32 = 1 << 1;
+
+/// The bi-planar pixel format of `CVPixelBuffer.h` that holds a stream of this
+/// layout in the stream's own range. 8-bit: `kCVPixelFormatType_420YpCbCr8BiPlanar`
+/// `VideoRange`/`FullRange` ('420v', '420f'), the 4:2:2 ('422v', '422f') and 4:4:4
+/// ('444v', '444f') kin. 10-bit (`420YpCbCr10BiPlanar...`, each sample in the
+/// 10 most significant bits of a 16-bit word): 'x420', 'xf20', 'x422', 'xf22',
+/// 'x444', 'xf44'.
+pub(super) fn pixel_format(layout: Layout, full_range: bool) -> u32 {
+    let code: &[u8; 4] = match (layout.depth, layout.chroma, full_range) {
+        (8, Chroma::C420, false) => b"420v",
+        (8, Chroma::C420, true) => b"420f",
+        (8, Chroma::C422, false) => b"422v",
+        (8, Chroma::C422, true) => b"422f",
+        (8, Chroma::C444, false) => b"444v",
+        (8, Chroma::C444, true) => b"444f",
+        (_, Chroma::C420, false) => b"x420",
+        (_, Chroma::C420, true) => b"xf20",
+        (_, Chroma::C422, false) => b"x422",
+        (_, Chroma::C422, true) => b"xf22",
+        (_, Chroma::C444, false) => b"x444",
+        (_, Chroma::C444, true) => b"xf44",
+    };
+    u32::from_be_bytes(*code)
+}
 
 #[link(name = "VideoToolbox", kind = "framework")]
 extern "C" {
@@ -100,7 +126,7 @@ struct Shared {
     pts: Vec<i64>,
     /// Which frames to copy out.
     wanted: Vec<bool>,
-    frames: Vec<Option<Nv12Frame>>,
+    frames: Vec<Option<NativeFrame>>,
     outputs: usize,
     /// The first failure, as text.
     error: Option<String>,
@@ -112,6 +138,8 @@ pub(super) struct Decoder {
     session: CfRef,
     description: CfTypeRef,
     shared: Arc<Mutex<Shared>>,
+    layout: Layout,
+    full_range: bool,
 }
 
 impl Drop for Decoder {
@@ -132,10 +160,17 @@ fn framework(api: &'static str, detail: impl Into<String>) -> MediaError {
 
 impl Decoder {
     /// A session for the track `first` (a `CMSampleBufferRef`) belongs to,
-    /// decoding to pixel format `format` ([`FORMAT_420V`] or [`FORMAT_420F`]).
-    /// `pts` are the presentation times of the track's frames in presentation
-    /// order, `wanted` which of them to keep.
-    pub(super) fn new(first: CfTypeRef, format: u32, pts: Vec<i64>, wanted: Vec<bool>) -> Result<Decoder, MediaError> {
+    /// decoding to the stream's own pixel format ([`pixel_format`] of `layout`
+    /// and `full_range`). `pts` are the presentation times of the track's frames
+    /// in presentation order, `wanted` which of them to keep.
+    pub(super) fn new(
+        first: CfTypeRef,
+        layout: Layout,
+        full_range: bool,
+        pts: Vec<i64>,
+        wanted: Vec<bool>,
+    ) -> Result<Decoder, MediaError> {
+        let format = pixel_format(layout, full_range);
         // SAFETY: `first` is a live CMSampleBuffer; the format description is
         // borrowed from it and kept alive by the caller's samples.
         let description = unsafe { CMSampleBufferGetFormatDescription(first) };
@@ -176,12 +211,15 @@ impl Decoder {
                 outputs: 0,
                 error: None,
             })),
+            layout,
+            full_range,
         })
     }
 
     /// Decode one compressed sample. Samples must come in decode order and share
     /// the first one's format description.
-    pub(super) fn decode(&mut self, sample: CfTypeRef, format: u32) -> Result<(), MediaError> {
+    pub(super) fn decode(&mut self, sample: CfTypeRef) -> Result<(), MediaError> {
+        let (layout, full_range) = (self.layout, self.full_range);
         // SAFETY: `sample` is a live CMSampleBuffer.
         let description = unsafe { CMSampleBufferGetFormatDescription(sample) };
         // SAFETY: both are live CMFormatDescriptions (the session's was borrowed
@@ -234,7 +272,7 @@ impl Decoder {
                         if guard.frames[index].is_some() {
                             return Err(format!("frame {index} came out twice"));
                         }
-                        guard.frames[index] = Some(copy_planes(image, format)?);
+                        guard.frames[index] = Some(copy_planes(image, layout, full_range)?);
                     }
                     Ok(())
                 })();
@@ -280,7 +318,7 @@ impl Decoder {
     }
 
     /// Wait for the last frames and return the kept ones, indexed by presentation order.
-    pub(super) fn finish(self) -> Result<Vec<Option<Nv12Frame>>, MediaError> {
+    pub(super) fn finish(self) -> Result<Vec<Option<NativeFrame>>, MediaError> {
         // SAFETY: the session is live.
         let status = unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr()) };
         if status != 0 {
@@ -365,7 +403,11 @@ unsafe fn dict_f64(dict: CfTypeRef, key: CfTypeRef) -> Option<f64> {
 
 /// The rectangle of a decoded buffer that is the picture: the clean aperture the
 /// decoder attaches (H.264 and HEVC cropping), or the whole buffer without one.
-fn picture_rect(image: CfTypeRef, coded: (usize, usize)) -> Result<(usize, usize, usize, usize), String> {
+fn picture_rect(
+    image: CfTypeRef,
+    coded: (usize, usize),
+    (sub_w, sub_h): (usize, usize),
+) -> Result<(usize, usize, usize, usize), String> {
     // SAFETY: `image` is live; the attachment is +1 or NULL and is held by a `CfRef`.
     let aperture = unsafe {
         CfRef::take(CVBufferCopyAttachment(
@@ -404,17 +446,77 @@ fn picture_rect(image: CfTypeRef, coded: (usize, usize)) -> Result<(usize, usize
         w.round() as usize,
         h.round() as usize,
     );
-    if x0 + w > coded.0 || y0 + h > coded.1 || x0 % 2 != 0 || y0 % 2 != 0 || w % 2 != 0 || h % 2 != 0 {
+    // The rectangle must start and end on chroma samples: H.264 and HEVC crop in
+    // units of the chroma sample, so a conforming stream does.
+    if x0 + w > coded.0 || y0 + h > coded.1 || x0 % sub_w != 0 || y0 % sub_h != 0 || w % sub_w != 0 || h % sub_h != 0 {
         return Err(format!(
-            "the clean aperture {w}x{h} at ({x0}, {y0}) does not fit a {}x{} 4:2:0 buffer",
+            "the clean aperture {w}x{h} at ({x0}, {y0}) does not fit a {}x{} buffer whose chroma is subsampled by {sub_w}x{sub_h}",
             coded.0, coded.1
         ));
     }
     Ok((x0, y0, w, h))
 }
 
-/// The picture rectangle of a decoded NV12 buffer, copied out tightly packed.
-fn copy_planes(image: CfTypeRef, format: u32) -> Result<Nv12Frame, String> {
+/// Chroma subsampling factors `(horizontal, vertical)` of a layout.
+fn subsampling(chroma: Chroma) -> (usize, usize) {
+    match chroma {
+        Chroma::C420 => (2, 2),
+        Chroma::C422 => (2, 1),
+        Chroma::C444 => (1, 1),
+    }
+}
+
+/// A rectangle of one locked plane as samples: `rows` rows of `per_row` samples
+/// starting at row `row0`, sample `col0`. 8-bit planes are bytes; deeper ones are
+/// 16-bit words with the sample in the high bits (`depth` of them), returned
+/// right-aligned, and a word with a non-zero low part is an error.
+///
+/// # Safety
+/// The plane must be locked, hold at least `row0 + rows` rows of `stride` bytes,
+/// and each row at least `col0 + per_row` samples.
+unsafe fn read_plane(
+    base: *const u8,
+    stride: usize,
+    (row0, rows): (usize, usize),
+    (col0, per_row): (usize, usize),
+    depth: u8,
+) -> Result<Samples, String> {
+    if depth == 8 {
+        let mut out = Vec::with_capacity(rows * per_row);
+        for r in 0..rows {
+            // SAFETY: the caller guarantees the row holds `col0 + per_row` bytes.
+            out.extend_from_slice(std::slice::from_raw_parts(
+                base.add((row0 + r) * stride + col0),
+                per_row,
+            ));
+        }
+        return Ok(Samples::U8(out));
+    }
+    let shift = 16 - u32::from(depth);
+    let mut out = Vec::with_capacity(rows * per_row);
+    let mut low = 0u16;
+    for r in 0..rows {
+        let row = base.add((row0 + r) * stride + col0 * 2);
+        for i in 0..per_row {
+            // SAFETY: the caller guarantees `col0 + per_row` words in the row; the
+            // read is unaligned-safe.
+            let word = row.add(i * 2).cast::<u16>().read_unaligned();
+            low |= word & ((1 << shift) - 1);
+            out.push(word >> shift);
+        }
+    }
+    if low != 0 {
+        return Err(format!(
+            "a {depth}-bit sample word has bits set below its {depth} high bits ({low:#06x})"
+        ));
+    }
+    Ok(Samples::U16(out))
+}
+
+/// The picture rectangle of a decoded bi-planar buffer, copied out tightly packed
+/// (planes `Y` and interleaved `CbCr`), deeper-than-8-bit samples right-aligned.
+fn copy_planes(image: CfTypeRef, layout: Layout, full_range: bool) -> Result<NativeFrame, String> {
+    let format = pixel_format(layout, full_range);
     // SAFETY: `image` is a live CVPixelBuffer for the handler's duration.
     let (got, cw, ch, planes) = unsafe {
         (
@@ -428,9 +530,10 @@ fn copy_planes(image: CfTypeRef, format: u32) -> Result<Nv12Frame, String> {
         return Err(format!("the decoder returned pixel format {got:#x}, not {format:#x}"));
     }
     if planes != 2 {
-        return Err(format!("an NV12 buffer has {planes} planes, not 2"));
+        return Err(format!("a bi-planar buffer has {planes} planes, not 2"));
     }
-    let (x0, y0, w, h) = picture_rect(image, (cw, ch))?;
+    let (sub_w, sub_h) = subsampling(layout.chroma);
+    let (x0, y0, w, h) = picture_rect(image, (cw, ch), (sub_w, sub_h))?;
     // SAFETY: as above.
     let dims = |p: usize| unsafe {
         (
@@ -438,13 +541,16 @@ fn copy_planes(image: CfTypeRef, format: u32) -> Result<Nv12Frame, String> {
             CVPixelBufferGetHeightOfPlane(image, p),
         )
     };
-    if dims(0) != (cw, ch) || dims(1) != (cw.div_ceil(2), ch.div_ceil(2)) {
+    let (ccw, cch) = (cw.div_ceil(sub_w), ch.div_ceil(sub_h));
+    if dims(0) != (cw, ch) || dims(1) != (ccw, cch) {
         return Err(format!(
-            "NV12 planes are {:?} and {:?} for a {cw}x{ch} buffer",
+            "the planes are {:?} and {:?} for a {cw}x{ch} {:?} buffer",
             dims(0),
-            dims(1)
+            dims(1),
+            layout.chroma
         ));
     }
+    let bytes = if layout.depth == 8 { 1 } else { 2 };
     let lock = Lock::new(image)?;
     // SAFETY: the buffer is locked (`lock`), so the plane base addresses and
     // strides are valid until it drops at the end of this function.
@@ -456,29 +562,35 @@ fn copy_planes(image: CfTypeRef, format: u32) -> Result<Nv12Frame, String> {
             CVPixelBufferGetBytesPerRowOfPlane(image, 1),
         )
     };
-    if y_base.is_null() || uv_base.is_null() || y_stride < cw || uv_stride < cw {
+    if y_base.is_null() || uv_base.is_null() || y_stride < cw * bytes || uv_stride < 2 * ccw * bytes {
         return Err(format!(
             "the planes have no readable rows (strides {y_stride} and {uv_stride} for {cw} pixels)"
         ));
     }
-    let mut y = Vec::with_capacity(w * h);
-    for row in 0..h {
-        // SAFETY: the locked luma plane holds `ch >= y0 + h` rows of `y_stride >=
-        // cw >= x0 + w` bytes; this reads `w` bytes of row `y0 + row` from column `x0`.
-        y.extend_from_slice(unsafe { std::slice::from_raw_parts(y_base.add((y0 + row) * y_stride + x0), w) });
-    }
-    let mut uv = Vec::with_capacity(w * h / 2);
-    for row in 0..h / 2 {
-        // SAFETY: the chroma plane holds `ch / 2` rows of `uv_stride >= cw` bytes
-        // (Cb, Cr pairs for `cw / 2` chroma columns); the picture starts at byte
-        // `x0` (an even column, so a whole pair) of row `y0 / 2` and spans `w` bytes.
-        uv.extend_from_slice(unsafe { std::slice::from_raw_parts(uv_base.add((y0 / 2 + row) * uv_stride + x0), w) });
-    }
+    // SAFETY: the luma plane holds `ch >= y0 + h` rows of `y_stride >= cw * bytes
+    // >= (x0 + w) * bytes` bytes (the rectangle was checked to lie in the buffer);
+    // the chroma plane holds `cch` rows of `uv_stride >= 2 * ccw * bytes` bytes,
+    // `ccw` pairs each, and the rectangle starts on a chroma sample (`picture_rect`),
+    // so it spans `h / sub_h` rows of `w / sub_w` pairs from pair `x0 / sub_w` of
+    // row `y0 / sub_h`.
+    let (y, uv) = unsafe {
+        (
+            read_plane(y_base, y_stride, (y0, h), (x0, w), layout.depth)?,
+            read_plane(
+                uv_base,
+                uv_stride,
+                (y0 / sub_h, h / sub_h),
+                (2 * (x0 / sub_w), 2 * (w / sub_w)),
+                layout.depth,
+            )?,
+        )
+    };
     drop(lock);
-    Ok(Nv12Frame {
+    Ok(NativeFrame {
         width: w,
         height: h,
-        full_range: format == FORMAT_420F,
+        layout,
+        full_range,
         y,
         uv,
     })

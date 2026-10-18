@@ -4,9 +4,10 @@
 //! decoded 8-bit RGB frames, sampled the way
 //! [`crate::embedgemma2_pre::sample_frame_indices`] samples them, with the
 //! frame rate and duration the reference loader computes and each frame's
-//! presentation time. For 8-bit 4:2:0 streams the RGB is byte-equal to what
-//! the reference loader (transformers, through torchcodec, which converts with
-//! libswscale) produces; see `tests/media_video_exact.rs`.
+//! presentation time. For the H.264 and HEVC streams VideoToolbox decodes, in
+//! 8 or 10 bits and 4:2:0, 4:2:2 or 4:4:4, the RGB is byte-equal to what
+//! the `ffmpeg` CLI (libswscale, which torchcodec also converts with) produces;
+//! see `tests/media_video_exact.rs`.
 //!
 //! # How the frames are chosen
 //!
@@ -29,24 +30,32 @@
 //! # Colour
 //!
 //! AVFoundation's own decode (`AVAssetReader` with output settings) returns the
-//! right luma but altered chroma, so it is not used for 8-bit 4:2:0 streams
+//! right luma but altered chroma, so it is not used for H.264 and HEVC
 //! ([`ColorPath::Swscale`], the default). Their compressed samples go to a
-//! `VTDecompressionSession` directly (`vt.rs`), whose planes are byte-equal to
-//! FFmpeg's on H.264 and HEVC, and [`yuv::nv12_to_rgb24`] converts them with
-//! libswscale's arithmetic for the matrix and range the stream is tagged with
-//! (untagged means BT.601 limited, as libswscale does). Anything else
-//! (10-bit, 4:2:2, odd sizes, an unlisted matrix) is converted by AVFoundation
-//! to BGRA ([`Conversion::AvFoundation`] reports which path ran).
+//! `VTDecompressionSession` directly (`vt.rs`) in the stream's own pixel format
+//! (8 or 10 bits; 4:2:0, 4:2:2 or 4:4:4), whose planes are byte-equal to FFmpeg's,
+//! and [`yuv::to_rgb24`] converts them with libswscale's arithmetic for that format
+//! and the matrix and range the stream is tagged with (untagged means BT.601
+//! limited, as libswscale does). One class depends on a scaler setting libswscale
+//! takes from the caller: 10-bit 4:2:0 (the vertical chroma filter,
+//! [`VideoOptions::chroma_filter`], bicubic by default: torchcodec sets no scaler flags). A stream that cannot be converted exactly (another
+//! codec, 12-bit or monochrome video, a matrix [`yuv::Matrix`] does not hold, a
+//! shape libswscale does not define) is **refused by name** with
+//! [`MediaError::Unsupported`]; only an explicit [`ColorPath::AvFoundation`]
+//! converts it, with the system's arithmetic ([`Conversion::AvFoundation`]).
 //!
 //! # Rotation
 //!
 //! The frames come out as stored; the track's `preferredTransform` is applied
 //! by this module as one of the eight EXIF orientations ([`Rotation::Apply`],
-//! the default), after the colour conversion, which for even-sized 4:2:0 gives
-//! the same bytes as turning the planes first (a 90 degree turn or flip maps 2x2
-//! chroma blocks to 2x2 blocks); only the width-dependent choice of converter
-//! (see `yuv.rs`) could tell the orders apart. What torchcodec does with a
-//! rotation flag was not run. [`Rotation::Ignore`] returns the frames as stored.
+//! the default). The order relative to the colour conversion changes the bytes
+//! for 4:2:0, and is torchcodec's, for every layout: the stored picture is converted
+//! (the converter's choice depends on the stored width, and the 10-bit chroma filter
+//! on the stored rows) and the RGB is turned afterwards, because torchcodec makes a
+//! rotation a libavfilter transform after `format=rgb24,` (`yuv.rs`, "What the
+//! reference loader does with libswscale"). The `ffmpeg` CLI's autorotate turns 4:2:0
+//! planes first and differs (11,185 of 11,520 bytes on a 48x40 clip). Source read, not
+//! run: torchcodec was never executed here. [`Rotation::Ignore`] returns the frames as stored.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -60,8 +69,8 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2_foundation::{NSError, NSString, NSURL};
 
 use super::cf::{CFDataGetBytePtr, CFDataGetLength, CFDictionaryGetValue, CFGetTypeID, CfRef, CfTypeRef};
-use super::yuv::{self, Flavor, Matrix, Nv12, Range};
-use super::{containers, orient, vt, MediaError};
+use super::yuv::{self, Chroma, ChromaFilter, Flavor, Layout, Matrix, Params, Picture, Range, Threads};
+use super::{codec_config, containers, orient, vt, MediaError};
 use crate::embedgemma2_pre::{
     preprocess_video, sample_frame_indices, PreparedVideo, RawImage, VideoConfig, MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES,
 };
@@ -212,17 +221,18 @@ pub enum Rotation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorPath {
     /// Decode the compressed samples with VideoToolbox into the decoder's own
-    /// 8-bit 4:2:0 planes (see `vt.rs`) and convert them with
-    /// [`yuv::nv12_to_rgb24`], which reproduces libswscale byte for byte (what
-    /// torchcodec and the `ffmpeg` CLI compute), for the given converter
-    /// flavor. A stream that is not 8-bit 4:2:0, has odd dimensions, or whose
-    /// matrix is not one [`Matrix`] holds, is decoded to BGRA by AVFoundation
-    /// instead ([`Conversion::AvFoundation`] in the result says so).
+    /// planes (see `vt.rs`) and convert them with [`yuv::to_rgb24`], which
+    /// reproduces libswscale byte for byte (what torchcodec and the `ffmpeg` CLI
+    /// compute), for the given converter flavor. H.264 and HEVC at 8 or 10 bits and
+    /// 4:2:0, 4:2:2 or 4:4:4 are exact. A stream that cannot be (see the module
+    /// docs) is refused with [`MediaError::Unsupported`], naming why; it is never
+    /// converted approximately.
     Swscale(Flavor),
     /// AVFoundation's own decode and YCbCr to BGRA conversion (`AVAssetReader`
-    /// and CoreVideo). Its luma equals the decoder's, but its chroma does not
-    /// (8 to 15 percent of the chroma samples differ, by up to about 70, on
-    /// the fixtures), so this is not libswscale and not close to it either.
+    /// and CoreVideo), for any stream it decodes. Its luma equals the decoder's,
+    /// but its chroma does not (8 to 15 percent of the chroma samples differ, by up
+    /// to about 70, on the fixtures), so this is not libswscale and not close to it
+    /// either. Chosen explicitly, never as a fallback.
     AvFoundation,
 }
 
@@ -235,11 +245,14 @@ impl Default for ColorPath {
 /// Which conversion produced the frames of a [`DecodedVideo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conversion {
-    /// [`yuv::nv12_to_rgb24`] with this matrix, range and flavor.
+    /// [`yuv::to_rgb24`] with this layout, matrix, range and flavor (and, for
+    /// 10-bit 4:2:0, chroma filter).
     Swscale {
+        layout: Layout,
         matrix: Matrix,
         range: Range,
         flavor: Flavor,
+        filter: ChromaFilter,
     },
     /// AVFoundation's BGRA conversion.
     AvFoundation,
@@ -251,6 +264,11 @@ pub struct VideoOptions {
     pub rotation: Rotation,
     /// How decoded YCbCr becomes RGB.
     pub color: ColorPath,
+    /// The vertical chroma filter of 10-bit 4:2:0 under [`ColorPath::Swscale`]:
+    /// the scaler flag the reference uses (see `yuv.rs`; nothing else depends on it).
+    pub chroma_filter: ChromaFilter,
+    /// Threads converting a frame's rows (the bytes do not depend on it).
+    pub threads: Threads,
     /// The most frames [`VideoSource::decode_frames`] returns.
     pub max_frames: usize,
     /// The most bytes of RGB frames it returns.
@@ -264,6 +282,8 @@ impl Default for VideoOptions {
         Self {
             rotation: Rotation::Apply,
             color: ColorPath::default(),
+            chroma_filter: ChromaFilter::default(),
+            threads: Threads::default(),
             max_frames: 4096,
             max_bytes: 1 << 32,
             load_timeout: Duration::from_secs(60),
@@ -301,13 +321,11 @@ pub struct VideoInfo {
     pub orientation: u32,
     /// The colour tags the stream carries.
     pub tags: StreamTags,
-    /// Whether the codec configuration says 8-bit 4:2:0 (H.264 Baseline to
-    /// High, HEVC with 8-bit 4:2:0 in its `hvcC`), the only streams
-    /// [`ColorPath::Swscale`] converts exactly.
-    pub eight_bit_420: bool,
-    /// The pixel format (`CVPixelBufferGetPixelFormatType`, a four-character
-    /// code as a number) AVFoundation decodes the track to natively.
-    pub native_format: u32,
+    /// The sample layout (depth and chroma subsampling) the codec configuration
+    /// declares for an H.264 or HEVC stream, the streams [`ColorPath::Swscale`]
+    /// converts exactly; otherwise why this stream has none (the reason
+    /// [`ColorPath::Swscale`] refuses it with).
+    pub layout: Result<Layout, String>,
     /// The size of the stored frames, before rotation.
     pub stored_width: usize,
     pub stored_height: usize,
@@ -333,17 +351,43 @@ pub struct DecodedVideo {
     pub conversion: Conversion,
 }
 
-/// A decoded frame's planes as AVFoundation produced them (8-bit 4:2:0),
-/// tightly packed: `width * height` luma bytes, then `(width / 2) * (height /
-/// 2)` interleaved Cb/Cr pairs. Not rotated.
+/// One plane's samples: bytes for 8-bit pictures, 16-bit values (right-aligned,
+/// as FFmpeg's `yuv420p10le` holds them) for deeper ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Nv12Frame {
+pub enum Samples {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl Samples {
+    /// The number of samples.
+    pub fn len(&self) -> usize {
+        match self {
+            Samples::U8(v) => v.len(),
+            Samples::U16(v) => v.len(),
+        }
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A decoded frame's planes as VideoToolbox produced them, tightly packed: a
+/// `width * height` luma plane, then interleaved Cb/Cr pairs, `ceil(height / sub)`
+/// rows of `2 * ceil(width / sub)` samples with the layout's subsampling.
+/// Not rotated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeFrame {
     pub width: usize,
     pub height: usize,
-    /// `true` for `420f` (full range), `false` for `420v`.
+    /// Bit depth and chroma subsampling.
+    pub layout: Layout,
+    /// Whether the buffer is a full-range format (`420f`, `xf20`, ...).
     pub full_range: bool,
-    pub y: Vec<u8>,
-    pub uv: Vec<u8>,
+    pub y: Samples,
+    pub uv: Samples,
 }
 
 impl DecodedVideo {
@@ -516,23 +560,19 @@ impl VideoSource {
         Ok(indices)
     }
 
-    /// Decode the frames at `indices` to the decoder's own 8-bit 4:2:0 planes,
-    /// without converting or rotating them (for checking the planes against
-    /// another decoder's). They come from VideoToolbox driven directly (see
-    /// `vt.rs` for why not from `AVAssetReader`'s decoded output).
+    /// Decode the frames at `indices` to the decoder's own planes, without
+    /// converting or rotating them (for checking the planes against another
+    /// decoder's). They come from VideoToolbox driven directly (see `vt.rs` for
+    /// why not from `AVAssetReader`'s decoded output).
     ///
     /// # Errors
     /// As [`VideoSource::decode_frames`], and [`MediaError::Unsupported`] when
-    /// the track is not 8-bit 4:2:0 H.264 or HEVC with even sides.
-    pub fn decode_native_planes(&self, indices: &[usize]) -> Result<Vec<Nv12Frame>, MediaError> {
+    /// the track is not an H.264 or HEVC stream of a layout VideoToolbox decodes
+    /// to one of the formats `vt` knows (8 or 10 bits; 4:2:0, 4:2:2, 4:4:4).
+    pub fn decode_native_planes(&self, indices: &[usize]) -> Result<Vec<NativeFrame>, MediaError> {
         let wanted = self.checked_wanted(indices)?;
-        if !self.info.eight_bit_420 || self.info.stored_width % 2 != 0 || self.info.stored_height % 2 != 0 {
-            return Err(MediaError::Unsupported {
-                what: "video",
-                detail: "the track is not 8-bit 4:2:0 with even sides".into(),
-            });
-        }
-        let mut kept = autoreleasepool(|_| self.read_nv12(&wanted))?;
+        let layout = self.exact_layout()?;
+        let mut kept = autoreleasepool(|_| self.read_native(&wanted, layout))?;
         indices
             .iter()
             .map(|i| {
@@ -551,13 +591,9 @@ impl VideoSource {
 
     /// Decode the whole track with VideoToolbox and return the planes of the
     /// sorted, unique `wanted` frames, in that order.
-    fn read_nv12(&self, wanted: &[usize]) -> Result<Vec<Nv12Frame>, MediaError> {
+    fn read_native(&self, wanted: &[usize], layout: Layout) -> Result<Vec<NativeFrame>, MediaError> {
         const WHAT: &str = "video";
-        let format = if self.info.tags.full_range == Some(true) {
-            vt::FORMAT_420F
-        } else {
-            vt::FORMAT_420V
-        };
+        let full_range = self.info.tags.full_range == Some(true);
         let total = self.info.total_frames;
         let mut flags = vec![false; total];
         for &w in wanted {
@@ -580,13 +616,14 @@ impl VideoSource {
                 if decoder.is_none() {
                     decoder = Some(vt::Decoder::new(
                         sample.as_ptr(),
-                        format,
+                        layout,
+                        full_range,
                         self.media_pts.clone(),
                         flags.clone(),
                     )?);
                 }
                 if let Some(d) = decoder.as_mut() {
-                    d.decode(sample.as_ptr(), format)?;
+                    d.decode(sample.as_ptr())?;
                 }
                 samples += 1;
                 Ok(false)
@@ -627,33 +664,57 @@ impl VideoSource {
             .collect()
     }
 
-    /// The conversion this source's frames get under its options.
-    fn plan(&self) -> Plan {
+    /// The stream's sample layout, or why it has none that is converted exactly.
+    fn exact_layout(&self) -> Result<Layout, MediaError> {
+        self.info.layout.clone().map_err(|reason| MediaError::Unsupported {
+            what: "video",
+            detail: format!(
+                "{reason}; the colour conversion is exact only for H.264 and HEVC at 8 or 10 bits in 4:2:0, 4:2:2 \
+                 or 4:4:4 (ColorPath::AvFoundation converts anything the system decodes, with its own arithmetic)"
+            ),
+        })
+    }
+
+    /// The conversion this source's frames get under its options, or the
+    /// reason there is no exact one.
+    fn plan(&self) -> Result<Plan, MediaError> {
         let ColorPath::Swscale(flavor) = self.options.color else {
-            return Plan::AvFoundation;
+            return Ok(Plan::AvFoundation);
         };
         let info = &self.info;
-        if !info.eight_bit_420 {
-            return Plan::AvFoundation;
-        }
+        let layout = self.exact_layout()?;
         let range = if info.tags.full_range == Some(true) {
             Range::Full
         } else {
             Range::Limited
         };
-        if info.stored_width % 2 != 0 || info.stored_height % 2 != 0 {
-            return Plan::AvFoundation;
-        }
         // A stream that does not name its matrix is converted as libswscale
         // does: with BT.601's, whatever its size.
         let matrix = match info.tags.matrix_code {
             None => Matrix::Bt601,
-            Some(code) => match Matrix::from_code(code) {
-                Some(m) => m,
-                None => return Plan::AvFoundation,
-            },
+            Some(code) => Matrix::from_code(code).ok_or_else(|| MediaError::Unsupported {
+                what: "video",
+                detail: format!(
+                    "the stream's matrix_coefficients {code} is not one the exact conversion holds (BT.709, BT.601, \
+                     BT.2020 non-constant, FCC, SMPTE 240M); ColorPath::AvFoundation converts it with the system's arithmetic"
+                ),
+            })?,
         };
-        Plan::Swscale { matrix, range, flavor }
+        let filter = self.options.chroma_filter;
+        // Frames are converted at the stored size and turned afterwards (see `convert_native`).
+        yuv::check_shape(layout, info.stored_width, info.stored_height, filter).map_err(|e| {
+            MediaError::Unsupported {
+                what: "video",
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(Plan::Swscale {
+            layout,
+            matrix,
+            range,
+            flavor,
+            filter,
+        })
     }
 
     fn checked_wanted(&self, indices: &[usize]) -> Result<Vec<usize>, MediaError> {
@@ -759,7 +820,7 @@ impl VideoSource {
     /// them out in the order of `asked`.
     fn decode_wanted(&self, wanted: &[usize], asked: &[usize]) -> Result<DecodedVideo, MediaError> {
         const WHAT: &str = "video";
-        let plan = self.plan();
+        let plan = self.plan()?;
         let mut dims: Option<(usize, usize)> = None;
         // Checks each converted frame against the first one's size and the byte bound.
         let mut emit = |convert: &dyn Fn(Option<(usize, usize)>) -> Converted| {
@@ -783,11 +844,25 @@ impl VideoSource {
         };
         let (orientation, rotation) = (self.info.orientation, self.options.rotation);
         let kept: Vec<Vec<u8>> = match plan {
-            Plan::Swscale { matrix, range, flavor } => self
-                .read_nv12(wanted)?
-                .iter()
-                .map(|f| emit(&|expect| convert_nv12(f, (matrix, range, flavor), orientation, rotation, expect)))
-                .collect::<Result<_, _>>()?,
+            Plan::Swscale {
+                layout,
+                matrix,
+                range,
+                flavor,
+                filter,
+            } => {
+                let params = Params {
+                    matrix,
+                    range,
+                    flavor,
+                    filter,
+                    threads: self.options.threads,
+                };
+                self.read_native(wanted, layout)?
+                    .iter()
+                    .map(|f| emit(&|expect| convert_native(f, &params, orientation, rotation, expect)))
+                    .collect::<Result<_, _>>()?
+            }
             Plan::AvFoundation => {
                 let settings = bgra_settings()?;
                 self.read_frames(&settings, wanted, |image| {
@@ -832,7 +907,19 @@ impl VideoSource {
             timestamps: asked.iter().map(|&i| self.info.timestamps[i]).collect(),
             frames,
             conversion: match plan {
-                Plan::Swscale { matrix, range, flavor } => Conversion::Swscale { matrix, range, flavor },
+                Plan::Swscale {
+                    layout,
+                    matrix,
+                    range,
+                    flavor,
+                    filter,
+                } => Conversion::Swscale {
+                    layout,
+                    matrix,
+                    range,
+                    flavor,
+                    filter,
+                },
                 Plan::AvFoundation => Conversion::AvFoundation,
             },
         })
@@ -843,9 +930,11 @@ impl VideoSource {
 #[derive(Clone, Copy, Debug)]
 enum Plan {
     Swscale {
+        layout: Layout,
         matrix: Matrix,
         range: Range,
         flavor: Flavor,
+        filter: ChromaFilter,
     },
     AvFoundation,
 }
@@ -987,14 +1076,14 @@ fn open_inner(path: &Path, options: &VideoOptions, temp: Option<TempFile>) -> Re
                 })
             }
         };
-        let (tags, eight_bit_420) = stream_format(&track);
+        let (tags, layout) = stream_format(&track);
         let first_pass = count_frames(&asset, &track)?;
         // Compressed samples carry media time; decoded frames carry track time,
         // with the edit list applied (an H.264 stream with B-frames starts its
         // media at +2 frames and the edit list shifts it back to 0). Report
         // track time, which is what FFmpeg and OpenCV report, and which
         // `decode_wanted` checks against every decoded frame.
-        let first = first_decoded(&asset, &track, tags, eight_bit_420)?;
+        let first = first_decoded(&asset, &track, tags, &layout)?;
         let timescale = f64::from(first_pass.timescale);
         let shift_seconds = first_pass.pts[0] as f64 / timescale - first.seconds;
         let shift = (shift_seconds * timescale).round();
@@ -1039,8 +1128,7 @@ fn open_inner(path: &Path, options: &VideoOptions, temp: Option<TempFile>) -> Re
                 timestamps,
                 orientation,
                 tags,
-                eight_bit_420,
-                native_format: first.format,
+                layout,
                 stored_width: first.width,
                 stored_height: first.height,
             },
@@ -1075,33 +1163,34 @@ fn orientation_of(t: &CgAffineTransform) -> Option<u32> {
     }
 }
 
-/// The colour tags of the track's first format description, and whether the
-/// stream is 8-bit 4:2:0 (the only kind [`yuv`] converts as libswscale does).
+/// The colour tags of the track's first format description, and the sample
+/// layout of the stream if it is one [`yuv`] converts as libswscale does.
 ///
 /// The bit depth and chroma format are read from the codec configuration the
 /// sample description carries (`avcC` for H.264, `hvcC` for HEVC), because the
 /// pixel format a decoder is *asked* for says nothing about the stream: a 10-bit
 /// stream asked for `420v` is converted to it by the system without complaint.
-fn stream_format(track: &Retained<AnyObject>) -> (StreamTags, bool) {
+fn stream_format(track: &Retained<AnyObject>) -> (StreamTags, Result<Layout, String>) {
     let none = StreamTags {
         matrix_code: None,
         full_range: None,
     };
+    let missing = || Err("the track has no format description".to_string());
     // SAFETY: `formatDescriptions` is an NSArray of CMFormatDescriptionRef (nil
     // if the track has none); `count` and `objectAtIndex:` are plain reads, and
     // the element stays alive as long as the track does.
     unsafe {
         let descriptions: Option<Retained<AnyObject>> = msg_send![&**track, formatDescriptions];
         let Some(descriptions) = descriptions else {
-            return (none, false);
+            return (none, missing());
         };
         let count: usize = msg_send![&*descriptions, count];
         if count == 0 {
-            return (none, false);
+            return (none, missing());
         }
         let desc: *const AnyObject = msg_send![&*descriptions, objectAtIndex: 0usize];
         if desc.is_null() {
-            return (none, false);
+            return (none, missing());
         }
         let desc: CfTypeRef = desc.cast();
         let matrix = CMFormatDescriptionGetExtension(desc, kCVImageBufferYCbCrMatrixKey);
@@ -1121,7 +1210,7 @@ fn stream_format(track: &Retained<AnyObject>) -> (StreamTags, bool) {
                 matrix_code,
                 full_range,
             },
-            is_8bit_420(desc),
+            stream_layout(desc),
         )
     }
 }
@@ -1151,25 +1240,30 @@ unsafe fn configuration_record(desc: CfTypeRef, atom: &str) -> Option<Vec<u8>> {
     Some(std::slice::from_raw_parts(ptr, len).to_vec())
 }
 
-/// Whether the format description is H.264 or HEVC coding 8-bit 4:2:0.
+/// The sample layout of the format description's stream: H.264 and HEVC from their
+/// configuration record ([`codec_config`]), anything else is why it has none.
 ///
 /// # Safety
 /// `desc` must be a live `CMFormatDescriptionRef`.
-unsafe fn is_8bit_420(desc: CfTypeRef) -> bool {
+unsafe fn stream_layout(desc: CfTypeRef) -> Result<Layout, String> {
     let subtype = CMFormatDescriptionGetMediaSubType(desc);
-    if subtype == u32::from_be_bytes(*b"avc1") || subtype == u32::from_be_bytes(*b"avc3") {
-        // AVCDecoderConfigurationRecord: [version, profile_idc, ...]. Baseline,
-        // Main, Extended and High are 4:2:0 at 8 bits by definition of the
-        // profile; High 10, 4:2:2 and 4:4:4 are not.
-        return configuration_record(desc, "avcC").is_some_and(|r| r.len() >= 4 && matches!(r[1], 66 | 77 | 88 | 100));
+    let is = |code: &[u8; 4]| subtype == u32::from_be_bytes(*code);
+    if is(b"avc1") || is(b"avc3") {
+        let record = configuration_record(desc, "avcC").ok_or("the H.264 track has no avcC record")?;
+        return codec_config::avc_layout(&record);
     }
-    if subtype == u32::from_be_bytes(*b"hvc1") || subtype == u32::from_be_bytes(*b"hev1") {
-        // HEVCDecoderConfigurationRecord: chromaFormat at byte 16 (2 bits),
-        // bitDepthLumaMinus8 at 17 and bitDepthChromaMinus8 at 18 (3 bits each).
-        return configuration_record(desc, "hvcC")
-            .is_some_and(|r| r.len() >= 19 && r[16] & 3 == 1 && r[17] & 7 == 0 && r[18] & 7 == 0);
+    if is(b"hvc1") || is(b"hev1") {
+        let record = configuration_record(desc, "hvcC").ok_or("the HEVC track has no hvcC record")?;
+        return codec_config::hevc_layout(&record);
     }
-    false
+    let name: String = subtype
+        .to_be_bytes()
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { char::from(b) } else { '?' })
+        .collect();
+    Err(format!(
+        "the codec '{name}' is not H.264 or HEVC, the codecs whose decode is held to FFmpeg's"
+    ))
 }
 
 /// A value handed from AVFoundation's completion queue to the caller.
@@ -1434,8 +1528,6 @@ fn count_frames(asset: &Retained<AnyObject>, track: &Retained<AnyObject>) -> Res
 struct FirstDecoded {
     /// Presentation time (track time, edits applied), seconds.
     seconds: f64,
-    /// `CVPixelBufferGetPixelFormatType`.
-    format: u32,
     width: usize,
     height: usize,
 }
@@ -1446,11 +1538,18 @@ fn first_decoded(
     asset: &Retained<AnyObject>,
     track: &Retained<AnyObject>,
     tags: StreamTags,
-    eight_bit_420: bool,
+    layout: &Result<Layout, String>,
 ) -> Result<FirstDecoded, MediaError> {
     // The planes of an 8-bit 4:2:0 stream in the range it is tagged with (an
     // empty settings dictionary is refused by AVFoundation with an exception);
-    // anything else as BGRA, which `VideoSource::plan` will convert with the system.
+    // anything else as BGRA. Only the frame's time and size are used here.
+    let eight_bit_420 = matches!(
+        layout,
+        Ok(Layout {
+            chroma: Chroma::C420,
+            depth: 8
+        })
+    );
     let settings = if eight_bit_420 {
         format_settings(if tags.full_range == Some(true) {
             PIXEL_FORMAT_420F
@@ -1476,21 +1575,15 @@ fn first_decoded(
         }
         // SAFETY: as above; the time is returned by value, and `image` is the
         // sample's live CVPixelBuffer.
-        let (seconds, format, width, height) = unsafe {
+        let (seconds, width, height) = unsafe {
             (
                 CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample.as_ptr())),
-                CVPixelBufferGetPixelFormatType(image),
                 CVPixelBufferGetWidth(image),
                 CVPixelBufferGetHeight(image),
             )
         };
         return if seconds.is_finite() {
-            Ok(FirstDecoded {
-                seconds,
-                format,
-                width,
-                height,
-            })
+            Ok(FirstDecoded { seconds, width, height })
         } else {
             Err(MediaError::Decode {
                 what: "video",
@@ -1585,11 +1678,71 @@ fn convert_frame(image: CfTypeRef, orientation: u32, rotation: Rotation, expect:
     Ok((rgb, w, h))
 }
 
-/// Decoded planes as an RGB frame by libswscale's arithmetic (`conversion` is
-/// matrix, range and flavor), rotated like [`convert_frame`]'s.
-fn convert_nv12(
-    frame: &Nv12Frame,
-    conversion: (Matrix, Range, Flavor),
+/// Convert planes of `width x height` (tightly packed, as [`NativeFrame`]).
+fn convert_planes(
+    width: usize,
+    height: usize,
+    layout: Layout,
+    y: &Samples,
+    uv: &Samples,
+    params: &Params,
+) -> Result<Vec<u8>, MediaError> {
+    // Interleaved Cb, Cr pairs: one per sample for 4:4:4, one per two for the others.
+    let uv_stride = if layout.chroma == Chroma::C444 {
+        2 * width
+    } else {
+        width
+    };
+    let convert_err = |e: yuv::YuvError| MediaError::Decode {
+        what: "video",
+        detail: e.to_string(),
+    };
+    match (y, uv) {
+        (Samples::U8(y), Samples::U8(uv)) => yuv::to_rgb24(
+            &Picture {
+                width,
+                height,
+                layout,
+                y,
+                y_stride: width,
+                uv,
+                uv_stride,
+            },
+            params,
+        ),
+        (Samples::U16(y), Samples::U16(uv)) => yuv::to_rgb24(
+            &Picture {
+                width,
+                height,
+                layout,
+                y,
+                y_stride: width,
+                uv,
+                uv_stride,
+            },
+            params,
+        ),
+        _ => {
+            return Err(MediaError::Decode {
+                what: "video",
+                detail: "a frame's planes hold different sample types".into(),
+            })
+        }
+    }
+    .map_err(convert_err)
+}
+
+/// Decoded planes as an RGB frame by libswscale's arithmetic (`params` is
+/// matrix, range, flavor, chroma filter and threads), rotated per `orientation`
+/// when `rotation` is [`Rotation::Apply`]. The order is torchcodec's, for every
+/// layout: the picture is converted at its stored size (the converter's
+/// width-dependent choice and, at 10 bits, the vertical chroma filter, act on the
+/// stored picture) and the RGB is turned afterwards (`format=rgb24,` then the
+/// rotation filters in its filter graph; `yuv.rs`, experiments 9 and 10). The
+/// `ffmpeg` CLI's autorotate differs for 4:2:0, where it turns the planes first.
+fn convert_native(
+    frame: &NativeFrame,
+    params: &Params,
     orientation: u32,
     rotation: Rotation,
     expect: Option<(usize, usize)>,
@@ -1602,24 +1755,7 @@ fn convert_nv12(
         });
     }
     check_size((w, h), orientation, rotation, expect)?;
-    let (matrix, range, flavor) = conversion;
-    let rgb = yuv::nv12_to_rgb24(
-        &Nv12 {
-            width: w,
-            height: h,
-            y: &frame.y,
-            y_stride: w,
-            uv: &frame.uv,
-            uv_stride: w,
-        },
-        matrix,
-        range,
-        flavor,
-    )
-    .map_err(|e| MediaError::Decode {
-        what: "video",
-        detail: e.to_string(),
-    })?;
+    let rgb = convert_planes(w, h, frame.layout, &frame.y, &frame.uv, params)?;
     if rotation == Rotation::Apply && orientation != 1 {
         return Ok(orient::apply(orientation, rgb, w, h, 3));
     }

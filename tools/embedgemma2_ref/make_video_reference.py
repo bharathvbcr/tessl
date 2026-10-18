@@ -15,10 +15,12 @@ What the reference is given, and why it is what the reference loader produces
 ------------------------------------------------------------------------------
 transformers' `fetch_videos` decodes a video path with torchcodec
 (`VideoDecoder(seek_mode="exact")`), which is not installed here. The array
-given to sentence-transformers is the `ffmpeg` CLI's decode of the whole file to
-rgb24 with autorotation (scripts/gen_media_video_exact_fixtures.py documents why
-that equals torchcodec's frames, as far as that is known without running it: both
-are libswscale with the frame's own matrix and range), and the metadata is torchcodec's
+given to sentence-transformers is torchcodec's frames as its source (v0.17.0, BSD-3)
+makes them, with the `ffmpeg` CLI as the libswscale: the stored picture converted to
+rgb24 with the scaler flags unset (`swsFlags = 0`, or a `format=rgb24` filtergraph, which
+sets none), then the display rotation applied to the RGB
+(`gen.torchcodec_rgb24`; scripts/gen_media_video_exact_fixtures.py cites the files and
+the probes that the graph, `sws_scale` flags 0 and the CLI agree). The metadata is torchcodec's
 exact-mode figures (`num_frames` = packets, `duration` = last pts + duration -
 first pts, `fps` = num_frames / duration), from the same script. The video
 processor then samples frames from those with `sample_frames`, as it does for a
@@ -31,9 +33,18 @@ Cases (`name`: file, timestamps)
   e2e_video_ts   the same with `add_timestamps` on: each frame's block is
                  preceded by its `mm:ss` label
   rot90          h264_709_tv_64x48_rot90.mp4, a stored 64x48 turned by its
-                 rotation matrix: the model sees 48x64
+                 rotation matrix: the model sees 48x64. A 4:2:0 picture whose
+                 stored width is a NEON width and upright width is not, so converting
+                 before the turn (torchcodec) and after (the CLI's autorotate) differ
   hevc_pc        hevc_601_pc_34x26.mp4, HEVC, BT.601 full range, a width off
                  libswscale's NEON widths
+  hevc_main10    hevc_p10_601_pc_66x38.mp4, HEVC Main 10 (yuv420p10le), BT.601 full
+                 range: the 10-bit planes VideoToolbox decodes, converted with the
+                 bicubic chroma filter that unset scaler flags give
+  odd_444_10bit  hevc_p410_240m_tv_33x17.mp4, HEVC 4:4:4 10-bit at an odd 33x17,
+                 SMPTE 240M: odd widths and heights exist only in 4:4:4 (and odd
+                 heights in 4:2:2)
+  odd_422        hevc_422_709_tv_64x33.mp4, HEVC 4:2:2 at an odd height of 33
 """
 
 import os
@@ -59,6 +70,9 @@ CASES = [  # (name, fixture, add_timestamps)
     ("e2e_video_ts", "e2e_video", True),
     ("rot90", "h264_709_tv_64x48_rot90", False),
     ("hevc_pc", "hevc_601_pc_34x26", False),
+    ("hevc_main10", "hevc_p10_601_pc_66x38", False),
+    ("odd_444_10bit", "hevc_p410_240m_tv_33x17", False),
+    ("odd_422", "hevc_422_709_tv_64x33", False),
 ]
 
 
@@ -80,7 +94,13 @@ def reference_item(fixture):
     w, h, rot = int(facts["w"]), int(facts["h"]), int(facts["rotation"])
     if rot in (90, 270):
         w, h = h, w
-    raw = np.frombuffer(gen.decode(path, "rgb24"), dtype=np.uint8)
+    # torchcodec's frames: the stored picture converted by libswscale with no scaler flags (the
+    # CLI's default; 10-bit 4:2:0 is the one layout whose RGB depends on them), then the
+    # display rotation applied to the RGB (the generator's docstring cites torchcodec's source).
+    raw = np.frombuffer(
+        gen.torchcodec_rgb24(path, int(facts["w"]), int(facts["h"]), frames, rot, "" if facts["flip"] == "none" else facts["flip"]),
+        dtype=np.uint8,
+    )
     assert raw.size == frames * h * w * 3, (fixture, raw.size, frames, h, w)
     item = {
         "array": raw.reshape(frames, h, w, 3).copy(),

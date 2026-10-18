@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 pub mod audio;
 pub mod cf;
+pub mod codec_config;
 mod containers;
 pub mod image;
 mod integrity;

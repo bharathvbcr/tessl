@@ -1158,14 +1158,53 @@ fn media_decode_refuses_an_empty_list_and_an_unknown_unit() {
 #[test]
 fn video_color_draws_a_bar_and_a_median_per_path_of_every_call() {
     let doc = parse("media_video_color_m5pro.json");
-    let drawn = arr(&doc)
+    let rows: Vec<&str> = arr(&doc)
         .iter()
-        .filter(|r| !s(at(r, "workload")).ends_with(":video_open"))
-        .count();
-    assert!(drawn > 0 && drawn % 2 == 0);
+        .map(|r| s(at(r, "workload")))
+        .filter(|w| !w.ends_with(":video_open") && !w.starts_with("yuv:"))
+        .collect();
+    let drawn = rows.len();
+    // Two paths (exact, bgra) for every call, or three (and exact1) in a run that timed the
+    // converter on one thread as well.
+    let paths = if rows.iter().any(|w| w.ends_with(":exact1")) {
+        3
+    } else {
+        2
+    };
+    assert!(drawn > 0 && drawn % paths == 0);
     let e = elems("video-color");
     assert_eq!(count(&e, "bar"), drawn);
     assert_eq!(count(&e, "median"), drawn);
+    video_color_draws_three_bars_per_call_when_the_single_thread_path_was_timed();
+}
+
+/// A run that also timed the single-threaded converter draws three bars per call (called from
+/// `video_color_draws_a_bar_and_a_median_per_path_of_every_call`, which keeps the test count).
+fn video_color_draws_three_bars_per_call_when_the_single_thread_path_was_timed() {
+    let dir = fresh("video_color_three");
+    let row = |workload: &str| {
+        format!("{{\"workload\":\"{workload}\",\"ms_min\":{},\"ms_median\":1.5,\"iters\":3,\"units\":30.0,\"unit\":\"frame\"}}", workload.len())
+    };
+    // Two calls of one clip, the converter-alone rows and the open row of a bench run with BENCH_YUV.
+    let rows = [
+        "a.mp4:video_open",
+        "a.mp4:video_first_30:exact",
+        "a.mp4:video_first_30:exact1",
+        "a.mp4:video_first_30:bgra",
+        "a.mp4:video_sampled_9:exact",
+        "a.mp4:video_sampled_9:exact1",
+        "a.mp4:video_sampled_9:bgra",
+        "yuv:420_8bit_1280x720:single",
+        "yuv:420_8bit_1280x720:threads",
+    ]
+    .map(row);
+    let p = write_json(&dir, "media_video_color_m5pro.json", &format!("[{}]", rows.join(",")));
+    let plot = registry::find("video-color").expect("video-color");
+    let out = (plot.render)(&p).unwrap_or_else(|e| panic!("video-color: {e}"));
+    let e = check_xml(&out.svg).unwrap_or_else(|e| panic!("video-color: {e}"));
+    assert_eq!(count(&e, "bar"), 6);
+    assert_eq!(count(&e, "median"), 6);
+    assert!(out.svg.contains("exact1: the same on one thread"));
 }
 
 #[test]
@@ -1183,6 +1222,22 @@ fn video_color_refuses_what_it_cannot_pair_or_name() {
         (
             format!("[{}]", row("a.mp4:video_first_30:exact", "frame")),
             "needs both an exact and a bgra row",
+        ),
+        (
+            // One call with exact1, another without: the run is half threaded-timed.
+            format!(
+                "[{},{},{},{},{}]",
+                row("a.mp4:video_first_30:exact", "frame"),
+                row("a.mp4:video_first_30:exact1", "frame"),
+                row("a.mp4:video_first_30:bgra", "frame"),
+                row("a.mp4:video_sampled_9:exact", "frame"),
+                row("a.mp4:video_sampled_9:bgra", "frame")
+            ),
+            "other calls have an exact1 row, this one needs it too",
+        ),
+        (
+            format!("[{}]", row("yuv:420_8bit_1280x720:single", "frame")),
+            "no video_sampled/video_first workloads",
         ),
         (
             format!(

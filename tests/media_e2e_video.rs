@@ -41,11 +41,14 @@ const ABS_BOUND: f64 = 1e-4;
 const COS_BOUND: f64 = 0.99999;
 
 /// `(case, fixture, timestamps on)`, the cases of `make_video_reference.py`.
-const CASES: [(&str, &str, bool); 4] = [
+const CASES: [(&str, &str, bool); 7] = [
     ("e2e_video", "e2e_video", false),
     ("e2e_video_ts", "e2e_video", true),
     ("rot90", "h264_709_tv_64x48_rot90", false),
     ("hevc_pc", "hevc_601_pc_34x26", false),
+    ("hevc_main10", "hevc_p10_601_pc_66x38", false),
+    ("odd_444_10bit", "hevc_p410_240m_tv_33x17", false),
+    ("odd_422", "hevc_422_709_tv_64x33", false),
 ];
 
 fn snapshot() -> PathBuf {

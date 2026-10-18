@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_jpeg_fixtures.py",
- "generator_commit": "8699afe0025e4449e52caee7fdb8feac4a5c836c",
+ "generator_commit": "cfc20c7201bfad2355fafe1d56b5eaec08839703",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",

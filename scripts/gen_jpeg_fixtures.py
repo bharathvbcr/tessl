@@ -381,7 +381,7 @@ def ll_put_diff(bw, d):
 
 def write_lossless(width, height, comps, planes, *, psv=1, pt=0, precision=8, restart=0, interleave=True, adobe=None,
                    jfif=False, comp_ids=None, diffs=None, eoi=True, scan_ss=None, scan_se=0, scan_ah=0, dht_extra=b"",
-                   restart_rows=None):
+                   restart_rows=None, scans=None):
     """A lossless JPEG: comps [(h, v)], planes[c] the coded samples (after the point transform), padded to the MCU grid
     ([mcu rows * v, mcu cols * h]). `diffs[c]`, when given, are the differences written instead of the ones the
     samples imply (arbitrary values, the decoder's hostile input). `restart` is in MCUs and a multiple of the MCUs per
@@ -452,7 +452,10 @@ def write_lossless(width, height, comps, planes, *, psv=1, pt=0, precision=8, re
         bw.flush()
         return seg(0xDA, hdr) + bytes(bw.out)
 
-    if interleave or len(comps) == 1:
+    if scans is not None:  # explicit scans, each a list of component indices (a component may be left out or repeated)
+        for s in scans:
+            out += code_scan(list(s))
+    elif interleave or len(comps) == 1:
         out += code_scan(list(range(len(comps))))
     else:
         for c in range(len(comps)):
@@ -592,6 +595,18 @@ def cut_mid(name, data, klass, note, ks=None):
             case(f"{name}_mid{k}_{third}", data[:at] + b"\xff\xd9", klass, f"{note} cut inside scan {k + 1}, {third}/3 of it + EOI", tessl="either")
 
 
+def cut_hole(name, data, klass, note, ks=None):
+    """Scan k cut short a third and two thirds of the way into its entropy data, the scans after it kept: the cut scan
+    runs out of data at the next marker, and later scans decode normally (found by live fuzzing: a later scan with data
+    moves libjpeg-turbo's last_good_iMCU_row on)."""
+    pos = scan_offsets(data) + [len(data) - 2]
+    for k in ks if ks is not None else range(len(pos) - 1):
+        body = pos[k] + 2 + struct.unpack(">H", data[pos[k] + 2:pos[k] + 4])[0]
+        for third in (1, 2):
+            at = body + (pos[k + 1] - body) * third // 3
+            case(f"{name}_hole{k}_{third}", data[:at] + data[pos[k + 1]:], klass, f"{note} scan {k + 1} cut at {third}/3, the scans after it kept", tessl="either")
+
+
 def smoothing_cases():
     """Progressive files whose scans stop early: libjpeg-turbo smooths them (block smoothing)."""
     k = "smoothing"
@@ -607,7 +622,7 @@ def smoothing_cases():
     for (h, w) in [(8, 8), (9, 9), (17, 15), (24, 40), (65, 129), (1, 9), (9, 1), (33, 200), (200, 33), (72, 40),
                    (32, 32), (48, 24), (64, 40), (96, 17)]:
         im = photo(h, w, h * 7 + w)
-        cut_all(f"smoothing_size_{h}x{w}_420", cj(im, "-progressive", "-sample", "2x2,1x1,1x1"), k, f"{h}x{w} 4:2:0", ks=(1, 2, 5))
+        cut_all(f"smoothing_size_{h}x{w}_420", cj(im, "-progressive", "-sample", "2x2,1x1,1x1"), k, f"{h}x{w} 4:2:0", ks=(1, 2, 5, 6))
         cut_all(f"smoothing_size_{h}x{w}_gray", cj(im, "-progressive", "-grayscale"), k, f"{h}x{w} gray", ks=(1, 2))
         cut_all(f"smoothing_size_{h}x{w}_440", cj(im, "-progressive", "-sample", "1x2,1x1,1x1"), k, f"{h}x{w} 4:4:0", ks=(1, 5))
     # components of three and four block rows per iMCU row (the row logic is measured on two)
@@ -629,6 +644,10 @@ def smoothing_cases():
     cut_mid("smoothing_gray", cj(photo(40, 56, 9), "-grayscale", "-progressive"), k, "grayscale 40x56")
     cut_mid("smoothing_420", cj(photo(40, 56, 9), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 40x56")
     cut_mid("smoothing_440", cj(photo(65, 40, 3), "-progressive", "-sample", "1x2,1x1,1x1"), k, "4:4:0 65x40", ks=(0, 1, 3, 6))
+    cut_hole("smoothing_gray", cj(photo(40, 56, 9), "-grayscale", "-progressive"), k, "grayscale 40x56")
+    cut_hole("smoothing_420", cj(photo(40, 56, 9), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 40x56")
+    cut_hole("smoothing_420_24x40", cj(photo(24, 40, 4), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 24x40")
+    cut_hole("smoothing_rst", cj(photo(40, 56, 9), "-progressive", "-restart", "2", "-grayscale"), k, "restart 2 gray", ks=(0, 1, 3))
     cut_mid("smoothing_arith_gray", cj(photo(40, 56, 9), "-arithmetic", "-progressive", "-grayscale"), k, "arithmetic gray", ks=(0, 2))
     cut_mid("smoothing_rst", cj(photo(40, 56, 9), "-progressive", "-restart", "2", "-grayscale"), k, "restart 2 gray", ks=(0, 1, 3))
 
@@ -713,6 +732,17 @@ def lossless_cases():
         case(f"lossless_refused_gray_psv{psv}", write_lossless(13, 11, g1, ll_planes(rng, g1, 13, 11), psv=psv), k, "one component: gray to RGB is not converted", tessl="either")
         case(f"lossless_refused_ycc_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, jfif=True), k, "YCbCr to RGB is not converted", tessl="either")
         case(f"lossless_refused_adobe1_psv{psv}", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=psv, adobe=1), k, "Adobe transform 1 (YCbCr)", tessl="either")
+    # the standard-table fallback belongs to the DCT Huffman decoder: a lossless stream with no DHT is refused (found by live fuzzing)
+    case("lossless_no_dht", strip_dht(write_lossless(17, 9, c3, p3, psv=4, adobe=0)), k, "lossless, DHT removed: no standard tables", tessl="either")
+    # every component must be in some scan ("Bogus virtual array access" otherwise); a component may be in several
+    for name, scans, note in (("missing_first", [[1], [2]], "the first component is in no scan"),
+                              ("missing_last", [[0], [1]], "the last component is in no scan"),
+                              ("missing_middle_pair", [[0], [2]], "the middle component is in no scan"),
+                              ("missing_in_interleaved", [[1, 2]], "one interleaved scan of the last two components"),
+                              ("single_then_pair", [[0], [1, 2]], "one component, then the other two interleaved"),
+                              ("pair_then_single", [[0, 1], [2]], "two components interleaved, then the third"),
+                              ("repeated_scan", [[0], [0], [1], [2]], "the first component in two scans")):
+        case(f"lossless_scans_{name}", write_lossless(17, 9, c3, p3, psv=4, adobe=0, scans=scans), k, note, tessl="either")
     case("lossless_ids_123_no_marker", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=2), k, "no JFIF or Adobe marker, ids 1 2 3: decoded as RGB")
     case("lossless_ids_789_no_marker", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=3, comp_ids=[7, 8, 9]), k, "no marker, unrecognised ids")
     for pt in (1, 2, 4, 7):

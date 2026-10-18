@@ -24,10 +24,14 @@
 mod common;
 
 use std::fs;
+use std::sync::Arc;
 
 use common::{buf, random_f32, seeded, with_gpu};
-use tessl::qwen35::{self, Cols, OutCols};
-use tessl::qwen35_bwd::{gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd, rms_norm_bwd_part_len};
+use tessl::qwen35::{self, AttnShape, AttnTargets, Cols, OutCols};
+use tessl::qwen35_bwd::{
+    attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, rms_norm_bwd,
+    rms_norm_bwd_part_len, AttnQkvGrads,
+};
 use tessl::tensor::DType;
 use tessl::GpuRuntime;
 
@@ -313,21 +317,31 @@ fn to_bytes(segs: &[(String, Vec<f32>)]) -> Vec<u8> {
 
 #[test]
 fn characterize() {
-    with_gpu(|rt| {
-        let segs = collect(rt);
-        for (name, v) in &segs {
+    with_gpu(|rt| record_or_compare(&collect(rt), "RSTD_BITS_OUT", "RSTD_BITS_BASE"));
+}
+
+/// The qk-norm pair's characterization, recorded apart (`RSTD_QK_OUT`,
+/// `RSTD_QK_BASE`) so each baseline keeps its own shape.
+#[test]
+fn characterize_qk() {
+    with_gpu(|rt| record_or_compare(&collect_qk(rt), "RSTD_QK_OUT", "RSTD_QK_BASE"));
+}
+
+fn record_or_compare(segs: &[(String, Vec<f32>)], out_var: &str, base_var: &str) {
+    {
+        for (name, v) in segs {
             assert!(v.iter().all(|f| f.is_finite()), "{name}: non-finite value");
         }
-        let bytes = to_bytes(&segs);
-        if let Ok(path) = std::env::var("RSTD_BITS_OUT") {
+        let bytes = to_bytes(segs);
+        if let Ok(path) = std::env::var(out_var) {
             fs::write(&path, &bytes).unwrap();
             eprintln!("recorded {} bytes to {path}", bytes.len());
         }
-        if let Ok(path) = std::env::var("RSTD_BITS_BASE") {
+        if let Ok(path) = std::env::var(base_var) {
             let base = fs::read(&path).unwrap();
             assert_eq!(base.len(), bytes.len(), "baseline {path} has a different shape");
             let mut at = 0usize;
-            for (name, v) in &segs {
+            for (name, v) in segs {
                 let (mut max, mut differ, mut worst) = (0u64, 0usize, 0usize);
                 for (i, f) in v.iter().enumerate() {
                     let o = u32::from_le_bytes(base[at + 4 * i..at + 4 * i + 4].try_into().unwrap());
@@ -344,5 +358,211 @@ fn characterize() {
                 );
             }
         }
+    }
+}
+
+// ------------------------------------------------------------ qk norm + rope ---
+
+const QK_D: usize = 64;
+const QK_T: usize = 28;
+
+fn qk_shape(rot: usize) -> AttnShape {
+    AttnShape {
+        batch: 1,
+        seq: QK_T as u32,
+        q_heads: 1,
+        kv_heads: 1,
+        head_dim: QK_D as u32,
+        rotary_dim: rot as u32,
+    }
+}
+
+/// Forward over `proj` (`[QK_T, 4 * QK_D]`: q and its gate, k, v): the
+/// rotated queries `[QK_T, QK_D]` and the K cache `[QK_T, QK_D]`.
+fn qk_fwd(rt: &Arc<GpuRuntime>, proj: &[f32], qw: &[f32], kw: &[f32], rot: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
+    let (pb, qwb, kwb) = (buf(rt, proj), buf(rt, qw), buf(rt, kw));
+    let q = seeded(rt, QK_T * QK_D, SENTINEL);
+    let k = seeded(rt, QK_T * QK_D, SENTINEL);
+    let v = seeded(rt, QK_T * QK_D, SENTINEL);
+    let targets = AttnTargets {
+        q_out: &q,
+        k_cache: &k,
+        v_cache: &v,
+    };
+    qwen35::attn_qk_norm_rope(
+        rt,
+        &qk_shape(rot),
+        Cols::dense(&pb, (4 * QK_D) as u32),
+        &qwb,
+        &kwb,
+        &targets,
+        0,
+        1e6,
+        eps,
+    )
+    .unwrap();
+    rt.synchronize().unwrap();
+    (q.read_f32()[..QK_T * QK_D].to_vec(), k.read_f32()[..QK_T * QK_D].to_vec())
+}
+
+/// Backward: `dproj` (`[QK_T, 4 * QK_D]`) and the two norm-weight gradients.
+#[allow(clippy::too_many_arguments)]
+fn qk_bwd(
+    rt: &Arc<GpuRuntime>,
+    proj: &[f32],
+    qw: &[f32],
+    kw: &[f32],
+    dq: &[f32],
+    dk: &[f32],
+    rot: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let shape = qk_shape(rot);
+    let (pb, qwb, kwb) = (buf(rt, proj), buf(rt, qw), buf(rt, kw));
+    let (dqb, dkb) = (buf(rt, dq), buf(rt, dk));
+    let dvb = seeded(rt, QK_T * QK_D, 0.0);
+    let dp = seeded(rt, QK_T * 4 * QK_D, SENTINEL);
+    let (dqw, dkw) = (seeded(rt, QK_D, SENTINEL), seeded(rt, QK_D, SENTINEL));
+    let part = seeded(rt, attn_qk_norm_rope_bwd_part_len(&shape).max(1), SENTINEL);
+    let grads = AttnQkvGrads {
+        dq: &dqb,
+        dk: &dkb,
+        dv: &dvb,
+    };
+    attn_qk_norm_rope_bwd(
+        rt,
+        &shape,
+        Cols::dense(&pb, (4 * QK_D) as u32),
+        &qwb,
+        &kwb,
+        &grads,
+        &dp,
+        &dqw,
+        &dkw,
+        &part,
+        1e6,
+        eps,
+    )
+    .unwrap();
+    rt.synchronize().unwrap();
+    (
+        dp.read_f32()[..QK_T * 4 * QK_D].to_vec(),
+        dqw.read_f32()[..QK_D].to_vec(),
+        dkw.read_f32()[..QK_D].to_vec(),
+    )
+}
+
+/// `[QK_T, 4 * QK_D]` with each row at `EXPONENTS[r % len]`, its q head
+/// (columns `0..D`) and k head (columns `2D..3D`) starting `a, a`.
+fn qk_proj(seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let w = 4 * QK_D;
+    let (mut p, mut a) = (random_f32(QK_T * w, seed), Vec::new());
+    for r in 0..QK_T {
+        let k = EXPONENTS[r % EXPONENTS.len()];
+        for v in &mut p[r * w..(r + 1) * w] {
+            *v *= pow2(k);
+        }
+        for col in [0, 2 * QK_D] {
+            if r % 7 == 1 {
+                p[r * w + col..r * w + col + QK_D].fill(0.0);
+            }
+            p[r * w + col] = pow2(k);
+            p[r * w + col + 1] = pow2(k);
+        }
+        a.push(pow2(k));
+    }
+    (p, a)
+}
+
+/// Rows whose forward `rstd` and backward `rstd` differ in bits, for the q and
+/// the k head. With `rotary_dim = 0` and `w = 0` the observation is the rms
+/// norm's: forward `y[1] = a * rstd`, backward (`dy = [a, -a, 0, ...]`)
+/// `dx[0] = rstd * a`.
+fn qk_mismatches(rt: &Arc<GpuRuntime>, eps: f32) -> Vec<String> {
+    let (p, a) = qk_proj(7400);
+    let w = vec![0.0f32; QK_D];
+    let (q, k) = qk_fwd(rt, &p, &w, &w, 0, eps);
+    let (mut dq, mut dk) = (vec![0.0f32; QK_T * QK_D], vec![0.0f32; QK_T * QK_D]);
+    for r in 0..QK_T {
+        for g in [&mut dq, &mut dk] {
+            g[r * QK_D] = a[r];
+            g[r * QK_D + 1] = -a[r];
+        }
+    }
+    let (dp, _, _) = qk_bwd(rt, &p, &w, &w, &dq, &dk, 0, eps);
+    let mut bad = Vec::new();
+    for r in 0..QK_T {
+        for (what, fwd, bwd) in [
+            ("q", q[r * QK_D + 1], dp[r * 4 * QK_D]),
+            ("k", k[r * QK_D + 1], dp[r * 4 * QK_D + 2 * QK_D]),
+        ] {
+            if fwd.to_bits() != bwd.to_bits() {
+                bad.push(format!(
+                    "qk {what} eps={eps:e} row {r} a={:e}: forward {fwd:e} ({:#010x}), backward {bwd:e} ({:#010x})",
+                    a[r],
+                    fwd.to_bits(),
+                    bwd.to_bits()
+                ));
+            }
+        }
+    }
+    bad
+}
+
+#[test]
+fn qk_norm_rope_backward_rebuilds_the_forward_rstd() {
+    with_gpu(|rt| {
+        let bad: Vec<String> = EPS.iter().flat_map(|&e| qk_mismatches(rt, e)).collect();
+        assert!(bad.is_empty(), "{} rows differ:\n{}", bad.len(), bad.join("\n"));
     });
+}
+
+/// Forward outputs through both entries (Qwen's `1 + w` and the packed
+/// `weight_bias = 0` EmbeddingGemma 2 reads) and the backward's gradients, on
+/// seeded rows of every magnitude, with a real rotary slice.
+fn collect_qk(rt: &Arc<GpuRuntime>) -> Vec<(String, Vec<f32>)> {
+    let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+    for eps in EPS {
+        let (p, _) = qk_proj(7500);
+        let qw: Vec<f32> = random_f32(QK_D, 7501).iter().map(|v| 0.9 * v).collect();
+        let kw: Vec<f32> = random_f32(QK_D, 7502).iter().map(|v| 0.9 * v).collect();
+        let (q, k) = qk_fwd(rt, &p, &qw, &kw, 16, eps);
+        out.push((format!("qk fwd q eps={eps:e}"), q));
+        out.push((format!("qk fwd k eps={eps:e}"), k));
+        let dq = random_f32(QK_T * QK_D, 7503);
+        let dk = random_f32(QK_T * QK_D, 7504);
+        let (dp, dqw, dkw) = qk_bwd(rt, &p, &qw, &kw, &dq, &dk, 16, eps);
+        out.push((format!("qk bwd dproj eps={eps:e}"), dp));
+        out.push((format!("qk bwd dq_norm_w eps={eps:e}"), dqw));
+        out.push((format!("qk bwd dk_norm_w eps={eps:e}"), dkw));
+
+        // The packed entry with `weight_bias = 0`: `* w`, as EmbeddingGemma 2.
+        let (pb, qwb, kwb) = (buf(rt, &p), buf(rt, &qw), buf(rt, &kw));
+        let q = seeded(rt, QK_T * QK_D, SENTINEL);
+        let k = seeded(rt, QK_T * QK_D, SENTINEL);
+        let v = seeded(rt, QK_T * QK_D, SENTINEL);
+        let targets = AttnTargets {
+            q_out: &q,
+            k_cache: &k,
+            v_cache: &v,
+        };
+        qwen35::attn_qk_norm_rope_packed(
+            rt,
+            &qk_shape(16),
+            Cols::dense(&pb, (4 * QK_D) as u32),
+            (2 * QK_D) as u32,
+            0.0,
+            &qwb,
+            &kwb,
+            &targets,
+            0,
+            1e6,
+            eps,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        out.push((format!("qk packed w-bias 0 q eps={eps:e}"), q.read_f32()[..QK_T * QK_D].to_vec()));
+        out.push((format!("qk packed w-bias 0 k eps={eps:e}"), k.read_f32()[..QK_T * QK_D].to_vec()));
+    }
+    out
 }

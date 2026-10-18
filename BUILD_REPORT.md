@@ -1,4 +1,112 @@
-# BUILD_REPORT — GitPulse backlog, waves 6–7 (2026-10-14/15)
+# BUILD_REPORT — GitPulse backlog, waves 13–16 (2026-10-17/18)
+
+`main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `a37a0c2` → **`bf091a2`**, all fast-forwards, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path).
+
+## How this run worked
+
+- **GitPulse:** cards were read and written through the installed `gitpulse-mcp` over stdio (the MCP was not attached). Every card here went `in_progress` → `review` with evidence and `expected_revision`. None was requested `done`, which Manvi gates.
+- **Roles:** Fable made the sequencing and judgement calls. Opus (this session) wrote every brief, reviewed every diff, and ran the final checks. Sonnet implemented each lane in its own worktree. A *separate* Sonnet attacked each lane, mutation-testing it where possible, and every break went back to the implementer.
+- **GitPulse insights / collision risk** were load-shed for most of the run (load 80–230, "git spawn rate budget is low"). Collisions were checked from committed branch diffs instead, which cannot see uncommitted work in other worktrees. The live eg2 lane's files were avoided until its work was integrated.
+- **DevMap:** I rebuilt the index (gen 1394). `impact`/`affected` walks stopped at depth 3 (`walk_incomplete`; 14 files with parse-error regions), so blast radii are lower bounds.
+- **`dev verify`:** gates nothing here (no DevCouncil config). The gate run was `scripts/ci_local.sh`, minus its GPU-lock-only steps.
+- **Branch base:** agent worktrees branch from `origin/main` (`60a6240`, 199 commits stale). Wave 13's lanes were built on it by mistake and rebased onto local `main`. After that, every lane started with `git merge --ff-only <main>`.
+
+## Gates
+
+Final run, on `bf091a2`:
+- fmt, release build (all targets), clippy `-D warnings` (default and `quant-prep`), doc `-D warnings`.
+- Hosted device-free selection (103 invocations, 1196 tests) and completeness.
+- Dialect lint, kernel IR check (38 kernels).
+- Emulator host contract and the exact, model and fast-math kernel cases.
+- Comparator lanes (15), torch binding host tests (108), Go unit (`make -C go unit`).
+- Every targeted device test binary, serial, and `--lib` (265).
+
+**NOT run:**
+- The GPU-lock-only steps: the full serialized `cargo test --release`, the Python GPU tests and the Go device tests. The `mac_heavy` lock was held by ojas or Lappi jobs nearly the whole run.
+- Examples, the `mtl_tensor` quant-prep run, and the release-ready gate.
+- `kernel_coverage --check`: exits 77 on `main` already (see ft-6d88defb).
+
+Earlier landings had the same gate set, each on its own tree.
+
+## Tasks moved to review (evidence in each card's log)
+
+| Card | Wave | Result |
+|---|---|---|
+| ft-14fa3c44 wave10 manifest/merge/kcov | 13 | Triage only. AC1–2 were already on `main` (5c54400, 2323add). AC3 is stale (eg2 was merged, not rebased). AC4 is ft-6d88defb. |
+| ft-de6fa0ab Metal 4 faults + reader bounds | 13 | AC2–4 and the AC5 site list were already on `main`. `host_access_ban`'s "any receiver named `st`" exemption is now an exact counted site list: a first heuristic let 22 of 37 hostile cases through, so it was replaced. Added a commit-feedback error-path unit test. AC1 is closed by owner decision (timeouts stay retryable). |
+| ft-c0bb2f03 decode ICB | 13 | AC4: `IcbCopySmoke::encode_copy` refuses while an execute is in flight. The token is read atomically under the batch lock; the adversarial pass found a TOCTOU in the first version. AC1–3 belong to ojas → filed ojas ft-4d9d3b55. |
+| ft-20802330 NAX int4 + ExactF32 | 13 | The int4b constructor exists (compile probe `tools/probes/int4b/`, which fails on any deviation). The rest was split into ft-fd8bde58 and ft-36deadf7. |
+| ft-a13c82af tiled FA-2 collapse | 14 | One `attn_fa2.h` template. Outputs are bit-identical, using goldens recorded on the old kernels. Slots are byte-identical, and ojas checked gemma-metal. Owner kept `TESSL_ATTN_TILED` as the A/B baseline. |
+| ft-4b1313de runtime lease spike | 14 | Invariant table plus 9 pinning tests, mutation-verified (M1–M7 caught; M5b unobservable). Decision: no shared read guard now. AC1 measurement open (GPU). |
+| ft-1a0f8c18 kernel templating | 15 | `gemv_q4_mlx` (10), `gemm_q4_mlx` (4) and utils copy/cast are templated. 132-row goldens and the IR-checked slots are identical. `qdot16` reloads its weight word per m (reported, not changed). Owner wants a real tuned `_wide` kernel (GPU-gated). The RMSNorm convention is not started: it changes numerics. |
+| ft-afb1c42d host near-copies | 15 | Dispatch validator; poison-safe release queue (3 of 4 tests failed before the fix); loader/tensor/npy generics. Error texts are proven unchanged by running the new tests on the old code. Remainder is in progress (wave 16 C). |
+| ft-fd8bde58 int4 TensorOps GEMM | 15 | Measured on the GPU: low nibble first, `int4b` is two's complement. A per-group MLX Q4 TensorOps GEMM matches `gemm_q4_mlx` and f64 within derived bounds. No production entry point and no benchmark yet. |
+| ft-36deadf7 ExactF32 coop epilogue | 15 | Two new kernels. Bit-identical to the separate passes once FMA contraction was turned off (`STRICT`; it was 1 ulp off). 432+ cases. Census 298→300 with bench lanes. NN only. |
+| ft-c59ff950 `SqNormPlan::parts_words` | 16 | ojas asked for it. One owner of the 2·pieces rule; all four mutants caught. |
+| ft-9e79d8be ragged Qwen3.5 training | 16 | `train_step_ragged_into` (Rust core). Per-sequence losses are bit-identical to each sequence alone. Sequences are isolated. The memory bound now counts the ragged step: the adversarial pass found it undercounting. The single-sequence `train_step_bytes` is measured equal to `a37a0c2`'s. C API and Python wiring are deferred (public contract). |
+
+Also merged without a card, at your request:
+- **`ea630de`:** the prepared integration of `gp/clip-sq-norm`, `gp/w11-2bmem` and `gp/w12-kcov`. It brings `tessl::sq_norm` with overflow-safe per-piece scaling.
+- **Your uncommitted work, committed:** the GDN speed tool and its result (recorded as `valid: false` by its own spread gate), the `bench/tok_hf_native` crate (a **new third-party dependency**: `tokenizers =0.23.2`, isolated in its own workspace), and `tasks/` (excluded from the crate).
+- **The eg2 lane:** media decoding, plot_results, capi_embedgemma2 and a Go binding under `go/`. The Go binding depends on **gusset**, pinned to a commit, outside tessl's crate graph. eg2 also adds `THIRD_PARTY_NOTICES.md` for its libjpeg-turbo-derived JPEG decoder.
+
+## Benchmarks
+
+None. No hot path changed in a way that needed timing:
+- The template refactors are bit-identical, and their IR was checked.
+- ExactF32 adds a fused path; nothing that existed was slowed.
+- No speedup is claimed anywhere.
+
+Every benchmark-gated card stays open because the `mac_heavy` lock was busy.
+
+## New tasks filed
+
+- ojas **ft-4d9d3b55**: gemma-metal 31B decode-graph ICB migration.
+- tessl **ft-36deadf7**: ExactF32 epilogue. Done in wave 15.
+- tessl **ft-c59ff950**: `parts_words`. Done in wave 16.
+
+Updated rather than duplicated:
+- **ft-fd8bde58**: the int4 blocker turned out not to exist.
+- **ft-6d88defb**: the exit-77 diagnosis. Two existing bench lanes fail inside the tool: `softcap_sample` n=512 exceeds 256 lanes, and `bench_qwen35_train` gets a wrong out shape.
+
+## Fable's decisions
+
+1. Wave 13: three lanes. Scope the `st` exemption; don't rename public API. Close timeout escalation as an owner decision. Run the int4 probe compile-only.
+2. Wave 14: FA-2 collapse and the lease spike. Defer ragged training while the eg2 lane held `qwen35_train.rs`. Don't adopt the dead session's cards.
+3. Wave 15: four low-risk lanes. Kernel templating on the FA-2 method, near-copies subset, int4 parity, ExactF32. No benchmark work.
+4. Wave 16: `parts_words` and ragged training (Rust core only), then near-copies remainder and config parsing (BERT and Qwen3.5 only). Defer the RMSNorm numerics change. The nn.rs split lands last.
+
+## Owner decisions (2026-10-18)
+
+| Item | Decision | Remaining work |
+|---|---|---|
+| Tiled attention | Keep as the A/B baseline | Docs follow-up |
+| Q4 `Wide` | Write a real tuned wide kernel | GPU benchmark first; announce to ojas |
+| Kernel coverage | Bench lanes for every kernel | GPU; fix the two failing lanes first |
+| GPU wait timeouts | Stay retryable | None |
+
+## Still pending
+
+- **Wave 16 C and D:** in flight.
+- **For you:** the C API and Python signature for ragged batches.
+- **Not started, for a later wave:** the RMSNorm rsqrt convention, which changes training numerics and needs an ojas announcement. ft-376ad5d4 public-surface narrowing (breaking).
+- **Disk:** finished agent worktrees under `.claude/worktrees/` keep their `target/` (0.7–1.3 GB each). The gate holds `rm -rf` there for you.
+
+## Branches and backups
+
+- **Deleted:** every merged or contained branch of this run, the stale `gp/*` lanes, the three stale detached merge worktrees, and 12 stale eg2 agent branches.
+- **Backups:** every deleted ref is under `refs/backup/2026-10-17-w14/`.
+- **Kept:** `main`, the live `eg2/integrate`, the two running lanes, and five finished worktrees that are harness-locked or hold agent scratch.
+
+## Incidents
+
+- A shared `target/` was wiped by someone else mid-run.
+- The disk hit 100% (ENOSPC) overnight from per-lane build dirs plus ojas's verify cache. No shell could run. I stopped my agents, and space was freed by the owner.
+- One tessl fast-forward (`527de20`) landed during an ojas re-run. ojas had permitted it, but it mixed two sources of change. Since then, a fast-forward waits for ojas's "rerun done".
+
+---
+
+# Earlier run: waves 6–7 (2026-10-14/15)
 
 Base: `main` @ `620939d` (which already held waves 1–5, see the earlier report below). All of this run's work is on **`gp/wave7`** (worktree `../tessl-wave6`): `gp/wave6` (wave 6 plus integration fixes) with the four wave-7 lanes merged on top. That is 56 commits and 96 files (+13.3k / −4.3k, report and CHANGELOG included) ahead of `main`. **Nothing is merged into `main` or pushed**, because that is your call.
 

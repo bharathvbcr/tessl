@@ -1168,8 +1168,9 @@ fn gated_rms_norm_f32_and_bf16() {
 // ------------------------------------------------------------ residual norm ---
 
 /// `qwen35::rms_norm` on the zero-centred `w`: the f32 output is tessl's
-/// generic RMSNorm fed `1 + w` folded in f32, bit for bit (the same reduction
-/// and the same `fl(1 + w)`), so storing `w` moved no forward; both outputs
+/// generic RMSNorm fed `1 + w` folded in f32 (the same reduction and the same
+/// `fl(1 + w)`; only the inverse root is `precise::` here), within 3 ulp, so
+/// storing `w` moved no forward; both outputs
 /// are `x * rstd * (1 + w)` in f64 to their dtype's rounding. Weights reach
 /// below -0.5, where `1 + w` rounds `w`. The 2B's hidden size spans several
 /// simdgroups; 300 is not a power of two.
@@ -1204,11 +1205,21 @@ fn qwen35_rms_norm_f32_and_bf16() {
             tessl::nn::rms_norm_f32(rt, &xb, &fb, &generic, r, d, eps).unwrap();
             rt.synchronize().unwrap();
             let got = out.read_f32()[..rows * dim].to_vec();
-            let same = got
+            // The norms differ in the inverse root only (`precise::rsqrt` here,
+            // fast `rsqrt` in the generic kernel, so that the backward's rebuilt
+            // `rstd` is the forward's): one ulp of `rstd`, and the product with
+            // `x` and `1 + w` rounds twice more. Never further apart than 3 ulp.
+            let ulps = |a: f32, b: f32| (i64::from(a.to_bits() as i32) - i64::from(b.to_bits() as i32)).abs();
+            let worst = got
                 .iter()
                 .zip(&generic.read_f32()[..rows * dim])
-                .all(|(a, b)| a.to_bits() == b.to_bits());
-            assert!(same, "{rows}x{dim}: not the generic RMSNorm on 1 + w bit for bit");
+                .map(|(&a, &b)| ulps(a, b))
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 3,
+                "{rows}x{dim}: {worst} ulp from the generic RMSNorm on 1 + w"
+            );
             assert_close_rel(&format!("qwen35 rms_norm f32 {rows}x{dim}"), &got, &want, 1e-5, 1e-6);
             for (i, (&g, &wv)) in read_bf16(&outb, want.len()).iter().zip(&want).enumerate() {
                 // One bf16 rounding of the f32 result: half an ulp of 2^-8, plus slack.

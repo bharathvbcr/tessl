@@ -239,6 +239,7 @@ pub mod bert;
 pub mod capi;
 pub mod capi_embedgemma2;
 pub mod cb_replay;
+mod config_json;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;

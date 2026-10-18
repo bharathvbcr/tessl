@@ -53,7 +53,10 @@ fn both_name_a_missing_required_key() {
         bert_err(&edit(MINI, "\"type_vocab_size\":2,", "")),
         "config.json: missing \"type_vocab_size\""
     );
-    assert_eq!(bert_err(&edit(DISTIL, "\"dim\":768,", "")), "config.json: missing \"dim\"");
+    assert_eq!(
+        bert_err(&edit(DISTIL, "\"dim\":768,", "")),
+        "config.json: missing \"dim\""
+    );
     let q = edit(QWEN, "\"vocab_size\"", "\"vocab_sizeX\"");
     assert_eq!(qwen_err(&q), "config.json: missing \"vocab_size\"");
     let q = edit(QWEN, "\"rms_norm_eps\"", "\"rms_norm_epsX\"");
@@ -63,7 +66,11 @@ fn both_name_a_missing_required_key() {
 #[test]
 fn both_refuse_a_non_integer_or_negative_count() {
     for bad in ["-1", "1.5", "1e3", "\"6\"", "true", "null", "[]"] {
-        let b = bert_err(&edit(MINI, "\"num_hidden_layers\":6", &format!("\"num_hidden_layers\":{bad}")));
+        let b = bert_err(&edit(
+            MINI,
+            "\"num_hidden_layers\":6",
+            &format!("\"num_hidden_layers\":{bad}"),
+        ));
         assert!(
             b.starts_with("config.json: num_hidden_layers must be a non-negative integer, got "),
             "{bad}: {b}"
@@ -95,7 +102,10 @@ fn both_refuse_a_count_above_u32() {
 #[test]
 fn both_refuse_a_non_number_epsilon() {
     let b = bert_err(&edit(MINI, "1e-12", "\"1e-12\""));
-    assert!(b.starts_with("config.json: layer_norm_eps must be a number, got "), "{b}");
+    assert!(
+        b.starts_with("config.json: layer_norm_eps must be a number, got "),
+        "{b}"
+    );
     let b = bert_err(&edit(MINI, "1e-12", "-1e-12"));
     assert!(b.starts_with("config.json: layer_norm_eps must be positive"), "{b}");
     let q = qwen_err(&edit(QWEN, "\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": \"x\""));
@@ -153,10 +163,12 @@ fn bert_flag_must_be_a_boolean() {
             "{bad}: {r:?}"
         );
     }
-    assert!(
-        bert_err(&edit(DISTIL, "\"sinusoidal_pos_embds\":false", "\"sinusoidal_pos_embds\":true"))
-            .contains("sinusoidal_pos_embds is not supported")
-    );
+    assert!(bert_err(&edit(
+        DISTIL,
+        "\"sinusoidal_pos_embds\":false",
+        "\"sinusoidal_pos_embds\":true"
+    ))
+    .contains("sinusoidal_pos_embds is not supported"));
 }
 
 /// DRIFT: Qwen refuses a `null` string (wrong type); BERT read `null` as

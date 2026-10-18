@@ -61,6 +61,20 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **JPEG: block smoothing and lossless JPEG, byte for byte** (`tessl::media::jpeg`).
+  The decoder no longer refuses a progressive stream that libjpeg-turbo 3.1.3
+  smooths (scans cut short, or a scan that runs out of data): the 5x5 estimator,
+  the previous-scan record, `last_good_iMCU_row` and the block rows read at the
+  picture and iMCU-row edges were measured with the oracle
+  (`torchvision.io.decode_image`, mode RGB) and are held by 572 smoothing fixtures.
+  Lossless JPEG (SOF3: predictors 1-7, point transform, restart rows, precisions
+  2-8, RGB and CMYK) decodes to the reference's bytes (146 fixtures); what the
+  reference refuses (gray, YCbCr and YCCK lossless, precisions above 8, a stream
+  with no DHT, a component in no scan, bad parameters) is a named error here too,
+  and one shape it decodes (several scans, a restart interval, components of
+  different sizes) stays a named `Unsupported`. 998 fixtures agree with the
+  oracle (874 byte-equal, 123 refused by both, 1 named refusal); 10000 live-fuzz
+  mutants, 0 disagreements.
 - **C ABI 12** (additive; `TESSL_ABI_VERSION` 11 → 12):
   `tessl_runtime_set_async_encode`, and `tessl_qwen35_read_parameter_host` /
   `tessl_qwen35_write_parameter_host` for one parameter-table entry. A per-entry

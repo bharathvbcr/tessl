@@ -189,8 +189,8 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         ("idct", 5),
         ("markers", 6),
         ("layout", 6),
-        ("smoothing", 500),
-        ("lossless", 140),
+        ("smoothing", 560),
+        ("lossless", 145),
     ] {
         assert!(
             count(class) >= at_least,

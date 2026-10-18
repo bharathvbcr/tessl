@@ -2909,7 +2909,7 @@ behaves as before: the tag is read from the first Exif APP1 segment (bounded par
 `ImageInfo::exif_orientation`, and applied only for `ExifOrientation::Apply`.
 
 **The reference** (established by reading what torchvision's `decode_jpeg` does and probing
-it, and held by 162 fixtures; the fixture generator's docstring repeats it): libjpeg-turbo 3.1.3 (the
+it, and held by 998 fixtures; the fixture generator's docstring repeats it): libjpeg-turbo 3.1.3 (the
 library bundled in the installed torchvision 0.29.1 wheel; libjpeg API 8; NEON SIMD on this
 arm64 machine), called as `jpeg_read_header`, `out_color_space = JCS_RGB` (for CMYK and YCCK,
 `JCS_CMYK`, then torchvision's own `v = k * cmy + 128; ((v >> 8) + v) >> 8`),
@@ -2918,8 +2918,8 @@ upsampling on (so the merged upsampler is never selected), block smoothing on, 8
 only. The source manager fails when libjpeg asks for a byte past the end of the data ("Image is
 incomplete or truncated"), so a stream with no EOI is an error. `decode_image` hands data to
 the JPEG decoder only when it starts `FF D8 FF`. PIL 12.3 bundles libjpeg-turbo 3.1.4.1 and
-returns the same bytes as torchvision on all 162 fixtures both decode, so the choice between
-the two candidate paths does not matter.
+returns the same bytes as torchvision on every fixture both decode (0 differ), so the choice
+between the two candidate paths does not matter.
 
 **What is decoded.** Baseline and extended sequential (SOF0, SOF1) and progressive (SOF2)
 Huffman, and arithmetic-coded sequential and progressive (SOF9, SOF10; the Q-coder table is
@@ -2935,19 +2935,43 @@ files too: a bad Huffman code, a marker inside entropy data (the rest of the seg
 as zeros), extraneous bytes before a marker and a wrong restart marker are warnings in
 libjpeg and decode, and decode here to the same pixels.
 
+**Block smoothing** (`smooth.rs`). libjpeg-turbo 3.1 smooths a progressive image whose scans
+stop before AC coefficients 1 to 5 (or 1 to 9) are complete (a truncated progressive file that
+still has its EOI, or a scan that runs out of data) from the neighbouring DC values, a 5x5
+window per block. The source was not on this machine, so nothing here is copied: the 25-weight
+tables, the rounding and the limit by the point transform (T.81 K.8 extended), the guard on
+the quantizers, the "previous scan" record (`prev_bits`, 0 for components first seen in the
+first scan), `last_good_iMCU_row` (the iMCU row of the last MCU decoded while its segment had
+data) and the block rows read at the top, bottom and iMCU-row edges were each measured with
+the oracle, on cjpeg's own cuts of real pictures and on one-component files with chosen DC
+images, quantizers and progression states written by the generator, and then held by the
+fixtures (the row rule by one-component pictures of every height from one block row to
+past two iMCU rows, at 2, 3 and 4 block rows per iMCU row). Where a rule could not be told
+from another on the fixtures it is the simplest one that fits. The limit of "byte for
+byte" is what the fixtures hold: 3 or 4 block rows per iMCU row are covered by the
+one-component files and by a few cjpeg `-sample 1x3`/`1x4`/`2x3` pictures, not by large real
+pictures.
+
+**Lossless JPEG (SOF3)** (`lossless.rs`). Predictors 1 to 7, the point transform, restart
+intervals (whole MCU rows), precisions 2 to 8, one to four components, RGB and CMYK as
+libjpeg-turbo 3.x delivers them (plain replication for subsampled components, no DCT
+upsampling filters). The reference refuses, and so does this decoder with a named error:
+precisions 9 to 16 ("Unsupported JPEG data precision"), gray, YCbCr and YCCK frames ("Unsupported
+color conversion request": its lossless path only copies samples), a lossless stream with no
+DHT (the standard-table fallback belongs to the DCT decoder), a frame with a component in no
+scan, a restart interval that is not a whole number of MCU rows, and invalid predictor and point
+transform parameters.
+
 **Refused by name** (`JpegError::Unsupported`, `MediaError::Unsupported`):
 
-- *Block smoothing.* libjpeg-turbo 3.1 smooths a progressive image whose scans stop before
-  AC coefficients 1 to 5 are complete (a truncated progressive file that still has its EOI)
-  from neighbouring DC values. The estimator was not reproduced (an estimator recalled from
-  libjpeg 6 differed from the reference by 3 to 12 levels), so such a stream is refused rather
-  than decoded to something that is not the reference's. Measured by decoding the five
-  committed cases with the refusal switched off: the plain-IDCT result differs from the
-  reference by max 12 to 99 and mean 1.18 to 15.9 per byte. A complete progressive file is
-  not affected. 5 of the 194 fixtures, 2 of the 468 corpus entries and 10 of 4000 live
-  mutants hit it.
-- *Lossless JPEG (SOF3).* The reference decodes it (libjpeg-turbo 3.x); this decoder does not.
 - *12-bit.* The reference's 8-bit build refuses it too, so this is agreement, not a gap.
+- *Lossless samples of another width than 8*, and the lossless colour spaces above: the
+  reference refuses them too (agreement).
+- *One lossless shape the reference decodes and this decoder does not reproduce*: several scans
+  with a restart interval and components of different sizes (`lossless_rst_sub_noninterleaved`).
+  The reference counts the restart rows over the last scan's MCU rows when it undifferences the
+  whole frame; that diagnosis is inferred from the one fixture, not verified, and the shape is
+  refused rather than guessed.
 
 **Own bounds** (not the format's; each is checked before anything is allocated):
 `options.max_pixels` against the header's size, a working-memory ceiling of 6 GiB for
@@ -2957,7 +2981,7 @@ costs a pass over every block, so a file spending 14 bytes per scan could otherw
 minutes). Hostile input is a named error (`Truncated`, `NotJpeg`, `Invalid`, `Unsupported`,
 `Limit`), never a panic.
 
-**Evidence** (`tests/media_jpeg.rs`, 11 tests plus one ignored; fixtures and the oracle's
+**Evidence** (`tests/media_jpeg.rs`, 12 tests plus one ignored; fixtures and the oracle's
 bytes in `tests/fixtures/jpeg/`, made by `scripts/gen_jpeg_fixtures.py` with PIL, `cjpeg`
 3.2.0 and the generator's own coefficient-level writer):
 
@@ -2972,17 +2996,23 @@ bytes in `tests/fixtures/jpeg/`, made by `scripts/gen_jpeg_fixtures.py` with PIL
 | quality 1 to 100 | 10 |
 | arithmetic (sequential, progressive, 4:4:4, 4:2:0, 4:2:2) | 5 |
 | IDCT extremes, layout (non-interleaved scans, every scan order, 10-block MCU), header oddities, tables (standard tables with no DHT, 16-bit DQT) | 26 |
-| refused by both the oracle and this decoder (12-bit, no EOI, cuts, 2/5/6/10 components, bad sampling, bad tables, bad signature, ...) | 32 |
-| refused by name, decoded by the oracle (block smoothing, lossless) | 6 |
+| block smoothing: cjpeg's own cuts (every prefix of the default script for 6 subsamplings and gray, 14 sizes with odd and even block-row counts, 7 progression scripts), scans cut short with and without later scans kept, restarts, arithmetic, one-component files at 2 to 4 block rows per iMCU row for every height, DC images and progression states chosen to hit each estimate, zero quantizers, 16-bit extremes | 572 |
+| lossless: predictors 1 to 7, point transforms, precisions 2 to 8, RGB and CMYK, 4:2:0 and 4:2:2 replication, restarts, non-interleaved and mixed scan lists, cjpeg's own encoder, wild differences | 146 byte-equal |
+| refused by both the oracle and this decoder (12-bit, no EOI, cuts, 2/5/6/10 components, bad sampling, bad tables, bad signature, lossless gray/YCbCr/YCCK, precisions 9 to 16, bad lossless parameters, no DHT, a component in no scan, ...) | 123 |
+| the one named refusal, decoded by the oracle (`lossless_rst_sub_noninterleaved`) | 1 |
 
-All 194 fixtures agree: 156 are byte-equal, 32 are refused by both and 6 are the named
-refusals above (5 block smoothing, 1 lossless). A corpus of 468 mutated JPEGs (26 bases, deterministic mutator) holds the
-oracle's verdict and pixels: 310 byte-equal, 156 refused by both, 2 named refusals, 0
-disagreements. The ignored `live_fuzz_against_the_oracle` regenerates mutants against
-torchvision (`scripts/gen_jpeg_fixtures.py --live-fuzz DIR COUNT SEED`): 4000 fresh mutants
-(seed 777): 2285 byte-equal, 1705 refused by both, 10 named refusals, 0 disagreements.
-`mutated_inputs_never_panic` decodes 6160 in-process mutants of 154 fixtures in release and in
-the debug profile (overflow checks on); every strict prefix of seven valid files is an error.
+All 998 fixtures agree: 874 are byte-equal, 123 are refused by both and 1 is the named
+refusal above. A corpus of 612 mutated JPEGs (deterministic mutator, smoothing and lossless
+bases included) holds the oracle's verdict and pixels: 408 byte-equal, 204 refused by both, 0
+named refusals, 0 disagreements. The ignored `live_fuzz_against_the_oracle` regenerates mutants
+against torchvision (`scripts/gen_jpeg_fixtures.py --live-fuzz DIR COUNT SEED`): 4000 fresh
+mutants (seed 777): 2224 byte-equal, 1776 refused by both, 0 disagreements; 6000 more (seed
+4242): 3243 byte-equal, 2757 refused by both, 0 disagreements. The first run, before the final
+fixes, found five disagreements (a lossless stream with no DHT decoding with the standard
+tables, a lossless component in no scan, and `last_good_iMCU_row` not following later scans),
+each now a fixture. `mutated_inputs_never_panic` decodes 34920 in-process mutants of 873
+fixtures in release and in the debug profile (overflow checks on); every strict prefix of
+seven valid files is an error.
 That the oracle is torchvision's and that PIL agrees is held by
 `the_two_candidate_oracles_agree_on_every_fixture`.
 
@@ -3469,10 +3499,13 @@ tried.
 
 ### What is left
 
-- JPEG: libjpeg-turbo's block smoothing (progressive streams cut short before AC coefficients 1
-  to 5 are complete) and lossless SOF3 are refused by name, not decoded; see JPEG decoding. The
-  smoothing estimator would need to be derived from the reference's behaviour (the fixtures
-  `smoothing_*` hold its output) or from the library source, which was not on this machine.
+- JPEG: block smoothing and lossless SOF3 are decoded byte for byte on all 998 fixtures; see
+  JPEG decoding. What is left is one lossless shape refused by name (several scans, a restart
+  interval and components of different sizes; the reference decodes it, the cause of the
+  difference is inferred), and the smoothing and lossless rules being measured against the
+  oracle rather than read from the library source, which was not on this machine: shapes the
+  fixtures do not contain (large real pictures with 3 or 4 block rows per iMCU row) are
+  unverified; reading the library source would settle them.
 - torchcodec itself is not in the environment: the video reference is the `ffmpeg` CLI and
   torchcodec's documented exact-mode figures, so a run with torchcodec installed would close
   the last inferred step. What it does with a rotation flag is unverified (the default here

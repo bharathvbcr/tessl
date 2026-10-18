@@ -13,14 +13,14 @@ use tessl::GpuRuntime;
 
 /// `(t, bf16 operands, bytes)`.
 const PINNED: [(u32, bool, u64); 8] = [
-    (2, false, 0),
-    (2, true, 0),
-    (17, false, 0),
-    (17, true, 0),
-    (256, false, 0),
-    (256, true, 0),
-    (4096, false, 0),
-    (4096, true, 0),
+    (2, false, 2149185792),
+    (2, true, 2150339840),
+    (17, false, 2150411008),
+    (17, true, 2151967488),
+    (256, false, 2163621888),
+    (256, true, 2169847808),
+    (4096, false, 2378167296),
+    (4096, true, 2436969472),
 ];
 
 #[test]
@@ -32,7 +32,11 @@ fn the_single_sequence_step_bound_is_unchanged() {
     let model = Qwen35Model::load(&rt, &st, "model.", cfg, Precision::F32).unwrap();
     let mut bad = Vec::new();
     for (t, bf16, want) in PINNED {
-        let mm = if bf16 { GemmOperands::Bf16 } else { GemmOperands::ExactF32 };
+        let mm = if bf16 {
+            GemmOperands::Bf16
+        } else {
+            GemmOperands::ExactF32
+        };
         let got = model.train_step_bytes(t, mm);
         eprintln!("PIN ({t}, {bf16}, {got}),");
         if got != want {

@@ -630,6 +630,21 @@ def smoothing_cases():
     for tag, s in (("v3", "1x3,1x1,1x1"), ("v4", "1x4,1x1,1x1"), ("v4c2", "1x4,1x2,1x1"), ("h2v3", "2x3,1x1,1x1")):
         for (h, w) in [(33, 47), (96, 24), (104, 40), (56, 17)]:
             cut_all(f"smoothing_tall_{tag}_{h}x{w}", cj(photo(h, w, h + w), "-progressive", "-sample", s), k, f"cjpeg -sample {s}, {h}x{w}", ks=(1, 2, 5))
+    # Pictures many iMCU rows tall at three and four block rows per iMCU row. jdcoefct.c:543-570 picks the five block rows
+    # of every block from image_block_row and image_block_rows, which count with the *current* iMCU row's block_rows (the
+    # partial count in the last one): the clauses that matter are the first two iMCU rows (rows two up that are not in the
+    # prior iMCU row), the interior (a three-iMCU-row window), the second-to-last and the last (one, two, or all-but-one of
+    # v rows present). Heights are chosen so that the last iMCU row holds 1 .. v block rows.
+    for tag, s, vb in (("v3", "1x3,1x1,1x1", 3), ("v4", "1x4,1x1,1x1", 4), ("h2v3", "2x3,1x1,1x1", 3), ("420", "2x2,1x1,1x1", 2),
+                       ("440", "1x2,1x1,1x1", 2), ("h2v4", "2x4,1x1,1x1", 4)):
+        for extra in range(1, vb + 1):  # block rows in the last iMCU row of the luma component
+            h = 8 * vb * 6 + 8 * extra - 3  # six full iMCU rows and `extra` more block rows, the last one 5 samples tall
+            w = 40 + 3 * extra
+            cut_all(f"smoothing_large_{tag}_{h}x{w}", cj(photo(h, w, h + w), "-progressive", "-sample", s), k,
+                    f"cjpeg -sample {s}, {h}x{w}: six full iMCU rows and {extra} block row(s)", ks=(1, 2, 5))
+    # a large 4:2:0 picture (36 block rows of luma) and a large 1x3 one, every prefix of the default script
+    cut_all("smoothing_big_420", cj(photo(288, 96, 17), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 288x96", ks=(1, 2, 3, 5, 7))
+    cut_all("smoothing_big_v3", cj(photo(290, 64, 19), "-progressive", "-sample", "1x3,1x1,1x1"), k, "cjpeg -sample 1x3, 290x64", ks=(1, 2, 3, 5))
     # progression scripts that leave coef_bits in states the default script never does
     for tag, s in (("420", "2x2,1x1,1x1"), ("444", "1x1,1x1,1x1")):
         for name, script in SCAN_SCRIPTS.items():
@@ -780,7 +795,7 @@ def lossless_cases():
     pl = ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12)
     case("lossless_rst_sub_interleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16), k, "4:2:0, restart every 2 MCU rows")
     case("lossless_rst_sub_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16, interleave=False), k,
-         "4:2:0 in three scans with a restart interval (the interval is checked against the last scan's MCU row)", tessl="either")
+         "4:2:0 in three scans with a restart interval; Y restarts every row, inside its 2-row iMCU row", tessl="either")
     # a scan that ends in a marker before the picture does: the rest is zero differences, i.e. prediction only
     for name, data in (("rgb", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=4, adobe=0)),
                        ("ps7", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=7, adobe=0)),

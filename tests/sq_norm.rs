@@ -237,8 +237,33 @@ fn refusals_encode_nothing() {
         "out: buffer belongs to another runtime",
     );
     assert_eq!(rt.take_dispatch_count(), 0, "a refusal encoded work");
+    assert_eq!(plan.parts_words(), 2 * plan.pieces());
     // Disjoint ranges of one buffer are fine.
     plan.encode(&rt, (&table, 0), (&big, 0), (&big, 8), "test").unwrap();
     rt.synchronize().unwrap();
     assert_eq!(decode_sq_norm(&big.contents_u32()[2..2 + SQ_OUT_WORDS]).unwrap(), 100.0);
+}
+
+#[test]
+fn parts_words_is_two_per_piece_and_encode_refuses_one_short() {
+    let rt = GpuRuntime::new().unwrap();
+    let n = 3 * tessl::sq_norm::SQ_PIECE;
+    let t = f32_tensor(&rt, &vec![1.0; n]);
+    let plan = SqNormPlan::new(&rt, &[SqWindow::dense(&t.buffer, 0, DType::F32, n)], "test").unwrap();
+    assert_eq!(plan.pieces(), 3);
+    assert_eq!(plan.parts_words(), 2 * plan.pieces());
+    let table = rt.alloc_buffer_from_u32(plan.table_words()).unwrap();
+    let out = rt.alloc_buffer(4 * SQ_OUT_WORDS).unwrap();
+    let short = rt.alloc_buffer(4 * (plan.parts_words() - 1)).unwrap();
+    let m = plan
+        .encode(&rt, (&table, 0), (&short, 0), (&out, 0), "test")
+        .unwrap_err();
+    assert!(
+        m.contains("parts needs 24 bytes at offset 0 of a 20-byte buffer"),
+        "{m}"
+    );
+    let exact = rt.alloc_buffer(4 * plan.parts_words()).unwrap();
+    plan.encode(&rt, (&table, 0), (&exact, 0), (&out, 0), "test").unwrap();
+    rt.synchronize().unwrap();
+    assert_eq!(decode_sq_norm(&out.contents_u32()[..SQ_OUT_WORDS]).unwrap(), n as f64);
 }

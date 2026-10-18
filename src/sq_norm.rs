@@ -153,9 +153,18 @@ impl SqNormPlan {
         self.pieces as usize
     }
 
+    /// The `u32` words [`Self::encode`] requires of `parts`: `2 * pieces()`.
+    /// Layout: the piece sums in words `[0, pieces())`, the shifts in
+    /// `[pieces(), 2 * pieces())`, each written there (the kernels bind the
+    /// shifts at buffer index 3, `4 * pieces()` bytes past the `parts`
+    /// offset). Zero for a plan with no pieces.
+    pub fn parts_words(&self) -> usize {
+        2 * self.pieces()
+    }
+
     /// Record both dispatches in one binder scope (one commit, so one wait
     /// whatever the encode mode), without waiting: `table` holds
-    /// [`Self::table_words`]; `parts` has room for `2 * pieces()` words
+    /// [`Self::table_words`]; `parts` has room for [`Self::parts_words`] words
     /// (each piece's sum, then its shift), every one written here; `out`
     /// for [`SQ_OUT_WORDS`], read by [`decode_sq_norm`] once the work is
     /// done. The windows' buffers must stay alive until then: the table
@@ -175,7 +184,7 @@ impl SqNormPlan {
         let n = self.pieces as usize;
         let ranges = [
             ("table", table, self.words.len() * 4),
-            ("parts", parts, 8 * n),
+            ("parts", parts, 4 * self.parts_words()),
             ("out", out, 4 * SQ_OUT_WORDS),
         ];
         for (name, (buf, off), bytes) in ranges {
@@ -230,7 +239,7 @@ pub fn sq_norm(rt: &GpuRuntime, windows: &[SqWindow<'_>], what: &str) -> Result<
     // Fresh, so written without waiting for the GPU; every word of `parts`
     // and `out` is written by the kernels.
     let table = rt.alloc_buffer_from_u32(plan.table_words())?;
-    let parts = rt.alloc_buffer(8 * plan.pieces())?;
+    let parts = rt.alloc_buffer(4 * plan.parts_words())?;
     let out = rt.alloc_buffer(4 * SQ_OUT_WORDS)?;
     plan.encode(rt, (&table, 0), (&parts, 0), (&out, 0), what)?;
     rt.synchronize()?;

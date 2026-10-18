@@ -1,0 +1,19 @@
+# The Hugging Face `tokenizers` crate as a `bench_paired` lane beside
+# `bench_embedgemma2_tok` and `bench/embedgemma2_tok_hf.py`. A crate of its
+# own, with an empty workspace, so `tokenizers` never enters tessl's
+# dependency graph or Cargo.lock.
+[package]
+name = "tok_hf_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The version of the Python lane's wheel (tokenizers 0.23.2), with Oniguruma,
+# the crate's default regex engine; no progress bar, HTTP or training.
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+
+[profile.release]
+debug = 1

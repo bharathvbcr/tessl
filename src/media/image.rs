@@ -307,8 +307,8 @@ pub fn decode_image_file(path: &Path, options: &ImageOptions) -> Result<DecodedI
 /// the system does not know the format, [`MediaError::Limit`] when the image has
 /// more than `options.max_pixels` pixels, [`MediaError::Decode`] when the data is
 /// damaged or truncated, and [`MediaError::Unsupported`] for a JPEG kind the
-/// native decoder names and refuses (12-bit, lossless, progressive with block
-/// smoothing).
+/// native decoder names and refuses (what the reference's 8-bit path refuses
+/// too: 12-bit samples, lossless samples of another width than 8 bits).
 pub fn decode_image(bytes: &[u8], options: &ImageOptions) -> Result<DecodedImage, MediaError> {
     if jpeg::has_jpeg_signature(bytes) && options.color == ColorHandling::Native {
         return decode_jpeg_native(bytes, options);

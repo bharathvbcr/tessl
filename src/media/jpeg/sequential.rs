@@ -21,7 +21,7 @@ impl Decoder<'_> {
         let Some(spec) = spec else {
             return invalid(format!("Huffman table {tblno} is not defined (JERR_NO_HUFF_TABLE)"));
         };
-        let d = Derived::build(spec, is_dc, tblno)?;
+        let d = Derived::build(spec, is_dc, tblno, self.lossless)?;
         if is_dc {
             self.dc_derived[tblno] = Some(d);
         } else {
@@ -53,6 +53,9 @@ impl Decoder<'_> {
         self.last_dc = [0; MAX_COMPS_IN_SCAN];
         self.eobrun = 0;
         self.restarts_to_go = self.restart_interval;
+        if self.lossless {
+            return self.start_lossless_pass();
+        }
         if self.arithmetic {
             return self.start_arith_pass();
         }
@@ -76,7 +79,14 @@ impl Decoder<'_> {
             .store
             .take()
             .ok_or_else(|| JpegError::Invalid("internal: no block store".into()))?;
-        let r = self.scan_loop(&mut store);
+        let r = if self.lossless {
+            match &mut store {
+                Store::Planes(planes) => self.decode_scan_lossless(planes),
+                Store::Coefs(_) => invalid("internal: a lossless frame holds coefficients"),
+            }
+        } else {
+            self.scan_loop(&mut store)
+        };
         self.store = Some(store);
         r
     }
@@ -99,6 +109,18 @@ impl Decoder<'_> {
                             block.copy_from_slice(&coefs[ci][at..at + 64]);
                         }
                     }
+                }
+                // `last_good_iMCU_row` follows the data: every MCU decoded while the segment still
+                // has data moves it to the MCU's iMCU row (one MCU row in an interleaved scan,
+                // v_samp_factor of them in a single-component scan), so after a scan that ran dry it
+                // is the row where it did, and a later scan with data moves it on.
+                if !self.inp.insufficient {
+                    let rows_per_imcu = if self.scan_comps.len() == 1 {
+                        self.comps[self.scan_comps[0]].v
+                    } else {
+                        1
+                    };
+                    self.last_good_imcu_row = my / rows_per_imcu;
                 }
                 self.decode_mcu(&mut mcu[..nb])?;
                 match store {

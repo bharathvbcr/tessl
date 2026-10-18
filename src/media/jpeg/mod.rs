@@ -24,6 +24,13 @@
 //! incomplete or truncated" there, so every truncation, a missing EOI included,
 //! is an error here too ([`JpegError::Truncated`]).
 //!
+//! Two behaviours of the reference are part of that: libjpeg-turbo smooths a
+//! progressive file whose scans stop before the first AC coefficients are known
+//! (`smooth.rs`: a 5x5 estimator whose weights and row logic were measured against
+//! the reference, not copied, and agree with it on every committed fixture), and
+//! libjpeg-turbo 3.x decodes lossless JPEG (SOF3; `lossless.rs`) through the same
+//! 8-bit path, with plain replication for subsampled components.
+//!
 //! Every size is checked before it allocates: the pixel count against the
 //! caller's bound, the component, sampling-factor, MCU-block and Huffman-table
 //! counts against libjpeg's own limits, marker lengths against the bytes that
@@ -41,6 +48,7 @@ mod color;
 mod exif;
 mod huff;
 mod idct;
+mod lossless;
 mod markers;
 mod output;
 mod progressive;
@@ -126,6 +134,8 @@ pub enum JpegCoding {
     SequentialArithmetic,
     /// Progressive, arithmetic (SOF10).
     ProgressiveArithmetic,
+    /// Lossless, Huffman (SOF3).
+    Lossless,
 }
 
 /// What the file said about itself, for callers that report it.
@@ -297,6 +307,8 @@ pub(crate) struct Decoder<'a> {
     pub progressive: bool,
     pub arithmetic: bool,
     pub lossless: bool,
+    /// Samples per side of a data unit: 8 for the DCT modes, 1 for lossless.
+    pub unit: usize,
     pub precision: u32,
     pub width: u32,
     pub height: u32,
@@ -307,6 +319,15 @@ pub(crate) struct Decoder<'a> {
     pub mcu_rows_full: usize,
     pub has_multiple_scans: bool,
     pub coef_bits: Vec<CoefBits>,
+    /// `coef_bits[0..10]` from before the last scan that touched each component
+    /// (libjpeg-turbo keeps them in the second half of its `coef_bits` array).
+    pub prev_bits: Vec<[i32; smooth::SAVED_COEFS]>,
+    /// `master->last_good_iMCU_row`: the iMCU row of the last MCU decoded while
+    /// its segment still had data; block smoothing uses `prev_bits` for the rows
+    /// after it.
+    pub last_good_imcu_row: usize,
+    /// Whether each component has been in a scan so far (a lossless frame needs all of them).
+    pub scanned: Vec<bool>,
 
     // Scan.
     /// libjpeg's `cur_comp_info`, by position in the scan header.
@@ -365,6 +386,7 @@ impl<'a> Decoder<'a> {
             progressive: false,
             arithmetic: false,
             lossless: false,
+            unit: 8,
             precision: 8,
             width: 0,
             height: 0,
@@ -375,6 +397,9 @@ impl<'a> Decoder<'a> {
             mcu_rows_full: 0,
             has_multiple_scans: false,
             coef_bits: Vec::new(),
+            prev_bits: Vec::new(),
+            last_good_imcu_row: 0,
+            scanned: Vec::new(),
             cur_comp: [None; MAX_COMPS_IN_SCAN],
             scan_comps: Vec::new(),
             mcu_layout: Vec::new(),
@@ -420,9 +445,10 @@ impl<'a> Decoder<'a> {
             )));
         }
         // jinit_huff_decoder: a sequential Huffman stream that has not defined
-        // tables 0 and 1 by now gets the standard ones. (Progressive and
-        // arithmetic streams get none.)
-        if !self.progressive && !self.arithmetic {
+        // tables 0 and 1 by now gets the standard ones. (Progressive, arithmetic
+        // and lossless streams get none: the oracle refuses a lossless stream
+        // with no DHT, "Huffman table 0x00 was not defined".)
+        if !self.progressive && !self.arithmetic && !self.lossless {
             let std = huff::standard_tables();
             for t in 0..2 {
                 if self.dc_spec[t].is_none() {
@@ -440,16 +466,27 @@ impl<'a> Decoder<'a> {
                     self.comps.len()
                 ));
             }
-            JpegColorSpace::Rgb | JpegColorSpace::YCbCr | JpegColorSpace::Grayscale => {}
-            JpegColorSpace::Cmyk | JpegColorSpace::Ycck => {}
+            JpegColorSpace::Rgb | JpegColorSpace::Cmyk => {}
+            cs @ (JpegColorSpace::YCbCr | JpegColorSpace::Grayscale | JpegColorSpace::Ycck) => {
+                // libjpeg-turbo's lossless decoder only copies samples: RGB stays RGB and CMYK stays
+                // CMYK, and every conversion (gray or YCbCr to RGB, YCCK to CMYK) is refused when the
+                // decompressor is started, before any scan is read.
+                if self.lossless {
+                    return Err(JpegError::Unsupported(format!(
+                        "lossless JPEG in the {cs:?} colour space: the reference refuses to convert it \
+                         (JERR_CONVERSION_NOTIMPL, unsupported color conversion request)"
+                    )));
+                }
+            }
         }
         // Planes (one byte per padded sample), the coefficient arrays of a
         // multi-scan file (two bytes per coefficient) and the 3-byte output.
         let mut bytes = px * 3;
+        let unit2 = (self.unit * self.unit) as u64;
         for c in &self.comps {
-            let samples = (c.blocks_w as u64) * (c.blocks_h as u64) * 64;
+            let samples = (c.blocks_w as u64) * (c.blocks_h as u64) * unit2;
             bytes += samples;
-            if self.has_multiple_scans {
+            if self.has_multiple_scans && !self.lossless {
                 bytes += samples * 2;
             }
         }
@@ -476,7 +513,9 @@ impl<'a> Decoder<'a> {
                     }
                 } else {
                     let (a, b, c) = (self.comps[0].id, self.comps[1].id, self.comps[2].id);
-                    if (a, b, c) == (b'R', b'G', b'B') {
+                    // A lossless frame without a marker is RGB whatever its ids (the reference decodes
+                    // ids 1 2 3 there, where a DCT frame would be YCbCr).
+                    if self.lossless || (a, b, c) == (b'R', b'G', b'B') {
                         JpegColorSpace::Rgb
                     } else {
                         JpegColorSpace::YCbCr
@@ -507,6 +546,13 @@ impl<'a> Decoder<'a> {
             match self.read_markers()? {
                 markers::Reached::Eoi => {
                     self.eoi_reached = true;
+                    // The reference's lossless decoder reads every component back through its whole-image
+                    // buffers, and one that was never in a scan makes it fail ("Bogus virtual array access").
+                    if self.lossless && self.scanned.iter().any(|&s| !s) {
+                        return invalid(
+                            "a component of a lossless frame was never in a scan (libjpeg: JERR_BAD_VIRTUAL_ACCESS)",
+                        );
+                    }
                     return Ok(());
                 }
                 markers::Reached::Sos => {
@@ -526,7 +572,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn allocate_store(&mut self) {
-        self.store = Some(if self.has_multiple_scans {
+        self.store = Some(if self.lossless {
+            lossless::lossless_store(self)
+        } else if self.has_multiple_scans {
             Store::Coefs(
                 self.comps
                     .iter()

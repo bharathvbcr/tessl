@@ -295,6 +295,24 @@ fn run() -> Result<(), String> {
             batch: 1,
             run: Box::new(|| gemm_epilogue(&a, &b, &c, to, epi())),
         },
+        // Relaxed precision is off for this name: the exact-f32 epilogue.
+        Lane {
+            name: "epi_f32",
+            m: gm,
+            n: gn,
+            k: gk,
+            batch: 1,
+            run: Box::new(|| gemm_epilogue(&a, &b, &c, to, epi())),
+        },
+        // N <= 512 takes the 64x64 exact-f32 epilogue tile.
+        Lane {
+            name: "epi_f32_narrow",
+            m: gm,
+            n: nn_narrow,
+            k: gk,
+            batch: 1,
+            run: Box::new(|| gemm_epilogue(&a, &b_narrow, &c_narrow, to, epi())),
+        },
     ];
 
     let mut rows: Vec<String> = Vec::new();

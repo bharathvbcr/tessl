@@ -15,9 +15,9 @@ flowchart TD
     Validate -- Pass --> ModeCheck{"Call Variant?"}
 
     ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• 16-byte alignment at every batch start"]
-    ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
+    ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• TensorOps backend<br/>• BF16, F16, Relaxed F32 or exact F32"}
     EpiCheck -- No --> EpiErr["Return Err(Epilogue needs coop path)"]
-    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]
+    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• exact F32: *_f32_exact_epi, every step rounded on its own (bit-equal to separate passes)<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]
     
     ModeCheck -- "gemm() / gemm_tiled()" --> BackendCheck{"Backend?"}
 

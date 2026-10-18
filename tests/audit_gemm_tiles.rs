@@ -5,7 +5,7 @@
 //! matmul_tensorops.metal` and `src/` and compares text.
 //!
 //! The Rust side is read from the selectors themselves, not from a hand-kept
-//! copy: the `(kernel, TILE_*)` arms of `coop_kernel`, `epi_kernel`, the
+//! copy: the `(kernel, TILE_*)` arms of `coop_kernel`, `epi_kernel`, `epi_exact_f32_kernel`, the
 //! batched `match` in `gemm_batched` and `SplitKPar::kernel`, plus every
 //! `pipeline("matmul2d_tensorops_...")` site under `src/` paired with the
 //! `TILE_*` that follows it. An anchor that disappears fails the audit (a
@@ -413,6 +413,7 @@ fn kernel_literals(body: &str) -> Vec<(usize, &str)> {
 const ANCHORS: &[(&str, &str)] = &[
     ("coop_kernel", "fn coop_kernel("),
     ("epi_kernel", "fn epi_kernel("),
+    ("epi_exact_f32_kernel", "fn epi_exact_f32_kernel("),
     (
         "the batched match in gemm_batched",
         "match (elem, coop_narrow(m, n, elem))",

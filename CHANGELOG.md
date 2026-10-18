@@ -8,6 +8,18 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`gemm_epilogue` on exact f32.** With relaxed precision off, f32 operands
+  no longer get the "needs the cooperative-destination path" refusal: they run
+  `matmul2d_tensorops_f32_exact_epi` (128x64) or `_64x64_sg4` (the plain
+  rule's tile, N <= 512 narrow), exact f32 products with the cooperative
+  register epilogue. Every epilogue step rounds on its own (`epi_*_strict` in
+  `gemm_coop.h`, `#pragma clang fp contract(off)`: fast math otherwise fuses
+  `alpha * p + beta * prev` into an fma, measured 1 ulp from the separate
+  passes), so the result is bit-identical to `gemm` followed by separate scale,
+  accumulate, bias and activation passes at the shapes `gemm` runs as one
+  dispatch (`tests/gemm_exact_f32_epilogue.rs`, `to_bits` equality). The bf16,
+  f16 and relaxed kernels are unchanged. Only the simdgroup backend is still
+  refused. Kernel entry points: 300. `bench_gemm_variants` has an `epi_f32` lane.
 - **`tessl::sq_norm`: the global gradient norm over any windows.** What
   `Qwen35Model::grad_sq_norm` ran, for any set of f32 or bf16 windows of this
   runtime's buffers: `SqNormPlan::new` checks the windows and builds the

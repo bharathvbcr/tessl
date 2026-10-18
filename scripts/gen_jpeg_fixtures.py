@@ -46,6 +46,7 @@ Layout of tests/fixtures/jpeg/:
 import io
 import itertools
 import json
+import math
 import os
 import random
 import shutil
@@ -855,6 +856,90 @@ def lossless_cases():
         cj_case(f"lossless_cjpeg_precision_{prec}", photo(9, 11, 4), ["-lossless", "1", "-precision", str(prec)], f"cjpeg -precision {prec}")
 
 
+def lossless_restart_subsampled_cases():
+    """Lossless frames whose components differ in size, in several scans, with a restart interval.
+
+    libjpeg-turbo undifferences a scan one iMCU row at a time (jddiffct.c decompress_data): a non-interleaved scan of a
+    component with v_samp_factor Vi decodes Vi MCU rows (restart markers are honoured between them, and each restart
+    resets every component's predictor to the first-row state) and only then undifferences the Vi rows together. A restart
+    that falls inside an iMCU row therefore moves the first-row treatment to the iMCU row's first row. The grid varies what
+    decides that: the component's v (1 to 4), the restart interval in rows of that component (1, 2, 3 -- odd and even,
+    aligned or not with the iMCU row), the scan order and grouping, and picture sizes that are not a multiple of the MCU."""
+    k = "lossless"
+    rng = np.random.default_rng(1103)
+    layouts = {
+        "420": [(2, 2), (1, 1), (1, 1)],
+        "h1v2": [(1, 2), (1, 1), (1, 1)],
+        "h2v1": [(2, 1), (1, 1), (1, 1)],
+        "v3": [(1, 3), (1, 1), (1, 1)],
+        "v4": [(1, 4), (1, 1), (1, 1)],
+        "mixed": [(2, 2), (2, 1), (1, 2)],
+        "cbv2": [(1, 1), (1, 2), (1, 1)],
+        "h2v3": [(2, 3), (1, 1), (1, 1)],
+    }
+    scan_lists = {
+        "sep": [[0], [1], [2]],
+        "rev": [[2], [1], [0]],
+        "yfirst_pair": [[0], [1, 2]],
+        "pair_yl": [[1, 2], [0]],
+        "mid": [[1], [0], [2]],
+    }
+    sizes = {  # widths multiples of hmax keep the restart interval valid for every scan with a small lcm
+        "420": ((16, 12), (16, 25), (8, 9)),
+        "h1v2": ((5, 7), (13, 12)),
+        "h2v1": ((16, 9), (8, 5)),
+        "v3": ((7, 10), (5, 13)),
+        "v4": ((6, 9), (4, 17)),
+        "mixed": ((16, 12), (8, 11)),
+        "cbv2": ((7, 12), (9, 5)),
+        "h2v3": ((16, 13), (8, 7)),
+    }
+
+    def widths(comps, w, scans):
+        hmax = max(h for h, _ in comps)
+        mcux = -(-w // hmax)
+        return {len(s) > 1 and mcux or -(-w * comps[s[0]][0] // hmax) for s in scans}
+
+    for name, comps in layouts.items():
+        for (w, h) in sizes[name]:
+            for sname, scans in scan_lists.items():
+                if sname in ("rev", "mid") and (w, h) != sizes[name][0]:
+                    continue  # the order does not interact with the size; keep the grid to a few hundred KB
+                base = math.lcm(*widths(comps, w, scans))
+                for m in (1, 2, 3):
+                    if m == 3 and sname not in ("sep", "yfirst_pair"):
+                        continue
+                    psv = 1 + (hash_name(f"{name}{w}{h}{sname}{m}") % 7)
+                    pl = ll_planes(rng, comps, w, h)
+                    case(f"lossless_rstsub_{name}_{w}x{h}_{sname}_r{m}",
+                         write_lossless(w, h, comps, pl, psv=psv, adobe=0, restart=base * m, scans=scans), k,
+                         f"{name} {w}x{h}, scans {scans}, restart every {base * m} MCUs, predictor {psv}")
+    # a point transform, a cut inside the scans and a restart interval that is not a whole number of some scan's rows
+    comps = layouts["420"]
+    pl = ll_planes(rng, comps, 16, 12, pt=3)
+    case("lossless_rstsub_420_pt3", write_lossless(16, 12, comps, pl, psv=4, pt=3, adobe=0, restart=16, scans=scan_lists["sep"]), k,
+         "4:2:0 in three scans, restart every Y row, point transform 3")
+    for sname in ("sep", "yfirst_pair"):
+        data = write_lossless(16, 25, comps, ll_planes(rng, comps, 16, 25), psv=5, adobe=0, restart=16, scans=scan_lists[sname])
+        sos = scan_offsets(data)
+        for si in (0, 1):
+            body = sos[si] + 2 + struct.unpack(">H", data[sos[si] + 2:sos[si] + 4])[0]
+            nxt = sos[si + 1] if si + 1 < len(sos) else len(data) - 2
+            for third in (1, 2):
+                at = body + (nxt - body) * third // 3
+                case(f"lossless_rstsub_cut_{sname}_s{si}_{third}", data[:at] + data[nxt:], k,
+                     f"4:2:0 16x25 {sname}, restart every Y row, scan {si + 1} cut at {third}/3 and the scans after it kept", tessl="either")
+    for restart in (8, 24, 12):  # Y's rows are 16 samples wide: 8 and 24 are not whole Y rows, 12 neither; chroma's 8 divides 8 and 24
+        case(f"lossless_rstsub_420_16x12_bad_r{restart}",
+             write_lossless(16, 12, comps, ll_planes(rng, comps, 16, 12), psv=4, adobe=0, restart=restart, restart_rows=1, scans=scan_lists["sep"]), k,
+             f"4:2:0 in three scans, restart interval {restart} (not a multiple of the Y scan's 16 MCUs per row)", tessl="either")
+
+
+def hash_name(s):
+    """A stable small hash (Python's hash() is salted per process)."""
+    return zlib.crc32(s.encode())
+
+
 def build_cases():
     img = photo(33, 47, 5)
     # --- subsampling x coding ------------------------------------------------
@@ -982,6 +1067,7 @@ def build_cases():
     smoothing_cases()
     # --- lossless (SOF3): libjpeg-turbo 3.x decodes it ----------------------------------------
     lossless_cases()
+    lossless_restart_subsampled_cases()
     # --- the reference refuses these, so must tessl ---------------------------------------------
     case("err_12bit_cjpeg", cj(photo(16, 24, 2), "-precision", "12"), "error", "12-bit precision")
     case("err_precision_12_sof0", write_jpeg(W, H, c3, rand_coefs(rng, c3, W, H), QT, precision=12), "error", "SOF0 with 12-bit precision")

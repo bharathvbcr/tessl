@@ -1004,12 +1004,18 @@ mod audit_tests {
     fn exact_writers_check_length_and_round_trip() {
         let rt = GpuRuntime::new().unwrap();
         let b = rt.alloc_buffer(16).unwrap();
-        assert_eq!(b.try_write_f32(&[1.0]).unwrap_err(), "write_f32: 1 elements for a buffer of 4");
+        assert_eq!(
+            b.try_write_f32(&[1.0]).unwrap_err(),
+            "write_f32: 1 elements for a buffer of 4"
+        );
         assert_eq!(
             b.try_write_bf16_bits(&[1, 2, 3]).unwrap_err(),
             "write_bf16_bits: 3 elements for a buffer of 8"
         );
-        assert_eq!(b.try_write_u32(&[]).unwrap_err(), "write_u32: 0 elements for a buffer of 4");
+        assert_eq!(
+            b.try_write_u32(&[]).unwrap_err(),
+            "write_u32: 0 elements for a buffer of 4"
+        );
         b.try_write_u32(&[1, 2, 3, 4]).unwrap();
         assert_eq!(b.contents_u32().to_vec(), vec![1, 2, 3, 4]);
         b.try_write_bf16_bits(&[9; 8]).unwrap();

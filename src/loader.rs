@@ -301,7 +301,10 @@ mod tests {
         let tb = rt.alloc_tensor_bf16(&[2]).unwrap();
         ld.bf16_into("b", &[2], &tb).unwrap();
         assert_eq!(tb.buffer.contents_u16().to_vec(), vec![0x4040, 0x4080]);
-        assert_eq!(ld.bf16_into("b", &[3], &tb).unwrap_err(), "m.b: shape [2], expected [3]");
+        assert_eq!(
+            ld.bf16_into("b", &[3], &tb).unwrap_err(),
+            "m.b: shape [2], expected [3]"
+        );
         assert_eq!(
             ld.bf16_into_root("m.b", &[3], &tb).unwrap_err(),
             "m.b: shape [2], expected [3]"

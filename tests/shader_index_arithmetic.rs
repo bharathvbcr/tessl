@@ -11,6 +11,9 @@ const EMBED: &str = include_str!("../kernels/embed_lookup.metal");
 const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
 const GEMM_Q4_MLX: &str = include_str!("../kernels/gemm_q4_mlx.metal");
+/// The simdgroup GEMV / GEMM bodies the `*_simd*` entries of the two files above delegate to.
+const GEMV_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemv_q4_mlx_simd.h");
+const GEMM_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemm_q4_mlx_simd.h");
 const GEMV_Q8: &str = include_str!("../kernels/gemv_q8.metal");
 const REDUCE: &str = include_str!("../kernels/reduce.metal");
 const RMS_NORM: &str = include_str!("../kernels/rms_norm.metal");
@@ -159,7 +162,17 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
         "const ulong gi = (ulong)row * groups_per_row + g;",
         "Q8 GEMV scale table",
     );
-    require(GEMM_Q4_MLX, "sb[(ulong)row * gpr + g]", "MLX Q4 GEMM scale table");
+    // The simd entries delegate to the shared bodies; each entry file must
+    // still include its body, or the body's checks would say nothing of it.
+    require(GEMV_Q4_MLX, "#include \"gemv_q4_mlx_simd.h\"", "MLX Q4 GEMV");
+    require(GEMM_Q4_MLX, "#include \"gemm_q4_mlx_simd.h\"", "MLX Q4 GEMM");
+    require(GEMM_Q4_MLX, "q4_simd_gemm<", "MLX Q4 GEMM");
+    require(GEMV_Q4_MLX, "q4_simd_gemv<", "MLX Q4 GEMV");
+    require(
+        GEMM_Q4_MLX_SIMD_H,
+        "sb[(ulong)row * gpr + g]",
+        "MLX Q4 GEMM scale table",
+    );
     forbid(GEMV_Q4, "const uint row_base = row * cols;", "Q4 GEMV");
     forbid(
         GEMV_Q4_MLX,
@@ -172,6 +185,7 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
         "Q8 GEMV scale table",
     );
     forbid(GEMM_Q4_MLX, "sb[row * gpr + g]", "MLX Q4 GEMM scale table");
+    forbid(GEMM_Q4_MLX_SIMD_H, "sb[row * gpr + g]", "MLX Q4 GEMM scale table");
 }
 
 #[test]
@@ -226,13 +240,13 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
             "for (ulong i = lid; i < (ulong)n; i += tptg)",
         ),
         (
-            "MLX Q4 GEMV",
-            GEMV_Q4_MLX,
+            "MLX Q4 GEMV (gemv_q4_mlx_simd.h)",
+            GEMV_Q4_MLX_SIMD_H,
             "for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK)",
         ),
         (
-            "MLX Q4 GEMM",
-            GEMM_Q4_MLX,
+            "MLX Q4 GEMM (gemm_q4_mlx_simd.h)",
+            GEMM_Q4_MLX_SIMD_H,
             "for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK)",
         ),
     ] {
@@ -262,8 +276,18 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
             "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
         ),
         (
+            "MLX Q4 GEMV (gemv_q4_mlx_simd.h)",
+            GEMV_Q4_MLX_SIMD_H,
+            "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
+        ),
+        (
             "MLX Q4 GEMM",
             GEMM_Q4_MLX,
+            "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
+        ),
+        (
+            "MLX Q4 GEMM (gemm_q4_mlx_simd.h)",
+            GEMM_Q4_MLX_SIMD_H,
             "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
         ),
     ] {

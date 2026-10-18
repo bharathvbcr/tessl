@@ -46,6 +46,7 @@ Layout of tests/fixtures/jpeg/:
 import io
 import itertools
 import json
+import math
 import os
 import random
 import shutil
@@ -629,6 +630,21 @@ def smoothing_cases():
     for tag, s in (("v3", "1x3,1x1,1x1"), ("v4", "1x4,1x1,1x1"), ("v4c2", "1x4,1x2,1x1"), ("h2v3", "2x3,1x1,1x1")):
         for (h, w) in [(33, 47), (96, 24), (104, 40), (56, 17)]:
             cut_all(f"smoothing_tall_{tag}_{h}x{w}", cj(photo(h, w, h + w), "-progressive", "-sample", s), k, f"cjpeg -sample {s}, {h}x{w}", ks=(1, 2, 5))
+    # Pictures many iMCU rows tall at three and four block rows per iMCU row. jdcoefct.c:543-570 picks the five block rows
+    # of every block from image_block_row and image_block_rows, which count with the *current* iMCU row's block_rows (the
+    # partial count in the last one): the clauses that matter are the first two iMCU rows (rows two up that are not in the
+    # prior iMCU row), the interior (a three-iMCU-row window), the second-to-last and the last (one, two, or all-but-one of
+    # v rows present). Heights are chosen so that the last iMCU row holds 1 .. v block rows.
+    for tag, s, vb in (("v3", "1x3,1x1,1x1", 3), ("v4", "1x4,1x1,1x1", 4), ("h2v3", "2x3,1x1,1x1", 3), ("420", "2x2,1x1,1x1", 2),
+                       ("440", "1x2,1x1,1x1", 2), ("h2v4", "2x4,1x1,1x1", 4)):
+        for extra in range(1, vb + 1):  # block rows in the last iMCU row of the luma component
+            h = 8 * vb * 6 + 8 * extra - 3  # six full iMCU rows and `extra` more block rows, the last one 5 samples tall
+            w = 40 + 3 * extra
+            cut_all(f"smoothing_large_{tag}_{h}x{w}", cj(photo(h, w, h + w), "-progressive", "-sample", s), k,
+                    f"cjpeg -sample {s}, {h}x{w}: six full iMCU rows and {extra} block row(s)", ks=(1, 2, 5))
+    # a large 4:2:0 picture (36 block rows of luma) and a large 1x3 one, every prefix of the default script
+    cut_all("smoothing_big_420", cj(photo(288, 96, 17), "-progressive", "-sample", "2x2,1x1,1x1"), k, "4:2:0 288x96", ks=(1, 2, 3, 5, 7))
+    cut_all("smoothing_big_v3", cj(photo(290, 64, 19), "-progressive", "-sample", "1x3,1x1,1x1"), k, "cjpeg -sample 1x3, 290x64", ks=(1, 2, 3, 5))
     # progression scripts that leave coef_bits in states the default script never does
     for tag, s in (("420", "2x2,1x1,1x1"), ("444", "1x1,1x1,1x1")):
         for name, script in SCAN_SCRIPTS.items():
@@ -779,7 +795,7 @@ def lossless_cases():
     pl = ll_planes(rng, [(2, 2), (1, 1), (1, 1)], 16, 12)
     case("lossless_rst_sub_interleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16), k, "4:2:0, restart every 2 MCU rows")
     case("lossless_rst_sub_noninterleaved", write_lossless(16, 12, [(2, 2), (1, 1), (1, 1)], pl, psv=4, adobe=0, restart=16, interleave=False), k,
-         "4:2:0 in three scans with a restart interval (the interval is checked against the last scan's MCU row)", tessl="either")
+         "4:2:0 in three scans with a restart interval; Y restarts every row, inside its 2-row iMCU row", tessl="either")
     # a scan that ends in a marker before the picture does: the rest is zero differences, i.e. prediction only
     for name, data in (("rgb", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=4, adobe=0)),
                        ("ps7", write_lossless(17, 9, c3, ll_planes(rng, c3, 17, 9), psv=7, adobe=0)),
@@ -853,6 +869,90 @@ def lossless_cases():
             print("cjpeg cannot encode", tag, "-", e)
     for prec in (2, 4, 7, 12, 16):
         cj_case(f"lossless_cjpeg_precision_{prec}", photo(9, 11, 4), ["-lossless", "1", "-precision", str(prec)], f"cjpeg -precision {prec}")
+
+
+def lossless_restart_subsampled_cases():
+    """Lossless frames whose components differ in size, in several scans, with a restart interval.
+
+    libjpeg-turbo undifferences a scan one iMCU row at a time (jddiffct.c decompress_data): a non-interleaved scan of a
+    component with v_samp_factor Vi decodes Vi MCU rows (restart markers are honoured between them, and each restart
+    resets every component's predictor to the first-row state) and only then undifferences the Vi rows together. A restart
+    that falls inside an iMCU row therefore moves the first-row treatment to the iMCU row's first row. The grid varies what
+    decides that: the component's v (1 to 4), the restart interval in rows of that component (1, 2, 3 -- odd and even,
+    aligned or not with the iMCU row), the scan order and grouping, and picture sizes that are not a multiple of the MCU."""
+    k = "lossless"
+    rng = np.random.default_rng(1103)
+    layouts = {
+        "420": [(2, 2), (1, 1), (1, 1)],
+        "h1v2": [(1, 2), (1, 1), (1, 1)],
+        "h2v1": [(2, 1), (1, 1), (1, 1)],
+        "v3": [(1, 3), (1, 1), (1, 1)],
+        "v4": [(1, 4), (1, 1), (1, 1)],
+        "mixed": [(2, 2), (2, 1), (1, 2)],
+        "cbv2": [(1, 1), (1, 2), (1, 1)],
+        "h2v3": [(2, 3), (1, 1), (1, 1)],
+    }
+    scan_lists = {
+        "sep": [[0], [1], [2]],
+        "rev": [[2], [1], [0]],
+        "yfirst_pair": [[0], [1, 2]],
+        "pair_yl": [[1, 2], [0]],
+        "mid": [[1], [0], [2]],
+    }
+    sizes = {  # widths multiples of hmax keep the restart interval valid for every scan with a small lcm
+        "420": ((16, 12), (16, 25), (8, 9)),
+        "h1v2": ((5, 7), (13, 12)),
+        "h2v1": ((16, 9), (8, 5)),
+        "v3": ((7, 10), (5, 13)),
+        "v4": ((6, 9), (4, 17)),
+        "mixed": ((16, 12), (8, 11)),
+        "cbv2": ((7, 12), (9, 5)),
+        "h2v3": ((16, 13), (8, 7)),
+    }
+
+    def widths(comps, w, scans):
+        hmax = max(h for h, _ in comps)
+        mcux = -(-w // hmax)
+        return {len(s) > 1 and mcux or -(-w * comps[s[0]][0] // hmax) for s in scans}
+
+    for name, comps in layouts.items():
+        for (w, h) in sizes[name]:
+            for sname, scans in scan_lists.items():
+                if sname in ("rev", "mid") and (w, h) != sizes[name][0]:
+                    continue  # the order does not interact with the size; keep the grid to a few hundred KB
+                base = math.lcm(*widths(comps, w, scans))
+                for m in (1, 2, 3):
+                    if m == 3 and sname not in ("sep", "yfirst_pair"):
+                        continue
+                    psv = 1 + (hash_name(f"{name}{w}{h}{sname}{m}") % 7)
+                    pl = ll_planes(rng, comps, w, h)
+                    case(f"lossless_rstsub_{name}_{w}x{h}_{sname}_r{m}",
+                         write_lossless(w, h, comps, pl, psv=psv, adobe=0, restart=base * m, scans=scans), k,
+                         f"{name} {w}x{h}, scans {scans}, restart every {base * m} MCUs, predictor {psv}")
+    # a point transform, a cut inside the scans and a restart interval that is not a whole number of some scan's rows
+    comps = layouts["420"]
+    pl = ll_planes(rng, comps, 16, 12, pt=3)
+    case("lossless_rstsub_420_pt3", write_lossless(16, 12, comps, pl, psv=4, pt=3, adobe=0, restart=16, scans=scan_lists["sep"]), k,
+         "4:2:0 in three scans, restart every Y row, point transform 3")
+    for sname in ("sep", "yfirst_pair"):
+        data = write_lossless(16, 25, comps, ll_planes(rng, comps, 16, 25), psv=5, adobe=0, restart=16, scans=scan_lists[sname])
+        sos = scan_offsets(data)
+        for si in (0, 1):
+            body = sos[si] + 2 + struct.unpack(">H", data[sos[si] + 2:sos[si] + 4])[0]
+            nxt = sos[si + 1] if si + 1 < len(sos) else len(data) - 2
+            for third in (1, 2):
+                at = body + (nxt - body) * third // 3
+                case(f"lossless_rstsub_cut_{sname}_s{si}_{third}", data[:at] + data[nxt:], k,
+                     f"4:2:0 16x25 {sname}, restart every Y row, scan {si + 1} cut at {third}/3 and the scans after it kept", tessl="either")
+    for restart in (8, 24, 12):  # Y's rows are 16 samples wide: 8 and 24 are not whole Y rows, 12 neither; chroma's 8 divides 8 and 24
+        case(f"lossless_rstsub_420_16x12_bad_r{restart}",
+             write_lossless(16, 12, comps, ll_planes(rng, comps, 16, 12), psv=4, adobe=0, restart=restart, restart_rows=1, scans=scan_lists["sep"]), k,
+             f"4:2:0 in three scans, restart interval {restart} (not a multiple of the Y scan's 16 MCUs per row)", tessl="either")
+
+
+def hash_name(s):
+    """A stable small hash (Python's hash() is salted per process)."""
+    return zlib.crc32(s.encode())
 
 
 def build_cases():
@@ -982,6 +1082,7 @@ def build_cases():
     smoothing_cases()
     # --- lossless (SOF3): libjpeg-turbo 3.x decodes it ----------------------------------------
     lossless_cases()
+    lossless_restart_subsampled_cases()
     # --- the reference refuses these, so must tessl ---------------------------------------------
     case("err_12bit_cjpeg", cj(photo(16, 24, 2), "-precision", "12"), "error", "12-bit precision")
     case("err_precision_12_sof0", write_jpeg(W, H, c3, rand_coefs(rng, c3, W, H), QT, precision=12), "error", "SOF0 with 12-bit precision")
@@ -1070,8 +1171,11 @@ def mutate(rng, b):
     return bytes(b)
 
 
-def fuzz_bases():
-    """Small bases covering every coding and layout."""
+def fuzz_bases(live=False):
+    """Small bases covering every coding and layout. `live` adds bases only the live fuzz mutates (the committed
+    corpus is drawn from one random stream over the sorted bases, so adding to it would redraw all of it): lossless
+    frames in several scans with a restart interval and components of different sizes, and larger progressive
+    pictures at three and four block rows per iMCU row."""
     img = photo(24, 40, 6)
     g = np.asarray(Image.fromarray(img).convert("L"))
     bases = {}
@@ -1111,13 +1215,23 @@ def fuzz_bases():
     bases["lossless_rgb_rst"] = write_lossless(8, 10, l3, ll_planes(lrng, l3, 8, 10), psv=6, adobe=0, restart=16)
     bases["lossless_420_pt"] = write_lossless(18, 10, l420, ll_planes(lrng, l420, 18, 10, pt=2), psv=7, pt=2, adobe=0)
     bases["lossless_noninterleaved"] = write_lossless(9, 7, l3, ll_planes(lrng, l3, 9, 7), psv=2, adobe=0, interleave=False)
+    if live:
+        w, h = 18, 11  # the restart interval of 18 MCUs is one row of the first component, whatever the scan
+        for tag, comps, scans in (("420_sep", l420, [[0], [1], [2]]), ("420_pair", l420, [[0], [1, 2]]),
+                                  ("v3_sep", [(1, 3), (1, 1), (1, 1)], [[0], [1], [2]]),
+                                  ("mixed_rev", [(2, 2), (2, 1), (1, 2)], [[2], [1], [0]])):
+            bases["lossless_rstsub_" + tag] = write_lossless(w, h, comps, ll_planes(lrng, comps, w, h), psv=4, adobe=0,
+                                                              restart=w, scans=scans)
+        for tag, s in (("v3", "1x3,1x1,1x1"), ("420", "2x2,1x1,1x1"), ("v4", "1x4,1x1,1x1")):
+            pj = cj(photo(104, 40, 23), "-progressive", "-sample", s)
+            bases["smooth_large_" + tag] = pj[:scan_offsets(pj)[2]] + b"\xff\xd9"
     return bases
 
 
 def fuzz_stream(seed):
     """Yield (base name, mutant bytes) forever, round-robin over the bases."""
     rng = random.Random(seed)
-    bases = fuzz_bases()
+    bases = fuzz_bases(live=True)
     names = sorted(bases)
     while True:
         for n in names:

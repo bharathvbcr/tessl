@@ -12,7 +12,8 @@ controller, the accurate integer inverse DCT (`jidctint.c`, and the 16-bit-lane 
 libjpeg-turbo's 64-bit ARM NEON version on corrupt blocks), the fancy chroma upsampler and the
 YCbCr colour converter, the block smoothing of `jdcoefct.c` (`smooth.rs`: libjpeg-turbo's
 5x5 estimator, whose integer weight tables were measured from the reference's output on
-synthetic progressive files, not copied) and the lossless decoder of libjpeg-turbo 3.x
+synthetic progressive files and afterwards compared with the 3.1.3 source, which they equal; no C code
+is copied) and the lossless decoder of libjpeg-turbo 3.x
 (`jdlossls.c`, `jdlhuff.c`, `jddiffct.c`, `jdpred.c`, `jdscale.c`; `lossless.rs`). The arithmetic decoder's probability state table (`ARITAB` in
 `src/media/jpeg/arith.rs`) holds the same values as the library's `jpeg_aritab`, which is
 Table D.3 of ITU-T T.81. These are works derived from or based on the IJG code, so the IJG

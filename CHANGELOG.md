@@ -92,15 +92,21 @@ All notable changes to `tessl` are recorded here. The format follows
   smooths (scans cut short, or a scan that runs out of data): the 5x5 estimator,
   the previous-scan record, `last_good_iMCU_row` and the block rows read at the
   picture and iMCU-row edges were measured with the oracle
-  (`torchvision.io.decode_image`, mode RGB) and are held by 572 smoothing fixtures.
+  (`torchvision.io.decode_image`, mode RGB), then compared with libjpeg-turbo
+  3.1.3's `jdcoefct.c` (read, not copied: they agree) and are held by 635
+  smoothing fixtures, large pictures at 2 to 4 block rows per iMCU row included.
   Lossless JPEG (SOF3: predictors 1-7, point transform, restart rows, precisions
-  2-8, RGB and CMYK) decodes to the reference's bytes (146 fixtures); what the
-  reference refuses (gray, YCbCr and YCCK lossless, precisions above 8, a stream
-  with no DHT, a component in no scan, bad parameters) is a named error here too,
-  and one shape it decodes (several scans, a restart interval, components of
-  different sizes) stays a named `Unsupported`. 998 fixtures agree with the
-  oracle (874 byte-equal, 123 refused by both, 1 named refusal); 10000 live-fuzz
-  mutants, 0 disagreements.
+  2-8, RGB and CMYK) decodes to the reference's bytes (324 fixtures). A lossless
+  scan is undifferenced one iMCU row at a time (`jddiffct.c`), so with several
+  scans, a restart interval and components of different sizes a restart inside a
+  non-interleaved iMCU row moves the first-row prediction to the iMCU row's first
+  row; that shape, first refused by name on a wrong inferred cause, is decoded
+  byte for byte (178 fixtures). What the reference refuses (gray, YCbCr and YCCK
+  lossless, precisions above 8, a stream with no DHT, a component in no scan, bad
+  parameters, a restart interval that is no whole number of a scan's rows) is a
+  named error here too. 1241 fixtures agree with the oracle (1115 byte-equal, 126
+  refused by both, no named refusal of anything the reference decodes); 24000
+  live-fuzz mutants (10000 before, 14000 after the change), 0 disagreements.
 - **JPEG: a pure-Rust decoder, byte for byte libjpeg-turbo's**
   (`tessl::media::jpeg`, `src/media/jpeg/`: no dependency, no `unsafe`).
   `decode_image` hands data that starts `FF D8 FF` to it (with the default

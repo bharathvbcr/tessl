@@ -66,11 +66,6 @@ fn cases() -> Vec<Case> {
         .collect()
 }
 
-/// Fixtures the oracle decodes and this decoder refuses by name, the one shape it does not reproduce: a lossless frame in
-/// several scans with a restart interval and components of different sizes (the reference counts restart rows over
-/// the last scan's MCU rows).
-const OPEN_CASES: [&str; 1] = ["lossless_rst_sub_noninterleaved"];
-
 fn first_diff(a: &[u8], b: &[u8]) -> Option<(usize, u8, u8)> {
     a.iter().zip(b).position(|(x, y)| x != y).map(|i| (i, a[i], b[i]))
 }
@@ -162,6 +157,13 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         "smoothing_tall_v3_33x47_2scans",
         "smoothing_vrows2_04_dc",
         "smoothing_vrows4_08_ac9",
+        // large real pictures at 2 to 4 block rows per iMCU row (jdcoefct.c:543-570)
+        "smoothing_large_v3_149x43_1scans",
+        "smoothing_large_v4_221x52_2scans",
+        "smoothing_large_h2v4_205x46_5scans",
+        "smoothing_large_420_101x43_5scans",
+        "smoothing_big_420_1scans",
+        "smoothing_big_v3_5scans",
         // lossless: every predictor, the point transform, restarts, subsampling, cjpeg's own encoder
         "lossless_rgb_psv1",
         "lossless_rgb_psv7",
@@ -172,6 +174,18 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         "lossless_huge_diffs_psv7",
         "lossless_cjpeg_psv1",
         "lossless_cjpeg_psv7",
+        // lossless, several scans, a restart interval, components of different sizes (iMCU-row undifferencing)
+        "lossless_rst_sub_noninterleaved",
+        "lossless_rstsub_420_16x12_sep_r1",
+        "lossless_rstsub_420_16x12_sep_r3",
+        "lossless_rstsub_420_16x25_yfirst_pair_r2",
+        "lossless_rstsub_v3_7x10_sep_r1",
+        "lossless_rstsub_v4_4x17_sep_r3",
+        "lossless_rstsub_mixed_16x12_pair_yl_r1",
+        "lossless_rstsub_cbv2_7x12_mid_r1",
+        "lossless_rstsub_420_pt3",
+        "lossless_rstsub_cut_sep_s0_1",
+        "lossless_rstsub_420_16x12_bad_r8",
     ] {
         assert!(has(n), "fixture {n} is missing from manifest.txt");
     }
@@ -189,8 +203,8 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         ("idct", 5),
         ("markers", 6),
         ("layout", 6),
-        ("smoothing", 560),
-        ("lossless", 145),
+        ("smoothing", 630),
+        ("lossless", 320),
     ] {
         assert!(
             count(class) >= at_least,
@@ -210,18 +224,6 @@ fn fixtures_equal_the_oracle_byte_for_byte() {
         let got = jpeg::decode(&input, 1 << 28);
         let entry = per_class.entry(c.class.clone()).or_default();
         entry.1 += 1;
-        if OPEN_CASES.contains(&c.name.as_str()) {
-            // The reference decodes it; this decoder says by name that it does not reproduce how.
-            match got {
-                Err(JpegError::Unsupported(msg)) if msg.contains("restart interval") => entry.0 += 1,
-                other => failures.push(format!(
-                    "{}: expected the named refusal, got {:?}",
-                    c.name,
-                    other.map(|i| i.width)
-                )),
-            }
-            continue;
-        }
         match (c.ok, got) {
             (true, Ok(img)) => {
                 let golden = read(&format!("{}.jpg.rgb", c.name));
@@ -262,6 +264,46 @@ fn fixtures_equal_the_oracle_byte_for_byte() {
         cases.len(),
         failures.join("\n")
     );
+}
+
+/// libjpeg-turbo undifferences a lossless scan one iMCU row at a time (`jddiffct.c` `decompress_data`): a restart
+/// marker inside the iMCU row of a non-interleaved scan (a component with `v_samp_factor` above 1 and a restart
+/// interval of one of its rows) moves the "first row" prediction to the iMCU row's first row. This decoder used to
+/// refuse the shape, and decoded row by row when the refusal was lifted; every case of the family, the one the
+/// refusal was named after included, must equal the oracle now, and the family must really be in the fixtures:
+/// restart intervals that fall inside an iMCU row (Y of 2, 3 and 4 block rows) and across it.
+#[test]
+fn a_lossless_restart_inside_an_imcu_row_equals_the_oracle() {
+    let cases = cases();
+    let family: Vec<&Case> = cases
+        .iter()
+        .filter(|c| c.name.starts_with("lossless_rstsub_") || c.name == "lossless_rst_sub_noninterleaved")
+        .collect();
+    let decoded = family.iter().filter(|c| c.ok).count();
+    assert!(decoded >= 150, "{decoded} decoded cases in the family");
+    for tag in ["420_", "v3_", "v4_", "h1v2_", "mixed_", "cbv2_", "h2v3_", "h2v1_"] {
+        assert!(
+            family.iter().any(|c| c.ok && c.name.contains(tag)),
+            "no case of layout {tag} in the family"
+        );
+    }
+    for c in family {
+        let got = jpeg::decode(&read(&format!("{}.jpg", c.name)), 1 << 28);
+        if c.ok {
+            let img = got.unwrap_or_else(|e| panic!("{}: the oracle decodes it, this does not: {e}", c.name));
+            assert_eq!((img.width, img.height), (c.w, c.h), "{}", c.name);
+            let golden = read(&format!("{}.jpg.rgb", c.name));
+            assert_eq!(
+                first_diff(&img.rgb, &golden),
+                None,
+                "{}: differs from the oracle",
+                c.name
+            );
+            assert_eq!(img.rgb.len(), golden.len(), "{}", c.name);
+        } else {
+            assert!(got.is_err(), "{}: the oracle refuses it, this decodes", c.name);
+        }
+    }
 }
 
 /// PIL (libjpeg-turbo 3.1.4.1) and torchvision (3.1.3) agree on every case both
@@ -512,6 +554,7 @@ fn every_strict_prefix_of_a_valid_file_is_an_error() {
         "lossless_rgb_psv4",
         "lossless_rgb_psv6",
         "lossless_rst6_6x12_psv4",
+        "lossless_rstsub_420_16x12_sep_r1",
     ] {
         let full = read(&format!("{name}.jpg"));
         assert!(jpeg::decode(&full, 1 << 28).is_ok(), "{name}");

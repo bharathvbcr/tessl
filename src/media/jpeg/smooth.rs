@@ -16,20 +16,21 @@
 //! values of the neighbouring blocks, and limited to `2^Al - 1` in magnitude
 //! while `Al > 0`). libjpeg-turbo 2.1 widened the neighbourhood from 3x3 to 5x5,
 //! estimates nine AC coefficients instead of five, and, while no AC coefficient
-//! has arrived at all, also replaces the DC by a smoothed value. No source for
-//! those versions was available while this was written, so the weight tables
-//! are *measured*, not recalled: each is an integer table read off the
+//! has arrived at all, also replaces the DC by a smoothed value. The weight
+//! tables were first *measured*: each is an integer table read off the
 //! reference by decoding progressive files that carry nothing but a DC scan
 //! (and files whose AC scans are all-zero), one DC impulse at a time, with the
 //! prediction of every block recovered exactly by matching the IDCT's pixels
 //! (`scripts/gen_jpeg_fixtures.py` writes the same kind of files for the
-//! committed fixtures). The tables, the loop structure (which neighbour rows are
-//! replicated at the picture's edges, which `coef_bits` apply after a corrupt
-//! scan) and every constant here are held by byte-equality with the reference
-//! on the `smoothing_*` fixtures and on mutated files, not by a copy of the
-//! library's code. The algorithm's description follows libjpeg's own: the
-//! structure and the `smoothing_ok` conditions are what the library's
-//! documentation and public behaviour specify; see `THIRD_PARTY_NOTICES.md`.
+//! committed fixtures). They were then compared with libjpeg-turbo 3.1.3's
+//! `jdcoefct.c` and agree with it: `smoothing_ok` (lines 355-417), the choice of
+//! `coef_bits` against `last_good_iMCU_row` and `change_dc` (515-525), the five
+//! block rows (543-570), the 5x5 DC window and its edge replication (571-596),
+//! every weight of the nine AC estimates and of the DC estimate (607-778, the
+//! `Q00 * (...)` sums), and the rounding and the `(1 << Al) - 1` limit. The code
+//! here is written from that behaviour, not copied; see `THIRD_PARTY_NOTICES.md`.
+//! The byte-equality fixtures (`smoothing_*`) and the mutated files remain the
+//! check that the whole holds.
 
 use super::idct;
 use super::Decoder;
@@ -315,11 +316,12 @@ impl Decoder<'_> {
 /// libjpeg's handling of the top and bottom of the picture and of the iMCU-row
 /// boundaries. `last_imcu` is the index of the picture's last iMCU row.
 ///
-/// Provenance: the rule is measured, not copied. The oracle's output on
-/// one-component pictures of every height from one block row to a few iMCU
-/// rows past two, at 2, 3 and 4 block rows per iMCU row (`smoothing_vrows*`),
-/// and on real 4:2:0, 4:4:0, 4:2:2 and taller-sampled pictures, fixes every
-/// clause below; each is the simplest one all of those cases agree on.
+/// Provenance: the rule was first measured with the oracle (one-component pictures of every height from one block
+/// row to a few iMCU rows past two, at 2, 3 and 4 block rows per iMCU row, `smoothing_vrows*`, and real 4:2:0, 4:4:0,
+/// 4:2:2 and taller-sampled pictures), then compared with libjpeg-turbo 3.1.3's `jdcoefct.c` lines 543-570, whose
+/// `image_block_row` and `image_block_rows` (counted with the current iMCU row's own, partial in the last, number of
+/// block rows) reproduce every clause below; the test `the_neighbour_rows_equal_the_librarys_formulas` holds the two
+/// to each other.
 fn neighbour_rows(v: usize, height_in_blocks: usize, blocks_h: usize, by: usize, last_imcu: i64) -> [usize; 5] {
     let imcu = (by / v) as i64;
     let brow = by % v;
@@ -433,6 +435,56 @@ mod tests {
         // reachable while two iMCU rows remain.
         assert_eq!(neighbour_rows(1, 3, 3, 0, 2), [0, 0, 0, 1, 2]);
         assert_eq!(neighbour_rows(1, 3, 3, 1, 2), [0, 0, 1, 2, 2]);
+    }
+
+    /// The neighbour rows as `decompress_smooth_data` computes them (jdcoefct.c:543-570), written out from the library's
+    /// own variables: `image_block_row = output_iMCU_row * block_rows + block_row` and `image_block_rows = block_rows *
+    /// total_iMCU_rows`, where `block_rows` is the current iMCU row's own count (the partial one in the last).
+    fn rows_as_the_library_counts(v: usize, height: usize, by: usize) -> [usize; 5] {
+        let total = height.div_ceil(v);
+        let imcu = by / v;
+        let block_row = by % v;
+        let block_rows = if imcu + 1 < total {
+            v
+        } else {
+            match height % v {
+                0 => v,
+                m => m,
+            }
+        };
+        let image_block_row = imcu * block_rows + block_row;
+        let image_block_rows = block_rows * total;
+        let prev = if image_block_row > 0 { by - 1 } else { by };
+        let prev_prev = if image_block_row > 1 { by - 2 } else { prev };
+        let next = if image_block_row + 1 < image_block_rows {
+            by + 1
+        } else {
+            by
+        };
+        let next_next = if image_block_row + 2 < image_block_rows {
+            by + 2
+        } else {
+            next
+        };
+        [prev_prev, prev, by, next, next_next]
+    }
+
+    /// The row rule `neighbour_rows` implements was found with the oracle; this holds it to the library's formulas for
+    /// every height up to nine iMCU rows at one to four block rows per iMCU row.
+    #[test]
+    fn the_neighbour_rows_equal_the_librarys_formulas() {
+        for v in 1..=4usize {
+            for height in 1..=9 * v {
+                let imcus = height.div_ceil(v);
+                for by in 0..height {
+                    assert_eq!(
+                        neighbour_rows(v, height, imcus * v, by, imcus as i64 - 1),
+                        rows_as_the_library_counts(v, height, by),
+                        "v {v}, height {height}, row {by}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

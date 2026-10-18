@@ -6,7 +6,9 @@
 //! the Huffman code names the difference's category (0 to 16) and the extra bits
 //! give its value, exactly as a DC difference does in the DCT modes. What
 //! follows is the reference's behaviour, established with the oracle on the
-//! fixtures `lossless_*` and not by a copy of the library:
+//! fixtures `lossless_*` and checked against the 3.1.3 source (`jddiffct.c`,
+//! `jdlossls.c`, `jdlhuff.c`, `jdinput.c`; line numbers in the comments), not a
+//! copy of it:
 //!
 //! * the unit of coding is one sample, so a "block" is a sample, an MCU holds
 //!   `h * v` samples of each component, and the picture is `ceil(w / h_max)` MCUs
@@ -15,7 +17,14 @@
 //!   from `2^(P - Pt - 1)` and the rest of its row from the left; the first sample
 //!   of a later row is predicted from above; everything else by the scan's
 //!   predictor selection value (`Ss`, 1 to 7). Restart intervals are whole MCU
-//!   rows;
+//!   rows of the *scan* (`jddiffct.c:104-112`: `restart_interval % MCUs_per_row`,
+//!   and a non-interleaved scan's MCU row is one sample row of its component);
+//! * a scan is undifferenced one iMCU row at a time (`jddiffct.c:175-226`): an
+//!   interleaved scan's MCU row is its iMCU row, a non-interleaved scan decodes
+//!   `v_samp_factor` MCU rows first (restart markers are honoured between them)
+//!   and undifferences them together afterwards, so a restart, or a row decoded
+//!   from an exhausted segment, in the middle of an iMCU row makes the iMCU row's
+//!   *first* row the one predicted from `2^(P - Pt - 1)`;
 //! * the reconstruction is `(prediction + difference) mod 2^16`, kept in 16 bits
 //!   as the next prediction's input; the sample stored is that value shifted left
 //!   by the point transform `Al`, truncated to 8 bits;
@@ -42,7 +51,7 @@ impl Decoder<'_> {
     pub(crate) fn start_lossless_pass(&mut self) -> R<()> {
         if !(1..=7).contains(&self.ss) || self.se != 0 || self.ah != 0 || self.al >= self.precision {
             return invalid(format!(
-                "invalid lossless parameters Ss={} Se={} Ah={} Al={} (JERR_BAD_LOSSLESS)",
+                "invalid lossless parameters Ss={} Se={} Ah={} Al={} (JERR_BAD_PROGRESSION, jdlossls.c:254-258)",
                 self.ss, self.se, self.ah, self.al
             ));
         }
@@ -51,24 +60,6 @@ impl Decoder<'_> {
                 "restart interval {} is not a multiple of the {} MCUs in a row (JERR_BAD_RESTART)",
                 self.restart_interval, self.mcus_per_row
             ));
-        }
-        // In several scans the reference undifferences the whole frame after the last scan, counting restart
-        // rows in that scan's MCU rows; with components of unequal size that disagrees with the scan's own
-        // count, and the combination is not reproduced (it is refused, not guessed).
-        if self.restart_interval != 0 && self.scan_comps.len() < self.comps.len() {
-            let first = &self.comps[0];
-            if self
-                .comps
-                .iter()
-                .any(|c| (c.width_in_blocks, c.height_in_blocks) != (first.width_in_blocks, first.height_in_blocks))
-            {
-                return Err(JpegError::Unsupported(
-                    "lossless JPEG in several scans with a restart interval and components of different sizes: \
-                     the reference counts the restart rows over the last scan's MCU rows, which this decoder does \
-                     not reproduce"
-                        .into(),
-                ));
-            }
         }
         for ci in self.scan_comps.clone() {
             self.scanned[ci] = true;
@@ -90,10 +81,10 @@ impl Decoder<'_> {
             }
         };
         let widths: Vec<usize> = (0..n).map(|k| width_of(self, k)).collect();
-        // Sample rows of one MCU row, per component slot.
-        let rows_of: Vec<usize> = (0..n)
-            .map(|k| if n == 1 { 1 } else { self.comps[self.scan_comps[k]].v })
-            .collect();
+        // Sample rows of one iMCU row, per component slot: `v_samp_factor`, in an interleaved scan (one MCU row
+        // holds them all) and in a non-interleaved one (it takes that many MCU rows of one sample row each).
+        let rows_of: Vec<usize> = (0..n).map(|k| self.comps[self.scan_comps[k]].v).collect();
+        let mcu_rows_per_imcu = if n == 1 { rows_of[0] } else { 1 };
         let mut diff: Vec<Vec<i32>> = (0..n).map(|k| vec![0; widths[k] * rows_of[k]]).collect();
         let mut prev: Vec<Vec<u16>> = widths.iter().map(|&w| vec![0; w]).collect();
         let mut cur: Vec<Vec<u16>> = widths.iter().map(|&w| vec![0; w]).collect();
@@ -105,22 +96,37 @@ impl Decoder<'_> {
         };
         let mut rows_to_go = rows_per_interval;
         let start = 1i32 << (self.precision - self.al - 1);
-        for my in 0..self.mcu_rows_in_scan {
-            if rows_per_interval != 0 && rows_to_go == 0 {
-                self.process_restart()?;
-                rows_to_go = rows_per_interval;
+        let mut my = 0;
+        while my < self.mcu_rows_in_scan {
+            // `decompress_data` (jddiffct.c:175-204) decodes the iMCU row's MCU rows first and undifferences them
+            // together afterwards, so a restart, or a row decoded from an exhausted segment, anywhere in the iMCU
+            // row puts the whole iMCU row's first row back to the start-of-segment prediction (the entropy
+            // decoder's `process_restart`, jdlhuff.c:166-188, and its out-of-data branch, jdlhuff.c:231-237, both
+            // end in the undifferencer's `start_pass`, jdlossls.c:239-269).
+            let mcu_rows = mcu_rows_per_imcu.min(self.mcu_rows_in_scan - my);
+            let mut reset = false;
+            for yoffset in 0..mcu_rows {
+                if rows_per_interval != 0 && rows_to_go == 0 {
+                    self.process_restart()?;
+                    rows_to_go = rows_per_interval;
+                    reset = true;
+                }
+                // A row that starts with the segment already out of data is all zero differences, predicted as
+                // the first row of a segment: a flat 2^(P-1), not the row above.
+                reset |= self.inp.insufficient;
+                self.decode_difference_row(&mut diff, &widths, if n == 1 { yoffset } else { 0 })?;
+                rows_to_go = rows_to_go.wrapping_sub(1);
+            }
+            if reset {
                 first_row.iter_mut().for_each(|f| *f = true);
             }
-            // A row that starts with the segment already out of data is all zero differences, and the
-            // reference then predicts it as the first row of a segment: a flat 2^(P-1), not the row above.
-            if self.inp.insufficient {
-                first_row.iter_mut().for_each(|f| *f = true);
-            }
-            self.decode_difference_row(&mut diff, &widths)?;
             for slot in 0..n {
                 let ci = self.scan_comps[slot];
                 let stride = self.comps[ci].blocks_w;
-                for dy in 0..rows_of[slot] {
+                // Rows of this component present in the iMCU row: the decoded MCU rows of a non-interleaved scan, all
+                // of the MCU's rows otherwise (those past the picture only land in the plane's padding).
+                let present = if n == 1 { mcu_rows } else { rows_of[slot] };
+                for dy in 0..present {
                     let w = widths[slot];
                     let d = &diff[slot][dy * w..(dy + 1) * w];
                     if first_row[slot] {
@@ -132,7 +138,7 @@ impl Decoder<'_> {
                     } else {
                         undifference(self.ss, d, &prev[slot], &mut cur[slot]);
                     }
-                    let y = my * rows_of[slot] + dy;
+                    let y = if n == 1 { my + dy } else { my * rows_of[slot] + dy };
                     let row = &mut planes[ci][y * stride..y * stride + w];
                     for (o, &v) in row.iter_mut().zip(&cur[slot]) {
                         *o = (u32::from(v) << self.al) as u8;
@@ -140,17 +146,23 @@ impl Decoder<'_> {
                     std::mem::swap(&mut prev[slot], &mut cur[slot]);
                 }
             }
-            rows_to_go = rows_to_go.wrapping_sub(1);
+            my += mcu_rows;
         }
         Ok(())
     }
 
     /// `decode_mcus` for one MCU row: the differences of every sample, in
-    /// `diff[slot][row * width + x]`.
-    fn decode_difference_row(&mut self, diff: &mut [Vec<i32>], widths: &[usize]) -> R<()> {
+    /// `diff[slot][row * width + x]`; `yoffset` is the MCU row's place in its iMCU row (a non-interleaved scan's
+    /// sample row), 0 in an interleaved scan whose MCU carries all of its component's rows.
+    fn decode_difference_row(&mut self, diff: &mut [Vec<i32>], widths: &[usize], yoffset: usize) -> R<()> {
         if self.inp.insufficient {
             // Out of data in this segment: the rest decodes as zero differences.
-            diff.iter_mut().for_each(|d| d.fill(0));
+            if self.scan_comps.len() == 1 {
+                let w = widths[0];
+                diff[0][yoffset * w..(yoffset + 1) * w].fill(0);
+            } else {
+                diff.iter_mut().for_each(|d| d.fill(0));
+            }
             return Ok(());
         }
         let nb = self.blocks_in_mcu;
@@ -173,7 +185,8 @@ impl Decoder<'_> {
                     huff_extend(r, s)
                 };
                 let x = if self.scan_comps.len() == 1 { mx } else { mx * c.h + dx };
-                diff[slot][dy * widths[slot] + x] = value;
+                let row = if self.scan_comps.len() == 1 { yoffset } else { dy };
+                diff[slot][row * widths[slot] + x] = value;
             }
         }
         Ok(())

@@ -2925,6 +2925,162 @@ mod tests {
         ce / (ids.len() - 1) as f64
     }
 
+    fn pooled(b: &GpuBuffer) -> u64 {
+        GpuRuntime::allocated_bytes_for(b.nbytes(), BufferKind::Cold)
+    }
+
+    fn pooled_t(t: &Tensor) -> u64 {
+        pooled(&t.buffer)
+    }
+
+    /// The pool-rounded bytes a [`MixerScratch`] holds of its own: the
+    /// buffers `mixer_scratch` made, read off the allocated tensors, not its
+    /// `dresid`/`dx` (the caller's) nor the attention workspace (the step's,
+    /// counted with what the step holds throughout). Both destructurings are
+    /// exhaustive: a field added to the scratch fails to compile here until
+    /// it is counted. The GDN workspace has no instance size; its own static
+    /// `allocated_bytes_for` stands in for it.
+    fn mixer_held(model: &Qwen35Model, m: &MixerScratch) -> u64 {
+        let MixerScratch {
+            t,
+            dresid: _,
+            dx: _,
+            gdn,
+            attn,
+        } = m;
+        let mut n = 0;
+        if let Some(GdnScratch {
+            dy,
+            d_o,
+            dproj,
+            d_conv,
+            dg,
+            dbeta,
+            ws: _,
+            norm_part,
+            gates_part,
+            conv_part,
+        }) = gdn
+        {
+            n += [dy, d_o, dproj, d_conv, dg, dbeta]
+                .into_iter()
+                .map(pooled_t)
+                .sum::<u64>();
+            n += [norm_part, gates_part, conv_part].into_iter().map(pooled).sum::<u64>();
+            n += GdnTrainWorkspace::allocated_bytes_for(single_seq_gdn_dims(&model.cfg.gdn, *t));
+        }
+        if let Some(AttnScratch {
+            dy,
+            d_o,
+            dproj,
+            dq,
+            dk,
+            dv,
+            ws: _,
+            part,
+        }) = attn
+        {
+            n += [dy, dproj].into_iter().map(pooled_t).sum::<u64>();
+            n += [d_o, dq, dk, dv, part].into_iter().map(pooled).sum::<u64>();
+        }
+        n
+    }
+
+    /// Every buffer a [`Scratch`] holds, mixers included.
+    fn scratch_held(model: &Qwen35Model, s: &Scratch) -> u64 {
+        let Scratch {
+            mx,
+            d_mid,
+            d_gate,
+            d_up,
+            norm_part,
+        } = s;
+        pooled_t(&mx.dresid)
+            + pooled_t(&mx.dx)
+            + mixer_held(model, mx)
+            + [d_mid, d_gate, d_up].into_iter().map(pooled_t).sum::<u64>()
+            + pooled(norm_part)
+    }
+
+    fn tiny_model() -> Qwen35Model {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
+        let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+        let rt = GpuRuntime::new().unwrap();
+        let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+        Qwen35Model::load(&rt, &st, "model.", cfg, Precision::F32).unwrap()
+    }
+
+    /// The scratch bounds equal the bytes the allocators made, exactly: the
+    /// whole scratch, its row-wise part (the packed scratch of a ragged step)
+    /// and each sequence's mixer scratch. A tolerance would let a missing
+    /// mirror hide in the pool-cap slack; this does not.
+    #[test]
+    fn scratch_bounds_equal_the_bytes_the_scratch_allocators_make() {
+        let model = tiny_model();
+        for t in [2u32, 3, 17, 64, 256, 1000] {
+            let ws = model.attn_workspace(t).unwrap();
+            let sc = model.scratch(t, ws, true).unwrap();
+            assert_eq!(
+                scratch_held(&model, &sc),
+                model.scratch_bytes(t),
+                "scratch_bytes at t={t}"
+            );
+            let packed = model.scratch(t, None, false).unwrap();
+            assert_eq!(
+                scratch_held(&model, &packed),
+                model.rowwise_scratch_bytes(t),
+                "rowwise_scratch_bytes at t={t}"
+            );
+            let h = model.cfg.hidden as usize;
+            let n = t as usize;
+            let mx = model
+                .mixer_scratch(
+                    t,
+                    model.attn_workspace(t).unwrap(),
+                    true,
+                    tensor(&model.rt, &[n, h]).unwrap(),
+                    tensor(&model.rt, &[n, h]).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                mixer_held(&model, &mx),
+                model.mixer_scratch_bytes(t),
+                "mixer_scratch_bytes at t={t}"
+            );
+        }
+    }
+
+    /// A ragged step's bound: the packed row-wise scratch plus one mixer
+    /// scratch per sequence at its own length, as `train_step_ragged_into`
+    /// builds them (per-sequence `dresid`/`dx` are views, so not allocated).
+    #[test]
+    fn ragged_scratch_bound_equals_the_packed_plus_per_sequence_allocations() {
+        let model = tiny_model();
+        let h = model.cfg.hidden as usize;
+        for lens in [vec![5usize, 17, 30], vec![2, 64, 3, 40, 100], vec![256, 2]] {
+            let total: usize = lens.iter().sum();
+            let sc = model.scratch(total as u32, None, false).unwrap();
+            let mut held = scratch_held(&model, &sc);
+            let mut start = 0;
+            for &n in &lens {
+                let mx = model
+                    .mixer_scratch(
+                        n as u32,
+                        model.attn_workspace(n as u32).unwrap(),
+                        true,
+                        sc.mx.dresid.view(&[n, h], start * h),
+                        sc.mx.dx.view(&[n, h], start * h),
+                    )
+                    .unwrap();
+                held += mixer_held(&model, &mx);
+                start += n;
+            }
+            let bound = model.rowwise_scratch_bytes(total as u32)
+                + lens.iter().map(|&n| model.mixer_scratch_bytes(n as u32)).sum::<u64>();
+            assert_eq!(held, bound, "ragged lens {lens:?}");
+        }
+    }
+
     /// The reference directory is `QWEN35_TRAIN_REF_DIR` when set, and a
     /// directory without `ids.npy` is refused naming the variable and the
     /// path (ft-19f4bd16: the in-crate 2B test once read a fixed path and

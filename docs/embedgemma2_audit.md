@@ -86,6 +86,18 @@ as host rows); the text encoder's scatter now reads the towers' output buffers
 directly, so every `EmbedGemma2Multimodal::encode` call, the C entries and the
 Python methods included, waits once. See `docs/embedgemma2.md`, One call.
 
+**Closed further (2026-10-17).** The C and Python entries no longer need a
+tokenizer or a processor of the caller's: eleven raw front-end entries
+(`tessl_embedgemma2_{embed_texts,tokenize,decode,prompt_*,embed_images,embed_audio,embed_videos,embed_media}`,
+merge 641dba8) and seven for files, bytes, soft-token counts and text
+interleaved with media (`tessl_embedgemma2_{embed_*_sources,*_soft_token_count,embed_segments}`,
+merge 879ead2), all in `src/capi_embedgemma2.rs` (`rg -o 'extern "C" fn
+tessl_embedgemma2_\w+'` lists 27 entries); `tests/capi_embedgemma2_raw.rs` and
+`tests/capi_embedgemma2_media.rs`. A Go binding over the same ABI is
+`go/embedgemma2` (merge ec4c3ec; `make -C go device` compares every entry bit
+for bit with the Rust call). Python's `embed_images` / `embed_audio` now take
+raw images and PCM (`CHANGELOG.md`, Changed (breaking)).
+
 ### G4. Tokenization is the caller's
 
 There is no tokenizer in tessl (`rg -l tokeniz src` finds only doc comments).
@@ -95,6 +107,14 @@ dependency, which needs the owner's decision) or a hand-written BPE over
 take a caller's `tokenizers.Tokenizer` and apply the checkpoint's prompts
 (`config_sentence_transformers.json`) without a new Rust dependency.
 **verified** (no tokenizer); the decision is the owner's.
+
+**Resolved (lane T, merge 5a2e9c6).** `tessl::embedgemma2_tok` is a hand-written
+BPE over the snapshot's `tokenizer.json`: no new dependency, no Python.
+`tests/embedgemma2_tok_tiny.rs` (device-free, three hand-written tokenizers) and
+the opt-in `tests/embedgemma2_tok_real.rs` (4671 texts: ids equal
+sentence-transformers' in 4680 of 4680 comparisons, the nine refused strings
+counted twice) hold it to exact id equality (`docs/embedgemma2.md`,
+Tokenizer). The Python and C text entries tokenize through it.
 
 ### G5. Where an encode's time goes is not measured per stage
 
@@ -197,6 +217,20 @@ GEMMs. Fusing norm-into-GEMM prologue or gate-into-GEMM epilogue
 (`gemm_epilogue` exists) would cut dispatches and activation traffic.
 Value **unverified** until G5 ranks it.
 
+**Partly resolved (lane X, merge 201abfc).** The row passes are fused where
+the arithmetic stays bit for bit (`kernels/embedgemma2_text.metal`): 15 to 13
+dispatches per layer at `ExactF32`, 17 to 13 at `Bf16`. Embeddings are
+unchanged to the bit (tiny: `tiny_embedding_hashes` in
+`tests/embedgemma2_memory.rs`; real checkpoint: 12 hashes at both precisions,
+`docs/embedgemma2.md`, Text-encoder fusion) and
+`a_layer_runs_the_pinned_kernels` / `bf16_a_layer_runs_the_pinned_kernels`
+(`tests/embedgemma2_tiny.rs`) pin the layer. **No end-to-end speed-up is
+claimed**: `bench_paired` refused both runs on its own drift gate (spreads up to
+19.3x on a host at load 66 to 108). Still open: `gelu(gate) * up` into the
+`gate|up` GEMM, dropping the dead f32 `a.attn` buffer at `Bf16`, GEMMs that
+write bf16 directly (`docs/embedgemma2.md`, What is left (text-encoder
+fusion)). The audio tower's version of this work is lane I (ae11582).
+
 ### G8. Two thirds of the checkpoint are not implemented: the vision and audio towers
 
 `google/embeddinggemma-2` is a 744.4M-parameter multimodal embedder, all
@@ -240,6 +274,14 @@ Preprocessing (image resize and patchify, the audio log-mel front end) stays
 the caller's, as tokenization does; tessl starts from the processor's
 tensors. The goldens are `tools/embedgemma2_ref/make_mm_reference.py`.
 
+**Resolved** (towers M1, M2; merge M3; facade F; one wait K, as in the table
+below). **Preprocessing is no longer the caller's** (lane P, merge f8ce932):
+`tessl::embedgemma2_pre` makes the towers' inputs from raw bytes, PCM and
+frames, bit-exact for images and about one ulp for the log-mel
+(`tests/embedgemma2_pre.rs`, device-free; `docs/embedgemma2.md`,
+Preprocessing). Decoding the files into those bytes is `tessl::media`
+(`docs/embedgemma2.md`, Media decoding).
+
 ### Already on the board (referenced, not re-filed)
 
 * ft-d0a49f5d: re-measure `attn_tiled.h` for the EG2 encoder after 4e5faac.
@@ -256,24 +298,32 @@ tensors. The goldens are `tools/embedgemma2_ref/make_mm_reference.py`.
   **verified** (code).
 * Pooling cost: < 0.2 % of an encode. **verified** (committed result).
 
-## Status at close (2026-10-16)
+## Status (closed 2026-10-16, updated 2026-10-17)
 
-All work is on the local branch `eg2/integrate` (not pushed; `main` is still
-60a6240). Every merge was verified on the merged tree: fmt, clippy and rustdoc
-with `-D warnings`, the device test binaries, the six real-checkpoint suites
+The first wave (lanes A to K) was merged into `main` as 8c80af7 (`git
+merge-base --is-ancestor 8c80af7 main` holds); `main` is no longer 60a6240. The
+later lanes P, T, X, AB, R, F2 and V (video input, merge 6f62a50, not the
+decode lane V below) are ancestors of 8c80af7 too (`git merge-base
+--is-ancestor` on each merge commit, **verified**). The lanes after it (PY3, D,
+BIND, M, CR, J, V (decode, 4d06651), G, V2) are on `eg2/integrate` (e2c345f at
+this update). Every merge of the first wave was
+verified on the merged tree on 2026-10-16: fmt, clippy and rustdoc with `-D
+warnings`, the device test binaries, the six real-checkpoint suites
 (`--ignored`), `scripts/hosted_tests.sh` and `--outside`, and the Python
-binding tests. Whole-encode result: `bench/results/embedgemma2_final_m5pro.*`.
+binding tests. **This update reads the table below from the code and the
+docs; it did not rerun any of that.** Whole-encode result:
+`bench/results/embedgemma2_final_m5pro.*`.
 
 | Gap | Status | Merge | Evidence |
 |---|---|---|---|
 | G1 per-dispatch waits | resolved: `GpuRuntime::async_scope`; `encode` waits once | d13d1d3 (A) | `tests/async_scope.rs`; 1x16 84.9 -> 7.4 ms (`embedgemma2_before_after_m5pro.txt`) |
-| G2 no bf16 path | resolved: `GemmOperands::Bf16` (B), bf16 attention tiles (E), vision tower bf16 (J); audio tower stays exact f32 | e5be45e, 16f5190, 224be3f | `tests/embedgemma2_model.rs`; 2.75x to 3.0x faster than 60a6240 from 64x32 up (`embedgemma2_final_m5pro.txt`) |
-| G3 no C ABI / Python | resolved: text (C), multimodal (F) | ac5364a, 433e659 | `tests/capi_embedgemma2*.rs`, `tests/capi_contract.rs`, `python/tests/test_embedgemma2*.py` |
-| G4 tokenizer | open: needs the owner's decision on a dependency (Python callers pass a tokenizer today) | - | - |
+| G2 no bf16 path | resolved: `GemmOperands::Bf16` (B), bf16 attention tiles (E), vision tower bf16 (J), audio tower bf16 (AB: `EmbedGemma2Audio::load_with`, weights 587,121,792 B against 1,172,751,488 B; its speed is not published, the drift gate refused every run) | e5be45e, 16f5190, 224be3f, 005063c | `tests/embedgemma2_model.rs`, `tests/embedgemma2_audio_tiny.rs` (`bf16_mode_is_not_the_exact_forward`); 2.75x to 3.0x faster than 60a6240 from 64x32 up (`embedgemma2_final_m5pro.txt`) |
+| G3 no C ABI / Python | resolved: text (C), multimodal (F); raw front ends (BIND), files, bytes, counts and segments (M), Go (G) | ac5364a, 433e659, 641dba8, 879ead2, ec4c3ec | `tests/capi_embedgemma2*.rs`, `tests/capi_contract.rs`, `python/tests/test_embedgemma2*.py`, `go/embedgemma2` (`make -C go device`) |
+| G4 tokenizer | resolved: `tessl::embedgemma2_tok`, a hand-written BPE, no new dependency (T) | 5a2e9c6 | `tests/embedgemma2_tok_tiny.rs`; `tests/embedgemma2_tok_real.rs` (opt-in): 4680 of 4680 comparisons equal sentence-transformers' |
 | G5 stage profile | resolved (D); towers profiled (I, J) | 2e7ba35 | `embedgemma2_stage_profile_m5pro.txt`, `embedgemma2_{audio,vision}_profile_m5pro.txt` |
-| G6 device peak | resolved: 1652 -> 466 MiB above the model (H); towers release before their wait (K) | 27a0407, 03dae0f | `tests/embedgemma2_memory.rs`, `embedgemma2_memory_m5pro.txt` |
-| G7 elementwise dispatches | partly: audio tower 28 -> 17 dispatches per layer (I), vision RoPE table (J); text-encoder fusion not done | ae11582, 224be3f | `embedgemma2_audio_profile_m5pro.txt` (end-to-end audio speed-up not shown: noise) |
-| G8 vision and audio towers | resolved: towers (M1, M2), merge (M3), facade (F), one host wait per media call (K) | 6eedd5a, 06465a9, 908c3a2, 433e659, 03dae0f | `tests/embedgemma2_e2e_model.rs`: max abs 3.8e-7 against sentence-transformers |
+| G6 device peak | resolved: 1652 -> 466 MiB above the model (H); towers release before their wait (K); the pool recycles a dropped buffer at the next allocation when the GPU is idle (R: `recycle_if_idle`, consecutive calls hold `extra == 0`) | 27a0407, 03dae0f, 1f447c9 | `tests/embedgemma2_memory.rs`, `tests/pool_recycle_at_alloc.rs`, `embedgemma2_memory_m5pro.txt` |
+| G7 elementwise dispatches | partly: text encoder fused 15 -> 13 dispatches per layer at `ExactF32`, 17 -> 13 at `Bf16`, bits unchanged (X); audio tower 28 -> 17 (I); vision RoPE table (J). No end-to-end speed-up shown for X or I: the drift gate refused X's runs, I's was inside the noise | 201abfc, ae11582, 224be3f | `tests/embedgemma2_tiny.rs` (`a_layer_runs_the_pinned_kernels`), `tiny_embedding_hashes`, `embedgemma2_audio_profile_m5pro.txt` |
+| G8 vision and audio towers | resolved: towers (M1, M2), merge (M3), facade (F), one host wait per media call (K); preprocessing in Rust (P); video input in Rust (V of 6f62a50, F2) and decoded natively (D bd993d4, the decode lane V 4d06651, V2 e2c345f) | 6eedd5a, 06465a9, 908c3a2, 433e659, 03dae0f, f8ce932, 6f62a50, 8967e31, bd993d4, 4d06651, e2c345f | `tests/embedgemma2_e2e_model.rs`: max abs 3.8e-7 against sentence-transformers; `tests/embedgemma2_pre.rs`; `tests/embedgemma2_video_tiny.rs`; `tests/media_e2e_video.rs`: 1.38e-7 to 8.53e-7 |
 | 1x16 latency (from G5) | resolved for ExactF32: opt-in split-K for the text encoder only (G) | f1a8677 | 1x16 0.60x (`embedgemma2_small_m_m5pro.txt`, `embedgemma2_final_m5pro.txt`) |
 
 Found on the way:
@@ -284,7 +334,32 @@ Found on the way:
 * `embedgemma2_memory` read a process-wide device figure, so its result
   depended on test order; device-byte tests now run in a child process (7459e16).
 
-Still open: G4; text-encoder elementwise fusion (G7); an audio tower bf16 mode;
-video; a C/Python entry for caller-built ids with media (`MmItem::Media`); the
-pool-level recycle at allocation time; the audio tower's end-to-end speed-up on
-a quiet machine.
+Closed since 2026-10-16, each from the code: G4 (T, above); an audio tower bf16
+mode (AB, `src/embedgemma2_audio.rs` `load_with`); video (`MmItem::Video` and
+`MmItem::TimestampedVideo` in `src/embedgemma2_mm.rs`, `tessl_embedgemma2_embed_videos`
+in the C ABI, frames decoded by `tessl::media`); a C/Python entry for
+caller-built ids with media (`tessl_embedgemma2_embed_media`, Python
+`media([{"ids": ...}])`); the pool-level recycle at allocation time (R,
+`src/runtime.rs` `recycle_if_idle`).
+
+Still open:
+
+* G7: `gelu(gate) * up` into the `gate|up` GEMM, dropping the dead f32 `a.attn`
+  buffer at `Bf16`, and GEMMs that write bf16 directly (each changes bits or the
+  itemised bytes some test asserts), and the end-to-end speed of the fusion that
+  landed, which needs a quiet host (`bench_paired --evidence --rounds 6
+  --max-spread 1.25`).
+* The audio tower's end-to-end speed-up, fused and `Bf16`, on a quiet machine
+  (`docs/embedgemma2.md`, Audio tower bf16 and speed: refused by the drift gate
+  in all six attempts).
+* The media list in `docs/embedgemma2.md`, What is left: torchcodec itself was
+  never run (the video reference is the `ffmpeg` CLI arranged as its source
+  arranges libswscale); one lossless-JPEG shape refused by name and block
+  smoothing / lossless rules measured against the oracle, not read from the
+  library source; `AVAssetReader`'s chroma resampling characterised, not
+  reproduced; VideoToolbox here does not decode H.264 High 10, 4:2:2 or 4:4:4;
+  the threaded colour conversion's cost is unmeasured; Ogg Opus in SILK or
+  hybrid mode is 15 to 20 dB from a torchcodec reference; librosa's `soxr_hq`
+  and torchaudio's resampler are not reproduced; HEIC, H.264 and HEVC tests
+  cannot run in the hosted sandbox; bit equality is with the AArch64 NEON
+  FFmpeg (x86 unverified); a file's own channel mask is not read.

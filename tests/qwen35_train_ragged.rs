@@ -111,8 +111,15 @@ fn seq_a() -> Vec<u32> {
 /// `Supervise::Rows` on it. Bit-identical means these never change; they are
 /// the bits of this GPU family's kernels, so a different GPU may need them
 /// re-pinned from the pre-change commit.
-const GOLDEN_CAUSAL: u64 = 0xfb977a5f6aedd64a;
-const GOLDEN_ROWS: u64 = 0xd962357482c76de8;
+///
+/// Re-pinned (RMSNorm and qk-norm forward/backward to `precise::rsqrt`, owner
+/// decision 2026-10-18, card ft-1a0f8c18 AC5): an ulp-level change of the
+/// forward norms. Old values: causal 0xfb977a5f6aedd64a, rows
+/// 0xd962357482c76de8. The norm rewrite in 7d9ef30 alone gave causal
+/// 0x465a2c57c290769e, rows 0x3aef36370924cc39; the qk-norm kernels in e677f35
+/// moved only the causal digest. Pinned in `--release`.
+const GOLDEN_CAUSAL: u64 = 0x06504ffc2068a5b0;
+const GOLDEN_ROWS: u64 = 0x3aef36370924cc39;
 
 fn causal_digest(model: &Qwen35Model) -> u64 {
     let a = seq_a();

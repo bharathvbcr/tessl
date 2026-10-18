@@ -82,8 +82,10 @@ kernel void qwen35_residual_add_f32(
 ///
 /// The sum of squares is `rms_norm.metal`'s, lane for lane: lane `lid` walks
 /// `dim[lid], dim[lid + tptg], ...` and `reduce_row_add` folds the lanes, so
-/// with the host's `reduce_tptg` the rows' scale is the one tessl's generic
-/// RMSNorm computes.
+/// with the host's `reduce_tptg` the rows' mean square is the one tessl's
+/// generic RMSNorm computes. The inverse root is `precise::rsqrt`, not
+/// `rsqrt`: `qwen35_rms_norm_bwd_f32` rebuilds `rstd` from `x` with
+/// `precise::rsqrt`, and training needs both to be the same bits.
 ///
 /// Grid: one threadgroup per row.
 #define QWEN35_RMS_NORM_KERNEL(NAME, OUT_T)                                       \
@@ -109,7 +111,7 @@ kernel void NAME(                                                               
         const float v = xin[d];                                                   \
         ss += v * v;                                                              \
     }                                                                             \
-    const float inv = rsqrt(reduce_row_add(ss, scratch, sgid, lane, tptg) / (float)dim + eps); \
+    const float inv = precise::rsqrt(reduce_row_add(ss, scratch, sgid, lane, tptg) / (float)dim + eps); \
     for (ulong d = lid; d < (ulong)dim; d += tptg) {                              \
         const float wp = 1.0f + weight[d];                                        \
         xout[d] = (OUT_T)(xin[d] * inv * wp);                                     \

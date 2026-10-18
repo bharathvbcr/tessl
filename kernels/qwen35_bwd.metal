@@ -450,7 +450,7 @@ inline void qwen35_norm_rope_row_bwd(
     for (uint d = lane; d < D; d += 32u) {
         ss += src[d] * src[d];
     }
-    const float rstd = rsqrt(simd_sum(ss) / (float)D + eps);
+    const float rstd = precise::rsqrt(simd_sum(ss) / (float)D + eps);
     const uint half_rot = rotary_dim / 2u;
     float dn[BWD_MAX_COLS];
     float dot = 0.0f;

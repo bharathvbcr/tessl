@@ -951,7 +951,9 @@ inline void gated_rms_norm_row(
     for (uint d = lane; d < D; d += 32u) {
         ss += xr[d] * xr[d];
     }
-    const float inv = rsqrt(simd_sum(ss) / (float)D + eps);
+    // `precise::`: `qwen35_gated_rms_norm_bwd_f32` rebuilds this `rstd` with
+    // `precise::rsqrt`, and training needs both to be the same bits.
+    const float inv = precise::rsqrt(simd_sum(ss) / (float)D + eps);
     for (uint d = lane; d < D; d += 32u) {
         orow[d] = (OutT)(w[d] * (xr[d] * inv) * tessl_silu(zr[d]));
     }

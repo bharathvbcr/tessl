@@ -3,57 +3,55 @@
 #include "softcap.h"
 using namespace metal;
 
-kernel void copy_f32(
-    device const float *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
+// The elementwise copy and cast kernels are one template body each, stamped
+// out per element type. The stamps own the entry name and the
+// `[[buffer(N)]]` slots the host binds (0 = in, 1 = out, 2 = n); a macro rather
+// than a `template [[host_name]]` instantiation because the kernel census
+// (`xcrun metal -E`, `kernel void NAME`) names each entry by its declaration.
+// `tests/q4_kernels_template.rs` pins every one of them bit for bit.
+template <typename T>
+inline void util_copy(device const T *in, device T *out, uint n, uint gid)
 {
     if (gid >= n) return;
     out[gid] = in[gid];
 }
 
+template <typename S, typename D>
+inline void util_cast(device const S *in, device D *out, uint n, uint gid)
+{
+    if (gid >= n) return;
+    out[gid] = D(in[gid]);
+}
+
+#define TESSL_COPY_KERNEL(NAME, T)                                  \
+    kernel void NAME(                                               \
+        device const T *in [[buffer(0)]],                           \
+        device T *out [[buffer(1)]],                                \
+        constant uint &n [[buffer(2)]],                             \
+        uint gid [[thread_position_in_grid]])                       \
+    {                                                               \
+        util_copy<T>(in, out, n, gid);                              \
+    }
+
+#define TESSL_CAST_KERNEL(NAME, S, D)                               \
+    kernel void NAME(                                               \
+        device const S *in [[buffer(0)]],                           \
+        device D *out [[buffer(1)]],                                \
+        constant uint &n [[buffer(2)]],                             \
+        uint gid [[thread_position_in_grid]])                       \
+    {                                                               \
+        util_cast<S, D>(in, out, n, gid);                           \
+    }
+
+TESSL_COPY_KERNEL(copy_f32, float)
 // Bitwise: indices and other integer data, which a float copy could alter
 // (small integers are f32 denormals).
-kernel void copy_u32(
-    device const uint *in [[buffer(0)]],
-    device uint *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
+TESSL_COPY_KERNEL(copy_u32, uint)
+TESSL_COPY_KERNEL(copy_bf16, bfloat)
+TESSL_COPY_KERNEL(copy_f16, half)
 
-kernel void copy_bf16(
-    device const bfloat *in [[buffer(0)]],
-    device bfloat *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
-
-kernel void cast_f32_to_bf16(
-    device const float *in [[buffer(0)]],
-    device bfloat *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = bfloat(in[gid]);
-}
-
-kernel void cast_bf16_to_f32(
-    device const bfloat *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = float(in[gid]);
-}
+TESSL_CAST_KERNEL(cast_f32_to_bf16, float, bfloat)
+TESSL_CAST_KERNEL(cast_bf16_to_f32, bfloat, float)
 
 kernel void zero_f32(
     device float *x [[buffer(0)]],
@@ -138,16 +136,6 @@ kernel void softcap_f32(
     post[gid] = tessl_apply_softcap(pre[gid], softcap);
 }
 
-kernel void copy_f16(
-    device const half *in [[buffer(0)]],
-    device half *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
-
 /// f32 -> IEEE half.
 ///
 /// Unlike bf16, half has only 5 exponent bits, so values above 65504 do not
@@ -155,22 +143,5 @@ kernel void copy_f16(
 /// activations. The two casts differ in range, not in rounding: both are
 /// round-to-nearest-even conversions, and `cast_f32_to_bf16` matches the host
 /// `f32_to_bf16_bits` bit for bit (tests/bf16_cast.rs).
-kernel void cast_f32_to_f16(
-    device const float *in [[buffer(0)]],
-    device half *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = half(in[gid]);
-}
-
-kernel void cast_f16_to_f32(
-    device const half *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = float(in[gid]);
-}
+TESSL_CAST_KERNEL(cast_f32_to_f16, float, half)
+TESSL_CAST_KERNEL(cast_f16_to_f32, half, float)

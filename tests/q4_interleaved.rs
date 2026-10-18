@@ -31,7 +31,7 @@ use common::{
 use tessl::nn::{self, GateUpDispatch, Q4MlxBank, Q4MlxLayout, QkvOutputs, QuantShape};
 
 const UNWRITTEN: f32 = -4.25e28;
-/// `SIMD_ROWS` in `kernels/gemv_q4_mlx.metal`.
+/// `SIMD_ROWS` in `kernels/q4_mlx_dot.h`.
 const I4_ROWS: usize = 4;
 /// Columns per `uint2` pack — `SIMD_VPT`, and the width `qdot16` consumes.
 const I4_PACK_COLS: usize = 16;

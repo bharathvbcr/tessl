@@ -12,6 +12,31 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Simdgroup geometry shared by every `*_simd*` GEMV / GEMM entry (the bodies
+// are `gemv_q4_mlx_simd.h` and `gemm_q4_mlx_simd.h`). One simdgroup owns
+// SIMD_ROWS output rows and each lane reads SIMD_VPT = 16 nibbles (two packs of
+// eight) per K block of SIMD_BLOCK = 512 columns; a threadgroup is
+// SIMD_SG_PER_TG simdgroups. The host (`nn::simd_gemv_threadgroups`) and
+// gemma-metal size their grids from these numbers.
+constant uint SIMD_SIZE = 32u;
+constant uint SIMD_ROWS = 4u;
+constant uint SIMD_SG_PER_TG = 2u;
+constant uint SIMD_PACKS = 2u;
+constant uint SIMD_VPT = 8u * SIMD_PACKS;        // 16
+constant uint SIMD_BLOCK = SIMD_SIZE * SIMD_VPT; // 512
+
+/// Weight packing a simd entry reads. Interleaved4 is
+/// `[tile][uint2 pack][r0..r3]` weights plus `[tile][group][r0..r3]` bfloat2
+/// scale/bias, in 4-row tiles stored at full height.
+enum class Q4Layout : uint { RowMajor = 0u, Interleaved4 = 1u };
+
+/// One quantized bank as a kernel sees it: packed nibbles and interleaved
+/// bfloat2 scale/bias. (The unused `biases` buffer slot is not carried.)
+struct Q4Bank {
+    device const uchar *packed;
+    device const bfloat2 *sb;
+};
+
 /// MLX load_vector bits=4: store x with 16^k prescale + return sum(x).
 ///
 /// `x` must be 8-byte aligned: every caller advances it by whole 16-element

@@ -42,7 +42,9 @@ make -C go bench     # the overhead benchmark; rewrites bench/results/embedgemma
 --manifest-path go/engine/Cargo.toml`), generates the fixtures, then runs
 `go vet` and `go test -count=1 ./...` with `TESSL_GO_REQUIRE_DEVICE=1`, which
 turns missing fixtures from a skip into a failure. `scripts/ci_local.sh` runs
-`make -C go unit` always and `make -C go device` under the heavy-job lock.
+`make -C go unit` always and `make -C go device` under the heavy-job lock. In
+`.github/workflows/ci.yml` the hosted `go` job runs `make -C go unit` and the
+self-hosted `gpu` job runs `make -C go device`.
 
 Go's build cache keys a cgo package on the text of its flags and not on the
 bytes of the archive they name, so the Makefile passes the archive's hash in
@@ -69,7 +71,9 @@ gusset's own and tessl's separately: the umbrella crate (`go/engine`) is both in
 one `libgusset.a`, exporting `tessl_go_engine_init` to register its operations
 on gusset's opcode dispatch. A Rust staticlib carries none of the system
 libraries its crates link, so the cgo preamble names them (Metal, CoreGraphics,
-AudioToolbox, ImageIO, AVFoundation, CoreMedia, CoreVideo, Foundation, libobjc).
+AudioToolbox, ImageIO, AVFoundation, CoreMedia, CoreVideo, VideoToolbox,
+Foundation, libobjc). `tests/go_link_frameworks.rs` fails when a framework a
+`#[link(kind = "framework")]` under `src/` names is missing from that line.
 
 **Dependency, and its pin.** The binding adds one dependency, gusset, at commit
 `984209b542885b10b43e3d9aaf2073fd871e9eb9` (the pushed `origin/main`, the same
@@ -201,7 +205,5 @@ it).
 
 ## Not done
 
-- No CI job runs these tests: `scripts/ci_local.sh` does, but the hosted workflow
-  has no Go step and the device tests need a Metal runner.
 - Linux and Windows: tessl is Metal.
 - Streaming results, and cancelling a tessl call mid-flight: tessl has neither.

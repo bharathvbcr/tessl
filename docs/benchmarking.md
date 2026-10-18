@@ -715,7 +715,7 @@ a script raised (a missing key, a division by zero).
 
 ### EmbedGemma 2 figures: `plot_results`
 
-`src/bin/plot_results` draws the sixteen EmbedGemma 2 and media benchmark figures in
+`src/bin/plot_results` draws the seventeen EmbedGemma 2, media and Go-binding benchmark figures in
 `bench/results/*.svg` from the JSON beside them, with no plotting dependency
 (it replaced thirteen matplotlib scripts and their PNGs):
 
@@ -726,7 +726,7 @@ cargo run --release --bin plot_results -- all bench/results [--out-dir DIR]
 
 `NAME` is one of `final`, `audio-speed`, `mm-onewait`, `pre`, `vision-speed`,
 `audio-profile`, `stage-profile`, `text-fusion`, `memory`, `small-m`, `tok`,
-`video`, `media-decode`, `media-resample`, `video-color`, `jpeg-decode`. The figure is written as `<stem of RESULT.json>.svg` next to the JSON.
+`video`, `media-decode`, `media-resample`, `video-color`, `jpeg-decode`, `go-overhead`. The figure is written as `<stem of RESULT.json>.svg` next to the JSON.
 The same data is the same bytes. A figure refuses to draw, writes nothing and
 names the reason where its script would have raised: a missing key, an empty
 list, a time that cannot go on a log axis, lanes that disagree on the token ids

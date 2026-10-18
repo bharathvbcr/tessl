@@ -16,7 +16,8 @@
 //!
 //! Each function decodes with the defaults the reference does (an image's RGB
 //! samples as stored with the EXIF orientation ignored, as torchvision reads a
-//! path; audio at the extractor's rate as the channel mean; a video's upright
+//! path; audio mixed to mono and resampled to the extractor's rate as torchcodec
+//! does, with libswresample's matrix and resampler; a video's upright
 //! frames), preprocesses at once and drops the decoded pixels, so a caller that
 //! prepares many files holds one decoded medium at a time and the prepared
 //! inputs (bounded by the vision tower's per-call limits). Every failure is a
@@ -55,8 +56,8 @@ pub fn prepare_image(cfg: &ImageConfig, source: MediaSource<'_>) -> Result<Prepa
 }
 
 /// An audio file or its bytes, decoded to mono at the extractor's rate
-/// ([`AudioOptions::default`] at `front_end`'s sampling rate: the channel
-/// mean, at most 30 minutes) and turned into the audio tower's input
+/// ([`AudioOptions::default`] at `front_end`'s sampling rate: libswresample's
+/// downmix and resampler, at most 30 minutes) and turned into the audio tower's input
 /// ([`AudioFrontEnd::extract`], which cuts the clip to the extractor's 30 s).
 pub fn prepare_audio(front_end: &AudioFrontEnd, source: MediaSource<'_>) -> Result<AudioInput, MediaError> {
     let rate = front_end.config().sampling_rate;

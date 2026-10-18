@@ -341,7 +341,7 @@ reference does, preprocess at once, drop the decoded pixels.
 | Entry | Takes | Runs |
 |---|---|---|
 | `tessl_embedgemma2_embed_image_sources(model, source, blob, blob_len, offsets, n_images, truncate_dim, out, out_len, err, err_len)` | `source` `TESSL_EMBEDGEMMA2_SOURCE_PATHS` (1: UTF-8 paths) or `_BYTES` (2: whole encoded files), laid end to end in `blob` and cut by `n_images + 1` strictly increasing `u64` offsets from 0 to `blob_len`; `n_images` 1 to 256 | ImageIO, `preprocess_image`, the vision tower; one wait |
-| `tessl_embedgemma2_embed_audio_sources(.. same, n_clips ..)` | the same | AudioToolbox to 16 kHz mono (the channel mean), `AudioFrontEnd::extract`, the audio tower; one wait |
+| `tessl_embedgemma2_embed_audio_sources(.. same, n_clips ..)` | the same | AudioToolbox at the file's rate, then libswresample's downmix and resampler to 16 kHz mono (`media::resample`), `AudioFrontEnd::extract`, the audio tower; one wait |
 | `tessl_embedgemma2_embed_video_sources(model, source, blob, blob_len, offsets, n_videos, extension, extension_len, timestamps, truncate_dim, out, out_len, err, err_len)` | as above; `extension` (1 to 8 letters or digits; null with 0 is `mp4`, paths take null with 0) is the type video bytes are sniffed as; `timestamps` 0 or 1 | the sampler's frames decoded, `MmItem::Video` or `MmItem::TimestampedVideo`; one wait |
 | `tessl_embedgemma2_image_soft_token_count(model, image_dims, n_images, out, out_len, err, err_len)` | `[n, 2]` `u32` `(height, width)`; `out` `n` `u64`, `out_len` exactly `n` | the count of placeholders the image makes, from its size alone (`embedgemma2_pre::image_soft_tokens`) |
 | `tessl_embedgemma2_audio_soft_token_count(model, sample_counts, n_clips, sampling_rate, out, out_len, err, err_len)` | `n` sample counts (1 to 2^28) at the extractor's rate | the tower's mask count for the frames the extractor would build, after the 30 s cut (`audio_soft_tokens`, 750 at most); a clip too short for a frame is refused by index |
@@ -2678,8 +2678,9 @@ tokens); in bf16 the runs are too disturbed to say.
 
 ### Not done
 
-* No `Video` entry in the C ABI or Python (`capi*.rs` and `python/` are another
-  piece of work); `MmItem::Video` is Rust-only for now.
+* (Closed since: videos reach the C ABI as `tessl_embedgemma2_embed_videos`,
+  `tessl_embedgemma2_embed_video_sources` and `MmItem::Media` items of
+  `tessl_embedgemma2_embed_media`, and Python and Go through them.)
 * x86 / AVX2 behaviour of the native resize is as unverified as [Preprocessing](#preprocessing) says.
 
 ## Pool recycle at allocation
@@ -2861,7 +2862,7 @@ empty result, and a file that is cut short is an error rather than the part that
 | `AudioFileOpenWithCallbacks`, `AudioFileClose` | `AudioFile.h` | decode from bytes |
 | `AudioConverterNew`, `AudioConverterSetProperty`, `AudioConverterFillComplexBuffer`, `AudioConverterDispose` | `AudioConverter.h` | the sample-rate conversion of `Resampler::AudioToolbox` (the default converts in `media::resample`, no framework) |
 | `AVURLAsset`, `AVAssetReader`, `AVAssetReaderTrackOutput`, `AVAssetTrack` (`loadTracksWithMediaType:completionHandler:`, `preferredTransform`, `nominalFrameRate`), `CMSampleBuffer*`, `CVPixelBuffer*` | AVFoundation, CoreMedia, CoreVideo | video |
-| `VTDecompressionSessionCreate`, `VTDecompressionSessionDecodeFrameWithOutputHandler`, `VTDecompressionSessionWaitForAsynchronousFrames`, `VTDecompressionSessionInvalidate`, `CVBufferCopyAttachment` (clean aperture) | VideoToolbox `VTDecompressionSession.h`, CoreVideo | the 8-bit 4:2:0 video decode (`src/media/vt.rs`) |
+| `VTDecompressionSessionCreate`, `VTDecompressionSessionDecodeFrameWithOutputHandler`, `VTDecompressionSessionWaitForAsynchronousFrames`, `VTDecompressionSessionInvalidate`, `CVBufferCopyAttachment` (clean aperture) | VideoToolbox `VTDecompressionSession.h`, CoreVideo | the video decode into the decoder's own planes, 8 and 10 bit, 4:2:0, 4:2:2 and 4:4:4 (`src/media/vt.rs`) |
 | `CFData*`, `CFURLCreateFromFileSystemRepresentation`, `CFDictionaryGetValue`, `CFNumberGetValue`, `CFRelease` | CoreFoundation | held by `cf::CfRef`, released on every path |
 
 ### What the reference decodes, and what this follows
@@ -3506,9 +3507,9 @@ never silently ("pixel data is shorter than its size", "no frame could be decode
 running the tests under the job's profile). So `tests/media_decode.rs` (21 tests: every image
 and audio format, the cut-file and bad-input refusals for all three kinds, no codec hardware)
 and `tests/media_leaks.rs`, `tests/media_resample.rs` (17 tests: the converter against the `ffmpeg`
-binary, AAC, MP3 and Opus; no device), `tests/media_jpeg.rs` (11 tests; the native JPEG decoder
+binary, AAC, MP3 and Opus; no device), `tests/media_jpeg.rs` (12 tests; the native JPEG decoder
 needs no framework, so it runs in the sandbox) and `tests/plot_results_resample.rs` are on
-`scripts/hosted_tests.txt` together with the 14 unit tests of `media::`; `tests/media_codecs.rs`
+`scripts/hosted_tests.txt` together with the 18 unit tests of `media::`; `tests/media_codecs.rs`
 (HEIC, H.264, HEVC: 8 tests), `tests/media_codecs_leaks.rs` and `tests/media_video_exact.rs`
 (13 tests) are local-only (`cargo test --release --test media_codecs`) and fail in the sandbox by
 construction, which is what `hosted_completeness` needs (a test that passes there must be

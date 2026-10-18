@@ -1288,8 +1288,9 @@ class EmbedGemma2(_Owned):
 
     def embed_audio_files(self, paths, truncate_dim=None):
         """Embed audio files, one row each: every file is decoded by AudioToolbox
-        (WAV, FLAC, MP3, AAC, M4A, Opus, ...), mixed to mono as the channel mean,
-        resampled to the extractor's 16 kHz, cut to its 30 s and run through
+        (WAV, FLAC, MP3, AAC, M4A, Opus, ...) at its own rate, mixed to mono and
+        resampled to the extractor's 16 kHz as torchcodec does (libswresample's
+        channel matrix and resampler, reproduced in Rust), cut to its 30 s and run through
         :meth:`embed_audio`'s feature extraction and tower, in one call with one
         GPU wait. ``paths`` is a path or a list of paths. Limits as
         :meth:`embed_image_files` (a file at most 2**32 bytes). Needs

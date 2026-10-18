@@ -288,8 +288,9 @@ func (m *Model) EmbedImageBytes(ctx context.Context, data [][]byte, truncateDim 
 }
 
 // EmbedAudioFiles embeds audio files into len(paths) rows: AudioToolbox
-// decodes them (WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, ...), mixes to mono by the
-// mean of the channels and resamples to the extractor's 16 kHz, then the path
+// decodes them (WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, ...) at their own rate, and
+// tessl mixes to mono and resamples to the extractor's 16 kHz as torchcodec
+// does (libswresample's channel matrix and resampler), then the path
 // is EmbedAudio's. A clip longer than 30 minutes is refused by the decoder.
 func (m *Model) EmbedAudioFiles(ctx context.Context, paths []string, truncateDim int) ([][]float32, error) {
 	const op = "EmbedAudioFiles"

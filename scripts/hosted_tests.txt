@@ -113,7 +113,7 @@ lib npy::accessor_tests:: 1
 lib parser_mutation:: 16
 lib qwen35::tests:: 6
 lib qwen35_adamw::step_kernel_tests:: 2
-lib qwen35_train::tests:: 1
+exact lib qwen35_train::tests::reference_dir_honours_the_variable_and_names_it_when_missing
 lib runtime::drop_wait_tests:: 1
 lib runtime::timestamp_decode_tests:: 2
 lib safetensors::tests:: 1

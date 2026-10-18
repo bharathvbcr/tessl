@@ -138,3 +138,245 @@ fn the_single_sequence_step_is_bit_identical_to_its_pin() {
     assert_eq!(c, GOLDEN_CAUSAL, "train_step moved");
     assert_eq!(r, GOLDEN_ROWS, "train_step_into(Rows) moved");
 }
+
+/// Sequence `k` of `len` tokens: ids below the vocabulary of 64, distinct
+/// enough between sequences that a leak would show.
+fn seq(k: u32, len: usize) -> Vec<u32> {
+    (0..len as u32).map(|i| (i * (5 + 2 * k) + 11 * k + 1) % 64).collect()
+}
+
+fn pack(seqs: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
+    let mut ids = Vec::new();
+    let mut cu = vec![0u32];
+    for s in seqs {
+        ids.extend_from_slice(s);
+        cu.push(ids.len() as u32);
+    }
+    (ids, cu)
+}
+
+fn bank_floats(g: &Qwen35Grads) -> Vec<Vec<f64>> {
+    all_bits(g)
+        .into_iter()
+        .map(|v| v.into_iter().map(|b| f64::from(f32::from_bits(b))).collect())
+        .collect()
+}
+
+/// Largest `|got - want|` over `want`'s largest magnitude, per buffer, worst.
+fn worst_rel(got: &Qwen35Grads, want: &Qwen35Grads) -> f64 {
+    bank_floats(got)
+        .iter()
+        .zip(bank_floats(want))
+        .map(|(g, w)| {
+            let peak = w.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
+            g.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / peak
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Bound on a gradient element's difference between the packed step and the
+/// sum of the single-sequence steps, relative to the tensor's peak. Both sum
+/// the same products; the packed step's weight-gradient GEMMs reduce over all
+/// T rows in one pass where the references reduce over each sequence's rows
+/// and add the partial sums (and the f32 reductions run in tiles of another
+/// shape). Each result differs by at most about `(T + S) * 2^-24` of the sum
+/// of the absolute terms; with T = 27, S = 3 that is 1.8e-6 of the terms, and
+/// the terms of a gradient with cancellation can exceed its peak by a factor
+/// of a few, so the bound is 1e-5 of the peak (as `supervised_rows_are_the_
+/// causal_loss_restricted` bounds a sum in another order).
+const GRAD_BOUND: f64 = 1e-5;
+/// A sequence's mean loss, packed against alone: the same rows through the
+/// same kernels (the GEMMs differ only in row count), summed in f64.
+const LOSS_BOUND: f64 = 1e-6;
+
+/// The references: every sequence alone as B = 1 (`Supervise::Rows` with
+/// the batch's `1 / predictions` scale, accumulated in a bank) and its own
+/// `train_step` loss.
+fn singles(model: &Qwen35Model, seqs: &[Vec<u32>]) -> (Qwen35Grads, Vec<f64>) {
+    let n: usize = seqs.iter().map(|s| s.len() - 1).sum();
+    let bank = Qwen35Grads::zeros_like(model).unwrap();
+    let mut losses = Vec::new();
+    for (k, s) in seqs.iter().enumerate() {
+        let pos: Vec<u32> = (0..s.len() as u32 - 1).collect();
+        let targets: Vec<u32> = s[1..].to_vec();
+        model
+            .train_step_into(
+                s,
+                GemmOperands::ExactF32,
+                Supervise::Rows {
+                    positions: &pos,
+                    targets: &targets,
+                    scale: 1.0 / n as f32,
+                },
+                &bank,
+                k > 0,
+            )
+            .unwrap();
+        losses.push(model.train_step(s, GemmOperands::ExactF32).unwrap().loss);
+    }
+    (bank, losses)
+}
+
+#[test]
+fn a_ragged_batch_is_each_sequence_alone() {
+    let model = load();
+    // Lengths off the kernels' 32-row tiles and the GDN chunking, one of
+    // them 2 (a single prediction).
+    let seqs = [seq(0, 9), seq(1, 2), seq(2, 13), seq(3, 5)];
+    let (ids, cu) = pack(&seqs);
+    let (want, alone) = singles(&model, &seqs);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let got = model
+        .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, false)
+        .unwrap();
+    let n: usize = seqs.iter().map(|s| s.len() - 1).sum();
+    let mean: f64 = seqs
+        .iter()
+        .zip(&alone)
+        .map(|(s, l)| l * (s.len() - 1) as f64)
+        .sum::<f64>()
+        / n as f64;
+    eprintln!("per-sequence {:?} against alone {alone:?}", got.per_sequence);
+    for (k, (g, a)) in got.per_sequence.iter().zip(&alone).enumerate() {
+        assert!(
+            (g - a).abs() <= LOSS_BOUND * a.abs(),
+            "sequence {k}: {g} against {a} alone"
+        );
+    }
+    assert!(
+        (got.loss - mean).abs() <= LOSS_BOUND * mean.abs(),
+        "{} against {mean}",
+        got.loss
+    );
+    let rel = worst_rel(&bank, &want);
+    eprintln!("worst gradient rel {rel:.3e}");
+    assert!(
+        rel <= GRAD_BOUND,
+        "gradients are {rel:.3e} of their peak from the singles' sum"
+    );
+    assert!(bank_floats(&bank).iter().flatten().any(|&x| x != 0.0));
+}
+
+#[test]
+fn no_token_reads_another_sequence() {
+    let model = load();
+    let (a, b, c) = (seq(0, 9), seq(1, 7), seq(2, 11));
+    // The middle sequence changes; the neighbours' losses must not move by
+    // one bit (a leaked state, window or attended key would move them).
+    let b2: Vec<u32> = b.iter().map(|&t| (t + 17) % 64).collect();
+    let run = |mid: &[u32]| {
+        let (ids, cu) = pack(&[a.clone(), mid.to_vec(), c.clone()]);
+        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        model
+            .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, false)
+            .unwrap()
+            .per_sequence
+    };
+    let (x, y) = (run(&b), run(&b2));
+    assert_ne!(x[1].to_bits(), y[1].to_bits(), "the changed sequence did not change");
+    assert_eq!(x[0].to_bits(), y[0].to_bits(), "sequence 0 saw the sequence after it");
+    assert_eq!(x[2].to_bits(), y[2].to_bits(), "sequence 2 saw the sequence before it");
+}
+
+#[test]
+fn a_single_sequence_ragged_step_is_the_row_scored_step() {
+    let model = load();
+    let s = seq(4, 12);
+    let (ids, cu) = pack(std::slice::from_ref(&s));
+    let (want, alone) = singles(&model, std::slice::from_ref(&s));
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let got = model
+        .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, false)
+        .unwrap();
+    assert!((got.loss - alone[0]).abs() <= LOSS_BOUND * alone[0].abs());
+    // One sequence: the same kernels on the same shapes, the same bits.
+    assert_eq!(
+        all_bits(&bank),
+        all_bits(&want),
+        "one packed sequence is not the B = 1 step"
+    );
+}
+
+#[test]
+fn a_ragged_step_accumulates_into_a_bank() {
+    let model = load();
+    let seqs = [seq(0, 6), seq(1, 8)];
+    let (ids, cu) = pack(&seqs);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    model
+        .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, false)
+        .unwrap();
+    let once = bank_floats(&bank);
+    model
+        .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, true)
+        .unwrap();
+    let twice = bank_floats(&bank);
+    let mut worst = 0.0f64;
+    for (o, t) in once.iter().zip(&twice) {
+        let peak = o.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
+        for (a, b) in o.iter().zip(t) {
+            worst = worst.max((2.0 * a - b).abs() / peak);
+        }
+    }
+    assert!(
+        worst <= GRAD_BOUND,
+        "accumulating the same step twice is {worst:.3e} from double"
+    );
+}
+
+#[test]
+fn adversarial_cu_seqlens_are_refused_before_any_gpu_work() {
+    use tessl::qwen35_train::check_cu_seqlens;
+    let ok = check_cu_seqlens(&[0, 3, 7], 7).unwrap();
+    assert_eq!(ok, vec![0..3, 3..7]);
+    let bad: &[(&[u32], usize, &str)] = &[
+        (&[], 5, "at least 2"),
+        (&[0], 0, "at least 2"),
+        (&[1, 5], 5, "starts at 1"),
+        (&[0, 4, 3, 7], 7, "decreases"),
+        (&[0, 3, 3, 7], 7, "is empty"),
+        (&[0, 3, 6], 7, "ends at 6"),
+        (&[0, 3, 9], 7, "ends at 9"),
+        (&[0, 1, 7], 7, "one token"),
+        (&[0, u32::MAX], u32::MAX as usize + 1, "overflow u32"),
+        (&[0, 3, 5], u32::MAX as usize + 5, "overflow u32"),
+    ];
+    for (cu, total, needle) in bad {
+        let e = check_cu_seqlens(cu, *total).expect_err(needle);
+        assert!(e.contains(needle), "{cu:?}: {e:?} lacks {needle:?}");
+    }
+
+    // Through the model: refused, and the bank is as it was (zero).
+    let model = load();
+    let ids = seq(0, 7);
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    for (cu, needle) in [
+        (vec![], "at least 2"),
+        (vec![0, 4, 3, 7], "decreases"),
+        (vec![0, 3, 3, 7], "is empty"),
+        (vec![1, 7], "starts at 1"),
+        (vec![0, 6], "ends at 6"),
+    ] {
+        let e = model
+            .train_step_ragged_into(&ids, &cu, GemmOperands::ExactF32, &bank, true)
+            .expect_err(needle);
+        assert!(e.contains(needle), "{e:?} lacks {needle:?}");
+    }
+    // A token past the vocabulary, and a bank of another shape.
+    let (mut oob, cu) = pack(&[seq(0, 5), seq(1, 4)]);
+    oob[6] = 64;
+    let e = model
+        .train_step_ragged_into(&oob, &cu, GemmOperands::ExactF32, &bank, true)
+        .unwrap_err();
+    assert!(e.contains("token id 64"), "{e:?}");
+    let mut short = Qwen35Grads::zeros_like(&model).unwrap();
+    short.layers.pop();
+    let e = model
+        .train_step_ragged_into(&ids, &[0, 7], GemmOperands::ExactF32, &short, true)
+        .unwrap_err();
+    assert!(e.contains("layers, the model"), "{e:?}");
+    assert!(
+        bank_floats(&bank).iter().flatten().all(|&x| x == 0.0),
+        "a refused step wrote into the bank"
+    );
+}

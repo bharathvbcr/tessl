@@ -46,16 +46,15 @@ impl Decoder<'_> {
 
     /// Inverse-transform every component of a coefficient store to a plane.
     fn transform_coefficients(&mut self, mut coefs: Vec<Vec<i16>>) -> R<Vec<Vec<u8>>> {
-        if self.smoothing_ok() {
-            return Err(JpegError::Unsupported(
-                "progressive JPEG that ends before AC coefficients 1 to 5 are complete: the reference smooths it \
-                 from neighbouring DC values (block smoothing), which this decoder does not reproduce"
-                    .into(),
-            ));
-        }
+        let latch = self.smoothing_latch();
         let mut planes = Vec::with_capacity(self.comps.len());
         for (ci, c) in self.comps.iter().enumerate() {
-            let stride = c.blocks_w * 8;
+            if let Some(latch) = latch.as_ref() {
+                planes.push(self.transform_smoothed(ci, &coefs[ci], latch));
+                coefs[ci] = Vec::new();
+                continue;
+            }
+            let stride = c.blocks_w * self.unit;
             let mut plane = vec![128u8; stride * c.blocks_h * 8];
             if let Some(quant) = c.quant.as_ref() {
                 for by in 0..c.height_in_blocks {
@@ -77,18 +76,21 @@ impl Decoder<'_> {
         let c = &self.comps[ci];
         let (h_in, v_in) = (c.h, c.v);
         let (h_out, v_out) = (self.max_h, self.max_v);
+        // jinit_upsampler: `do_fancy = do_fancy_upsampling && min_DCT_scaled_size > 1`, and
+        // a lossless frame has no DCT (scaled size 1), so it only replicates.
+        let fancy = !self.lossless;
         Ok(if h_in == h_out && v_in == v_out {
             Upsample::Full
         } else if h_in * 2 == h_out && v_in == v_out {
-            if c.downsampled_width > 2 {
+            if fancy && c.downsampled_width > 2 {
                 Upsample::H2V1Fancy
             } else {
                 Upsample::H2V1
             }
-        } else if h_in == h_out && v_in * 2 == v_out {
+        } else if h_in == h_out && v_in * 2 == v_out && fancy {
             Upsample::H1V2Fancy
         } else if h_in * 2 == h_out && v_in * 2 == v_out {
-            if c.downsampled_width > 2 {
+            if fancy && c.downsampled_width > 2 {
                 Upsample::H2V2Fancy
             } else {
                 Upsample::H2V2
@@ -114,7 +116,7 @@ impl Decoder<'_> {
         for y in 0..h {
             for ci in 0..n {
                 let c = &self.comps[ci];
-                let stride = c.blocks_w * 8;
+                let stride = c.blocks_w * self.unit;
                 self.upsample_row(methods[ci], ci, &planes[ci], stride, y, &mut rows[ci], &mut tmp, w);
             }
             let out = &mut rgb[y * w * 3..(y + 1) * w * 3];

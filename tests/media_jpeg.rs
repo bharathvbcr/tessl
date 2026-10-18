@@ -5,9 +5,9 @@
 //! `tests/fixtures/jpeg/` is written by `scripts/gen_jpeg_fixtures.py` (see its
 //! docstring): `NAME.jpg` is an input, `NAME.jpg.rgb` the oracle's decoded bytes,
 //! `manifest.txt` says per case whether the oracle decodes it (`expect=ok`) or
-//! refuses it (`expect=error`), and whether this decoder is expected to match
-//! (`tessl=equal`) or to refuse by name a stream the oracle does decode
-//! (`tessl=refused`: lossless SOF3 and libjpeg-turbo's block smoothing).
+//! refuses it (`expect=error`); this decoder must do the same, and byte for byte
+//! (lossless SOF3 and libjpeg-turbo's block smoothing of progressive files that
+//! stop early included).
 //! `fuzz_corpus.bin` holds mutated inputs with the oracle's verdict and pixels.
 //!
 //! Three kinds of test: byte-for-byte equality wherever the oracle decodes;
@@ -39,7 +39,6 @@ fn read(name: &str) -> Vec<u8> {
 struct Case {
     name: String,
     ok: bool,
-    refused: bool,
     class: String,
     w: usize,
     h: usize,
@@ -58,7 +57,6 @@ fn cases() -> Vec<Case> {
             Case {
                 name,
                 ok: kv["expect"] == "ok",
-                refused: kv.get("tessl") == Some(&"refused"),
                 class: kv["class"].to_string(),
                 w: num("w"),
                 h: num("h"),
@@ -67,6 +65,11 @@ fn cases() -> Vec<Case> {
         })
         .collect()
 }
+
+/// Fixtures the oracle decodes and this decoder refuses by name, the one shape it does not reproduce: a lossless frame in
+/// several scans with a restart interval and components of different sizes (the reference counts restart rows over
+/// the last scan's MCU rows).
+const OPEN_CASES: [&str; 1] = ["lossless_rst_sub_noninterleaved"];
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<(usize, u8, u8)> {
     a.iter().zip(b).position(|(x, y)| x != y).map(|i| (i, a[i], b[i]))
@@ -144,10 +147,35 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         // the IDCT's extremes
         "idct_dense32767_q255",
         "idct_q65535",
+        // block smoothing: real encoders cut after k scans, synthetic progression states, corrupt scans
+        "smoothing_gray_1scans",
+        "smoothing_420_4scans",
+        "smoothing_s440_5scans",
+        "smoothing_dc_4x7_q40_17",
+        "smoothing_impulse_d5_q64_4",
+        "smoothing_only_zz4",
+        "smoothing_state_ac1to5_al3",
+        "smoothing_arith_420_3scans",
+        "smoothing_gray_mid1_1",
+        "smoothing_420_mid2_1",
+        "smoothing_size_32x32_420_1scans",
+        "smoothing_tall_v3_33x47_2scans",
+        "smoothing_vrows2_04_dc",
+        "smoothing_vrows4_08_ac9",
+        // lossless: every predictor, the point transform, restarts, subsampling, cjpeg's own encoder
+        "lossless_rgb_psv1",
+        "lossless_rgb_psv7",
+        "lossless_pt4_psv4",
+        "lossless_rst6_6x12_psv4",
+        "lossless_rgb_noninterleaved_psv3",
+        "lossless_wild_diffs_psv4",
+        "lossless_huge_diffs_psv7",
+        "lossless_cjpeg_psv1",
+        "lossless_cjpeg_psv7",
     ] {
         assert!(has(n), "fixture {n} is missing from manifest.txt");
     }
-    let count = |class: &str| cases.iter().filter(|c| c.class == class && c.ok && !c.refused).count();
+    let count = |class: &str| cases.iter().filter(|c| c.class == class && c.ok).count();
     for (class, at_least) in [
         ("subsampling", 5),
         ("progressive", 4),
@@ -161,6 +189,8 @@ fn the_fixture_grid_covers_every_class_the_decoder_claims() {
         ("idct", 5),
         ("markers", 6),
         ("layout", 6),
+        ("smoothing", 560),
+        ("lossless", 145),
     ] {
         assert!(
             count(class) >= at_least,
@@ -180,8 +210,20 @@ fn fixtures_equal_the_oracle_byte_for_byte() {
         let got = jpeg::decode(&input, 1 << 28);
         let entry = per_class.entry(c.class.clone()).or_default();
         entry.1 += 1;
-        match (c.ok, c.refused, got) {
-            (true, false, Ok(img)) => {
+        if OPEN_CASES.contains(&c.name.as_str()) {
+            // The reference decodes it; this decoder says by name that it does not reproduce how.
+            match got {
+                Err(JpegError::Unsupported(msg)) if msg.contains("restart interval") => entry.0 += 1,
+                other => failures.push(format!(
+                    "{}: expected the named refusal, got {:?}",
+                    c.name,
+                    other.map(|i| i.width)
+                )),
+            }
+            continue;
+        }
+        match (c.ok, got) {
+            (true, Ok(img)) => {
                 let golden = read(&format!("{}.jpg.rgb", c.name));
                 if (img.width, img.height) != (c.w, c.h) {
                     failures.push(format!(
@@ -199,29 +241,9 @@ fn fixtures_equal_the_oracle_byte_for_byte() {
                     entry.0 += 1;
                 }
             }
-            (true, false, Err(e)) => failures.push(format!("{}: the oracle decodes it, this does not: {e}", c.name)),
-            (true, true, Err(JpegError::Unsupported(msg))) => {
-                let named = match c.class.as_str() {
-                    "smoothing" => msg.contains("block smoothing"),
-                    "lossless" => msg.contains("lossless"),
-                    _ => false,
-                };
-                if named {
-                    entry.0 += 1;
-                } else {
-                    failures.push(format!(
-                        "{}: refused, but not by the name its class promises: {msg}",
-                        c.name
-                    ));
-                }
-            }
-            (true, true, other) => failures.push(format!(
-                "{}: expected a named refusal, got {:?}",
-                c.name,
-                other.map(|i| i.width)
-            )),
-            (false, _, Err(_)) => entry.0 += 1,
-            (false, _, Ok(img)) => failures.push(format!(
+            (true, Err(e)) => failures.push(format!("{}: the oracle decodes it, this does not: {e}", c.name)),
+            (false, Err(_)) => entry.0 += 1,
+            (false, Ok(img)) => failures.push(format!(
                 "{}: the oracle refuses it, this decodes {}x{}",
                 c.name, img.width, img.height
             )),
@@ -283,6 +305,18 @@ fn the_decoder_reports_what_the_file_said() {
     );
     let i = get("rgb3_ids_RGB");
     assert_eq!(i.color_space, JpegColorSpace::Rgb);
+    let i = get("lossless_cjpeg_psv1");
+    assert_eq!(
+        (i.components, i.coding, i.color_space, i.adobe_transform, i.scans),
+        (3, JpegCoding::Lossless, JpegColorSpace::Rgb, Some(0), 1)
+    );
+    let i = get("lossless_sub_h2v2_noninterleaved");
+    assert_eq!(
+        (i.coding, i.sampling, i.scans),
+        (JpegCoding::Lossless, vec![(2, 2), (1, 1), (1, 1)], 3)
+    );
+    let i = get("smoothing_s420_3scans");
+    assert_eq!((i.coding, i.scans), (JpegCoding::Progressive, 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -333,13 +367,10 @@ fn corpus() -> Vec<Entry> {
 #[test]
 fn the_fuzz_corpus_equals_the_oracle_wherever_it_decodes() {
     let entries = corpus();
-    let (mut equal, mut refused_both, mut named, mut failures) = (0usize, 0usize, 0usize, Vec::new());
+    let (mut equal, mut refused_both, mut failures) = (0usize, 0usize, Vec::new());
     for (i, e) in entries.iter().enumerate() {
         let got = jpeg::decode(&e.data, FUZZ_MAX_PIXELS);
         match (&e.pixels, got) {
-            // A mutant that cuts a progressive file short enough for libjpeg-turbo to smooth it:
-            // the one documented case where the oracle decodes and this decoder says why it won't.
-            (Some(_), Err(JpegError::Unsupported(msg))) if msg.contains("block smoothing") => named += 1,
             (Some((w, h, rgb)), Ok(img)) => {
                 if (img.width, img.height) == (*w, *h) && img.rgb == *rgb {
                     equal += 1;
@@ -358,14 +389,10 @@ fn the_fuzz_corpus_equals_the_oracle_wherever_it_decodes() {
         }
     }
     println!(
-        "fuzz corpus: {} entries, {equal} byte-equal, {refused_both} refused by both, {named} refused by name (block smoothing)",
+        "fuzz corpus: {} entries, {equal} byte-equal, {refused_both} refused by both",
         entries.len()
     );
     assert!(entries.len() >= 400, "{} entries", entries.len());
-    assert!(
-        named <= 5,
-        "{named} mutants hit the block-smoothing refusal: the corpus stopped testing equality"
-    );
     assert!(
         equal >= 250 && refused_both >= 100,
         "{equal} equal, {refused_both} refused: the corpus lost its balance"
@@ -434,7 +461,7 @@ fn mutate(rng: &mut Rng, base: &[u8]) -> Vec<u8> {
 fn mutation_bases() -> Vec<(String, Vec<u8>)> {
     cases()
         .into_iter()
-        .filter(|c| c.ok && !c.refused)
+        .filter(|c| c.ok)
         .map(|c| (c.name.clone(), read(&format!("{}.jpg", c.name))))
         .filter(|(_, b)| b.len() < 12_000)
         .collect()
@@ -478,6 +505,13 @@ fn every_strict_prefix_of_a_valid_file_is_an_error() {
         "cmyk4_adobe_2",
         "gray_baseline",
         "size_1x1_420",
+        // the smoothed and the lossless paths
+        "smoothing_s420_3scans",
+        "smoothing_dc_4x7_q40_17",
+        "smoothing_arith_gray_2scans",
+        "lossless_rgb_psv4",
+        "lossless_rgb_psv6",
+        "lossless_rst6_6x12_psv4",
     ] {
         let full = read(&format!("{name}.jpg"));
         assert!(jpeg::decode(&full, 1 << 28).is_ok(), "{name}");
@@ -553,6 +587,35 @@ fn an_oversized_image_is_refused_from_the_header_before_anything_is_allocated() 
 }
 
 #[test]
+fn an_oversized_lossless_image_is_bounded_like_any_other() {
+    let base = read("lossless_size_1x1.jpg");
+    let at = base.windows(2).position(|w| w == [0xFF, 0xC3]).expect("SOF3") + 5;
+    let with_dims = |h: u16, w: u16| {
+        let mut b = base.clone();
+        b[at..at + 2].copy_from_slice(&h.to_be_bytes());
+        b[at + 2..at + 4].copy_from_slice(&w.to_be_bytes());
+        b
+    };
+    assert!(matches!(
+        jpeg::decode(&with_dims(4096, 4096), 1 << 20),
+        Err(JpegError::Limit(_))
+    ));
+    let t = std::time::Instant::now();
+    assert!(matches!(
+        jpeg::decode(&with_dims(65500, 65500), usize::MAX),
+        Err(JpegError::Limit(_))
+    ));
+    assert!(t.elapsed().as_secs() < 5, "refusal took {:?}", t.elapsed());
+    assert!(matches!(
+        jpeg::decode(&with_dims(65501, 1), usize::MAX),
+        Err(JpegError::Invalid(_))
+    ));
+    // The data ends at the EOI long before the picture does: the rest is zero differences.
+    let r = jpeg::decode(&with_dims(2000, 3000), 1 << 26).expect("a marker ends the data; the rest is predicted");
+    assert_eq!((r.width, r.height, r.rgb.len()), (3000, 2000, 3000 * 2000 * 3));
+}
+
+#[test]
 fn the_scan_count_is_bounded() {
     // Three non-interleaved scans, then the last one repeated: libjpeg takes any
     // number of them, this decoder stops at MAX_SCANS with a named limit.
@@ -594,7 +657,7 @@ fn live_fuzz_against_the_oracle() {
         .collect();
     names.sort();
     assert!(!names.is_empty(), "no mutants in {}", d.display());
-    let (mut equal, mut refused, mut named, mut bad) = (0usize, 0usize, 0usize, Vec::new());
+    let (mut equal, mut refused, mut bad) = (0usize, 0usize, Vec::new());
     for n in &names {
         let stem = n.trim_end_matches(".jpg");
         let data = std::fs::read(d.join(n)).unwrap();
@@ -605,7 +668,6 @@ fn live_fuzz_against_the_oracle() {
             match got {
                 Ok(img) if img.rgb == want => equal += 1,
                 Ok(img) => bad.push(format!("{n}: decodes {}x{} to different bytes", img.width, img.height)),
-                Err(JpegError::Unsupported(msg)) if msg.contains("block smoothing") => named += 1,
                 Err(e) => bad.push(format!("{n}: the oracle decodes it, this fails: {e}")),
             }
         } else if got.is_err() {
@@ -614,6 +676,10 @@ fn live_fuzz_against_the_oracle() {
             bad.push(format!("{n}: the oracle refuses it, this decodes"));
         }
     }
-    println!("{} mutants: {equal} byte-equal, {refused} refused by both, {named} refused by name (block smoothing), {} disagree", names.len(), bad.len());
+    println!(
+        "{} mutants: {equal} byte-equal, {refused} refused by both, {} disagree",
+        names.len(),
+        bad.len()
+    );
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

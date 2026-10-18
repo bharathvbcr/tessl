@@ -28,8 +28,9 @@ pub(crate) const HUFF_LOOKAHEAD: i32 = 8;
 pub(crate) const MIN_GET_BITS: i32 = 57;
 
 impl Derived {
-    /// `jpeg_make_d_derived_tbl`. `is_dc` tables may only name symbols 0..=15.
-    pub fn build(spec: &HuffSpec, is_dc: bool, tblno: usize) -> R<Derived> {
+    /// `jpeg_make_d_derived_tbl`. `is_dc` tables may only name symbols 0..=15
+    /// (0..=16 in a lossless frame, whose categories reach 16).
+    pub fn build(spec: &HuffSpec, is_dc: bool, tblno: usize, lossless: bool) -> R<Derived> {
         let mut huffsize = [0u8; 257];
         let mut p = 0usize;
         for l in 1..=16usize {
@@ -91,7 +92,7 @@ impl Derived {
         }
         if is_dc {
             for &sym in &spec.vals[..numsymbols] {
-                if sym > 15 {
+                if sym > if lossless { 16 } else { 15 } {
                     return invalid(format!(
                         "DC Huffman table {tblno} names symbol {sym} (JERR_BAD_HUFF_TABLE)"
                     ));

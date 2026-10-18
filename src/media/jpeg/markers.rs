@@ -94,7 +94,7 @@ impl Decoder<'_> {
                 M_SOF2 => self.get_sof(JpegCoding::Progressive, false)?,
                 M_SOF9 => self.get_sof(JpegCoding::SequentialArithmetic, false)?,
                 M_SOF10 => self.get_sof(JpegCoding::ProgressiveArithmetic, false)?,
-                M_SOF3 => self.get_sof(JpegCoding::Sequential, true)?,
+                M_SOF3 => self.get_sof(JpegCoding::Lossless, true)?,
                 0xC5..=0xC8 | 0xCB | 0xCD..=0xCF => {
                     let m = self.inp.unread_marker;
                     return Err(JpegError::Unsupported(format!(
@@ -388,12 +388,17 @@ impl Decoder<'_> {
             return invalid(format!("image larger than {MAX_DIMENSION} pixels (JERR_IMAGE_TOO_BIG)"));
         }
         if self.lossless {
-            return Err(JpegError::Unsupported(
-                "lossless JPEG (SOF3): the reference decodes it, this decoder does not".into(),
-            ));
+            // libjpeg-turbo 3.x takes 2 to 16 bits; the reference reads through the 8-bit API.
+            if !(2..=16).contains(&self.precision) {
+                return invalid(format!("sample precision {} (JERR_BAD_PRECISION)", self.precision));
+            }
+            if !super::lossless::precision_supported(self.precision) {
+                return Err(super::lossless::unsupported_precision(self.precision));
+            }
         }
         match self.precision {
             8 => {}
+            _ if self.lossless => {}
             12 => {
                 return Err(JpegError::Unsupported(
                     "12-bit JPEG: the reference's 8-bit decode path refuses it (JERR_BAD_PRECISION)".into(),
@@ -421,20 +426,28 @@ impl Decoder<'_> {
         }
         let (w, h) = (self.width as usize, self.height as usize);
         let (mh, mv) = (self.max_h, self.max_v);
+        // A lossless "data unit" is one sample, not an 8x8 block.
+        let unit = if self.lossless { 1 } else { 8 };
+        self.unit = unit;
         for c in &mut self.comps {
-            c.width_in_blocks = (w * c.h).div_ceil(mh * 8);
-            c.height_in_blocks = (h * c.v).div_ceil(mv * 8);
+            c.width_in_blocks = (w * c.h).div_ceil(mh * unit);
+            c.height_in_blocks = (h * c.v).div_ceil(mv * unit);
             c.downsampled_width = (w * c.h).div_ceil(mh);
             c.downsampled_height = (h * c.v).div_ceil(mv);
         }
-        self.mcus_per_row_full = w.div_ceil(mh * 8);
-        self.mcu_rows_full = h.div_ceil(mv * 8);
+        self.mcus_per_row_full = w.div_ceil(mh * unit);
+        self.mcu_rows_full = h.div_ceil(mv * unit);
         for c in &mut self.comps {
             c.blocks_w = self.mcus_per_row_full * c.h;
             c.blocks_h = self.mcu_rows_full * c.v;
         }
         self.has_multiple_scans = self.scan_comps.len() < n || self.progressive;
+        // A lossless frame never keeps coefficients: its scans write samples directly.
         self.coef_bits = vec![[-1; 64]; n];
+        self.prev_bits = vec![[-1; super::smooth::SAVED_COEFS]; n];
+        self.scanned = vec![false; n];
+        // jinit_master_decompress: no row is bad until a scan says so.
+        self.last_good_imcu_row = self.mcu_rows_full.saturating_sub(1);
         Ok(())
     }
 
@@ -444,7 +457,8 @@ impl Decoder<'_> {
         self.per_scan_setup()?;
         // latch_quant_tables
         for &ci in &self.scan_comps.clone() {
-            if self.comps[ci].quant.is_some() {
+            // A lossless scan has no quantization: the files carry no DQT at all.
+            if self.comps[ci].quant.is_some() || self.lossless {
                 continue;
             }
             let tq = self.comps[ci].tq;

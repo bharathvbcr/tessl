@@ -183,11 +183,7 @@ impl Decoder<'_> {
                     self.ss, self.se, self.ah, self.al
                 ));
             }
-            for &ci in &self.scan_comps {
-                for b in &mut self.coef_bits[ci][self.ss..=self.se] {
-                    *b = self.al as i32;
-                }
-            }
+            self.record_progression();
         }
         self.arith_reset_stats();
         self.arith.coder.reset();

@@ -34,14 +34,7 @@ impl Decoder<'_> {
                 self.ss, self.se, self.ah, self.al
             ));
         }
-        // Inter-scan inconsistencies are warnings in libjpeg; the record is still
-        // updated, because block smoothing reads it.
-        for &ci in &self.scan_comps {
-            let bits = &mut self.coef_bits[ci];
-            for b in &mut bits[self.ss..=self.se] {
-                *b = self.al as i32;
-            }
-        }
+        self.record_progression();
         for k in 0..self.scan_comps.len() {
             let (dc, ac) = {
                 let c = &self.comps[self.scan_comps[k]];
@@ -56,6 +49,26 @@ impl Decoder<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The progression bookkeeping of `start_pass` (Huffman and arithmetic alike).
+    /// Inter-scan inconsistencies are warnings in libjpeg; the record is still
+    /// updated, because block smoothing reads it. Before a scan overwrites
+    /// `coef_bits`, the old values of zigzag positions `min(Ss, 1)..=max(Se, 9)`
+    /// are kept (`0` for the first scan) as the record of the earlier state.
+    pub(crate) fn record_progression(&mut self) {
+        let lo = self.ss.min(1);
+        // max(Se, 9) is at least 9, the last position kept.
+        let hi = super::smooth::SAVED_COEFS - 1;
+        let first_scan = self.input_scan_number <= 1;
+        for &ci in &self.scan_comps {
+            for k in lo..=hi {
+                self.prev_bits[ci][k] = if first_scan { 0 } else { self.coef_bits[ci][k] };
+            }
+            for b in &mut self.coef_bits[ci][self.ss..=self.se] {
+                *b = self.al as i32;
+            }
+        }
     }
 
     fn restart_if_due(&mut self) -> R<()> {

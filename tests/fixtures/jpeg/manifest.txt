@@ -1,164 +1,968 @@
-case sub_444_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
-case sub_444_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
-case sub_422_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
-case sub_422_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
-case sub_420_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
-case sub_420_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
-case sub_411_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
-case sub_411_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
-case sub_440_baseline expect=ok tessl=equal class=subsampling w=47 h=33 pil=equal
-case sub_440_progressive expect=ok tessl=equal class=progressive w=47 h=33 pil=equal
-case samp_2x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_1x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_4x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_1x4_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_4x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x4_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_3x1_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_1x1_2x2_2x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x1_1x2_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x2_2x1_1x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x2_1x1_2x2 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_3x2_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_1x3_1x1_1x1 expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x2_1x1_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_1x1_2x2_2x2_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_4x2_1x1_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case samp_2x1_1x2_1x1_prog expect=ok tessl=equal class=sampling w=33 h=31 pil=equal
-case size_1x1_420 expect=ok tessl=equal class=size w=1 h=1 pil=equal
-case size_1x1_444 expect=ok tessl=equal class=size w=1 h=1 pil=equal
-case size_1x1_prog expect=ok tessl=equal class=size w=1 h=1 pil=equal
-case size_1x1_gray expect=ok tessl=equal class=size w=1 h=1 pil=equal
-case size_1x9_420 expect=ok tessl=equal class=size w=9 h=1 pil=equal
-case size_1x9_444 expect=ok tessl=equal class=size w=9 h=1 pil=equal
-case size_1x9_prog expect=ok tessl=equal class=size w=9 h=1 pil=equal
-case size_1x9_gray expect=ok tessl=equal class=size w=9 h=1 pil=equal
-case size_9x1_420 expect=ok tessl=equal class=size w=1 h=9 pil=equal
-case size_9x1_444 expect=ok tessl=equal class=size w=1 h=9 pil=equal
-case size_9x1_prog expect=ok tessl=equal class=size w=1 h=9 pil=equal
-case size_9x1_gray expect=ok tessl=equal class=size w=1 h=9 pil=equal
-case size_2x2_420 expect=ok tessl=equal class=size w=2 h=2 pil=equal
-case size_2x2_444 expect=ok tessl=equal class=size w=2 h=2 pil=equal
-case size_2x2_prog expect=ok tessl=equal class=size w=2 h=2 pil=equal
-case size_2x2_gray expect=ok tessl=equal class=size w=2 h=2 pil=equal
-case size_3x3_420 expect=ok tessl=equal class=size w=3 h=3 pil=equal
-case size_3x3_444 expect=ok tessl=equal class=size w=3 h=3 pil=equal
-case size_3x3_prog expect=ok tessl=equal class=size w=3 h=3 pil=equal
-case size_3x3_gray expect=ok tessl=equal class=size w=3 h=3 pil=equal
-case size_7x13_420 expect=ok tessl=equal class=size w=13 h=7 pil=equal
-case size_7x13_444 expect=ok tessl=equal class=size w=13 h=7 pil=equal
-case size_7x13_prog expect=ok tessl=equal class=size w=13 h=7 pil=equal
-case size_7x13_gray expect=ok tessl=equal class=size w=13 h=7 pil=equal
-case size_13x7_420 expect=ok tessl=equal class=size w=7 h=13 pil=equal
-case size_13x7_444 expect=ok tessl=equal class=size w=7 h=13 pil=equal
-case size_13x7_prog expect=ok tessl=equal class=size w=7 h=13 pil=equal
-case size_13x7_gray expect=ok tessl=equal class=size w=7 h=13 pil=equal
-case size_8x8_420 expect=ok tessl=equal class=size w=8 h=8 pil=equal
-case size_8x8_444 expect=ok tessl=equal class=size w=8 h=8 pil=equal
-case size_8x8_prog expect=ok tessl=equal class=size w=8 h=8 pil=equal
-case size_8x8_gray expect=ok tessl=equal class=size w=8 h=8 pil=equal
-case size_9x9_420 expect=ok tessl=equal class=size w=9 h=9 pil=equal
-case size_9x9_444 expect=ok tessl=equal class=size w=9 h=9 pil=equal
-case size_9x9_prog expect=ok tessl=equal class=size w=9 h=9 pil=equal
-case size_9x9_gray expect=ok tessl=equal class=size w=9 h=9 pil=equal
-case size_17x15_420 expect=ok tessl=equal class=size w=15 h=17 pil=equal
-case size_17x15_444 expect=ok tessl=equal class=size w=15 h=17 pil=equal
-case size_17x15_prog expect=ok tessl=equal class=size w=15 h=17 pil=equal
-case size_17x15_gray expect=ok tessl=equal class=size w=15 h=17 pil=equal
-case size_65x129_420 expect=ok tessl=equal class=size w=129 h=65 pil=equal
-case size_65x129_444 expect=ok tessl=equal class=size w=129 h=65 pil=equal
-case size_65x129_prog expect=ok tessl=equal class=size w=129 h=65 pil=equal
-case size_65x129_gray expect=ok tessl=equal class=size w=129 h=65 pil=equal
-case size_3x4097_420 expect=ok tessl=equal class=size w=4097 h=3 pil=equal
-case size_3x4097_444 expect=ok tessl=equal class=size w=4097 h=3 pil=equal
-case size_3x4097_prog expect=ok tessl=equal class=size w=4097 h=3 pil=equal
-case size_3x4097_gray expect=ok tessl=equal class=size w=4097 h=3 pil=equal
-case size_4097x3_420 expect=ok tessl=equal class=size w=3 h=4097 pil=equal
-case size_4097x3_444 expect=ok tessl=equal class=size w=3 h=4097 pil=equal
-case size_4097x3_prog expect=ok tessl=equal class=size w=3 h=4097 pil=equal
-case size_4097x3_gray expect=ok tessl=equal class=size w=3 h=4097 pil=equal
-case rst_1_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_2_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_3_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_7_420 expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_rows_cjpeg expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_progressive expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_arith expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case rst_arith_progressive expect=ok tessl=equal class=restart w=47 h=33 pil=equal
-case gray_baseline expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
-case gray_progressive expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
-case gray_arith expect=ok tessl=equal class=grayscale w=47 h=33 pil=equal
-case quality_1_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_5_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_10_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_25_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_50_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_75_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_90_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_95_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_100_420 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case quality_100_444 expect=ok tessl=equal class=quality w=47 h=33 pil=equal
-case optimized_tables expect=ok tessl=equal class=tables w=47 h=33 pil=equal
-case std_tables_only expect=ok tessl=equal class=tables w=47 h=33 pil=equal
-case std_tables_only_gray expect=ok tessl=equal class=tables w=47 h=33 pil=equal
-case sof1_extended expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case arith_sequential_420 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
-case arith_sequential_444 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
-case arith_progressive expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
-case arith_progressive_gray expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
-case arith_422 expect=ok tessl=equal class=arithmetic w=47 h=33 pil=equal
-case cmyk_pil_adobe expect=ok tessl=equal class=colour w=47 h=33 pil=equal
-case cmyk4_adobe_None expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case cmyk4_adobe_0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case cmyk4_adobe_2 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case cmyk4_adobe_3 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_None_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_None_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_0_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_0_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_1_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_1_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_2_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_2_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_9_jfif0 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_adobe_9_jfif1 expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_ids_RGB expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case rgb3_ids_other expect=ok tessl=equal class=colour w=24 h=16 pil=equal
-case ycc_cube_y0 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
-case ycc_cube_y128 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
-case ycc_cube_y255 expect=ok tessl=equal class=colour w=160 h=160 pil=equal
-case ycck_flat expect=ok tessl=equal class=colour w=128 h=128 pil=equal
-case cmyk_flat expect=ok tessl=equal class=colour w=128 h=128 pil=equal
-case noninterleaved_scans expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case dqt_16bit expect=ok tessl=equal class=tables w=24 h=16 pil=equal
-case synth_rst_1 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
-case synth_rst_2 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
-case synth_rst_5 expect=ok tessl=equal class=restart w=24 h=16 pil=equal
-case idct_dense32767_q255 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
-case idct_dense32767_q1 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
-case idct_dense2000_q40 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
-case idct_dense1023_q200 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
-case idct_q65535 expect=ok tessl=equal class=idct w=48 h=40 pil=equal
-case idct_dc_ramp_q16 expect=ok tessl=equal class=idct w=64 h=32 pil=equal
-case marker_com_app_before_sof expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_fill_ff expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_trailing_garbage expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_garbage_before_eoi expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_dnl expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_dri_zero expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case marker_dup_eoi expect=ok tessl=equal class=markers w=47 h=33 pil=equal
-case scan_order_123 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case scan_order_132 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case scan_order_213 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case scan_order_231 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case scan_order_312 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case scan_order_321 expect=ok tessl=equal class=layout w=24 h=16 pil=equal
-case smoothing_gray_1scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
-case smoothing_gray_2scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
-case smoothing_gray_3scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
-case smoothing_420_1scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
-case smoothing_420_4scans expect=ok tessl=refused class=smoothing w=56 h=40 pil=equal
-case lossless_sof3 expect=ok tessl=refused class=lossless w=24 h=16 pil=equal
+case sub_444_baseline expect=ok class=subsampling w=47 h=33 pil=equal
+case sub_444_progressive expect=ok class=progressive w=47 h=33 pil=equal
+case sub_422_baseline expect=ok class=subsampling w=47 h=33 pil=equal
+case sub_422_progressive expect=ok class=progressive w=47 h=33 pil=equal
+case sub_420_baseline expect=ok class=subsampling w=47 h=33 pil=equal
+case sub_420_progressive expect=ok class=progressive w=47 h=33 pil=equal
+case sub_411_baseline expect=ok class=subsampling w=47 h=33 pil=equal
+case sub_411_progressive expect=ok class=progressive w=47 h=33 pil=equal
+case sub_440_baseline expect=ok class=subsampling w=47 h=33 pil=equal
+case sub_440_progressive expect=ok class=progressive w=47 h=33 pil=equal
+case samp_2x1_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_1x2_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_4x1_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_1x4_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_4x2_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x4_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_3x1_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_1x1_2x2_2x2 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x1_1x2_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x2_2x1_1x2 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x2_1x1_2x2 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_3x2_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_1x3_1x1_1x1 expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x2_1x1_1x1_prog expect=ok class=sampling w=33 h=31 pil=equal
+case samp_1x1_2x2_2x2_prog expect=ok class=sampling w=33 h=31 pil=equal
+case samp_4x2_1x1_1x1_prog expect=ok class=sampling w=33 h=31 pil=equal
+case samp_2x1_1x2_1x1_prog expect=ok class=sampling w=33 h=31 pil=equal
+case size_1x1_420 expect=ok class=size w=1 h=1 pil=equal
+case size_1x1_444 expect=ok class=size w=1 h=1 pil=equal
+case size_1x1_prog expect=ok class=size w=1 h=1 pil=equal
+case size_1x1_gray expect=ok class=size w=1 h=1 pil=equal
+case size_1x9_420 expect=ok class=size w=9 h=1 pil=equal
+case size_1x9_444 expect=ok class=size w=9 h=1 pil=equal
+case size_1x9_prog expect=ok class=size w=9 h=1 pil=equal
+case size_1x9_gray expect=ok class=size w=9 h=1 pil=equal
+case size_9x1_420 expect=ok class=size w=1 h=9 pil=equal
+case size_9x1_444 expect=ok class=size w=1 h=9 pil=equal
+case size_9x1_prog expect=ok class=size w=1 h=9 pil=equal
+case size_9x1_gray expect=ok class=size w=1 h=9 pil=equal
+case size_2x2_420 expect=ok class=size w=2 h=2 pil=equal
+case size_2x2_444 expect=ok class=size w=2 h=2 pil=equal
+case size_2x2_prog expect=ok class=size w=2 h=2 pil=equal
+case size_2x2_gray expect=ok class=size w=2 h=2 pil=equal
+case size_3x3_420 expect=ok class=size w=3 h=3 pil=equal
+case size_3x3_444 expect=ok class=size w=3 h=3 pil=equal
+case size_3x3_prog expect=ok class=size w=3 h=3 pil=equal
+case size_3x3_gray expect=ok class=size w=3 h=3 pil=equal
+case size_7x13_420 expect=ok class=size w=13 h=7 pil=equal
+case size_7x13_444 expect=ok class=size w=13 h=7 pil=equal
+case size_7x13_prog expect=ok class=size w=13 h=7 pil=equal
+case size_7x13_gray expect=ok class=size w=13 h=7 pil=equal
+case size_13x7_420 expect=ok class=size w=7 h=13 pil=equal
+case size_13x7_444 expect=ok class=size w=7 h=13 pil=equal
+case size_13x7_prog expect=ok class=size w=7 h=13 pil=equal
+case size_13x7_gray expect=ok class=size w=7 h=13 pil=equal
+case size_8x8_420 expect=ok class=size w=8 h=8 pil=equal
+case size_8x8_444 expect=ok class=size w=8 h=8 pil=equal
+case size_8x8_prog expect=ok class=size w=8 h=8 pil=equal
+case size_8x8_gray expect=ok class=size w=8 h=8 pil=equal
+case size_9x9_420 expect=ok class=size w=9 h=9 pil=equal
+case size_9x9_444 expect=ok class=size w=9 h=9 pil=equal
+case size_9x9_prog expect=ok class=size w=9 h=9 pil=equal
+case size_9x9_gray expect=ok class=size w=9 h=9 pil=equal
+case size_17x15_420 expect=ok class=size w=15 h=17 pil=equal
+case size_17x15_444 expect=ok class=size w=15 h=17 pil=equal
+case size_17x15_prog expect=ok class=size w=15 h=17 pil=equal
+case size_17x15_gray expect=ok class=size w=15 h=17 pil=equal
+case size_65x129_420 expect=ok class=size w=129 h=65 pil=equal
+case size_65x129_444 expect=ok class=size w=129 h=65 pil=equal
+case size_65x129_prog expect=ok class=size w=129 h=65 pil=equal
+case size_65x129_gray expect=ok class=size w=129 h=65 pil=equal
+case size_3x4097_420 expect=ok class=size w=4097 h=3 pil=equal
+case size_3x4097_444 expect=ok class=size w=4097 h=3 pil=equal
+case size_3x4097_prog expect=ok class=size w=4097 h=3 pil=equal
+case size_3x4097_gray expect=ok class=size w=4097 h=3 pil=equal
+case size_4097x3_420 expect=ok class=size w=3 h=4097 pil=equal
+case size_4097x3_444 expect=ok class=size w=3 h=4097 pil=equal
+case size_4097x3_prog expect=ok class=size w=3 h=4097 pil=equal
+case size_4097x3_gray expect=ok class=size w=3 h=4097 pil=equal
+case rst_1_420 expect=ok class=restart w=47 h=33 pil=equal
+case rst_2_420 expect=ok class=restart w=47 h=33 pil=equal
+case rst_3_420 expect=ok class=restart w=47 h=33 pil=equal
+case rst_7_420 expect=ok class=restart w=47 h=33 pil=equal
+case rst_rows_cjpeg expect=ok class=restart w=47 h=33 pil=equal
+case rst_progressive expect=ok class=restart w=47 h=33 pil=equal
+case rst_arith expect=ok class=restart w=47 h=33 pil=equal
+case rst_arith_progressive expect=ok class=restart w=47 h=33 pil=equal
+case gray_baseline expect=ok class=grayscale w=47 h=33 pil=equal
+case gray_progressive expect=ok class=grayscale w=47 h=33 pil=equal
+case gray_arith expect=ok class=grayscale w=47 h=33 pil=equal
+case quality_1_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_5_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_10_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_25_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_50_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_75_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_90_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_95_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_100_420 expect=ok class=quality w=47 h=33 pil=equal
+case quality_100_444 expect=ok class=quality w=47 h=33 pil=equal
+case optimized_tables expect=ok class=tables w=47 h=33 pil=equal
+case std_tables_only expect=ok class=tables w=47 h=33 pil=equal
+case std_tables_only_gray expect=ok class=tables w=47 h=33 pil=equal
+case sof1_extended expect=ok class=markers w=47 h=33 pil=equal
+case arith_sequential_420 expect=ok class=arithmetic w=47 h=33 pil=equal
+case arith_sequential_444 expect=ok class=arithmetic w=47 h=33 pil=equal
+case arith_progressive expect=ok class=arithmetic w=47 h=33 pil=equal
+case arith_progressive_gray expect=ok class=arithmetic w=47 h=33 pil=equal
+case arith_422 expect=ok class=arithmetic w=47 h=33 pil=equal
+case cmyk_pil_adobe expect=ok class=colour w=47 h=33 pil=equal
+case cmyk4_adobe_None expect=ok class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_0 expect=ok class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_2 expect=ok class=colour w=24 h=16 pil=equal
+case cmyk4_adobe_3 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_None_jfif0 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_None_jfif1 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_0_jfif0 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_0_jfif1 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_1_jfif0 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_1_jfif1 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_2_jfif0 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_2_jfif1 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_9_jfif0 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_adobe_9_jfif1 expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_ids_RGB expect=ok class=colour w=24 h=16 pil=equal
+case rgb3_ids_other expect=ok class=colour w=24 h=16 pil=equal
+case ycc_cube_y0 expect=ok class=colour w=160 h=160 pil=equal
+case ycc_cube_y128 expect=ok class=colour w=160 h=160 pil=equal
+case ycc_cube_y255 expect=ok class=colour w=160 h=160 pil=equal
+case ycck_flat expect=ok class=colour w=128 h=128 pil=equal
+case cmyk_flat expect=ok class=colour w=128 h=128 pil=equal
+case noninterleaved_scans expect=ok class=layout w=24 h=16 pil=equal
+case dqt_16bit expect=ok class=tables w=24 h=16 pil=equal
+case synth_rst_1 expect=ok class=restart w=24 h=16 pil=equal
+case synth_rst_2 expect=ok class=restart w=24 h=16 pil=equal
+case synth_rst_5 expect=ok class=restart w=24 h=16 pil=equal
+case idct_dense32767_q255 expect=ok class=idct w=48 h=40 pil=equal
+case idct_dense32767_q1 expect=ok class=idct w=48 h=40 pil=equal
+case idct_dense2000_q40 expect=ok class=idct w=48 h=40 pil=equal
+case idct_dense1023_q200 expect=ok class=idct w=48 h=40 pil=equal
+case idct_q65535 expect=ok class=idct w=48 h=40 pil=equal
+case idct_dc_ramp_q16 expect=ok class=idct w=64 h=32 pil=equal
+case marker_com_app_before_sof expect=ok class=markers w=47 h=33 pil=equal
+case marker_fill_ff expect=ok class=markers w=47 h=33 pil=equal
+case marker_trailing_garbage expect=ok class=markers w=47 h=33 pil=equal
+case marker_garbage_before_eoi expect=ok class=markers w=47 h=33 pil=equal
+case marker_dnl expect=ok class=markers w=47 h=33 pil=equal
+case marker_dri_zero expect=ok class=markers w=47 h=33 pil=equal
+case marker_dup_eoi expect=ok class=markers w=47 h=33 pil=equal
+case scan_order_123 expect=ok class=layout w=24 h=16 pil=equal
+case scan_order_132 expect=ok class=layout w=24 h=16 pil=equal
+case scan_order_213 expect=ok class=layout w=24 h=16 pil=equal
+case scan_order_231 expect=ok class=layout w=24 h=16 pil=equal
+case scan_order_312 expect=ok class=layout w=24 h=16 pil=equal
+case scan_order_321 expect=ok class=layout w=24 h=16 pil=equal
+case smoothing_gray_1scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_2scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_3scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_4scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_5scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_1scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_2scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_3scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_4scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_5scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_6scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_7scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_8scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_9scans expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_s444_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s444_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s422_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s420_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s411_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s440_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_s21_12_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_size_8x8_420_1scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_420_2scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_420_5scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_420_6scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_gray_1scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_gray_2scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_440_1scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_8x8_440_5scans expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_size_9x9_420_1scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_420_2scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_420_5scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_420_6scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_gray_1scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_gray_2scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_440_1scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_9x9_440_5scans expect=ok class=smoothing w=9 h=9 pil=equal
+case smoothing_size_17x15_420_1scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_420_2scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_420_5scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_420_6scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_gray_1scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_gray_2scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_440_1scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_17x15_440_5scans expect=ok class=smoothing w=15 h=17 pil=equal
+case smoothing_size_24x40_420_1scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_420_2scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_420_5scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_420_6scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_gray_1scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_gray_2scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_440_1scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_24x40_440_5scans expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_size_65x129_420_1scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_420_2scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_420_5scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_420_6scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_gray_1scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_gray_2scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_440_1scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_65x129_440_5scans expect=ok class=smoothing w=129 h=65 pil=equal
+case smoothing_size_1x9_420_1scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_420_2scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_420_5scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_420_6scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_gray_1scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_gray_2scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_440_1scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_1x9_440_5scans expect=ok class=smoothing w=9 h=1 pil=equal
+case smoothing_size_9x1_420_1scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_420_2scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_420_5scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_420_6scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_gray_1scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_gray_2scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_440_1scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_9x1_440_5scans expect=ok class=smoothing w=1 h=9 pil=equal
+case smoothing_size_33x200_420_1scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_420_2scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_420_5scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_420_6scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_gray_1scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_gray_2scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_440_1scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_33x200_440_5scans expect=ok class=smoothing w=200 h=33 pil=equal
+case smoothing_size_200x33_420_1scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_420_2scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_420_5scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_420_6scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_gray_1scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_gray_2scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_440_1scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_200x33_440_5scans expect=ok class=smoothing w=33 h=200 pil=equal
+case smoothing_size_72x40_420_1scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_420_2scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_420_5scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_420_6scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_gray_1scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_gray_2scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_440_1scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_72x40_440_5scans expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_size_32x32_420_1scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_420_2scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_420_5scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_420_6scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_gray_1scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_gray_2scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_440_1scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_32x32_440_5scans expect=ok class=smoothing w=32 h=32 pil=equal
+case smoothing_size_48x24_420_1scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_420_2scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_420_5scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_420_6scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_gray_1scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_gray_2scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_440_1scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_48x24_440_5scans expect=ok class=smoothing w=24 h=48 pil=equal
+case smoothing_size_64x40_420_1scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_420_2scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_420_5scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_420_6scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_gray_1scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_gray_2scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_440_1scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_64x40_440_5scans expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_size_96x17_420_1scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_420_2scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_420_5scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_420_6scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_gray_1scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_gray_2scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_440_1scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_size_96x17_440_5scans expect=ok class=smoothing w=17 h=96 pil=equal
+case smoothing_tall_v3_33x47_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v3_33x47_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v3_33x47_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v3_96x24_1scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v3_96x24_2scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v3_96x24_5scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v3_104x40_1scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v3_104x40_2scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v3_104x40_5scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v3_56x17_1scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v3_56x17_2scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v3_56x17_5scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4_33x47_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4_33x47_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4_33x47_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4_96x24_1scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4_96x24_2scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4_96x24_5scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4_104x40_1scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4_104x40_2scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4_104x40_5scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4_56x17_1scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4_56x17_2scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4_56x17_5scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4c2_33x47_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4c2_33x47_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4c2_33x47_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_v4c2_96x24_1scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4c2_96x24_2scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4c2_96x24_5scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_v4c2_104x40_1scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4c2_104x40_2scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4c2_104x40_5scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_v4c2_56x17_1scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4c2_56x17_2scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_v4c2_56x17_5scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_h2v3_33x47_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_h2v3_33x47_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_h2v3_33x47_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_tall_h2v3_96x24_1scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_h2v3_96x24_2scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_h2v3_96x24_5scans expect=ok class=smoothing w=24 h=96 pil=equal
+case smoothing_tall_h2v3_104x40_1scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_h2v3_104x40_2scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_h2v3_104x40_5scans expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_tall_h2v3_56x17_1scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_h2v3_56x17_2scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_tall_h2v3_56x17_5scans expect=ok class=smoothing w=17 h=56 pil=equal
+case smoothing_420_spectral_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_spectral_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_spectral_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_spectral_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_10scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_11scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_12scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_13scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_14scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_15scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_16scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_deep_17scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_10scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_high_first_11scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_420_luma_first_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_spectral_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_spectral_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_spectral_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_spectral_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_10scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_11scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_12scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_13scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_14scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_15scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_16scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_deep_17scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_10scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_high_first_11scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_444_luma_first_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_spectral_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_spectral_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_deep_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_high_first_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_high_first_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_high_first_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_high_first_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_high_first_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_6scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_7scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_8scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_420_9scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_gray_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_gray_2scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_arith_gray_4scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_rst_420_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_rst_420_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_rst_420_5scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_rst_arith_1scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_rst_arith_3scans expect=ok class=smoothing w=47 h=33 pil=equal
+case smoothing_gray_mid0_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid0_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_mid1_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid1_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid2_1 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_mid2_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_mid3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid3_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid4_1 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_mid4_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_mid5_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_mid5_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid0_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid0_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid1_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid1_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid2_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid2_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid3_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid4_1 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid4_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid5_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid5_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid6_1 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid6_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid7_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid7_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid8_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid8_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_420_mid9_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_mid9_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_440_mid0_1 expect=ok class=smoothing w=40 h=65 pil=equal
+case smoothing_440_mid0_2 expect=ok class=smoothing w=40 h=65 pil=equal
+case smoothing_440_mid1_1 expect=ok class=smoothing w=40 h=65 pil=equal
+case smoothing_440_mid1_2 expect=ok class=smoothing w=40 h=65 pil=equal
+case smoothing_440_mid3_1 expect=ok class=smoothing w=40 h=65 pil=equal
+case smoothing_440_mid3_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_440_mid6_1 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_440_mid6_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_gray_hole0_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x00_was_not_defined
+case smoothing_gray_hole0_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_gray_hole1_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole1_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole2_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_gray_hole2_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_gray_hole3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole3_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole4_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_gray_hole4_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole5_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_gray_hole5_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole0_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x00_was_not_defined
+case smoothing_420_hole0_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole1_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x01_was_not_defined
+case smoothing_420_hole1_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole2_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole2_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole3_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole4_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole4_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole5_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole5_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole6_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole6_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole7_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole7_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole8_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole8_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_hole9_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_hole9_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_420_24x40_hole0_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x00_was_not_defined
+case smoothing_420_24x40_hole0_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole1_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x01_was_not_defined
+case smoothing_420_24x40_hole1_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole2_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole2_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole3_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole3_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole4_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole4_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole5_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole5_2 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole6_1 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole6_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole7_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole7_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole8_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole8_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_420_24x40_hole9_1 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_420_24x40_hole9_2 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_rst_hole0_1 expect=error class=smoothing oracle=ERR_Huffman_table_0x00_was_not_defined
+case smoothing_rst_hole0_2 expect=error class=smoothing oracle=ERR_Bogus_Huffman_table_definition
+case smoothing_rst_hole1_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_hole1_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_hole3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_hole3_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_arith_gray_mid0_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_arith_gray_mid0_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_arith_gray_mid2_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_arith_gray_mid2_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_mid0_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_mid0_2 expect=error class=smoothing oracle=ERR_Image_is_incomplete_or_truncated
+case smoothing_rst_mid1_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_mid1_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_mid3_1 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_rst_mid3_2 expect=ok class=smoothing w=56 h=40 pil=equal
+case smoothing_dc_1x1_q16_8 expect=ok class=smoothing w=8 h=8 pil=equal
+case smoothing_dc_1x2_q16_8 expect=ok class=smoothing w=16 h=8 pil=equal
+case smoothing_dc_2x1_q16_8 expect=ok class=smoothing w=8 h=16 pil=equal
+case smoothing_dc_1x3_q3_1 expect=ok class=smoothing w=24 h=8 pil=equal
+case smoothing_dc_3x1_q3_1 expect=ok class=smoothing w=8 h=24 pil=equal
+case smoothing_dc_3x3_q3_1 expect=ok class=smoothing w=24 h=24 pil=equal
+case smoothing_dc_4x7_q40_17 expect=ok class=smoothing w=56 h=32 pil=equal
+case smoothing_dc_9x6_q7_60 expect=ok class=smoothing w=48 h=72 pil=equal
+case smoothing_dc_10x10_q1_1 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_dc_6x6_q255_255 expect=ok class=smoothing w=48 h=48 pil=equal
+case smoothing_dc_8x8_q16_40 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_impulse_d5_q64_4 expect=ok class=smoothing w=104 h=104 pil=equal
+case smoothing_impulse_d-5_q64_4 expect=ok class=smoothing w=104 h=104 pil=equal
+case smoothing_impulse_d2_q256_1 expect=ok class=smoothing w=104 h=104 pil=equal
+case smoothing_impulse_d1_q255_255 expect=ok class=smoothing w=104 h=104 pil=equal
+case smoothing_impulse_d30_q8_2 expect=ok class=smoothing w=104 h=104 pil=equal
+case smoothing_dc_al1 expect=ok class=smoothing w=72 h=56 pil=equal
+case smoothing_dc_al2 expect=ok class=smoothing w=72 h=56 pil=equal
+case smoothing_dc_al4 expect=ok class=smoothing w=72 h=56 pil=equal
+case smoothing_dc_al2_refined_once expect=ok class=smoothing w=72 h=56 pil=equal
+case smoothing_state_ac1to2_al1 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to5_al2 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to5_al3 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to5_al5 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to9_al6 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to9_al4 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_state_ac1to3_al7 expect=ok class=smoothing w=80 h=80 pil=equal
+case smoothing_only_zz1 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz2 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz3 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz4 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz5 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz6 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz7 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz8 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_only_zz9 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_state_known_1to5_missing_6to9 expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_state_high_band_only expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_state_no_dc_scan expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_state_refined_to_known expect=ok class=smoothing w=72 h=72 pil=equal
+case smoothing_vrows2_01_dc expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows2_01_ac5 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows2_01_ac9 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows2_02_dc expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows2_02_ac5 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows2_02_ac9 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows2_03_dc expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows2_03_ac5 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows2_03_ac9 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows2_04_dc expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows2_04_ac5 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows2_04_ac9 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows2_05_dc expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows2_05_ac5 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows2_05_ac9 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows2_06_dc expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows2_06_ac5 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows2_06_ac9 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows2_07_dc expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows2_07_ac5 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows2_07_ac9 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows2_08_dc expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows2_08_ac5 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows2_08_ac9 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows2_09_dc expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows2_09_ac5 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows2_09_ac9 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows3_01_dc expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows3_01_ac5 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows3_01_ac9 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows3_02_dc expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows3_02_ac5 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows3_02_ac9 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows3_03_dc expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows3_03_ac5 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows3_03_ac9 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows3_04_dc expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows3_04_ac5 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows3_04_ac9 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows3_05_dc expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows3_05_ac5 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows3_05_ac9 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows3_06_dc expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows3_06_ac5 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows3_06_ac9 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows3_07_dc expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows3_07_ac5 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows3_07_ac9 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows3_08_dc expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows3_08_ac5 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows3_08_ac9 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows3_09_dc expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows3_09_ac5 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows3_09_ac9 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows3_10_dc expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows3_10_ac5 expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows3_10_ac9 expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows3_11_dc expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows3_11_ac5 expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows3_11_ac9 expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows3_12_dc expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows3_12_ac5 expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows3_12_ac9 expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows3_13_dc expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows3_13_ac5 expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows3_13_ac9 expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows4_01_dc expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows4_01_ac5 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows4_01_ac9 expect=ok class=smoothing w=40 h=8 pil=equal
+case smoothing_vrows4_02_dc expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows4_02_ac5 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows4_02_ac9 expect=ok class=smoothing w=40 h=16 pil=equal
+case smoothing_vrows4_03_dc expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows4_03_ac5 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows4_03_ac9 expect=ok class=smoothing w=40 h=24 pil=equal
+case smoothing_vrows4_04_dc expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows4_04_ac5 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows4_04_ac9 expect=ok class=smoothing w=40 h=32 pil=equal
+case smoothing_vrows4_05_dc expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows4_05_ac5 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows4_05_ac9 expect=ok class=smoothing w=40 h=40 pil=equal
+case smoothing_vrows4_06_dc expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows4_06_ac5 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows4_06_ac9 expect=ok class=smoothing w=40 h=48 pil=equal
+case smoothing_vrows4_07_dc expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows4_07_ac5 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows4_07_ac9 expect=ok class=smoothing w=40 h=56 pil=equal
+case smoothing_vrows4_08_dc expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows4_08_ac5 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows4_08_ac9 expect=ok class=smoothing w=40 h=64 pil=equal
+case smoothing_vrows4_09_dc expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows4_09_ac5 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows4_09_ac9 expect=ok class=smoothing w=40 h=72 pil=equal
+case smoothing_vrows4_10_dc expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows4_10_ac5 expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows4_10_ac9 expect=ok class=smoothing w=40 h=80 pil=equal
+case smoothing_vrows4_11_dc expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows4_11_ac5 expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows4_11_ac9 expect=ok class=smoothing w=40 h=88 pil=equal
+case smoothing_vrows4_12_dc expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows4_12_ac5 expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows4_12_ac9 expect=ok class=smoothing w=40 h=96 pil=equal
+case smoothing_vrows4_13_dc expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows4_13_ac5 expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows4_13_ac9 expect=ok class=smoothing w=40 h=104 pil=equal
+case smoothing_vrows4_14_dc expect=ok class=smoothing w=40 h=112 pil=equal
+case smoothing_vrows4_14_ac5 expect=ok class=smoothing w=40 h=112 pil=equal
+case smoothing_vrows4_14_ac9 expect=ok class=smoothing w=40 h=112 pil=equal
+case smoothing_vrows4_15_dc expect=ok class=smoothing w=40 h=120 pil=equal
+case smoothing_vrows4_15_ac5 expect=ok class=smoothing w=40 h=120 pil=equal
+case smoothing_vrows4_15_ac9 expect=ok class=smoothing w=40 h=120 pil=equal
+case smoothing_vrows4_16_dc expect=ok class=smoothing w=40 h=128 pil=equal
+case smoothing_vrows4_16_ac5 expect=ok class=smoothing w=40 h=128 pil=equal
+case smoothing_vrows4_16_ac9 expect=ok class=smoothing w=40 h=128 pil=equal
+case smoothing_vrows4_17_dc expect=ok class=smoothing w=40 h=136 pil=equal
+case smoothing_vrows4_17_ac5 expect=ok class=smoothing w=40 h=136 pil=equal
+case smoothing_vrows4_17_ac9 expect=ok class=smoothing w=40 h=136 pil=equal
+case smoothing_zero_quantizer_0 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_1 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_8 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_16 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_9 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_2 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_3 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_10 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_17 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_24 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_4 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_5 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_25 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_63 expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_3_part expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_24_part expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_zero_quantizer_1_part expect=ok class=smoothing w=64 h=64 pil=equal
+case smoothing_extreme_dc2047_q255_1 expect=ok class=smoothing w=48 h=48 pil=equal
+case smoothing_extreme_dc2047_q65535_1 expect=ok class=smoothing w=48 h=48 pil=equal
+case smoothing_extreme_dc16000_q1_65535 expect=ok class=smoothing w=48 h=48 pil=equal
+case smoothing_extreme_dc16000_q255_3 expect=ok class=smoothing w=48 h=48 pil=equal
+case smoothing_extreme_dc2047_q40_255 expect=ok class=smoothing w=48 h=48 pil=equal
+case lossless_rgb_psv1 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv1 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv1 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv2 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv2 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv2 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv3 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv3 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv3 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv4 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv4 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv4 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv5 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv5 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv5 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv6 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv6 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv6 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rgb_psv7 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_rgb_ids_psv7 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_noise_psv7 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_refused_gray_psv1 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_refused_ycc_psv1 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_refused_adobe1_psv1 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_refused_gray_psv4 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_refused_ycc_psv4 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_refused_adobe1_psv4 expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_no_dht expect=error class=lossless oracle=ERR_Huffman_table_0x00_was_not_defined
+case lossless_scans_missing_first expect=error class=lossless oracle=ERR_Bogus_virtual_array_access
+case lossless_scans_missing_last expect=error class=lossless oracle=ERR_Bogus_virtual_array_access
+case lossless_scans_missing_middle_pair expect=error class=lossless oracle=ERR_Bogus_virtual_array_access
+case lossless_scans_missing_in_interleaved expect=error class=lossless oracle=ERR_Bogus_virtual_array_access
+case lossless_scans_single_then_pair expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_scans_pair_then_single expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_scans_repeated_scan expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_ids_123_no_marker expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_ids_789_no_marker expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_pt1_psv1 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt1_psv4 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt1_psv6 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt1_psv7 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt2_psv1 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt2_psv4 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt2_psv6 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt2_psv7 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt4_psv1 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt4_psv4 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt4_psv6 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt4_psv7 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt7_psv1 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt7_psv4 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt7_psv6 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_pt7_psv7 expect=ok class=lossless w=12 h=10 pil=equal
+case lossless_rgb_noninterleaved_psv1 expect=ok class=lossless w=12 h=7 pil=equal
+case lossless_rgb_noninterleaved_psv3 expect=ok class=lossless w=12 h=7 pil=equal
+case lossless_rgb_noninterleaved_psv7 expect=ok class=lossless w=12 h=7 pil=equal
+case lossless_size_1x1 expect=ok class=lossless w=1 h=1 pil=equal
+case lossless_size_1x7 expect=ok class=lossless w=7 h=1 pil=equal
+case lossless_size_7x1 expect=ok class=lossless w=1 h=7 pil=equal
+case lossless_size_2x2 expect=ok class=lossless w=2 h=2 pil=equal
+case lossless_size_8x8 expect=ok class=lossless w=8 h=8 pil=equal
+case lossless_size_3x33 expect=ok class=lossless w=33 h=3 pil=equal
+case lossless_size_33x3 expect=ok class=lossless w=3 h=33 pil=equal
+case lossless_sub_h2v1_12x16 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_sub_h2v1_9x13 expect=ok class=lossless w=13 h=9 pil=equal
+case lossless_sub_h2v2_12x16 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_sub_h2v2_9x13 expect=ok class=lossless w=13 h=9 pil=equal
+case lossless_sub_h1v2_12x16 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_sub_h1v2_9x13 expect=ok class=lossless w=13 h=9 pil=equal
+case lossless_sub_h4v1_12x16 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_sub_h4v1_9x13 expect=ok class=lossless w=13 h=9 pil=equal
+case lossless_sub_h2v2_all_12x16 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_sub_h2v2_all_9x13 expect=ok class=lossless w=13 h=9 pil=equal
+case lossless_sub_h2v2_noninterleaved expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_cmyk expect=ok class=lossless w=10 h=6 pil=equal
+case lossless_refused_ycck expect=error class=lossless oracle=ERR_Unsupported_color_conversion_request
+case lossless_cmyk_ids expect=ok class=lossless w=10 h=6 pil=equal
+case lossless_rst6_6x12_psv1 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst6_6x12_psv4 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst6_6x12_psv7 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst12_6x12_psv1 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst12_6x12_psv4 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst12_6x12_psv7 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_rst9_9x8_psv1 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst9_9x8_psv4 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst9_9x8_psv7 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst18_9x8_psv1 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst18_9x8_psv4 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst18_9x8_psv7 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_rst_rgb_interleaved expect=ok class=lossless w=5 h=9 pil=equal
+case lossless_rst_rgb_noninterleaved expect=ok class=lossless w=5 h=9 pil=equal
+case lossless_rst_sub_interleaved expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_rst_sub_noninterleaved expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_cut_rgb_1 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_cut_rgb_2 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_cut_ps7_1 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_cut_ps7_2 expect=ok class=lossless w=17 h=9 pil=equal
+case lossless_cut_rst_1 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_cut_rst_2 expect=ok class=lossless w=6 h=12 pil=equal
+case lossless_cut_sub_1 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_cut_sub_2 expect=ok class=lossless w=16 h=12 pil=equal
+case lossless_rst_partial_row expect=error class=lossless oracle=ERR_Invalid_restart_interval_4;_must_be_an_integer_multiple_of_the_number_of_MCUs_in_an_MCU_row_(6)
+case lossless_rst_one_mcu expect=error class=lossless oracle=ERR_Invalid_restart_interval_1;_must_be_an_integer_multiple_of_the_number_of_MCUs_in_an_MCU_row_(6)
+case lossless_wild_diffs_psv1 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv1 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv2 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv2 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv3 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv3 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv4 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv4 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv5 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv5 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv6 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv6 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_psv7 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_huge_diffs_psv7 expect=ok class=lossless w=7 h=6 pil=equal
+case lossless_wild_diffs_pt3 expect=ok class=lossless w=9 h=8 pil=equal
+case lossless_small_diffs_p2 expect=ok class=lossless w=9 h=8 pil=error
+case lossless_small_diffs_p5 expect=ok class=lossless w=9 h=8 pil=error
+case lossless_small_diffs_p7 expect=ok class=lossless w=9 h=8 pil=error
+case lossless_params_psv0 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=0_Se=0_Ah=0_Al=0
+case lossless_params_psv8 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=8_Se=0_Ah=0_Al=0
+case lossless_params_se1 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=1_Ah=0_Al=0
+case lossless_params_ah1 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=1_Al=0
+case lossless_params_pt_eq_precision_minus1 expect=ok class=lossless w=8 h=8 pil=equal
+case lossless_params_pt_eq_precision expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=0_Al=8
+case lossless_params_pt_over_precision expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=0_Al=9
+case lossless_params_pt15 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=0_Al=15
+case lossless_params_p4_pt1 expect=ok class=lossless w=8 h=8 pil=error
+case lossless_params_p4_pt3 expect=ok class=lossless w=8 h=8 pil=error
+case lossless_params_p4_pt4 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=0_Al=4
+case lossless_params_p4_pt5 expect=error class=lossless oracle=ERR_Invalid_progressive/lossless_parameters_Ss=1_Se=0_Ah=0_Al=5
+case lossless_precision_2_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_2_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_3_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_3_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_4_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_4_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_5_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_5_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_6_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_6_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_7_rgb expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_7_rgb_p1 expect=ok class=lossless w=8 h=6 pil=error
+case lossless_precision_8_rgb expect=ok class=lossless w=8 h=6 pil=equal
+case lossless_precision_8_rgb_p1 expect=ok class=lossless w=8 h=6 pil=equal
+case lossless_precision_9_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_9
+case lossless_precision_9_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_9
+case lossless_precision_10_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_10
+case lossless_precision_10_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_10
+case lossless_precision_11_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_11
+case lossless_precision_11_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_11
+case lossless_precision_12_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_12
+case lossless_precision_12_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_12
+case lossless_precision_13_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_13
+case lossless_precision_13_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_13
+case lossless_precision_14_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_14
+case lossless_precision_14_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_14
+case lossless_precision_15_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_15
+case lossless_precision_15_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_15
+case lossless_precision_16_rgb expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_16
+case lossless_precision_16_rgb_p1 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_16
+case lossless_cjpeg_psv1 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv2 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv3 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv4 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv5 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv6 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv7 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv1_pt1 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv4_pt3 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_psv7_pt2 expect=ok class=lossless w=24 h=16 pil=equal
+case lossless_cjpeg_gray_flag expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_rgb expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_420 expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_422 expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_restart expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_scans_split expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_scans_pt expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_scans_pt_split expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_scans_420 expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_scans_420_split expect=ok class=lossless w=23 h=17 pil=equal
+case lossless_cjpeg_precision_2 expect=ok class=lossless w=11 h=9 pil=error
+case lossless_cjpeg_precision_4 expect=ok class=lossless w=11 h=9 pil=error
+case lossless_cjpeg_precision_7 expect=ok class=lossless w=11 h=9 pil=error
+case lossless_cjpeg_precision_12 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_12
+case lossless_cjpeg_precision_16 expect=error class=lossless oracle=ERR_Unsupported_JPEG_data_precision_16
 case err_12bit_cjpeg expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_12
 case err_precision_12_sof0 expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_12
 case err_precision_16 expect=error class=error oracle=ERR_Unsupported_JPEG_data_precision_16
@@ -176,7 +980,7 @@ case err_6_components expect=error class=error oracle=ERR_Bogus_marker_length
 case err_10_components expect=error class=error oracle=ERR_Bogus_marker_length
 case err_fractional_sampling_3_2_1 expect=error class=error oracle=ERR_Fractional_sampling_not_implemented_yet
 case err_mcu_over_10_blocks expect=error class=error oracle=ERR_Sampling_factors_too_large_for_interleaved_scan
-case layout_mcu_10_blocks expect=ok tessl=equal class=layout w=24 h=16 pil=equal
+case layout_mcu_10_blocks expect=ok class=layout w=24 h=16 pil=equal
 case err_sampling_zero expect=error class=error oracle=ERR_Bogus_sampling_factors
 case err_sampling_5 expect=error class=error oracle=ERR_Bogus_sampling_factors
 case err_zero_width expect=error class=error oracle=ERR_Empty_JPEG_image_(DNL_not_supported)

@@ -98,8 +98,9 @@
 //! norm after it are one launch), [`ew`] (the clamp, SiLU and clamp between a
 //! feed-forward's linears), [`lconv`] (the GLU, the depthwise conv and the
 //! conv norm of the light conv in one pass) and [`attention`]. The matmuls are
-//! tessl's [`gemm`] (exact f32) or `gemm_bf16`; `gemm_epilogue` has no
-//! exact-f32 path, so the clamps are not fused into them. The passes that feed
+//! tessl's [`gemm`] (exact f32) or `gemm_bf16`; the clamps are not fused
+//! into them (`gemm_epilogue` has an exact-f32 path now, but not one for
+//! these clamps). The passes that feed
 //! a GEMM take the type of their output from the host ([`ActStore`]) in the
 //! same entry, so the bf16 mode adds no kernel entry. q, k and v are one
 //! `[hidden, 3 * hidden]` GEMM on one clamped input whenever their input clamps

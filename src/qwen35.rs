@@ -499,9 +499,9 @@ pub fn fused_projection(x: &Tensor, packed: &Tensor, proj: &Tensor, backend: Gem
 
 /// `residual += y @ w_out` in one dispatch: the output projection with the
 /// residual add folded into the GEMM epilogue (`beta = 1` accumulates into `C`
-/// while the product is still in registers). Needs the epilogue path — bf16 or
-/// f16 operands, or f32 with [`GpuRuntime::set_relaxed_precision`] on, on
-/// TensorOps.
+/// while the product is still in registers). Needs the TensorOps backend; f32
+/// operands take the exact-f32 epilogue kernel, or the relaxed one with
+/// [`GpuRuntime::set_relaxed_precision`] on.
 pub fn project_residual(y: &Tensor, w_out: &Tensor, residual: &Tensor, backend: GemmBackend) -> Result<(), String> {
     gemm_epilogue(
         y,

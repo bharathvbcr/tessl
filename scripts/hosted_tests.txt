@@ -18,6 +18,7 @@ bin bench_attn_cli 2
 bin build_artifact_contract 2
 bin capi_contract 80
 bin check_kernel_ir_planted 6
+bin config_json_parsers 10
 bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2

@@ -2088,6 +2088,7 @@ impl Qwen35Model {
     /// kernels; `tests/qwen35_train.rs`
     /// (`train_forward_hidden_states_are_the_inference_forwards`) pins the
     /// two to the same hidden states.
+    #[allow(clippy::too_many_arguments)]
     fn train_layer_forward(
         &self,
         layer: &Layer,

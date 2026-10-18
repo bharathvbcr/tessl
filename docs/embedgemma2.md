@@ -3297,7 +3297,7 @@ fixture (12 files, 48 settings). The end-to-end file has a nominal 24000/1001 ra
   fixtures, every one an error.
 - **Release of CoreVideo / CoreMedia objects**: a `Lock` guard unlocks every pixel buffer, the
   session is invalidated in `Drop`, and `leaks --atExit` reported 0 leaks for 0 bytes on
-  `media_video_exact` (13 tests, 19411 nodes malloced) and `media_codecs_leaks` (19750 nodes),
+  `media_video_exact` (13 tests, 17615 nodes malloced) and `media_codecs_leaks` (19750 nodes),
   both run with `--test-threads=1`.
 
 ### Hosted job: what runs and what cannot

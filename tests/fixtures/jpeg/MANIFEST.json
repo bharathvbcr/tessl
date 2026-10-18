@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_jpeg_fixtures.py",
- "generator_commit": "a93c263e3c3d10f0870a7382a30db67b9ea112ec",
+ "generator_commit": "8699afe0025e4449e52caee7fdb8feac4a5c836c",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",
@@ -1724,9 +1724,1794 @@
   "lossless_rst_sub_noninterleaved.jpg": {
    "role": "input",
    "published": true,
-   "note": "lossless: 4:2:0 in three scans with a restart interval (the interval is checked against the last scan's MCU row)"
+   "note": "lossless: 4:2:0 in three scans with a restart interval; Y restarts every row, inside its 2-row iMCU row"
   },
   "lossless_rst_sub_noninterleaved.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_bad_r12.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 in three scans, restart interval 12 (not a multiple of the Y scan's 16 MCUs per row)"
+  },
+  "lossless_rstsub_420_16x12_bad_r24.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 in three scans, restart interval 24 (not a multiple of the Y scan's 16 MCUs per row)"
+  },
+  "lossless_rstsub_420_16x12_bad_r8.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 in three scans, restart interval 8 (not a multiple of the Y scan's 16 MCUs per row)"
+  },
+  "lossless_rstsub_420_16x12_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[1], [0], [2]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_420_16x12_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[1], [0], [2]], restart every 32 MCUs, predictor 3"
+  },
+  "lossless_rstsub_420_16x12_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[1, 2], [0]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_420_16x12_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[1, 2], [0]], restart every 32 MCUs, predictor 1"
+  },
+  "lossless_rstsub_420_16x12_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[2], [1], [0]], restart every 16 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_16x12_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[2], [1], [0]], restart every 32 MCUs, predictor 3"
+  },
+  "lossless_rstsub_420_16x12_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1], [2]], restart every 16 MCUs, predictor 7"
+  },
+  "lossless_rstsub_420_16x12_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1], [2]], restart every 32 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_16x12_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1], [2]], restart every 48 MCUs, predictor 4"
+  },
+  "lossless_rstsub_420_16x12_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1, 2]], restart every 16 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1, 2]], restart every 32 MCUs, predictor 7"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x12, scans [[0], [1, 2]], restart every 48 MCUs, predictor 7"
+  },
+  "lossless_rstsub_420_16x12_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[1, 2], [0]], restart every 16 MCUs, predictor 2"
+  },
+  "lossless_rstsub_420_16x25_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[1, 2], [0]], restart every 32 MCUs, predictor 7"
+  },
+  "lossless_rstsub_420_16x25_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1], [2]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_420_16x25_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1], [2]], restart every 32 MCUs, predictor 3"
+  },
+  "lossless_rstsub_420_16x25_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1], [2]], restart every 48 MCUs, predictor 2"
+  },
+  "lossless_rstsub_420_16x25_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1, 2]], restart every 16 MCUs, predictor 2"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1, 2]], restart every 32 MCUs, predictor 7"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 16x25, scans [[0], [1, 2]], restart every 48 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_16x25_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[1, 2], [0]], restart every 8 MCUs, predictor 4"
+  },
+  "lossless_rstsub_420_8x9_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[1, 2], [0]], restart every 16 MCUs, predictor 3"
+  },
+  "lossless_rstsub_420_8x9_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1], [2]], restart every 8 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_8x9_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1], [2]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_420_8x9_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1], [2]], restart every 24 MCUs, predictor 4"
+  },
+  "lossless_rstsub_420_8x9_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1, 2]], restart every 8 MCUs, predictor 6"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1, 2]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 420 8x9, scans [[0], [1, 2]], restart every 24 MCUs, predictor 4"
+  },
+  "lossless_rstsub_420_8x9_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_420_pt3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 in three scans, restart every Y row, point transform 3"
+  },
+  "lossless_rstsub_420_pt3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[1], [0], [2]], restart every 7 MCUs, predictor 4"
+  },
+  "lossless_rstsub_cbv2_7x12_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[1], [0], [2]], restart every 14 MCUs, predictor 6"
+  },
+  "lossless_rstsub_cbv2_7x12_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[1, 2], [0]], restart every 7 MCUs, predictor 4"
+  },
+  "lossless_rstsub_cbv2_7x12_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[1, 2], [0]], restart every 14 MCUs, predictor 5"
+  },
+  "lossless_rstsub_cbv2_7x12_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[2], [1], [0]], restart every 7 MCUs, predictor 3"
+  },
+  "lossless_rstsub_cbv2_7x12_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[2], [1], [0]], restart every 14 MCUs, predictor 5"
+  },
+  "lossless_rstsub_cbv2_7x12_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1], [2]], restart every 7 MCUs, predictor 4"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1], [2]], restart every 14 MCUs, predictor 7"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1], [2]], restart every 21 MCUs, predictor 5"
+  },
+  "lossless_rstsub_cbv2_7x12_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1, 2]], restart every 7 MCUs, predictor 2"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1, 2]], restart every 14 MCUs, predictor 6"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 7x12, scans [[0], [1, 2]], restart every 21 MCUs, predictor 4"
+  },
+  "lossless_rstsub_cbv2_7x12_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[1, 2], [0]], restart every 9 MCUs, predictor 1"
+  },
+  "lossless_rstsub_cbv2_9x5_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[1, 2], [0]], restart every 18 MCUs, predictor 1"
+  },
+  "lossless_rstsub_cbv2_9x5_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1], [2]], restart every 9 MCUs, predictor 4"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1], [2]], restart every 18 MCUs, predictor 6"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1], [2]], restart every 27 MCUs, predictor 1"
+  },
+  "lossless_rstsub_cbv2_9x5_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1, 2]], restart every 9 MCUs, predictor 3"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1, 2]], restart every 18 MCUs, predictor 2"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: cbv2 9x5, scans [[0], [1, 2]], restart every 27 MCUs, predictor 2"
+  },
+  "lossless_rstsub_cbv2_9x5_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_sep_s0_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 sep, restart every Y row, scan 1 cut at 1/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_sep_s0_1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_sep_s0_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 sep, restart every Y row, scan 1 cut at 2/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_sep_s0_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_sep_s1_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 sep, restart every Y row, scan 2 cut at 1/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_sep_s1_1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_sep_s1_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 sep, restart every Y row, scan 2 cut at 2/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_sep_s1_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s0_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 yfirst_pair, restart every Y row, scan 1 cut at 1/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s0_1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s0_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 yfirst_pair, restart every Y row, scan 1 cut at 2/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s0_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s1_1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 yfirst_pair, restart every Y row, scan 2 cut at 1/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s1_1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s1_2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: 4:2:0 16x25 yfirst_pair, restart every Y row, scan 2 cut at 2/3 and the scans after it kept"
+  },
+  "lossless_rstsub_cut_yfirst_pair_s1_2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[1, 2], [0]], restart every 13 MCUs, predictor 7"
+  },
+  "lossless_rstsub_h1v2_13x12_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[1, 2], [0]], restart every 26 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_13x12_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1], [2]], restart every 13 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1], [2]], restart every 26 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1], [2]], restart every 39 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h1v2_13x12_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1, 2]], restart every 13 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1, 2]], restart every 26 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 13x12, scans [[0], [1, 2]], restart every 39 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_13x12_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[1], [0], [2]], restart every 5 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_5x7_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[1], [0], [2]], restart every 10 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h1v2_5x7_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[1, 2], [0]], restart every 5 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h1v2_5x7_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[1, 2], [0]], restart every 10 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h1v2_5x7_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[2], [1], [0]], restart every 5 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h1v2_5x7_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[2], [1], [0]], restart every 10 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_5x7_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1], [2]], restart every 5 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1], [2]], restart every 10 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1], [2]], restart every 15 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h1v2_5x7_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1, 2]], restart every 5 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1, 2]], restart every 10 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h1v2 5x7, scans [[0], [1, 2]], restart every 15 MCUs, predictor 7"
+  },
+  "lossless_rstsub_h1v2_5x7_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[1], [0], [2]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v1_16x9_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[1], [0], [2]], restart every 32 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v1_16x9_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[1, 2], [0]], restart every 16 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h2v1_16x9_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[1, 2], [0]], restart every 32 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v1_16x9_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[2], [1], [0]], restart every 16 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h2v1_16x9_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[2], [1], [0]], restart every 32 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_16x9_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1], [2]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1], [2]], restart every 32 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1], [2]], restart every 48 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v1_16x9_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1, 2]], restart every 16 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1, 2]], restart every 32 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 16x9, scans [[0], [1, 2]], restart every 48 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_16x9_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[1, 2], [0]], restart every 8 MCUs, predictor 7"
+  },
+  "lossless_rstsub_h2v1_8x5_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[1, 2], [0]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_8x5_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1], [2]], restart every 8 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1], [2]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1], [2]], restart every 24 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h2v1_8x5_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1, 2]], restart every 8 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1, 2]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v1 8x5, scans [[0], [1, 2]], restart every 24 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h2v1_8x5_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[1], [0], [2]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v3_16x13_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[1], [0], [2]], restart every 32 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v3_16x13_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[1, 2], [0]], restart every 16 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h2v3_16x13_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[1, 2], [0]], restart every 32 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v3_16x13_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[2], [1], [0]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v3_16x13_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[2], [1], [0]], restart every 32 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h2v3_16x13_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1], [2]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1], [2]], restart every 32 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1], [2]], restart every 48 MCUs, predictor 7"
+  },
+  "lossless_rstsub_h2v3_16x13_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1, 2]], restart every 16 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1, 2]], restart every 32 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 16x13, scans [[0], [1, 2]], restart every 48 MCUs, predictor 1"
+  },
+  "lossless_rstsub_h2v3_16x13_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[1, 2], [0]], restart every 8 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h2v3_8x7_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[1, 2], [0]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_h2v3_8x7_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1], [2]], restart every 8 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1], [2]], restart every 16 MCUs, predictor 2"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1], [2]], restart every 24 MCUs, predictor 7"
+  },
+  "lossless_rstsub_h2v3_8x7_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1, 2]], restart every 8 MCUs, predictor 6"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1, 2]], restart every 16 MCUs, predictor 5"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: h2v3 8x7, scans [[0], [1, 2]], restart every 24 MCUs, predictor 3"
+  },
+  "lossless_rstsub_h2v3_8x7_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[1], [0], [2]], restart every 16 MCUs, predictor 2"
+  },
+  "lossless_rstsub_mixed_16x12_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[1], [0], [2]], restart every 32 MCUs, predictor 6"
+  },
+  "lossless_rstsub_mixed_16x12_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[1, 2], [0]], restart every 16 MCUs, predictor 1"
+  },
+  "lossless_rstsub_mixed_16x12_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[1, 2], [0]], restart every 32 MCUs, predictor 7"
+  },
+  "lossless_rstsub_mixed_16x12_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[2], [1], [0]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_mixed_16x12_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[2], [1], [0]], restart every 32 MCUs, predictor 1"
+  },
+  "lossless_rstsub_mixed_16x12_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1], [2]], restart every 16 MCUs, predictor 7"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1], [2]], restart every 32 MCUs, predictor 2"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1], [2]], restart every 48 MCUs, predictor 7"
+  },
+  "lossless_rstsub_mixed_16x12_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1, 2]], restart every 16 MCUs, predictor 7"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1, 2]], restart every 32 MCUs, predictor 5"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 16x12, scans [[0], [1, 2]], restart every 48 MCUs, predictor 1"
+  },
+  "lossless_rstsub_mixed_16x12_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[1, 2], [0]], restart every 8 MCUs, predictor 3"
+  },
+  "lossless_rstsub_mixed_8x11_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[1, 2], [0]], restart every 16 MCUs, predictor 4"
+  },
+  "lossless_rstsub_mixed_8x11_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1], [2]], restart every 8 MCUs, predictor 5"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1], [2]], restart every 16 MCUs, predictor 7"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1], [2]], restart every 24 MCUs, predictor 6"
+  },
+  "lossless_rstsub_mixed_8x11_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1, 2]], restart every 8 MCUs, predictor 5"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1, 2]], restart every 16 MCUs, predictor 6"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: mixed 8x11, scans [[0], [1, 2]], restart every 24 MCUs, predictor 4"
+  },
+  "lossless_rstsub_mixed_8x11_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[1, 2], [0]], restart every 5 MCUs, predictor 1"
+  },
+  "lossless_rstsub_v3_5x13_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[1, 2], [0]], restart every 10 MCUs, predictor 1"
+  },
+  "lossless_rstsub_v3_5x13_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1], [2]], restart every 5 MCUs, predictor 1"
+  },
+  "lossless_rstsub_v3_5x13_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1], [2]], restart every 10 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_5x13_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1], [2]], restart every 15 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v3_5x13_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1, 2]], restart every 5 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1, 2]], restart every 10 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 5x13, scans [[0], [1, 2]], restart every 15 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_5x13_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[1], [0], [2]], restart every 7 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v3_7x10_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[1], [0], [2]], restart every 14 MCUs, predictor 1"
+  },
+  "lossless_rstsub_v3_7x10_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[1, 2], [0]], restart every 7 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_7x10_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[1, 2], [0]], restart every 14 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_7x10_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[2], [1], [0]], restart every 7 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v3_7x10_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[2], [1], [0]], restart every 14 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v3_7x10_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1], [2]], restart every 7 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v3_7x10_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1], [2]], restart every 14 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v3_7x10_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1], [2]], restart every 21 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v3_7x10_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1, 2]], restart every 7 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1, 2]], restart every 14 MCUs, predictor 4"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v3 7x10, scans [[0], [1, 2]], restart every 21 MCUs, predictor 4"
+  },
+  "lossless_rstsub_v3_7x10_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[1, 2], [0]], restart every 4 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v4_4x17_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[1, 2], [0]], restart every 8 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v4_4x17_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1], [2]], restart every 4 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v4_4x17_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1], [2]], restart every 8 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v4_4x17_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1], [2]], restart every 12 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v4_4x17_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1, 2]], restart every 4 MCUs, predictor 4"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1, 2]], restart every 8 MCUs, predictor 7"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 4x17, scans [[0], [1, 2]], restart every 12 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v4_4x17_yfirst_pair_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_mid_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[1], [0], [2]], restart every 6 MCUs, predictor 4"
+  },
+  "lossless_rstsub_v4_6x9_mid_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_mid_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[1], [0], [2]], restart every 12 MCUs, predictor 1"
+  },
+  "lossless_rstsub_v4_6x9_mid_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_pair_yl_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[1, 2], [0]], restart every 6 MCUs, predictor 7"
+  },
+  "lossless_rstsub_v4_6x9_pair_yl_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_pair_yl_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[1, 2], [0]], restart every 12 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v4_6x9_pair_yl_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_rev_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[2], [1], [0]], restart every 6 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v4_6x9_rev_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_rev_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[2], [1], [0]], restart every 12 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v4_6x9_rev_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_sep_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1], [2]], restart every 6 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v4_6x9_sep_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_sep_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1], [2]], restart every 12 MCUs, predictor 2"
+  },
+  "lossless_rstsub_v4_6x9_sep_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_sep_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1], [2]], restart every 18 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v4_6x9_sep_r3.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r1.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1, 2]], restart every 6 MCUs, predictor 3"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r1.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r2.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1, 2]], restart every 12 MCUs, predictor 6"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r2.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r3.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "lossless: v4 6x9, scans [[0], [1, 2]], restart every 18 MCUs, predictor 5"
+  },
+  "lossless_rstsub_v4_6x9_yfirst_pair_r3.jpg.rgb": {
    "role": "golden",
    "published": true,
    "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
@@ -4721,6 +6506,96 @@
    "published": true,
    "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
   },
+  "smoothing_big_420_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 288x96 cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_big_420_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_420_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 288x96 cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_big_420_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_420_3scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 288x96 cut after 3 of 10 scans + EOI"
+  },
+  "smoothing_big_420_3scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_420_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 288x96 cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_big_420_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_420_7scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: 4:2:0 288x96 cut after 7 of 10 scans + EOI"
+  },
+  "smoothing_big_420_7scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_v3_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3, 290x64 cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_big_v3_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_v3_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3, 290x64 cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_big_v3_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_v3_3scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3, 290x64 cut after 3 of 10 scans + EOI"
+  },
+  "smoothing_big_v3_3scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_big_v3_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3, 290x64 cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_big_v3_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
   "smoothing_dc_10x10_q1_1.jpg": {
    "role": "input",
    "published": true,
@@ -5347,6 +7222,546 @@
    "note": "smoothing: one DC impulse 5, Q00 64, AC quantizers 4"
   },
   "smoothing_impulse_d5_q64_4.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_101x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_420_101x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_101x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_420_101x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_101x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_420_101x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_109x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_420_109x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_109x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_420_109x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_420_109x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_420_109x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_101x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_440_101x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_101x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_440_101x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_101x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 101x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_440_101x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_109x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_440_109x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_109x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_440_109x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_440_109x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x2,1x1,1x1, 109x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_440_109x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_149x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_149x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_149x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_149x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_149x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_149x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_157x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_157x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_157x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_157x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_157x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_157x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_165x49_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_165x49_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_165x49_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_165x49_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v3_165x49_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v3_165x49_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_197x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_197x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_197x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_197x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_197x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_197x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_205x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_205x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_205x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_205x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_205x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_205x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_213x49_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_213x49_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_213x49_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_213x49_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_213x49_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_213x49_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_221x52_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_221x52_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_221x52_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_221x52_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_h2v4_221x52_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 2x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_h2v4_221x52_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_149x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_149x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_149x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_149x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_149x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 149x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_149x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_157x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_157x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_157x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_157x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_157x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 157x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_157x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_165x49_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_165x49_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_165x49_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_165x49_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v3_165x49_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x3,1x1,1x1, 165x49: six full iMCU rows and 3 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v3_165x49_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_197x43_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_197x43_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_197x43_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_197x43_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_197x43_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 197x43: six full iMCU rows and 1 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_197x43_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_205x46_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_205x46_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_205x46_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_205x46_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_205x46_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 205x46: six full iMCU rows and 2 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_205x46_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_213x49_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_213x49_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_213x49_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_213x49_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_213x49_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 213x49: six full iMCU rows and 3 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_213x49_5scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_221x52_1scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 1 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_221x52_1scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_221x52_2scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 2 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_221x52_2scans.jpg.rgb": {
+   "role": "golden",
+   "published": true,
+   "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"
+  },
+  "smoothing_large_v4_221x52_5scans.jpg": {
+   "role": "input",
+   "published": true,
+   "note": "smoothing: cjpeg -sample 1x4,1x1,1x1, 221x52: six full iMCU rows and 4 block row(s) cut after 5 of 10 scans + EOI"
+  },
+  "smoothing_large_v4_221x52_5scans.jpg.rgb": {
    "role": "golden",
    "published": true,
    "note": "torchvision.io.decode_image(mode=RGB) of the input of the same name"

@@ -36,9 +36,43 @@ fn read_le_payload<T: PlainScalar>(f: &mut File, dst: &mut [T], what: &str) -> R
     Ok(())
 }
 
+/// The element types an `.npy` payload can hold: which [`NpyArray`] field
+/// carries them and what their absence is called. Sealed by being private.
+trait NpyElement: Sized {
+    const DTYPE: &'static str;
+    fn payload(array: &NpyArray) -> Option<&[Self]>;
+}
+
+impl NpyElement for f32 {
+    const DTYPE: &'static str = "float32";
+    fn payload(array: &NpyArray) -> Option<&[f32]> {
+        array.data_f32.as_deref()
+    }
+}
+
+impl NpyElement for f64 {
+    const DTYPE: &'static str = "float64";
+    fn payload(array: &NpyArray) -> Option<&[f64]> {
+        array.data_f64.as_deref()
+    }
+}
+
+impl NpyElement for i64 {
+    const DTYPE: &'static str = "int64";
+    fn payload(array: &NpyArray) -> Option<&[i64]> {
+        array.data_i64.as_deref()
+    }
+}
+
 impl NpyArray {
+    /// The payload as `T`, or the "expected {dtype} npy" error: the one owner
+    /// of the typed accessors below.
+    fn slice<T: NpyElement>(&self) -> Result<&[T], String> {
+        T::payload(self).ok_or_else(|| format!("expected {} npy", T::DTYPE))
+    }
+
     pub fn f32_slice(&self) -> Result<&[f32], String> {
-        self.data_f32.as_deref().ok_or_else(|| "expected float32 npy".into())
+        self.slice()
     }
 
     /// The f64 payload. Separate from [`NpyArray::f32_slice`] on purpose: a
@@ -46,11 +80,11 @@ impl NpyArray {
     /// not itself a source of error, and silently narrowing it to f32 on load
     /// would discard the property it exists to provide.
     pub fn f64_slice(&self) -> Result<&[f64], String> {
-        self.data_f64.as_deref().ok_or_else(|| "expected float64 npy".into())
+        self.slice()
     }
 
     pub fn i64_slice(&self) -> Result<&[i64], String> {
-        self.data_i64.as_deref().ok_or_else(|| "expected int64 npy".into())
+        self.slice()
     }
 
     pub fn scalar_f32(&self) -> Result<f32, String> {
@@ -354,3 +388,30 @@ pub fn write_npy_f32(path: &Path, shape: &[usize], data: &[f32]) -> Result<(), S
 
 #[allow(dead_code)]
 pub fn seek_noop() {}
+
+#[cfg(test)]
+mod accessor_tests {
+    use super::*;
+
+    /// Each typed accessor yields its own payload and, for any other, the
+    /// error naming the dtype it wanted.
+    #[test]
+    fn typed_slices_return_their_payload_or_name_the_missing_dtype() {
+        let only = |f32s: Option<Vec<f32>>, f64s: Option<Vec<f64>>, i64s: Option<Vec<i64>>| NpyArray {
+            shape: vec![1],
+            data_f32: f32s,
+            data_f64: f64s,
+            data_i64: i64s,
+        };
+        let a = only(Some(vec![1.5]), None, None);
+        assert_eq!(a.f32_slice().unwrap(), &[1.5]);
+        assert_eq!(a.f64_slice().unwrap_err(), "expected float64 npy");
+        assert_eq!(a.i64_slice().unwrap_err(), "expected int64 npy");
+        let b = only(None, Some(vec![2.5]), None);
+        assert_eq!(b.f64_slice().unwrap(), &[2.5]);
+        assert_eq!(b.f32_slice().unwrap_err(), "expected float32 npy");
+        let c = only(None, None, Some(vec![7]));
+        assert_eq!(c.i64_slice().unwrap(), &[7]);
+        assert_eq!(c.scalar_f32().unwrap_err(), "expected float32 npy");
+    }
+}

@@ -607,6 +607,15 @@ fn take_completed<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -> Vec<T> 
     done.into_iter().map(|(_, item)| item).collect()
 }
 
+/// Queue `item` on `queue` until the GPU passes `after`.
+///
+/// The one push every deferred-release queue goes through. A poisoned lock
+/// still holds the queue; dropping `item` here instead would free it under
+/// in-flight work (the rule [`take_completed`] applies on the way out).
+fn push_deferred<T>(queue: &Mutex<Vec<Deferred<T>>>, after: u64, item: T) {
+    queue.lock().unwrap_or_else(PoisonError::into_inner).push((after, item));
+}
+
 /// Persistent Hot scalar workspace (pos-buffer style). Bounded bump arena for
 /// stable GPU addresses across encodes — not a full decode ICB scalar graph.
 pub struct ParamsBuffer {
@@ -1324,24 +1333,17 @@ impl GpuRuntime {
 
     /// Called from [`crate::tensor::PooledBuffer`] Drop for cold temps.
     pub(crate) fn schedule_cold_recycle(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>, nbytes: usize) {
-        let after = self.release_point();
-        if let Ok(mut q) = self.pending_cold_recycle.lock() {
-            q.push((after, (buffer, nbytes)));
-        }
+        push_deferred(&self.pending_cold_recycle, self.release_point(), (buffer, nbytes));
     }
 
-    /// Retire a Hot buffer after all submitted work has completed.
-    ///
-    /// Hot storage never enters the freelist, but must leave the residency set
-    /// when its final handle drops.
-    /// Count a new wrap of a caller-owned buffer, adding it to the residency
-    /// set if it is the first live one.
     /// Wraps of caller buffers counted since the runtime was made. Test hook.
     #[doc(hidden)]
     pub fn external_wrap_total(&self) -> u64 {
         self.external_wrap_total.load(Ordering::Relaxed)
     }
 
+    /// Count a new wrap of a caller-owned buffer, adding it to the residency
+    /// set if it is the first live one.
     pub(crate) fn retain_external(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
         let key = buffer as *const ProtocolObject<dyn MTLBuffer> as *const () as usize;
         self.external_wrap_total.fetch_add(1, Ordering::Relaxed);
@@ -1356,29 +1358,21 @@ impl GpuRuntime {
     /// A wrap of a caller-owned buffer dropped; its count falls after the GPU
     /// has caught up, and the last one removes it from residency.
     pub(crate) fn schedule_external_release(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
-        let after = self.release_point();
-        if let Ok(mut q) = self.pending_external_release.lock() {
-            q.push((after, buffer));
-        }
+        push_deferred(&self.pending_external_release, self.release_point(), buffer);
     }
 
+    /// Retire a Hot buffer after all submitted work has completed.
+    ///
+    /// Hot storage never enters the freelist, but must leave the residency set
+    /// when its final handle drops.
     pub(crate) fn schedule_hot_retirement(&self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
-        let after = self.release_point();
-        if let Ok(mut q) = self.pending_retirement.lock() {
-            q.push((after, buffer));
-        }
+        push_deferred(&self.pending_retirement, self.release_point(), buffer);
     }
 
     /// Hold `alloc` until submitted work has completed, then release it,
     /// removing it from the residency set first when `resident`.
     pub(crate) fn schedule_release(&self, alloc: Retained<ProtocolObject<dyn MTLAllocation>>, resident: bool) {
-        // A poisoned lock still holds the queue; dropping `alloc` here instead
-        // would free it under in-flight work.
-        let after = self.release_point();
-        self.pending_release
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((after, (alloc, resident)));
+        push_deferred(&self.pending_release, self.release_point(), (alloc, resident));
     }
 
     /// The shared-event value after which a release scheduled now is safe:
@@ -3846,5 +3840,65 @@ mod alloc_recycle_tests {
         assert!(error.contains("lifetime event is at"), "{error}");
         assert!(rt.is_poisoned());
         assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
+    }
+}
+
+/// A panic while one of the deferred-release queues is locked poisons its
+/// mutex. The queue still holds its items, so a later push must still queue
+/// the buffer: dropping it at once would free memory under in-flight work.
+#[cfg(test)]
+mod deferred_release_poison_tests {
+    use super::*;
+
+    fn poison<T>(queue: &Mutex<T>) {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = queue.lock().unwrap();
+            panic!("poisoning a deferred-release queue on purpose");
+        }));
+        assert!(unwound.is_err());
+        assert!(queue.is_poisoned());
+    }
+
+    fn raw(rt: &GpuRuntime) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        rt.device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .expect("buffer")
+    }
+
+    fn len<T>(queue: &Mutex<Vec<T>>) -> usize {
+        queue.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    #[test]
+    fn cold_recycle_survives_a_poisoned_queue() {
+        let rt = GpuRuntime::new().unwrap();
+        poison(&rt.pending_cold_recycle);
+        rt.schedule_cold_recycle(raw(&rt), 4096);
+        assert_eq!(len(&rt.pending_cold_recycle), 1, "buffer dropped instead of queued");
+    }
+
+    #[test]
+    fn external_release_survives_a_poisoned_queue() {
+        let rt = GpuRuntime::new().unwrap();
+        poison(&rt.pending_external_release);
+        rt.schedule_external_release(raw(&rt));
+        assert_eq!(len(&rt.pending_external_release), 1, "buffer dropped instead of queued");
+    }
+
+    #[test]
+    fn hot_retirement_survives_a_poisoned_queue() {
+        let rt = GpuRuntime::new().unwrap();
+        poison(&rt.pending_retirement);
+        rt.schedule_hot_retirement(raw(&rt));
+        assert_eq!(len(&rt.pending_retirement), 1, "buffer dropped instead of queued");
+    }
+
+    #[test]
+    fn release_survives_a_poisoned_queue() {
+        let rt = GpuRuntime::new().unwrap();
+        poison(&rt.pending_release);
+        let buffer = raw(&rt);
+        rt.schedule_release(ProtocolObject::from_retained(buffer), false);
+        assert_eq!(len(&rt.pending_release), 1, "allocation dropped instead of queued");
     }
 }

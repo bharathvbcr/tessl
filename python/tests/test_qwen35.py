@@ -87,6 +87,51 @@ class Qwen35Training(unittest.TestCase):
         worst = max(rel_err(grads[n], want[n]) for n in want)
         self.assertLessEqual(worst, 1e-4)
 
+    def test_a_packed_batch_is_each_sequence_alone(self):
+        # tests/qwen35_train_ragged.rs's logic: the packed step's per-sequence
+        # losses are each sequence's own train_step loss (1e-6 relative), and
+        # its gradients the sum of the singles' scaled by (n_i - 1) / predictions
+        # (1e-5 of each tensor's peak). cu_seqlens is the int32 prefix-offset
+        # tensor DataCollatorWithFlattening calls cu_seq_lens_q, and the ids
+        # its [1, T] input_ids.
+        lens = [9, 2, 13, 5]
+        seqs, at = [], 0
+        for n in lens:
+            seqs.append(self.ids[at:at + n])
+            at += n
+        packed = torch.cat(seqs)[None]
+        cu = torch.tensor([0] + [sum(lens[:k + 1]) for k in range(len(lens))], dtype=torch.int32)
+        predictions = sum(n - 1 for n in lens)
+        m = self.model()
+        # The references, as tests/qwen35_train_ragged.rs's `singles`: every
+        # sequence alone with the batch's 1 / predictions scale, accumulated.
+        for k, (s, n) in enumerate(zip(seqs, lens)):
+            m.train_forward(s, positions=list(range(n - 1)), targets=s[1:], scale=1.0 / predictions)
+            m.train_backward(accumulate=k > 0)
+        want = {k: v.cpu().clone() for k, v in m.grads().items()}
+        alone = [m.train_step(s) for s in seqs]
+        loss, per = m.train_step_ragged(packed, cu)
+        self.assertEqual(len(per), len(lens))
+        for got, a in zip(per, alone):
+            self.assertLessEqual(abs(got - a), 1e-6 * abs(a))
+        mean = sum(a * (n - 1) for a, n in zip(alone, lens)) / predictions
+        self.assertLessEqual(abs(loss - mean), 1e-6 * abs(mean))
+        grads = m.grads()
+        self.assertEqual(sorted(grads), sorted(want))
+        self.assertLessEqual(max(rel_err(grads[n], want[n]) for n in want), 1e-5)
+        # Accumulating the same step again doubles the bank.
+        m.train_step_ragged(packed, cu, accumulate=True)
+        twice = m.grads()
+        self.assertLessEqual(max(rel_err(twice[n], 2 * grads[n].cpu().double()) for n in want), 1e-6)
+
+    def test_a_bad_cu_seqlens_is_refused_by_the_library(self):
+        m = self.model()
+        x = self.ids[:7]
+        for cu, needle in (([0, 4], "ends at 4"), ([1, 7], "starts at 1"), ([0, 3, 3, 7], "is empty"),
+                           ([0, 6, 7], "one token"), ([0], "at least 2")):
+            with self.assertRaisesRegex(TesslError, needle):
+                m.train_step_ragged(x, torch.tensor(cu, dtype=torch.int32))
+
     def test_a_bf16_operand_step_stays_near_transformers(self):
         # The same bounds as tests/qwen35_train.rs (set for this fixture before
         # its first run): loss within 2^-8, every gradient within 2^-5 of its

@@ -8,6 +8,17 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **C ABI 13** (additive; `TESSL_ABI_VERSION` 12 → 13): `tessl_qwen35_train_step_ragged`
+  exposes `Qwen35Model::train_step_ragged_into` (card ft-9e79d8be). It takes the
+  packed token ids, `cu_seqlens` (prefix offsets, `n_seq + 1` values: transformers'
+  `cu_seq_lens_q`), `operands` and `accumulate` (0 or 1), and returns the token-mean
+  loss plus each sequence's own loss in a caller buffer of `n_seq` f64s. Every
+  pointer, length and `cu_seqlens` rule (`check_cu_seqlens`) is checked before any
+  GPU work, with the bank as it was. `tessl_qwen35_train_step` and the other entries
+  are unchanged. `tessl_torch` gains `Qwen35.train_step_ragged(ids, cu_seqlens,
+  operands, accumulate)` (an int32 `cu_seqlens` tensor and `[1, T]` or 1-D ids, as
+  `DataCollatorWithFlattening` produces them); `chunk_gated_delta_rule` still refuses
+  `cu_seqlens` (the kernel seam has no ragged form) and now names this entry.
 - **`gemm_epilogue` on exact f32.** With relaxed precision off, f32 operands
   no longer get the "needs the cooperative-destination path" refusal: they run
   `matmul2d_tensorops_f32_exact_epi` (128x64) or `_64x64_sg4` (the plain

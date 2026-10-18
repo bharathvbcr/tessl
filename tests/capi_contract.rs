@@ -20,8 +20,8 @@ use tessl::capi::{
     tessl_cross_entropy_rows, tessl_gdn_train_backward, tessl_gdn_train_forward, tessl_qwen35_adamw_free,
     tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step_count, tessl_qwen35_free, tessl_qwen35_grad_sq_norm,
     tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_train_discard, tessl_qwen35_train_step,
-    tessl_runtime_free, tessl_runtime_poisoned, tessl_synchronize, TesslQwen35, TesslRuntime, TESSL_ABI_VERSION,
-    TESSL_ERR, TESSL_F32, TESSL_OK,
+    tessl_qwen35_train_step_ragged, tessl_runtime_free, tessl_runtime_poisoned, tessl_synchronize, TesslQwen35,
+    TesslRuntime, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_OK,
 };
 
 const ERR_LEN: usize = 512;
@@ -75,6 +75,22 @@ fn model_entries(model: *mut TesslQwen35) -> Vec<Call> {
         run(&mut out, "tessl_qwen35_train_step", &|e, n| {
             tessl_qwen35_train_step(model, ptr::null(), 0, 0, ptr::null_mut(), e, n)
         });
+        run(&mut out, "tessl_qwen35_train_step_ragged", &|e, n| {
+            tessl_qwen35_train_step_ragged(
+                model,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                e,
+                n,
+            )
+        });
         run(&mut out, "tessl_qwen35_train_discard", &|e, n| {
             tessl_qwen35_train_discard(model, e, n)
         });
@@ -100,7 +116,7 @@ fn a_null_handle_is_a_refusal_with_a_message_and_a_null_free_is_a_no_op() {
         .into_iter()
         .chain(model_entries(ptr::null_mut()))
         .collect();
-    assert_eq!(calls.len(), 13);
+    assert_eq!(calls.len(), 14);
     for (name, status, message) in calls {
         assert_eq!(status, TESSL_ERR, "{name}");
         assert!(message.starts_with("null "), "{name}: {message:?}");

@@ -10,9 +10,9 @@
 //! * `qwen35_rms_norm` (`w = 0`): `y[1] = a * rstd`. The backward with
 //!   `dy[0] = a, dy[1] = -a` has `dot = a*a - a*a = 0` exactly, so
 //!   `dx[0] = rstd * a`. Equal bits iff the two `rstd` are.
-//! * `qwen35_gated_rms_norm` (`w = 1`, `z[0] = z[1]`): `y[0] = a * rstd * s`,
-//!   `s = silu(z)`. The backward with `dy[0] = 1, dy[1] = -1` cancels `m`
-//!   exactly and gives `dx[0] = rstd * s`, so `y[0] == a * dx[0]`.
+//! * `qwen35_gated_rms_norm` (`w = 1`, `z[0] = z[1] = 64`, where `silu(z) = 64`
+//!   exactly): `y[0] = a * rstd * 64`. The backward with `dy[0] = 1, dy[1] = -1`
+//!   cancels `m` exactly and gives `dx[0] = rstd * 64`, so `y[0] == a * dx[0]`.
 //!
 //! The rest of the file is a characterization: `characterize` collects the
 //! forward outputs and the backward gradients on fixed seeded inputs (large,
@@ -200,8 +200,12 @@ fn gated_mismatches(rt: &std::sync::Arc<GpuRuntime>, d: usize, eps: f32) -> Vec<
     let (x, a) = rows_x(rows, d, 7200);
     let mut z = random_f32(rows * d, 7201);
     z.iter_mut().for_each(|v| *v *= 3.0);
+    // `silu(64) = 64 * sigmoid(64) = 64` exactly (the sigmoid is 1 to f32), so
+    // `s` is a power of two and the products below do not round: the kernels
+    // may associate `a * rstd * s` either way (fast math does).
     for r in 0..rows {
-        z[r * d + 1] = z[r * d];
+        z[r * d] = 64.0;
+        z[r * d + 1] = 64.0;
     }
     let w = vec![1.0f32; d];
     let y = gated_fwd(rt, &x, &z, &w, rows, 1, d, eps);

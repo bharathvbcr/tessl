@@ -160,6 +160,17 @@ pub struct Qwen35Grads {
 /// bf16; a [`GpuBuffer`] part is always f32).
 type Part<'a> = (&'a GpuBuffer, usize, usize, DType);
 
+/// The one `GdnTrainDims` the trainer builds: a single sequence of `t` tokens over
+/// the layout's value heads.
+fn single_seq_gdn_dims(g: &qwen35::GdnProjLayout, t: u32) -> GdnTrainDims {
+    GdnTrainDims {
+        batch: 1,
+        seq: t,
+        heads: g.v_heads(),
+        v_dim: g.v_dim(),
+    }
+}
+
 fn tensor_part(t: &Tensor) -> Part<'_> {
     (&t.buffer, t.byte_offset(), t.numel(), t.dtype)
 }
@@ -1667,12 +1678,7 @@ impl Qwen35Model {
         let has = |k: crate::qwen35_model::LayerKind| cfg.layers.contains(&k);
         let gdn = if mixers && has(crate::qwen35_model::LayerKind::LinearAttention) {
             let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
-            let dims = GdnTrainDims {
-                batch: 1,
-                seq: t,
-                heads: g.v_heads(),
-                v_dim: g.v_dim(),
-            };
+            let dims = single_seq_gdn_dims(&g, t);
             Some(GdnScratch {
                 dy: tensor(rt, &[tu, hv * dv])?,
                 d_o: tensor(rt, &[1, tu, hv, dv])?,
@@ -1947,13 +1953,7 @@ impl Qwen35Model {
             Mixer::Gdn(_) => {
                 let g = cfg.gdn;
                 let (hv, dv) = (g.v_heads() as usize, g.v_dim() as usize);
-                let ckpt = GdnTrainDims {
-                    batch: 1,
-                    seq: t,
-                    heads: g.v_heads(),
-                    v_dim: g.v_dim(),
-                }
-                .checkpoint_shape();
+                let ckpt = single_seq_gdn_dims(&g, t).checkpoint_shape();
                 b.extend([
                     f(tu * g.width() as usize), // proj
                     mm.nn_scratch_bytes(tu, g.width() as usize, h, wd),
@@ -2087,12 +2087,7 @@ impl Qwen35Model {
                 f(tu * g.width() as usize),
                 f(tu * g.conv_dim() as usize), // d_conv: dq, dk, dv
                 2 * f(tu * hv),                // dg, dbeta
-                GdnTrainWorkspace::allocated_bytes_for(GdnTrainDims {
-                    batch: 1,
-                    seq: t,
-                    heads: g.v_heads(),
-                    v_dim: g.v_dim(),
-                }),
+                GdnTrainWorkspace::allocated_bytes_for(single_seq_gdn_dims(&g, t)),
                 f(gated_rms_norm_bwd_part_len(t, g.v_heads(), g.v_dim())),
                 f(gdn_gates_bwd_part_len(t, g.v_heads())),
                 f(conv1d_silu_bwd_part_len(1, t, g.conv_dim(), cfg.conv_kernel)),
@@ -2410,12 +2405,7 @@ impl Qwen35Model {
             t,
             g.v_heads(),
         )?;
-        let dims = GdnTrainDims {
-            batch: 1,
-            seq: t,
-            heads: g.v_heads(),
-            v_dim: g.v_dim(),
-        };
+        let dims = single_seq_gdn_dims(&g, t);
         let ckpt = tensor(rt, &dims.checkpoint_shape())?;
         let o = tensor(rt, &[1, tu, hv, dv])?;
         let qkv = g.conv_qkv(&conv.buffer);
@@ -2705,12 +2695,7 @@ impl Qwen35Model {
             g.v_dim(),
             cfg.rms_norm_eps,
         )?;
-        let dims = GdnTrainDims {
-            batch: 1,
-            seq: t,
-            heads: g.v_heads(),
-            v_dim: g.v_dim(),
-        };
+        let dims = single_seq_gdn_dims(&g, t);
         let qkv = g.conv_qkv(&s.conv.buffer);
         let dqkv = g.conv_qkv(&gs.d_conv.buffer);
         let ld = qkv.ld;

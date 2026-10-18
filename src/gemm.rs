@@ -229,15 +229,7 @@ pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     {
         return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
     }
-    let rt = src.runtime();
-    let p = rt.pipeline("cast_f32_to_bf16")?;
-    let n = src.numel();
-    crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-        crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
-        crate::dispatch::set_u32(bnd, n as u32, 2);
-    })?;
-    Ok(())
+    cast_between(src, dst, "cast_f32_to_bf16")
 }
 
 /// Hot-resident bf16 clone of an f32 master (weights / EMA banks).
@@ -296,15 +288,7 @@ pub fn cast_bf16_to_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     {
         return Err("cast destination must match shape/runtime, be f32, and not overlap source".into());
     }
-    let rt = src.runtime();
-    let p = rt.pipeline("cast_bf16_to_f32")?;
-    let n = src.numel();
-    crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-        crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
-        crate::dispatch::set_u32(bnd, n as u32, 2);
-    })?;
-    Ok(())
+    cast_between(src, dst, "cast_bf16_to_f32")
 }
 
 /// `f32 -> f16`, allocating the destination.

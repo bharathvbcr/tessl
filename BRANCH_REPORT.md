@@ -310,3 +310,158 @@ git branch <branch> refs/backup/2026-10-17-pass3/gp/<name>
 # from the bundle if the refs are gone:
 git fetch /Users/bharath/Code/research/tessl-backups/tessl-refs-2026-10-17-pass3.bundle 'refs/backup/2026-10-17-pass3/*:refs/backup/2026-10-17-pass3/*'
 ```
+
+## Consolidation of 2026-10-18/19 (session tessl-a3, after the history scrub)
+
+Local only, nothing pushed. `origin/main` is still `60a6240`.
+
+**Outcome:** `main` moved `a1fccca` → `49d905e` → `a8fc965` → **`5971091`** → the commit that adds this section.
+- The first two moves are tessl-d5's. It landed wave 18 by cherry-picking each lane's own
+  commits onto scrubbed main, then committed its build report.
+- The last two are this session's: the `eg2/integrate` merge, then this report.
+
+**15 branches deleted** with their 12 worktrees. **1 kept** besides `main`.
+Main reaches neither scrubbed blob (`c8dd865`, `58b292b`); checked with
+`git rev-list --objects main -- src/media/resample.rs`.
+
+### Why nothing merged at the 21:50 inventory
+
+- **The scrub left 7 lanes on the old history.** At 20:41, main was rewritten to remove the
+  LGPL-derived `src/media/resample.rs`. tessl-d5's 7 wave-18 lanes had been cut from
+  pre-scrub `4e99ca6` at 20:39. Each still reached both blobs, so `merge --no-ff` would have
+  put the history back.
+- **Wave 18 was live.** tessl-d5 (pid 3901) was busy, and its tasks were in progress or in
+  review.
+- **eg2 was in use.** `eg2/integrate` had a live (idle) session and untracked files.
+- Fable reviewed this classification.
+- Backups were taken first:
+  - refs `refs/backup/2026-10-18T2150/*` for all 11 heads;
+  - bundle `tessl-backups/tessl-refs-2026-10-18T2150.bundle`, sha256 `4a52f1c7…76db`.
+
+### Wave 18 (landed by tessl-d5)
+
+- tessl-d5 integrated wave 18 itself. This session agreed not to run a second integration.
+- 12 commits `829f225..49d905e` on `a1fccca`, cherry-picked, never merged.
+- Its gates: fmt, build, clippy ×2, doc, hosted 1210, dialect, IR, emulator ×4, comparator,
+  torch host, Go unit, 689 device + lib 272.
+- ojas-2a acknowledged before the move.
+- This session checked the result independently:
+  - `git cherry main <lane> 4e99ca6` marks every lane commit `-`;
+  - `4e99ca6` is not an ancestor of main.
+
+### `eg2/integrate` merged: `5971091` (parents `a8fc965`, `5d9d589`)
+
+- **What came in:** 4 commits, 40 files: EmbedGemma 2 bench recordings (quiet machine, and
+  vs sentence-transformers on MPS), bench and plot binaries and their tests, docs, and
+  post-scrub sha references.
+- **Merged twice.** The first merge, `9b95f5e` (eg2 at `d8f9cc3`), was reviewed but never
+  landed: its ci:local was stopped when free disk space fell under 5 GiB.
+  - By the retry, the eg2 session had added `5d9d589`, so the merge was redone from
+    `a8fc965`.
+  - `5d9d589` touches neither hand-resolved file.
+  - The new tree equals `9b95f5e`'s plus exactly `d8f9cc3..5d9d589`'s 11 files.
+- **Built in its own worktree:** `../tessl-land`, on branch `land/eg2-onto-49d905e`.
+- **Conflict, `tests/qwen35_train_bytes_pin.rs` header:**
+  - Wave 18's `b19341c` reworded it for the re-pin. It still cited `a37a0c2`, the pre-scrub
+    name of `8c51319`, because the lane was written on the old history.
+  - eg2's `d8f9cc3` renamed that citation in the old wording.
+  - **Resolved:** wave 18's wording and `PINNED` values, with `8c51319`. Main and the
+    resolution differ only on that line.
+  - `a37a0c2` was the only pre-scrub commit name wave 18 added. Every hex token added on
+    the main side since `a1fccca` was checked.
+- **`BUILD_REPORT.md` merged cleanly.**
+  - tessl-d5's new "History scrub" section said the shas in later sections are pre-scrub.
+  - `d8f9cc3` renames them, which makes that false after this merge, so the sentence now
+    says so.
+  - The only pre-scrub names left are the deliberate old→new map (`41d8866`, `4e99ca6`).
+- **Changed on both sides, merged automatically, no clash:**
+  - `docs/benchmarking.md`: the two sides edit separate passages.
+  - `scripts/hosted_tests.txt`: no line was edited by both sides. The counts for
+    `bench_paired_cli` (30), `shader_index_arithmetic` (24) and bins (261) match `#[test]`.
+  - `tests/qwen35_train_ragged.rs`.
+- **Nothing outside those files breaks:** none of eg2's sources use lane C's moved
+  `config_json` / `encode_batch` items.
+- **Reviewed by Opus before the commit:** APPROVE.
+  - Opus left one point open: the `plot_results` (59) and `plot_results_go_overhead` (9)
+    counts in `hosted_tests.txt` don't match a `#[test]` count.
+  - Neither side of this merge changed those counts. The hosted-manifest step of ci:local
+    checks them.
+- **ci:local on `5971091`: `ci:local OK`, with no skips.**
+  - It ran 10-19 11:01–15:34 under the mac_heavy lock, so the python/tests GPU tests and
+    Go device tests ran too.
+  - 357 cargo `test result` lines: 3,425 passed, 0 failed, 68 ignored. The Python
+    unittest runs printed OK.
+  - Two earlier attempts were stopped by the under-5-GiB disk guard; other projects' temp
+    dirs had filled the disk.
+- **ojas-2a:** announced before the move and acknowledged it ("nothing for ojas to hold
+  on"). `git diff a8fc965 5971091` is empty for `src/runtime.rs`, `src/nn.rs`, `src/qwen35*`,
+  `kernels/`, safetensors and `Cargo.*`. The three error strings ojas pins are present.
+
+### Deleted (15 branches, 12 worktrees)
+
+None of the lane backups are in-repo refs: every lane reaches the scrubbed history, and
+tessl-d5 had deleted its own `refs/backup/2026-10-17-w14/*` for that reason at the owner's
+direction.
+
+| branch | tip | how it was proven redundant | backup |
+|---|---|---|---|
+| `eg2/squash` | `e58e349` | Abandoned squash. Its tree is `eg2/integrate@4976312` ± one doc line. | `refs/backup/2026-10-18T2150/eg2/squash` |
+| `backup/eg2-integrate-unsquashed` | `c4ed3f7` | Same sha as `refs/backup/2026-10-18/pre-scrub/eg2-integrate`. | that ref, plus `refs/backup/2026-10-18T2150/backup/eg2-integrate-unsquashed` |
+| `worktree-agent-a7cc82a395b90ff77` | `8e6b1aa` | Ancestor of a5c7. Adversarial pass, throwaway. | `refs/backup/2026-10-18T2150/…` |
+| `worktree-agent-a1d8ec82d69e54337` | `1f47b37` | Ancestor of a3981. | `refs/backup/2026-10-18T2150/…` |
+| `worktree-agent-a705d0a668227759d` | `cbd505f` | Ancestor of a9c5. | `refs/backup/2026-10-18T2150/…` |
+| `worktree-agent-ac4237797208015c5` | `4e99ca6` | Pre-scrub main. tessl-d5's integration from the old base, stopped and abandoned. | `refs/backup/2026-10-18/pre-scrub/main` |
+| `worktree-agent-a1ab17f396b4f4eda` | `b9b3a63` | Lane D. Every commit `-` against main. | bundle `tessl-lanes-2026-10-19-w18` |
+| `worktree-agent-a2435385eec2ccce9` | `ddcbb0a` | D's adversarial pass. Every commit `-`. | bundle |
+| `worktree-agent-a3981c68244d7d3a5` | `039c41b` | Lane C. Every commit `-`. | bundle |
+| `worktree-agent-a5c7dfb77889cac8d` | `8e6b1aa` | Lane A. Every commit `-`. | bundle |
+| `worktree-agent-a9c5f5a6b0e211e61` | `6a699f7` | Lane B. Every commit `-`. | bundle |
+| `worktree-agent-a7b4fca460eb2fefd` | `49d905e` | tessl-d5's integration branch. Its tip *is* the landed main. | bundle |
+| `land/eg2-onto-49d905e` | this report's commit | This session's landing branch, now main. | main |
+
+Each branch was deleted with `-D`, because a cherry-picked lane is not an ancestor of main
+(so `-d` refuses). The 4 `tmp/` scratch dirs were checked file by file:
+- every file but one was byte-identical to a committed blob;
+- the one unique file, a3981's `tmp/before.txt` (a characterization test log), is saved at
+  `tessl-backups/2026-10-19-w18-scratch/a3981-before.txt`.
+
+Lane bundle: `/Users/bharath/Code/research/tessl-backups/tessl-lanes-2026-10-19-w18.bundle`
+(6 heads, sha256 `0cc3e2e8…f3d7`). The list is in `tessl-lanes-2026-10-19-w18.txt`.
+
+### Kept
+
+- **`main`.**
+- **`eg2/integrate`** (`5d9d589`, now merged into main): it is still checked out at
+  `../tessl-eg2`.
+  - A live, idle session (pid 94493) is in that worktree.
+  - The worktree holds 4 untracked `bench/results/*attempt*` files, which belong to that
+    session.
+  - `git branch -d eg2/integrate` will succeed once the eg2 session is done with the
+    worktree.
+- **`../tessl-eg2/target/wt_base`** (detached at `42f1d52`, the eg2 bench baseline):
+  - Its directory was gone by 11:26 on 10-19, so `git worktree prune` removed the leftover
+    metadata.
+  - `42f1d52` is on main and reaches no scrubbed blob.
+- **tessl-d5's bench-lane wave** (`worktree-agent-ab9086…`, `acec4ee…`, `ad270c6…`): live
+  and started 10-19. tessl-d5 will cherry-pick it onto main after this landing.
+
+### Open for the owner
+
+These refs still reach the scrubbed LGPL blobs:
+- `refs/backup/2026-10-18T2150/*` lane and unsquashed refs (8);
+- `refs/backup/2026-10-18/pre-scrub/*`;
+- `refs/original/refs/scrub/*`, plus `refs/scrub/*`.
+
+Until they are deleted and the repo is gc'd, the blobs stay in the object store. tessl-d5's
+report asks to keep them until the scrubbing session publishes an old→new map.
+
+### Restore
+
+```sh
+# a deleted lane, from the bundle:
+git fetch /Users/bharath/Code/research/tessl-backups/tessl-lanes-2026-10-19-w18.bundle 'refs/heads/worktree-agent-<id>:refs/heads/worktree-agent-<id>'
+# eg2/squash, the 2026-10-18T2150 lane tips, or unsquashed:
+git branch <branch> refs/backup/2026-10-18T2150/<branch>
+# main as it was before the eg2 merge:
+git branch main-before-eg2 a8fc965
+```

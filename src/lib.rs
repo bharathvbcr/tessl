@@ -250,6 +250,7 @@ pub mod embedgemma2_mm;
 pub mod embedgemma2_pre;
 pub mod embedgemma2_tok;
 pub mod embedgemma2_vision;
+mod encode_batch;
 pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;

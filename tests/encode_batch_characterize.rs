@@ -35,16 +35,42 @@ fn cases() -> Vec<(&'static str, String)> {
     for root in ["[]", "3", "null", "\"x\"", "{", ""] {
         v.push(("root", root.to_string()));
     }
-    v.push(("text_config missing", edit(&base, "\"text_config\":{", "\"text_configX\":{")));
+    v.push((
+        "text_config missing",
+        edit(&base, "\"text_config\":{", "\"text_configX\":{"),
+    ));
     v.push(("vocab missing", edit(&base, "\"vocab_size\":48,", "")));
     v.push(("vocab float", edit(&base, "\"vocab_size\":48,", "\"vocab_size\":48.5,")));
-    v.push(("vocab negative", edit(&base, "\"vocab_size\":48,", "\"vocab_size\":-1,")));
+    v.push((
+        "vocab negative",
+        edit(&base, "\"vocab_size\":48,", "\"vocab_size\":-1,"),
+    ));
     v.push(("vocab null", edit(&base, "\"vocab_size\":48,", "\"vocab_size\":null,")));
-    v.push(("vocab big", edit(&base, "\"vocab_size\":48,", "\"vocab_size\":4294967296,")));
+    v.push((
+        "vocab big",
+        edit(&base, "\"vocab_size\":48,", "\"vocab_size\":4294967296,"),
+    ));
     v.push(("vocab zero", edit(&base, "\"vocab_size\":48,", "\"vocab_size\":0,")));
-    v.push(("eps string", edit(&base, "\"rms_norm_eps\":1e-06,\n\"layer", "\"rms_norm_eps\":\"x\",\n\"layer")));
-    v.push(("eps negative", edit(&base, "\"rms_norm_eps\":1e-06,\n\"layer", "\"rms_norm_eps\":-1.0,\n\"layer")));
-    v.push(("eps missing", edit(&base, "\"rms_norm_eps\":1e-06,\n\"layer", "\n\"layer")));
+    v.push((
+        "eps string",
+        edit(
+            &base,
+            "\"rms_norm_eps\":1e-06,\n\"layer",
+            "\"rms_norm_eps\":\"x\",\n\"layer",
+        ),
+    ));
+    v.push((
+        "eps negative",
+        edit(
+            &base,
+            "\"rms_norm_eps\":1e-06,\n\"layer",
+            "\"rms_norm_eps\":-1.0,\n\"layer",
+        ),
+    ));
+    v.push((
+        "eps missing",
+        edit(&base, "\"rms_norm_eps\":1e-06,\n\"layer", "\n\"layer"),
+    ));
     v.push((
         "text model_type wrong",
         edit(&base, "\"embedding_gemma2_text\"", "\"gemma\""),
@@ -55,48 +81,137 @@ fn cases() -> Vec<(&'static str, String)> {
     ));
     v.push((
         "activation wrong",
-        edit(&base, "\"hidden_activation\":\"gelu_pytorch_tanh\",\n", "\"hidden_activation\":\"relu\",\n"),
+        edit(
+            &base,
+            "\"hidden_activation\":\"gelu_pytorch_tanh\",\n",
+            "\"hidden_activation\":\"relu\",\n",
+        ),
     ));
-    v.push(("attention_bias true", edit(&base, "\"attention_bias\":false,\"hidden_activation\"", "\"attention_bias\":true,\"hidden_activation\"")));
+    v.push((
+        "attention_bias true",
+        edit(
+            &base,
+            "\"attention_bias\":false,\"hidden_activation\"",
+            "\"attention_bias\":true,\"hidden_activation\"",
+        ),
+    ));
     v.push((
         "layer_types short",
-        edit(&base, "[\"full_attention\",\"sliding_attention\",\"sliding_attention\"]", "[\"full_attention\"]"),
+        edit(
+            &base,
+            "[\"full_attention\",\"sliding_attention\",\"sliding_attention\"]",
+            "[\"full_attention\"]",
+        ),
     ));
     v.push((
         "layer_types unknown",
-        edit(&base, "[\"full_attention\",\"sliding_attention\",\"sliding_attention\"]", "[\"full_attention\",\"x\",\"sliding_attention\"]"),
+        edit(
+            &base,
+            "[\"full_attention\",\"sliding_attention\",\"sliding_attention\"]",
+            "[\"full_attention\",\"x\",\"sliding_attention\"]",
+        ),
     ));
     v.push((
         "per_layer unknown key",
         edit(&base, "\"00\":{\"head_dim\":512}", "\"00\":{\"hidden\":512}"),
     ));
-    v.push(("per_layer index", edit(&base, "\"00\":{\"head_dim\":512}", "\"9\":{\"head_dim\":512}")));
-    v.push(("rope missing", edit(&base, "\"rope_parameters\":{\"full", "\"rope_parametersX\":{\"full")));
-    v.push(("rope_type", edit(&base, "\"rope_type\":\"default\"},\n\"slid", "\"rope_type\":\"yarn\"},\n\"slid")));
-    v.push(("pad_token_id string", edit(&base, "\"pad_token_id\":0", "\"pad_token_id\":\"0\"")));
-    v.push(("pad_token_id null", edit(&base, "\"pad_token_id\":0", "\"pad_token_id\":null")));
-    v.push(("image_token_id negative", edit(&base, "\"image_token_id\":60", "\"image_token_id\":-1")));
+    v.push((
+        "per_layer index",
+        edit(&base, "\"00\":{\"head_dim\":512}", "\"9\":{\"head_dim\":512}"),
+    ));
+    v.push((
+        "rope missing",
+        edit(&base, "\"rope_parameters\":{\"full", "\"rope_parametersX\":{\"full"),
+    ));
+    v.push((
+        "rope_type",
+        edit(
+            &base,
+            "\"rope_type\":\"default\"},\n\"slid",
+            "\"rope_type\":\"yarn\"},\n\"slid",
+        ),
+    ));
+    v.push((
+        "pad_token_id string",
+        edit(&base, "\"pad_token_id\":0", "\"pad_token_id\":\"0\""),
+    ));
+    v.push((
+        "pad_token_id null",
+        edit(&base, "\"pad_token_id\":0", "\"pad_token_id\":null"),
+    ));
+    v.push((
+        "image_token_id negative",
+        edit(&base, "\"image_token_id\":60", "\"image_token_id\":-1"),
+    ));
     // Vision tower.
-    v.push(("vision missing", edit(&base, "\"vision_config\":", "\"vision_configX\":")));
-    v.push(("vision patch string", edit(&base, "\"patch_size\":4", "\"patch_size\":\"4\"")));
+    v.push((
+        "vision missing",
+        edit(&base, "\"vision_config\":", "\"vision_configX\":"),
+    ));
+    v.push((
+        "vision patch string",
+        edit(&base, "\"patch_size\":4", "\"patch_size\":\"4\""),
+    ));
     v.push(("vision patch missing", edit(&base, "\"patch_size\":4,", "")));
     v.push(("vision patch zero", edit(&base, "\"patch_size\":4", "\"patch_size\":0")));
-    v.push(("vision eps string", edit(&base, "\"rms_norm_eps\":1e-06,\n\"attention_bias\"", "\"rms_norm_eps\":\"e\",\n\"attention_bias\"")));
+    v.push((
+        "vision eps string",
+        edit(
+            &base,
+            "\"rms_norm_eps\":1e-06,\n\"attention_bias\"",
+            "\"rms_norm_eps\":\"e\",\n\"attention_bias\"",
+        ),
+    ));
     v.push(("vision model_type", edit(&base, "\"gemma4_vision\"", "\"gemma\"")));
-    v.push(("vision activation", edit(&base, "\"hidden_activation\":\"gelu_pytorch_tanh\",\"hidden_size\":96", "\"hidden_activation\":\"relu\",\"hidden_size\":96")));
-    v.push(("vision standardize number", edit(&base, "\"standardize\":false", "\"standardize\":1")));
-    v.push(("vision standardize true", edit(&base, "\"standardize\":false", "\"standardize\":true")));
-    v.push(("vision attention_bias true", edit(&base, "\"attention_bias\":false,\"attention_dropout\"", "\"attention_bias\":true,\"attention_dropout\"")));
+    v.push((
+        "vision activation",
+        edit(
+            &base,
+            "\"hidden_activation\":\"gelu_pytorch_tanh\",\"hidden_size\":96",
+            "\"hidden_activation\":\"relu\",\"hidden_size\":96",
+        ),
+    ));
+    v.push((
+        "vision standardize number",
+        edit(&base, "\"standardize\":false", "\"standardize\":1"),
+    ));
+    v.push((
+        "vision standardize true",
+        edit(&base, "\"standardize\":false", "\"standardize\":true"),
+    ));
+    v.push((
+        "vision attention_bias true",
+        edit(
+            &base,
+            "\"attention_bias\":false,\"attention_dropout\"",
+            "\"attention_bias\":true,\"attention_dropout\"",
+        ),
+    ));
     // Audio tower.
     v.push(("audio missing", edit(&base, "\"audio_config\":", "\"audio_configX\":")));
-    v.push(("audio hidden_act", edit(&base, "\"hidden_act\":\"silu\"", "\"hidden_act\":\"gelu\"")));
+    v.push((
+        "audio hidden_act",
+        edit(&base, "\"hidden_act\":\"silu\"", "\"hidden_act\":\"gelu\""),
+    ));
     v.push(("audio model_type", edit(&base, "\"gemma4_audio\"", "\"x\"")));
-    v.push(("audio clipped number", edit(&base, "\"use_clipped_linears\":true", "\"use_clipped_linears\":1")));
+    v.push((
+        "audio clipped number",
+        edit(&base, "\"use_clipped_linears\":true", "\"use_clipped_linears\":1"),
+    ));
     v.push(("audio chunk missing", edit(&base, "\"attention_chunk_size\":4,", "")));
-    v.push(("audio chunk negative", edit(&base, "\"attention_chunk_size\":4", "\"attention_chunk_size\":-4")));
-    v.push(("audio logit_cap string", edit(&base, "\"attention_logit_cap\":4.0", "\"attention_logit_cap\":\"4\"")));
+    v.push((
+        "audio chunk negative",
+        edit(&base, "\"attention_chunk_size\":4", "\"attention_chunk_size\":-4"),
+    ));
+    v.push((
+        "audio logit_cap string",
+        edit(&base, "\"attention_logit_cap\":4.0", "\"attention_logit_cap\":\"4\""),
+    ));
     v.push(("audio channels short", edit(&base, "[32,8]", "[32]")));
-    v.push(("audio eps zero", edit(&base, "\"rms_norm_eps\":1e-05", "\"rms_norm_eps\":0")));
+    v.push((
+        "audio eps zero",
+        edit(&base, "\"rms_norm_eps\":1e-05", "\"rms_norm_eps\":0"),
+    ));
     v
 }
 
@@ -138,7 +253,7 @@ fn the_three_readers_answer_as_recorded() {
 
 type UploadFn = fn(&std::sync::Arc<tessl::GpuRuntime>, &[(u32, u32)], u32) -> Result<tessl::tensor::GpuBuffer, String>;
 
-fn cached_configs()-> Vec<PathBuf> {
+fn cached_configs() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
@@ -148,7 +263,11 @@ fn cached_configs()-> Vec<PathBuf> {
         return out;
     };
     for m in models.flatten() {
-        if !m.file_name().to_string_lossy().starts_with("models--google--embeddinggemma") {
+        if !m
+            .file_name()
+            .to_string_lossy()
+            .starts_with("models--google--embeddinggemma")
+        {
             continue;
         }
         let Ok(snaps) = std::fs::read_dir(m.path().join("snapshots")) else {
@@ -179,7 +298,12 @@ fn text_reader_answers_the_cached_real_configs() {
         assert!(t.contains("EmbedGemma2Config"), "{t}");
         // Pinned shapes of google/embeddinggemma-2.
         assert!(t.contains("embedding_dim: 768"), "{}: {t}", p.display());
-        eprintln!("{}: text ok; vision {:?}; audio {:?}", p.display(), v.map(|x| x.len()), a.map(|x| x.len()));
+        eprintln!(
+            "{}: text ok; vision {:?}; audio {:?}",
+            p.display(),
+            v.map(|x| x.len()),
+            a.map(|x| x.len())
+        );
     }
 }
 
@@ -203,7 +327,10 @@ fn upload_segments_texts_and_bounds() {
                 e(&[(0, 1), (5, 2)], 8),
                 format!("{name}::upload_segments: segment 1 is [5, 2); need start < end <= 8")
             );
-            assert!(f(rt, &[], 0).is_ok(), "{name}: an empty list uploads nothing and is not an error");
+            assert!(
+                f(rt, &[], 0).is_ok(),
+                "{name}: an empty list uploads nothing and is not an error"
+            );
             assert!(f(rt, &[(0, 2), (2, 8)], 8).is_ok(), "{name}");
         }
     });
@@ -227,7 +354,10 @@ fn embedgemma2_encode_refuses_a_bad_batch_with_exact_texts() {
             err(&many, None, false),
             format!("{W}: {} sequences exceeds the batch limit {MAX_BATCH}", MAX_BATCH + 1)
         );
-        assert_eq!(err(&[&ok, &ok], None, true), format!("{W}: trace takes one sequence, got 2"));
+        assert_eq!(
+            err(&[&ok, &ok], None, true),
+            format!("{W}: trace takes one sequence, got 2")
+        );
         assert_eq!(err(&[&ok, &[]], None, false), format!("{W}: sequence 1 is empty"));
         assert_eq!(
             err(&[&ok], Some(0), false),

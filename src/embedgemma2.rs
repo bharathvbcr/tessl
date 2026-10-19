@@ -98,10 +98,11 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
+use crate::config_json;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2_tok::Tokenizer;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
-use crate::json::{self, Json, NumForm, Syntax};
+use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_bf16, rms_norm_f32,
@@ -454,16 +455,7 @@ pub fn encoder_attn_with(
 /// `[start, end)` row ranges for [`segment_mean_rows`], checked against
 /// `rows` and uploaded: `[n, 2]` u32.
 pub fn upload_segments(rt: &Arc<GpuRuntime>, segments: &[(u32, u32)], rows: u32) -> Result<GpuBuffer, String> {
-    for (i, &(start, end)) in segments.iter().enumerate() {
-        if start >= end || end > rows {
-            return Err(format!(
-                "embedgemma2::upload_segments: segment {i} is [{start}, {end}); need start < end <= {rows}"
-            ));
-        }
-    }
-    let flat: Vec<u32> = segments.iter().flat_map(|&(a, b)| [a, b]).collect();
-    rt.alloc_buffer_from_u32(&flat)
-        .map_err(|e| format!("embedgemma2::upload_segments: {e}"))
+    crate::encode_batch::upload_segments(rt, "embedgemma2", segments, rows)
 }
 
 /// `out[s] = mean(x[start_s..end_s])` over `x: [rows, dim]` f32, into `out:
@@ -1223,51 +1215,19 @@ impl EmbedGemma2Config {
     /// `text_config`, or a bare text config). Everything the forward does not
     /// implement is refused by name.
     pub fn from_config_json(text: &str) -> Result<Self, String> {
-        const SYNTAX: Syntax = Syntax {
-            what: "config.json",
-            max_depth: 16,
-            uints_only: false,
-            literals: true,
-        };
-        let root = json::parse(text, SYNTAX)?;
-        if !matches!(root, Json::Object(_)) {
-            return Err("config.json: the root is not an object".into());
-        }
+        let root = config_json::parse_object(text)?;
         let c = root.get("text_config").unwrap_or(&root);
-        let uint_in = |obj: &Json, k: &str| -> Result<u32, String> {
-            match obj.get(k) {
-                Some(Json::Num {
-                    form: NumForm::Uint,
-                    int: n,
-                    ..
-                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
-                Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
-        let uint = |k: &str| uint_in(c, k);
-        let num = |obj: &Json, k: &str| -> Result<f64, String> {
-            match obj.get(k) {
-                Some(Json::Num { value, .. }) => Ok(*value),
-                Some(v) => Err(format!("config.json: {k} must be a number, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
+        let uint = |k: &str| config_json::uint(c, k);
+        let num = |obj: &Json, k: &str| config_json::float(config_json::field(obj, k)?, k);
         // An id that may be absent (or null: a text-only config); a present one
         // must be a u32.
         let opt_uint = |obj: &Json, k: &str| -> Result<Option<u32>, String> {
             match obj.get(k) {
                 None | Some(Json::Null) => Ok(None),
-                Some(_) => uint_in(obj, k).map(Some),
+                Some(_) => config_json::uint(obj, k).map(Some),
             }
         };
-        let string = |k: &str| -> Result<Option<&str>, String> {
-            match c.get(k) {
-                None => Ok(None),
-                Some(Json::Str(s)) => Ok(Some(s.as_str())),
-                Some(v) => Err(format!("config.json: {k} must be a string, got {v:?}")),
-            }
-        };
+        let string = |k: &str| config_json::string(c, k);
 
         if let Some(t) = string("model_type")? {
             if t != "embedding_gemma2_text" {
@@ -1363,7 +1323,7 @@ impl EmbedGemma2Config {
                             }
                         }
                     }
-                    let get = |k: &str| v.get(k).map(|_| uint_in(v, k)).transpose();
+                    let get = |k: &str| v.get(k).map(|_| config_json::uint(v, k)).transpose();
                     overrides[i] = (get("head_dim")?, get("num_key_value_heads")?);
                 }
             }
@@ -2229,18 +2189,7 @@ impl EmbedGemma2Model {
                 cfg.embedding_dim
             ));
         }
-        if ids.is_empty() {
-            return Err(format!("{what}: empty batch"));
-        }
-        if ids.len() > MAX_BATCH {
-            return Err(format!(
-                "{what}: {} sequences exceeds the batch limit {MAX_BATCH}",
-                ids.len()
-            ));
-        }
-        if trace && ids.len() != 1 {
-            return Err(format!("{what}: trace takes one sequence, got {}", ids.len()));
-        }
+        crate::encode_batch::check_batch_shape(what, ids.len(), MAX_BATCH, trace)?;
         if self.operands == GemmOperands::ExactF32 && self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{what}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"

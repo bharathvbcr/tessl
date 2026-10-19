@@ -114,10 +114,11 @@ use std::sync::Arc;
 
 use objc2_metal::MTLComputePipelineState;
 
+use crate::config_json;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2::SoftSegment;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, select_backend, GemmBackend, GemmOperands};
-use crate::json::{self, Json, NumForm, Syntax};
+use crate::json::{Json, NumForm};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35_model::Precision;
@@ -332,38 +333,12 @@ impl AudioConfig {
     /// `audio_config` and a `text_config`, or a bare audio config plus
     /// `text_hidden`). What the forward does not implement is refused by name.
     pub fn from_config_json(text: &str) -> Result<Self, String> {
-        const SYNTAX: Syntax = Syntax {
-            what: "config.json",
-            max_depth: 16,
-            uints_only: false,
-            literals: true,
-        };
-        let root = json::parse(text, SYNTAX)?;
-        if !matches!(root, Json::Object(_)) {
-            return Err("config.json: the root is not an object".into());
-        }
+        let root = config_json::parse_object(text)?;
         let c = root
             .get("audio_config")
             .ok_or("config.json: missing \"audio_config\"")?;
-        let uint_in = |obj: &Json, k: &str| -> Result<u32, String> {
-            match obj.get(k) {
-                Some(Json::Num {
-                    form: NumForm::Uint,
-                    int: n,
-                    ..
-                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
-                Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
-        let uint = |k: &str| uint_in(c, k);
-        let num = |k: &str| -> Result<f64, String> {
-            match c.get(k) {
-                Some(Json::Num { value, .. }) => Ok(*value),
-                Some(v) => Err(format!("config.json: {k} must be a number, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
+        let uint = |k: &str| config_json::uint(c, k);
+        let num = |k: &str| config_json::float(config_json::field(c, k)?, k);
         if let Some(Json::Str(t)) = c.get("model_type") {
             if t != "gemma4_audio" {
                 return Err(format!("config.json: audio model_type {t:?} is not gemma4_audio"));
@@ -412,7 +387,7 @@ impl AudioConfig {
             ));
         };
         let text_hidden = match root.get("text_config") {
-            Some(t) => uint_in(t, "hidden_size")?,
+            Some(t) => config_json::uint(t, "hidden_size")?,
             None => {
                 return Err("config.json: missing \"text_config\" (the soft tokens' width is its hidden_size)".into())
             }

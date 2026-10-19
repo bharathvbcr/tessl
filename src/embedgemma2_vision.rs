@@ -118,12 +118,13 @@
 
 use std::sync::Arc;
 
+use crate::config_json;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{
     encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims, SoftSegment,
 };
 use crate::gemm::{cast_f32_to_bf16_into, GemmOperands};
-use crate::json::{self, Json, NumForm, Syntax};
+use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{
     attn_kv_capacity, attn_kv_capacity_bf16, bind_rope_inv_freq, require, require_disjoint_writes, rms_norm_bf16,
@@ -502,45 +503,14 @@ impl VisionConfig {
     /// `vision_config` and a `text_config`). Everything the forward does not
     /// implement is refused by name.
     pub fn from_config_json(text: &str) -> Result<Self, String> {
-        const SYNTAX: Syntax = Syntax {
-            what: "config.json",
-            max_depth: 16,
-            uints_only: false,
-            literals: true,
-        };
-        let root = json::parse(text, SYNTAX)?;
-        if !matches!(root, Json::Object(_)) {
-            return Err("config.json: the root is not an object".into());
-        }
+        let root = config_json::parse_object(text)?;
         let c = root
             .get("vision_config")
             .ok_or("config.json: missing \"vision_config\"")?;
         let text_cfg = root.get("text_config").ok_or("config.json: missing \"text_config\"")?;
-        let uint_of = |obj: &Json, k: &str| -> Result<u32, String> {
-            match obj.get(k) {
-                Some(Json::Num {
-                    form: NumForm::Uint,
-                    int: n,
-                    ..
-                }) => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
-                Some(v) => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
-        let num_of = |obj: &Json, k: &str| -> Result<f64, String> {
-            match obj.get(k) {
-                Some(Json::Num { value, .. }) => Ok(*value),
-                Some(v) => Err(format!("config.json: {k} must be a number, got {v:?}")),
-                None => Err(format!("config.json: missing {k:?}")),
-            }
-        };
-        let str_of = |obj: &Json, k: &str| -> Result<Option<String>, String> {
-            match obj.get(k) {
-                None => Ok(None),
-                Some(Json::Str(s)) => Ok(Some(s.clone())),
-                Some(v) => Err(format!("config.json: {k} must be a string, got {v:?}")),
-            }
-        };
+        let uint_of = config_json::uint;
+        let num_of = |obj: &Json, k: &str| config_json::float(config_json::field(obj, k)?, k);
+        let str_of = config_json::string;
         let flag = |k: &str| -> Result<bool, String> {
             match c.get(k) {
                 None => Ok(false),
@@ -556,7 +526,7 @@ impl VisionConfig {
                 ));
             }
         }
-        match str_of(c, "hidden_activation")?.as_deref() {
+        match str_of(c, "hidden_activation")? {
             Some("gelu_pytorch_tanh") => {}
             other => {
                 return Err(format!(
@@ -633,7 +603,7 @@ impl VisionConfig {
         let rope = c
             .get("rope_parameters")
             .ok_or("config.json: vision_config is missing \"rope_parameters\"")?;
-        match str_of(rope, "rope_type")?.as_deref() {
+        match str_of(rope, "rope_type")? {
             Some("axial") => {}
             other => {
                 return Err(format!(

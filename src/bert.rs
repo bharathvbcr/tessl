@@ -332,19 +332,7 @@ pub fn bias_gelu_erf(
 /// `[start, end)` row ranges for [`segment_sparse_max`], checked against
 /// `rows` and uploaded: `[n, 2]` u32.
 pub fn upload_segments(rt: &Arc<GpuRuntime>, segments: &[(u32, u32)], rows: u32) -> Result<GpuBuffer, String> {
-    for (i, &(start, end)) in segments.iter().enumerate() {
-        if start >= end || end > rows {
-            return Err(format!(
-                "bert::upload_segments: segment {i} is [{start}, {end}); need start < end <= {rows}"
-            ));
-        }
-    }
-    let flat: Vec<u32> = segments.iter().flat_map(|&(a, b)| [a, b]).collect();
-    // A fresh buffer written without waiting for the GPU: a host write into
-    // an ordinary allocation would first commit and wait on everything
-    // queued, the whole encoder forward on the first head block.
-    rt.alloc_buffer_from_u32(&flat)
-        .map_err(|e| format!("bert::upload_segments: {e}"))
+    crate::encode_batch::upload_segments(rt, "bert", segments, rows)
 }
 
 /// `pooled[s, v] = max(pooled[s, v], log1p(relu(max_{r in segment s}
@@ -820,18 +808,7 @@ impl BertSparseModel {
     pub fn encode(&self, batch: &[&[u32]], trace: bool) -> Result<SparseOutput, String> {
         const WHAT: &str = "BertSparseModel::encode";
         let cfg = &self.cfg;
-        if batch.is_empty() {
-            return Err(format!("{WHAT}: empty batch"));
-        }
-        if batch.len() > MAX_BATCH {
-            return Err(format!(
-                "{WHAT}: {} sequences exceeds the batch limit {MAX_BATCH}",
-                batch.len()
-            ));
-        }
-        if trace && batch.len() != 1 {
-            return Err(format!("{WHAT}: trace takes one sequence, got {}", batch.len()));
-        }
+        crate::encode_batch::check_batch_shape(WHAT, batch.len(), MAX_BATCH, trace)?;
         if self.rt.f32_gemm_runs_relaxed() {
             return Err(format!(
                 "{WHAT}: the forward needs exact-f32 GEMMs; switch the runtime's relaxed precision off"

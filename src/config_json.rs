@@ -1,5 +1,5 @@
-//! The one reader of a Hugging Face `config.json` that `bert` and
-//! `qwen35_model` share: parse to an object, then typed field readers over
+//! The one reader of a Hugging Face `config.json` that `bert`, `qwen35_model`
+//! and the EmbedGemma2 text, vision and audio configs share: parse to an object, then typed field readers over
 //! tessl's own [`Json`]. Every message names the key and starts `config.json:`.
 //!
 //! A key that is present with the wrong type is always an error, `null`

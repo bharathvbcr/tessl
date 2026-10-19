@@ -164,6 +164,30 @@ fn clean_env_drops_inherited_bench_variables_but_not_the_lane_line() {
 }
 
 #[test]
+fn the_label_is_written_to_the_json_and_absent_without_one() {
+    let d = scratch("label");
+    let a = metric_bin(&d, "a", "1");
+    let b = metric_bin(&d, "b", "2");
+    for (tag, label) in [("with", Some("42f1d52 against head")), ("without", None)] {
+        let out_json = d.join(format!("{tag}.json"));
+        let mut args = strs(&["--format", "metrics", "--rounds", "2", "--out"]);
+        args.push(out_json.display().to_string());
+        if let Some(l) = label {
+            args.extend(strs(&["--label", l]));
+        }
+        args.push(format!("a={}", a.display()));
+        args.push(format!("b={}", b.display()));
+        let out = run(&args);
+        assert!(out.status.success(), "{tag}: {}", stderr(&out));
+        let text = fs::read_to_string(&out_json).unwrap();
+        match label {
+            Some(l) => assert!(text.contains(&format!("\"label\": \"{l}\"")), "{tag}: {text}"),
+            None => assert!(!text.contains("\"label\""), "{tag}: {text}"),
+        }
+    }
+}
+
+#[test]
 fn a_drifting_ratio_past_max_spread_exits_3_and_publishes_nothing() {
     let d = scratch("drift");
     let counter = d.join("n");

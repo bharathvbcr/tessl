@@ -338,6 +338,8 @@ fn no_svg_in(dir: &Path) -> bool {
 
 const ALL: &[(&str, &str)] = &[
     ("final", "embedgemma2_final_m5pro"),
+    ("integrate-text", "embedgemma2_integrate_text_m5pro"),
+    ("integrate-mm", "embedgemma2_integrate_mm_m5pro"),
     ("audio-speed", "embedgemma2_audio_speed_m5pro"),
     ("mm-onewait", "embedgemma2_mm_onewait_m5pro"),
     ("pre", "embedgemma2_pre_m5pro"),
@@ -1065,6 +1067,52 @@ fn tok_refuses_a_missing_lane_file() {
     assert_eq!(r.code, Some(1));
     assert!(r.err.contains("hf_lane.json"), "{}", r.err);
     assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn a_paired_figure_is_titled_by_its_runs_label_and_refused_without_one() {
+    let f = "embedgemma2_final_m5pro.json";
+    let dir = copy_of("label", &[f]);
+    let p = dir.join(f);
+    tamper(
+        &p,
+        "60a6240 against eg2/integrate\"",
+        "branch point against the integrated tree\"",
+        false,
+    );
+    let r = run(&["final", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let svg = fs::read_to_string(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    assert!(
+        svg.contains("branch point against the integrated tree (6 interleaved rounds)"),
+        "title is not the label"
+    );
+    assert!(!svg.contains("60a6240"), "a revision the run did not record is drawn");
+    // The three runs it draws each carry their own label.
+    for (name, want) in [
+        ("final", "60a6240 against eg2/integrate"),
+        ("integrate-text", "42f1d52 (branch point) against eg2/integrate"),
+        ("integrate-mm", "multimodal encode on Apple M5 Pro: 42f1d52"),
+    ] {
+        assert!(render(name).svg.contains(want), "{name}");
+    }
+    fs::remove_file(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    tamper(&p, "\"label\":", "\"label_gone\":", false);
+    let r = run(&["final", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("final.label: missing key"), "{}", r.err);
+    assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn figures_whose_data_records_no_machine_state_claim_none() {
+    // These result files hold timings only; the load they ran at is in the .txt
+    // beside them, so a title asserting it would be a constant, not a record.
+    for name in ["jpeg-decode", "video-color"] {
+        let svg = render(name).svg;
+        assert!(!svg.contains("shared machine"), "{name}");
+        assert!(svg.contains("recorded in the .txt beside the data"), "{name}");
+    }
 }
 
 #[test]

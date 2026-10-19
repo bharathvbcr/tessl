@@ -45,9 +45,38 @@ fn svg_of(path: &Path) -> registry::Output {
 
 /// A result document with the given rows (already JSON) and ping minimum.
 fn doc(rows: &str, ping: &str) -> String {
+    doc_with_load(rows, ping, "{ 3.87 5.25 6.69 }")
+}
+
+/// [`doc`] with the `vm.loadavg` record taken before the run (after: `{ 5.56 5.54 6.70 }`).
+fn doc_with_load(rows: &str, ping: &str, before: &str) -> String {
     format!(
-        "{{\"benchmark\":\"embedgemma2_go_overhead\",\"rounds\":3,\"iters_per_round\":10,\"ping\":{{\"min_us\":{ping}}},\"rows\":[{rows}]}}"
+        "{{\"benchmark\":\"embedgemma2_go_overhead\",\"rounds\":3,\"iters_per_round\":10,\
+         \"host\":{{\"loadavg_before\":\"{before}\",\"loadavg_after\":\"{{ 5.56 5.54 6.70 }}\"}},\
+         \"ping\":{{\"min_us\":{ping}}},\"rows\":[{rows}]}}"
     )
+}
+
+#[test]
+fn the_figure_states_the_recorded_load_and_refuses_a_bad_record() {
+    let dir = fresh("load");
+    let write = |body: &str| {
+        let p = dir.join("embedgemma2_go_m5pro.json");
+        fs::write(&p, body).unwrap();
+        p
+    };
+    let svg = svg_of(&write(&doc(&row("texts x1", "60.0", "10.0"), "3.0"))).svg;
+    assert!(
+        svg.contains("1-minute load average 3.9 before, 5.6 after"),
+        "load not drawn"
+    );
+    assert!(!svg.contains("shared machine"), "a condition the run did not record");
+    for bad in ["", "{ }", "{ busy 1 2 }", "{ -1 0 0 }"] {
+        let p = write(&doc_with_load(&row("texts x1", "60.0", "10.0"), "3.0", bad));
+        let (code, _, err) = run(&["go-overhead", p.to_str().unwrap()]);
+        assert_eq!(code, Some(1), "{bad:?}");
+        assert!(err.contains("is not a vm.loadavg record"), "{bad:?}: {err}");
+    }
 }
 
 /// One workload's row; `paired` is the paired overhead minimum, `vs_direct` the

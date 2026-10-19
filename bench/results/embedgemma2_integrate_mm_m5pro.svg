@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="652.8" viewBox="0 0 1500 652.8" role="img">
+<title>EmbeddingGemma 2 multimodal encode on Apple M5 Pro: 42f1d52 (branch point) against eg2/integrate 2849fbe (8 interleaved rounds)</title>
+<style>
+text{font-family:-apple-system,Helvetica,Arial,sans-serif}
+.ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
+.bg{fill:#fff}.grid{stroke:#e6e5e1;stroke-width:1}.axis{stroke:#b3b2ac;stroke-width:1}
+.sk{stroke:#0b0b0b}.mk{stroke:#52514e}.edge{stroke:#fff}
+@media (prefers-color-scheme:dark){.bg{fill:#1a1a19}.ink{fill:#f0efec}.mut{fill:#c3c2b7}.dim{fill:#8c8b84}
+.grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
+</style>
+<rect class="bg" width="100%" height="100%"/>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">EmbeddingGemma 2 multimodal encode on Apple M5 Pro: 42f1d52 (branch point) against eg2/integrate 2849fbe (8 interleaved rounds)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">Left: each lane&apos;s median over rounds of its min-of-N encode time, log scale. Middle: speed-up against the first lane (1 / the median per-round ratio, whiskers at the lowest and highest round). Right: device peak above the loaded model.</text>
+<rect class="key" x="14" y="54.3" width="14" height="10" fill="#2a78d6"/>
+<text class="mut" x="34" y="63.3" font-size="11">before</text>
+<rect class="key" x="83.02" y="54.3" width="14" height="10" fill="#eb6834"/>
+<text class="mut" x="103.02" y="63.3" font-size="11">after</text>
+<rect class="key" x="143.35" y="54.3" width="14" height="10" fill="#8a8985"/>
+<text class="mut" x="163.35" y="63.3" font-size="11">control</text>
+<g class="panel">
+<line class="grid" x1="71.04" y1="578.84" x2="506" y2="578.84"/>
+<line class="axis" x1="67.04" y1="578.84" x2="71.04" y2="578.84"/>
+<text class="mut" x="64.04" y="582.69" font-size="11" text-anchor="end">200</text>
+<line class="grid" x1="71.04" y1="393.23" x2="506" y2="393.23"/>
+<line class="axis" x1="67.04" y1="393.23" x2="71.04" y2="393.23"/>
+<text class="mut" x="64.04" y="397.08" font-size="11" text-anchor="end">500</text>
+<line class="grid" x1="71.04" y1="252.81" x2="506" y2="252.81"/>
+<line class="axis" x1="67.04" y1="252.81" x2="71.04" y2="252.81"/>
+<text class="mut" x="64.04" y="256.66" font-size="11" text-anchor="end">1000</text>
+<line class="grid" x1="71.04" y1="112.4" x2="506" y2="112.4"/>
+<line class="axis" x1="67.04" y1="112.4" x2="71.04" y2="112.4"/>
+<text class="mut" x="64.04" y="116.25" font-size="11" text-anchor="end">2000</text>
+<line class="axis" x1="143.53" y1="578.84" x2="143.53" y2="582.84"/>
+<text class="mut" x="146.53" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 146.53 592.84)">mixed_full</text>
+<line class="axis" x1="288.52" y1="578.84" x2="288.52" y2="582.84"/>
+<text class="mut" x="291.52" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 291.52 592.84)">mixed_short</text>
+<line class="axis" x1="433.51" y1="578.84" x2="433.51" y2="582.84"/>
+<text class="mut" x="436.51" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 436.51 592.84)">media_only</text>
+<line class="axis" x1="71.04" y1="578.84" x2="506" y2="578.84"/>
+<line class="axis" x1="71.04" y1="112.4" x2="71.04" y2="578.84"/>
+<text class="mut" x="31.52" y="345.62" font-size="12" text-anchor="middle" transform="rotate(-90 31.52 345.62)">encode, ms (median over rounds of min-of-N; log)</text>
+<text class="ink" x="71.04" y="98.06" font-size="13" font-weight="600">Encode time per workload</text>
+<rect x="87.09" y="238.94" width="35.57" height="339.9" class="bar" fill="#2a78d6"/>
+<rect x="125.75" y="239.07" width="35.57" height="339.77" class="bar" fill="#eb6834"/>
+<rect x="164.41" y="237.62" width="35.57" height="341.22" class="bar" fill="#8a8985"/>
+<rect x="232.07" y="426.62" width="35.57" height="152.22" class="bar" fill="#2a78d6"/>
+<rect x="270.73" y="428.17" width="35.57" height="150.67" class="bar" fill="#eb6834"/>
+<rect x="309.4" y="430.68" width="35.57" height="148.17" class="bar" fill="#8a8985"/>
+<rect x="377.06" y="434.72" width="35.57" height="144.12" class="bar" fill="#2a78d6"/>
+<rect x="415.72" y="435.61" width="35.57" height="143.23" class="bar" fill="#eb6834"/>
+<rect x="454.38" y="441.19" width="35.57" height="137.66" class="bar" fill="#8a8985"/>
+</g>
+<g class="panel">
+<line class="grid" x1="578.56" y1="340.26" x2="1032" y2="340.26"/>
+<line class="axis" x1="574.56" y1="340.26" x2="578.56" y2="340.26"/>
+<text class="mut" x="571.56" y="344.11" font-size="11" text-anchor="end">1</text>
+<line class="axis" x1="654.13" y1="578.84" x2="654.13" y2="582.84"/>
+<text class="mut" x="657.13" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 657.13 592.84)">mixed_full</text>
+<line class="axis" x1="805.28" y1="578.84" x2="805.28" y2="582.84"/>
+<text class="mut" x="808.28" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 808.28 592.84)">mixed_short</text>
+<line class="axis" x1="956.43" y1="578.84" x2="956.43" y2="582.84"/>
+<text class="mut" x="959.43" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 959.43 592.84)">media_only</text>
+<line class="axis" x1="578.56" y1="578.84" x2="1032" y2="578.84"/>
+<line class="axis" x1="578.56" y1="112.4" x2="578.56" y2="578.84"/>
+<text class="mut" x="557.52" y="345.62" font-size="12" text-anchor="middle" transform="rotate(-90 557.52 345.62)">speed-up vs before (log; whiskers: lowest/highest round)</text>
+<text class="ink" x="578.56" y="98.06" font-size="13" font-weight="600">Speed-up against the first lane (before)</text>
+<line x1="578.56" y1="340.26" x2="1032" y2="340.26" class="ref mk" stroke-width="1" stroke-dasharray="5 4"/>
+<rect x="596.09" y="339.3" width="55.62" height="239.54" class="bar" fill="#eb6834"/>
+<g class="whisker sk" stroke-width="1"><line x1="623.9" y1="439.13" x2="623.9" y2="306.36"/><line x1="620.9" y1="439.13" x2="626.9" y2="439.13"/><line x1="620.9" y1="306.36" x2="626.9" y2="306.36"/></g>
+<text class="ink" x="626.9" y="301.36" font-size="9.5" transform="rotate(-90 626.9 301.36)">1.00x</text>
+<rect x="656.55" y="336" width="55.62" height="242.84" class="bar" fill="#8a8985"/>
+<g class="whisker sk" stroke-width="1"><line x1="684.36" y1="429.97" x2="684.36" y2="268.85"/><line x1="681.36" y1="429.97" x2="687.36" y2="429.97"/><line x1="681.36" y1="268.85" x2="687.36" y2="268.85"/></g>
+<text class="ink" x="687.36" y="263.85" font-size="9.5" transform="rotate(-90 687.36 263.85)">1.00x</text>
+<rect x="747.24" y="337.22" width="55.62" height="241.63" class="bar" fill="#eb6834"/>
+<g class="whisker sk" stroke-width="1"><line x1="775.05" y1="343.07" x2="775.05" y2="237.55"/><line x1="772.05" y1="343.07" x2="778.05" y2="343.07"/><line x1="772.05" y1="237.55" x2="778.05" y2="237.55"/></g>
+<text class="ink" x="778.05" y="232.55" font-size="9.5" transform="rotate(-90 778.05 232.55)">1.00x</text>
+<rect x="807.7" y="340.55" width="55.62" height="238.29" class="bar" fill="#8a8985"/>
+<g class="whisker sk" stroke-width="1"><line x1="835.51" y1="466.62" x2="835.51" y2="232.97"/><line x1="832.51" y1="466.62" x2="838.51" y2="466.62"/><line x1="832.51" y1="232.97" x2="838.51" y2="232.97"/></g>
+<text class="ink" x="838.51" y="227.97" font-size="9.5" transform="rotate(-90 838.51 227.97)">1.00x</text>
+<rect x="898.39" y="331.11" width="55.62" height="247.74" class="bar" fill="#eb6834"/>
+<g class="whisker sk" stroke-width="1"><line x1="926.2" y1="373.54" x2="926.2" y2="253.87"/><line x1="923.2" y1="373.54" x2="929.2" y2="373.54"/><line x1="923.2" y1="253.87" x2="929.2" y2="253.87"/></g>
+<text class="ink" x="929.2" y="248.87" font-size="9.5" transform="rotate(-90 929.2 248.87)">1.01x</text>
+<rect x="958.85" y="335.11" width="55.62" height="243.73" class="bar" fill="#8a8985"/>
+<g class="whisker sk" stroke-width="1"><line x1="986.66" y1="393.67" x2="986.66" y2="167.01"/><line x1="983.66" y1="393.67" x2="989.66" y2="393.67"/><line x1="983.66" y1="167.01" x2="989.66" y2="167.01"/></g>
+<text class="ink" x="989.66" y="162.01" font-size="9.5" transform="rotate(-90 989.66 162.01)">1.00x</text>
+</g>
+<g class="panel">
+<line class="grid" x1="1116.88" y1="578.84" x2="1474" y2="578.84"/>
+<line class="axis" x1="1112.88" y1="578.84" x2="1116.88" y2="578.84"/>
+<text class="mut" x="1109.88" y="582.69" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="1116.88" y1="444.19" x2="1474" y2="444.19"/>
+<line class="axis" x1="1112.88" y1="444.19" x2="1116.88" y2="444.19"/>
+<text class="mut" x="1109.88" y="448.04" font-size="11" text-anchor="end">200</text>
+<line class="grid" x1="1116.88" y1="309.54" x2="1474" y2="309.54"/>
+<line class="axis" x1="1112.88" y1="309.54" x2="1116.88" y2="309.54"/>
+<text class="mut" x="1109.88" y="313.39" font-size="11" text-anchor="end">400</text>
+<line class="grid" x1="1116.88" y1="174.89" x2="1474" y2="174.89"/>
+<line class="axis" x1="1112.88" y1="174.89" x2="1116.88" y2="174.89"/>
+<text class="mut" x="1109.88" y="178.74" font-size="11" text-anchor="end">600</text>
+<line class="axis" x1="1176.4" y1="578.84" x2="1176.4" y2="582.84"/>
+<text class="mut" x="1179.4" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 1179.4 592.84)">mixed_full</text>
+<line class="axis" x1="1295.44" y1="578.84" x2="1295.44" y2="582.84"/>
+<text class="mut" x="1298.44" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 1298.44 592.84)">mixed_short</text>
+<line class="axis" x1="1414.48" y1="578.84" x2="1414.48" y2="582.84"/>
+<text class="mut" x="1417.48" y="592.84" font-size="11" text-anchor="end" transform="rotate(-35 1417.48 592.84)">media_only</text>
+<line class="axis" x1="1116.88" y1="578.84" x2="1474" y2="578.84"/>
+<line class="axis" x1="1116.88" y1="112.4" x2="1116.88" y2="578.84"/>
+<text class="mut" x="1083.52" y="345.62" font-size="12" text-anchor="middle" transform="rotate(-90 1083.52 345.62)">device peak above the model, MiB (max over rounds)</text>
+<text class="ink" x="1116.88" y="98.06" font-size="13" font-weight="600">Device memory</text>
+<rect x="1130.05" y="155.77" width="29.2" height="423.08" class="bar" fill="#2a78d6"/>
+<rect x="1161.8" y="155.77" width="29.2" height="423.08" class="bar" fill="#eb6834"/>
+<rect x="1193.54" y="155.77" width="29.2" height="423.08" class="bar" fill="#8a8985"/>
+<rect x="1249.09" y="138.8" width="29.2" height="440.04" class="bar" fill="#2a78d6"/>
+<rect x="1280.84" y="138.8" width="29.2" height="440.04" class="bar" fill="#eb6834"/>
+<rect x="1312.58" y="138.8" width="29.2" height="440.04" class="bar" fill="#8a8985"/>
+<rect x="1368.13" y="138.8" width="29.2" height="440.04" class="bar" fill="#2a78d6"/>
+<rect x="1399.88" y="138.8" width="29.2" height="440.04" class="bar" fill="#eb6834"/>
+<rect x="1431.62" y="138.8" width="29.2" height="440.04" class="bar" fill="#8a8985"/>
+</g>
+</svg>

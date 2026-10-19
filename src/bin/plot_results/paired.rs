@@ -101,10 +101,13 @@ const FINAL_COLORS: &[(&str, &str)] = &[
     ("control", GREY),
     ("after_f32", ORANGE),
     ("after_bf16", GREEN),
+    ("before", BLUE),
+    ("after", ORANGE),
 ];
 
-/// `embedgemma2_final_m5pro.json`: text encode time per workload, speed-up
-/// against the first lane, and device memory.
+/// A `bench_paired --label` run (`embedgemma2_final_m5pro.json` and the
+/// `embedgemma2_integrate_*` runs): encode time per workload, speed-up against
+/// the first lane, and device memory, under the run's own label.
 pub fn final_(json: &Path) -> R<Output> {
     let doc = load(json)?;
     let root = N::root(&doc, "final");
@@ -117,6 +120,9 @@ pub fn final_(json: &Path) -> R<Output> {
         ));
     }
     let base = lanes[0].clone();
+    // What the lanes are is the run's own record (`bench_paired --label`), not
+    // this figure's: one function draws every such run.
+    let label = root.get("label")?.s()?.to_string();
     let works: Vec<String> = rows
         .iter()
         .map(|r| r.get("workload")?.s().map(str::to_string))
@@ -129,10 +135,7 @@ pub fn final_(json: &Path) -> R<Output> {
     let mut fig = Figure::new(
         1500.0,
         560.0,
-        &format!(
-            "EmbeddingGemma 2 text encode on Apple M5 Pro: 60a6240 against eg2/integrate ({} interleaved rounds)",
-            rounds_of(&root)
-        ),
+        &format!("{label} ({} interleaved rounds)", rounds_of(&root)),
         &[
             "Left: each lane's median over rounds of its min-of-N encode time, log scale. Middle: speed-up against \
              the first lane (1 / the median per-round ratio, whiskers at the lowest and highest round). Right: \
@@ -187,7 +190,7 @@ pub fn final_(json: &Path) -> R<Output> {
     let scale = Scale::headroom(Kind::Log, lo, top, cells[1].h - CHROME_PX, 48.0)?;
     let mut ax = Axes::new(
         cells[1],
-        &format!("Speed-up against 60a6240 ({base})"),
+        &format!("Speed-up against the first lane ({base})"),
         &[],
         AxisCfg::categories(&works, false)?.rotated(35.0),
         AxisCfg::fixed(scale, &[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])

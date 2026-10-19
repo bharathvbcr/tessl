@@ -1,6 +1,7 @@
 {
   "rounds": 6,
   "format": "Workloads",
+  "label": "EmbeddingGemma 2 text encode on Apple M5 Pro: 60a6240 against eg2/integrate",
   "lanes": [
     {
       "name": "before_async",

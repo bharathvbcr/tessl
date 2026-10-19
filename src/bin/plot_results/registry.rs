@@ -34,6 +34,16 @@ pub const PLOTS: &[Plot] = &[
         render: crate::paired::final_,
     },
     Plot {
+        name: "integrate-text",
+        file: "embedgemma2_integrate_text_m5pro.json",
+        render: crate::paired::final_,
+    },
+    Plot {
+        name: "integrate-mm",
+        file: "embedgemma2_integrate_mm_m5pro.json",
+        render: crate::paired::final_,
+    },
+    Plot {
         name: "audio-speed",
         file: "embedgemma2_audio_speed_m5pro.json",
         render: crate::paired::audio_speed,

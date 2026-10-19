@@ -13,7 +13,7 @@ ignored hosted_selection hosted_selection_has_no_device
 bin audit_gemm_tiles 17
 bin bench_clip_2048_result 11
 bin bench_env_validation 2
-bin bench_paired_cli 29
+bin bench_paired_cli 30
 bin bench_attn_cli 2
 bin build_artifact_contract 2
 bin capi_contract 80
@@ -42,8 +42,8 @@ bin media_yuv_formats 5
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
-bin plot_results 57
-bin plot_results_go_overhead 8
+bin plot_results 59
+bin plot_results_go_overhead 9
 bin plot_results_resample 7
 bin reader_bounds 12
 bin qwen35_config 8
@@ -96,7 +96,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 260
+bins 261
 
 # Library tests.
 lib ab_flags::tests:: 10

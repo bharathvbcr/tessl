@@ -105,9 +105,10 @@ All notable changes to `tessl` are recorded here. The format follows
   (`mutated_inputs_never_panic`, in the release and the debug profile). The
   reference bytes are in `tests/fixtures/jpeg/` (`scripts/gen_jpeg_fixtures.py`
   runs torchvision), held by `tests/media_jpeg.rs`, which is hosted: the
-  decoder needs no framework. It costs 4 to 41 % more wall time than ImageIO on
-  one thread (1080p 4:2:0 baseline 11.6 against 10.4 ms; a shared machine, so
-  indicative: `bench_jpeg_decode`, `bench/results/jpeg_decode_m5pro.*`).
+  decoder needs no framework. It takes from 3 % less (progressive) to 56 % more
+  (4:4:4) wall time than ImageIO on one thread (1080p 4:2:0 baseline 8.8 against
+  7.8 ms; a quiet machine, load 3.8: `bench_jpeg_decode`,
+  `bench/results/jpeg_decode_m5pro.*`).
   `THIRD_PARTY_NOTICES.md` carries the Independent JPEG Group License, from
   libjpeg-turbo's `README.ijg`, unaltered: the decoder holds no libjpeg source
   but is based in part on the IJG's work.
@@ -160,9 +161,13 @@ All notable changes to `tessl` are recorded here. The format follows
   cosine 1.000000000; the first file through
   `ColorPath::AvFoundation` is 2.0e-2 max abs, cosine 0.9864, outside the
   bound. The conversion runs on row bands (`Threads::Auto`, byte-identical to
-  one thread: `threading_never_changes_a_byte`); **no speedup is claimed**:
-  its bench was not run, every run of that lane ran at a load average above
-  100, and `bench/results/media_video_color_m5pro.*` predates it.
+  one thread: `threading_never_changes_a_byte`), 3.1 to 4.7 times faster than
+  one thread on the converter alone (1080p: 0.25 to 0.80 ms a frame threaded,
+  1.02 to 3.52 ms on one thread); the whole call stays dominated by the decode,
+  and at 1080p the exact path is 1.2 to 1.5 ms a frame slower than
+  AVFoundation's BGRA conversion over 30 frames (a quiet machine, load 3.8 to
+  4.7: `bench_media_decode`, `BENCH_YUV=1`,
+  `bench/results/media_video_color_m5pro.*`).
 - **`media::resample`: the `ffmpeg` binary's default resampler and channel
   downmix, 0 ULP** (`src/media/resample.rs`). A clean-room implementation
   derived by black-box comparison with the ffmpeg 9.0.2 binary (`ffmpeg -ac 1
@@ -335,19 +340,18 @@ All notable changes to `tessl` are recorded here. The format follows
   `EMBEDGEMMA2_MM_REF_DIR`): texts, Matryoshka 512 / 256 / 128, images, audio,
   video and timestamped video within 3.725e-7 max abs, cosine 1.000000000, and
   the tokenizer's 7949 ids for 8 texts equal. The boundary costs, per call, the
-  Go wall time minus the engine's own timing of the same call: 32.0 us for one
-  text, 49.9 us for one image, 112.9 us for 256 texts, 100.9 us for 8 images,
-  0.9 us for a `Ping` (`bench/results/embedgemma2_go_m5pro.*`, drawn by
-  `plot_results go-overhead`). **Not a quiet-machine recording** (load average
-  98.6 before, 70.9 after, not under the `mac_heavy` lock): read the paired
-  minima, not the medians. CI: a `go` job on `macos-26` runs `make -C go unit`
+  Go wall time minus the engine's own timing of the same call: 9.1 us for one
+  text, 13.4 us for one image, 60.5 us for 256 texts, 43.0 us for 8 images
+  (0.8 to 2.4 % of the call), 1.3 us for a `Ping`
+  (`bench/results/embedgemma2_go_m5pro.*`, drawn by `plot_results
+  go-overhead`, which states the run's recorded load: 3.9 before, 5.6 after). CI: a `go` job on `macos-26` runs `make -C go unit`
   and the `gpu` job runs `make -C go device`; `scripts/ci_local.sh` runs both.
   `tests/go_link_frameworks.rs` (hosted) holds the `-framework` list of
   `go/embedgemma2/engine.go` to the frameworks `src/` links, since a static
   archive records none. `Cargo.toml` excludes `go/**` from the published
   package. See `docs/embedgemma2.md`, Go, and `go/README.md`.
 - **`plot_results`: the benchmark figures are Rust SVG**
-  (`src/bin/plot_results`, no plotting dependency). It draws 17 figures to
+  (`src/bin/plot_results`, no plotting dependency). It draws 19 figures to
   `bench/results/*.svg` from the JSON beside them (`plot_results NAME
   RESULT.json`, or `all DIR`) and replaces the thirteen matplotlib `*_plot.py`
   scripts and their PNGs. Every module is listed once, in
@@ -361,7 +365,18 @@ All notable changes to `tessl` are recorded here. The format follows
   vanished on the dark background. `tests/plot_results.rs` renders every
   committed JSON and checks the SVG is well formed and holds the JSON's bars,
   dots and series; `plot_results_resample` and `plot_results_go_overhead` are
-  the two figures with tests of their own.
+  the two figures with tests of their own. A figure states only what its data
+  records: the paired figures take their title from the run's `label`
+  (`bench_paired --label`, refused when absent) and `go-overhead` the load
+  average its run recorded; `jpeg-decode` and `video-color`, whose data holds no
+  machine state, no longer claim a "shared machine".
+- **The branch's paired benchmark** (`embedgemma2_integrate_{text,mm}_m5pro.*`,
+  `plot_results integrate-text` / `integrate-mm`): 42f1d52, where the media and
+  binding work branched, against 2849fbe, with a byte-copy control lane, on a
+  quiet machine. Text ExactF32 0.998x to 1.003x of the base's time (control
+  0.999x to 1.032x), Bf16 0.312x to 0.334x from 64x32 up; multimodal 0.993x to
+  0.999x (control 0.996x to 1.000x). That work changed no kernel, and the
+  encoder's speed did not move.
 - **C ABI 12** (additive; `TESSL_ABI_VERSION` 11 → 12):
   `tessl_runtime_set_async_encode`, and `tessl_qwen35_read_parameter_host` /
   `tessl_qwen35_write_parameter_host` for one parameter-table entry. A per-entry

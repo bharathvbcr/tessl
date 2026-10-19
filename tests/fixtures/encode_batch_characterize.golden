@@ -1,0 +1,147 @@
+CASE	root	0	ERR	config.json: the root is not an object
+CASE	root	1	ERR	config.json: the root is not an object
+CASE	root	2	ERR	config.json: the root is not an object
+CASE	root	0	ERR	config.json: the root is not an object
+CASE	root	1	ERR	config.json: the root is not an object
+CASE	root	2	ERR	config.json: the root is not an object
+CASE	root	0	ERR	config.json: the root is not an object
+CASE	root	1	ERR	config.json: the root is not an object
+CASE	root	2	ERR	config.json: the root is not an object
+CASE	root	0	ERR	config.json: the root is not an object
+CASE	root	1	ERR	config.json: the root is not an object
+CASE	root	2	ERR	config.json: the root is not an object
+CASE	root	0	ERR	config.json: expected a string key at byte 1
+CASE	root	1	ERR	config.json: expected a string key at byte 1
+CASE	root	2	ERR	config.json: expected a string key at byte 1
+CASE	root	0	ERR	config.json: unexpected end at byte 0
+CASE	root	1	ERR	config.json: unexpected end at byte 0
+CASE	root	2	ERR	config.json: unexpected end at byte 0
+CASE	text_config missing	0	ERR	config.json: model_type "embedding_gemma2" is not embedding_gemma2_text
+CASE	text_config missing	1	ERR	config.json: missing "text_config"
+CASE	text_config missing	2	ERR	config.json: missing "text_config" (the soft tokens' width is its hidden_size)
+CASE	vocab missing	0	ERR	config.json: missing "vocab_size"
+CASE	vocab missing	1	OK	201
+CASE	vocab missing	2	OK	264
+CASE	vocab float	0	ERR	config.json: vocab_size must be a non-negative integer, got Num { value: 48.5, int: 0, form: Float }
+CASE	vocab float	1	OK	201
+CASE	vocab float	2	OK	264
+CASE	vocab negative	0	ERR	config.json: vocab_size must be a non-negative integer, got Num { value: -1.0, int: 1, form: NegInt }
+CASE	vocab negative	1	OK	201
+CASE	vocab negative	2	OK	264
+CASE	vocab null	0	ERR	config.json: vocab_size must be a non-negative integer, got Null
+CASE	vocab null	1	OK	201
+CASE	vocab null	2	OK	264
+CASE	vocab big	0	ERR	config.json: vocab_size = 4294967296 exceeds u32
+CASE	vocab big	1	OK	201
+CASE	vocab big	2	OK	264
+CASE	vocab zero	0	ERR	config.json: vocab_size is zero
+CASE	vocab zero	1	OK	201
+CASE	vocab zero	2	OK	264
+CASE	eps string	0	ERR	config.json: rms_norm_eps must be a number, got Str("x")
+CASE	eps string	1	OK	201
+CASE	eps string	2	OK	264
+CASE	eps negative	0	ERR	config.json: rms_norm_eps must be positive, got -1
+CASE	eps negative	1	OK	201
+CASE	eps negative	2	OK	264
+CASE	eps missing	0	ERR	config.json: missing "rms_norm_eps"
+CASE	eps missing	1	OK	201
+CASE	eps missing	2	OK	264
+CASE	text model_type wrong	0	ERR	config.json: model_type "gemma" is not embedding_gemma2_text
+CASE	text model_type wrong	1	OK	201
+CASE	text model_type wrong	2	OK	264
+CASE	text model_type number	0	ERR	config.json: model_type must be a string, got Num { value: 3.0, int: 3, form: Uint }
+CASE	text model_type number	1	OK	201
+CASE	text model_type number	2	OK	264
+CASE	activation wrong	0	ERR	config.json: hidden_activation must be gelu_pytorch_tanh, got Some("relu")
+CASE	activation wrong	1	OK	201
+CASE	activation wrong	2	OK	264
+CASE	attention_bias true	0	ERR	config.json: attention_bias is not supported
+CASE	attention_bias true	1	OK	201
+CASE	attention_bias true	2	OK	264
+CASE	layer_types short	0	ERR	config.json: layer_types has 1 entries but num_hidden_layers is 3
+CASE	layer_types short	1	OK	201
+CASE	layer_types short	2	OK	264
+CASE	layer_types unknown	0	ERR	config.json: layer_types[1] = Str("x") is not a known layer type
+CASE	layer_types unknown	1	OK	201
+CASE	layer_types unknown	2	OK	264
+CASE	per_layer unknown key	0	ERR	config.json: per_layer_config["00"].hidden is not supported
+CASE	per_layer unknown key	1	OK	201
+CASE	per_layer unknown key	2	OK	264
+CASE	per_layer index	0	ERR	config.json: per_layer_config names layer 9 of 3
+CASE	per_layer index	1	OK	201
+CASE	per_layer index	2	OK	264
+CASE	rope missing	0	ERR	config.json: missing "rope_parameters"
+CASE	rope missing	1	OK	201
+CASE	rope missing	2	OK	264
+CASE	rope_type	0	ERR	config.json: rope_parameters.full_attention.rope_type must be "default", got Some(Str("yarn"))
+CASE	rope_type	1	OK	201
+CASE	rope_type	2	OK	264
+CASE	pad_token_id string	0	ERR	config.json: pad_token_id must be a non-negative integer, got Str("0")
+CASE	pad_token_id string	1	OK	201
+CASE	pad_token_id string	2	OK	264
+CASE	pad_token_id null	0	OK	576
+CASE	pad_token_id null	1	OK	201
+CASE	pad_token_id null	2	OK	264
+CASE	image_token_id negative	0	ERR	config.json: image_token_id must be a non-negative integer, got Num { value: -1.0, int: 1, form: NegInt }
+CASE	image_token_id negative	1	OK	201
+CASE	image_token_id negative	2	OK	264
+CASE	vision missing	0	OK	579
+CASE	vision missing	1	ERR	config.json: missing "vision_config"
+CASE	vision missing	2	OK	264
+CASE	vision patch string	0	OK	579
+CASE	vision patch string	1	ERR	config.json: patch_size must be a non-negative integer, got Str("4")
+CASE	vision patch string	2	OK	264
+CASE	vision patch missing	0	OK	579
+CASE	vision patch missing	1	ERR	config.json: missing "patch_size"
+CASE	vision patch missing	2	OK	264
+CASE	vision patch zero	0	OK	579
+CASE	vision patch zero	1	ERR	config.json: patch_size is zero
+CASE	vision patch zero	2	OK	264
+CASE	vision eps string	0	OK	579
+CASE	vision eps string	1	ERR	config.json: rms_norm_eps must be a number, got Str("e")
+CASE	vision eps string	2	OK	264
+CASE	vision model_type	0	OK	579
+CASE	vision model_type	1	ERR	config.json: vision_config.model_type "gemma" is not gemma4_vision
+CASE	vision model_type	2	OK	264
+CASE	vision activation	0	OK	579
+CASE	vision activation	1	ERR	config.json: vision_config.hidden_activation must be gelu_pytorch_tanh, got Some("relu")
+CASE	vision activation	2	OK	264
+CASE	vision standardize number	0	OK	579
+CASE	vision standardize number	1	ERR	config.json: vision_config.standardize must be a boolean, got Num { value: 1.0, int: 1, form: Uint }
+CASE	vision standardize number	2	OK	264
+CASE	vision standardize true	0	OK	579
+CASE	vision standardize true	1	ERR	config.json: vision_config.standardize is not supported
+CASE	vision standardize true	2	OK	264
+CASE	vision attention_bias true	0	OK	579
+CASE	vision attention_bias true	1	ERR	config.json: vision_config.attention_bias is not supported
+CASE	vision attention_bias true	2	OK	264
+CASE	audio missing	0	OK	579
+CASE	audio missing	1	OK	201
+CASE	audio missing	2	ERR	config.json: missing "audio_config"
+CASE	audio hidden_act	0	OK	579
+CASE	audio hidden_act	1	OK	201
+CASE	audio hidden_act	2	ERR	config.json: audio hidden_act must be silu, got Some(Str("gelu"))
+CASE	audio model_type	0	OK	579
+CASE	audio model_type	1	OK	201
+CASE	audio model_type	2	ERR	config.json: audio model_type "x" is not gemma4_audio
+CASE	audio clipped number	0	OK	579
+CASE	audio clipped number	1	OK	201
+CASE	audio clipped number	2	ERR	config.json: use_clipped_linears must be a bool, got Some(Num { value: 1.0, int: 1, form: Uint })
+CASE	audio chunk missing	0	OK	579
+CASE	audio chunk missing	1	OK	201
+CASE	audio chunk missing	2	ERR	config.json: missing "attention_chunk_size"
+CASE	audio chunk negative	0	OK	579
+CASE	audio chunk negative	1	OK	201
+CASE	audio chunk negative	2	ERR	config.json: attention_chunk_size must be a non-negative integer, got Num { value: -4.0, int: 4, form: NegInt }
+CASE	audio logit_cap string	0	OK	579
+CASE	audio logit_cap string	1	OK	201
+CASE	audio logit_cap string	2	ERR	config.json: attention_logit_cap must be a number, got Str("4")
+CASE	audio channels short	0	OK	579
+CASE	audio channels short	1	OK	201
+CASE	audio channels short	2	ERR	config.json: subsampling_conv_channels has 1 entries, need 2
+CASE	audio eps zero	0	OK	579
+CASE	audio eps zero	1	OK	201
+CASE	audio eps zero	2	ERR	config.json: audio rms_norm_eps must be positive and finite, got 0
+BASE	0	EmbedGemma2Config { hidden: 64, ple_dim: 32, intermediate: 128, vocab: 48, embedding_dim: 96, q_heads: 2, sliding_window: 3, rms_norm_eps: 1e-6, layers: [LayerSpec { sliding: false, head_dim: 512, kv_heads: 1, rope_theta: 1000000.0 }, LayerSpec { sliding: true, head_dim: 256, kv_heads: 1, rope_theta: 10000.0 }, LayerSpec { sliding: true, head_dim: 256, kv_heads: 2, rope_theta: 10000.0 }], special_tokens: SpecialTokens { pad: Some(0), bos: Some(2), eos: Some(1), image: Some(60), video: Some(62), audio: Some(61), boi: Some(40), eoi: Some(41), boa: Some(42), eoa: Some(43) } }
+BASE	1	VisionConfig { hidden: 96, layers: 2, heads: 2, head_dim: 64, intermediate: 160, patch_size: 4, pooling_kernel: 2, position_embedding_size: 128, rms_norm_eps: 1e-6, rope_theta: 100.0, text_hidden: 64 }
+BASE	2	AudioConfig { hidden: 64, layers: 2, heads: 4, conv_kernel: 5, sub_channels: [32, 8], out_dims: 48, embed_dim: 64, residual_weight: 0.5, logit_cap: 4.0, invalid_logit: -1000000000.0, chunk: 4, context_left: 5, eps: 1e-5, gradient_clip: 2.5, clipped_linears: true }

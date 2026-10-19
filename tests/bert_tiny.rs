@@ -361,3 +361,35 @@ fn async_encode_waits_only_once_per_head_block() {
         );
     });
 }
+
+/// The refusals of `encode` before any GPU work, with their exact texts (a
+/// characterization: the batch-shape checks are shared with EmbedGemma2's).
+#[test]
+fn encode_refuses_a_bad_batch_with_exact_texts() {
+    const W: &str = "BertSparseModel::encode";
+    with_gpu(|rt| {
+        let model = BertSparseModel::load(rt, &checkpoint(BertFamily::Bert, 7), config(BertFamily::Bert)).unwrap();
+        let err = |b: &[&[u32]], trace: bool| model.encode(b, trace).map(|_| ()).unwrap_err();
+        let ok: Vec<u32> = vec![1, 2, 3];
+        assert_eq!(err(&[], false), format!("{W}: empty batch"));
+        let many: Vec<&[u32]> = vec![ok.as_slice(); MAX_BATCH + 1];
+        assert_eq!(
+            err(&many, false),
+            format!("{W}: {} sequences exceeds the batch limit {MAX_BATCH}", MAX_BATCH + 1)
+        );
+        assert_eq!(err(&[&ok, &ok], true), format!("{W}: trace takes one sequence, got 2"));
+        assert_eq!(err(&[&ok, &[]], false), format!("{W}: sequence 1 is empty"));
+        let long = vec![1u32; POSITIONS + 1];
+        assert_eq!(
+            err(&[&ok, &long], false),
+            format!(
+                "{W}: sequence 1 has {} tokens; the model has {POSITIONS} positions (truncate it)",
+                POSITIONS + 1
+            )
+        );
+        assert_eq!(
+            err(&[&[VOCAB as u32]], false),
+            format!("{W}: sequence 0: token id {VOCAB} >= vocab {VOCAB}")
+        );
+    });
+}

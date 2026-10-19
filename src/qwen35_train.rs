@@ -46,8 +46,8 @@ use crate::cross_entropy::{
 };
 use crate::dispatch::{dispatch_1d, dispatch_2d, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::gdn_train::{
-    gdn_train_backward_windowed, gdn_train_forward_windowed, GdnTrainDims, GdnTrainWindowedGrads,
-    GdnTrainWindowedInputs, GdnTrainWorkspace, GdnWindow,
+    gdn_train_backward_windowed, gdn_train_forward_transient_bytes, gdn_train_forward_windowed, GdnTrainDims,
+    GdnTrainWindowedGrads, GdnTrainWindowedInputs, GdnTrainWorkspace, GdnWindow,
 };
 use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, GemmOperands};
 use crate::nn::require_runtime;
@@ -1930,6 +1930,13 @@ impl Qwen35Model {
     /// One layer's forward intermediates, with its GEMMs' temporaries;
     /// `output` adds the `down` projection's product (its stream out is the
     /// next layer's input, which [`Self::step_bytes`] holds).
+    ///
+    /// Under bf16 operands the bound over-counts by one bf16 `[rows, hidden]`
+    /// copy per sequence (the mixer's `w_in` GEMM is charged a copy of `x1`,
+    /// but reads the layer's bf16 twin, which the gate/up charge covers).
+    /// That is safe: an over-count only raises a bound whose purpose is to
+    /// refuse a step that might not fit, and the exact tests pin the
+    /// difference rather than letting it grow unnoticed.
     fn layer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands, output: bool) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
@@ -1974,6 +1981,9 @@ impl Qwen35Model {
                     f(tu * hv * dv), // o
                     f(tu * hv * dv), // y
                     mm.nn_scratch_bytes(tu, h, hv * dv, wd),
+                    // The chunked kernel's normalized q and k, decay, beta and
+                    // C x C products, made and freed inside the forward call.
+                    gdn_train_forward_transient_bytes(single_seq_gdn_dims(&g, t), g.k_heads()),
                 ]);
             }
             Mixer::Attn(_) => {
@@ -2000,6 +2010,13 @@ impl Qwen35Model {
     }
 
     /// One layer's backward: its gradients, and its GEMMs' temporaries.
+    ///
+    /// Two deliberate over-counts, both safe for the same reason (they only
+    /// raise a refuse-if-it-might-not-fit bound, and the exact tests pin
+    /// each): every gradient is charged, though a step into an f32 bank
+    /// writes its matrices in place; and under bf16 operands each GEMM is
+    /// charged the bf16 copy of an operand whose twin the backward already
+    /// holds (the twin is allocated once).
     fn layer_bwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands) -> (u64, u64) {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
@@ -2155,6 +2172,9 @@ impl Qwen35Model {
             CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype, mm),
             gemms,
             GpuRuntime::allocated_bytes_for(n * h * 4, BufferKind::Cold),
+            // `cross_entropy_rows` stages its row and target ids through two
+            // `[n]` u32 buffers (`upload_u32`), freed with the call.
+            2 * GpuRuntime::allocated_bytes_for(n * 4, BufferKind::Cold),
         ]
         .iter()
         .fold(0, |a, &b| a.saturating_add(b))
@@ -2893,7 +2913,6 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::gdn_train::gdn_train_forward_transient_bytes;
     use crate::npy::read_npy;
     use crate::qwen35_model::Qwen35Config;
     use crate::safetensors::SafeTensors;
@@ -3114,36 +3133,20 @@ mod tests {
         GpuRuntime::allocated_bytes_for(n as usize * model.cfg.hidden as usize * 2, BufferKind::Cold)
     }
 
-    /// Signed `got - bound` a forward's cell must show, from the three
-    /// documented places the bound and the allocators part:
+    /// Signed `got - bound` a forward's cell must show, from the two
+    /// documented places the bound and the allocators part (the bound
+    /// counts the GDN kernel's transients, which an earlier version of
+    /// these tests found it did not):
     ///
-    /// * `+ gdn_train_forward_transient_bytes` per sequence of a GDN layer:
-    ///   the chunked kernel's normalized q and k, decay, beta and two C x C
-    ///   products, made and freed inside the call. The bound does not count
-    ///   them (the function's own doc says a bounding caller adds it), and
-    ///   `tests/qwen35_train_bytes_pin.rs` pins the bound without it.
     /// * `+` the stream out (`output`): the next layer's input, which the
     ///   bound leaves to `step_bytes`'s held part.
     /// * `-` under bf16 operands, one bf16 `[n, hidden]` copy per sequence:
     ///   each mixer's `w_in` GEMM is charged a copy of `x1` (`nn_scratch_bytes`)
     ///   but reads the layer's one bf16 twin of `x1`, whose size the
     ///   gate/up charge covers.
-    fn forward_slack(
-        model: &Qwen35Model,
-        li: usize,
-        t: u32,
-        lens: Option<&[usize]>,
-        mm: GemmOperands,
-        output: bool,
-    ) -> i64 {
+    fn forward_slack(model: &Qwen35Model, t: u32, lens: Option<&[usize]>, mm: GemmOperands, output: bool) -> i64 {
         let seqs = seq_lens(t, lens);
         let mut s = 0i64;
-        if matches!(model.layers[li].mixer, Mixer::Gdn(_)) {
-            let g = model.cfg.gdn;
-            for &n in &seqs {
-                s += gdn_train_forward_transient_bytes(single_seq_gdn_dims(&g, n), g.k_heads()) as i64;
-            }
-        }
         if output {
             s += GpuRuntime::allocated_bytes_for(t as usize * model.cfg.hidden as usize * 4, BufferKind::Cold) as i64;
         }
@@ -3167,7 +3170,7 @@ mod tests {
                     for output in [true, false] {
                         let (got, _saved) = forward_alloc(&model, li, t, lens.as_deref(), mm, output);
                         let bound = model.layer_fwd_step_bytes(&model.layers[li], t, mm, output, lens32.as_deref());
-                        let slack = forward_slack(&model, li, t, lens.as_deref(), mm, output);
+                        let slack = forward_slack(&model, t, lens.as_deref(), mm, output);
                         cells += 1;
                         if got as i64 - bound as i64 != slack {
                             bad.push(format!(
@@ -3383,8 +3386,9 @@ mod tests {
         requested(model) - before
     }
 
-    /// The cross-entropy allocates `ce_bytes(batched)` plus exactly the two
-    /// `u32` staging buffers the bound omits, on one chunk and on several (a
+    /// The cross-entropy allocates exactly `ce_bytes(batched)` (the bound
+    /// counts its two `u32` staging buffers, which an earlier version of this
+    /// test found it did not), on one chunk and on several (a
     /// vocabulary of one chunk, a chunk and a bit, two and a bit). Unbatched
     /// the bound counts one chunk's GEMM temporaries, so it equals the batched
     /// one on a single chunk and never exceeds it. (The exact lane's GEMM
@@ -3401,15 +3405,9 @@ mod tests {
                     let got = ce_alloc(&mut model, t, vocab, mm);
                     let bound = model.ce_bytes(t, mm, true);
                     let single = model.ce_bytes(t, mm, false);
-                    // The bound does not count the two `u32` staging buffers
-                    // (`max_rows` long each) that `cross_entropy_rows`'s
-                    // `upload_u32` of the rows and the targets makes
-                    // (`tests/qwen35_train_bytes_pin.rs` pins the bound without
-                    // them): the allocated bytes exceed it by exactly these.
-                    let staging = 2 * GpuRuntime::allocated_bytes_for(t as usize * 4, BufferKind::Cold);
                     cells += 1;
                     let chunks = vocab.div_ceil(CE_CHUNK);
-                    if got != bound + staging || single > bound || (chunks == 1 && single != bound) {
+                    if got != bound || single > bound || (chunks == 1 && single != bound) {
                         bad.push(format!(
                             "{name} vocab={vocab} t={t}: allocated {got}, batched bound {bound}, unbatched {single}"
                         ));
@@ -3423,6 +3421,36 @@ mod tests {
             bad.len(),
             bad.join("\n")
         );
+    }
+
+    /// Prints the step bounds for the real Qwen3.5-2B configuration at the
+    /// sizes a trainer uses, from the config's arithmetic alone: the tiny
+    /// fixture's runtime and layer shapes stand in for the 2B's (the bound
+    /// reads only the config, the layer kinds, the embedding dtype and the
+    /// runtime's pool cap). Run with
+    /// `cargo test --lib report_2b_step_bounds -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints a report"]
+    fn report_2b_step_bounds() {
+        let mut model = tiny_model();
+        let cfg = Qwen35Config::qwen35_2b().unwrap();
+        let mut layers = Vec::new();
+        for kind in &cfg.layers {
+            let idx = usize::from(*kind == crate::qwen35_model::LayerKind::FullAttention);
+            layers.push(tiny_model().layers.swap_remove(idx));
+        }
+        model.cfg = cfg;
+        model.layers = layers;
+        for (name, mm) in [("exact", GemmOperands::ExactF32), ("bf16", GemmOperands::Bf16)] {
+            for t in [512u32, 2048, 4096, 8192] {
+                println!("BOUND {name} single t={t} {}", model.train_step_bytes(t, mm));
+            }
+            let cu = [0u32, 2048, 4096, 6144, 8192];
+            println!(
+                "BOUND {name} ragged 4x2048 {}",
+                model.train_step_ragged_bytes(&cu, 8192, mm, true).unwrap()
+            );
+        }
     }
 
     /// The attention workspace bound is the bytes `AttnTrainWorkspace::new`

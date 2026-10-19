@@ -1,8 +1,8 @@
 # BUILD_REPORT — GitPulse backlog, waves 13–17 (2026-10-17/18)
 
-`main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `a37a0c2` → `bf091a2` → `0819992` (this report) → **`41d8866`**. Every move was a fast-forward, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path). ojas independently verified `bf091a2`: Metal 124/124 and ojas-qwen35 14/14, with its clip path switched to `parts_words`.
+`main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `8c51319` → `cef623e` → `e3dff5a` (this report) → **`a083088`**. Every move was a fast-forward, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path). ojas independently verified `cef623e`: Metal 124/124 and ojas-qwen35 14/14, with its clip path switched to `parts_words`.
 
-## Waves 16C/D and 17, landed at `41d8866`
+## Waves 16C/D and 17, landed at `a083088`
 
 **Gates**, run after the last merge:
 - fmt, release build, clippy ×2, doc.
@@ -38,9 +38,9 @@ An apparent "pre-existing flake" in that pin was a mis-measurement. The lane edi
 
 Follow-up for the owner: EmbedGemma2's own norms (eg2 text, vision and audio) are still fast rsqrt beside the now-precise qk-norm. That's inference-only, so it isn't a break.
 
-ft-c59ff950 `parts_words` landed in `bf091a2`, and ojas switched to it.
+ft-c59ff950 `parts_words` landed in `cef623e`, and ojas switched to it.
 
-**ojas verified `41d8866`** (run 9, ojas main 4123dfb): qwen35 CPU 42/42, Tape provider CPU 14/14 and Metal 5/5, clippy clean. Nothing moved numerically. `gpu_parity` was 9/10: the miss, `gpu_real_2b_single_step_matches_the_transformers_reference`, is environmental, because the disk cleanup deleted `tessl/target/qwen35_train_ref`. Regenerating it is a 17 GB CPU job that must run under the `mac_heavy` lock; the command has been handed to the owner.
+**ojas verified `a083088`** (run 9, ojas main 4123dfb): qwen35 CPU 42/42, Tape provider CPU 14/14 and Metal 5/5, clippy clean. Nothing moved numerically. `gpu_parity` was 9/10: the miss, `gpu_real_2b_single_step_matches_the_transformers_reference`, is environmental, because the disk cleanup deleted `tessl/target/qwen35_train_ref`. Regenerating it is a 17 GB CPU job that must run under the `mac_heavy` lock; the command has been handed to the owner.
 
 **Branches:** only `main` and the live eg2 session's fully merged `eg2/integrate` remain. Every deleted ref is under `refs/backup/2026-10-17-w14/`.
 
@@ -55,7 +55,7 @@ ft-c59ff950 `parts_words` landed in `bf091a2`, and ojas switched to it.
 
 ## Gates
 
-Final run, on `bf091a2`:
+Final run, on `cef623e`:
 - fmt, release build (all targets), clippy `-D warnings` (default and `quant-prep`), doc `-D warnings`.
 - Hosted device-free selection (103 invocations, 1196 tests) and completeness.
 - Dialect lint, kernel IR check (38 kernels).
@@ -85,7 +85,7 @@ Earlier landings had the same gate set, each on its own tree.
 | ft-fd8bde58 int4 TensorOps GEMM | 15 | Measured on the GPU: low nibble first, `int4b` is two's complement. A per-group MLX Q4 TensorOps GEMM matches `gemm_q4_mlx` and f64 within derived bounds. No production entry point and no benchmark yet. |
 | ft-36deadf7 ExactF32 coop epilogue | 15 | Two new kernels. Bit-identical to the separate passes once FMA contraction was turned off (`STRICT`; it was 1 ulp off). 432+ cases. Census 298→300 with bench lanes. NN only. |
 | ft-c59ff950 `SqNormPlan::parts_words` | 16 | ojas asked for it. One owner of the 2·pieces rule; all four mutants caught. |
-| ft-9e79d8be ragged Qwen3.5 training | 16 | `train_step_ragged_into` (Rust core). Per-sequence losses are bit-identical to each sequence alone. Sequences are isolated. The memory bound now counts the ragged step: the adversarial pass found it undercounting. The single-sequence `train_step_bytes` is measured equal to `a37a0c2`'s. C API and Python wiring are deferred (public contract). |
+| ft-9e79d8be ragged Qwen3.5 training | 16 | `train_step_ragged_into` (Rust core). Per-sequence losses are bit-identical to each sequence alone. Sequences are isolated. The memory bound now counts the ragged step: the adversarial pass found it undercounting. The single-sequence `train_step_bytes` is measured equal to `8c51319`'s. C API and Python wiring are deferred (public contract). |
 
 Also merged without a card, at your request:
 - **`ea630de`:** the prepared integration of `gp/clip-sq-norm`, `gp/w11-2bmem` and `gp/w12-kcov`. It brings `tessl::sq_norm` with overflow-safe per-piece scaling.

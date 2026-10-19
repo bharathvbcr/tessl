@@ -882,7 +882,7 @@ Measured on an M5 Pro against the real checkpoint, paired and interleaved
 (`bench_paired` over `bench_embedgemma2`; `bench/results/embedgemma2_*_m5pro.*`).
 
 * **The 2026-10-17 media, binding and Go work as a whole** (42f1d52, the branch point, against
-  `eg2/integrate` at 2849fbe, each a release build in its own target directory, with a control
+  `eg2/integrate` at cccdffd, each a release build in its own target directory, with a control
   lane that is a byte copy of the base binary; recorded 2026-10-18 on a quiet machine, 1-minute
   load average 3.7 to 5.9; the drift gate, `--max-spread 1.25`, passed on the first attempt;
   `embedgemma2_integrate_{text,mm}_m5pro.{txt,json,svg}`, drawn by `plot_results
@@ -3681,7 +3681,7 @@ indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
 
 **Video to RGB, exact path against the BGRA path** (`BENCH_MEDIA_DIR=target/media_bench_video`,
 clips from `bench/make_video_bench_inputs.py`, minimum of 30 calls after 5 warm-ups, a fresh
-source each; recorded 2026-10-18 at eg2/integrate 2849fbe on a quiet machine, 1-minute load
+source each; recorded 2026-10-18 at eg2/integrate cccdffd on a quiet machine, 1-minute load
 average 3.8 to 4.7 across the run; `bench/results/media_video_color_m5pro.{txt,json,svg}`,
 plotted by `plot_results video-color`; the bench refuses a run in which a path fell back to the
 other). Wall time of one call, ms, with ms per frame in brackets for the first-30-frames rows;
@@ -3754,7 +3754,7 @@ own speed (it is the same algorithm in C with NEON).
 **JPEG, native against ImageIO.** `bench_jpeg_decode` (inputs from
 `bench/make_jpeg_bench_inputs.py`) times `decode_image` (the native path) and
 `decode_image_imageio` on the same bytes, one call of each in turn per iteration, minimum of 40
-after 3 warm-ups. Recorded 2026-10-18 at eg2/integrate 2849fbe on a quiet machine (1-minute
+after 3 warm-ups. Recorded 2026-10-18 at eg2/integrate cccdffd on a quiet machine (1-minute
 load average 3.8); an earlier run on a shared machine had medians moving by tens of percent and
 minima 27 to 50 % higher (`bench/results/jpeg_decode_m5pro.{txt,json,svg}`, plotted
 by `plot_results jpeg-decode`, whose own tests are in `tests/plot_results.rs`). The two paths do not
@@ -3829,4 +3829,6 @@ tried.
   with the `ffmpeg` binary and FFmpeg's published option documentation, without FFmpeg's source
   or the earlier implementation (`docs/media_resample_cleanroom.md` records what was consulted,
   including the structural hints in the earlier tests' comments, each re-derived by experiment).
-  The earlier implementation remains in this branch's history until it is squashed.
+  The earlier implementation, derived from libswresample's LGPL source, was removed from the
+  repository's history on 2026-10-18: the commits that held it carry a provenance note in
+  its place (commit SHAs from that point on changed; references in this tree were updated).

@@ -1,12 +1,12 @@
-EmbeddingGemma 2 multimodal encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate 2849fbe
-Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b.
+EmbeddingGemma 2 multimodal encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate cccdffd
+Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b. Recorded at 2849fbe, renamed cccdffd (the same tree) by the 2026-10-18 history scrub.
 
 What ran
   bench_paired --rounds 8 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=8, BENCH_WARMUP=2,
   lane order reversed on odd rounds, one fresh process per lane per round, min-of-N per process.
   Lanes (target/run_integrate_bench.sh):
     before   42f1d52's bench_embedgemma2_mm (a detached worktree, its own target dir)
-    after    eg2/integrate at 2849fbe's bench_embedgemma2_mm
+    after    eg2/integrate at cccdffd's bench_embedgemma2_mm
     control  a byte copy of the before binary
   src/bin/bench_embedgemma2_mm.rs is the same file at both revisions: one
   EmbedGemma2Multimodal::encode call from host ids, pixels and features to host embeddings, f32

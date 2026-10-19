@@ -1,5 +1,5 @@
-EmbeddingGemma 2 text encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate 2849fbe
-Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b.
+EmbeddingGemma 2 text encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate cccdffd
+Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b. Recorded at 2849fbe, renamed cccdffd (the same tree) by the 2026-10-18 history scrub.
 
 What ran
   bench_paired --rounds 6 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=10, BENCH_WARMUP=3,
@@ -7,7 +7,7 @@ What ran
   Lanes (the script is target/run_integrate_bench.sh in the integration worktree):
     before_async  42f1d52's bench_embedgemma2 (a detached worktree, its own target dir), BENCH_ASYNC=1
     control       a byte copy of that binary, BENCH_ASYNC=1 (the run's own noise)
-    after_f32     eg2/integrate at 2849fbe, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
+    after_f32     eg2/integrate at cccdffd, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
     after_bf16    the same binary, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
   src/bin/bench_embedgemma2.rs is the same file at both revisions. The run waited for a quiet
   machine (1-minute load < 6, 5-minute < 10): load { 5.87 8.55 12.76 } at the start, { 4.12 4.76

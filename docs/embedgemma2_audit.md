@@ -91,10 +91,10 @@ tokenizer or a processor of the caller's: eleven raw front-end entries
 (`tessl_embedgemma2_{embed_texts,tokenize,decode,prompt_*,embed_images,embed_audio,embed_videos,embed_media}`,
 merge 641dba8) and seven for files, bytes, soft-token counts and text
 interleaved with media (`tessl_embedgemma2_{embed_*_sources,*_soft_token_count,embed_segments}`,
-merge 879ead2), all in `src/capi_embedgemma2.rs` (`rg -o 'extern "C" fn
+merge cb05339), all in `src/capi_embedgemma2.rs` (`rg -o 'extern "C" fn
 tessl_embedgemma2_\w+'` lists 27 entries); `tests/capi_embedgemma2_raw.rs` and
 `tests/capi_embedgemma2_media.rs`. A Go binding over the same ABI is
-`go/embedgemma2` (merge ec4c3ec; `make -C go device` compares every entry bit
+`go/embedgemma2` (merge bb2afb6; `make -C go device` compares every entry bit
 for bit with the Rust call). Python's `embed_images` / `embed_audio` now take
 raw images and PCM (`CHANGELOG.md`, Changed (breaking)).
 
@@ -305,7 +305,7 @@ merge-base --is-ancestor 8c80af7 main` holds); `main` is no longer 60a6240. The
 later lanes P, T, X, AB, R, F2 and V (video input, merge 6f62a50, not the
 decode lane V below) are ancestors of 8c80af7 too (`git merge-base
 --is-ancestor` on each merge commit, **verified**). The lanes after it (PY3, D,
-BIND, M, CR, J, V (decode, 4d06651), G, V2) are on `eg2/integrate` (e2c345f at
+BIND, M, CR, J, V (decode, bb099ca), G, V2) are on `eg2/integrate` (8277ab6 at
 this update). Every merge of the first wave was
 verified on the merged tree on 2026-10-16: fmt, clippy and rustdoc with `-D
 warnings`, the device test binaries, the six real-checkpoint suites
@@ -318,12 +318,12 @@ docs; it did not rerun any of that.** Whole-encode result:
 |---|---|---|---|
 | G1 per-dispatch waits | resolved: `GpuRuntime::async_scope`; `encode` waits once | d13d1d3 (A) | `tests/async_scope.rs`; 1x16 84.9 -> 7.4 ms (`embedgemma2_before_after_m5pro.txt`) |
 | G2 no bf16 path | resolved: `GemmOperands::Bf16` (B), bf16 attention tiles (E), vision tower bf16 (J), audio tower bf16 (AB: `EmbedGemma2Audio::load_with`, weights 587,121,792 B against 1,172,751,488 B; its speed is not published, the drift gate refused every run) | e5be45e, 16f5190, 224be3f, 005063c | `tests/embedgemma2_model.rs`, `tests/embedgemma2_audio_tiny.rs` (`bf16_mode_is_not_the_exact_forward`); 2.75x to 3.0x faster than 60a6240 from 64x32 up (`embedgemma2_final_m5pro.txt`) |
-| G3 no C ABI / Python | resolved: text (C), multimodal (F); raw front ends (BIND), files, bytes, counts and segments (M), Go (G) | ac5364a, 433e659, 641dba8, 879ead2, ec4c3ec | `tests/capi_embedgemma2*.rs`, `tests/capi_contract.rs`, `python/tests/test_embedgemma2*.py`, `go/embedgemma2` (`make -C go device`) |
+| G3 no C ABI / Python | resolved: text (C), multimodal (F); raw front ends (BIND), files, bytes, counts and segments (M), Go (G) | ac5364a, 433e659, 641dba8, cb05339, bb2afb6 | `tests/capi_embedgemma2*.rs`, `tests/capi_contract.rs`, `python/tests/test_embedgemma2*.py`, `go/embedgemma2` (`make -C go device`) |
 | G4 tokenizer | resolved: `tessl::embedgemma2_tok`, a hand-written BPE, no new dependency (T) | 5a2e9c6 | `tests/embedgemma2_tok_tiny.rs`; `tests/embedgemma2_tok_real.rs` (opt-in): 4680 of 4680 comparisons equal sentence-transformers' |
 | G5 stage profile | resolved (D); towers profiled (I, J) | 2e7ba35 | `embedgemma2_stage_profile_m5pro.txt`, `embedgemma2_{audio,vision}_profile_m5pro.txt` |
 | G6 device peak | resolved: 1652 -> 466 MiB above the model (H); towers release before their wait (K); the pool recycles a dropped buffer at the next allocation when the GPU is idle (R: `recycle_if_idle`, consecutive calls hold `extra == 0`) | 27a0407, 03dae0f, 1f447c9 | `tests/embedgemma2_memory.rs`, `tests/pool_recycle_at_alloc.rs`, `embedgemma2_memory_m5pro.txt` |
 | G7 elementwise dispatches | partly: text encoder fused 15 -> 13 dispatches per layer at `ExactF32`, 17 -> 13 at `Bf16`, bits unchanged (X); audio tower 28 -> 17 (I); vision RoPE table (J). No end-to-end speed-up shown for X or I: the drift gate refused X's runs, I's was inside the noise | 201abfc, ae11582, 224be3f | `tests/embedgemma2_tiny.rs` (`a_layer_runs_the_pinned_kernels`), `tiny_embedding_hashes`, `embedgemma2_audio_profile_m5pro.txt` |
-| G8 vision and audio towers | resolved: towers (M1, M2), merge (M3), facade (F), one host wait per media call (K); preprocessing in Rust (P); video input in Rust (V of 6f62a50, F2) and decoded natively (D bd993d4, the decode lane V 4d06651, V2 e2c345f) | 6eedd5a, 06465a9, 908c3a2, 433e659, 03dae0f, f8ce932, 6f62a50, 8967e31, bd993d4, 4d06651, e2c345f | `tests/embedgemma2_e2e_model.rs`: max abs 3.8e-7 against sentence-transformers; `tests/embedgemma2_pre.rs`; `tests/embedgemma2_video_tiny.rs`; `tests/media_e2e_video.rs`: 1.38e-7 to 8.53e-7 |
+| G8 vision and audio towers | resolved: towers (M1, M2), merge (M3), facade (F), one host wait per media call (K); preprocessing in Rust (P); video input in Rust (V of 6f62a50, F2) and decoded natively (D bd993d4, the decode lane V bb099ca, V2 8277ab6) | 6eedd5a, 06465a9, 908c3a2, 433e659, 03dae0f, f8ce932, 6f62a50, 8967e31, bd993d4, bb099ca, 8277ab6 | `tests/embedgemma2_e2e_model.rs`: max abs 3.8e-7 against sentence-transformers; `tests/embedgemma2_pre.rs`; `tests/embedgemma2_video_tiny.rs`; `tests/media_e2e_video.rs`: 1.38e-7 to 8.53e-7 |
 | 1x16 latency (from G5) | resolved for ExactF32: opt-in split-K for the text encoder only (G) | f1a8677 | 1x16 0.60x (`embedgemma2_small_m_m5pro.txt`, `embedgemma2_final_m5pro.txt`) |
 
 Found on the way:

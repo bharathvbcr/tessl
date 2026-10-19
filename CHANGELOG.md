@@ -421,7 +421,7 @@ All notable changes to `tessl` are recorded here. The format follows
   machine state, no longer claim a "shared machine".
 - **The branch's paired benchmark** (`embedgemma2_integrate_{text,mm}_m5pro.*`,
   `plot_results integrate-text` / `integrate-mm`): 42f1d52, where the media and
-  binding work branched, against 2849fbe, with a byte-copy control lane, on a
+  binding work branched, against cccdffd, with a byte-copy control lane, on a
   quiet machine. Text ExactF32 0.998x to 1.003x of the base's time (control
   0.999x to 1.032x), Bf16 0.312x to 0.334x from 64x32 up; multimodal 0.993x to
   0.999x (control 0.996x to 1.000x). That work changed no kernel, and the

@@ -173,7 +173,7 @@ per-round ratios against the base lane, with the lowest and highest round beside
 it. `--max-spread X` (1 to 1.25) turns a ratio series whose max/min exceeds `X`
 into exit 3 with nothing reported. `--label TEXT` (one line, at most 200 bytes)
 records what the lanes are, for example `42f1d52 (branch point) against
-eg2/integrate 2849fbe`, as the JSON's `label`: the paired figures (`final`,
+eg2/integrate cccdffd`, as the JSON's `label`: the paired figures (`final`,
 `integrate-text`, `integrate-mm`) draw it as their title and refuse a file without
 one, so a figure cannot name revisions its run did not record.
 

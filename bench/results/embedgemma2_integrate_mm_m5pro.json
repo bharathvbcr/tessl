@@ -1,7 +1,7 @@
 {
   "rounds": 8,
   "format": "Workloads",
-  "label": "EmbeddingGemma 2 multimodal encode on Apple M5 Pro: 42f1d52 (branch point) against eg2/integrate 2849fbe",
+  "label": "EmbeddingGemma 2 multimodal encode on Apple M5 Pro: 42f1d52 (branch point) against eg2/integrate cccdffd",
   "lanes": [
     {
       "name": "before",
@@ -362,7 +362,7 @@
       "available": true,
       "root": "$HOME/Code/research/tessl-eg2",
       "scope": ".",
-      "revision": "2849fbebf091dd98ec449d2545b5c98b6f4b2b14",
+      "revision": "cccdffd0647c618eec79cfd8709a4dd06df4b3ac",
       "dirty": true,
       "status_porcelain": [
         "?? bench/results/embedgemma2_integrate_mm_m5pro.json.attempt.json",

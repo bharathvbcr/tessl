@@ -1,6 +1,6 @@
 //! `Qwen35Model::train_step_bytes` for one sequence is what it was before the
 //! ragged step existed: the pre-flight bound ojas-qwen35's `train_step`
-//! relies on. The values were printed by a37a0c2's `src/qwen35_train.rs` on
+//! relies on. The values were printed by 8c51319's `src/qwen35_train.rs` on
 //! the tiny fixture (default dispatch, this GPU's tensor-op capability and
 //! pool cap, which the bound reads), then pinned.
 

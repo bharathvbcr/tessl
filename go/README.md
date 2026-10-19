@@ -194,7 +194,7 @@ it).
   round trip with no work (`Ping`) is 1.3 us at best. Against direct calls of
   0.38 ms to 7.9 ms that is 0.8% to 2.4% (Go wall over the direct time, each a
   minimum from a separate process, is 1.008 to 1.042). Recorded 2026-10-18 at
-  eg2/integrate 2849fbe on a quiet machine (1-minute load average 3.9 before, 5.6
+  eg2/integrate cccdffd on a quiet machine (1-minute load average 3.9 before, 5.6
   after; the run waited for a load below 6, and no machine-wide lock was held),
   9 rounds of 150 calls per arm. The direct arm runs on a thread of its own with
   gusset's worker stack, which is what the engine's model lives on; the same arm on

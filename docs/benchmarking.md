@@ -801,6 +801,14 @@ PyTorch is quoted here, and their two figures (`img/attention_speed_history.svg`
 unverified for this tree. They become quotable when the attention ladder is
 re-run on this tree with `bench_paired` (recipe under "Paired rounds").
 
+**The tiled attention kernels are the A/B baseline, not a production path.**
+`TESSL_ATTN_TILED`, the `*_tiled` functions of `nn` (`flash_attn_swa_tiled`,
+`flash_attn_global_h512_tiled`) and the `flash_attn_*_with_scalars` entries are
+kept on purpose (owner decision, ft-a13c82af). They are the baseline that
+`bench_flash_attn` measures the router's split-KV and rows kernels against. A shipping run does not set the
+variable, and `bench_flash_attn --dump-parity` refuses to run with it set, so a
+parity dump always describes the shipping configuration.
+
 ![Attention tuning knobs](img/attention_tuning.svg)
 
 `attn_tune_*.json` and `attn_dispatch_split_m5pro.json` (imported: knob sweeps

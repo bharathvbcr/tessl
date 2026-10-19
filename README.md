@@ -546,7 +546,7 @@ The removed `GEMMA_METAL_*` and `METAL_NATIVE_*` spellings are no longer read.
 | `TESSL_ICB_PREBUILT_TABLES` | `1` (on) | Freezes buffer binds into per-command argument tables, shared by fingerprint. `0` opts out. |
 | `TESSL_ICB_TRIAGE` | `0` | Decode-ICB triage mode for diagnosing a replay regression. |
 | `TESSL_ICB_SMOKE` | `0` | Opt-in ICB smoke wiring. |
-| `TESSL_ATTN_TILED` | unset | Set (any value) to force the original tiled attention kernels instead of the default. Read once per process, for A/B runs. |
+| `TESSL_ATTN_TILED` | unset | Set (any value) to force the original tiled attention kernels instead of the router's split-KV/rows kernels. Read once per process. It is `bench_flash_attn`'s A/B baseline (kept on purpose, with `nn::flash_attn_swa_tiled`, `nn::flash_attn_global_h512_tiled` and the `flash_attn_*_with_scalars` entries), not a production path. |
 | `TESSL_KERNEL_TRACE` | unset | Set (any value) to record which kernels a process used. |
 
 ---

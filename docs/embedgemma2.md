@@ -881,6 +881,34 @@ and the 6147-token embedding moved from `9.2e-7` to `2.1e-7`.
 Measured on an M5 Pro against the real checkpoint, paired and interleaved
 (`bench_paired` over `bench_embedgemma2`; `bench/results/embedgemma2_*_m5pro.*`).
 
+* **Against sentence-transformers on PyTorch MPS** (tessl at d8f9cc3 against
+  sentence-transformers 6.1.0 on torch 2.14.1, `bench/embedgemma2_torch.py`, the same token ids,
+  batched as its `encode` batches; 4 interleaved rounds of min-of-10, recorded 2026-10-19, drift
+  gate passed on the first attempt; `embedgemma2_vs_torch_m5pro.{txt,json,svg}`, drawn by
+  `plot_results vs-torch`). tessl is faster on every workload torch can run, in every round:
+  torch takes 1.6x to 3.4x tessl's time in f32 and 3.1x to 4.4x in bf16, and its bf16 lane takes
+  1.04x to 3.4x the time of tessl's default ExactF32. Two of the eight workloads are not in the
+  run because torch does not run them reliably under this machine's 32 GiB per-process cap
+  (memguard; MPS's own ceiling is 33.6 GiB): `encode` pads `1x4096+63x32` to 32 x 4096 (stopped at
+  the cap in f32 and bf16; MPS itself refused 8 GiB more once, in f32) and
+  `1x6147+1x1658+6x10-42` to 8 x 6147 (one f32 encode finished, in 17.5 s; the next was stopped at
+  the cap); tessl packs them and runs each in under 0.7 s with a peak
+  footprint under 2 GiB. The run started at 1-minute load 5.2 and other sessions took it to 16.7
+  during it (the JSON records the start and the finish, the `.txt` the range); the smallest per-round margin,
+  torch bf16 against tessl f32 at 32x256, was 0.976x.
+* **The 2026-10-17 media, binding and Go work as a whole** (42f1d52, the branch point, against
+  `eg2/integrate` at cccdffd, each a release build in its own target directory, with a control
+  lane that is a byte copy of the base binary; recorded 2026-10-18 on a quiet machine, 1-minute
+  load average 3.7 to 5.9; the drift gate, `--max-spread 1.25`, passed on the first attempt;
+  `embedgemma2_integrate_{text,mm}_m5pro.{txt,json,svg}`, drawn by `plot_results
+  integrate-text` and `integrate-mm`). That work added media decoding, front ends and bindings
+  and touched no kernel, and the encoder's speed did not move. Text, 6 rounds of min-of-10:
+  ExactF32 0.998x to 1.003x of the base's time on all eight workloads (control 0.999x to
+  1.032x); Bf16 0.856x at 1x16 and 0.312x to 0.334x from 64x32 up (3.0x to 3.2x faster).
+  Multimodal (`bench_embedgemma2_mm`, 8 rounds of min-of-8, host ids, pixels and features to
+  host embeddings): 0.993x to 0.999x on `mixed_full`, `mixed_short` and `media_only` (control
+  0.996x to 1.000x), 1070 / 421 / 406 ms.
+
 * **The 2026-10-15 work as a whole** (60a6240 in its best mode, `BENCH_ASYNC=1`,
   against `eg2/integrate` at 7459e16, with a control lane at 0.995x to 1.002x;
   `embedgemma2_final_m5pro.{txt,json,png}`). ExactF32, the default: 1x16 0.60x
@@ -3668,42 +3696,53 @@ indicative**; `bench/results/media_decode_m5pro.{txt,json,svg}`, plotted by
 
 **Video to RGB, exact path against the BGRA path** (`BENCH_MEDIA_DIR=target/media_bench_video`,
 clips from `bench/make_video_bench_inputs.py`, minimum of 30 calls after 5 warm-ups, a fresh
-source each; **load average 21 when the run started and the machine ran other agents, so
-indicative**; `bench/results/media_video_color_m5pro.{txt,json,svg}`, plotted by
-`plot_results video-color`; the bench refuses a run in which a path fell back to the other).
-Wall time of one call, ms, with ms per frame in brackets for the first-30-frames rows:
+source each; recorded 2026-10-18 at eg2/integrate cccdffd on a quiet machine, 1-minute load
+average 3.8 to 4.7 across the run; `bench/results/media_video_color_m5pro.{txt,json,svg}`,
+plotted by `plot_results video-color`; the bench refuses a run in which a path fell back to the
+other). Wall time of one call, ms, with ms per frame in brackets for the first-30-frames rows;
+`exact1` is the exact path with the conversion on one thread:
 
-| clip | call | exact (VideoToolbox planes + Rust conversion) | bgra (AVFoundation) |
-|---|---|---|---|
-| 720p H.264 (1280 wide, NEON) | 10 sampled frames | 248 | 222 |
-| | first 30 frames | 235 (7.8) | 229 (7.6) |
-| 720p HEVC | 10 sampled | 152 | 216 |
-| | first 30 | 181 (6.0) | 197 (6.6) |
-| 1080p H.264 | 5 sampled | 168 | 233 |
-| | first 30 | 228 (7.6) | 139 (4.6) |
-| 1270x720 H.264 (table converter) | 5 sampled | 125 | 119 |
-| | first 30 | 127 (4.2) | 117 (3.9) |
+| clip | call | exact (VideoToolbox planes + Rust conversion, threaded) | exact1 (one thread) | bgra (AVFoundation) |
+|---|---|---|---|---|
+| 720p H.264 (1280 wide, NEON) | 10 sampled frames | 193 | 197 | 211 |
+| | first 30 frames | 199 (6.6) | 222 (7.4) | 212 (7.1) |
+| 720p HEVC | 10 sampled | 143 | 149 | 194 |
+| | first 30 | 148 (4.9) | 171 (5.7) | 195 (6.5) |
+| 1080p H.264 | 5 sampled | 169 | 186 | 144 |
+| | first 30 | 182 (6.1) | 238 (7.9) | 147 (4.9) |
+| 1080p HEVC Main 10 | 5 sampled | 137 | 154 | 156 |
+| | first 30 | 196 (6.5) | 295 (9.8) | 152 (5.1) |
+| 1270x720 H.264 (table converter) | 5 sampled | 105 | 107 | 119 |
+| | first 30 | 113 (3.8) | 126 (4.2) | 116 (3.9) |
+| 720p HEVC 4:4:4 | 5 sampled | 109 | 111 | 118 |
+| | first 30 | 115 (3.8) | 125 (4.2) | 119 (4.0) |
 
-Both paths decode every frame up to the last one asked for, so the rows are dominated by the
-decode. At 720p the two paths are within 0.7 ms per frame of each other in the first-30 rows,
-in either direction (HEVC: exact faster), and the sampled rows swap order from run to run (an
-earlier, noisier run had them the other way). At 1080p the first-30 rows are 89 ms apart
-(228 against 139), but the same clip's sampled rows are 65 ms apart in the opposite direction
-(168 against 233), so this run does not isolate the conversion's cost; a single-threaded
-conversion of 2 Mpixel is a plausible reason for the first-30 gap (inferred, not profiled).
-**The conversion is now threaded** (`Params::threads`, `Threads::Auto` by default: row bands
+**The converter alone** (`BENCH_YUV=1`, the same run: one frame of decoder planes to RGB, minimum
+of 30; threaded output checked equal to one thread first):
+
+| layout | 1280x720, one thread → threaded (ms) | 1920x1080, one thread → threaded (ms) |
+|---|---|---|
+| 8-bit 4:2:0 | 0.96 → 0.24 | 2.21 → 0.47 |
+| 10-bit 4:2:0 | 1.55 → 0.39 | 3.52 → 0.80 |
+| 10-bit 4:2:2 | 0.84 → 0.27 | 1.97 → 0.52 |
+| 8-bit 4:4:4 | 0.45 → 0.14 | 1.02 → 0.25 |
+
+Threading cuts the conversion 3.1 to 4.7 times; at 1080p it is 0.25 to 0.80 ms a frame. Both
+paths decode every frame up to the last one asked for, so the whole-call rows are dominated by
+the decode. With threads, the exact path is as fast as or faster than AVFoundation's BGRA
+conversion at 720p (every row) and on the sampled Main 10 call, and slower on 1080p H.264 (182
+against 147 ms for 30 frames, 1.2 ms a frame) and 1080p Main 10's first 30 (196 against 152,
+1.5 ms a frame). The converter alone accounts for 0.47 and 0.80 ms of those frames, so the rest
+of each gap is outside the conversion (inferred: the copy of the decoder's planes out of the
+`CVPixelBuffer`, not profiled).
+**The conversion is threaded** (`Params::threads`, `Threads::Auto` by default: row bands
 over `std::thread::scope`, one band per available core up to eight, pictures under 65,536
 pixels single). It
 cannot change the bytes, since each output pixel is a function of its own samples (and, for
 10-bit 4:2:0, of fixed neighbouring chroma rows), and the tests hold that:
 `threading_never_changes_a_byte` (every format, many sizes and thread counts) and
-`the_thread_count_never_changes_the_frames` (through the whole decode). **Its speed was not
-measured**: the benchmark (`bench_media_decode` with `BENCH_YUV=1`, which now also times the
-converter alone, `yuv:LAYOUT_WxH:single|threads`, and the whole call with one thread,
-`exact1`) was not run, because the machine's load average was 130 to 190 for the whole lane
-and a timing taken then would measure the other agents, so `bench/results/media_video_color_m5pro.*`
-above are still the pre-threading numbers. `plot_results video-color` draws the third bar once a run
-contains `exact1` rows.
+`the_thread_count_never_changes_the_frames` (through the whole decode). Its speed is the
+`exact` against `exact1` columns and the converter table above.
 
 The audio rows above were measured with the `AudioConverter` as the default (before the Rust
 resampler); the sample-rate conversion at the `Mastering` setting was most of the audio time.
@@ -3730,22 +3769,23 @@ own speed (it is the same algorithm in C with NEON).
 **JPEG, native against ImageIO.** `bench_jpeg_decode` (inputs from
 `bench/make_jpeg_bench_inputs.py`) times `decode_image` (the native path) and
 `decode_image_imageio` on the same bytes, one call of each in turn per iteration, minimum of 40
-after 3 warm-ups. **Indicative only: the machine was shared with other agents and the medians
-move by tens of percent between runs** (`bench/results/jpeg_decode_m5pro.{txt,json,svg}`, plotted
+after 3 warm-ups. Recorded 2026-10-18 at eg2/integrate cccdffd on a quiet machine (1-minute
+load average 3.8); an earlier run on a shared machine had medians moving by tens of percent and
+minima 27 to 50 % higher (`bench/results/jpeg_decode_m5pro.{txt,json,svg}`, plotted
 by `plot_results jpeg-decode`, whose own tests are in `tests/plot_results.rs`). The two paths do not
 return the same pixels (the native one is the reference's):
 
 | file | MP | native ms (min) | ImageIO ms (min) | native / ImageIO |
 |---|---|---|---|---|
-| 1080p 4:2:0 baseline | 2.07 | 11.6 | 10.4 | 1.12 |
-| 1080p 4:2:0 progressive | 2.07 | 19.9 | 19.1 | 1.04 |
-| 1080p 4:2:2 baseline | 2.07 | 12.8 | 10.6 | 1.21 |
-| 1080p 4:4:4 baseline | 2.07 | 18.8 | 13.3 | 1.41 |
-| 1080p gray | 2.07 | 7.3 | 6.4 | 1.13 |
-| 2160p 4:2:0 baseline | 8.29 | 49.4 | 38.0 | 1.30 |
-| 224x224 4:2:0 baseline | 0.05 | 0.30 | 0.29 | 1.03 |
+| 1080p 4:2:0 baseline | 2.07 | 8.8 | 7.8 | 1.13 |
+| 1080p 4:2:0 progressive | 2.07 | 15.2 | 15.8 | 0.97 |
+| 1080p 4:2:2 baseline | 2.07 | 10.1 | 7.8 | 1.31 |
+| 1080p 4:4:4 baseline | 2.07 | 13.6 | 8.7 | 1.56 |
+| 1080p gray | 2.07 | 5.6 | 4.5 | 1.25 |
+| 2160p 4:2:0 baseline | 8.29 | 35.0 | 27.0 | 1.30 |
+| 224x224 4:2:0 baseline | 0.05 | 0.20 | 0.19 | 1.06 |
 
-So the exact decoder costs 4 to 41 % more wall time than ImageIO on one thread (the 4:4:4 file,
+So the exact decoder takes from 3 % less (progressive) to 56 % more wall time than ImageIO on one thread (the 4:4:4 file,
 which has no chroma upsampling to hide behind, is the slowest relative to ImageIO). A sampled
 profile of the 1080p files put most native time in the output stage (chroma upsampling and
 colour conversion), then the IDCT, then Huffman decoding; the upsampling and colour loops were
@@ -3782,8 +3822,10 @@ tried.
   created for them, checked in this lane with a scratch program and not kept as a test), and
   MPEG-4 Part 2 fails to open under both colour paths (a test). 12-bit and monochrome HEVC are refused by name. Odd-width 4:2:0 and 4:2:2 and
   odd-height 4:2:0 cannot be coded by either codec and are refused by the converter.
-- The converter is threaded (byte-identical to one thread, held by tests), but its cost per
-  frame was not measured: every run in this lane was at a load average above 100.
+- At 1080p the exact video path is still 1.2 to 1.5 ms a frame slower than AVFoundation's BGRA
+  conversion on 30 consecutive frames, more than the threaded converter's 0.47 to 0.80 ms
+  (measured, see Media decoding); where the rest goes is inferred (the copy out of the
+  `CVPixelBuffer`), not profiled.
 - Ogg Opus in SILK or hybrid mode does not match a torchcodec reference closely (15 to 20 dB
   from FFmpeg's native decoder, which is itself 2 to 4 samples behind libopus there); matching
   it needs FFmpeg's SILK decoding, not a shift. AudioToolbox is exact against libopus for
@@ -3802,4 +3844,6 @@ tried.
   with the `ffmpeg` binary and FFmpeg's published option documentation, without FFmpeg's source
   or the earlier implementation (`docs/media_resample_cleanroom.md` records what was consulted,
   including the structural hints in the earlier tests' comments, each re-derived by experiment).
-  The earlier implementation remains in this branch's history until it is squashed.
+  The earlier implementation, derived from libswresample's LGPL source, was removed from the
+  repository's history on 2026-10-18: the commits that held it carry a provenance note in
+  its place (commit SHAs from that point on changed; references in this tree were updated).

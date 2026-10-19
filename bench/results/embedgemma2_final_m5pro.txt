@@ -10,7 +10,9 @@ What ran
     after_f32     eg2/integrate at 7459e16, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
     after_bf16    the same binary, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
   Published by the drift gate on its first attempt with these lanes; the provenance block
-  (revision, lane binary hashes, host, load) is in embedgemma2_final_m5pro.json.
+  (revision, lane binary hashes, host, load) is in embedgemma2_final_m5pro.json. The run
+  predates bench_paired --label; the JSON's "label" key (the figure's title) was added on
+  2026-10-18 from the first line of this file.
 
   A first attempt also had a lane for 60a6240's default mode (every dispatch committed and waited,
   what a library caller got before lane A's async_scope). It was refused, nothing published: its

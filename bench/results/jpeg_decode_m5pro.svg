@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="574.8" viewBox="0 0 1100 574.8" role="img">
-<title>JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro, shared machine)</title>
+<title>JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro)</title>
 <style>
 text{font-family:-apple-system,Helvetica,Arial,sans-serif}
 .ink{fill:#0b0b0b}.mut{fill:#52514e}.dim{fill:#898781}.bold{font-weight:600}
@@ -9,8 +9,8 @@ text{font-family:-apple-system,Helvetica,Arial,sans-serif}
 .grid{stroke:#2c2c2a}.axis{stroke:#55544f}.sk{stroke:#f0efec}.mk{stroke:#c3c2b7}.edge{stroke:#1a1a19}}
 </style>
 <rect class="bg" width="100%" height="100%"/>
-<text class="ink" x="14" y="26" font-size="15" font-weight="600">JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro, shared machine)</text>
-<text class="mut" x="14" y="40.8" font-size="11.5">Bars are the minimum of N interleaved calls; the tick is the median. Indicative, not a paired comparison.</text>
+<text class="ink" x="14" y="26" font-size="15" font-weight="600">JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro)</text>
+<text class="mut" x="14" y="40.8" font-size="11.5">Bars are the minimum of N interleaved calls; the tick is the median. Indicative, not a paired comparison; the machine&apos;s load is recorded in the .txt beside the data.</text>
 <rect class="key" x="14" y="54.3" width="14" height="10" fill="#2a78d6"/>
 <text class="mut" x="34" y="63.3" font-size="11">native (tessl::media::jpeg, libjpeg-turbo exact)</text>
 <rect class="key" x="278.93" y="54.3" width="14" height="10" fill="#eb6834"/>
@@ -34,81 +34,60 @@ text{font-family:-apple-system,Helvetica,Arial,sans-serif}
 <text class="mut" x="221.9" y="488.31" font-size="11" text-anchor="end">uhd_420_baseline.jpg  (8.29 MP)</text>
 <line class="grid" x1="228.9" y1="84.8" x2="228.9" y2="515.2"/>
 <line class="axis" x1="228.9" y1="515.2" x2="228.9" y2="519.2"/>
-<text class="mut" x="228.9" y="532" font-size="11" text-anchor="middle">0.2</text>
-<line class="grid" x1="327.87" y1="84.8" x2="327.87" y2="515.2"/>
-<line class="axis" x1="327.87" y1="515.2" x2="327.87" y2="519.2"/>
-<text class="mut" x="327.87" y="532" font-size="11" text-anchor="middle">0.5</text>
-<line class="grid" x1="402.74" y1="84.8" x2="402.74" y2="515.2"/>
-<line class="axis" x1="402.74" y1="515.2" x2="402.74" y2="519.2"/>
-<text class="mut" x="402.74" y="532" font-size="11" text-anchor="middle">1</text>
-<line class="grid" x1="477.61" y1="84.8" x2="477.61" y2="515.2"/>
-<line class="axis" x1="477.61" y1="515.2" x2="477.61" y2="519.2"/>
-<text class="mut" x="477.61" y="532" font-size="11" text-anchor="middle">2</text>
-<line class="grid" x1="576.58" y1="84.8" x2="576.58" y2="515.2"/>
-<line class="axis" x1="576.58" y1="515.2" x2="576.58" y2="519.2"/>
-<text class="mut" x="576.58" y="532" font-size="11" text-anchor="middle">5</text>
-<line class="grid" x1="651.45" y1="84.8" x2="651.45" y2="515.2"/>
-<line class="axis" x1="651.45" y1="515.2" x2="651.45" y2="519.2"/>
-<text class="mut" x="651.45" y="532" font-size="11" text-anchor="middle">10</text>
-<line class="grid" x1="726.32" y1="84.8" x2="726.32" y2="515.2"/>
-<line class="axis" x1="726.32" y1="515.2" x2="726.32" y2="519.2"/>
-<text class="mut" x="726.32" y="532" font-size="11" text-anchor="middle">20</text>
-<line class="grid" x1="825.29" y1="84.8" x2="825.29" y2="515.2"/>
-<line class="axis" x1="825.29" y1="515.2" x2="825.29" y2="519.2"/>
-<text class="mut" x="825.29" y="532" font-size="11" text-anchor="middle">50</text>
-<line class="grid" x1="900.16" y1="84.8" x2="900.16" y2="515.2"/>
-<line class="axis" x1="900.16" y1="515.2" x2="900.16" y2="519.2"/>
-<text class="mut" x="900.16" y="532" font-size="11" text-anchor="middle">100</text>
-<line class="grid" x1="975.03" y1="84.8" x2="975.03" y2="515.2"/>
-<line class="axis" x1="975.03" y1="515.2" x2="975.03" y2="519.2"/>
-<text class="mut" x="975.03" y="532" font-size="11" text-anchor="middle">200</text>
-<line class="grid" x1="1074" y1="84.8" x2="1074" y2="515.2"/>
-<line class="axis" x1="1074" y1="515.2" x2="1074" y2="519.2"/>
-<text class="mut" x="1074" y="532" font-size="11" text-anchor="middle">500</text>
+<text class="mut" x="228.9" y="532" font-size="11" text-anchor="middle">0.1</text>
+<line class="grid" x1="484.91" y1="84.8" x2="484.91" y2="515.2"/>
+<line class="axis" x1="484.91" y1="515.2" x2="484.91" y2="519.2"/>
+<text class="mut" x="484.91" y="532" font-size="11" text-anchor="middle">1</text>
+<line class="grid" x1="740.92" y1="84.8" x2="740.92" y2="515.2"/>
+<line class="axis" x1="740.92" y1="515.2" x2="740.92" y2="519.2"/>
+<text class="mut" x="740.92" y="532" font-size="11" text-anchor="middle">10</text>
+<line class="grid" x1="996.93" y1="84.8" x2="996.93" y2="515.2"/>
+<line class="axis" x1="996.93" y1="515.2" x2="996.93" y2="519.2"/>
+<text class="mut" x="996.93" y="532" font-size="11" text-anchor="middle">100</text>
 <line class="axis" x1="228.9" y1="515.2" x2="1074" y2="515.2"/>
 <line class="axis" x1="228.9" y1="84.8" x2="228.9" y2="515.2"/>
 <text class="mut" x="651.45" y="554.8" font-size="12" text-anchor="middle">wall time per call, ms (min of N; tick = median)</text>
-<rect x="228.9" y="93.41" width="438.76" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="686.3" y1="93.41" x2="686.3" y2="114.31" class="median sk" stroke-width="2"/>
-<text class="mut" x="694.3" y="107.54" font-size="10.5">11.6 ms</text>
-<rect x="228.9" y="116.77" width="426.79" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="676.87" y1="116.77" x2="676.87" y2="137.68" class="median sk" stroke-width="2"/>
-<text class="mut" x="684.87" y="130.9" font-size="10.5">10.4 ms</text>
-<rect x="228.9" y="154.89" width="497.08" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="778.82" y1="154.89" x2="778.82" y2="175.8" class="median sk" stroke-width="2"/>
-<text class="mut" x="786.82" y="169.02" font-size="10.5">19.9 ms</text>
-<rect x="228.9" y="178.26" width="492.47" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="776.86" y1="178.26" x2="776.86" y2="199.16" class="median sk" stroke-width="2"/>
-<text class="mut" x="784.86" y="192.39" font-size="10.5">19.1 ms</text>
-<rect x="228.9" y="216.38" width="449.62" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="733.79" y1="216.38" x2="733.79" y2="237.28" class="median sk" stroke-width="2"/>
-<text class="mut" x="741.79" y="230.51" font-size="10.5">12.8 ms</text>
-<rect x="228.9" y="239.74" width="428.79" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="684.1" y1="239.74" x2="684.1" y2="260.65" class="median sk" stroke-width="2"/>
-<text class="mut" x="692.1" y="253.87" font-size="10.5">10.6 ms</text>
-<rect x="228.9" y="277.87" width="490.57" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="740.7" y1="277.87" x2="740.7" y2="298.77" class="median sk" stroke-width="2"/>
-<text class="mut" x="748.7" y="291.99" font-size="10.5">18.8 ms</text>
-<rect x="228.9" y="301.23" width="453.16" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="694.13" y1="301.23" x2="694.13" y2="322.13" class="median sk" stroke-width="2"/>
-<text class="mut" x="702.13" y="315.36" font-size="10.5">13.3 ms</text>
-<rect x="228.9" y="339.35" width="387.83" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="661.86" y1="339.35" x2="661.86" y2="360.26" class="median sk" stroke-width="2"/>
-<text class="mut" x="669.86" y="353.48" font-size="10.5">7.3 ms</text>
-<rect x="228.9" y="362.72" width="374.83" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="608.84" y1="362.72" x2="608.84" y2="383.62" class="median sk" stroke-width="2"/>
-<text class="mut" x="616.84" y="376.84" font-size="10.5">6.4 ms</text>
-<rect x="228.9" y="400.84" width="43.62" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="275.15" y1="400.84" x2="275.15" y2="421.74" class="median sk" stroke-width="2"/>
-<text class="mut" x="283.15" y="414.96" font-size="10.5">0.3 ms</text>
-<rect x="228.9" y="424.2" width="40.77" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="280.91" y1="424.2" x2="280.91" y2="445.11" class="median sk" stroke-width="2"/>
-<text class="mut" x="288.91" y="438.33" font-size="10.5">0.3 ms</text>
-<rect x="228.9" y="462.32" width="595.05" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
-<line x1="842.91" y1="462.32" x2="842.91" y2="483.23" class="median sk" stroke-width="2"/>
-<text class="mut" x="850.91" y="476.45" font-size="10.5">49.4 ms</text>
-<rect x="228.9" y="485.69" width="566.83" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
-<line x1="812.2" y1="485.69" x2="812.2" y2="506.59" class="median sk" stroke-width="2"/>
-<text class="mut" x="820.2" y="499.81" font-size="10.5">38.0 ms</text>
+<rect x="228.9" y="93.41" width="497.4" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="727.46" y1="93.41" x2="727.46" y2="114.31" class="median sk" stroke-width="2"/>
+<text class="mut" x="735.46" y="107.54" font-size="10.5">8.8 ms</text>
+<rect x="228.9" y="116.77" width="484.18" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="721.64" y1="116.77" x2="721.64" y2="137.68" class="median sk" stroke-width="2"/>
+<text class="mut" x="729.64" y="130.9" font-size="10.5">7.8 ms</text>
+<rect x="228.9" y="154.89" width="558.89" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="789.8" y1="154.89" x2="789.8" y2="175.8" class="median sk" stroke-width="2"/>
+<text class="mut" x="797.8" y="169.02" font-size="10.5">15.2 ms</text>
+<rect x="228.9" y="178.26" width="562.54" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="794.52" y1="178.26" x2="794.52" y2="199.16" class="median sk" stroke-width="2"/>
+<text class="mut" x="802.52" y="192.39" font-size="10.5">15.8 ms</text>
+<rect x="228.9" y="216.38" width="513.63" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="744.13" y1="216.38" x2="744.13" y2="237.28" class="median sk" stroke-width="2"/>
+<text class="mut" x="752.13" y="230.51" font-size="10.5">10.1 ms</text>
+<rect x="228.9" y="239.74" width="483.81" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="719.05" y1="239.74" x2="719.05" y2="260.65" class="median sk" stroke-width="2"/>
+<text class="mut" x="727.05" y="253.87" font-size="10.5">7.8 ms</text>
+<rect x="228.9" y="277.87" width="546.37" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="776.21" y1="277.87" x2="776.21" y2="298.77" class="median sk" stroke-width="2"/>
+<text class="mut" x="784.21" y="291.99" font-size="10.5">13.6 ms</text>
+<rect x="228.9" y="301.23" width="497.16" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="733.55" y1="301.23" x2="733.55" y2="322.13" class="median sk" stroke-width="2"/>
+<text class="mut" x="741.55" y="315.36" font-size="10.5">8.7 ms</text>
+<rect x="228.9" y="339.35" width="447.94" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="679.67" y1="339.35" x2="679.67" y2="360.26" class="median sk" stroke-width="2"/>
+<text class="mut" x="687.67" y="353.48" font-size="10.5">5.6 ms</text>
+<rect x="228.9" y="362.72" width="422.98" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="655.28" y1="362.72" x2="655.28" y2="383.62" class="median sk" stroke-width="2"/>
+<text class="mut" x="663.28" y="376.84" font-size="10.5">4.5 ms</text>
+<rect x="228.9" y="400.84" width="79.6" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="310.27" y1="400.84" x2="310.27" y2="421.74" class="median sk" stroke-width="2"/>
+<text class="mut" x="318.27" y="414.96" font-size="10.5">0.2 ms</text>
+<rect x="228.9" y="424.2" width="73.22" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="306.24" y1="424.2" x2="306.24" y2="445.11" class="median sk" stroke-width="2"/>
+<text class="mut" x="314.24" y="438.33" font-size="10.5">0.2 ms</text>
+<rect x="228.9" y="462.32" width="651.43" height="20.91" class="bar" fill="#2a78d6" fill-opacity="0.85"/>
+<line x1="881.45" y1="462.32" x2="881.45" y2="483.23" class="median sk" stroke-width="2"/>
+<text class="mut" x="889.45" y="476.45" font-size="10.5">35.0 ms</text>
+<rect x="228.9" y="485.69" width="622.53" height="20.91" class="bar" fill="#eb6834" fill-opacity="0.85"/>
+<line x1="860.24" y1="485.69" x2="860.24" y2="506.59" class="median sk" stroke-width="2"/>
+<text class="mut" x="868.24" y="499.81" font-size="10.5">27.0 ms</text>
 </g>
 </svg>

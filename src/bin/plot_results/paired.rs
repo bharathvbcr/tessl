@@ -10,8 +10,8 @@
 //! * [`pre`]: tessl's preprocessors against the Hugging Face processors.
 
 use crate::chart::{
-    nice_ceil, nice_floor, Axes, AxisCfg, Figure, Kind, LegendItem, Paint, Scale, Stroke, Ts, Va, BLUE, GREEN, GREY,
-    ORANGE,
+    nice_ceil, nice_floor, Axes, AxisCfg, Figure, Kind, LegendItem, Paint, Scale, Stroke, Ts, Va, BLUE, GOLD, GREEN,
+    GREY, M_BLUE, M_GREEN, M_ORANGE, M_RED, ORANGE,
 };
 use crate::data::{max_of, min_of, N, R};
 use crate::json::Json;
@@ -22,9 +22,48 @@ use std::path::Path;
 /// area is short of its cell, for sizing a range before the axes exist.
 pub const CHROME_PX: f64 = 150.0;
 
-/// A series colour by lane name; a lane the figure has no colour for is grey.
-pub fn color_of(table: &[(&str, &'static str)], lane: &str) -> &'static str {
-    table.iter().find(|(n, _)| *n == lane).map(|(_, c)| *c).unwrap_or(GREY)
+/// Colours a lane the figure's table does not name is given, in order.
+const SERIES: &[&str] = &[BLUE, ORANGE, GREEN, GOLD, M_RED, M_BLUE, M_GREEN, M_ORANGE];
+
+/// A figure's lanes with their series colours.
+pub struct LaneColors(Vec<(String, &'static str)>);
+
+impl LaneColors {
+    /// A lane the table names keeps its colour; any other takes the first of
+    /// [`SERIES`] no lane of this figure uses, so two lanes are never drawn alike.
+    pub fn new(table: &[(&str, &'static str)], lanes: &[String]) -> R<LaneColors> {
+        let named = |l: &str| table.iter().find(|(n, _)| *n == l).map(|(_, c)| *c);
+        let mut used: Vec<&'static str> = lanes.iter().filter_map(|l| named(l)).collect();
+        let mut out = Vec::with_capacity(lanes.len());
+        for l in lanes {
+            let c = match named(l) {
+                Some(c) => c,
+                None => {
+                    let c = SERIES.iter().copied().find(|c| !used.contains(c)).ok_or_else(|| {
+                        format!("lane {l:?}: more lanes than the {} series colours", SERIES.len())
+                    })?;
+                    used.push(c);
+                    c
+                }
+            };
+            out.push((l.clone(), c));
+        }
+        Ok(LaneColors(out))
+    }
+
+    /// The colour of one of the figure's lanes; a name that is not one of them
+    /// is a drawing bug, reported rather than drawn grey.
+    pub fn of(&self, lane: &str) -> R<&'static str> {
+        self.0
+            .iter()
+            .find(|(n, _)| n == lane)
+            .map(|(_, c)| *c)
+            .ok_or_else(|| format!("lane {lane:?} is not one of the figure's lanes"))
+    }
+
+    pub fn legend(&self) -> Vec<LegendItem> {
+        self.0.iter().map(|(l, c)| LegendItem::boxed(l, c)).collect()
+    }
 }
 
 pub fn lane_names(doc: &N) -> R<Vec<String>> {
@@ -101,10 +140,13 @@ const FINAL_COLORS: &[(&str, &str)] = &[
     ("control", GREY),
     ("after_f32", ORANGE),
     ("after_bf16", GREEN),
+    ("before", BLUE),
+    ("after", ORANGE),
 ];
 
-/// `embedgemma2_final_m5pro.json`: text encode time per workload, speed-up
-/// against the first lane, and device memory.
+/// A `bench_paired --label` run (`embedgemma2_final_m5pro.json` and the
+/// `embedgemma2_integrate_*` runs): encode time per workload, speed-up against
+/// the first lane, and device memory, under the run's own label.
 pub fn final_(json: &Path) -> R<Output> {
     let doc = load(json)?;
     let root = N::root(&doc, "final");
@@ -117,22 +159,20 @@ pub fn final_(json: &Path) -> R<Output> {
         ));
     }
     let base = lanes[0].clone();
+    // What the lanes are is the run's own record (`bench_paired --label`), not
+    // this figure's: one function draws every such run.
+    let label = root.get("label")?.s()?.to_string();
     let works: Vec<String> = rows
         .iter()
         .map(|r| r.get("workload")?.s().map(str::to_string))
         .collect::<R<_>>()?;
 
-    let legend: Vec<LegendItem> = lanes
-        .iter()
-        .map(|l| LegendItem::boxed(l, color_of(FINAL_COLORS, l)))
-        .collect();
+    let colors = LaneColors::new(FINAL_COLORS, &lanes)?;
+    let legend = colors.legend();
     let mut fig = Figure::new(
         1500.0,
         560.0,
-        &format!(
-            "EmbeddingGemma 2 text encode on Apple M5 Pro: 60a6240 against eg2/integrate ({} interleaved rounds)",
-            rounds_of(&root)
-        ),
+        &format!("{label} ({} interleaved rounds)", rounds_of(&root)),
         &[
             "Left: each lane's median over rounds of its min-of-N encode time, log scale. Middle: speed-up against \
              the first lane (1 / the median per-round ratio, whiskers at the lowest and highest round). Right: \
@@ -165,7 +205,7 @@ pub fn final_(json: &Path) -> R<Output> {
                 x,
                 w * 0.92,
                 (0.0, r.get(l)?.get("ms_min_median")?.pos()?),
-                &Paint::new(color_of(FINAL_COLORS, l)),
+                &Paint::new(colors.of(l)?),
             );
         }
     }
@@ -187,10 +227,10 @@ pub fn final_(json: &Path) -> R<Output> {
     let scale = Scale::headroom(Kind::Log, lo, top, cells[1].h - CHROME_PX, 48.0)?;
     let mut ax = Axes::new(
         cells[1],
-        &format!("Speed-up against 60a6240 ({base})"),
+        &format!("Speed-up against the first lane ({base})"),
         &[],
         AxisCfg::categories(&works, false)?.rotated(35.0),
-        AxisCfg::fixed(scale, &[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
+        AxisCfg::fixed(scale, &[0.1, 0.15, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0])
             .labelled(&format!("speed-up vs {base} (log; whiskers: lowest/highest round)")),
     )?;
     ax.axhline(1.0, &Stroke::muted(1.0).dashed());
@@ -201,7 +241,7 @@ pub fn final_(json: &Path) -> R<Output> {
             let v = r.get(l)?.get("vs_base")?;
             let sp = 1.0 / v.get("median")?.pos()?;
             let (wlo, whi) = (1.0 / v.get("hi")?.pos()?, 1.0 / v.get("lo")?.pos()?);
-            ax.bar(x, w * 0.92, (0.0, sp), &Paint::new(color_of(FINAL_COLORS, l)));
+            ax.bar(x, w * 0.92, (0.0, sp), &Paint::new(colors.of(l)?));
             ax.whisker(x, (wlo, whi), 3.0, &Stroke::ink(1.0));
             ax.text(x, whi, (3.0, -5.0), &format!("{sp:.2}x"), &Ts::new(9.5).ink().rot(90.0));
         }
@@ -209,16 +249,17 @@ pub fn final_(json: &Path) -> R<Output> {
     fig.add(ax);
 
     // Device memory, linear.
+    // A lane that printed no device peak (the torch lanes) has none to draw; a
+    // 0 MiB bar would say it used no memory.
     let mut peaks = Vec::new();
     for r in &rows {
         for l in &lanes {
-            peaks.push(match r.get(l)?.opt("device_peak_mib_max") {
-                Some(p) => p.f()?,
-                None => 0.0,
-            });
+            if let Some(p) = r.get(l)?.opt("device_peak_mib_max") {
+                peaks.push(p.f()?);
+            }
         }
     }
-    let top = max_of(&peaks)?;
+    let top = if peaks.is_empty() { 0.0 } else { max_of(&peaks)? };
     let mut ax = Axes::new(
         cells[2],
         "Device memory",
@@ -231,11 +272,10 @@ pub fn final_(json: &Path) -> R<Output> {
     for (k, r) in rows.iter().enumerate() {
         for (i, l) in lanes.iter().enumerate() {
             let x = k as f64 + (i as f64 - (lanes.len() as f64 - 1.0) / 2.0) * w;
-            let p = match r.get(l)?.opt("device_peak_mib_max") {
-                Some(p) => p.f()?,
-                None => 0.0,
-            };
-            ax.bar(x, w * 0.92, (0.0, p), &Paint::new(color_of(FINAL_COLORS, l)));
+            match r.get(l)?.opt("device_peak_mib_max") {
+                Some(p) => ax.bar(x, w * 0.92, (0.0, p.f()?), &Paint::new(colors.of(l)?)),
+                None => ax.text(x, 0.0, (3.0, -5.0), "not recorded", &Ts::new(9.5).dim().rot(90.0)),
+            }
         }
     }
     fig.add(ax);
@@ -256,10 +296,8 @@ pub fn audio_speed(json: &Path) -> R<Output> {
     let rows = root.get("summary")?.nonempty()?;
     let lanes = lane_names(&root)?;
     let base = lanes[0].clone();
-    let legend: Vec<LegendItem> = lanes
-        .iter()
-        .map(|l| LegendItem::boxed(l, color_of(BEFORE_AFTER_COLORS, l)))
-        .collect();
+    let colors = LaneColors::new(BEFORE_AFTER_COLORS, &lanes)?;
+    let legend = colors.legend();
     let mut fig = Figure::new(
         390.0 * rows.len() as f64,
         470.0,
@@ -295,7 +333,7 @@ pub fn audio_speed(json: &Path) -> R<Output> {
             } else {
                 None
             };
-            strip_lane(&mut ax, x as f64, &d, color_of(BEFORE_AFTER_COLORS, l), label)?;
+            strip_lane(&mut ax, x as f64, &d, colors.of(l)?, label)?;
         }
         fig.add(ax);
     }
@@ -319,10 +357,8 @@ pub fn mm_onewait(json: &Path) -> R<Output> {
     let rows = root.get("summary")?.nonempty()?;
     let lanes = lane_names(&root)?;
     let base = lanes[0].clone();
-    let legend: Vec<LegendItem> = lanes
-        .iter()
-        .map(|l| LegendItem::boxed(l, color_of(BEFORE_AFTER_COLORS, l)))
-        .collect();
+    let colors = LaneColors::new(BEFORE_AFTER_COLORS, &lanes)?;
+    let legend = colors.legend();
     let mut fig = Figure::new(
         390.0 * rows.len() as f64,
         760.0,
@@ -372,7 +408,7 @@ pub fn mm_onewait(json: &Path) -> R<Output> {
             } else {
                 None
             };
-            strip_lane(&mut ax, x as f64, &d, color_of(BEFORE_AFTER_COLORS, l), label)?;
+            strip_lane(&mut ax, x as f64, &d, colors.of(l)?, label)?;
             let best = min_of(&d.get("ms_min_all")?.floats()?)?;
             ax.text(
                 x as f64,
@@ -402,7 +438,7 @@ pub fn mm_onewait(json: &Path) -> R<Output> {
             },
         )?;
         for (x, (l, p)) in lanes.iter().zip(&peaks).enumerate() {
-            bx.bar(x as f64, 0.55, (0.0, *p), &Paint::new(color_of(BEFORE_AFTER_COLORS, l)));
+            bx.bar(x as f64, 0.55, (0.0, *p), &Paint::new(colors.of(l)?));
             let waits = MM_WAITS.iter().find(|(name, _)| name == l).map(|(_, w)| *w);
             let label = match waits {
                 Some(w) => format!("{p:.1}\n{w} wait{}", if w == 1 { "" } else { "s" }),
@@ -475,9 +511,8 @@ pub fn pre(json: &Path) -> R<Output> {
     )?;
     let width = 0.38;
     for (i, r) in rows.iter().enumerate() {
-        for (j, lane) in ["tessl", "hf"].iter().enumerate() {
+        for (j, &(lane, c)) in PRE_COLORS.iter().enumerate() {
             let d = r.get(lane)?;
-            let c = color_of(PRE_COLORS, lane);
             let x = i as f64 + (j as f64 - 0.5) * width;
             let med = d.get("ms_min_median")?.pos()?;
             ax.bar(x, width * 0.92, (0.0, med), &Paint::new(c).alpha(0.28));

@@ -23,6 +23,13 @@ pub fn go_overhead(json: &Path) -> R<Output> {
     let rows = root.get("rows")?.nonempty()?;
     let ping = root.get("ping")?.get("min_us")?.pos()?;
     let (rounds, iters) = (root.get("rounds")?.pos()?, root.get("iters_per_round")?.pos()?);
+    // The machine's state is the run's record (`vm.loadavg` before and after), so
+    // the figure says what it was rather than assuming it.
+    let host = root.get("host")?;
+    let (load_before, load_after) = (
+        one_minute_load(&host.get("loadavg_before")?)?,
+        one_minute_load(&host.get("loadavg_after")?)?,
+    );
 
     struct Row {
         label: String,
@@ -100,7 +107,7 @@ pub fn go_overhead(json: &Path) -> R<Output> {
     ];
     let notes = format!(
         "Tiny multimodal checkpoint, one call per point; minimum of {} calls ({} rounds of {}) per arm, the arms alternating in separate \
-         processes, and all arms' outputs are bit-identical. Indicative: a shared machine.",
+         processes, and all arms' outputs are bit-identical. 1-minute load average {load_before:.1} before, {load_after:.1} after.",
         rounds as u64 * iters as u64,
         rounds as u64,
         iters as u64
@@ -183,4 +190,14 @@ pub fn go_overhead(json: &Path) -> R<Output> {
         svg: fig.finish(),
         table,
     })
+}
+
+/// The 1-minute figure of a `vm.loadavg` record, `"{ 3.87 5.25 6.69 }"`.
+fn one_minute_load(v: &N) -> R<f64> {
+    let text = v.s()?;
+    let first = text.trim().trim_start_matches('{').split_whitespace().next();
+    match first.map(str::parse::<f64>) {
+        Some(Ok(x)) if x.is_finite() && x >= 0.0 => Ok(x),
+        _ => Err(format!("{}: {text:?} is not a vm.loadavg record", v.path())),
+    }
 }

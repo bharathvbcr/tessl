@@ -1,0 +1,24 @@
+EmbeddingGemma 2 multimodal encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate cccdffd
+Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b. Recorded at 2849fbe, renamed cccdffd (the same tree) by the 2026-10-18 history scrub.
+
+What ran
+  bench_paired --rounds 8 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=8, BENCH_WARMUP=2,
+  lane order reversed on odd rounds, one fresh process per lane per round, min-of-N per process.
+  Lanes (target/run_integrate_bench.sh):
+    before   42f1d52's bench_embedgemma2_mm (a detached worktree, its own target dir)
+    after    eg2/integrate at cccdffd's bench_embedgemma2_mm
+    control  a byte copy of the before binary
+  src/bin/bench_embedgemma2_mm.rs is the same file at both revisions: one
+  EmbedGemma2Multimodal::encode call from host ids, pixels and features to host embeddings, f32
+  operands, workloads mixed_full, mixed_short and media_only (see that file's header).
+  EMBEDGEMMA2_SNAPSHOT, EMBEDGEMMA2_REF_DIR, EMBEDGEMMA2_MM_REF_DIR as in docs/embedgemma2.md.
+  Waited for a quiet machine (1-minute load < 6, 5-minute < 10): load { 4.12 4.76 6.66 } at the
+  start, { 3.70 7.86 8.14 } at the end. Published by the drift gate on its first attempt. The
+  run predates bench_paired --label; its "label" key was added to the JSON afterwards.
+
+                workload   before ms   after ms  vs base                control ms  vs base
+              mixed_full    1070.885   1070.189  0.999x [0.975, 1.076]   1077.866  0.997x [0.948, 1.069]
+             mixed_short     424.012    420.779  0.998x [0.927, 1.002]    415.604  1.000x [0.923, 1.098]
+              media_only     407.392    405.609  0.993x [0.938, 1.025]    394.595  0.996x [0.879, 1.040]
+
+Reading: no change (0.993x to 0.999x, inside the control lane's 0.996x to 1.000x).

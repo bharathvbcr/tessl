@@ -43,8 +43,9 @@ pub fn jpeg_decode(json: &Path) -> R<Output> {
     let mut fig = Figure::new(
         1100.0,
         90.0 + 56.0 * rows.len() as f64,
-        "JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro, shared machine)",
-        &["Bars are the minimum of N interleaved calls; the tick is the median. Indicative, not a paired comparison."],
+        "JPEG decoding, native against ImageIO, one call per file (Apple M5 Pro)",
+        &["Bars are the minimum of N interleaved calls; the tick is the median. Indicative, not a paired comparison; \
+           the machine's load is recorded in the .txt beside the data."],
         &legend,
     );
     let cell = fig.cells(&[1.0], &[1.0])[0];

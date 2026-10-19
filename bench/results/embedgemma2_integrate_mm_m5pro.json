@@ -1,0 +1,581 @@
+{
+  "rounds": 8,
+  "format": "Workloads",
+  "label": "EmbeddingGemma 2 multimodal encode on Apple M5 Pro: 42f1d52 (branch point) against eg2/integrate cccdffd",
+  "lanes": [
+    {
+      "name": "before",
+      "argv": [
+        "target/wt_base/target/release/bench_embedgemma2_mm"
+      ],
+      "env": {
+        "BENCH_ITERS": "8",
+        "BENCH_WARMUP": "2"
+      }
+    },
+    {
+      "name": "after",
+      "argv": [
+        "target/release/bench_embedgemma2_mm"
+      ],
+      "env": {
+        "BENCH_ITERS": "8",
+        "BENCH_WARMUP": "2"
+      }
+    },
+    {
+      "name": "control",
+      "argv": [
+        "target/wt_base/target/release/bench_embedgemma2_mm_control"
+      ],
+      "env": {
+        "BENCH_ITERS": "8",
+        "BENCH_WARMUP": "2"
+      }
+    }
+  ],
+  "env": {},
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "mixed_full",
+      "before": {
+        "ms_min_median": 1070.88535,
+        "ms_min_min": 1067.164,
+        "ms_min_max": 1150.9126,
+        "ms_min_all": [
+          1069.1925,
+          1071.3792,
+          1150.9126,
+          1145.4546,
+          1069.8263,
+          1070.3915,
+          1084.4665,
+          1067.164
+        ],
+        "device_peak_mib_max": 628.4,
+        "forwards_max": 5
+      },
+      "after": {
+        "ms_min_median": 1070.18855,
+        "ms_min_min": 1066.219,
+        "ms_min_max": 1179.2885,
+        "ms_min_all": [
+          1066.219,
+          1070.4271,
+          1122.2915,
+          1179.2885,
+          1151.3734,
+          1069.95,
+          1066.7989,
+          1066.5955
+        ],
+        "device_peak_mib_max": 628.4,
+        "forwards_max": 5,
+        "vs_base": {
+          "median": 0.9992893060072008,
+          "lo": 0.9751318214780166,
+          "hi": 1.0762246170242777
+        }
+      },
+      "control": {
+        "ms_min_median": 1077.8656,
+        "ms_min_min": 1066.3929,
+        "ms_min_max": 1143.5621,
+        "ms_min_all": [
+          1066.3929,
+          1067.4222,
+          1133.2678,
+          1086.2642,
+          1143.5621,
+          1143.3984,
+          1069.467,
+          1068.3093
+        ],
+        "device_peak_mib_max": 628.4,
+        "forwards_max": 5,
+        "vs_base": {
+          "median": 0.9968441025786261,
+          "lo": 0.9483258437305154,
+          "hi": 1.06892315135644
+        },
+        "vs_prev": {
+          "median": 1.00088494720212,
+          "lo": 0.9211182844571112,
+          "hi": 1.0686465722697323
+        }
+      }
+    },
+    {
+      "workload": "mixed_short",
+      "before": {
+        "ms_min_median": 424.0118,
+        "ms_min_min": 396.6237,
+        "ms_min_max": 456.0181,
+        "ms_min_all": [
+          397.2741,
+          439.029,
+          422.1467,
+          425.8769,
+          456.0181,
+          451.716,
+          398.4602,
+          396.6237
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 4
+      },
+      "after": {
+        "ms_min_median": 420.77909999999997,
+        "ms_min_min": 396.8008,
+        "ms_min_max": 430.5304,
+        "ms_min_all": [
+          397.1346,
+          426.5817,
+          423.031,
+          426.3197,
+          430.5304,
+          418.5272,
+          396.8008,
+          396.8746
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 0.997742162842544,
+          "lo": 0.926527287056469,
+          "hi": 1.0020947694249416
+        }
+      },
+      "control": {
+        "ms_min_median": 415.60389999999995,
+        "ms_min_min": 397.2508,
+        "ms_min_max": 467.7947,
+        "ms_min_all": [
+          403.4463,
+          405.393,
+          425.8148,
+          467.7947,
+          427.3242,
+          426.1539,
+          397.2508,
+          397.9991
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 1.0002162933219911,
+          "lo": 0.9233854711192199,
+          "hi": 1.0984270337273518
+        },
+        "vs_prev": {
+          "median": 1.0047069969431721,
+          "lo": 0.9503290928795116,
+          "hi": 1.097286144646846
+        }
+      }
+    },
+    {
+      "workload": "media_only",
+      "before": {
+        "ms_min_median": 407.39205000000004,
+        "ms_min_min": 379.902,
+        "ms_min_max": 437.2593,
+        "ms_min_all": [
+          381.1039,
+          437.2593,
+          407.0812,
+          407.7029,
+          429.9656,
+          423.2298,
+          383.6483,
+          379.902
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 2
+      },
+      "after": {
+        "ms_min_median": 405.60925,
+        "ms_min_min": 379.674,
+        "ms_min_max": 417.9092,
+        "ms_min_all": [
+          379.674,
+          410.0775,
+          405.2827,
+          417.9092,
+          413.9387,
+          405.9358,
+          380.145,
+          380.0776
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.9932252109947084,
+          "lo": 0.9378359705556862,
+          "hi": 1.0250336703516212
+        }
+      },
+      "control": {
+        "ms_min_median": 394.59475,
+        "ms_min_min": 380.417,
+        "ms_min_max": 424.2077,
+        "ms_min_all": [
+          380.417,
+          384.4476,
+          406.676,
+          424.2077,
+          416.0274,
+          404.7419,
+          381.4118,
+          382.6983
+        ],
+        "device_peak_mib_max": 653.6,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.9961840232116046,
+          "lo": 0.8792210937537521,
+          "hi": 1.0404824199190146
+        },
+        "vs_prev": {
+          "median": 1.003385129921682,
+          "lo": 0.9374998628308064,
+          "hi": 1.0150714557133462
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "before": [{"workload":"mixed_full","ms_min":1069.1925,"ms_median":1074.0877,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":397.2741,"ms_median":397.8278,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":381.1039,"ms_median":381.6180,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1066.2190,"ms_median":1067.7358,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":397.1346,"ms_median":397.3124,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":379.6740,"ms_median":380.0265,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1066.3929,"ms_median":1072.8295,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":403.4463,"ms_median":410.9514,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":380.4170,"ms_median":382.0511,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1071.3792,"ms_median":1086.6609,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":439.0290,"ms_median":450.7172,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":437.2593,"ms_median":444.4856,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1070.4271,"ms_median":1077.5117,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":426.5817,"ms_median":432.3955,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":410.0775,"ms_median":414.0359,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1067.4222,"ms_median":1070.9724,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":405.3930,"ms_median":406.6647,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":384.4476,"ms_median":388.2290,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1150.9126,"ms_median":1183.5210,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":422.1467,"ms_median":442.3490,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":407.0812,"ms_median":409.0497,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1122.2915,"ms_median":1139.0453,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":423.0310,"ms_median":425.3512,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":405.2827,"ms_median":406.4056,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1133.2678,"ms_median":1143.4168,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":425.8148,"ms_median":426.4958,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":406.6760,"ms_median":408.3114,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1145.4546,"ms_median":1158.4858,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":425.8769,"ms_median":430.1882,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":407.7029,"ms_median":408.7826,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1179.2885,"ms_median":1205.7981,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":426.3197,"ms_median":437.4290,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":417.9092,"ms_median":424.5485,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1086.2642,"ms_median":1137.6171,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":467.7947,"ms_median":481.1406,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":424.2077,"ms_median":440.9562,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1069.8263,"ms_median":1074.6464,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":456.0181,"ms_median":470.7991,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":429.9656,"ms_median":431.5978,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1151.3734,"ms_median":1178.4883,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":430.5304,"ms_median":432.2599,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":413.9387,"ms_median":415.1311,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1143.5621,"ms_median":1155.3331,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":427.3242,"ms_median":428.2680,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":416.0274,"ms_median":421.4602,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1070.3915,"ms_median":1084.2845,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":451.7160,"ms_median":459.5997,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":423.2298,"ms_median":430.4912,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1069.9500,"ms_median":1128.9369,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":418.5272,"ms_median":422.0580,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":405.9358,"ms_median":417.0933,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1143.3984,"ms_median":1155.6445,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":426.1539,"ms_median":432.3002,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":404.7419,"ms_median":407.0847,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1084.4665,"ms_median":1131.3665,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":398.4602,"ms_median":398.9293,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":383.6483,"ms_median":387.9549,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1066.7989,"ms_median":1067.8810,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":396.8008,"ms_median":397.1965,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":380.1450,"ms_median":380.5849,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1069.4670,"ms_median":1070.4618,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":397.2508,"ms_median":397.5483,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":381.4118,"ms_median":383.2153,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    },
+    {
+      "before": [{"workload":"mixed_full","ms_min":1067.1640,"ms_median":1068.4955,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":396.6237,"ms_median":397.5805,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":379.9020,"ms_median":380.1434,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "after": [{"workload":"mixed_full","ms_min":1066.5955,"ms_median":1067.5330,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":396.8746,"ms_median":397.6296,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":380.0776,"ms_median":380.2816,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}],
+      "control": [{"workload":"mixed_full","ms_min":1068.3093,"ms_median":1084.3235,"iters":8,"items":12,"sync_waits":1,"forwards":5,"emb_err_max":2.980232238769531e-7,"device_peak_mib":628.4},{"workload":"mixed_short","ms_min":397.9991,"ms_median":399.0575,"iters":8,"items":12,"sync_waits":1,"forwards":4,"emb_err_max":null,"device_peak_mib":653.6},{"workload":"media_only","ms_min":382.6983,"ms_median":383.1367,"iters":8,"items":4,"sync_waits":1,"forwards":2,"emb_err_max":null,"device_peak_mib":653.6}]
+    }
+  ],
+  "lane_archive": "bench/results/embedgemma2_integrate_mm_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-19T00:47:46Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 8 --evidence --max-spread 1.25 --clean-env --out bench/results/embedgemma2_integrate_mm_m5pro.json before:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm after:BENCH_ITERS=8,BENCH_WARMUP=2=target/release/bench_embedgemma2_mm control:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm_control",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+      "--rounds",
+      "8",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--clean-env",
+      "--out",
+      "bench/results/embedgemma2_integrate_mm_m5pro.json",
+      "before:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm",
+      "after:BENCH_ITERS=8,BENCH_WARMUP=2=target/release/bench_embedgemma2_mm",
+      "control:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm_control"
+    ],
+    "cwd": "$HOME/Code/research/tessl-eg2",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 8,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "before",
+          "argv": [
+            "target/wt_base/target/release/bench_embedgemma2_mm"
+          ],
+          "env": {
+            "BENCH_ITERS": "8",
+            "BENCH_WARMUP": "2"
+          }
+        },
+        {
+          "name": "after",
+          "argv": [
+            "target/release/bench_embedgemma2_mm"
+          ],
+          "env": {
+            "BENCH_ITERS": "8",
+            "BENCH_WARMUP": "2"
+          }
+        },
+        {
+          "name": "control",
+          "argv": [
+            "target/wt_base/target/release/bench_embedgemma2_mm_control"
+          ],
+          "env": {
+            "BENCH_ITERS": "8",
+            "BENCH_WARMUP": "2"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-eg2",
+      "scope": ".",
+      "revision": "cccdffd0647c618eec79cfd8709a4dd06df4b3ac",
+      "dirty": true,
+      "status_porcelain": [
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.stdout"
+      ],
+      "status_line_count": 75,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 4.12158203125,
+        "loadavg_5m": 4.76171875,
+        "loadavg_15m": 6.65771484375,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2289767795138889,
+        "normalized_loadavg_5m": 0.2645399305555556,
+        "normalized_loadavg_15m": 0.369873046875
+      },
+      "finish": {
+        "loadavg_1m": 3.697265625,
+        "loadavg_5m": 7.86181640625,
+        "loadavg_15m": 8.14306640625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.20540364583333334,
+        "normalized_loadavg_5m": 0.436767578125,
+        "normalized_loadavg_15m": 0.452392578125
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+        "size_bytes": 890096,
+        "mtime_ns": 1792302789883557959,
+        "sha256": "66ad9a836b08ce471abd4e365e358b3da7526856b94736c6cad98401b96a7add"
+      },
+      "lane:after:bench_embedgemma2_mm": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2_mm",
+        "size_bytes": 4018912,
+        "mtime_ns": 1792302769465283082,
+        "sha256": "797fd7f2c768ddb04fa014c0fdb6b6a793719555ee6a0ac2d66dc9b4ba2132d9"
+      },
+      "lane:before:bench_embedgemma2_mm": {
+        "path": "$HOME/Code/research/tessl-eg2/target/wt_base/target/release/bench_embedgemma2_mm",
+        "size_bytes": 4015424,
+        "mtime_ns": 1792294075151195759,
+        "sha256": "446100c1db9ac7a1cc84fb88267083df48050a5900dc4cf772f51894343f43c8"
+      },
+      "lane:control:bench_embedgemma2_mm_control": {
+        "path": "$HOME/Code/research/tessl-eg2/target/wt_base/target/release/bench_embedgemma2_mm_control",
+        "size_bytes": 4015424,
+        "mtime_ns": 1792294075151195759,
+        "sha256": "446100c1db9ac7a1cc84fb88267083df48050a5900dc4cf772f51894343f43c8"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-19T00:57:58Z"
+  }
+}

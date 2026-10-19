@@ -115,8 +115,8 @@ fn seq_a() -> Vec<u32> {
 /// Re-pinned (RMSNorm and qk-norm forward/backward to `precise::rsqrt`, owner
 /// decision 2026-10-18, card ft-1a0f8c18 AC5): an ulp-level change of the
 /// forward norms. Old values: causal 0xfb977a5f6aedd64a, rows
-/// 0xd962357482c76de8. The norm rewrite in 7d9ef30 alone gave causal
-/// 0x465a2c57c290769e, rows 0x3aef36370924cc39; the qk-norm kernels in e677f35
+/// 0xd962357482c76de8. The norm rewrite in 4632d2e alone gave causal
+/// 0x465a2c57c290769e, rows 0x3aef36370924cc39; the qk-norm kernels in 201bc61
 /// moved only the causal digest. Pinned in `--release`.
 const GOLDEN_CAUSAL: u64 = 0x06504ffc2068a5b0;
 const GOLDEN_ROWS: u64 = 0x3aef36370924cc39;

@@ -1,6 +1,6 @@
 //! `Qwen35Model::train_step_bytes` for one sequence is pinned: the
 //! pre-flight bound ojas-qwen35's `train_step` relies on. The values were
-//! first printed by a37a0c2's `src/qwen35_train.rs` on the tiny fixture
+//! first printed by 8c51319's `src/qwen35_train.rs` on the tiny fixture
 //! (default dispatch, this GPU's tensor-op capability and pool cap, which the
 //! bound reads), and re-pinned when the bound began counting two allocations
 //! it had omitted (see `PINNED`).

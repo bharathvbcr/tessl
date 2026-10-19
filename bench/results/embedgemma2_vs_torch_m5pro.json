@@ -1,0 +1,989 @@
+{
+  "rounds": 4,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "tessl_f32",
+      "argv": [
+        "target/release/bench_embedgemma2"
+      ],
+      "env": {
+        "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3",
+        "BENCH_PRECISION": "f32"
+      }
+    },
+    {
+      "name": "torch_f32",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/embedgemma2_torch.py",
+        "--dtype",
+        "f32"
+      ],
+      "env": {
+        "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "tessl_bf16",
+      "argv": [
+        "target/release/bench_embedgemma2"
+      ],
+      "env": {
+        "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3",
+        "BENCH_PRECISION": "bf16"
+      }
+    },
+    {
+      "name": "torch_bf16",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/embedgemma2_torch.py",
+        "--dtype",
+        "bf16"
+      ],
+      "env": {
+        "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+        "BENCH_ITERS": "10",
+        "BENCH_WARMUP": "3"
+      }
+    }
+  ],
+  "env": {},
+  "label": "EmbeddingGemma 2 text encode on Apple M5 Pro: tessl d8f9cc3 against sentence-transformers 6.1.0 on torch 2.14.1 MPS; the two workloads torch cannot fit in 32 GiB left out",
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "1x16",
+      "tessl_f32": {
+        "ms_min_median": 4.45645,
+        "ms_min_min": 4.3458,
+        "ms_min_max": 5.0299,
+        "ms_min_all": [
+          4.3965,
+          4.5164,
+          5.0299,
+          4.3458
+        ],
+        "device_peak_mib_max": 2,
+        "peak_footprint_mib_max": 871.5,
+        "forwards_max": 1
+      },
+      "torch_f32": {
+        "ms_min_median": 15.3763,
+        "ms_min_min": 14.6442,
+        "ms_min_max": 16.2918,
+        "ms_min_all": [
+          14.9847,
+          15.7679,
+          16.2918,
+          14.6442
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 3.3890305504678384,
+          "lo": 3.238990834807849,
+          "hi": 3.4912540961828005
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 3.793,
+        "ms_min_min": 3.6818,
+        "ms_min_max": 3.8738,
+        "ms_min_all": [
+          3.6818,
+          3.8229,
+          3.7631,
+          3.8738
+        ],
+        "device_peak_mib_max": 2,
+        "peak_footprint_mib_max": 604.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.8419436853171112,
+          "lo": 0.7481460864033083,
+          "hi": 0.8913893874545539
+        },
+        "vs_prev": {
+          "median": 0.24407610825500128,
+          "lo": 0.23098122982113703,
+          "hi": 0.2645279359746521
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 15.108,
+        "ms_min_min": 14.5418,
+        "ms_min_max": 15.7272,
+        "ms_min_all": [
+          15.1463,
+          15.7272,
+          15.0697,
+          14.5418
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 3.3956273157238734,
+          "lo": 2.996023777808704,
+          "hi": 3.4822424940217873
+        },
+        "vs_prev": {
+          "median": 4.05921373263926,
+          "lo": 3.753885074087459,
+          "hi": 4.113944910931491
+        }
+      }
+    },
+    {
+      "workload": "64x32",
+      "tessl_f32": {
+        "ms_min_median": 101.0329,
+        "ms_min_min": 100.6338,
+        "ms_min_max": 102.8738,
+        "ms_min_all": [
+          100.7595,
+          101.3063,
+          102.8738,
+          100.6338
+        ],
+        "device_peak_mib_max": 114,
+        "peak_footprint_mib_max": 984.3,
+        "forwards_max": 1
+      },
+      "torch_f32": {
+        "ms_min_median": 163.8961,
+        "ms_min_min": 163.3448,
+        "ms_min_max": 166.4329,
+        "ms_min_all": [
+          163.4304,
+          164.3618,
+          166.4329,
+          163.3448
+        ],
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 1.622204647741471,
+          "lo": 1.6178356393950646,
+          "hi": 1.6231604093256937
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 34.041399999999996,
+        "ms_min_min": 33.7163,
+        "ms_min_max": 34.3613,
+        "ms_min_all": [
+          33.7163,
+          34.3613,
+          33.981,
+          34.1018
+        ],
+        "device_peak_mib_max": 112,
+        "peak_footprint_mib_max": 715.1,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.33674589487452955,
+          "lo": 0.3303173402751721,
+          "hi": 0.33918226211005637
+        },
+        "vs_prev": {
+          "median": 0.20753779857484356,
+          "lo": 0.20417237216920456,
+          "hi": 0.20905891758303938
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 104.5635,
+        "ms_min_min": 104.1809,
+        "ms_min_max": 105.2563,
+        "ms_min_all": [
+          104.5771,
+          105.2563,
+          104.5499,
+          104.1809
+        ],
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 1.0365679197664184,
+          "lo": 1.0162927781417619,
+          "hi": 1.0389906649438387
+        },
+        "vs_prev": {
+          "median": 3.0699693441029563,
+          "lo": 3.054997096927435,
+          "hi": 3.10167782348597
+        }
+      }
+    },
+    {
+      "workload": "32x256",
+      "tessl_f32": {
+        "ms_min_median": 439.95965,
+        "ms_min_min": 426.5441,
+        "ms_min_max": 458.6287,
+        "ms_min_all": [
+          427.751,
+          452.1683,
+          458.6287,
+          426.5441
+        ],
+        "device_peak_mib_max": 466.1,
+        "peak_footprint_mib_max": 1336.5,
+        "forwards_max": 1
+      },
+      "torch_f32": {
+        "ms_min_median": 714.7046499999999,
+        "ms_min_min": 709.4274,
+        "ms_min_max": 731.0691,
+        "ms_min_all": [
+          709.4274,
+          718.8457,
+          731.0691,
+          710.5636
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.62626906719808,
+          "lo": 1.589774648067987,
+          "hi": 1.665861982383533
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 146.61655,
+        "ms_min_min": 141.9967,
+        "ms_min_max": 154.9812,
+        "ms_min_all": [
+          142.063,
+          151.1701,
+          141.9967,
+          154.9812
+        ],
+        "device_peak_mib_max": 424,
+        "peak_footprint_mib_max": 1027.3,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.33321937738364693,
+          "lo": 0.30961145693673336,
+          "hi": 0.36334156304119547
+        },
+        "vs_prev": {
+          "median": 0.2052729234806343,
+          "lo": 0.19423157127007556,
+          "hi": 0.21811024375580174
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 450.77869999999996,
+        "ms_min_min": 447.7432,
+        "ms_min_max": 465.3835,
+        "ms_min_all": [
+          451.3737,
+          465.3835,
+          447.7432,
+          450.1837
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.0422258194719274,
+          "lo": 0.9762651138055687,
+          "hi": 1.055421233115169
+        },
+        "vs_prev": {
+          "median": 3.1158681960151657,
+          "lo": 2.9047632874180866,
+          "hi": 3.1772783905731967
+        }
+      }
+    },
+    {
+      "workload": "8x1024",
+      "tessl_f32": {
+        "ms_min_median": 530.7996499999999,
+        "ms_min_min": 513.0687,
+        "ms_min_max": 566.5052,
+        "ms_min_all": [
+          513.0687,
+          543.4669,
+          566.5052,
+          518.1324
+        ],
+        "device_peak_mib_max": 466.1,
+        "peak_footprint_mib_max": 1336.6,
+        "forwards_max": 1
+      },
+      "torch_f32": {
+        "ms_min_median": 962.46465,
+        "ms_min_min": 935.8139,
+        "ms_min_max": 993.6747,
+        "ms_min_all": [
+          937.8798,
+          987.0495,
+          993.6747,
+          935.8139
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.8111689714089045,
+          "lo": 1.7540433874216868,
+          "hi": 1.8279809312086275
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 185.79809999999998,
+        "ms_min_min": 178.7928,
+        "ms_min_max": 194.8035,
+        "ms_min_all": [
+          178.7928,
+          194.8035,
+          180.2899,
+          191.3063
+        ],
+        "device_peak_mib_max": 424,
+        "peak_footprint_mib_max": 1027.4,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.35346162106642276,
+          "lo": 0.31824932939715295,
+          "hi": 0.36922280868750923
+        },
+        "vs_prev": {
+          "median": 0.19399724643012559,
+          "lo": 0.18143754691550462,
+          "hi": 0.2044277179469123
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 562.24305,
+        "ms_min_min": 558.2593,
+        "ms_min_max": 589.311,
+        "ms_min_all": [
+          565.7167,
+          589.311,
+          558.7694,
+          558.2593
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.0809000851902093,
+          "lo": 0.9863446972772714,
+          "hi": 1.1026139384452802
+        },
+        "vs_prev": {
+          "median": 3.0622194980232926,
+          "lo": 2.918143835304954,
+          "hi": 3.1640910595952407
+        }
+      }
+    },
+    {
+      "workload": "2x4096",
+      "tessl_f32": {
+        "ms_min_median": 681.675,
+        "ms_min_min": 660.8494,
+        "ms_min_max": 721.992,
+        "ms_min_all": [
+          660.8494,
+          697.878,
+          721.992,
+          665.472
+        ],
+        "device_peak_mib_max": 466.1,
+        "peak_footprint_mib_max": 1336.7,
+        "forwards_max": 1
+      },
+      "torch_f32": {
+        "ms_min_median": 1944.9465,
+        "ms_min_min": 1911.6555,
+        "ms_min_max": 1976.2689,
+        "ms_min_all": [
+          1911.6555,
+          1966.9988,
+          1976.2689,
+          1922.8942
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 2.854030907292654,
+          "lo": 2.7372448725193634,
+          "hi": 2.8927248780130546
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 234.1409,
+        "ms_min_min": 222.5696,
+        "ms_min_max": 240.3338,
+        "ms_min_all": [
+          234.035,
+          240.3338,
+          222.5696,
+          234.2468
+        ],
+        "device_peak_mib_max": 424,
+        "peak_footprint_mib_max": 1027.5,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.3481894714726277,
+          "lo": 0.30827155979567644,
+          "hi": 0.3541427139072836
+        },
+        "vs_prev": {
+          "median": 0.12200145176490765,
+          "lo": 0.11262111142871296,
+          "hi": 0.12242530100219416
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 1011.7747,
+        "ms_min_min": 989.351,
+        "ms_min_max": 1038.7099,
+        "ms_min_all": [
+          1038.7099,
+          1032.5676,
+          989.351,
+          990.9818
+        ],
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 1.4843615295647794,
+          "lo": 1.3703074272291107,
+          "hi": 1.57178004549902
+        },
+        "vs_prev": {
+          "median": 4.367328395764912,
+          "lo": 4.23050304209065,
+          "hi": 4.445130871421793
+        }
+      }
+    },
+    {
+      "workload": "128x8-512",
+      "tessl_f32": {
+        "ms_min_median": 1858.84465,
+        "ms_min_min": 1787.939,
+        "ms_min_max": 1945.1273,
+        "ms_min_all": [
+          1787.939,
+          1945.1273,
+          1917.5525,
+          1800.1368
+        ],
+        "device_peak_mib_max": 649.8,
+        "peak_footprint_mib_max": 1535.5,
+        "forwards_max": 16
+      },
+      "torch_f32": {
+        "ms_min_median": 3604.38445,
+        "ms_min_min": 3573.565,
+        "ms_min_max": 3821.13,
+        "ms_min_all": [
+          3573.565,
+          3634.3212,
+          3821.13,
+          3574.4477
+        ],
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 1.9891827160339495,
+          "lo": 1.8684233160472323,
+          "hi": 1.9987063317037101
+        }
+      },
+      "tessl_bf16": {
+        "ms_min_median": 658.89365,
+        "ms_min_min": 641.3627,
+        "ms_min_max": 672.2495,
+        "ms_min_all": [
+          671.6403,
+          672.2495,
+          641.3627,
+          646.147
+        ],
+        "device_peak_mib_max": 604,
+        "peak_footprint_mib_max": 1212.2,
+        "forwards_max": 16,
+        "vs_base": {
+          "median": 0.3522751094592973,
+          "lo": 0.33446943434404014,
+          "hi": 0.37565056749698955
+        },
+        "vs_prev": {
+          "median": 0.1828704262006076,
+          "lo": 0.16784634388256878,
+          "hi": 0.18794685419182244
+        }
+      },
+      "torch_bf16": {
+        "ms_min_median": 2331.7816000000003,
+        "ms_min_min": 2281.891,
+        "ms_min_max": 2424.7133,
+        "ms_min_all": [
+          2380.8085,
+          2424.7133,
+          2282.7547,
+          2281.891
+        ],
+        "forwards_max": 4,
+        "vs_base": {
+          "median": 1.2570892623947292,
+          "lo": 1.1904522561963753,
+          "hi": 1.3315938071712736
+        },
+        "vs_prev": {
+          "median": 3.5519965199718104,
+          "lo": 3.5315353936488134,
+          "hi": 3.6068651594385712
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "tessl_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.3965,"ms_median":4.5498,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.2},{"workload":"64x32","backend":"tessl-f32","ms_min":100.7595,"ms_median":101.0082,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.0,"peak_footprint_mib":983.7},{"workload":"32x256","backend":"tessl-f32","ms_min":427.7510,"ms_median":430.1754,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.0},{"workload":"8x1024","backend":"tessl-f32","ms_min":513.0687,"ms_median":518.5018,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.2},{"workload":"2x4096","backend":"tessl-f32","ms_min":660.8494,"ms_median":663.8762,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.2},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1787.9390,"ms_median":1793.9933,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":649.8,"peak_footprint_mib":1535.4}],
+      "torch_f32": [{"workload": "1x16", "backend": "torch-mps-f32", "ms_min": 14.9847, "ms_median": 15.2695, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-f32", "ms_min": 163.4304, "ms_median": 163.6733, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-f32", "ms_min": 709.4274, "ms_median": 712.7026, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-f32", "ms_min": 937.8798, "ms_median": 944.3954, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-f32", "ms_min": 1911.6555, "ms_median": 1919.0052, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-f32", "ms_min": 3573.565, "ms_median": 3666.0334, "iters": 10, "forwards": 4}],
+      "tessl_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.6818,"ms_median":3.7983,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.0},{"workload":"64x32","backend":"tessl-bf16","ms_min":33.7163,"ms_median":33.8522,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.0,"peak_footprint_mib":714.5},{"workload":"32x256","backend":"tessl-bf16","ms_min":142.0630,"ms_median":143.6972,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1026.7},{"workload":"8x1024","backend":"tessl-bf16","ms_min":178.7928,"ms_median":193.2427,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1026.8},{"workload":"2x4096","backend":"tessl-bf16","ms_min":234.0350,"ms_median":237.7835,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1026.9},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":671.6403,"ms_median":682.3277,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":604.0,"peak_footprint_mib":1212.0}],
+      "torch_bf16": [{"workload": "1x16", "backend": "torch-mps-bf16", "ms_min": 15.1463, "ms_median": 16.1521, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-bf16", "ms_min": 104.5771, "ms_median": 105.1584, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-bf16", "ms_min": 451.3737, "ms_median": 455.427, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-bf16", "ms_min": 565.7167, "ms_median": 568.85, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-bf16", "ms_min": 1038.7099, "ms_median": 1049.9809, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-bf16", "ms_min": 2380.8085, "ms_median": 2491.806, "iters": 10, "forwards": 4}]
+    },
+    {
+      "tessl_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.5164,"ms_median":4.7218,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.5},{"workload":"64x32","backend":"tessl-f32","ms_min":101.3063,"ms_median":101.9281,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.0,"peak_footprint_mib":984.0},{"workload":"32x256","backend":"tessl-f32","ms_min":452.1683,"ms_median":466.5075,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.4},{"workload":"8x1024","backend":"tessl-f32","ms_min":543.4669,"ms_median":554.1225,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.5},{"workload":"2x4096","backend":"tessl-f32","ms_min":697.8780,"ms_median":715.7283,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.5},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1945.1273,"ms_median":1978.4403,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":649.8,"peak_footprint_mib":1530.4}],
+      "torch_f32": [{"workload": "1x16", "backend": "torch-mps-f32", "ms_min": 15.7679, "ms_median": 15.9441, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-f32", "ms_min": 164.3618, "ms_median": 165.7814, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-f32", "ms_min": 718.8457, "ms_median": 767.5666, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-f32", "ms_min": 987.0495, "ms_median": 1000.2313, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-f32", "ms_min": 1966.9988, "ms_median": 1997.3499, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-f32", "ms_min": 3634.3212, "ms_median": 3823.4455, "iters": 10, "forwards": 4}],
+      "tessl_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.8229,"ms_median":3.9124,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.3},{"workload":"64x32","backend":"tessl-bf16","ms_min":34.3613,"ms_median":34.5411,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.0,"peak_footprint_mib":714.8},{"workload":"32x256","backend":"tessl-bf16","ms_min":151.1701,"ms_median":159.1739,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.1},{"workload":"8x1024","backend":"tessl-bf16","ms_min":194.8035,"ms_median":196.7795,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.1},{"workload":"2x4096","backend":"tessl-bf16","ms_min":240.3338,"ms_median":244.1442,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.2},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":672.2495,"ms_median":684.4193,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":604.0,"peak_footprint_mib":1212.2}],
+      "torch_bf16": [{"workload": "1x16", "backend": "torch-mps-bf16", "ms_min": 15.7272, "ms_median": 16.6973, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-bf16", "ms_min": 105.2563, "ms_median": 106.138, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-bf16", "ms_min": 465.3835, "ms_median": 484.5894, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-bf16", "ms_min": 589.311, "ms_median": 594.5399, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-bf16", "ms_min": 1032.5676, "ms_median": 1038.2819, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-bf16", "ms_min": 2424.7133, "ms_median": 2468.3274, "iters": 10, "forwards": 4}]
+    },
+    {
+      "tessl_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":5.0299,"ms_median":5.1124,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":871.5},{"workload":"64x32","backend":"tessl-f32","ms_min":102.8738,"ms_median":103.9455,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.0,"peak_footprint_mib":984.3},{"workload":"32x256","backend":"tessl-f32","ms_min":458.6287,"ms_median":465.0659,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.5},{"workload":"8x1024","backend":"tessl-f32","ms_min":566.5052,"ms_median":571.3939,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.6},{"workload":"2x4096","backend":"tessl-f32","ms_min":721.9920,"ms_median":728.0055,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1336.7},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1917.5525,"ms_median":1937.1859,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":649.8,"peak_footprint_mib":1534.4}],
+      "torch_f32": [{"workload": "1x16", "backend": "torch-mps-f32", "ms_min": 16.2918, "ms_median": 16.5855, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-f32", "ms_min": 166.4329, "ms_median": 167.2406, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-f32", "ms_min": 731.0691, "ms_median": 769.8739, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-f32", "ms_min": 993.6747, "ms_median": 1009.7584, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-f32", "ms_min": 1976.2689, "ms_median": 1992.6559, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-f32", "ms_min": 3821.13, "ms_median": 3867.2748, "iters": 10, "forwards": 4}],
+      "tessl_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.7631,"ms_median":3.8025,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.1},{"workload":"64x32","backend":"tessl-bf16","ms_min":33.9810,"ms_median":34.2093,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.0,"peak_footprint_mib":714.5},{"workload":"32x256","backend":"tessl-bf16","ms_min":141.9967,"ms_median":144.9407,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1026.9},{"workload":"8x1024","backend":"tessl-bf16","ms_min":180.2899,"ms_median":188.2534,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.0},{"workload":"2x4096","backend":"tessl-bf16","ms_min":222.5696,"ms_median":230.1290,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.0},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":641.3627,"ms_median":648.8164,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":604.0,"peak_footprint_mib":1211.8}],
+      "torch_bf16": [{"workload": "1x16", "backend": "torch-mps-bf16", "ms_min": 15.0697, "ms_median": 15.2735, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-bf16", "ms_min": 104.5499, "ms_median": 104.8652, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-bf16", "ms_min": 447.7432, "ms_median": 451.8598, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-bf16", "ms_min": 558.7694, "ms_median": 564.1583, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-bf16", "ms_min": 989.351, "ms_median": 998.8422, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-bf16", "ms_min": 2282.7547, "ms_median": 2323.6081, "iters": 10, "forwards": 4}]
+    },
+    {
+      "tessl_f32": [{"workload":"1x16","backend":"tessl-f32","ms_min":4.3458,"ms_median":4.4126,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":2.0,"peak_footprint_mib":870.9},{"workload":"64x32","backend":"tessl-f32","ms_min":100.6338,"ms_median":100.7899,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":114.0,"peak_footprint_mib":983.0},{"workload":"32x256","backend":"tessl-f32","ms_min":426.5441,"ms_median":426.9603,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1335.6},{"workload":"8x1024","backend":"tessl-f32","ms_min":518.1324,"ms_median":542.2503,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1335.7},{"workload":"2x4096","backend":"tessl-f32","ms_min":665.4720,"ms_median":701.6011,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":777.8,"device_peak_mib":466.1,"peak_footprint_mib":1335.7},{"workload":"128x8-512","backend":"tessl-f32","ms_min":1800.1368,"ms_median":1824.1245,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":777.8,"device_peak_mib":649.8,"peak_footprint_mib":1535.5}],
+      "torch_f32": [{"workload": "1x16", "backend": "torch-mps-f32", "ms_min": 14.6442, "ms_median": 19.496, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-f32", "ms_min": 163.3448, "ms_median": 163.7487, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-f32", "ms_min": 710.5636, "ms_median": 715.1872, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-f32", "ms_min": 935.8139, "ms_median": 941.8467, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-f32", "ms_min": 1922.8942, "ms_median": 1979.3627, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-f32", "ms_min": 3574.4477, "ms_median": 3618.6316, "iters": 10, "forwards": 4}],
+      "tessl_bf16": [{"workload":"1x16","backend":"tessl-bf16","ms_min":3.8738,"ms_median":3.9204,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":2.0,"peak_footprint_mib":604.2},{"workload":"64x32","backend":"tessl-bf16","ms_min":34.1018,"ms_median":35.3847,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":112.0,"peak_footprint_mib":715.1},{"workload":"32x256","backend":"tessl-bf16","ms_min":154.9812,"ms_median":164.4629,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.3},{"workload":"8x1024","backend":"tessl-bf16","ms_min":191.3063,"ms_median":196.0185,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.4},{"workload":"2x4096","backend":"tessl-bf16","ms_min":234.2468,"ms_median":236.3638,"iters":10,"async":0,"serialized":0,"forwards":1,"weight_mib":517.0,"device_peak_mib":424.0,"peak_footprint_mib":1027.5},{"workload":"128x8-512","backend":"tessl-bf16","ms_min":646.1470,"ms_median":653.8160,"iters":10,"async":0,"serialized":0,"forwards":16,"weight_mib":517.0,"device_peak_mib":604.0,"peak_footprint_mib":1212.2}],
+      "torch_bf16": [{"workload": "1x16", "backend": "torch-mps-bf16", "ms_min": 14.5418, "ms_median": 16.0302, "iters": 10, "forwards": 1}, {"workload": "64x32", "backend": "torch-mps-bf16", "ms_min": 104.1809, "ms_median": 104.8325, "iters": 10, "forwards": 2}, {"workload": "32x256", "backend": "torch-mps-bf16", "ms_min": 450.1837, "ms_median": 453.0537, "iters": 10, "forwards": 1}, {"workload": "8x1024", "backend": "torch-mps-bf16", "ms_min": 558.2593, "ms_median": 562.5238, "iters": 10, "forwards": 1}, {"workload": "2x4096", "backend": "torch-mps-bf16", "ms_min": 990.9818, "ms_median": 998.9577, "iters": 10, "forwards": 1}, {"workload": "128x8-512", "backend": "torch-mps-bf16", "ms_min": 2281.891, "ms_median": 2314.5912, "iters": 10, "forwards": 4}]
+    }
+  ],
+  "lane_archive": "bench/results/embedgemma2_vs_torch_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-19T09:56:27Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 4 --evidence --max-spread 1.25 --clean-env --label 'EmbeddingGemma 2 text encode on Apple M5 Pro: tessl d8f9cc3 against sentence-transformers 6.1.0 on torch 2.14.1 MPS; the two workloads torch cannot fit in 32 GiB left out' --out bench/results/embedgemma2_vs_torch_m5pro.json 'tessl_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2' 'torch_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype f32' 'tessl_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2' 'torch_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype bf16'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+      "--rounds",
+      "4",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--clean-env",
+      "--label",
+      "EmbeddingGemma 2 text encode on Apple M5 Pro: tessl d8f9cc3 against sentence-transformers 6.1.0 on torch 2.14.1 MPS; the two workloads torch cannot fit in 32 GiB left out",
+      "--out",
+      "bench/results/embedgemma2_vs_torch_m5pro.json",
+      "tessl_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2",
+      "torch_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype f32",
+      "tessl_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2",
+      "torch_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype bf16"
+    ],
+    "cwd": "$HOME/Code/research/tessl-eg2",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 4,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "tessl_f32",
+          "argv": [
+            "target/release/bench_embedgemma2"
+          ],
+          "env": {
+            "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3",
+            "BENCH_PRECISION": "f32"
+          }
+        },
+        {
+          "name": "torch_f32",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/embedgemma2_torch.py",
+            "--dtype",
+            "f32"
+          ],
+          "env": {
+            "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "tessl_bf16",
+          "argv": [
+            "target/release/bench_embedgemma2"
+          ],
+          "env": {
+            "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3",
+            "BENCH_PRECISION": "bf16"
+          }
+        },
+        {
+          "name": "torch_bf16",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/embedgemma2_torch.py",
+            "--dtype",
+            "bf16"
+          ],
+          "env": {
+            "BENCH_WORKLOADS": "1x16,64x32,32x256,8x1024,2x4096,128x8-512",
+            "BENCH_ITERS": "10",
+            "BENCH_WARMUP": "3"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-eg2",
+      "scope": ".",
+      "revision": "d8f9cc37c40b6e173fd8a89aba16812d496b5799",
+      "dirty": true,
+      "status_porcelain": [
+        " M bench/embedgemma2_torch.py",
+        " M scripts/hosted_tests.txt",
+        " M src/bin/plot_results/paired.rs",
+        " M tests/plot_results.rs",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r01-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r02-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r03-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r04-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r05-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r06-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r07-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-0-before.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-0-before.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-0-before.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-1-after.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-1-after.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-1-after.stdout",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-2-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-2-control.stderr",
+        "?? bench/results/embedgemma2_integrate_mm_m5pro.json.lanes/r08-2-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r01-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r02-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r03-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r04-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r05-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-0-before_async.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-1-control.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-2-after_f32.stdout",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.meta.json",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.stderr",
+        "?? bench/results/embedgemma2_integrate_text_m5pro.json.lanes/r06-3-after_bf16.stdout",
+        "?? bench/results/embedgemma2_vs_torch_m5pro.json.attempt.json"
+      ],
+      "status_line_count": 151,
+      "status_truncated": false,
+      "tracked_diff_sha256": "fb9b96a4b33a35c4dbd69d7f964e104d4c36ebeff2308737aeaf01afb94734ff",
+      "tracked_diff_bytes": 14434
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      "python_packages:torch_f32": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      },
+      "python_packages:torch_bf16": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 5.24853515625,
+        "loadavg_5m": 9.89697265625,
+        "loadavg_15m": 20.08251953125,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2915852864583333,
+        "normalized_loadavg_5m": 0.5498318142361112,
+        "normalized_loadavg_15m": 1.1156955295138888
+      },
+      "finish": {
+        "loadavg_1m": 8.9736328125,
+        "loadavg_5m": 9.802734375,
+        "loadavg_15m": 12.87060546875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.49853515625,
+        "normalized_loadavg_5m": 0.5445963541666666,
+        "normalized_loadavg_15m": 0.7150336371527778
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792375829015198643,
+        "sha256": "08be6b2be733416a81f487de7a2b6536816a6fba4b03799e6e78238f658b3a30"
+      },
+      "lane:tessl_bf16:bench_embedgemma2": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2",
+        "size_bytes": 3763680,
+        "mtime_ns": 1792375802012504403,
+        "sha256": "9e0e71108760a449ae3d2c7edc359bbba1313917bfe42fcff127ae1c42adb5b0"
+      },
+      "lane:tessl_f32:bench_embedgemma2": {
+        "path": "$HOME/Code/research/tessl-eg2/target/release/bench_embedgemma2",
+        "size_bytes": 3763680,
+        "mtime_ns": 1792375802012504403,
+        "sha256": "9e0e71108760a449ae3d2c7edc359bbba1313917bfe42fcff127ae1c42adb5b0"
+      },
+      "lane:torch_bf16:embedgemma2_torch.py": {
+        "path": "$HOME/Code/research/tessl-eg2/bench/embedgemma2_torch.py",
+        "size_bytes": 5728,
+        "mtime_ns": 1792402005386265586,
+        "sha256": "0779b81b2a9540dce300919a09cb8da51d73808795369850e8a9f543029ec8db"
+      },
+      "lane:torch_bf16:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      },
+      "lane:torch_f32:embedgemma2_torch.py": {
+        "path": "$HOME/Code/research/tessl-eg2/bench/embedgemma2_torch.py",
+        "size_bytes": 5728,
+        "mtime_ns": 1792402005386265586,
+        "sha256": "0779b81b2a9540dce300919a09cb8da51d73808795369850e8a9f543029ec8db"
+      },
+      "lane:torch_f32:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-19T10:13:38Z"
+  }
+}

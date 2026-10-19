@@ -1,0 +1,29 @@
+EmbeddingGemma 2 text encode: 42f1d52 (the branch point of eg2/integrate) against eg2/integrate cccdffd
+Apple M5 Pro, 2026-10-18. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b. Recorded at 2849fbe, renamed cccdffd (the same tree) by the 2026-10-18 history scrub.
+
+What ran
+  bench_paired --rounds 6 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=10, BENCH_WARMUP=3,
+  lane order reversed on odd rounds, one fresh process per lane per round, min-of-N per process.
+  Lanes (the script is target/run_integrate_bench.sh in the integration worktree):
+    before_async  42f1d52's bench_embedgemma2 (a detached worktree, its own target dir), BENCH_ASYNC=1
+    control       a byte copy of that binary, BENCH_ASYNC=1 (the run's own noise)
+    after_f32     eg2/integrate at cccdffd, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
+    after_bf16    the same binary, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
+  src/bin/bench_embedgemma2.rs is the same file at both revisions. The run waited for a quiet
+  machine (1-minute load < 6, 5-minute < 10): load { 5.87 8.55 12.76 } at the start, { 4.12 4.76
+  6.66 } at the end. Published by the drift gate on its first attempt. The run predates
+  bench_paired --label; its "label" key was added to the JSON afterwards, from this header.
+
+                workload   before_async ms  control ms  vs base         after_f32 ms  vs base         after_bf16 ms  vs base
+                    1x16             4.340       4.465  1.032x [0.987, 1.124]  4.374  1.003x [0.975, 1.046]   3.733  0.856x [0.842, 0.865]
+                   64x32           100.537     100.515  1.000x [0.995, 1.003]  100.538  0.999x [0.997, 1.002]  33.597  0.334x [0.332, 0.337]
+                  32x256           425.558     425.686  0.999x [0.989, 1.004]  425.466  1.000x [0.988, 1.008]  140.729  0.331x [0.324, 0.337]
+                  8x1024           513.870     514.862  1.002x [0.987, 1.052]  514.316  1.001x [0.984, 1.009]  163.492  0.319x [0.311, 0.328]
+                  2x4096           656.195     665.931  1.015x [0.996, 1.087]  655.768  0.999x [0.986, 1.015]  207.013  0.316x [0.302, 0.324]
+               128x8-512          1779.887    1781.150  1.000x [0.991, 1.042]  1779.615  1.000x [0.989, 1.003]  585.781  0.329x [0.323, 0.341]
+            1x4096+63x32           427.033     427.232  1.000x [0.991, 1.038]  426.384  0.998x [0.988, 1.044]  136.193  0.319x [0.307, 0.327]
+   1x6147+1x1658+6x10-42           690.135     690.516  1.001x [0.993, 1.029]  689.662  0.999x [0.992, 1.004]  215.408  0.312x [0.305, 0.326]
+
+Reading: ExactF32 is the base's speed on every workload (0.998x to 1.003x of its time, inside
+the control lane's 0.999x to 1.032x). The branch added media decoding, front ends and bindings
+and changed no kernel. Bf16 is 3.0x to 3.2x faster from 64x32 up.

@@ -467,11 +467,17 @@ struct Options {
     lane_timeout: Duration,
     clean_env: bool,
     evidence: bool,
+    /// What the lanes are, in words (`--label`), written to the JSON as `label`:
+    /// the title a figure of this run draws, so it is recorded with the run.
+    label: Option<String>,
     lanes: Vec<Lane>,
 }
 
+/// The longest `--label`, in bytes: one line of a figure title.
+const MAX_LABEL_BYTES: usize = 200;
+
 /// Options that take a value; each also accepts `--name=value`.
-const VALUE_OPTIONS: [&str; 8] = [
+const VALUE_OPTIONS: [&str; 9] = [
     "--rounds",
     "--out",
     "--format",
@@ -480,6 +486,7 @@ const VALUE_OPTIONS: [&str; 8] = [
     "--require",
     "--max-spread",
     "--lane-timeout",
+    "--label",
 ];
 
 /// The only command-line parser: `main`, the evidence marker and the tests all
@@ -496,6 +503,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         lane_timeout: Duration::from_secs(DEFAULT_LANE_TIMEOUT_SECS),
         clean_env: false,
         evidence: false,
+        label: None,
         lanes: Vec::new(),
     };
     let mut rounds = None;
@@ -554,6 +562,16 @@ fn parse_args(args: &[String]) -> Res<Options> {
                 o.require.push((f.to_string(), n));
             }
             "--max-spread" => o.max_spread = Some(evidence::parse_ratio_spread_limit(&v)?),
+            "--label" => {
+                if v.trim().is_empty() || v.len() > MAX_LABEL_BYTES || v.chars().any(char::is_control) {
+                    return Err(format!(
+                        "--label: expected one line of 1 to {MAX_LABEL_BYTES} bytes with no control characters"
+                    ));
+                }
+                if o.label.replace(v).is_some() {
+                    return Err("--label given twice".into());
+                }
+            }
             _ => {
                 let secs = common::parse_count(flag, &v, 1)? as u64;
                 if secs > MAX_LANE_TIMEOUT_SECS {
@@ -1274,6 +1292,9 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
             ("lanes".into(), Jv::Arr(o.lanes.iter().map(lane_json).collect())),
             ("env".into(), Jv::Obj(env_json)),
         ];
+        if let Some(label) = &o.label {
+            doc.push(("label".into(), Jv::str(label.clone())));
+        }
         doc.extend(report.extra);
         if let Some(spread) = o.max_spread {
             doc.push(("max_ratio_spread".into(), Jv::Num(spread)));
@@ -1506,6 +1527,7 @@ mod tests {
             lane_timeout: Duration::from_secs(60),
             clean_env: false,
             evidence: false,
+            label: None,
             lanes: vec![parse_lane("tessl=a").unwrap(), parse_lane("other=b").unwrap()],
         }
     }
@@ -1701,6 +1723,33 @@ mod tests {
         let ev = with(&["--evidence", "--out", "o.json"]).unwrap();
         assert_eq!((ev.rounds, ev.max_spread), (6, Some(1.10)));
         assert!(parse_args(&args(&["a=x", "a=y"])).is_err(), "duplicate lane name");
+    }
+
+    #[test]
+    fn a_label_is_one_bounded_line_given_once() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let with = |extra: &[&str]| {
+            let mut v = args(extra);
+            v.extend(args(&["a=x", "b=y"]));
+            parse_args(&v)
+        };
+        assert_eq!(with(&[]).unwrap().label, None);
+        assert_eq!(
+            with(&["--label", "base against head"]).unwrap().label.as_deref(),
+            Some("base against head")
+        );
+        assert_eq!(with(&["--label=x=y"]).unwrap().label.as_deref(), Some("x=y"));
+        let long = "x".repeat(MAX_LABEL_BYTES + 1);
+        for bad in [
+            &["--label", ""][..],
+            &["--label", "  "],
+            &["--label", "a\nb"],
+            &["--label", &long],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?} accepted");
+        }
+        assert!(with(&["--label", "a", "--label", "b"]).is_err(), "twice");
+        assert!(with(&["--label"]).is_err(), "no value");
     }
 
     /// Dependency-free xorshift, seeded: the same inputs every run.

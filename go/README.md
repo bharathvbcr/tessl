@@ -188,20 +188,18 @@ it).
 - **Overhead** ([figure](../bench/results/embedgemma2_go_m5pro.svg),
   [table](../bench/results/embedgemma2_go_m5pro.txt)). The cost of the boundary,
   measured per call as the Go wall time minus the engine's own timing of the same
-  tessl call (so the GPU time is identical on both sides), is 32 us for one text
-  and 40-50 us for one image, growing with the bytes copied to 113 us for 256
-  texts (about 790 KB of embeddings back) and 101 us for 8 224x224 images (1.2 MB
-  in); a round trip with no work (`Ping`) is 0.9 us at best. Against direct calls
-  of 0.46 ms to 8.7 ms that is 1.3% to 8% (Go wall over the direct time, each a
-  minimum from a separate process, is 0.99 to 1.28). **This recording is not from a
-  quiet machine**: the 1-minute load average was 99 before it and 71 after, and it
-  was not under the `mac_heavy` lock, so read the paired minima and not the
-  medians (inflated several-fold by the load) or the difference of the minima of
-  the two processes (noise of about 100 us, negative for 8 images). The direct arm
-  runs on a thread of its own with gusset's worker stack, which is what the
-  engine's model lives on; the same arm on the process's main thread is within
-  about 9% of it, either way, in this recording. Re-record on an idle machine with
-  `make -C go bench` under the lock.
+  tessl call (so the GPU time is identical on both sides), is 9 us for one text
+  and 13 us for one image, growing with the bytes copied to 61 us for 256 texts
+  (about 790 KB of embeddings back) and 43 us for 8 224x224 images (1.2 MB in); a
+  round trip with no work (`Ping`) is 1.3 us at best. Against direct calls of
+  0.38 ms to 7.9 ms that is 0.8% to 2.4% (Go wall over the direct time, each a
+  minimum from a separate process, is 1.008 to 1.042). Recorded 2026-10-18 at
+  eg2/integrate cccdffd on a quiet machine (1-minute load average 3.9 before, 5.6
+  after; the run waited for a load below 6, and no machine-wide lock was held),
+  9 rounds of 150 calls per arm. The direct arm runs on a thread of its own with
+  gusset's worker stack, which is what the engine's model lives on; the same arm on
+  the process's main thread is within 1.8% of it, either way. An earlier recording
+  at a load of 70 to 99 put the boundary at 32 to 113 us.
 
 ## Not done
 

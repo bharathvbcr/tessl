@@ -142,12 +142,13 @@ pub fn video_color(json: &Path) -> R<Output> {
             90.0 + 56.0 * groups.len() as f64
         },
         if three {
-            "Video to RGB frames under the colour paths (Apple M5 Pro, shared machine)"
+            "Video to RGB frames under the colour paths (Apple M5 Pro)"
         } else {
-            "Video to RGB frames under the two colour paths (Apple M5 Pro, shared machine)"
+            "Video to RGB frames under the two colour paths (Apple M5 Pro)"
         },
         &[
-            "Wall time of one call, a freshly opened source each: bar = minimum of N, tick = median. Indicative, not a paired comparison.",
+            "Wall time of one call, a freshly opened source each: bar = minimum of N, tick = median. Indicative, not a paired comparison; \
+             the machine's load is recorded in the .txt beside the data.",
         ],
         &legend,
     );

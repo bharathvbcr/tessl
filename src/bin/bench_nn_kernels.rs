@@ -42,8 +42,8 @@ mod common;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tessl::tensor::GpuBuffer;
 use tessl::gemm::cast_f16_to_f32;
+use tessl::tensor::GpuBuffer;
 use tessl::{nn, softcap_f32, GpuRuntime};
 
 const BATCH: usize = 64;

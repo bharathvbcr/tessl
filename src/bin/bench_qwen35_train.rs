@@ -535,15 +535,7 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
         Op {
             name: "gdn_train forward (sequential)",
             run: Box::new(|| {
-                gdn_train_forward_with(
-                    GdnTrainKernel::Sequential,
-                    rt,
-                    gd,
-                    inputs(),
-                    &o_seq,
-                    None,
-                    &ckpt_seq,
-                )
+                gdn_train_forward_with(GdnTrainKernel::Sequential, rt, gd, inputs(), &o_seq, None, &ckpt_seq)
             }),
             outputs: vec![("o", &o_seq.buffer, t * vd)],
             reps: REPS,

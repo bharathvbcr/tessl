@@ -48,6 +48,14 @@
 //!   mixer's inner stages (in-projection, conv, scan, ...) are not split out:
 //!   the model has no stage seam below `LayerPart`.
 //!
+//! After those tables the default run also times **single-op lanes** at the first
+//! T (`METRIC op_{name}_ms_t{T}`): public ops the model's own forward does not
+//! dispatch at these shapes (the attention Q/K norm + RoPE with bf16 targets and
+//! with a position buffer, the GELU-tanh gated act in f32 and bf16, the f32
+//! residual add, shared-prefix attention, the scaled embedding gather, answer
+//! scoring over an f32 and a bf16 table). Each is checked to have written finite,
+//! non-zero output before it is timed.
+//!
 //! Before anything is timed, one forward runs and its final norm and logits
 //! must be finite and not all zero; there is no timing without it.
 //!
@@ -1019,7 +1027,6 @@ fn dispatch_count(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32]) -> Res
     Ok(rt.take_dispatch_count())
 }
 
-/// The default run: gate, then the lanes above at each T.
 // ---------------------------------------------------------------- op lanes ---
 
 /// RoPE geometry of Qwen3.5-2B's full-attention layers (`partial_rotary_factor`
@@ -1119,7 +1126,10 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
     let layout = qwen35::AttnProjLayout::new(Q_HEADS, KV_HEADS, HEAD_DIM)?;
     let width = layout.width() as usize;
     let proj = bounded(rt, t * width, 71, 1.0)?;
-    let (qnw, knw) = (bounded(rt, HEAD_DIM as usize, 72, 0.3)?, bounded(rt, HEAD_DIM as usize, 73, 0.3)?);
+    let (qnw, knw) = (
+        bounded(rt, HEAD_DIM as usize, 72, 0.3)?,
+        bounded(rt, HEAD_DIM as usize, 73, 0.3)?,
+    );
     {
         let (q_out, k_cache, v_cache) = (
             poisoned(rt, t * qd * 2)?,
@@ -1344,7 +1354,9 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
         const N_SLOTS: usize = 4;
         const N_ANSWERS: usize = 4;
         let hidden = bounded(rt, t * HIDDEN, 85, 1.0)?;
-        let slots: Vec<u32> = (0..N_SLOTS as u32).map(|s| (s + 1) * (t32 / (N_SLOTS as u32 + 1))).collect();
+        let slots: Vec<u32> = (0..N_SLOTS as u32)
+            .map(|s| (s + 1) * (t32 / (N_SLOTS as u32 + 1)))
+            .collect();
         let slots = buf_u32(rt, &slots)?;
         let answers = buf_u32(rt, &[3, 1000, 2047, 4000])?;
         let norm_w = bounded(rt, HIDDEN, 86, 0.3)?;
@@ -1393,6 +1405,7 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
     Ok(())
 }
 
+/// The default run: gate, then the lanes above at each T.
 fn run_model(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts, check_only: bool) -> Res<()> {
     let vocab = model.config().vocab;
     rt.set_async_encode(true)?;

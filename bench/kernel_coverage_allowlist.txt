@@ -9,3 +9,5 @@
 # dispatches, fails the check, so the list cannot outlive what it records.
 #
 # Empty until the uncovered kernels are triaged (ft-6d88defb).
+mtl_tensor_fill_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)
+mtl_tensor_read_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)

@@ -881,6 +881,21 @@ and the 6147-token embedding moved from `9.2e-7` to `2.1e-7`.
 Measured on an M5 Pro against the real checkpoint, paired and interleaved
 (`bench_paired` over `bench_embedgemma2`; `bench/results/embedgemma2_*_m5pro.*`).
 
+* **Against sentence-transformers on PyTorch MPS** (tessl at d8f9cc3 against
+  sentence-transformers 6.1.0 on torch 2.14.1, `bench/embedgemma2_torch.py`, the same token ids,
+  batched as its `encode` batches; 4 interleaved rounds of min-of-10, recorded 2026-10-19, drift
+  gate passed on the first attempt; `embedgemma2_vs_torch_m5pro.{txt,json,svg}`, drawn by
+  `plot_results vs-torch`). tessl is faster on every workload torch can run, in every round:
+  torch takes 1.6x to 3.4x tessl's time in f32 and 3.1x to 4.4x in bf16, and its bf16 lane takes
+  1.04x to 3.4x the time of tessl's default ExactF32. Two of the eight workloads are not in the
+  run because torch does not run them reliably under this machine's 32 GiB per-process cap
+  (memguard; MPS's own ceiling is 33.6 GiB): `encode` pads `1x4096+63x32` to 32 x 4096 (stopped at
+  the cap in f32 and bf16; MPS itself refused 8 GiB more once, in f32) and
+  `1x6147+1x1658+6x10-42` to 8 x 6147 (one f32 encode finished, in 17.5 s; the next was stopped at
+  the cap); tessl packs them and runs each in under 0.7 s with a peak
+  footprint under 2 GiB. The run started at 1-minute load 5.2 and other sessions took it to 16.7
+  during it (the JSON records the start and the finish, the `.txt` the range); the smallest per-round margin,
+  torch bf16 against tessl f32 at 32x256, was 0.976x.
 * **The 2026-10-17 media, binding and Go work as a whole** (42f1d52, the branch point, against
   `eg2/integrate` at cccdffd, each a release build in its own target directory, with a control
   lane that is a byte copy of the base binary; recorded 2026-10-18 on a quiet machine, 1-minute

@@ -12,7 +12,16 @@ A workload runs as sentence-transformers' `encode` runs it: sorted longest
 first and cut into batches of --batch-size (its default, 32), each padded to
 its own longest sequence. One batch of a ragged workload padded to its
 longest asked MPS for more memory than the machine has (16 GiB for one
-attention at 1x6147 beside seven short texts).
+attention at 1x6147 beside seven short texts). Batches of 32 still do it for
+two of the default workloads on a 64 GiB M5 Pro: 1x4096+63x32 (32 texts padded
+to 4096; stopped at the 32 GiB cap in f32 and bf16, and once refused by MPS itself) and
+1x6147+1x1658+6x10-42 (eight texts padded to 6147; one f32 run finished in
+17.5 s, the next was stopped at the machine's 32 GiB per-process cap). A run
+that has to finish leaves both out with BENCH_WORKLOADS.
+
+The MPS cache is emptied between workloads, outside the timed region, so one
+workload's cached buffers are not held through the next. Each workload's
+starting MPS driver memory goes to stderr.
 
 --dtype f32 is the like-for-like lane (tessl's forward is f32 with exact-f32
 GEMMs); bf16 is the checkpoint's dtype, reported as what a torch deployment
@@ -24,6 +33,7 @@ import glob
 import json
 import os
 import statistics
+import sys
 import time
 
 import torch
@@ -96,6 +106,8 @@ def main():
                 es = [model(dict(f))["sentence_embedding"] for f in batches]
             return torch.cat(es).float().cpu()
 
+        print(f"{w}: MPS driver holds {torch.mps.driver_allocated_memory() / 2**30:.1f} GiB",
+              file=sys.stderr, flush=True)
         e = run()
         norms = e.norm(dim=1)
         if not torch.isfinite(e).all() or (norms - 1).abs().max().item() > 1e-2:
@@ -112,6 +124,9 @@ def main():
         rows.append({"workload": w.strip(), "backend": f"torch-mps-{args.dtype}",
                      "ms_min": round(ms[0], 4), "ms_median": round(statistics.median(ms), 4),
                      "iters": args.iters, "forwards": len(batches)})
+        batches.clear()
+        del e
+        torch.mps.empty_cache()
     print(json.dumps(rows))
 
 

@@ -426,6 +426,18 @@ All notable changes to `tessl` are recorded here. The format follows
   0.999x to 1.032x), Bf16 0.312x to 0.334x from 64x32 up; multimodal 0.993x to
   0.999x (control 0.996x to 1.000x). That work changed no kernel, and the
   encoder's speed did not move.
+- **tessl against sentence-transformers on PyTorch MPS**
+  (`embedgemma2_vs_torch_m5pro.*`, `plot_results vs-torch`): d8f9cc3 against
+  sentence-transformers 6.1.0 on torch 2.14.1, same token ids, 4 interleaved
+  rounds. torch takes 1.6x to 3.4x tessl's time in f32 and 3.1x to 4.4x in
+  bf16, on every workload and round it ran. `1x4096+63x32` and
+  `1x6147+1x1658+6x10-42` are left out: `encode` pads them to 32 x 4096 and
+  8 x 6147, and torch did not run them reliably under the machine's 32 GiB
+  per-process cap (one f32 encode of the second finished, in 17.5 s).
+  `bench/embedgemma2_torch.py` empties the MPS cache between workloads (outside
+  the timed region). The paired figures give a lane their colour table does not
+  name its own series colour (they were all the control's grey), and mark a lane
+  that recorded no device peak "not recorded" instead of drawing 0 MiB.
 - **C ABI 12** (additive; `TESSL_ABI_VERSION` 11 → 12):
   `tessl_runtime_set_async_encode`, and `tessl_qwen35_read_parameter_host` /
   `tessl_qwen35_write_parameter_host` for one parameter-table entry. A per-entry

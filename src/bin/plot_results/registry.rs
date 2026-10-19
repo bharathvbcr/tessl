@@ -44,6 +44,11 @@ pub const PLOTS: &[Plot] = &[
         render: crate::paired::final_,
     },
     Plot {
+        name: "vs-torch",
+        file: "embedgemma2_vs_torch_m5pro.json",
+        render: crate::paired::final_,
+    },
+    Plot {
         name: "audio-speed",
         file: "embedgemma2_audio_speed_m5pro.json",
         render: crate::paired::audio_speed,

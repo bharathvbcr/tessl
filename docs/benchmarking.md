@@ -174,7 +174,7 @@ it. `--max-spread X` (1 to 1.25) turns a ratio series whose max/min exceeds `X`
 into exit 3 with nothing reported. `--label TEXT` (one line, at most 200 bytes)
 records what the lanes are, for example `42f1d52 (branch point) against
 eg2/integrate cccdffd`, as the JSON's `label`: the paired figures (`final`,
-`integrate-text`, `integrate-mm`) draw it as their title and refuse a file without
+`integrate-text`, `integrate-mm`, `vs-torch`) draw it as their title and refuse a file without
 one, so a figure cannot name revisions its run did not record.
 
 Options take `--name value` or `--name=value`; one parser reads both, and an
@@ -719,7 +719,7 @@ a script raised (a missing key, a division by zero).
 
 ### EmbedGemma 2 figures: `plot_results`
 
-`src/bin/plot_results` draws the nineteen EmbedGemma 2, media and Go-binding benchmark figures in
+`src/bin/plot_results` draws the twenty EmbedGemma 2, media and Go-binding benchmark figures in
 `bench/results/*.svg` from the JSON beside them, with no plotting dependency
 (it replaced thirteen matplotlib scripts and their PNGs):
 
@@ -728,7 +728,7 @@ cargo run --release --bin plot_results -- NAME bench/results/RESULT.json [--out-
 cargo run --release --bin plot_results -- all bench/results [--out-dir DIR]
 ```
 
-`NAME` is one of `final`, `integrate-text`, `integrate-mm`, `audio-speed`, `mm-onewait`, `pre`, `vision-speed`,
+`NAME` is one of `final`, `integrate-text`, `integrate-mm`, `vs-torch`, `audio-speed`, `mm-onewait`, `pre`, `vision-speed`,
 `audio-profile`, `stage-profile`, `text-fusion`, `memory`, `small-m`, `tok`,
 `video`, `media-decode`, `media-resample`, `video-color`, `jpeg-decode`, `go-overhead`. The figure is written as `<stem of RESULT.json>.svg` next to the JSON.
 The same data is the same bytes. A figure refuses to draw, writes nothing and

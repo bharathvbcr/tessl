@@ -340,6 +340,7 @@ const ALL: &[(&str, &str)] = &[
     ("final", "embedgemma2_final_m5pro"),
     ("integrate-text", "embedgemma2_integrate_text_m5pro"),
     ("integrate-mm", "embedgemma2_integrate_mm_m5pro"),
+    ("vs-torch", "embedgemma2_vs_torch_m5pro"),
     ("audio-speed", "embedgemma2_audio_speed_m5pro"),
     ("mm-onewait", "embedgemma2_mm_onewait_m5pro"),
     ("pre", "embedgemma2_pre_m5pro"),
@@ -1102,6 +1103,54 @@ fn a_paired_figure_is_titled_by_its_runs_label_and_refused_without_one() {
     assert_eq!(r.code, Some(1));
     assert!(r.err.contains("final.label: missing key"), "{}", r.err);
     assert!(no_svg_in(&dir));
+}
+
+#[test]
+fn lanes_the_colour_table_does_not_name_are_still_drawn_apart() {
+    // A run's lane names are its own (`tessl_f32`, `torch_bf16`, ...); a figure
+    // that had no colour for them drew every such lane the control's grey.
+    let f = "embedgemma2_final_m5pro.json";
+    let dir = copy_of("lane_colours", &[f]);
+    let p = dir.join(f);
+    tamper(&p, "after_f32", "lane_x", true);
+    tamper(&p, "after_bf16", "lane_y", true);
+    let r = run(&["final", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let svg = fs::read_to_string(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    // before_async keeps its blue and control its grey; the two unnamed lanes
+    // take the next series colours no lane of the figure uses.
+    for (colour, what) in [
+        ("#2a78d6", "blue"),
+        ("#8a8985", "grey"),
+        ("#eb6834", "orange"),
+        ("#1f9e6e", "green"),
+    ] {
+        assert!(svg.contains(colour), "no {what} series");
+    }
+}
+
+#[test]
+fn a_lane_that_recorded_no_device_peak_is_not_drawn_as_zero() {
+    // The torch lanes print no device peak; a missing peak drawn as a 0 MiB bar
+    // reads as "used no memory".
+    let f = "embedgemma2_final_m5pro.json";
+    let dir = copy_of("no_peak", &[f]);
+    let p = dir.join(f);
+    let r = run(&["final", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let with = fs::read_to_string(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    assert!(!with.contains("not recorded"), "a recorded peak is called missing");
+    fs::remove_file(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    tamper(&p, "\"device_peak_mib_max\"", "\"device_peak_gone\"", true);
+    let r = run(&["final", p.to_str().unwrap()]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let svg = fs::read_to_string(dir.join("embedgemma2_final_m5pro.svg")).unwrap();
+    // Eight workloads, four lanes: every bar of the panel is a "not recorded".
+    assert_eq!(
+        svg.matches("not recorded").count(),
+        8 * 4,
+        "missing peaks are not marked"
+    );
 }
 
 #[test]

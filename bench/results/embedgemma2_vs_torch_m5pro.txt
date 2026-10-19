@@ -1,0 +1,52 @@
+EmbeddingGemma 2 text encode: tessl (eg2/integrate d8f9cc3) against sentence-transformers on PyTorch MPS
+Apple M5 Pro (64 GiB), 2026-10-19. Snapshot google/embeddinggemma-2 914f7f89142e33e77833254d9c9b90c3cef7303b.
+torch 2.14.1, transformers 5.19.0, sentence-transformers 6.1.0 (~/.venvs/ml-2026-10).
+
+What ran
+  bench_paired --rounds 4 --evidence --max-spread 1.25 --clean-env, BENCH_ITERS=10, BENCH_WARMUP=3,
+  lane order reversed on odd rounds, one fresh process per lane per round, min-of-N per process.
+  Both sides get the same token ids (no tokenization in either lane) and return unit-norm embeddings.
+  Lanes (target/run_torch_bench.sh):
+    tessl_f32   bench_embedgemma2 at d8f9cc3, BENCH_PRECISION=f32 (GemmOperands::ExactF32, the default)
+    torch_f32   bench/embedgemma2_torch.py --dtype f32: SentenceTransformer on "mps", float32,
+                transformers' default attention for the model, batches as encode() makes them
+                (longest first, batch size 32, each padded to its own longest)
+    tessl_bf16  the same tessl binary, BENCH_PRECISION=bf16 (GemmOperands::Bf16)
+    torch_bf16  the torch lane with --dtype bf16 (the checkpoint's own dtype)
+  The torch script's only change from its committed version is outside the timed region (it empties
+  the MPS cache between workloads and logs memory to stderr; the run had `del batches, e` where the
+  committed script has `batches.clear()` and `del e`, the same release of the same tensors, also
+  outside timing). The run waited for 1-minute load < 6
+  and 5-minute < 10: { 5.25 9.90 20.08 } at the start. Other sessions picked up during it: the lanes
+  started at 1-minute load 5.1 to 16.7 (5-minute 7.7 to 12.2), read from bench_paired's per-lane
+  metadata (PATH.lanes/, not committed); the JSON keeps the start and the finish. Published by
+  the drift gate on its first attempt.
+
+Two of bench_embedgemma2's eight default workloads are not in the run (BENCH_WORKLOADS, all lanes)
+  1x4096+63x32           encode()'s first batch is 32 texts padded to 4096. MPS refused it once (f32): "MPS backend
+                         out of memory (MPS allocated: 26.05 GiB, other allocations: 1.84 GiB, max allowed:
+                         33.60 GiB). Tried to allocate 8.00 GiB". In f32 and in bf16 the process was
+                         otherwise stopped by the machine's memory guard (memguard -cap-gib 32, SIGTERM).
+  1x6147+1x1658+6x10-42  one batch of eight padded to 6147. One f32 run alone finished (17.5 s for one
+                         encode); the next, in a process that had run the other workloads, was stopped at
+                         the 32 GiB cap.
+  tessl runs both (pack_forwards packs sequences instead of padding a batch): 426 ms and 690 ms in
+  f32, the process's peak footprint at most 1911 MiB over all eight workloads
+  (embedgemma2_integrate_text_m5pro.json, after_f32).
+  A smaller --batch-size would let torch run them; that is no longer the default and was not run.
+
+                workload  tessl_f32 ms  torch_f32 ms  vs base [lo, hi]        tessl_bf16 ms  torch_bf16 ms  vs tessl_bf16 [lo, hi]
+                    1x16         4.456        15.376  3.389x [3.239, 3.491]          3.793         15.108  4.059x [3.754, 4.114]
+                   64x32       101.033       163.896  1.622x [1.618, 1.623]         34.041        104.564  3.070x [3.055, 3.102]
+                  32x256       439.960       714.705  1.626x [1.590, 1.666]        146.617        450.779  3.116x [2.905, 3.177]
+                  8x1024       530.800       962.465  1.811x [1.754, 1.828]        185.798        562.243  3.062x [2.918, 3.164]
+                  2x4096       681.675      1944.947  2.854x [2.737, 2.893]        234.141       1011.775  4.367x [4.231, 4.445]
+               128x8-512      1858.845      3604.384  1.989x [1.868, 1.999]        658.894       2331.782  3.552x [3.532, 3.607]
+  (ratios are torch's time over tessl's, the median per-round ratio with the lowest and highest round)
+
+Reading: tessl is faster on every workload torch can run, in every round. Like for like in f32,
+torch takes 1.6x to 3.4x tessl's time; in bf16, 3.1x to 4.4x. torch's fastest lane (bf16) against
+tessl's default (ExactF32): 1.04x to 3.4x tessl's time (torch_bf16 vs base, median), with one round
+at 32x256 and one at 8x1024 where torch bf16 was within 2.4% under tessl f32 (lo 0.976, 0.986).
+The gap is widest at 1x16 and 2x4096; why was not profiled here. torch's device memory is not
+recorded (the figure marks it "not recorded"): the torch lane prints no device peak.

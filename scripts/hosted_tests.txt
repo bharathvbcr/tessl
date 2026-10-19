@@ -43,7 +43,7 @@ bin media_yuv_formats 5
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
-bin plot_results 59
+bin plot_results 61
 bin plot_results_go_overhead 9
 bin plot_results_resample 7
 bin reader_bounds 12

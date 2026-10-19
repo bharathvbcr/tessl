@@ -1,4 +1,31 @@
-# BUILD_REPORT — GitPulse backlog, waves 13–18 (2026-10-17/19)
+# BUILD_REPORT — GitPulse backlog, waves 13–19 (2026-10-17/19)
+
+## Wave 19: a bench lane for every kernel (`main` = `1c4d03e`)
+
+Owner decision: bench lanes for **all** kernel entry points. `kernel_coverage --check` now **exits 0**. Of 303 entry points, 301 are dispatched by bench lanes. The other 2 are allowlisted as test-only by owner decision: `mtl_tensor_fill_i8` / `mtl_tensor_read_i8` are only dispatched by a `#[cfg(test)]` test behind `quant-prep`. `--audit-allowlist` accepts both rows.
+
+**Lane 1** added 25 kernels across four binaries:
+- `bench_nn_kernels`: utils.
+- `bench_gemm_variants`: TN split-K.
+- `bench_qwen35_train`: GDN train, CE bf16, AdamW / window copies / q8 moments / bank views.
+- `bench_qwen35_layers`: Qwen3.5 op lanes in the default run.
+
+**Lane 2** added 22 kernels:
+- `bench_embedgemma2{,_audio,_vision} --kernels`.
+- `bench_encoder_attn`: the tiled variants.
+
+Every lane checks its result before timing. Most compare against a host reference or a derived bound. Three EmbedGemma2 audio kernels get only finite and range checks, which do catch NaN.
+
+The adversarial pass on both lanes found three problems, all fixed before landing:
+- AdamW / moment write-backs that were never read back. They are now read back and bit-checked.
+- Op lanes that checked only finite, non-zero output. They now have host references.
+- `bench_encoder_attn` skipped its 10% spread guard whenever `TESSL_KERNEL_TRACE` was set. It now skips only on an explicit `--coverage-probe`, which `kernel_coverage` passes, and says so when it does.
+
+Accepted as unobservable: `eg2t_scale_rms_norm_f32` can't detect an ignored scale, because `rms(x·s)` is scale-invariant. Accepted by convention: `bench_gemm_variants` lanes are timing-only, and their correctness is covered in `tests/`.
+
+**Changed:** bench binaries, `src/bin/common`, `tests/kernel_coverage.rs`, the allowlist, and `hosted_tests.txt` `bins` 261 → 262. No library code, no kernels. No timing claims.
+
+**Landing.** It was cherry-picked onto `09efe84`, the eg2 merge that tessl-a3 landed first (first green lands first). Gates were green after the last pick: fmt, build, clippy ×2, doc, hosted 1218 + completeness, dialect, IR, emulator ×4, comparator, torch host 110, Go unit, bench and lib tests. ojas acked it; it builds none of these files.
 
 ## History scrub (2026-10-18 ~20:41, by the eg2 session) and wave 18
 

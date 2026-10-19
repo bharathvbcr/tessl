@@ -742,6 +742,41 @@ pub fn suites() -> Vec<Suite> {
             ],
         ),
         suite("bench_nn_kernels", &[], &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")]),
+        // The encoder attention at the head dims the models run (256 and 512 text,
+        // 64 vision, 32 BERT): the rows, f32 tiled, bf16 tiled and bf16-output
+        // tiled kernels of each. Two rounds is the bench's minimum.
+        suite(
+            "bench_encoder_attn",
+            &[],
+            &[
+                (
+                    "BENCH_SHAPES",
+                    "text_swa_8x1024,text_glob_8x1024,vision_1x2520,bert32_8x512",
+                ),
+                ("BENCH_ROUNDS", "2"),
+                ("BENCH_ITERS", "1"),
+                ("BENCH_REPS", "1"),
+                ("BENCH_WARMUP", "0"),
+            ],
+        ),
+        // EmbedGemma 2's fused text row passes, the audio tower's `eg2a_*`
+        // kernels and the vision tower's position, pooling and rope passes, each
+        // through its public function on random operands (no checkpoint).
+        suite(
+            "bench_embedgemma2",
+            &["--kernels"],
+            &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")],
+        ),
+        suite(
+            "bench_embedgemma2_audio",
+            &["--kernels"],
+            &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")],
+        ),
+        suite(
+            "bench_embedgemma2_vision",
+            &["--kernels"],
+            &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")],
+        ),
         // The TN/NT accumulate lanes reach the accumulate kernels with no opt-in
         // since TESSL_GEMM_ACCUM / _ACCUM_DX were retired (2026-10-10).
         suite(

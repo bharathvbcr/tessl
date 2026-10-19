@@ -420,6 +420,123 @@ pub fn emit_kernel_trace() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel lanes: one public entry point on small random operands
+// ---------------------------------------------------------------------------
+
+/// A device buffer holding `data` (f32).
+pub fn upload_f32(rt: &std::sync::Arc<tessl::GpuRuntime>, data: &[f32]) -> Result<tessl::tensor::GpuBuffer, String> {
+    let b = rt.alloc_buffer(data.len().max(1) * 4)?;
+    b.write_f32(data);
+    Ok(b)
+}
+
+/// A device buffer holding `data` as bf16 (round to nearest even).
+pub fn upload_bf16(rt: &std::sync::Arc<tessl::GpuRuntime>, data: &[f32]) -> Result<tessl::tensor::GpuBuffer, String> {
+    let b = rt.alloc_buffer(data.len().max(1) * 2)?;
+    b.write_bf16_bits(&tessl::tensor::f32_slice_to_bf16(data));
+    Ok(b)
+}
+
+/// An f32 buffer of `n` NaNs, so an element a kernel never wrote is caught by
+/// [`check_lane_output`].
+pub fn poisoned_f32(rt: &std::sync::Arc<tessl::GpuRuntime>, n: usize) -> Result<tessl::tensor::GpuBuffer, String> {
+    upload_f32(rt, &vec![f32::NAN; n])
+}
+
+/// A bf16 buffer of `n` NaNs.
+pub fn poisoned_bf16(rt: &std::sync::Arc<tessl::GpuRuntime>, n: usize) -> Result<tessl::tensor::GpuBuffer, String> {
+    let b = rt.alloc_buffer(n.max(1) * 2)?;
+    b.write_bf16_bits(&vec![0x7fc0u16; n.max(1)]);
+    Ok(b)
+}
+
+/// The first `n` elements of a bf16 buffer, widened (after a `synchronize`).
+pub fn read_bf16(rt: &tessl::GpuRuntime, b: &tessl::tensor::GpuBuffer, n: usize) -> Result<Vec<f32>, String> {
+    rt.synchronize()?;
+    let bits = b.try_contents_u16()?;
+    if bits.len() < n {
+        return Err(format!("bf16 buffer holds {} elements, need {n}", bits.len()));
+    }
+    Ok(bits[..n].iter().map(|&x| tessl::tensor::bf16_bits_to_f32(x)).collect())
+}
+
+/// `x / sqrt(mean(x^2) + eps) * w` over one row in f64 (`* w`, not `* (1 +
+/// w)`; no weight when `w` is `None`): the host reference of a row norm.
+pub fn host_rms(x: &[f64], w: Option<&[f32]>, eps: f64) -> Vec<f64> {
+    let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + eps).sqrt();
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| v * inv * w.map_or(1.0, |w| f64::from(w[i])))
+        .collect()
+}
+
+/// A lane's result must be every element finite and not all zero: a kernel
+/// that wrote nothing (the buffer was poisoned with NaN first), or only zeros,
+/// cannot post a time.
+pub fn check_lane_output(lane: &str, out: &[f32]) -> Result<(), String> {
+    if out.is_empty() {
+        return Err(format!("{lane}: the output is empty"));
+    }
+    if let Some(i) = out.iter().position(|x| !x.is_finite()) {
+        return Err(format!(
+            "{lane}: element {i} of {} is {} (not finite)",
+            out.len(),
+            out[i]
+        ));
+    }
+    if out.iter().all(|&x| x == 0.0) {
+        return Err(format!("{lane}: all {} elements are zero", out.len()));
+    }
+    Ok(())
+}
+
+/// `got` against `want` (f64 host reference), each element within `abs + rel *
+/// |want|`; names the worst element on failure.
+pub fn check_against(lane: &str, got: &[f32], want: &[f64], abs: f64, rel: f64) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("{lane}: {} elements, expected {}", got.len(), want.len()));
+    }
+    let mut worst: Option<(usize, f64, f64)> = None;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let excess = (f64::from(g) - w).abs() - (abs + rel * w.abs());
+        // A NaN element (`excess` NaN) is always a failure.
+        if (excess.is_nan() || excess > 0.0) && worst.is_none_or(|(_, e, _)| excess.is_nan() || excess > e) {
+            worst = Some((i, excess, f64::from(g)));
+        }
+    }
+    match worst {
+        None => Ok(()),
+        Some((i, _, g)) => Err(format!(
+            "{lane}: element {i} is {g}, host reference {} (tolerance {abs:e} + {rel:e} * |ref|)",
+            want[i]
+        )),
+    }
+}
+
+/// Time `dispatch` (`warmup` untimed rounds, then `iters` timed ones, each
+/// ended by a `synchronize`) and print `METRIC <lane>_ms <median>`. The caller
+/// has already run and checked the kernel once.
+pub fn time_lane(
+    rt: &tessl::GpuRuntime,
+    lane: &str,
+    warmup: usize,
+    iters: usize,
+    mut dispatch: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut ms = Vec::with_capacity(iters);
+    for round in 0..warmup + iters {
+        let t0 = std::time::Instant::now();
+        dispatch()?;
+        rt.synchronize()?;
+        if round >= warmup {
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    println!("METRIC {lane}_ms {:.4}", median(ms)?);
+    Ok(())
+}
+
 /// The stdout line a `METRIC` lane ends with when it fails after it may have
 /// printed metrics: `METRIC_INCOMPLETE reason`. A consumer that reads stdout
 /// alone (a pipe, a saved log) must not take the `METRIC` lines before it as a

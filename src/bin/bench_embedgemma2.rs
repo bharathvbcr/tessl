@@ -5,6 +5,9 @@
 //!   cargo run --release --bin bench_embedgemma2
 //! ```
 //!
+//! `--kernels` instead runs the text tower's four fused row passes on random
+//! operands, with no checkpoint (see `run_text_kernels`).
+//!
 //! `--attn-kernel=rows|tiled` instead times the encoder attention kernel alone
 //! at the checkpoint's layer shapes, with no weights (see `run_attn_kernel`).
 //!
@@ -287,7 +290,174 @@ fn run_attn_kernel(
     Ok(())
 }
 
+/// [`common::host_rms`] with a weight.
+fn host_rms(x: &[f64], w: &[f32], eps: f64) -> Vec<f64> {
+    common::host_rms(x, Some(w), eps)
+}
+
+/// `--kernels`: the text tower's four fused row passes (`eg2t_resid_norm_f32`,
+/// `eg2t_resid_norm_bf16`, `eg2t_resid_add_bf16_copy`, `eg2t_scale_rms_norm_f32`)
+/// through their public entry points on random operands (no checkpoint, no
+/// weights), each checked once against an f64 host reference before it is
+/// timed: one `METRIC eg2t_{pass}_ms` per pass, the median of `BENCH_ITERS`
+/// dispatches. The row passes are what the tower runs per layer; this lane
+/// exists so `kernel_coverage` sees them dispatched.
+fn run_text_kernels(warmup: usize, iters: usize) -> Result<(), String> {
+    use common::{check_against, check_lane_output, poisoned_bf16, poisoned_f32, read_bf16, time_lane, upload_f32};
+    use tessl::embedgemma2::{resid_add_bf16_copy, resid_add_norm_bf16, resid_add_norm_f32, scale_rms_norm_inplace};
+
+    const ROWS: u32 = 5;
+    const DIM: u32 = 96;
+    const EPS: f32 = 1e-6;
+    const LAYER_SCALE: f32 = 0.75;
+    const SCALE: f32 = 9.5;
+    let (rows, dim) = (ROWS as usize, DIM as usize);
+    let n = rows * dim;
+    let rt = GpuRuntime::new_inference()?;
+    let y = common::fill_affine(n, 31, 3.0, 0.0);
+    let resid0 = common::fill_affine(n, 32, 5.0, 0.0);
+    let norm_w = |seed: u64| -> Vec<f32> { common::fill_affine(dim, seed, 0.4, 1.0) };
+    let (w_post, w_next) = (norm_w(33), norm_w(34));
+    let (y_b, w_post_b, w_next_b) = (
+        upload_f32(&rt, &y)?,
+        upload_f32(&rt, &w_post)?,
+        upload_f32(&rt, &w_next)?,
+    );
+
+    // The post-norm residual add: `ls * (resid + rms(y) * w_post)` per row.
+    let resid_after: Vec<f64> = (0..rows)
+        .flat_map(|r| {
+            let row = r * dim..(r + 1) * dim;
+            let yn = host_rms(
+                &y[row.clone()].iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+                &w_post,
+                f64::from(EPS),
+            );
+            let base = &resid0[row];
+            (0..dim)
+                .map(|i| f64::from(LAYER_SCALE) * (f64::from(base[i]) + yn[i]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let normed: Vec<f64> = (0..rows)
+        .flat_map(|r| host_rms(&resid_after[r * dim..(r + 1) * dim], &w_next, f64::from(EPS)))
+        .collect();
+
+    for bf16_out in [false, true] {
+        let lane = if bf16_out {
+            "eg2t_resid_norm_bf16"
+        } else {
+            "eg2t_resid_norm_f32"
+        };
+        let resid = upload_f32(&rt, &resid0)?;
+        let out = if bf16_out {
+            poisoned_bf16(&rt, n)?
+        } else {
+            poisoned_f32(&rt, n)?
+        };
+        let dispatch = |resid: &tessl::tensor::GpuBuffer| {
+            if bf16_out {
+                resid_add_norm_bf16(
+                    &rt,
+                    &y_b,
+                    &w_post_b,
+                    resid,
+                    &w_next_b,
+                    &out,
+                    ROWS,
+                    DIM,
+                    EPS,
+                    LAYER_SCALE,
+                )
+            } else {
+                resid_add_norm_f32(
+                    &rt,
+                    &y_b,
+                    &w_post_b,
+                    resid,
+                    &w_next_b,
+                    &out,
+                    ROWS,
+                    DIM,
+                    EPS,
+                    LAYER_SCALE,
+                )
+            }
+        };
+        dispatch(&resid)?;
+        rt.synchronize()?;
+        let got = if bf16_out {
+            read_bf16(&rt, &out, n)?
+        } else {
+            out.read_f32()
+        };
+        check_lane_output(lane, &got)?;
+        let (abs, rel) = if bf16_out { (1e-5, 1e-2) } else { (1e-5, 2e-4) };
+        check_against(&format!("{lane} out"), &got[..n], &normed, abs, rel)?;
+        check_against(
+            &format!("{lane} resid"),
+            &resid.read_f32()[..n],
+            &resid_after,
+            1e-5,
+            2e-4,
+        )?;
+        // Timed on a residual that is refreshed by the dispatch itself; its
+        // value drifts with the layer scale, which cannot change the time.
+        time_lane(&rt, lane, warmup, iters, || dispatch(&resid))?;
+    }
+
+    let lane = "eg2t_resid_add_bf16_copy";
+    let resid = upload_f32(&rt, &resid0)?;
+    let copy = poisoned_bf16(&rt, n)?;
+    resid_add_bf16_copy(&rt, &y_b, &w_post_b, &resid, &copy, ROWS, DIM, EPS, LAYER_SCALE)?;
+    rt.synchronize()?;
+    let got = read_bf16(&rt, &copy, n)?;
+    check_lane_output(lane, &got)?;
+    check_against(&format!("{lane} copy"), &got, &resid_after, 1e-5, 1e-2)?;
+    check_against(
+        &format!("{lane} resid"),
+        &resid.read_f32()[..n],
+        &resid_after,
+        1e-5,
+        2e-4,
+    )?;
+    time_lane(&rt, lane, warmup, iters, || {
+        resid_add_bf16_copy(&rt, &y_b, &w_post_b, &resid, &copy, ROWS, DIM, EPS, LAYER_SCALE)
+    })?;
+
+    // The per-layer inputs' scale and norm: `rms(x * scale) * w`, in place.
+    let lane = "eg2t_scale_rms_norm_f32";
+    let x = upload_f32(&rt, &y)?;
+    scale_rms_norm_inplace(&rt, &x, &w_next_b, ROWS, DIM, EPS, SCALE)?;
+    rt.synchronize()?;
+    let want: Vec<f64> = (0..rows)
+        .flat_map(|r| {
+            let scaled: Vec<f64> = y[r * dim..(r + 1) * dim]
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(SCALE))
+                .collect();
+            host_rms(&scaled, &w_next, f64::from(EPS))
+        })
+        .collect();
+    let got = x.read_f32();
+    check_lane_output(lane, &got[..n])?;
+    check_against(lane, &got[..n], &want, 1e-5, 2e-4)?;
+    time_lane(&rt, lane, warmup, iters, || {
+        scale_rms_norm_inplace(&rt, &x, &w_next_b, ROWS, DIM, EPS, SCALE)
+    })
+}
+
 fn main() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("--kernels") {
+        if let Some(extra) = std::env::args().nth(2) {
+            return Err(format!("unexpected argument {extra:?} after --kernels"));
+        }
+        let iters = env_usize("BENCH_ITERS", 10, 1)?;
+        let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
+        let outcome = common::mark_incomplete_on_error(run_text_kernels(warmup, iters));
+        common::emit_kernel_trace();
+        return outcome;
+    }
     let snap = PathBuf::from(
         std::env::var("EMBEDGEMMA2_SNAPSHOT").map_err(|_| "EMBEDGEMMA2_SNAPSHOT must name the snapshot directory")?,
     );

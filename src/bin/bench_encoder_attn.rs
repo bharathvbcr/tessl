@@ -1,6 +1,7 @@
 //! EmbeddingGemma 2 / BERT / vision-tower encoder attention, kernel against
 //! kernel: `encoder_attn`'s rows kernel, its production matrix-unit kernel
-//! (f32 operands), its bf16-operand kernel, and the swept geometries of
+//! (f32 operands), its bf16-operand kernel (and the form that stores bf16,
+//! `tiled_bf16o`, checked against it before it is timed), and the swept geometries of
 //! `kernels/tune/encoder_attn_tune.metal`, on the shapes the models run.
 //! (`bench_flash_attn` times the decoder kernels, whose arguments are
 //! positions and a causal rule; this takes `lens` and a symmetric window, and
@@ -273,6 +274,8 @@ struct Operands {
     kb: GpuBuffer,
     vb: GpuBuffer,
     o: GpuBuffer,
+    /// bf16 output, for `EncoderAttnKernel::TiledBf16Out`.
+    ob: GpuBuffer,
     lens: GpuBuffer,
 }
 
@@ -298,6 +301,7 @@ fn operands(rt: &Arc<GpuRuntime>, s: &Shape) -> Result<Operands, String> {
         kb: bf16_buffer(rt, &k)?,
         vb: bf16_buffer(rt, &v)?,
         o: rt.alloc_buffer(q_n * 4)?,
+        ob: rt.alloc_buffer(q_n * 2)?,
         lens,
     })
 }
@@ -474,6 +478,63 @@ fn run() -> Result<(), String> {
                 }),
             );
         }
+        if matches!(s.d, 256 | 512 | 64) {
+            // `bf16o` stores what `tiled_bf16` computes, rounded to bf16 (the
+            // library documents the two as the same values up to that cast):
+            // check it once before it is timed.
+            if only.is_empty() || only.iter().any(|o| "tiled_bf16o".contains(o.as_str())) {
+                let q_n = (s.b * s.t * s.h * s.d) as usize;
+                ops.o.write_f32(&vec![f32::NAN; q_n]);
+                encoder_attn_with(
+                    &rt,
+                    &ops.qb,
+                    &ops.kb,
+                    &ops.vb,
+                    &ops.o,
+                    &ops.lens,
+                    dims,
+                    EncoderAttnKernel::TiledBf16,
+                )?;
+                encoder_attn_with(
+                    &rt,
+                    &ops.qb,
+                    &ops.kb,
+                    &ops.vb,
+                    &ops.ob,
+                    &ops.lens,
+                    dims,
+                    EncoderAttnKernel::TiledBf16Out,
+                )?;
+                rt.synchronize()?;
+                let want: Vec<f64> = ops.o.read_f32().iter().map(|&x| f64::from(x)).collect();
+                let got = common::read_bf16(&rt, &ops.ob, want.len())?;
+                let what = format!("{} tiled_bf16o", s.name);
+                common::check_lane_output(&what, &got)?;
+                // One bf16 rounding of the f32 result: 2^-8 relative.
+                common::check_against(&what, &got, &want, 1e-6, 8e-3)?;
+            }
+            add_arm(
+                &mut arms,
+                &only,
+                reps,
+                "tiled_bf16o".into(),
+                Box::new(move || {
+                    for _ in 0..reps {
+                        encoder_attn_with(
+                            rt_ref,
+                            &ops_ref.qb,
+                            &ops_ref.kb,
+                            &ops_ref.vb,
+                            &ops_ref.ob,
+                            &ops_ref.lens,
+                            dims,
+                            EncoderAttnKernel::TiledBf16Out,
+                        )?;
+                    }
+                    rt_ref.synchronize()
+                }),
+            );
+        }
         if sweep {
             // A geometry that is fast because it is wrong is not a result:
             // each candidate's output must match the rows kernel's before it
@@ -593,7 +654,11 @@ fn run() -> Result<(), String> {
     if let Some(p) = out_path {
         common::atomic_write(std::path::Path::new(&p), format!("[{}]\n", json.join(",\n")).as_bytes())?;
     }
-    common::exit_if_unstable("bench_encoder_attn", &unstable);
+    // A coverage probe (`kernel_coverage` sets TESSL_KERNEL_TRACE) runs two
+    // short rounds and is not a measurement: its spread is not a verdict.
+    if !tessl::runtime::kernel_trace_enabled() {
+        common::exit_if_unstable("bench_encoder_attn", &unstable);
+    }
     Ok(())
 }
 

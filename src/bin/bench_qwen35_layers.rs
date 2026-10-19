@@ -1020,6 +1020,379 @@ fn dispatch_count(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32]) -> Res
 }
 
 /// The default run: gate, then the lanes above at each T.
+// ---------------------------------------------------------------- op lanes ---
+
+/// RoPE geometry of Qwen3.5-2B's full-attention layers (`partial_rotary_factor`
+/// 0.25 of the 256-wide head, theta 1e7) and the norm epsilon.
+const ROTARY_DIM: u32 = 64;
+const ROPE_THETA: f32 = 1e7;
+const NORM_EPS: f32 = 1e-6;
+/// Rows of the stand-in embedding / LM-head table in the op lanes: the lanes
+/// time the gather and the scoring at the model's hidden size, not at its
+/// 248k-row vocabulary (a 1 GB table per dtype).
+const LANE_VOCAB: usize = 4096;
+/// Positions of the shared prefix and the suffix a prefix-attention lane runs.
+const PREFIX_LEN: usize = 256;
+const SUFFIX_LEN: usize = 64;
+
+/// The first `n` f32 of `b` finite and not all zero.
+fn written_f32(what: &str, b: &GpuBuffer, n: usize) -> Res<()> {
+    finite_f32(what, b, n)?;
+    if b.read_f32()[..n].iter().all(|&x| x == 0.0) {
+        return Err(format!("{what}: all zeros"));
+    }
+    Ok(())
+}
+
+/// The first `n` bf16 of `b` finite and not all zero.
+fn written_bf16(what: &str, b: &GpuBuffer, n: usize) -> Res<()> {
+    let bits = b.contents_u16()[..n].to_vec();
+    if let Some(i) = bits.iter().position(|&h| h & 0x7F80 == 0x7F80) {
+        return Err(format!("{what}: element {i} of {n} is non-finite or never written"));
+    }
+    if bits.iter().all(|&h| h & 0x7FFF == 0) {
+        return Err(format!("{what}: all zeros"));
+    }
+    Ok(())
+}
+
+/// An f32 buffer of `n` bounded values seeded with `seed`.
+fn bounded(rt: &Arc<GpuRuntime>, n: usize, seed: u64, scale: f32) -> Res<GpuBuffer> {
+    buf(rt, &common::fill_affine(n, seed, scale, 0.0))
+}
+
+/// A bf16 buffer of `n` bounded values seeded with `seed`.
+fn bounded_bf16(rt: &Arc<GpuRuntime>, n: usize, seed: u64, scale: f32) -> Res<GpuBuffer> {
+    let b = rt.alloc_buffer(n * 2)?;
+    b.write_bf16_bits(&f32_slice_to_bf16(&common::fill_affine(n, seed, scale, 0.0)));
+    Ok(b)
+}
+
+/// An output buffer of `bytes` bytes filled with 0xFF: a NaN in f32 and in bf16.
+fn poisoned(rt: &Arc<GpuRuntime>, bytes: usize) -> Res<GpuBuffer> {
+    let b = rt.alloc_buffer(bytes)?;
+    b.write_bytes(&vec![0xFF; bytes]);
+    Ok(b)
+}
+
+/// One op lane: run `f` once and `check` its output (an op that wrote nothing
+/// is refused before it is timed), then time it and print the figure and its
+/// `METRIC op_{name}_ms_t{t}` line.
+fn op_lane(
+    rt: &Arc<GpuRuntime>,
+    t: usize,
+    iters: usize,
+    name: &str,
+    check: impl FnOnce() -> Res<()>,
+    mut f: impl FnMut() -> Res<()>,
+) -> Res<()> {
+    f()?;
+    rt.synchronize()?;
+    check().map_err(|e| format!("op lane {name}: {e}"))?;
+    let ms = time_ms(rt, REPS, iters, &mut f)?;
+    println!("{name:<40} {ms:>10.4}");
+    println!("METRIC op_{name}_ms_t{t} {ms:.6}");
+    Ok(())
+}
+
+/// The single ops the layer stack does not reach at this model's own shapes
+/// but a consumer's own forward does, each through its public entry point at
+/// `t` rows: the attention Q/K norm + RoPE in its bf16-target and
+/// position-buffer forms, the GELU-tanh gated MLP act in both output dtypes,
+/// the exact-f32 residual add, shared-prefix attention, the scaled embedding
+/// gather and the answer-scoring head over an f32 and a bf16 table.
+fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
+    let t32 = t as u32;
+    println!();
+    println!("single-op lanes at T = {t} (ms, median of {iters}, {REPS} per command buffer)");
+    let (qd, kvd) = ((Q_HEADS * HEAD_DIM) as usize, (KV_HEADS * HEAD_DIM) as usize);
+
+    // Q/K norm + RoPE + cache store, reading the fused projection in place.
+    let shape = qwen35::AttnShape {
+        batch: 1,
+        seq: t32,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        rotary_dim: ROTARY_DIM,
+    };
+    let layout = qwen35::AttnProjLayout::new(Q_HEADS, KV_HEADS, HEAD_DIM)?;
+    let width = layout.width() as usize;
+    let proj = bounded(rt, t * width, 71, 1.0)?;
+    let (qnw, knw) = (bounded(rt, HEAD_DIM as usize, 72, 0.3)?, bounded(rt, HEAD_DIM as usize, 73, 0.3)?);
+    {
+        let (q_out, k_cache, v_cache) = (
+            poisoned(rt, t * qd * 2)?,
+            poisoned(rt, t * kvd * 2)?,
+            poisoned(rt, t * kvd * 2)?,
+        );
+        let targets = qwen35::AttnTargets {
+            q_out: &q_out,
+            k_cache: &k_cache,
+            v_cache: &v_cache,
+        };
+        let columns = qwen35::QkvColumns {
+            q_head_stride: 2 * HEAD_DIM,
+            k_col: layout.k_off(),
+            v_col: layout.v_off(),
+            v_norm: false,
+        };
+        op_lane(
+            rt,
+            t,
+            iters,
+            "attn_qk_norm_rope_bf16",
+            || {
+                written_bf16("q_out", &q_out, t * qd)?;
+                written_bf16("k_cache", &k_cache, t * kvd)?;
+                written_bf16("v_cache", &v_cache, t * kvd)
+            },
+            || {
+                qwen35::attn_qk_norm_rope_columns(
+                    rt,
+                    &shape,
+                    Cols::dense(&proj, layout.width()),
+                    columns,
+                    1.0,
+                    &qnw,
+                    &knw,
+                    &targets,
+                    DType::BF16,
+                    0,
+                    ROPE_THETA,
+                    NORM_EPS,
+                )
+            },
+        )?;
+    }
+    {
+        let (q_out, k_cache, v_cache) = (
+            poisoned(rt, t * qd * 4)?,
+            poisoned(rt, t * kvd * 4)?,
+            poisoned(rt, t * kvd * 4)?,
+        );
+        let targets = qwen35::AttnTargets {
+            q_out: &q_out,
+            k_cache: &k_cache,
+            v_cache: &v_cache,
+        };
+        let pos = buf_u32(rt, &[0])?;
+        op_lane(
+            rt,
+            t,
+            iters,
+            "attn_qk_norm_rope_posbuf",
+            || {
+                written_f32("q_out", &q_out, t * qd)?;
+                written_f32("k_cache", &k_cache, t * kvd)?;
+                written_f32("v_cache", &v_cache, t * kvd)
+            },
+            || {
+                qwen35::attn_qk_norm_rope_posbuf(
+                    rt,
+                    &shape,
+                    Cols::dense(&proj, layout.width()),
+                    &qnw,
+                    &knw,
+                    &targets,
+                    &pos,
+                    ROPE_THETA,
+                    NORM_EPS,
+                )
+            },
+        )?;
+    }
+
+    // The gated MLP activation (GELU-tanh) over the gate and up windows.
+    let gate = bounded(rt, t * INTER, 74, 1.0)?;
+    let up = bounded(rt, t * INTER, 75, 1.0)?;
+    for (dtype, name, bytes) in [
+        (DType::F32, "gelu_tanh_glu_f32", 4usize),
+        (DType::BF16, "gelu_tanh_glu_bf16", 2),
+    ] {
+        let out = poisoned(rt, t * INTER * bytes)?;
+        op_lane(
+            rt,
+            t,
+            iters,
+            name,
+            || match dtype {
+                DType::BF16 => written_bf16("out", &out, t * INTER),
+                _ => written_f32("out", &out, t * INTER),
+            },
+            || {
+                qwen35::gated_act(
+                    rt,
+                    qwen35::GatedAct::GeluTanh,
+                    Cols::dense(&gate, INTER as u32),
+                    Cols::dense(&up, INTER as u32),
+                    qwen35::OutCols {
+                        cols: Cols::dense(&out, INTER as u32),
+                        dtype,
+                    },
+                    t32,
+                    INTER as u32,
+                )
+            },
+        )?;
+    }
+
+    // The residual add after an exact-f32 output projection. `y` is small, so
+    // the repeated adds of the timed runs stay finite.
+    {
+        let y = bounded(rt, t * HIDDEN, 76, 1e-3)?;
+        let resid = bounded(rt, t * HIDDEN, 77, 1.0)?;
+        op_lane(
+            rt,
+            t,
+            iters,
+            "residual_add_f32",
+            || written_f32("resid", &resid, t * HIDDEN),
+            || {
+                qwen35::residual_add(
+                    rt,
+                    Cols::dense(&y, HIDDEN as u32),
+                    Cols::dense(&resid, HIDDEN as u32),
+                    t32,
+                    HIDDEN as u32,
+                )
+            },
+        )?;
+    }
+
+    // Shared-prefix attention: SUFFIX_LEN queries after a PREFIX_LEN prefix.
+    {
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let q = bounded(rt, SUFFIX_LEN * qd, 78, scale)?;
+        let (pk, pv) = (
+            bounded(rt, PREFIX_LEN * kvd, 79, scale)?,
+            bounded(rt, PREFIX_LEN * kvd, 80, scale)?,
+        );
+        let (sk, sv) = (
+            bounded(rt, SUFFIX_LEN * kvd, 81, scale)?,
+            bounded(rt, SUFFIX_LEN * kvd, 82, scale)?,
+        );
+        let suffix_len = buf_u32(rt, &[SUFFIX_LEN as u32])?;
+        let q_pos = buf_u32(rt, &[PREFIX_LEN as u32])?;
+        let o = poisoned(rt, SUFFIX_LEN * qd * 4)?;
+        let dims = nn::AttnDims {
+            batch: 1,
+            tq: SUFFIX_LEN as u32,
+            heads: Q_HEADS,
+            heads_kv: KV_HEADS,
+            window: 0,
+            scale,
+        };
+        op_lane(
+            rt,
+            t,
+            iters,
+            "attn_prefix_rows",
+            || written_f32("o", &o, SUFFIX_LEN * qd),
+            || {
+                qwen35::attn_prefix_rows(
+                    rt,
+                    &q,
+                    qwen35::SharedPrefix {
+                        k: &pk,
+                        v: &pv,
+                        len: PREFIX_LEN as u32,
+                    },
+                    &sk,
+                    &sv,
+                    &suffix_len,
+                    &q_pos,
+                    &o,
+                    dims,
+                    false,
+                )
+            },
+        )?;
+    }
+
+    // The scaled embedding gather (bf16 table) and the answer scoring head.
+    let table_bf = bounded_bf16(rt, LANE_VOCAB * HIDDEN, 83, 0.05)?;
+    let table_f32 = bounded(rt, LANE_VOCAB * HIDDEN, 84, 0.05)?;
+    {
+        let ids: Vec<u32> = (0..t32).map(|i| (i * 7919) % LANE_VOCAB as u32).collect();
+        let ids = buf_u32(rt, &ids)?;
+        let out = poisoned(rt, t * HIDDEN * 4)?;
+        op_lane(
+            rt,
+            t,
+            iters,
+            "embed_rows_bf16_scaled",
+            || written_f32("out", &out, t * HIDDEN),
+            || {
+                qwen35::embed_rows_scaled(
+                    rt,
+                    &ids,
+                    t32,
+                    qwen35::LmHead {
+                        weight: &table_bf,
+                        dtype: DType::BF16,
+                        vocab: LANE_VOCAB as u32,
+                    },
+                    HIDDEN as u32,
+                    (HIDDEN as f32).sqrt(),
+                    &out,
+                )
+            },
+        )?;
+    }
+    {
+        const N_SLOTS: usize = 4;
+        const N_ANSWERS: usize = 4;
+        let hidden = bounded(rt, t * HIDDEN, 85, 1.0)?;
+        let slots: Vec<u32> = (0..N_SLOTS as u32).map(|s| (s + 1) * (t32 / (N_SLOTS as u32 + 1))).collect();
+        let slots = buf_u32(rt, &slots)?;
+        let answers = buf_u32(rt, &[3, 1000, 2047, 4000])?;
+        let norm_w = bounded(rt, HIDDEN, 86, 0.3)?;
+        for (head, dtype, name) in [
+            (&table_f32, DType::F32, "score_rows_f32"),
+            (&table_bf, DType::BF16, "score_rows_bf16"),
+        ] {
+            let (logits, logprobs) = (
+                poisoned(rt, N_SLOTS * N_ANSWERS * 4)?,
+                poisoned(rt, N_SLOTS * N_ANSWERS * 4)?,
+            );
+            op_lane(
+                rt,
+                t,
+                iters,
+                name,
+                || {
+                    written_f32("logits", &logits, N_SLOTS * N_ANSWERS)?;
+                    written_f32("logprobs", &logprobs, N_SLOTS * N_ANSWERS)
+                },
+                || {
+                    qwen35::score_answer_rows(
+                        rt,
+                        &hidden,
+                        t32,
+                        HIDDEN as u32,
+                        &slots,
+                        N_SLOTS as u32,
+                        &norm_w,
+                        1.0,
+                        NORM_EPS,
+                        qwen35::LmHead {
+                            weight: head,
+                            dtype,
+                            vocab: LANE_VOCAB as u32,
+                        },
+                        &answers,
+                        N_ANSWERS as u32,
+                        &logits,
+                        &logprobs,
+                    )
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn run_model(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts, check_only: bool) -> Res<()> {
     let vocab = model.config().vocab;
     rt.set_async_encode(true)?;
@@ -1064,6 +1437,7 @@ fn run_model(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts, 
             dispatches,
         });
     }
+    op_lanes(rt, ts[0], o.iters)?;
     rt.set_async_encode(false)?;
 
     println!();

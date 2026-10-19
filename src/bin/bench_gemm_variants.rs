@@ -273,6 +273,16 @@ fn run() -> Result<(), String> {
             batch: 1,
             run: Box::new(|| gemm_tn_f32(&a_tn_s, &b_tn_s, &c_s, to)),
         },
+        // `C +=` at a split-K shape is the only caller of the sequential exact-f32
+        // TN split-K (`matmul2d_tensorops_tn_splitk_f32`).
+        Lane {
+            name: "tn_accum_splitk_f32",
+            m: sm,
+            n: sn,
+            k: sk,
+            batch: 1,
+            run: Box::new(|| gemm_tn_accum_train(&a_tn_s, &b_tn_s, &c_s, to)),
+        },
         Lane {
             name: "tn_splitk_bf16",
             m: sm,

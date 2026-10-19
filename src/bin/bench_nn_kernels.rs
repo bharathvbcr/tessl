@@ -43,7 +43,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tessl::tensor::GpuBuffer;
-use tessl::{nn, GpuRuntime};
+use tessl::gemm::cast_f16_to_f32;
+use tessl::{nn, softcap_f32, GpuRuntime};
 
 const BATCH: usize = 64;
 
@@ -397,6 +398,7 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
     decode_lanes(&rt, &mut rows, warmup, iters)?;
     q4_mlx_lanes(&rt, &mut rows, warmup, iters)?;
     encoder_lanes(&rt, &mut rows, warmup, iters)?;
+    util_lanes(&rt, &mut rows, warmup, iters)?;
 
     println!(
         "{:<38} {:>16} {:>12} {:>10} {:>12} {:>10}",
@@ -1337,6 +1339,72 @@ fn encoder_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters
 
 /// Qwen3.5's vocabulary: the row a decode sampler reduces each token.
 const VOCAB: usize = 248_320;
+/// The `utils.metal` elementwise ops a caller runs between the big kernels: the
+/// logit softcap, the device blit in each storage dtype, and the f16 -> f32
+/// widening cast. Each lane asserts its result is the exact value it should be
+/// before it is timed.
+fn util_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters: usize) -> Result<(), String> {
+    use tessl::tensor::{f16_bits_to_f32, f32_slice_to_bf16, f32_to_f16_bits, gpu_copy, Tensor};
+    let n = 1usize << 20;
+    let sh = format!("n={n}");
+    let vals = common::fill(n, 0x91);
+
+    let pre = rt.alloc_tensor_f32(&[n])?;
+    pre.buffer.write_f32(&vals);
+    let post = softcap_f32(rt, &pre, 30.0)?;
+    rt.synchronize()?;
+    let got = post.buffer.read_f32();
+    assert_finite("softcap_f32", &got);
+    assert!(
+        got.iter()
+            .zip(&vals)
+            .all(|(g, v)| (g - 30.0 * (v / 30.0).tanh()).abs() <= 1e-4),
+        "softcap_f32: result is not softcap * tanh(x / softcap)"
+    );
+    lane(rt, rows, "softcap_f32", &sh, (2 * n * 4) as f64, warmup, iters, || {
+        softcap_f32(rt, &pre, 30.0).map(|_| ())
+    })?;
+
+    let bf_bits = f32_slice_to_bf16(&vals);
+    let f16_bits: Vec<u16> = vals.iter().map(|v| f32_to_f16_bits(*v)).collect();
+    let src_bf = rt.alloc_tensor_bf16(&[n])?;
+    src_bf.buffer.write_bf16_bits(&bf_bits);
+    let src_h = rt.alloc_tensor_f16(&[n])?;
+    src_h.buffer.write_f16_bits(&f16_bits);
+    let blit = |name: &str, src: &Tensor, dst: &Tensor, bits: &[u16]| -> Result<(), String> {
+        dst.buffer.write_bytes(&vec![0xFF; n * 2]);
+        gpu_copy(src, dst)?;
+        rt.synchronize()?;
+        assert!(
+            dst.buffer.contents_u16()[..n] == *bits,
+            "{name}: the copy differs from its source"
+        );
+        Ok(())
+    };
+    let dst_bf = rt.alloc_tensor_bf16(&[n])?;
+    blit("copy_bf16", &src_bf, &dst_bf, &bf_bits)?;
+    lane(rt, rows, "copy_bf16", &sh, (2 * n * 2) as f64, warmup, iters, || {
+        gpu_copy(&src_bf, &dst_bf)
+    })?;
+    let dst_h = rt.alloc_tensor_f16(&[n])?;
+    blit("copy_f16", &src_h, &dst_h, &f16_bits)?;
+    lane(rt, rows, "copy_f16", &sh, (2 * n * 2) as f64, warmup, iters, || {
+        gpu_copy(&src_h, &dst_h)
+    })?;
+
+    let wide = cast_f16_to_f32(&src_h)?;
+    rt.synchronize()?;
+    let got = wide.buffer.read_f32();
+    assert!(
+        got.iter().zip(&f16_bits).all(|(g, h)| *g == f16_bits_to_f32(*h)),
+        "cast_f16_to_f32: widening is not exact"
+    );
+    lane(rt, rows, "cast_f16_to_f32", &sh, (n * 6) as f64, warmup, iters, || {
+        cast_f16_to_f32(&src_h).map(|_| ())
+    })?;
+    Ok(())
+}
+
 /// Tokens per timed sample-loop iteration.
 const TOKENS: usize = 32;
 /// Calls per timed iteration of a host-only microbenchmark.

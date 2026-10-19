@@ -76,7 +76,10 @@
 //! an f32 tower under `UpdateRule::F32`, and a bf16 tower under each bf16 rule
 //! with a fresh f32 gradient set and with a bf16 bank. It is what puts every
 //! step kernel in the `kernel_coverage` bin's trace; it times nothing the
-//! `--clip` lane does not.
+//! `--clip` lane does not. It also runs what the optimizer's neighbours dispatch:
+//! the standalone f32 `adamw_step`, a parameter read-and-write-back on each
+//! tower, both moments read and written back under every moment storage, and an
+//! f32 bank whose embedding is a view (its head gradient is delivered by chunk).
 //!
 //! `--async` runs the step under [`GpuRuntime::set_async_encode`] (one command
 //! buffer between the waits the step itself makes); without it every
@@ -118,7 +121,7 @@ use tessl::gdn_train::{
 };
 use tessl::gemm::{cast_bf16_to_f32_into, GemmOperands};
 use tessl::qwen35::{rms_norm, AttnShape, Cols, GdnGateLogits, GdnParams};
-use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
+use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, Moment, MomentStorage, UpdateRule};
 use tessl::qwen35_bwd::{
     attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, conv1d_silu_bwd, conv1d_silu_bwd_part_len, copy_cols,
     embed_rows_bwd, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd, gdn_gates_bwd_part_len,
@@ -217,12 +220,15 @@ fn gate(rt: &Arc<GpuRuntime>, op: &mut Op<'_>) -> Res<()> {
 /// The ops `bench_t` times, in table order: the names `Op { name, .. }` carries
 /// there (`bench_t` refuses to start when the two differ). `--op=` is checked
 /// against this list before the GPU runtime exists.
-const OP_NAMES: [&str; 15] = [
+const OP_NAMES: [&str; 18] = [
     "gdn_train forward",
     "gdn_train backward",
+    "gdn_train forward (sequential)",
+    "gdn_train backward (sequential)",
     "attn_train forward",
     "attn_train backward",
     "cross-entropy + grads",
+    "cross-entropy + grads (bf16 hidden)",
     "rms_norm_bwd",
     "widen bf16 layer input",
     "rms_norm (f32 input)",
@@ -329,6 +335,24 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
     let d_o = tensor(rt, &[1, t, GDN_HEADS, GDN_DV], s(6), 1.0)?;
     let gdn_kernel = gdn_kernel_from_env()?;
     let gws = GdnTrainWorkspace::new_for(rt, gd, gdn_kernel)?;
+    // The token-sequential kernels (`gdn_train_fwd`, `gdn_train_bwd`,
+    // `gdn_train_bwd_finish`), the chunked form's parity oracle: production runs
+    // the chunked ones, so they get their own lanes, whatever BENCH_GDN_KERNEL
+    // picks for the two ops above.
+    let (o_seq, ckpt_seq) = (
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DV])?,
+        rt.alloc_tensor_f32(&gd.checkpoint_shape())?,
+    );
+    let gws_seq = GdnTrainWorkspace::new_for(rt, gd, GdnTrainKernel::Sequential)?;
+    let (dq_seq, dk_seq, dv_seq) = (
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DV])?,
+    );
+    let (dg_seq, dbeta_seq) = (
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS])?,
+        rt.alloc_tensor_f32(&[1, t, GDN_HEADS])?,
+    );
     let (dq, dk, dv) = (
         rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
         rt.alloc_tensor_f32(&[1, t, GDN_HEADS, GDN_DK])?,
@@ -509,6 +533,50 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
             reps: REPS,
         },
         Op {
+            name: "gdn_train forward (sequential)",
+            run: Box::new(|| {
+                gdn_train_forward_with(
+                    GdnTrainKernel::Sequential,
+                    rt,
+                    gd,
+                    inputs(),
+                    &o_seq,
+                    None,
+                    &ckpt_seq,
+                )
+            }),
+            outputs: vec![("o", &o_seq.buffer, t * vd)],
+            reps: REPS,
+        },
+        Op {
+            name: "gdn_train backward (sequential)",
+            run: Box::new(|| {
+                gdn_train_backward(
+                    rt,
+                    gd,
+                    inputs(),
+                    &ckpt_seq,
+                    &d_o,
+                    None,
+                    &gws_seq,
+                    GdnTrainGrads {
+                        dq: &dq_seq,
+                        dk: &dk_seq,
+                        dv: &dv_seq,
+                        dg: &dg_seq,
+                        dbeta: &dbeta_seq,
+                        ds0: None,
+                    },
+                )
+            }),
+            outputs: vec![
+                ("dq", &dq_seq.buffer, t * GDN_HEADS * GDN_DK),
+                ("dv", &dv_seq.buffer, t * vd),
+                ("dg", &dg_seq.buffer, t * GDN_HEADS),
+            ],
+            reps: REPS,
+        },
+        Op {
             name: "attn_train forward",
             run: Box::new(|| attn_train_forward(rt, &ad, &aq, &ak, &av, &ao, &lse, &aws)),
             outputs: vec![("o", &ao, t * qd), ("lse", &lse, ad.lse_len())],
@@ -543,6 +611,34 @@ fn bench_t(rt: &Arc<GpuRuntime>, t: usize, check_only: bool, operands: GemmOpera
                 cross_entropy_rows(
                     rt,
                     CeHidden { rows: &h, off: 0 },
+                    &emb,
+                    &rows,
+                    &targets,
+                    Reduction::Mean,
+                    operands,
+                    &ce_ws,
+                    Some(CeGrads {
+                        dh: &dh,
+                        dw: &dw,
+                        scale: 1.0,
+                    }),
+                )
+                .map(|_| ())
+            }),
+            outputs: vec![
+                ("dh", &dh.buffer, (t - 1) * HIDDEN),
+                ("dw (first 1024 rows)", &dw.buffer, 1024 * HIDDEN),
+            ],
+            reps: 1,
+        },
+        // A bf16 model's final hidden states are bf16: the gather widens them
+        // (`ce_gather_rows_bf16`) where the f32 op above reads f32 rows.
+        Op {
+            name: "cross-entropy + grads (bf16 hidden)",
+            run: Box::new(|| {
+                cross_entropy_rows(
+                    rt,
+                    CeHidden { rows: &x16, off: 0 },
                     &emb,
                     &rows,
                     &targets,
@@ -939,14 +1035,104 @@ fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res
 
 /// The gradient sets one AdamW step of `model` can take: a fresh f32 set from
 /// `train_step`, and on a bf16 tower also the bf16 bank `train_step_into` fills.
-fn adamw_gradients(model: &Qwen35Model, ids: &[u32], operands: GemmOperands) -> Res<Vec<(&'static str, Qwen35Grads)>> {
+fn adamw_gradients(
+    rt: &Arc<GpuRuntime>,
+    model: &Qwen35Model,
+    ids: &[u32],
+    operands: GemmOperands,
+) -> Res<Vec<(&'static str, Qwen35Grads)>> {
     let mut sets = vec![("gf32", model.train_step(ids, operands)?.grads)];
     if model.precision() == Precision::Bf16 {
         let bank = Qwen35Grads::zeros_like(model)?;
         model.train_step_into(ids, operands, Supervise::Causal, &bank, false)?;
         sets.push(("gbf16", bank));
+    } else {
+        // An f32 bank whose embedding is a view into a larger buffer is not
+        // "in place" for the step, so its head gradient is delivered by chunk
+        // (`qwen35_head_rows_to_bank_f32`, `qwen35_token_rows_to_bank_f32`).
+        let cfg = model.config();
+        let (vocab, hidden) = (cfg.vocab as usize, cfg.hidden as usize);
+        let mut bank = Qwen35Grads::zeros_like(model)?;
+        let wide = rt.alloc_tensor_f32(&[vocab + 1, hidden])?;
+        bank.embed = wide.try_view(&[vocab, hidden], 0)?;
+        model.train_step_into(ids, operands, Supervise::Causal, &bank, false)?;
+        sets.push(("gf32view", bank));
     }
     Ok(sets)
+}
+
+/// One dense f32 tensor per parameter-table entry, in the layout
+/// `read_parameters` fills and `write_parameters` takes.
+fn dense_parameter_tensors(rt: &Arc<GpuRuntime>, model: &Qwen35Model) -> Res<Vec<Tensor>> {
+    model
+        .parameter_table()?
+        .iter()
+        .map(|p| rt.alloc_tensor_f32(&p.storage_shape()))
+        .collect()
+}
+
+/// `what`'s tensors read back finite, with something non-zero among them.
+fn require_finite_nonzero(what: &str, ts: &[Tensor]) -> Res<()> {
+    let mut any = false;
+    for (i, t) in ts.iter().enumerate() {
+        for x in t.buffer.read_f32() {
+            if !x.is_finite() {
+                return Err(format!("--adamw-matrix: {what}: tensor {i} holds {x}"));
+            }
+            any |= x != 0.0;
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err(format!("--adamw-matrix: {what} read back all zeros"))
+    }
+}
+
+/// Read every parameter out and write it back: the copies a checkpoint save and
+/// restore make (`qwen35_window_copy_*`, f32 to f32 on an f32 tower, f32 to bf16
+/// on a bf16 one).
+fn parameter_roundtrip(rt: &Arc<GpuRuntime>, model: &Qwen35Model, label: &str) -> Res<()> {
+    let dense = dense_parameter_tensors(rt, model)?;
+    model.read_parameters(&dense)?;
+    require_finite_nonzero(&format!("{label} parameters"), &dense)?;
+    model.write_parameters(&dense)
+}
+
+/// Read both of `state`'s moments out and write them back: the 8-bit moments'
+/// decode and encode kernels (`qwen35_moment_q8_*`), and a bf16 moment's copy.
+fn moment_roundtrip(rt: &Arc<GpuRuntime>, model: &Qwen35Model, state: &mut AdamW, label: &str) -> Res<()> {
+    let dense = dense_parameter_tensors(rt, model)?;
+    for which in [Moment::First, Moment::Second] {
+        model.read_adamw_moment(state, which, &dense)?;
+        require_finite_nonzero(&format!("{label} {which:?} moment"), &dense)?;
+        model.write_adamw_moment(state, which, &dense)?;
+    }
+    Ok(())
+}
+
+/// The standalone device-tensor step (`tessl::qwen35_adamw::adamw_step`) on one
+/// f32 parameter: it must move the parameter and leave it finite.
+fn standalone_adamw_step(rt: &Arc<GpuRuntime>) -> Res<()> {
+    const N: usize = 4096;
+    let mut param = tensor(rt, &[N], 91, 1.0)?;
+    let before = param.buffer.read_f32();
+    let grad = tensor(rt, &[N], 92, 1.0)?;
+    let (mut m, mut v) = (rt.alloc_tensor_f32(&[N])?, rt.alloc_tensor_f32(&[N])?);
+    let hyper = AdamWHyper {
+        lr: 1e-3,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        grad_scale: 1.0,
+    };
+    tessl::qwen35_adamw::adamw_step(rt, &mut param, &grad, &mut m, &mut v, &hyper, 1, 0.01)?;
+    rt.synchronize()?;
+    let after = param.buffer.read_f32();
+    if !after.iter().all(|x| x.is_finite()) || after == before {
+        return Err("--adamw-matrix: adamw_step left the parameter unchanged or non-finite".into());
+    }
+    Ok(())
 }
 
 /// One AdamW step under every [`AdamWConfig`] a tower of each precision
@@ -954,6 +1140,7 @@ fn adamw_gradients(model: &Qwen35Model, ids: &[u32], operands: GemmOperands) -> 
 /// must leave a finite, non-zero gradient norm behind it and advance its
 /// state's step count.
 fn bench_adamw_matrix(rt: &Arc<GpuRuntime>, config_path: &str) -> Res<()> {
+    standalone_adamw_step(rt)?;
     let moments = [
         (MomentStorage::F32, "f32"),
         (MomentStorage::Bf16, "bf16"),
@@ -976,7 +1163,8 @@ fn bench_adamw_matrix(rt: &Arc<GpuRuntime>, config_path: &str) -> Res<()> {
         let ids: Vec<u32> = (0..16u32).map(|i| (i * 7 + 3) % cfg.vocab).collect();
         let model = Qwen35Model::random_tower(rt, cfg, precision, 1)?;
         let wd = model.default_weight_decay(0.01)?;
-        for (gname, grads) in adamw_gradients(&model, &ids, operands)? {
+        parameter_roundtrip(rt, &model, &format!("{precision:?}"))?;
+        for (gname, grads) in adamw_gradients(rt, &model, &ids, operands)? {
             let sq = model.grad_sq_norm(&grads)?;
             if !(sq.is_finite() && sq > 0.0) {
                 return Err(format!("--adamw-matrix: {precision:?} {gname} gradient norm^2 is {sq}"));
@@ -1003,6 +1191,9 @@ fn bench_adamw_matrix(rt: &Arc<GpuRuntime>, config_path: &str) -> Res<()> {
                         "adamw {precision:?} {rule} {gname} m{mom}: {:.2} ms",
                         t0.elapsed().as_secs_f64() * 1e3
                     );
+                    if gname == "gf32" {
+                        moment_roundtrip(rt, &model, &mut state, &format!("{precision:?} {rule} m{mom}"))?;
+                    }
                 }
             }
         }

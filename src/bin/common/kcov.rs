@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use crate::proc::{first_chars, run_bounded};
+use crate::proc::{first_chars, last_chars, run_bounded};
 use crate::pyjson::{obj, quote, quote_list, Doc};
 
 /// Exit status of a run that found gaps.
@@ -875,7 +875,7 @@ pub fn run_suites(suites: &[Suite], bin: &Path, tmp: &Path, crate_dir: &Path, su
                 "{} {shown}: exited {}\n{}",
                 s.name,
                 ran.code.map_or("by signal".to_string(), |c| c.to_string()),
-                first_chars(&ran.stderr, 400)
+                last_chars(&ran.stderr, 600)
             ));
             continue;
         }

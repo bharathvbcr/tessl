@@ -897,20 +897,26 @@ fn decode_chunk_constant_matches_the_shader() {
 #[test]
 fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
     let host = include_str!("../src/nn.rs");
-    let h128 = include_str!("../kernels/flash_attn_swa_h128.metal");
-    let h256 = include_str!("../kernels/flash_attn_swa_h256.metal");
-    let h512 = include_str!("../kernels/flash_attn_global_h512.metal");
+    // The three tiled kernels keep their ABI slots in the entry file and share
+    // one body, `attn_fa2.h`, which holds the clamp and the widened addresses.
+    let fa2 = include_str!("../kernels/attn_fa2.h");
+    let h128_entry = include_str!("../kernels/flash_attn_swa_h128.metal");
+    let h256_entry = include_str!("../kernels/flash_attn_swa_h256.metal");
+    let h512_entry = include_str!("../kernels/flash_attn_global_h512.metal");
+    let h128 = format!("{h128_entry}\n{fa2}");
+    let h256 = format!("{h256_entry}\n{fa2}");
+    let h512 = format!("{h512_entry}\n{fa2}");
     let rows = include_str!("../kernels/flash_attn_rows.metal");
     let decode = include_str!("../kernels/flash_attn_decode.metal");
 
-    for (name, source, slot) in [
-        ("swa_h128", h128, 13),
-        ("swa_h256", h256, 14),
-        ("global_h512", h512, 13),
-        ("rows", rows, 14),
+    for (name, source, slot_source, slot) in [
+        ("swa_h128", h128.as_str(), h128_entry, 13),
+        ("swa_h256", h256.as_str(), h256_entry, 14),
+        ("global_h512", h512.as_str(), h512_entry, 13),
+        ("rows", rows, rows, 14),
     ] {
         assert!(
-            source.contains(&format!("constant uint &kv_capacity [[buffer({slot})]]")),
+            slot_source.contains(&format!("constant uint &kv_capacity [[buffer({slot})]]")),
             "{name}: capacity ABI slot is missing"
         );
         assert!(
@@ -957,9 +963,9 @@ fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
     );
 
     for (name, source) in [
-        ("swa_h128", h128),
-        ("swa_h256", h256),
-        ("global_h512", h512),
+        ("swa_h128", h128.as_str()),
+        ("swa_h256", h256.as_str()),
+        ("global_h512", h512.as_str()),
         ("rows", rows),
         ("decode", decode),
     ] {

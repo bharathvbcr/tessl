@@ -443,16 +443,8 @@ impl<'a> Binder<'a> {
         if self.error.is_some() {
             return;
         }
-        let lanes = threads_per_tg
-            .width
-            .checked_mul(threads_per_tg.height)
-            .and_then(|n| n.checked_mul(threads_per_tg.depth));
-        let valid = lanes.zip(self.max_threads).is_some_and(|(n, max)| n > 0 && n <= max)
-            && [threadgroups.width, threadgroups.height, threadgroups.depth]
-                .iter()
-                .all(|&n| n > 0 && n <= u32::MAX as usize);
-        if !valid {
-            self.fail("invalid dispatch geometry or missing pipeline");
+        if let Err(message) = validate_dispatch_geometry(threadgroups, threads_per_tg, self.max_threads) {
+            self.fail(message);
             return;
         }
 
@@ -835,6 +827,54 @@ mod tests {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    /// `Binder::dispatch` and `validate_dispatch_geometry` must accept and
+    /// reject the same geometries with the same message.
+    #[test]
+    fn binder_dispatch_and_validator_agree_on_geometry() {
+        let big = u32::MAX as usize + 1;
+        let one = mtl_size(1, 1, 1);
+        let cases = [
+            (one, one),
+            (mtl_size(0, 1, 1), one),
+            (mtl_size(1, 0, 1), one),
+            (mtl_size(1, 1, 0), one),
+            (mtl_size(big, 1, 1), one),
+            (mtl_size(1, big, 1), one),
+            (mtl_size(1, 1, big), one),
+            (one, mtl_size(0, 1, 1)),
+            (one, mtl_size(1, 0, 1)),
+            (one, mtl_size(1, 1, 0)),
+            (one, mtl_size(usize::MAX, 2, 1)),
+            (one, mtl_size(1 << 20, 1 << 20, 1)),
+        ];
+        for (i, (groups, threads)) in cases.into_iter().enumerate() {
+            let rt = GpuRuntime::new().expect("runtime");
+            let pipe = rt.pipeline("copy_f32").unwrap();
+            let max = pipe.maxTotalThreadsPerThreadgroup();
+            let want = validate_dispatch_geometry(groups, threads, Some(max));
+            let got = rt.with_binder(|bnd| {
+                bnd.set_pipeline(&pipe);
+                bnd.dispatch(groups, threads);
+                Ok(())
+            });
+            assert_eq!(got.is_err(), want.is_err(), "case {i}: accept/reject differ");
+            if let (Err(g), Err(w)) = (&got, &want) {
+                assert!(g.contains(w.as_str()), "case {i}: {g:?} vs {w:?}");
+            }
+        }
+        // No pipeline bound: both refuse with the same text.
+        let rt = GpuRuntime::new().expect("runtime");
+        let want = validate_dispatch_geometry(one, one, None).unwrap_err();
+        let got = rt
+            .with_binder(|bnd| {
+                bnd.dispatch(one, one);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(got.contains(want.as_str()), "{got:?} vs {want:?}");
+    }
+
     #[test]
     fn binder_rejects_foreign_runtime_storage() {
         let rt = GpuRuntime::new().unwrap();

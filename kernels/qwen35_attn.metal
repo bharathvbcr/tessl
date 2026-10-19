@@ -50,7 +50,9 @@ inline void qwen35_norm_rope_row(
     for (uint d = lane; d < D; d += 32u) {
         ss += src[d] * src[d];
     }
-    const float inv = rsqrt(simd_sum(ss) / (float)D + eps);
+    // `precise::`, as the backward's rebuild of this `rstd`
+    // (`qwen35_attn_qk_norm_rope_bwd_f32`) is: training needs the same bits.
+    const float inv = precise::rsqrt(simd_sum(ss) / (float)D + eps);
 
     const uint half_rot = rotary_dim / 2u;
     for (uint p = lane; p < half_rot; p += 32u) {
@@ -135,7 +137,7 @@ inline void qk_norm_rope_unit(
             for (uint d = lane; d < D; d += 32u) {
                 ss += src[d] * src[d];
             }
-            inv = rsqrt(simd_sum(ss) / (float)D + eps);
+            inv = precise::rsqrt(simd_sum(ss) / (float)D + eps);
         }
         for (uint d = lane; d < D; d += 32u) {
             v_cache[slot + d] = (OT)(src[d] * inv);   // `* 1` is exact when not normed

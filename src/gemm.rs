@@ -229,15 +229,7 @@ pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     {
         return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
     }
-    let rt = src.runtime();
-    let p = rt.pipeline("cast_f32_to_bf16")?;
-    let n = src.numel();
-    crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-        crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
-        crate::dispatch::set_u32(bnd, n as u32, 2);
-    })?;
-    Ok(())
+    cast_between(src, dst, "cast_f32_to_bf16")
 }
 
 /// Hot-resident bf16 clone of an f32 master (weights / EMA banks).
@@ -296,15 +288,7 @@ pub fn cast_bf16_to_f32_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     {
         return Err("cast destination must match shape/runtime, be f32, and not overlap source".into());
     }
-    let rt = src.runtime();
-    let p = rt.pipeline("cast_bf16_to_f32")?;
-    let n = src.numel();
-    crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-        crate::dispatch::set_tensor(bnd, src, 0);
-        crate::dispatch::set_tensor(bnd, dst, 1);
-        crate::dispatch::set_u32(bnd, n as u32, 2);
-    })?;
-    Ok(())
+    cast_between(src, dst, "cast_bf16_to_f32")
 }
 
 /// `f32 -> f16`, allocating the destination.
@@ -898,11 +882,16 @@ impl Epilogue<'_> {
 /// The fused form of a GEMM followed by a scale, an accumulate, a bias add and
 /// an activation. See [`Epilogue`] for why that matters.
 ///
-/// Requires the cooperative-destination path — bf16 operands, or f32 with
-/// [`GpuRuntime::set_relaxed_precision`] on — because that is the path that holds the
-/// accumulator in registers. An f32 exact GEMM has nowhere to fuse into and is
-/// refused rather than silently falling back to separate dispatches, which
-/// would make the call quietly slower than the unfused code it replaced.
+/// Runs on the TensorOps backend, on a cooperative destination that holds the
+/// accumulator in registers: bf16 or f16 operands, f32 with
+/// [`GpuRuntime::set_relaxed_precision`] on (tf32-class products), or f32 with
+/// it off, which takes the exact-f32 epilogue kernels
+/// (`matmul2d_tensorops_f32_exact_epi*`). Those keep exact f32 products and
+/// round every epilogue step on its own (no fma contraction across scale,
+/// accumulate and bias), so the result is bit-identical to [`gemm`] followed
+/// by separate scale, accumulate, bias and activation passes, for the shapes
+/// [`gemm`] runs as one dispatch (its K-split routes sum in another order).
+/// The simdgroup backend has no register accumulator and is refused.
 ///
 /// An identity epilogue dispatches to the plain [`gemm`].
 ///
@@ -985,12 +974,14 @@ fn run_gemm_epilogue(
         return Err("GEMM requires matching operand dtypes".into());
     }
     let rt = a.runtime();
-    if !(use_bf16 || use_f16 || use_relaxed_f32(rt, backend)) || backend != GemmBackend::TensorOps {
+    // Exact f32 has its own epilogue kernels (exact products, same register
+    // accumulator); only the simdgroup backend, which has none, is refused.
+    let exact_f32 = !(use_bf16 || use_f16 || use_relaxed_f32(rt, backend));
+    if backend != GemmBackend::TensorOps {
         return Err(
-            "GEMM epilogue needs the cooperative-destination path: bf16 or f16 operands, or f32 \
-             with GpuRuntime::set_relaxed_precision(true), on the TensorOps backend. The exact-f32 \
-             and simdgroup kernels write C straight from the matmul with no register accumulator \
-             to fuse into, so there is nothing here to make faster"
+            "GEMM epilogue needs the cooperative-destination path on the TensorOps backend: the \
+             simdgroup kernels write C straight from the matmul with no register accumulator to \
+             fuse into"
                 .into(),
         );
     }
@@ -1025,7 +1016,11 @@ fn run_gemm_epilogue(
         CoopElem::RelaxedF32
     };
     let chosen = tile.unwrap_or_else(|| epi_tile_auto(m, n, elem));
-    let (kernel, tile) = epi_kernel(elem, chosen)?;
+    let (kernel, tile) = if exact_f32 {
+        epi_exact_f32_kernel(chosen)
+    } else {
+        epi_kernel(elem, chosen)?
+    };
     let pipeline = rt.pipeline(kernel)?;
     dispatch_tensorops_epi(rt, &pipeline, a, b, c, m, n, k, tile, epi)
 }
@@ -1118,6 +1113,16 @@ fn epi_kernel(elem: CoopElem, tile: EpiTile) -> Result<(&'static str, TileGeom),
         (CoopElem::RelaxedF32, EpiTile::Narrow) => ("matmul2d_tensorops_f32_relaxed_epi_64x64_sg4", TILE_COOP_NARROW),
         (CoopElem::RelaxedF32, EpiTile::Wide) => ("matmul2d_tensorops_f32_relaxed_epi", TILE_COOP_DEFAULT),
     })
+}
+
+/// The exact-f32 epilogue's kernel: exact products (the plain f32 kernels'
+/// descriptor, not the relaxed one) with the cooperative epilogue. The tile
+/// is [`epi_tile_auto`]'s rule for f32, N <= 512 narrow.
+fn epi_exact_f32_kernel(tile: EpiTile) -> (&'static str, TileGeom) {
+    match tile {
+        EpiTile::Narrow => ("matmul2d_tensorops_f32_exact_epi_64x64_sg4", TILE_COOP_NARROW),
+        EpiTile::Wide => ("matmul2d_tensorops_f32_exact_epi", TILE_COOP_DEFAULT),
+    }
 }
 
 /// Fewer 128×64 tiles than this leave the M5 Pro's GPU underfilled, and the
@@ -4073,6 +4078,8 @@ mod alignment_probe {
         CoopTnAccumBf16,
         CoopNtAccumBf16,
         Epilogue(CoopElem),
+        /// The exact-f32 epilogue ([`epi_exact_f32_kernel`]), 128x64.
+        EpilogueExactF32,
         Batched(CoopElem),
     }
 
@@ -4096,6 +4103,7 @@ mod alignment_probe {
         Probe::Epilogue(CoopElem::RelaxedF32),
         Probe::Epilogue(CoopElem::Bf16),
         Probe::Epilogue(CoopElem::F16),
+        Probe::EpilogueExactF32,
         Probe::Batched(CoopElem::RelaxedF32),
         Probe::Batched(CoopElem::Bf16),
         Probe::Batched(CoopElem::F16),
@@ -4130,6 +4138,7 @@ mod alignment_probe {
                     | Self::CoopTnAccumBf16
                     | Self::CoopNtAccumBf16
                     | Self::Epilogue(_)
+                    | Self::EpilogueExactF32
             )
         }
 
@@ -4149,6 +4158,7 @@ mod alignment_probe {
                 Self::Epilogue(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_epi",
                 Self::Epilogue(CoopElem::F16) => "matmul2d_tensorops_f16_f32_epi",
                 Self::Epilogue(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_epi",
+                Self::EpilogueExactF32 => epi_exact_f32_kernel(EpiTile::Wide).0,
                 Self::Batched(CoopElem::Bf16) => "matmul2d_tensorops_bf16_f32_batched",
                 Self::Batched(CoopElem::F16) => "matmul2d_tensorops_f16_f32_batched",
                 Self::Batched(CoopElem::RelaxedF32) => "matmul2d_tensorops_f32_relaxed_batched",
@@ -4283,7 +4293,7 @@ mod alignment_probe {
             Probe::CoopTnAccumBf16 | Probe::CoopNtAccumBf16 => {
                 dispatch_tensorops_accum(rt, &p, &a, &b, &c, m, n, k, TILE_COOP_ACCUM)?
             }
-            Probe::Epilogue(_) => {
+            Probe::Epilogue(_) | Probe::EpilogueExactF32 => {
                 let epi = Epilogue {
                     alpha: 0.5,
                     beta: 0.25,
@@ -4343,7 +4353,9 @@ mod alignment_probe {
         let c0 = seq(m * n, 3);
         let bias = seq(n, 4);
         match probe {
-            Probe::Epilogue(_) => (0..m * n).map(|e| 0.5 * prod[e] + 0.25 * c0[e] + bias[e % n]).collect(),
+            Probe::Epilogue(_) | Probe::EpilogueExactF32 => {
+                (0..m * n).map(|e| 0.5 * prod[e] + 0.25 * c0[e] + bias[e % n]).collect()
+            }
             p if p.accumulates() => prod.iter().zip(&c0).map(|(x, y)| x + y).collect(),
             _ => prod,
         }

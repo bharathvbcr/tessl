@@ -11,6 +11,9 @@ const EMBED: &str = include_str!("../kernels/embed_lookup.metal");
 const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
 const GEMM_Q4_MLX: &str = include_str!("../kernels/gemm_q4_mlx.metal");
+/// The simdgroup GEMV / GEMM bodies the `*_simd*` entries of the two files above delegate to.
+const GEMV_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemv_q4_mlx_simd.h");
+const GEMM_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemm_q4_mlx_simd.h");
 const GEMV_Q8: &str = include_str!("../kernels/gemv_q8.metal");
 const REDUCE: &str = include_str!("../kernels/reduce.metal");
 const RMS_NORM: &str = include_str!("../kernels/rms_norm.metal");
@@ -37,6 +40,7 @@ const QWEN35_BWD: &str = include_str!("../kernels/qwen35_bwd.metal");
 const QWEN35_ATTN_BWD: &str = include_str!("../kernels/qwen35_attn_bwd.metal");
 const QWEN35_ADAMW: &str = include_str!("../kernels/qwen35_adamw.metal");
 const ENCODER_ATTN: &str = include_str!("../kernels/encoder_attn.metal");
+const ATTN_FA2_H: &str = include_str!("../kernels/attn_fa2.h");
 const ATTN_ROWS_H: &str = include_str!("../kernels/attn_rows.h");
 /// The matrix-unit encoder entry points `encoder_attn.metal` and the tune rig instantiate.
 const ENCODER_ATTN_TILED_H: &str = include_str!("../kernels/encoder_attn_tiled.h");
@@ -158,7 +162,17 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
         "const ulong gi = (ulong)row * groups_per_row + g;",
         "Q8 GEMV scale table",
     );
-    require(GEMM_Q4_MLX, "sb[(ulong)row * gpr + g]", "MLX Q4 GEMM scale table");
+    // The simd entries delegate to the shared bodies; each entry file must
+    // still include its body, or the body's checks would say nothing of it.
+    require(GEMV_Q4_MLX, "#include \"gemv_q4_mlx_simd.h\"", "MLX Q4 GEMV");
+    require(GEMM_Q4_MLX, "#include \"gemm_q4_mlx_simd.h\"", "MLX Q4 GEMM");
+    require(GEMM_Q4_MLX, "q4_simd_gemm<", "MLX Q4 GEMM");
+    require(GEMV_Q4_MLX, "q4_simd_gemv<", "MLX Q4 GEMV");
+    require(
+        GEMM_Q4_MLX_SIMD_H,
+        "sb[(ulong)row * gpr + g]",
+        "MLX Q4 GEMM scale table",
+    );
     forbid(GEMV_Q4, "const uint row_base = row * cols;", "Q4 GEMV");
     forbid(
         GEMV_Q4_MLX,
@@ -171,6 +185,7 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
         "Q8 GEMV scale table",
     );
     forbid(GEMM_Q4_MLX, "sb[row * gpr + g]", "MLX Q4 GEMM scale table");
+    forbid(GEMM_Q4_MLX_SIMD_H, "sb[row * gpr + g]", "MLX Q4 GEMM scale table");
 }
 
 #[test]
@@ -225,13 +240,13 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
             "for (ulong i = lid; i < (ulong)n; i += tptg)",
         ),
         (
-            "MLX Q4 GEMV",
-            GEMV_Q4_MLX,
+            "MLX Q4 GEMV (gemv_q4_mlx_simd.h)",
+            GEMV_Q4_MLX_SIMD_H,
             "for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK)",
         ),
         (
-            "MLX Q4 GEMM",
-            GEMM_Q4_MLX,
+            "MLX Q4 GEMM (gemm_q4_mlx_simd.h)",
+            GEMM_Q4_MLX_SIMD_H,
             "for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK)",
         ),
     ] {
@@ -261,8 +276,18 @@ fn strided_shader_scans_cannot_roll_over_to_zero() {
             "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
         ),
         (
+            "MLX Q4 GEMV (gemv_q4_mlx_simd.h)",
+            GEMV_Q4_MLX_SIMD_H,
+            "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
+        ),
+        (
             "MLX Q4 GEMM",
             GEMM_Q4_MLX,
+            "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
+        ),
+        (
+            "MLX Q4 GEMM (gemm_q4_mlx_simd.h)",
+            GEMM_Q4_MLX_SIMD_H,
             "for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK)",
         ),
     ] {
@@ -352,12 +377,20 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
     assert_eq!(batch.wrapping_mul(per_batch), 0);
     assert_eq!(u64::from(batch) * u64::from(per_batch), 1u64 << 32);
 
+    // The three tiled kernels share one body (`attn_fa2.h`); each entry file
+    // must still delegate to it, or the body's checks would say nothing of it.
     for (label, source) in [
-        ("decode attention", ATTN_DECODE),
-        ("rows attention", ATTN_ROWS),
         ("sliding-window h128", ATTN_SWA_128),
         ("sliding-window h256", ATTN_SWA_256),
         ("global h512", ATTN_GLOBAL),
+    ] {
+        require(source, "#include \"attn_fa2.h\"", label);
+        require(source, "flash_attn_fa2_tiled<HEAD_DIM, BR, BC,", label);
+    }
+    for (label, source) in [
+        ("decode attention", ATTN_DECODE),
+        ("rows attention", ATTN_ROWS),
+        ("tiled FA-2 body (attn_fa2.h)", ATTN_FA2_H),
     ] {
         require(source, "(ulong)b * kv_capacity * kv_pos_stride", label);
         forbid(source, "b * kv_capacity * kv_pos_stride + hkv", label);
@@ -366,9 +399,7 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
     // `Tq`-strided query base to widen; the other four do.
     for (label, source) in [
         ("rows attention", ATTN_ROWS),
-        ("sliding-window h128", ATTN_SWA_128),
-        ("sliding-window h256", ATTN_SWA_256),
-        ("global h512", ATTN_GLOBAL),
+        ("tiled FA-2 body (attn_fa2.h)", ATTN_FA2_H),
     ] {
         require(source, "(ulong)b * Tq * q_pos_stride", label);
         forbid(source, "b * Tq * q_pos_stride + h *", label);
@@ -644,7 +675,10 @@ fn qwen35_adamw_offsets_are_widened() {
             "const uint n = min(QWEN35_SQ_PIECE, s.width - c0);",
             "squared-norm piece length",
         ),
-        ("const float x = float(g[base + c]);", "squared-norm element"),
+        (
+            "const float x = c < n ? float(g[base + c]) : 0.0f;",
+            "squared-norm element",
+        ),
     ] {
         require(QWEN35_ADAMW, needle, what);
     }

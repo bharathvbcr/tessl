@@ -957,6 +957,24 @@ fn the_command_line_refuses_a_partial_sweep_and_lists_every_failed_suite() {
 }
 
 #[test]
+fn a_failed_suite_quotes_the_tail_of_its_stderr_where_the_cause_is() {
+    let d = tmp("stderr-tail");
+    let bin = d.path().join("release");
+    // 700 characters of progress noise, then the reason: the head alone would hide it.
+    fake_bin(
+        &bin,
+        "bench_nn_kernels",
+        "printf 'BEGIN%0700d\\n' 0 >&2\necho 'error: the real cause' >&2\nexit 3",
+    );
+    let t = run_one(&bin, one_suite("bench_nn_kernels", &[], &[]));
+    assert_eq!(t.failures.len(), 1, "{:?}", t.failures);
+    let f = &t.failures[0];
+    assert!(f.contains("exited 3"), "{f}");
+    assert!(f.ends_with("error: the real cause"), "{f}");
+    assert!(!f.contains("BEGIN"), "only the last 600 characters are quoted: {f}");
+}
+
+#[test]
 fn the_command_line_refuses_a_stale_bench_binary() {
     let d = fake_release("cli-stale", "rms_norm_bf16");
     touch(&d.path().join("release/bench_flash_attn"), 1000);

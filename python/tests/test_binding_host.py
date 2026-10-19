@@ -78,6 +78,14 @@ class FakeLib:
         self.written = [src[k] for k in range(count)]
         return 0
 
+    def tessl_qwen35_train_step_ragged(self, h, ids, n, cu, n_cu, operands, acc, loss, per_seq, n_seq, err, n_err):
+        self.ragged = ([ids[k] for k in range(n)], [cu[k] for k in range(n_cu)], operands, acc, n_seq)
+        self.calls.append(("tessl_qwen35_train_step_ragged", h.value))
+        loss._obj.value = 1.5
+        for k in range(n_seq):
+            per_seq[k] = 0.25 * (k + 1)
+        return 0
+
     def tessl_runtime_poisoned(self, h, out, err, n):
         self._rec("tessl_runtime_poisoned", h.value)
         out._obj.value = self.poisoned
@@ -225,6 +233,35 @@ class OneParameter(HostCase):
         with self.assertRaisesRegex(TesslError, "parameter refused"):
             self.model_.read_parameter("norm.weight")
         self.assertFalse(self.model_.closed)
+
+
+class RaggedStep(HostCase):
+    """train_step_ragged hands the library u32 ids and prefix offsets (the
+    int32 tensor DataCollatorWithFlattening's cu_seq_lens_q is) and one
+    per-sequence slot for each sequence."""
+
+    def test_a_flattened_batch_reaches_the_library_as_u32_with_its_losses_back(self):
+        loss, per = self.model().train_step_ragged(
+            torch.tensor([[7, 8, 9, 1, 2]]), torch.tensor([0, 3, 5], dtype=torch.int32), operands="bf16", accumulate=True
+        )
+        self.assertEqual((loss, per), (1.5, [0.25, 0.5]))
+        self.assertEqual(self.lib.ragged, ([7, 8, 9, 1, 2], [0, 3, 5], 1, 1, 2))
+
+    def test_a_malformed_argument_is_refused_before_the_library(self):
+        m = self.model()
+        ids = torch.tensor([1, 2, 3, 4])
+        for kw, needle in (
+            (dict(cu_seqlens=torch.tensor([[0, 4]])), "cu_seqlens must be 1-D"),
+            (dict(cu_seqlens=torch.tensor([0.0, 4.0])), "cu_seqlens must be an integer tensor"),
+            (dict(cu_seqlens=torch.tensor([-1, 4])), "cu_seqlens must lie in"),
+            (dict(cu_seqlens=[0, 4], accumulate=2), "accumulate"),
+            (dict(cu_seqlens=[0, 4], operands="fp8"), "operands"),
+        ):
+            with self.assertRaisesRegex(TesslError, needle):
+                m.train_step_ragged(ids, **kw)
+        with self.assertRaisesRegex(TesslError, "ids must be 1-D"):
+            m.train_step_ragged(torch.zeros(2, 2, dtype=torch.long), [0, 4])
+        self.assertEqual(self.calls("tessl_qwen35_train_step_ragged"), [])
 
 
 class Panic(HostCase):

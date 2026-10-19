@@ -15,9 +15,9 @@ flowchart TD
     Validate -- Pass --> ModeCheck{"Call Variant?"}
 
     ModeCheck -- "gemm_batched()" --> Batched["gemm_batched()<br/>• Explicit BatchStrides<br/>• Stride-B=0 broadcasts weight<br/>• 16-byte alignment at every batch start"]
-    ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• BF16, F16 or Relaxed F32<br/>• TensorOps backend"}
+    ModeCheck -- "gemm_epilogue() / gemm_epilogue_tiled()" --> EpiCheck{"Epilogue Requirements<br/>• TensorOps backend<br/>• BF16, F16, Relaxed F32 or exact F32"}
     EpiCheck -- No --> EpiErr["Return Err(Epilogue needs coop path)"]
-    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]
+    EpiCheck -- Yes --> EpiDispatch["matmul2d_tensorops_*_epi<br/>• exact F32: *_f32_exact_epi, every step rounded on its own (bit-equal to separate passes)<br/>• Accumulator in registers<br/>• In-register alpha*A@B + beta*C + bias<br/>• Row-stride-0 column bias broadcast<br/>• Clamped precise::tanh / SiLU<br/>• 64x64 tile for bf16 M &lt; 128"]
     
     ModeCheck -- "gemm() / gemm_tiled()" --> BackendCheck{"Backend?"}
 
@@ -325,9 +325,11 @@ That exactness has a bound: a full-range dot product can wrap `int32` past
 `k = 131_072`, so larger `k` is refused rather than silently returning a wrapped
 sum.
 
-TensorOps itself accepts `int4b_format` — the reason there is no Int4 GEMM here
-is the shader-side tensor constructor for a sub-byte element type, not the host
-binding. An earlier version of this document and the README both blamed
+TensorOps itself accepts `int4b_format`, and the shader-side tensor constructor
+for it exists (compile-checked, not run: `device uchar *` handle, right operand
+only; see the `QUANT_PREFILL_GEMM_WIRED` doc in `src/mtl_tensor.rs` and
+`tools/probes/int4b/`). There is no Int4 GEMM here because none has been built
+and measured, not because of the host binding. An earlier version of this document and the README both blamed
 `MTLTensorDataType::Int4` being unbound in objc2-metal 0.3. That is true and
 irrelevant: it gates host-created `MTLTensor` descriptors, and every kernel here
 builds tensors from raw device pointers.
@@ -460,3 +462,32 @@ stateDiagram-v2
         PingPongWait --> SlotA: Recycle Slot 0 Allocator
     }
 ```
+
+## Runtime Access Lease
+
+`GpuRuntime::acquire_access` (`src/runtime.rs`) is one `AtomicBool` lease, taken by a `HostMapping` (via `GpuBuffer::map_host` and `host_access`, which then does a waiting commit), by the encoder (`with_binder`), by `commit`/`synchronize`, by the host-visible allocators and by `DecodeIcb`'s initialisation. A second taker fails at once with "runtime busy: another host mapping, encoder, or submit is active"; nothing blocks. `tests/runtime_lease.rs` pins the table below (all of it needs a device).
+
+| Invariant | Enforced at | Pinned by | Survives a Deref-only shared read guard |
+|---|---|---|---|
+| Fail-fast, no blocking, one holder | `runtime.rs` `acquire_access` CAS | `a_second_host_mapping_while_one_is_alive_is_refused_as_busy` | Only for exclusive takers. Readers need a count, not a flag |
+| No aliased `&mut [T]` | same CAS; `DerefMut` in `tensor.rs` `HostMapping` | same test (same buffer, other type, other buffer) | Not by a count on the existing guard (it hands out `DerefMut`). Needs a separate guard type |
+| No encode, submit or host allocation while mapped | lease held by `with_binder_barriers`, `commit`, `alloc_buffer_from_u32`, `bump_alloc_f32`, `bump_reset` | `a_live_mapping_refuses_encode_submit_and_host_allocation`, `bump_reset_reports_a_busy_runtime_instead_of_panicking` | Yes, if every exclusive taker fails while readers > 0 |
+| No mapping, nested encode or submit inside an encoder closure | lease held across the closure | `an_encoder_closure_refuses_mapping_nested_encode_and_submit` | Yes, same condition |
+| Busy refusals never poison; a busy error propagated out of a closure does | early `?` before `poison_on_failure`; closure `Err` sets the latch | `a_busy_refusal_propagated_out_of_an_encoder_closure_poisons_the_runtime` | Yes |
+| Mapping implies prior GPU work is complete | `host_access` runs `commit_m4(true)` (`wait_lifetime_event`) | `a_mapping_taken_over_open_encoded_work_reads_the_finished_result`, `a_params_push_waits_for_encoded_work_reading_the_slot` | Yes: wait at the 0 to 1 transition only, since no encode can start while readers > 0 |
+| Poisoned runtime refused, checked before busy and again after the CAS | `acquire_access` | `a_poisoned_runtime_refuses_mapping_before_it_reports_busy`, `a_poisoned_runtime_names_what_poisoned_it` | Yes, if checked on every shared acquire. A reader already handed out keeps working (pinned) |
+| Size/alignment/storage validated before the lease | `map_host` | `a_size_mismatch_is_reported_before_the_lease_is_tried` | Yes |
+| RAII release, also on unwind; the mapping owns an `Arc<GpuRuntime>` and its own `Arc` flag | `RuntimeAccess::drop`, `HostMapping` field order | `a_panic_with_a_live_mapping_releases_the_lease`, `a_mapping_outlives_the_callers_runtime_handle_and_releases_cleanly` | Yes, if the count is an `Arc` decremented in `Drop` |
+| Handles `!Send + !Sync` | no unsafe `Send`/`Sync` | `compile_fail` doctest on `GpuRuntime` | Yes. "Parallel" readers are several guards on one thread |
+
+### Decision: do not build a shared read guard (ft-4b1313de)
+
+Recommendation: do not build it now. Inferred, not measured (the GPU was held by another team, so no bench ran).
+
+- One consumer. The only demand is a digest that wants several mappings live on one thread. The per-entry readers (`read_parameter_host`, `read_gradient_host`, `read_adamw_moment_host`) each map, copy and release, so a loop over entries already works: each mapping drops before the next. Only holding two at once is refused.
+- The saving is small and unverified. After the first read the GPU is idle, so the repeated waits in `host_access` find the lifetime event already signaled. The 2 to 4 ms in the card is an inference.
+- Blast radius. `acquire_access` and `host_access` sit under every host write, upload, encode and submit (580+ symbols per the card's `devmap impact`; the worktree had no DevMap index, so this count was not re-run here). A lease that is a flag today becomes a flag plus a reader count in the one place every path shares.
+- The safe form is a second guard type, not a count on `HostMapping`, because `HostMapping: DerefMut` would alias.
+
+If a second consumer appears, the design that keeps every row above: replace the flag with an `Arc<AtomicU32>` (0 free, `u32::MAX` exclusive, otherwise the reader count); `acquire_access` stays the exclusive path and fails unless the state is 0; add `acquire_shared` that checks poison, increments unless the state is exclusive, and on the 0 to 1 transition runs `commit_m4(true)` once (undoing the increment if it fails); a new `HostRead<'a, T>` holds the runtime `Arc` and the count `Arc`, implements `Deref` only and decrements in `Drop`; `try_contents_*` and `map_host` stay exclusive, so a live reader makes them fail "runtime busy", as does every encode, submit and host allocation. The per-entry `_host` readers would take `HostRead` (a read), and `window_write_host` would stay exclusive. A reader that enters between another's wait and its own use needs no further wait, because nothing can encode while the count is above zero.
+

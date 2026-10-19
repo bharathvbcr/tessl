@@ -5,9 +5,10 @@
 //   gemv_q4_mlx_blocked — Hot-repacked [row_block][group][Bn][group_bytes]
 //   gemv_q4_mlx_blocked_gate_up_gelu — fused gate∥up → gelu_pytorch_tanh mid
 //   gemv_q4_mlx_simd* — true qmv_fast peel + bfloat2 sb; row-major or Interleaved4
+//                       (one templated body, gemv_q4_mlx_simd.h)
 #include <metal_stdlib>
 #include "act.h"
-#include "q4_mlx_dot.h"
+#include "gemv_q4_mlx_simd.h"
 using namespace metal;
 
 constant uint GEMV_TG = 128u;
@@ -370,22 +371,12 @@ kernel void gemv_q4_mlx_blocked_gate_up_gelu(
 }
 
 // ---------------------------------------------------------------------------
-// Simdgroup-cooperative MLX affine Q4 GEMV (M=1).
-// True `qmv_fast` peel (see mlx quantized.h):
-//   - interleaved Hot scale+bias as bfloat2 (one 4B load / group)
-//   - packs_per_thread=2 → 16 nibbles/lane → K-block 512
-//   - 4 results/simdgroup × 2 SG/TG → 8 rows/TG
-//   - load_vector 16^k-prescale x + ushort-mask qdot + bias*sum(x)
-//   - pointer walk (ws/sb/x advance) for occupancy
-// Layouts: row-major + Interleaved4 ([tile][pack2][r0..r3])
+// Simdgroup-cooperative MLX affine Q4 GEMV (M=1): the entry points below own
+// only their names and `[[buffer(N)]]` slots. The body is `gemv_q4_mlx_simd.h`
+// (`q4_simd_gemv<layout, epilogue>`); the simdgroup geometry (4 rows/SG, 2 SG/TG,
+// 16 nibbles/lane, K-block 512) is in `q4_mlx_dot.h`.
+// Layouts: row-major + Interleaved4 ([tile][pack2][r0..r3], `_i4`).
 // ---------------------------------------------------------------------------
-constant uint SIMD_SIZE = 32u;
-constant uint SIMD_ROWS = 4u;
-constant uint SIMD_SG_PER_TG = 2u;
-constant uint SIMD_PACKS = 2u;
-constant uint SIMD_VPT = 8u * SIMD_PACKS;     // 16
-constant uint SIMD_BLOCK = SIMD_SIZE * SIMD_VPT; // 512
-
 
 kernel void gemv_q4_mlx_simd(
     device const uchar *packed [[buffer(0)]],
@@ -401,37 +392,9 @@ kernel void gemv_q4_mlx_simd(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint gpr = cols / group_size;
-    const uint row_bytes = cols >> 1;
-    const uint lane_col0 = lane * SIMD_VPT;
-    // MLX qmv_fast occupancy: pointer-walk ws/sb/x across K blocks.
-    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat *xr = x + lane_col0;
-    const uint sb_k_step = SIMD_BLOCK / group_size;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(xr, xt);
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[(ulong)r * gpr];
-                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-        ws += SIMD_BLOCK >> 1;
-        sbr += sb_k_step;
-        xr += SIMD_BLOCK;
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::Store>(
+        Q4Bank{packed, sb}, q4_no_bank(), x, y, nullptr, 0u, rows, cols, group_size,
+        q4_simd_row0(tgid, sgid), lane);
 }
 
 kernel void gemv_q4_mlx_simd_add(
@@ -449,36 +412,9 @@ kernel void gemv_q4_mlx_simd_add(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint gpr = cols / group_size;
-    const uint row_bytes = cols >> 1;
-    const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat *xr = x + lane_col0;
-    const uint sb_k_step = SIMD_BLOCK / group_size;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(xr, xt);
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[(ulong)r * gpr];
-                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-        ws += SIMD_BLOCK >> 1;
-        sbr += sb_k_step;
-        xr += SIMD_BLOCK;
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum + resid[row];
-    }
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::AddResid>(
+        Q4Bank{packed, sb}, q4_no_bank(), x, y, resid, 0u, rows, cols, group_size,
+        q4_simd_row0(tgid, sgid), lane);
 }
 
 kernel void gemv_q4_mlx_simd_gate_up_gelu(
@@ -499,51 +435,9 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)gate_biases_unused; (void)up_biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint gpr = cols / group_size;
-    const uint row_bytes = cols >> 1;
-    const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *gws = gate_packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const uchar *uws = up_packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *gsbr = gate_sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat2 *usbr = up_sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat *xr = x + lane_col0;
-    const uint sb_k_step = SIMD_BLOCK / group_size;
-    float acc_g[SIMD_ROWS];
-    float acc_u[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(xr, xt);
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 gv = gsbr[(ulong)r * gpr];
-                const bfloat2 uv = usbr[(ulong)r * gpr];
-                acc_g[r] += qdot16(gws + (ulong)r * row_bytes, xt, float(gv.x), float(gv.y), xsum);
-                acc_u[r] += qdot16(uws + (ulong)r * row_bytes, xt, float(uv.x), float(uv.y), xsum);
-            }
-        }
-        gws += SIMD_BLOCK >> 1;
-        uws += SIMD_BLOCK >> 1;
-        gsbr += sb_k_step;
-        usbr += sb_k_step;
-        xr += SIMD_BLOCK;
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float gsum = simd_sum(acc_g[r]);
-        const float usum = simd_sum(acc_u[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) {
-            float v = tessl_gelu_pytorch_tanh(gsum) * usum;
-            if (mid_as_bf16 != 0u) {
-                ((device bfloat *)mid)[row] = bfloat(v);
-            } else {
-                mid[row] = v;
-            }
-        }
-    }
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::GateUpGelu>(
+        Q4Bank{gate_packed, gate_sb}, Q4Bank{up_packed, up_sb}, x, mid, nullptr,
+        mid_as_bf16, rows, cols, group_size, q4_simd_row0(tgid, sgid), lane);
 }
 
 // Fused K∥V (default-on product path). Bank-partitioned like QKV so each TG
@@ -569,45 +463,11 @@ kernel void gemv_q4_mlx_simd_kv(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)k_biases_unused; (void)v_biases_unused;
-    device const uchar *packed;
-    device const bfloat2 *sb;
-    device float *y;
-    uint local_tg;
-    if (tgid < tg_k) {
-        packed = k_packed; sb = k_sb; y = k_out; local_tg = tgid;
-    } else {
-        packed = v_packed; sb = v_sb; y = v_out; local_tg = tgid - tg_k;
-    }
-    const uint row0 = (local_tg * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint gpr = cols / group_size;
-    const uint row_bytes = cols >> 1;
-    const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat *xr = x + lane_col0;
-    const uint sb_k_step = SIMD_BLOCK / group_size;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(xr, xt);
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[(ulong)r * gpr];
-                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-        ws += SIMD_BLOCK >> 1;
-        sbr += sb_k_step;
-        xr += SIMD_BLOCK;
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    const Q4Route at = q4_route_kv(
+        tgid, tg_k, Q4Bank{k_packed, k_sb}, k_out, Q4Bank{v_packed, v_sb}, v_out, rows);
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::Store>(
+        at.bank, q4_no_bank(), x, at.y, nullptr, 0u, at.rows, cols, group_size,
+        q4_simd_row0(at.local_tg, sgid), lane);
 }
 
 // ---------------------------------------------------------------------------
@@ -628,35 +488,9 @@ kernel void gemv_q4_mlx_simd_i4(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint tile = row0 / SIMD_ROWS;
-    const uint gpr = cols / group_size;
-    const uint packs_u2 = cols >> 4;
-    const uint lane_col0 = lane * SIMD_VPT;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        const ulong col = k0 + lane_col0;
-        if (col + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(x + col, xt);
-            const ulong g = col / group_size;
-            const ulong pack2 = col >> 4;
-            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
-            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sb[sb0 + r];
-                acc[r] += qdot16(wp + r * 8u, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    q4_simd_gemv<Q4Layout::Interleaved4, Q4Epi::Store>(
+        Q4Bank{packed, sb}, q4_no_bank(), x, y, nullptr, 0u, rows, cols, group_size,
+        q4_simd_row0(tgid, sgid), lane);
 }
 
 kernel void gemv_q4_mlx_simd_add_i4(
@@ -674,35 +508,9 @@ kernel void gemv_q4_mlx_simd_add_i4(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint tile = row0 / SIMD_ROWS;
-    const uint gpr = cols / group_size;
-    const uint packs_u2 = cols >> 4;
-    const uint lane_col0 = lane * SIMD_VPT;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        const ulong col = k0 + lane_col0;
-        if (col + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(x + col, xt);
-            const ulong g = col / group_size;
-            const ulong pack2 = col >> 4;
-            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
-            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sb[sb0 + r];
-                acc[r] += qdot16(wp + r * 8u, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum + resid[row];
-    }
+    q4_simd_gemv<Q4Layout::Interleaved4, Q4Epi::AddResid>(
+        Q4Bank{packed, sb}, q4_no_bank(), x, y, resid, 0u, rows, cols, group_size,
+        q4_simd_row0(tgid, sgid), lane);
 }
 
 kernel void gemv_q4_mlx_simd_gate_up_gelu_i4(
@@ -723,46 +531,9 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu_i4(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)gate_biases_unused; (void)up_biases_unused;
-    const uint row0 = (tgid * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint tile = row0 / SIMD_ROWS;
-    const uint gpr = cols / group_size;
-    const uint packs_u2 = cols >> 4;
-    const uint lane_col0 = lane * SIMD_VPT;
-    float acc_g[SIMD_ROWS];
-    float acc_u[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) { acc_g[r] = 0.0f; acc_u[r] = 0.0f; }
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        const ulong col = k0 + lane_col0;
-        if (col + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(x + col, xt);
-            const ulong g = col / group_size;
-            const ulong pack2 = col >> 4;
-            const ulong base = (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
-            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 gv = gate_sb[sb0 + r];
-                const bfloat2 uv = up_sb[sb0 + r];
-                acc_g[r] += qdot16(gate_packed + base + r * 8u, xt, float(gv.x), float(gv.y), xsum);
-                acc_u[r] += qdot16(up_packed + base + r * 8u, xt, float(uv.x), float(uv.y), xsum);
-            }
-        }
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float gsum = simd_sum(acc_g[r]);
-        const float usum = simd_sum(acc_u[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) {
-            float v = tessl_gelu_pytorch_tanh(gsum) * usum;
-            if (mid_as_bf16 != 0u) {
-                ((device bfloat *)mid)[row] = bfloat(v);
-            } else {
-                mid[row] = v;
-            }
-        }
-    }
+    q4_simd_gemv<Q4Layout::Interleaved4, Q4Epi::GateUpGelu>(
+        Q4Bank{gate_packed, gate_sb}, Q4Bank{up_packed, up_sb}, x, mid, nullptr,
+        mid_as_bf16, rows, cols, group_size, q4_simd_row0(tgid, sgid), lane);
 }
 
 // Interleaved4 twin of bank-split `gemv_q4_mlx_simd_kv` (math ≡ `gemv_q4_mlx_simd_i4`).
@@ -785,44 +556,11 @@ kernel void gemv_q4_mlx_simd_kv_i4(
     uint lane [[thread_index_in_simdgroup]])
 {
     (void)k_biases_unused; (void)v_biases_unused;
-    device const uchar *packed;
-    device const bfloat2 *sb;
-    device float *y;
-    uint local_tg;
-    if (tgid < tg_k) {
-        packed = k_packed; sb = k_sb; y = k_out; local_tg = tgid;
-    } else {
-        packed = v_packed; sb = v_sb; y = v_out; local_tg = tgid - tg_k;
-    }
-    const uint row0 = (local_tg * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint tile = row0 / SIMD_ROWS;
-    const uint gpr = cols / group_size;
-    const uint packs_u2 = cols >> 4;
-    const uint lane_col0 = lane * SIMD_VPT;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        const ulong col = k0 + lane_col0;
-        if (col + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(x + col, xt);
-            const ulong g = col / group_size;
-            const ulong pack2 = col >> 4;
-            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
-            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sb[sb0 + r];
-                acc[r] += qdot16(wp + r * 8u, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    const Q4Route at = q4_route_kv(
+        tgid, tg_k, Q4Bank{k_packed, k_sb}, k_out, Q4Bank{v_packed, v_sb}, v_out, rows);
+    q4_simd_gemv<Q4Layout::Interleaved4, Q4Epi::Store>(
+        at.bank, q4_no_bank(), x, at.y, nullptr, 0u, at.rows, cols, group_size,
+        q4_simd_row0(at.local_tg, sgid), lane);
 }
 
 kernel void gemv_q4_mlx_tiled(
@@ -882,12 +620,12 @@ kernel void gemv_q4_mlx_tiled(
 //     [tg_q, tg_q + tg_k)     -> K
 //     [tg_q + tg_k, ...)      -> V
 // `tg_q` / `tg_k` are ceil(rows / (SIMD_SG_PER_TG * SIMD_ROWS)) computed host
-// side. Bank select depends only on `tgid` (TG-uniform); `row0` depends on
-// `sgid` (simdgroup-uniform), so the early-out never splits a simdgroup before
-// `simd_sum` — same invariant as `gemv_q4_mlx_simd`.
+// side (`q4_route_qkv`). Bank select depends only on `tgid` (TG-uniform);
+// `row0` depends on `sgid` (simdgroup-uniform), so the early-out never splits a
+// simdgroup before `simd_sum` — same invariant as `gemv_q4_mlx_simd`.
 //
-// Math is byte-identical to `gemv_q4_mlx_simd` (same load_x16_qdot + qdot16 +
-// pointer walk), so fused vs unfused must be bit-exact.
+// Math is byte-identical to `gemv_q4_mlx_simd` (same `q4_simd_gemv` body), so
+// fused vs unfused must be bit-exact.
 // ---------------------------------------------------------------------------
 kernel void gemv_q4_mlx_simd_qkv(
     device const uchar *q_packed [[buffer(0)]],
@@ -910,49 +648,12 @@ kernel void gemv_q4_mlx_simd_qkv(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    device const uchar *packed;
-    device const bfloat2 *sb;
-    device float *y;
-    uint rows;
-    uint local_tg;
-    if (tgid < tg_q) {
-        packed = q_packed; sb = q_sb; y = q_out; rows = rows_q;  local_tg = tgid;
-    } else if (tgid < tg_q + tg_k) {
-        packed = k_packed; sb = k_sb; y = k_out; rows = rows_kv; local_tg = tgid - tg_q;
-    } else {
-        packed = v_packed; sb = v_sb; y = v_out; rows = rows_kv; local_tg = tgid - tg_q - tg_k;
-    }
-
-    const uint row0 = (local_tg * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint gpr = cols / group_size;
-    const uint row_bytes = cols >> 1;
-    const uint lane_col0 = lane * SIMD_VPT;
-    device const uchar *ws = packed + (ulong)row0 * row_bytes + (lane_col0 >> 1);
-    device const bfloat2 *sbr = sb + (ulong)row0 * gpr + (lane_col0 / group_size);
-    device const bfloat *xr = x + lane_col0;
-    const uint sb_k_step = SIMD_BLOCK / group_size;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        if (k0 + lane_col0 + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(xr, xt);
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sbr[(ulong)r * gpr];
-                acc[r] += qdot16(ws + (ulong)r * row_bytes, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-        ws += SIMD_BLOCK >> 1;
-        sbr += sb_k_step;
-        xr += SIMD_BLOCK;
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    const Q4Route at = q4_route_qkv(
+        tgid, tg_q, tg_k, Q4Bank{q_packed, q_sb}, q_out, rows_q, Q4Bank{k_packed, k_sb},
+        k_out, Q4Bank{v_packed, v_sb}, v_out, rows_kv);
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::Store>(
+        at.bank, q4_no_bank(), x, at.y, nullptr, 0u, at.rows, cols, group_size,
+        q4_simd_row0(at.local_tg, sgid), lane);
 }
 
 // Interleaved4 twin of `gemv_q4_mlx_simd_qkv` (same bank partitioning; i4 pointer walk).
@@ -979,46 +680,10 @@ kernel void gemv_q4_mlx_simd_qkv_i4(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {
-    device const uchar *packed;
-    device const bfloat2 *sb;
-    device float *y;
-    uint rows;
-    uint local_tg;
-    if (tgid < tg_q) {
-        packed = q_packed; sb = q_sb; y = q_out; rows = rows_q;  local_tg = tgid;
-    } else if (tgid < tg_q + tg_k) {
-        packed = k_packed; sb = k_sb; y = k_out; rows = rows_kv; local_tg = tgid - tg_q;
-    } else {
-        packed = v_packed; sb = v_sb; y = v_out; rows = rows_kv; local_tg = tgid - tg_q - tg_k;
-    }
-
-    const uint row0 = (local_tg * SIMD_SG_PER_TG + sgid) * SIMD_ROWS;
-    if (row0 >= rows) return;
-    const uint tile = row0 / SIMD_ROWS;
-    const uint gpr = cols / group_size;
-    const uint packs_u2 = cols >> 4;
-    const uint lane_col0 = lane * SIMD_VPT;
-    float acc[SIMD_ROWS];
-    for (uint r = 0u; r < SIMD_ROWS; ++r) acc[r] = 0.0f;
-    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
-        const ulong col = k0 + lane_col0;
-        if (col + SIMD_VPT <= (ulong)cols) {
-            float xt[16];
-            const float xsum = load_x16_qdot(x + col, xt);
-            const ulong g = col / group_size;
-            const ulong pack2 = col >> 4;
-            device const uchar *wp = packed + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
-            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
-            for (uint r = 0u; r < SIMD_ROWS; ++r) {
-                if (row0 + r >= rows) break;
-                const bfloat2 sbv = sb[sb0 + r];
-                acc[r] += qdot16(wp + r * 8u, xt, float(sbv.x), float(sbv.y), xsum);
-            }
-        }
-    }
-    for (uint r = 0u; r < SIMD_ROWS; ++r) {
-        const float sum = simd_sum(acc[r]);
-        const uint row = row0 + r;
-        if (lane == 0u && row < rows) y[row] = sum;
-    }
+    const Q4Route at = q4_route_qkv(
+        tgid, tg_q, tg_k, Q4Bank{q_packed, q_sb}, q_out, rows_q, Q4Bank{k_packed, k_sb},
+        k_out, Q4Bank{v_packed, v_sb}, v_out, rows_kv);
+    q4_simd_gemv<Q4Layout::Interleaved4, Q4Epi::Store>(
+        at.bank, q4_no_bank(), x, at.y, nullptr, 0u, at.rows, cols, group_size,
+        q4_simd_row0(at.local_tg, sgid), lane);
 }

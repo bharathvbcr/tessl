@@ -1076,6 +1076,12 @@ pub(crate) fn dispatch_tg_1d(
 /// Each kernel bakes `HEAD_DIM` in as a `constant`, so the head dimension
 /// selects the kernel rather than being passed to it. Calling one with the
 /// wrong `D` reads past the end of every head.
+///
+/// Both sliding-window kernels share one body (`kernels/attn_fa2.h`) but not
+/// one buffer layout: `flash_attn_swa_h256` has an `out_bf16` flag at slot 13
+/// and `kv_capacity` at 14, while `flash_attn_swa_h128` has no `out_bf16` and
+/// binds `kv_capacity` at 13. Neither is ever dispatched with bf16 output from
+/// here (see `flash_attn_swa_with_scalars`); gemma-metal binds by slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnHeadDim {
     /// `flash_attn_swa_h128` / sliding window, `BR = 8`.
@@ -4656,7 +4662,9 @@ fn row_reduce(
 /// irrelevant here — that binding is for descriptors this path never creates.
 /// The same is true of Int4: `metal::int4b_format` exists in the shading
 /// language and TensorOps accepts it, and what is actually missing is the
-/// tensor constructor for a sub-byte element type, not an objc2 binding.
+/// shader-side tensor constructor does exist (it takes a `device uchar *`
+/// handle, right operand only); see `QUANT_PREFILL_GEMM_WIRED` in
+/// `mtl_tensor` for the compile-checked facts. What is not built is the GEMM.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_i8_dequant(
     rt: &Arc<GpuRuntime>,

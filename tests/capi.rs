@@ -3145,7 +3145,194 @@ fn set_async_encode_validates_and_toggles_the_runtime() {
     assert!(rt.async_encode_enabled());
     assert_eq!(set_async(&handle, 0), TESSL_OK);
     assert!(!rt.async_encode_enabled());
-    assert_eq!(TESSL_ABI_VERSION, 12);
+    assert_eq!(TESSL_ABI_VERSION, 13);
+}
+
+/// ABI 13's entry: the packed step through the ABI is the Rust API's ragged
+/// step, bit for bit (loss, per-sequence losses, gradients, accumulation), and
+/// every bad argument is refused with the bank as it was.
+#[test]
+fn the_ragged_step_through_the_abi_is_the_rust_ragged_step() {
+    use tessl::capi::tessl_qwen35_train_step_ragged;
+    let handle = Handle::new();
+    let model = load_model(handle.0);
+    let all = fixture_ids();
+    let lens = [9usize, 2, 13, 5];
+    let mut ids = Vec::new();
+    let mut cu = vec![0u32];
+    for (k, &n) in lens.iter().enumerate() {
+        ids.extend_from_slice(&all[k * 11..k * 11 + n]);
+        cu.push(ids.len() as u32);
+    }
+    let mut err = [0 as c_char; ERR_LEN];
+    let mut loss = 0.0f64;
+    let mut per = [0.0f64; 4];
+    let call = |ids: &[u32],
+                cu: &[u32],
+                operands: u32,
+                acc: u32,
+                loss: *mut f64,
+                per: *mut f64,
+                n_per: u64,
+                err: &mut [c_char; ERR_LEN]| unsafe {
+        tessl_qwen35_train_step_ragged(
+            model,
+            if ids.is_empty() { ptr::null() } else { ids.as_ptr() },
+            ids.len() as u64,
+            if cu.is_empty() { ptr::null() } else { cu.as_ptr() },
+            cu.len() as u64,
+            operands,
+            acc,
+            loss,
+            per,
+            n_per,
+            err.as_mut_ptr(),
+            ERR_LEN,
+        )
+    };
+    with_gpu(|rt| {
+        let st =
+            tessl::safetensors::SafeTensors::open(std::path::Path::new(fixture("model.safetensors").to_str().unwrap()))
+                .unwrap();
+        let cfg = tessl::qwen35_model::Qwen35Config::from_config_file(std::path::Path::new(
+            fixture("config.json").to_str().unwrap(),
+        ))
+        .unwrap();
+        let rust = tessl::qwen35_model::Qwen35Model::load(rt, &st, "model.", cfg, tessl::qwen35_model::Precision::F32)
+            .unwrap();
+        let table = rust.parameter_table().unwrap();
+
+        // Refusals first: nothing ran, so the bank holds no gradients yet.
+        let (lp, pp) = (&mut loss as *mut f64, per.as_mut_ptr());
+        let bad = |what: &str, s: i32, err: &[c_char; ERR_LEN], needle: &str| {
+            assert_eq!(s, TESSL_ERR, "{what}");
+            assert!(msg(err).contains(needle), "{what}: {}", msg(err));
+        };
+        let s = call(&ids, &cu, 0, 0, ptr::null_mut(), pp, 4, &mut err);
+        bad("null loss", s, &err, "null ids, cu_seqlens, loss or per_seq");
+        let s = call(&ids, &cu, 0, 0, lp, ptr::null_mut(), 4, &mut err);
+        bad("null per_seq", s, &err, "null ids");
+        let s = call(&[], &cu, 0, 0, lp, pp, 4, &mut err);
+        bad("null ids", s, &err, "null ids");
+        let s = call(&ids, &[], 0, 0, lp, pp, 4, &mut err);
+        bad("null cu", s, &err, "null ids");
+        let s = call(&ids, &cu, 0, 0, lp, pp, 3, &mut err);
+        bad("per_seq too short", s, &err, "3 losses for 4 sequences");
+        let s = call(&ids, &cu, 0, 0, lp, pp, 5, &mut err);
+        bad("per_seq too long", s, &err, "5 losses for 4 sequences");
+        let s = call(&ids, &cu, 0, 2, lp, pp, 4, &mut err);
+        bad("accumulate 2", s, &err, "accumulate 2");
+        let s = call(&ids, &cu, 7, 0, lp, pp, 4, &mut err);
+        bad("operands 7", s, &err, "operands");
+        let s = call(&ids[..ids.len() - 1], &cu, 0, 0, lp, pp, 4, &mut err);
+        bad("cu ends past ids", s, &err, "ends at 29");
+        let mut one = cu.clone();
+        one[1] = 1;
+        let s = call(&ids, &one, 0, 0, lp, pp, 4, &mut err);
+        bad("one-token sequence", s, &err, "one token");
+        let mut dec = cu.clone();
+        dec[2] = dec[1] - 1;
+        let s = call(&ids, &dec, 0, 0, lp, pp, 4, &mut err);
+        bad("decreasing", s, &err, "decreases");
+        let mut rep = cu.clone();
+        rep[2] = rep[1];
+        let s = call(&ids, &rep, 0, 0, lp, pp, 4, &mut err);
+        bad("empty sequence", s, &err, "is empty");
+        let mut from1 = cu.clone();
+        from1[0] = 1;
+        let s = call(&ids, &from1, 0, 0, lp, pp, 4, &mut err);
+        bad("starts at 1", s, &err, "starts at 1");
+        let s = call(&ids, &cu[..1], 0, 0, lp, pp, 0, &mut err);
+        bad("one offset", s, &err, "at least 2");
+        // A refusal wrote nothing: still no gradients, losses untouched.
+        assert_eq!(loss, 0.0);
+        assert_eq!(per, [0.0; 4]);
+        let bufs: Vec<_> = table
+            .iter()
+            .map(|p| shared(rt, &vec![0.0; p.shape.iter().product()]))
+            .collect();
+        let refs: Vec<TesslTensorRef> = table
+            .iter()
+            .zip(&bufs)
+            .map(|(p, b)| tref(b, &p.storage_shape().iter().map(|&d| d as u64).collect::<Vec<_>>()))
+            .collect();
+        let s = unsafe {
+            tessl_qwen35_copy(
+                model,
+                TESSL_READ_GRADS,
+                refs.as_ptr(),
+                refs.len() as u64,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_ERR);
+        assert!(msg(&err).contains("no gradients yet"), "{}", msg(&err));
+
+        // A good step, bit for bit against the Rust API on its own bank.
+        let local: Vec<tessl::Tensor> = table
+            .iter()
+            .map(|p| rt.alloc_tensor_f32(&p.storage_shape()).unwrap())
+            .collect();
+        let bank = Qwen35Grads::zeros_like(&rust).unwrap();
+        for (acc, operands, rust_ops) in [
+            (0u32, TESSL_OPERANDS_EXACT_F32, GemmOperands::ExactF32),
+            (1, TESSL_OPERANDS_EXACT_F32, GemmOperands::ExactF32),
+            (0, TESSL_OPERANDS_BF16, GemmOperands::Bf16),
+        ] {
+            let s = call(&ids, &cu, operands, acc, lp, pp, 4, &mut err);
+            assert_eq!(s, TESSL_OK, "{}", msg(&err));
+            let want = rust
+                .train_step_ragged_into(&ids, &cu, rust_ops, &bank, acc == 1)
+                .unwrap();
+            assert_eq!(loss.to_bits(), want.loss.to_bits());
+            for (g, w) in per.iter().zip(&want.per_sequence) {
+                assert_eq!(g.to_bits(), w.to_bits());
+            }
+            let s = unsafe {
+                tessl_qwen35_copy(
+                    model,
+                    TESSL_READ_GRADS,
+                    refs.as_ptr(),
+                    refs.len() as u64,
+                    err.as_mut_ptr(),
+                    ERR_LEN,
+                )
+            };
+            assert_eq!(s, TESSL_OK, "{}", msg(&err));
+            rust.read_gradients(&bank, &local).unwrap();
+            for ((p, b), t) in table.iter().zip(&bufs).zip(&local) {
+                let got = read(b, p.shape.iter().product());
+                let exp = t.read_f32().unwrap();
+                assert!(
+                    got.iter().zip(&exp).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{} (accumulate {acc})",
+                    p.name
+                );
+            }
+        }
+        // A pending step blocks it, bank untouched.
+        let s = unsafe {
+            tessl_qwen35_train_forward(
+                model,
+                ids.as_ptr(),
+                ids.len() as u64,
+                TESSL_OPERANDS_EXACT_F32,
+                0,
+                ptr::null(),
+                ptr::null(),
+                0,
+                1.0,
+                lp,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        };
+        assert_eq!(s, TESSL_OK, "{}", msg(&err));
+        let s = call(&ids, &cu, 0, 0, lp, pp, 4, &mut err);
+        bad("pending", s, &err, "pending");
+    });
+    assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }
 
 /// Turning async encode off with work encoded and not yet waited for returns

@@ -437,21 +437,18 @@ fn the_epilogue_refuses_paths_with_nothing_to_fuse_into() {
         let err = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi).expect_err("simdgroup has nowhere to fuse");
         assert!(err.contains("cooperative-destination"), "{err}");
 
-        // Exact f32 TensorOps likewise.
+        // Exact f32 on TensorOps now fuses (tests/gemm_exact_f32_epilogue.rs).
         rt.set_relaxed_precision(false);
-        let err = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32 has nowhere to fuse");
-        assert!(err.contains("cooperative-destination"), "{err}");
+        gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect("exact f32 fuses into its own kernel");
     });
 }
 
-/// The refusal names the API that turns relaxed precision on and the dtypes
-/// the path takes, and reads as one line. It used to name
-/// `PrecisionMode::Relaxed`, which does not exist (`PrecisionMode` is `F32`
-/// or `Bf16`; relaxed is `GpuRuntime::set_relaxed_precision`), left f16 out,
-/// and carried two 14-space runs from a multi-line literal written without
-/// `\` continuations. `qwen35::project_residual` returns the same refusal.
+/// The refusal reads as one line and names the backend it needs. It once
+/// named `PrecisionMode::Relaxed`, which does not exist, and carried two
+/// 14-space runs from a multi-line literal written without `\` continuations.
+/// `qwen35::project_residual` returns the same refusal.
 #[test]
-fn epilogue_refusals_name_the_real_precision_api_in_one_line() {
+fn epilogue_refusals_read_as_one_line() {
     with_gpu(|rt| {
         rt.set_relaxed_precision(false);
         let (m, n, k) = (64usize, 64usize, 64usize);
@@ -462,11 +459,10 @@ fn epilogue_refusals_name_the_real_precision_api_in_one_line() {
             activation: Activation::Relu,
             ..Default::default()
         };
-        let direct = gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, epi).expect_err("exact f32");
-        let residual = tessl::qwen35::project_residual(&a, &b, &c, GemmBackend::TensorOps).expect_err("exact f32");
+        let direct = gemm_epilogue(&a, &b, &c, GemmBackend::Simdgroup, epi).expect_err("simdgroup");
+        let residual = tessl::qwen35::project_residual(&a, &b, &c, GemmBackend::Simdgroup).expect_err("simdgroup");
         for err in [&direct, &residual] {
-            assert!(err.contains("set_relaxed_precision"), "{err}");
-            assert!(err.contains("bf16 or f16 operands"), "{err}");
+            assert!(err.contains("TensorOps"), "{err}");
             assert!(!err.contains("PrecisionMode::Relaxed"), "{err}");
             assert!(!err.contains("  ") && !err.contains('\n'), "whitespace run in: {err:?}");
         }

@@ -53,7 +53,7 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 12
+_ABI_VERSION = 13
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
@@ -345,6 +345,11 @@ def _load():
         lib.tessl_qwen35_train_forward.argtypes = [
             ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, u32p, u32p, ctypes.c_uint64,
             ctypes.c_float, ctypes.POINTER(ctypes.c_double),
+        ] + err_args
+        lib.tessl_qwen35_train_step_ragged.restype = ctypes.c_int32
+        lib.tessl_qwen35_train_step_ragged.argtypes = [
+            ctypes.c_void_p, u32p, ctypes.c_uint64, u32p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
         ] + err_args
         lib.tessl_qwen35_hidden.restype = ctypes.c_int32
         lib.tessl_qwen35_hidden.argtypes = [
@@ -875,7 +880,10 @@ def chunk_gated_delta_rule(
     if not use_qk_l2norm_in_kernel:
         raise TesslError("tessl's GDN kernels implement use_qk_l2norm_in_kernel=True only")
     if cu_seqlens is not None:
-        raise TesslError("ragged batches (cu_seqlens) are not supported")
+        raise TesslError(
+            "ragged batches (cu_seqlens) are not supported by the GDN kernel seam; "
+            "train a packed batch with Qwen35.train_step_ragged"
+        )
     if query.dim() != 4 or query.shape != key.shape or query.shape[-1] != _GDN_DK:
         raise TesslError(f"query and key must both be [B, T, H, {_GDN_DK}], got {tuple(query.shape)} and {tuple(key.shape)}")
     B, T, H, _ = query.shape
@@ -1459,6 +1467,49 @@ class Qwen35(_Owned):
         self._check(status, err)
         self._has_grads = True
         return loss.value
+
+    def train_step_ragged(self, ids, cu_seqlens, operands: str = "f32", accumulate: bool = False):
+        """One training step on several sequences packed end to end.
+
+        ``ids`` is the packed token ids (1-D, or ``[1, T]`` as transformers'
+        ``DataCollatorWithFlattening`` produces ``input_ids``) and
+        ``cu_seqlens`` the prefix offsets of its sequences as the
+        flash-attention varlen path takes them (``cu_seq_lens_q``: an int32
+        tensor of ``n_seq + 1`` values from 0 to ``T``, strictly rising, each
+        sequence at least two tokens). Each sequence trains as ``train_step``
+        would train it alone (positions restart, no state or attention crosses
+        a boundary). The gradients, kept for ``grads()``, are those of the
+        token mean over every sequence's predicted positions, over the
+        previous ones or, with ``accumulate``, added to them. Returns
+        ``(loss, per_sequence)``: that token-mean loss and a list of each
+        sequence's own causal-LM loss. A bad ``cu_seqlens`` is refused before
+        any GPU work (like ``train_step``, a refused call leaves this
+        object reporting no gradients until the next successful step)."""
+        code = _operands_code(operands)
+        accumulate = _flag("accumulate", accumulate)
+        ids = torch.as_tensor(ids)
+        if ids.dim() == 2 and ids.shape[0] == 1:
+            ids = ids[0]
+        host = self._ids(ids)
+        cu = torch.as_tensor(cu_seqlens)
+        if cu.dim() != 1:
+            raise TesslError(f"cu_seqlens must be 1-D, got shape {tuple(cu.shape)}")
+        cu_host = _u32(cu, 1 << 32, "cu_seqlens")
+        n_cu = cu_host.t.numel()
+        n_seq = max(n_cu - 1, 0)
+        per_seq = (ctypes.c_double * max(n_seq, 1))()
+        loss = ctypes.c_double()
+        err = ctypes.create_string_buffer(_ERR_LEN)
+        # Host arrays only, as train_step: nothing of torch's to wait for.
+        self._has_grads = False
+        status = self._rt.lib.tessl_qwen35_train_step_ragged(
+            self._handle, host.ctypes_ptr, host.t.numel(), cu_host.ctypes_ptr, n_cu, code, accumulate,
+            ctypes.byref(loss), per_seq, n_seq, err, _ERR_LEN,
+        )
+        del host, cu_host
+        self._check(status, err)
+        self._has_grads = True
+        return loss.value, list(per_seq)[:n_seq]
 
 
 from .embedgemma2 import EmbedGemma2  # noqa: E402  (after the definitions it imports from this module)

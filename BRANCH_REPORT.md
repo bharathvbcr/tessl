@@ -261,3 +261,52 @@ git worktree add ../tessl-<name> <branch>
 # from the bundle if the refs are gone:
 git fetch /Users/bharath/Code/research/tessl-backups/tessl-refs-2026-10-16T2305.bundle refs/heads/<branch>:refs/heads/<branch>
 ```
+
+## Pass 3 folder cleanup (2026-10-17 ~11:55 CDT)
+
+Goal: remove the `/Users/bharath/Code/research/tessl-*` worktree folders whose work is already on `main` (42f1d52).
+
+**Checks run first:**
+- `gitpulse_insights`: every facet `ok`, 14 of 14 worktrees scanned, all candidates clean.
+- `gitpulse_collision_risk`: 0 overlaps, `sessions_ok`.
+- Live sessions: pid 24500 (`tessl-eg2`) and this session. pid 91618 (`b46d2477`) is gone.
+- `lsof -a -d cwd`: processes only in `tessl` and `tessl-eg2`.
+- No `b46d2477` jobs are waiting on `mac_heavy`; only ojas `ojas-clip-rows` jobs are queued.
+
+**Result: no sibling folder was removed.** Only the stale `old` entry went. Every candidate is either not on `main`, or is merged but its GitPulse task is still `in_progress`.
+
+| Folder | Tip | On `main`? | Decision and reason | Backup ref (`refs/backup/2026-10-17-pass3/…`) |
+| --- | --- | --- | --- | --- |
+| `tessl-w10-faults` | `gp/w10-faults` f9039b8 | yes (ancestor) | **kept**: task ft-380e34f4 (fault-injection set) is `in_progress` | `gp/w10-faults` |
+| `tessl-w10-gdnchunk` | `gp/w10-gdnchunk` d1175c7 | yes (ancestor) | **kept**: task ft-62af7c2e (chunked GDN) is `in_progress` | `gp/w10-gdnchunk` |
+| `tessl-w11-2bmem` | `gp/w11-2bmem` fcb7a08 | **no**: fcb7a08 (23:02 on 10-16) is not on `main` | **kept**: unmerged; tasks ft-02b223f0 and ft-19f4bd16 are `in_progress` | `gp/w11-2bmem` |
+| `tessl-w12-kcov` | `gp/w12-kcov` 1a6b606 | **no**: 1a6b606 (22:50 on 10-16) is not on `main` | **kept**: unmerged; task ft-6d88defb is `in_progress` | `gp/w12-kcov` |
+| `tessl-merge2` | detached 4685388 | **no** | **kept**: `main` + `gp/w11-2bmem` + `gp/w12-kcov`, the ready-made merge of the two lines above | `detached/tessl-merge2` |
+| `tessl-merge-w11` | detached 60ac94f | **no** | **kept**: despite its name, this is `main` + `gp/clip-sq-norm` (the clip line). It is not an ancestor of `tessl-merge-clip`'s 5cdf05d | `detached/tessl-merge-w11` |
+| `tessl-merge-clip` | detached 5cdf05d | no | kept, as instructed (clip line; ojas `gp/clip-sq-norm` waits on it) | `detached/tessl-merge-clip` (its first backup) |
+| `tessl-clipnorm` | `gp/clip-sq-norm` 2c02982 | no | kept, as instructed (clip line) | `gp/clip-sq-norm` |
+| `tessl-eg2` | `eg2/integrate` eb69075 | — | kept: live session pid 24500 | — |
+| `.claude/worktrees/agent-a02125…`, `agent-a86c7…` | — | — | kept: locked by pid 24500 | — |
+| `.claude/worktrees/agent-af4e93…` | — | — | kept, as instructed | — |
+| `old` (in `b46d2477`'s `/private/tmp` scratchpad) | detached 0fb1b30 (old `gp/wave10` tip) | yes (ancestor) | **removed** with `git worktree remove` (no `--force`). The session is gone, the tree was clean, and no task is open. The rest of the scratchpad (`run.sh`, logs, `old-target`) is untouched | `detached/old` |
+
+**Notes:**
+- **Branches deleted: none.** `gp/wave10` was already deleted before this pass; its tip is in `refs/backup/2026-10-17T0809/gp/wave10` (0fb1b30).
+- **Bundle:** `tessl-backups/tessl-refs-2026-10-17-pass3.bundle` holds all 10 pass-3 refs, including `main` at 42f1d52, and `git bundle verify` passes. The ref list is in `tessl-backups/tessl-backup-refs-2026-10-17-pass3.txt`.
+- **Not a worktree:** `/Users/bharath/Code/research/tessl-w2e` holds only a `target/` build-output folder from 2026-10-12. It is left for the owner to delete.
+- **Correction to round two above:** that section says all 6 kept branches are ancestors of `main`. After it was written, `gp/w11-2bmem` and `gp/w12-kcov` each gained one commit (fcb7a08 and 1a6b606), so that is no longer true.
+
+**To unblock the next pass:**
+- `gp/w10-faults` and `gp/w10-gdnchunk`: once the owner closes or reassigns ft-380e34f4 and ft-62af7c2e (their owning session `b46d2477` is gone), run `git worktree remove ../tessl-w10-faults`, `git worktree remove ../tessl-w10-gdnchunk`, and `git branch -d gp/w10-faults gp/w10-gdnchunk`.
+- `gp/w11-2bmem` and `gp/w12-kcov`: merge them first (`tessl-merge2` already holds that merge), then do the same.
+
+### Restore (pass 3)
+
+```sh
+# the old worktree (detached at the old gp/wave10 tip):
+git worktree add --detach <path> refs/backup/2026-10-17-pass3/detached/old
+# any examined tip, if its branch or worktree is lost later:
+git branch <branch> refs/backup/2026-10-17-pass3/gp/<name>
+# from the bundle if the refs are gone:
+git fetch /Users/bharath/Code/research/tessl-backups/tessl-refs-2026-10-17-pass3.bundle 'refs/backup/2026-10-17-pass3/*:refs/backup/2026-10-17-pass3/*'
+```

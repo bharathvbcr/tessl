@@ -78,7 +78,7 @@ use crate::qwen35_adamw::{
 };
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use crate::qwen35_params::ParamInfo;
-use crate::qwen35_train::{PendingStep, Qwen35Grads, Supervise};
+use crate::qwen35_train::{check_cu_seqlens, PendingStep, Qwen35Grads, Supervise};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::CheckpointView;
 use crate::tensor::{DType, Tensor};
@@ -89,7 +89,7 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 12;
+pub const TESSL_ABI_VERSION: u32 = 13;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -1393,6 +1393,90 @@ pub unsafe extern "C" fn tessl_qwen35_train_step(
             let bank = h.grads.as_ref().ok_or("no gradient bank")?;
             *loss = h.model.train_step_into(ids, operands, Supervise::Causal, bank, false)?;
             h.bank = BankState::Ready;
+            Ok(())
+        })
+    }
+}
+
+/// One training step on several sequences packed end to end in the `n` token
+/// ids at `ids`, cut at `cu_seqlens` (`n_cu` prefix offsets, `n_seq + 1`
+/// values from 0 to `n`; the layout of transformers' `cu_seq_lens_q`), its
+/// GEMMs on `operands` as [`tessl_qwen35_train_step`]
+/// ([`Qwen35Model::train_step_ragged_into`]). Each sequence is trained as it
+/// would be alone; the gradients are those of the token mean over every
+/// sequence's predicted positions, written into the handle's bank for
+/// [`tessl_qwen35_copy`], over the previous step's or, when `accumulate` is 1,
+/// added to them. `*loss` is that token-mean loss and `per_seq[i]` sequence
+/// `i`'s own mean loss (what [`tessl_qwen35_train_step`] reports for it
+/// alone); `n_per_seq` must be exactly `n_cu - 1`. A bad `cu_seqlens` (not
+/// from 0 to `n`, not strictly rising, a sequence under two tokens), a null
+/// pointer, a length mismatch, an `accumulate` other than 0 or 1, accumulating
+/// onto a failed step's partial bank and a pending step are all refused
+/// before any GPU work, with the bank as it was. ABI 13.
+///
+/// # Safety
+/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s,
+/// `cu_seqlens` to `n_cu` readable `u32`s, `loss` is writable and `per_seq`
+/// points to `n_per_seq` writable `f64`s.
+#[no_mangle]
+pub unsafe extern "C" fn tessl_qwen35_train_step_ragged(
+    model: *mut TesslQwen35,
+    ids: *const u32,
+    n: u64,
+    cu_seqlens: *const u32,
+    n_cu: u64,
+    operands: u32,
+    accumulate: u32,
+    loss: *mut f64,
+    per_seq: *mut f64,
+    n_per_seq: u64,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        guarded(model, err, err_len, |h| {
+            const WHAT: &str = "tessl_qwen35_train_step_ragged";
+            if ids.is_null() || cu_seqlens.is_null() || loss.is_null() || per_seq.is_null() {
+                return Err(format!("{WHAT}: null ids, cu_seqlens, loss or per_seq"));
+            }
+            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
+            let n_cu = usize::try_from(n_cu).map_err(|_| format!("{WHAT}: n_cu overflows usize"))?;
+            let n_per_seq = usize::try_from(n_per_seq).map_err(|_| format!("{WHAT}: n_per_seq overflows usize"))?;
+            let ids = checked_slice(ids, n, WHAT, "ids")?;
+            let cu = checked_slice(cu_seqlens, n_cu, WHAT, "cu_seqlens")?;
+            let ranges = check_cu_seqlens(cu, ids.len()).map_err(|e| format!("{WHAT}: {e}"))?;
+            if n_per_seq != ranges.len() {
+                return Err(format!(
+                    "{WHAT}: per_seq holds {n_per_seq} losses for {} sequences",
+                    ranges.len()
+                ));
+            }
+            let per_out = checked_slice_mut(per_seq, n_per_seq, WHAT, "per_seq")?;
+            let operands = parse_operands(operands, WHAT)?;
+            if accumulate > 1 {
+                return Err(format!("{WHAT}: accumulate {accumulate} is not 0 or 1"));
+            }
+            let accumulate = accumulate == 1;
+            h.no_pending(WHAT)?;
+            h.bank()?;
+            if accumulate && h.bank == BankState::Dirty {
+                return Err(format!(
+                    "{WHAT}: the bank holds a failed step's partial gradients; start again with accumulate = 0"
+                ));
+            }
+            h.bank = BankState::Dirty;
+            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
+            let r = h.model.train_step_ragged_into(ids, cu, operands, bank, accumulate)?;
+            h.bank = BankState::Ready;
+            if r.per_sequence.len() != per_out.len() {
+                return Err(format!(
+                    "{WHAT}: the step returned {} per-sequence losses",
+                    r.per_sequence.len()
+                ));
+            }
+            per_out.copy_from_slice(&r.per_sequence);
+            *loss = r.loss;
             Ok(())
         })
     }

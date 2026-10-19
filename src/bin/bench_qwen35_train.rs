@@ -829,7 +829,9 @@ fn gib(b: u64) -> f64 {
 }
 
 fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
-    let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
+    let ids: Vec<u32> = (0..tokens as u32)
+        .map(|i| (i * 104_729 + 17) % model.config().vocab)
+        .collect();
     let bank = match model.precision() {
         Precision::F32 => None,
         Precision::Bf16 => Some(Qwen35Grads::zeros_like(model)?),
@@ -885,7 +887,9 @@ fn bench_step(rt: &Arc<GpuRuntime>, model: &Qwen35Model, tokens: usize, operands
 /// One clipped optimizer step as a trainer runs it: the step's gradients
 /// into a bank, the bank's norm, then AdamW with the clip coefficient.
 fn bench_clip(model: &Qwen35Model, tokens: usize, operands: GemmOperands) -> Res<()> {
-    let ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 104_729 + 17) % VOCAB as u32).collect();
+    let ids: Vec<u32> = (0..tokens as u32)
+        .map(|i| (i * 104_729 + 17) % model.config().vocab)
+        .collect();
     let bank = Qwen35Grads::zeros_like(model)?;
     let mut state = match model.precision() {
         Precision::F32 => AdamW::new(model)?,
@@ -1046,7 +1050,7 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
     let rows: Vec<Vec<u32>> = (0..b.rows)
         .map(|r| {
             (0..b.len as u32)
-                .map(|i| ((i + 31 * r as u32) * 104_729 + 17) % VOCAB as u32)
+                .map(|i| ((i + 31 * r as u32) * 104_729 + 17) % model.config().vocab)
                 .collect()
         })
         .collect();

@@ -18,6 +18,7 @@ bin bench_attn_cli 2
 bin build_artifact_contract 2
 bin capi_contract 80
 bin check_kernel_ir_planted 6
+bin config_json_parsers 10
 bin dialect_lint_script 12
 bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
@@ -28,7 +29,7 @@ bin fixture_manifests 8
 bin gdn_gates 22
 bin gdn_state 10
 bin go_link_frameworks 2
-bin host_access_ban 4
+bin host_access_ban 6
 bin hosted_selection 6
 bin hosted_tests_script 9
 bin kernel_fast_math 13
@@ -57,7 +58,7 @@ bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
 bin bench_gemm_sweep_cli 5
 bin gemm_parity 45
-bin kernel_coverage 54
+bin kernel_coverage 55
 bin attn_tune 27
 bin bench_flash_attn_cli 6
 
@@ -109,13 +110,15 @@ lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib json::tests:: 4
 lib media:: 19
+lib npy::accessor_tests:: 1
 lib parser_mutation:: 16
 lib qwen35::tests:: 6
-lib qwen35_adamw::step_kernel_tests:: 3
-lib qwen35_train::tests:: 1
+lib qwen35_adamw::step_kernel_tests:: 2
+exact lib qwen35_train::tests::reference_dir_honours_the_variable_and_names_it_when_missing
 lib runtime::drop_wait_tests:: 1
 lib runtime::timestamp_decode_tests:: 2
 lib safetensors::tests:: 1
+lib sq_norm::tests:: 2
 exact lib cb_replay::tests::api_gap_survey_names_mtl4_and_icb cb_replay::tests::ledger_recycles_an_in_flight_slot_instead_of_wedging cb_replay::tests::mark_live_step_advances_ping_pong cb_replay::tests::not_wired_message_names_every_surveyed_gap cb_replay::tests::note_layer_live_replay_is_not_counted_as_a_tape_replay cb_replay::tests::on_gpu_complete_does_not_discard_an_open_recording cb_replay::tests::ping_pong_record_ready_dry_replay cb_replay::tests::try_replay_not_wired_by_default cb_replay::tests::try_replay_ready_not_wired_after_live decode_icb::tests::a_nested_nop_guard_restores_its_parent decode_icb::tests::binder_encode_nop_does_not_cross_thread_boundaries decode_icb::tests::decode_icb_flag_default_off gemm::tests::bf16_parallel_split_k_width_follows_the_threadgroup_count gemm::tests::few_tile_long_k_tn_takes_parallel_partitions gemm::tests::long_k_nn_with_a_large_b_takes_k_partitions gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch icb_smoke::tests::icb_smoke_flag_default_off nn::tests::static_attention_entry_names_match_the_kernel_naming_scheme runtime::lifetime_event_tests::a_lifetime_event_above_what_was_submitted_is_a_violation runtime::tests::feedback_wait_returns_at_once_when_the_callback_already_ran runtime::tests::feedback_wait_sees_a_failure_reported_from_another_thread runtime::tests::feedback_wait_wakes_on_the_callback_not_on_a_poll_tick runtime::tests::feedback_wait_without_a_callback_gives_up_at_the_limit tensor::contract_tests::bf16_preserves_special_values_and_ties tensor::contract_tests::gpu_matching_bf16_cast_canonicalises_nan_and_flushes_subnormals
 
 # Runs after the sandboxed entries, without the sandbox (it launches sandboxed children

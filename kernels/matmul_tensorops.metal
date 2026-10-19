@@ -325,13 +325,13 @@ TN_SPLITK_PAR_KERNEL(matmul2d_tensorops_tn_splitk_par_bf16_f32, bfloat, 64, 64, 
 // is gemm_coop.h's `mm_coop`, walked by `tile_walk` like every other GEMM
 // family (bench/results/gemm_panel_walk_m5pro.txt).
 template <typename ElemT, int SM = 128, int SN = 64, int NSG = 4,
-          bool RELAXED = false, bool EPILOGUE = false>
+          bool RELAXED = false, bool EPILOGUE = false, bool STRICT = false>
 inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint M, uint N, uint K, uint tiles_n,
                               uint tiles_m, uint tgpig,
                               device const float *bias, float alpha, float beta,
                               uint act) {
-    mm_coop<ElemT, SM, SN, NSG, false, false, RELAXED, false, EPILOGUE, walk_by_b>(
+    mm_coop<ElemT, SM, SN, NSG, false, false, RELAXED, false, EPILOGUE, walk_by_b, STRICT>(
         A, B, C, M, N, K, tiles_n, tiles_m, tgpig, bias, alpha, beta, act);
 }
 
@@ -499,6 +499,11 @@ NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f16_f32_batched_64x64_sg4,      half, 
 NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f32_relaxed_batched_64x64_sg4, float, 64, 64, 4, true)
 
 #define NN_COOP_EPI_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                   \
+    NN_COOP_EPI_STAMP(NAME, ELEM, SM, SN, NSG, RELAXED, false)
+// STRICT: every epilogue operation rounds on its own (gemm_coop.h
+// `epi_*_strict`), so the result equals the separate scale, accumulate, bias
+// and activation passes bit for bit.
+#define NN_COOP_EPI_STAMP(NAME, ELEM, SM, SN, NSG, RELAXED, STRICT)         \
     kernel void NAME(device ELEM *A [[buffer(0)]],                             \
                      device ELEM *B [[buffer(1)]],                             \
                      device float *C [[buffer(2)]],                            \
@@ -513,10 +518,13 @@ NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f32_relaxed_batched_64x64_sg4, float, 
                      constant uint &act [[buffer(11)]],                        \
                      constant uint &has_bias [[buffer(12)]],                   \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, true>(                   \
+        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, true, STRICT>(           \
             A, B, C, M, N, K, tiles_n, tiles_m, tgpig,                         \
             has_bias ? bias : nullptr, alpha, beta, act);                      \
     }
+
+#define NN_COOP_EPI_STRICT_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)            \
+    NN_COOP_EPI_STAMP(NAME, ELEM, SM, SN, NSG, RELAXED, true)
 
 /// f16 operands with f32 accumulate. Same cooperative machinery as bf16 — the
 /// element type is a template parameter — so this is an instantiation, not a
@@ -534,6 +542,11 @@ NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi_64x64_sg4, bfloat,  64, 64, 4
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,         float, 128, 64, 4, true)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f16_f32_epi_64x64_sg4,          half,  64, 64, 4, false)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi_64x64_sg4,      float,  64, 64, 4, true)
+// Exact-f32 products (RELAXED=false, the plain f32 kernels' descriptor) with
+// the same register-accumulator epilogue. `gemm_epilogue` routes exact f32
+// here (gemm.rs `epi_exact_f32_kernel`).
+NN_COOP_EPI_STRICT_KERNEL(matmul2d_tensorops_f32_exact_epi,                float, 128, 64, 4, false)
+NN_COOP_EPI_STRICT_KERNEL(matmul2d_tensorops_f32_exact_epi_64x64_sg4,      float,  64, 64, 4, false)
 
 /// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
 /// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched

@@ -267,6 +267,22 @@ static inline float gemm_apply_activation(float v, GemmActivation act) {
     }
 }
 
+// The strict epilogue's arithmetic, one rounding per operation. The module
+// compiles with fast math, whose contraction fuses `p * alpha + beta * prev`
+// into an fma (one rounding where the separate scale, accumulate and bias
+// passes round each step: measured 1 ulp apart at alpha = 0.7, beta = 0.3).
+// `contract(off)` keeps these expressions as written, and they live in their
+// own functions so it holds wherever they inline.
+#pragma clang fp contract(off)
+static inline float epi_scale_strict(float p, float alpha) { return p * alpha; }
+static inline float epi_axpby_strict(float p, float alpha, float beta, float prev) {
+    const float scaled = p * alpha;
+    const float carried = beta * prev;
+    return scaled + carried;
+}
+static inline float epi_add_strict(float v, float x) { return v + x; }
+#pragma clang fp contract(fast)
+
 /// One tile: zero → run → [ACCUM: + C] / [EPILOGUE] → store, on `op`'s
 /// cooperative destination for the views `tA`, `tB`, `tC`. `INTERIOR` says
 /// which view family they are, for the bias view built the same way.
@@ -277,7 +293,7 @@ static inline float gemm_apply_activation(float v, GemmActivation act) {
 /// bias)`; `beta * C_prev` reuses the same trick (a second cooperative tensor
 /// loaded from C, combined in registers), so C is read once and written once
 /// rather than round-tripped per term.
-template <bool ACCUM, bool EPILOGUE, bool INTERIOR, int SM, int SN, typename Op,
+template <bool ACCUM, bool EPILOGUE, bool INTERIOR, int SM, int SN, bool STRICT, typename Op,
           typename VA, typename VB, typename VC>
 inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC,
                       device const float *bias, int tx, int ty, int M, int N,
@@ -305,11 +321,17 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
             prevT.load(tC);
 #pragma clang loop unroll(full)
             for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                if (cT.is_valid_element(i)) cT[i] = cT[i] * alpha + beta * prevT[i];
+                if (cT.is_valid_element(i)) {
+                    if (STRICT) cT[i] = epi_axpby_strict(cT[i], alpha, beta, prevT[i]);
+                    else cT[i] = cT[i] * alpha + beta * prevT[i];
+                }
         } else if (alpha != 1.0f) {
 #pragma clang loop unroll(full)
             for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                if (cT.is_valid_element(i)) cT[i] *= alpha;
+                if (cT.is_valid_element(i)) {
+                    if (STRICT) cT[i] = epi_scale_strict(cT[i], alpha);
+                    else cT[i] *= alpha;
+                }
         }
         if (bias) {
             device float *b = const_cast<device float *>(bias);
@@ -323,7 +345,10 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
             }
 #pragma clang loop unroll(full)
             for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-                if (cT.is_valid_element(i)) cT[i] += biasT[i];
+                if (cT.is_valid_element(i)) {
+                    if (STRICT) cT[i] = epi_add_strict(cT[i], biasT[i]);
+                    else cT[i] += biasT[i];
+                }
         }
         if (act != GEMM_ACT_NONE) {
 #pragma clang loop unroll(full)
@@ -340,7 +365,7 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
 /// Interior tiles use offset pointer tensors; edges the bounds-checked slice
 /// path. `bias`, `alpha`, `beta` and `act` are read only with `EPILOGUE`.
 template <typename ElemT, int SM, int SN, int NSG, bool TRANS_A, bool TRANS_B,
-          bool RELAXED, bool ACCUM, bool EPILOGUE, typename Walk>
+          bool RELAXED, bool ACCUM, bool EPILOGUE, typename Walk, bool STRICT = false>
 inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
                     uint M, uint N, uint K, uint tiles_n, uint tiles_m, uint tgpig,
                     device const float *bias, float alpha, float beta, uint act) {
@@ -359,13 +384,13 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
         auto tA = gemm_a<TRANS_A>::template interior<SM>(A, (int)M, (int)K, ty);
         auto tB = gemm_b<TRANS_B>::template interior<SN>(B, (int)N, (int)K, tx);
         auto tC = gemm_c_interior<SM, SN>(C, (int)N, tx, ty, (int)N);
-        coop_tile<ACCUM, EPILOGUE, true, SM, SN>(op, tA, tB, tC, bias, tx, ty, (int)M,
+        coop_tile<ACCUM, EPILOGUE, true, SM, SN, STRICT>(op, tA, tB, tC, bias, tx, ty, (int)M,
                                                  (int)N, alpha, beta, act);
     } else {
         auto tA = gemm_a<TRANS_A>::edge(A, (int)M, (int)K, ty);
         auto tB = gemm_b<TRANS_B>::edge(B, (int)N, (int)K, tx);
         auto tC = gemm_c_edge(C, (int)M, (int)N, tx, ty, (int)N);
-        coop_tile<ACCUM, EPILOGUE, false, SM, SN>(op, tA, tB, tC, bias, tx, ty, (int)M,
+        coop_tile<ACCUM, EPILOGUE, false, SM, SN, STRICT>(op, tA, tB, tC, bias, tx, ty, (int)M,
                                                   (int)N, alpha, beta, act);
     }
 }

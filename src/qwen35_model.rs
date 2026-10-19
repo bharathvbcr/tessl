@@ -89,9 +89,10 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::config_json::{self, field, float};
 use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
-use crate::json::{self, Json, NumForm, Syntax};
+use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
@@ -189,48 +190,11 @@ impl Qwen35Config {
     /// `rope_parameters.mrope_*` (text positions are one stream, so the
     /// multimodal sections do not apply).
     pub fn from_config_json(text: &str) -> Result<Self, String> {
-        const SYNTAX: Syntax = Syntax {
-            what: "config.json",
-            max_depth: 16,
-            uints_only: false,
-            literals: true,
-        };
-        let root = json::parse(text, SYNTAX)?;
-        if !matches!(root, Json::Object(_)) {
-            return Err("config.json: the root is not an object".into());
-        }
+        let root = config_json::parse_object(text)?;
         let c = root.get("text_config").unwrap_or(&root);
-        let field = |k: &str| c.get(k).ok_or_else(|| format!("config.json: missing {k:?}"));
-        let uint = |k: &str| -> Result<u32, String> {
-            match field(k)? {
-                Json::Num {
-                    form: NumForm::Uint,
-                    int: n,
-                    ..
-                } => u32::try_from(*n).map_err(|_| format!("config.json: {k} = {n} exceeds u32")),
-                v => Err(format!("config.json: {k} must be a non-negative integer, got {v:?}")),
-            }
-        };
-        let float = |v: &Json, k: &str| -> Result<f64, String> {
-            match v {
-                Json::Num { value, .. } => Ok(*value),
-                v => Err(format!("config.json: {k} must be a number, got {v:?}")),
-            }
-        };
-        let flag = |k: &str| -> Result<Option<bool>, String> {
-            match c.get(k) {
-                None => Ok(None),
-                Some(Json::Bool(b)) => Ok(Some(*b)),
-                Some(v) => Err(format!("config.json: {k} must be true or false, got {v:?}")),
-            }
-        };
-        let string = |k: &str| -> Result<Option<&str>, String> {
-            match c.get(k) {
-                None => Ok(None),
-                Some(Json::Str(s)) => Ok(Some(s.as_str())),
-                Some(v) => Err(format!("config.json: {k} must be a string, got {v:?}")),
-            }
-        };
+        let uint = |k: &str| config_json::uint(c, k);
+        let flag = |k: &str| config_json::flag(c, k);
+        let string = |k: &str| config_json::string(c, k);
 
         // `tie_word_embeddings`, at the root and in `text_config`: whichever
         // are present must be booleans and agree, and one must be present
@@ -368,10 +332,7 @@ impl Qwen35Config {
                 ));
             }
         }
-        let theta = float(
-            rope.get("rope_theta").ok_or("config.json: missing \"rope_theta\"")?,
-            "rope_theta",
-        )?;
+        let theta = float(field(rope, "rope_theta")?, "rope_theta")?;
         let factor = match rope.get("partial_rotary_factor") {
             Some(v) => float(v, "partial_rotary_factor")?,
             None => 1.0,
@@ -383,7 +344,7 @@ impl Qwen35Config {
                  number of rotated dims"
             ));
         }
-        let eps = float(field("rms_norm_eps")?, "rms_norm_eps")?;
+        let eps = float(field(c, "rms_norm_eps")?, "rms_norm_eps")?;
 
         let cfg = Self {
             hidden,

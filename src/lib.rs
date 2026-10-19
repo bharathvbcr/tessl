@@ -107,7 +107,7 @@
 //!
 //! # Kernels
 //!
-//! 38 Metal sources compile to 298 kernel entry points: RMSNorm, gated MLP
+//! 38 Metal sources compile to 300 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -239,6 +239,7 @@ pub mod bert;
 pub mod capi;
 pub mod capi_embedgemma2;
 pub mod cb_replay;
+mod config_json;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
@@ -272,6 +273,7 @@ pub mod qwen35_params;
 pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
+pub mod sq_norm;
 pub mod tensor;
 
 pub use cb_replay::{

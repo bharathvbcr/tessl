@@ -70,7 +70,7 @@ fn the_step_bounds_cover_the_measured_peaks_without_their_pool_term() {
             let bound = model.train_step_bytes(t as u32, mm);
             rows.push((format!("single bf16={bf16} t={t}"), peak, bound, cap));
         }
-        for lens in [vec![5usize, 17, 30], vec![64usize, 3, 40, 100]] {
+        for lens in [vec![5usize, 17, 30], vec![64usize, 3, 40, 100], vec![40, 17, 70, 33]] {
             let mut cu = vec![0u32];
             for l in &lens {
                 cu.push(cu.last().unwrap() + *l as u32);

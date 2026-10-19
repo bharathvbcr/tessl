@@ -19,6 +19,11 @@ use tessl::GpuRuntime;
 /// `src/qwen35_train.rs`, which measure what each phase allocates). Old ->
 /// new, per `(t, bf16 operands)`:
 ///
+/// The delta at these `t` is entirely the GDN forward transient term: the
+/// cross-entropy staging term does not bind in the step's max here, so only
+/// `cross_entropy_bound_equals_the_bytes_the_cross_entropy_allocates` (in
+/// `src/qwen35_train.rs`) guards it.
+///
 /// * (2, false): 2149185792 -> 2149284608
 /// * (2, true): 2150339840 -> 2150438656
 /// * (17, false): 2150411008 -> 2150509824

@@ -380,36 +380,22 @@ fn a_ragged_step_without_accumulate_overwrites_the_bank() {
     );
 }
 
-/// The step's memory bound counts what a ragged step allocates (each
-/// sequence's mixer at its own length, the row-wise buffers once), and the
-/// measured peak stays under it, on the f32 model (head in place) and the bf16
-/// tower (a bf16 bank, head by chunk).
+/// Many short sequences cost more than one long one: the ragged bound says
+/// so, on the f32 model (head in place) and the bf16 tower (head by chunk).
+///
+/// This test used to also measure the step's peak with the device-wide
+/// `current_allocated_bytes`, which counts what every other test thread in
+/// this binary allocates meanwhile, so it failed once under load. The
+/// measured-peak-under-bound check lives in `qwen35_train_bound_peak.rs`, one
+/// test in a binary of its own (which also covers this 4-sequence shape).
 #[test]
-fn a_ragged_steps_peak_stays_under_its_bound() {
+fn a_ragged_steps_bound_exceeds_the_single_sequence_bound() {
     let seqs = [seq(0, 40), seq(1, 17), seq(2, 70), seq(3, 33)];
     let (ids, cu) = pack(&seqs);
     for (bf16, mm) in [(false, GemmOperands::ExactF32), (true, GemmOperands::Bf16)] {
-        let (rt, model) = load_rt(bf16);
-        let bank = Qwen35Grads::zeros_like(&model).unwrap();
+        let (_rt, model) = load_rt(bf16);
         let in_place = !bf16;
         let bound = model.train_step_ragged_bytes(&cu, ids.len(), mm, in_place).unwrap();
-        let packed_only = model.train_step_bytes(ids.len() as u32, mm);
-        rt.synchronize().unwrap();
-        let before = rt.current_allocated_bytes();
-        rt.reset_peak_allocated_bytes();
-        model.train_step_ragged_into(&ids, &cu, mm, &bank, false).unwrap();
-        let peak = rt.peak_allocated_bytes().saturating_sub(before);
-        eprintln!("bf16 {bf16}: peak {peak} B, ragged bound {bound} B, one-sequence bound {packed_only} B");
-        assert!(peak <= bound, "peak {peak} over the ragged bound {bound}");
-        // The bound's last term is the pool's freelist cap, which dwarfs this
-        // tiny step; the peak is also under the bound without it, so the
-        // step's own bytes are what is counted, not the cap's slack.
-        let cap = rt.memory_info().pool_cache_cap as u64;
-        assert!(
-            peak <= bound - cap,
-            "peak {peak} over the bound's own part {}",
-            bound - cap
-        );
         // Many short sequences cost more than one long one: the bound says so.
         let one = model
             .train_step_ragged_bytes(&[0, ids.len() as u32], ids.len(), mm, in_place)

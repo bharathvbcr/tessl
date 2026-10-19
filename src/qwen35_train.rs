@@ -1813,6 +1813,7 @@ impl Qwen35Model {
         };
         // A mixer's bytes over the step's sequences (one, unless ragged).
         let over = |per: &dyn Fn(u32) -> u64| lens.unwrap_or(&[t]).iter().fold(0u64, |a, &n| a.saturating_add(per(n)));
+        let layer_fwd = |l: &Layer, output: bool| self.layer_fwd_step_bytes(l, t, mm, output, lens);
         // At most `t` distinct tokens: their f32 rows and their ids.
         let head_held = match head {
             // Untied, the gather's gradient is a second [vocab, hidden] tensor.
@@ -1830,26 +1831,12 @@ impl Qwen35Model {
             head_held,
             attn_ws,
         ]);
-        // A layer's forward: the row-wise part over `t` rows and the mixer
-        // over each sequence (the whole layer's, with `lens` of one).
-        let layer_fwd = |l: &Layer, output: bool| {
-            self.layer_fwd_bytes(l, t, mm, output)
-                .saturating_sub(self.mixer_fwd_bytes(l, t, mm))
-                .saturating_add(over(&|n| self.mixer_fwd_bytes(l, n, mm)))
-        };
         let fwd: Vec<u64> = self.layers.iter().map(|l| layer_fwd(l, true)).collect();
         let bwd: Vec<(u64, u64)> = self
             .layers
             .iter()
             .map(|l| {
-                let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
-                let (mg, mt) = self.mixer_bwd_bytes(l, t, mm);
-                let grads = grads
-                    .saturating_sub(mg)
-                    .saturating_add(over(&|n| self.mixer_bwd_bytes(l, n, mm).0));
-                let temps = temps
-                    .saturating_sub(mt)
-                    .saturating_add(over(&|n| self.mixer_bwd_bytes(l, n, mm).1));
+                let (grads, temps) = self.layer_bwd_step_bytes(l, t, mm, lens);
                 (grads, sum(&[layer_fwd(l, false), grads, temps, widened]))
             })
             .collect();
@@ -1915,6 +1902,29 @@ impl Qwen35Model {
         ]);
         let pool = self.rt.memory_info().pool_cache_cap as u64;
         sum(&[held, fwd_most.max(ce).max(backward_held.saturating_add(bwd_most)), pool])
+    }
+
+    /// A layer's forward over a step: the row-wise part over `t` rows and
+    /// the mixer over each sequence (the whole layer's, with `lens` of one).
+    fn layer_fwd_step_bytes(&self, l: &Layer, t: u32, mm: GemmOperands, output: bool, lens: Option<&[u32]>) -> u64 {
+        lens.unwrap_or(&[t]).iter().fold(
+            self.layer_fwd_bytes(l, t, mm, output)
+                .saturating_sub(self.mixer_fwd_bytes(l, t, mm)),
+            |a, &n| a.saturating_add(self.mixer_fwd_bytes(l, n, mm)),
+        )
+    }
+
+    /// A layer's backward (gradients, temporaries) over a step, the mixer's
+    /// part over each sequence as [`Self::layer_fwd_step_bytes`].
+    fn layer_bwd_step_bytes(&self, l: &Layer, t: u32, mm: GemmOperands, lens: Option<&[u32]>) -> (u64, u64) {
+        let (grads, temps) = self.layer_bwd_bytes(l, t, mm);
+        let (mg, mt) = self.mixer_bwd_bytes(l, t, mm);
+        lens.unwrap_or(&[t])
+            .iter()
+            .fold((grads.saturating_sub(mg), temps.saturating_sub(mt)), |(g, tm), &n| {
+                let (ng, nt) = self.mixer_bwd_bytes(l, n, mm);
+                (g.saturating_add(ng), tm.saturating_add(nt))
+            })
     }
 
     /// One layer's forward intermediates, with its GEMMs' temporaries;
@@ -2883,6 +2893,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::gdn_train::gdn_train_forward_transient_bytes;
     use crate::npy::read_npy;
     use crate::qwen35_model::Qwen35Config;
     use crate::safetensors::SafeTensors;
@@ -3003,11 +3014,432 @@ mod tests {
     }
 
     fn tiny_model() -> Qwen35Model {
+        tiny_model_as(Precision::F32)
+    }
+
+    fn tiny_model_as(precision: Precision) -> Qwen35Model {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
         let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
         let rt = GpuRuntime::new().unwrap();
         let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
-        Qwen35Model::load(&rt, &st, "model.", cfg, Precision::F32).unwrap()
+        Qwen35Model::load(&rt, &st, "model.", cfg, precision).unwrap()
+    }
+
+    /// The model's runtime allocation total ([`GpuRuntime::requested_alloc_bytes`]),
+    /// which counts every pool request at the pool's rounding whether the
+    /// freelist or the device served it, so recycled buffers hide nothing.
+    fn requested(model: &Qwen35Model) -> u64 {
+        model.rt.requested_alloc_bytes()
+    }
+
+    /// The three operand lanes a model can train on: an f32 model on exact
+    /// f32 and on bf16 operands, and a bf16-stored model (bf16 weights, the
+    /// only lane it accepts).
+    fn lanes() -> Vec<(&'static str, Precision, GemmOperands)> {
+        vec![
+            ("f32/exact", Precision::F32, GemmOperands::ExactF32),
+            ("f32/bf16-operands", Precision::F32, GemmOperands::Bf16),
+            ("bf16-model/bf16-operands", Precision::Bf16, GemmOperands::Bf16),
+        ]
+    }
+
+    /// One sequence (`None`) or the packed ragged sequences of a step.
+    fn shapes() -> Vec<(u32, Option<Vec<usize>>)> {
+        vec![
+            (17, None),
+            (64, None),
+            (300, None),
+            (22, Some(vec![5, 17])),
+            (110, Some(vec![30, 3, 64, 13])),
+        ]
+    }
+
+    /// What `train_layer_forward` allocated for layer `li` (as the step's
+    /// forward or the backward's rebuild calls it: `output` is whether it
+    /// makes the stream out), with the saved state it returns. The
+    /// attention workspace(s) and the input stream are made before the mark,
+    /// as the step makes them.
+    fn forward_alloc(
+        model: &Qwen35Model,
+        li: usize,
+        t: u32,
+        lens: Option<&[usize]>,
+        mm: GemmOperands,
+        output: bool,
+    ) -> (u64, Saved) {
+        let h = model.cfg.hidden as usize;
+        let resid_in = tensor(&model.rt, &[t as usize, h]).unwrap();
+        let spans: Option<Vec<(usize, usize)>> = lens.map(|l| {
+            l.iter()
+                .scan(0, |s, &n| {
+                    let r = (*s, n);
+                    *s += n;
+                    Some(r)
+                })
+                .collect()
+        });
+        let (single_ws, ragged_ws): (_, Vec<_>) = match &spans {
+            None => (model.attn_workspace(t).unwrap(), Vec::new()),
+            Some(sp) => (
+                None,
+                sp.iter()
+                    .map(|&(_, n)| model.attn_workspace(n as u32).unwrap())
+                    .collect(),
+            ),
+        };
+        let refs: Vec<Option<&AttnTrainWorkspace>> = ragged_ws.iter().map(Option::as_ref).collect();
+        let rr = spans.as_deref().map(|spans| RaggedRef { spans, attn_ws: &refs });
+        let before = requested(model);
+        let (saved, _out) = model
+            .train_layer_forward(
+                &model.layers[li],
+                resid_in,
+                t,
+                output,
+                mm,
+                single_ws.as_ref(),
+                rr.as_ref(),
+            )
+            .unwrap();
+        (requested(model) - before, saved)
+    }
+
+    /// The sequence lengths a step's mixers run over (one, unless ragged).
+    fn seq_lens(t: u32, lens: Option<&[usize]>) -> Vec<u32> {
+        lens.map_or(vec![t], |l| l.iter().map(|&n| n as u32).collect())
+    }
+
+    /// The pool bytes of a bf16 `[n, hidden]` tensor.
+    fn bf16_rows(model: &Qwen35Model, n: u32) -> u64 {
+        GpuRuntime::allocated_bytes_for(n as usize * model.cfg.hidden as usize * 2, BufferKind::Cold)
+    }
+
+    /// Signed `got - bound` a forward's cell must show, from the three
+    /// documented places the bound and the allocators part:
+    ///
+    /// * `+ gdn_train_forward_transient_bytes` per sequence of a GDN layer:
+    ///   the chunked kernel's normalized q and k, decay, beta and two C x C
+    ///   products, made and freed inside the call. The bound does not count
+    ///   them (the function's own doc says a bounding caller adds it), and
+    ///   `tests/qwen35_train_bytes_pin.rs` pins the bound without it.
+    /// * `+` the stream out (`output`): the next layer's input, which the
+    ///   bound leaves to `step_bytes`'s held part.
+    /// * `-` under bf16 operands, one bf16 `[n, hidden]` copy per sequence:
+    ///   each mixer's `w_in` GEMM is charged a copy of `x1` (`nn_scratch_bytes`)
+    ///   but reads the layer's one bf16 twin of `x1`, whose size the
+    ///   gate/up charge covers.
+    fn forward_slack(
+        model: &Qwen35Model,
+        li: usize,
+        t: u32,
+        lens: Option<&[usize]>,
+        mm: GemmOperands,
+        output: bool,
+    ) -> i64 {
+        let seqs = seq_lens(t, lens);
+        let mut s = 0i64;
+        if matches!(model.layers[li].mixer, Mixer::Gdn(_)) {
+            let g = model.cfg.gdn;
+            for &n in &seqs {
+                s += gdn_train_forward_transient_bytes(single_seq_gdn_dims(&g, n), g.k_heads()) as i64;
+            }
+        }
+        if output {
+            s += GpuRuntime::allocated_bytes_for(t as usize * model.cfg.hidden as usize * 4, BufferKind::Cold) as i64;
+        }
+        if mm == GemmOperands::Bf16 {
+            s -= seqs.iter().map(|&n| bf16_rows(model, n) as i64).sum::<i64>();
+        }
+        s
+    }
+
+    /// Every (lane, shape, layer, output) cell: the layer forward allocates
+    /// what `layer_fwd_step_bytes` says plus exactly [`forward_slack`].
+    #[test]
+    fn layer_forward_bound_equals_the_bytes_the_forward_allocates() {
+        let mut bad = Vec::new();
+        let mut cells = 0;
+        for (name, precision, mm) in lanes() {
+            let model = tiny_model_as(precision);
+            for (t, lens) in shapes() {
+                let lens32 = lens.as_ref().map(|l| l.iter().map(|&n| n as u32).collect::<Vec<_>>());
+                for li in 0..model.layers.len() {
+                    for output in [true, false] {
+                        let (got, _saved) = forward_alloc(&model, li, t, lens.as_deref(), mm, output);
+                        let bound = model.layer_fwd_step_bytes(&model.layers[li], t, mm, output, lens32.as_deref());
+                        let slack = forward_slack(&model, li, t, lens.as_deref(), mm, output);
+                        cells += 1;
+                        if got as i64 - bound as i64 != slack {
+                            bad.push(format!(
+                                "{name} t={t} lens={lens:?} layer {li} output={output}: allocated {got}, \
+                                 bound {bound}, expected got-bound {slack}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} of {cells} cells differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// What `train_layer_backward` allocated for layer `li`: its gradients
+    /// (fresh, as a bankless single-sequence step makes them; a ragged step
+    /// delivers into a bank, here an accumulating one, which still makes them
+    /// before adding) and its temporaries. The scratch and the rebuilt
+    /// forward's saved state are made before the mark, as the step makes
+    /// them.
+    fn backward_alloc(model: &Qwen35Model, li: usize, t: u32, lens: Option<&[usize]>, mm: GemmOperands) -> (u64, u64) {
+        let h = model.cfg.hidden as usize;
+        let layer = &model.layers[li];
+        let resid_in = tensor(&model.rt, &[t as usize, h]).unwrap();
+        let bank = Qwen35Grads::zeros_like(model).unwrap();
+        match lens {
+            None => {
+                let mut sc = model.scratch(t, model.attn_workspace(t).unwrap(), true).unwrap();
+                let ws = sc.mx.attn.as_ref().map(|a| &a.ws);
+                let (s, _) = model
+                    .train_layer_forward(layer, resid_in, t, false, mm, ws, None)
+                    .unwrap();
+                let before = requested(model);
+                let _g = model.train_layer_backward(layer, &s, &mut sc, mm, None, None).unwrap();
+                (requested(model) - before, 0)
+            }
+            Some(l) => {
+                let spans: Vec<(usize, usize)> = l
+                    .iter()
+                    .scan(0, |s, &n| {
+                        let r = (*s, n);
+                        *s += n;
+                        Some(r)
+                    })
+                    .collect();
+                let mut sc = model.scratch(t, None, false).unwrap();
+                let scratch: Vec<MixerScratch> = spans
+                    .iter()
+                    .map(|&(start, n)| {
+                        model
+                            .mixer_scratch(
+                                n as u32,
+                                model.attn_workspace(n as u32).unwrap(),
+                                true,
+                                sc.mx.dresid.view(&[n, h], start * h),
+                                sc.mx.dx.view(&[n, h], start * h),
+                            )
+                            .unwrap()
+                    })
+                    .collect();
+                let mut rs = RaggedScratch { spans, scratch };
+                let refs: Vec<Option<&AttnTrainWorkspace>> =
+                    rs.scratch.iter().map(|x| x.attn.as_ref().map(|a| &a.ws)).collect();
+                let rr = RaggedRef {
+                    spans: &rs.spans,
+                    attn_ws: &refs,
+                };
+                let (s, _) = model
+                    .train_layer_forward(layer, resid_in, t, false, mm, None, Some(&rr))
+                    .unwrap();
+                let before = requested(model);
+                let _g = model
+                    .train_layer_backward(layer, &s, &mut sc, mm, Some((&bank.layers[li], true)), Some(&mut rs))
+                    .unwrap();
+                let got = requested(model) - before;
+                // The matrices an f32 bank takes in place: once for the MLP's,
+                // and per sequence for the mixer's.
+                let inplace_of = |m: &Tensor| if m.dtype == DType::F32 { pooled_t(m) } else { 0 };
+                let bl = &bank.layers[li];
+                let mixer = match &bl.mixer {
+                    MixerGrads::Gdn(g) => inplace_of(&g.w_in) + inplace_of(&g.w_out),
+                    MixerGrads::Attn(g) => inplace_of(&g.w_in) + inplace_of(&g.w_out),
+                };
+                let inplace = inplace_of(&bl.down) + inplace_of(&bl.gate) + inplace_of(&bl.up) + mixer * l.len() as u64;
+                (got, inplace)
+            }
+        }
+    }
+
+    /// Signed `got - (grads + temps)` a backward cell must show:
+    ///
+    /// * `-` the f32 bank matrices the GEMMs write in place
+    ///   ([`Qwen35Model::weight_grad`]): the bound charges every gradient,
+    ///   as a step with a bf16 bank (fresh tensors, delivered after) makes
+    ///   them. Only the ragged cells run into a bank (`inplace`, which
+    ///   `backward_alloc` reads off the bank's own tensors).
+    /// * `-` under bf16 operands, the copies the bound charges per GEMM for
+    ///   an activation whose bf16 twin the backward already holds (the twin
+    ///   is allocated once, and charged once by the GEMM that makes it
+    ///   from the same tensor as a right operand): the `dresid` twin's second
+    ///   reader (down `nt`), the saved `x2` twin on gate and up `tn`, the
+    ///   `d_gate`/`d_up` twins' `nt` readers, and per sequence the mixer's
+    ///   saved `y` twin (`w_out` `tn`), `dresid` twin (`nt`), saved `x1` twin
+    ///   (`w_in` `tn`) and `dproj` twin (`nt`).
+    fn backward_slack(
+        model: &Qwen35Model,
+        li: usize,
+        t: u32,
+        lens: Option<&[usize]>,
+        mm: GemmOperands,
+        inplace: u64,
+    ) -> i64 {
+        let cfg = &model.cfg;
+        let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
+        let c = |elems: usize| GpuRuntime::allocated_bytes_for(elems * 2, BufferKind::Cold) as i64;
+        let (width, y_cols) = match model.layers[li].mixer {
+            Mixer::Gdn(_) => (cfg.gdn.width() as usize, cfg.gdn.value_dim() as usize),
+            Mixer::Attn(_) => (
+                cfg.attn.width() as usize,
+                (cfg.attn.q_heads() * cfg.attn.head_dim()) as usize,
+            ),
+        };
+        let mut s = -(inplace as i64);
+        if mm == GemmOperands::Bf16 {
+            let tu = t as usize;
+            let mut twins = 3 * c(tu * h) + 2 * c(tu * i);
+            for n in seq_lens(t, lens) {
+                let n = n as usize;
+                twins += c(n * y_cols) + 2 * c(n * h) + c(n * width);
+            }
+            s -= twins;
+        }
+        s
+    }
+
+    /// Every (lane, shape, layer) cell: the layer backward allocates what
+    /// `layer_bwd_step_bytes` says (gradients and temporaries) plus exactly
+    /// [`backward_slack`].
+    #[test]
+    fn layer_backward_bound_equals_the_bytes_the_backward_allocates() {
+        let mut bad = Vec::new();
+        let mut cells = 0;
+        for (name, precision, mm) in lanes() {
+            let model = tiny_model_as(precision);
+            for (t, lens) in shapes() {
+                let lens32 = lens.as_ref().map(|l| l.iter().map(|&n| n as u32).collect::<Vec<_>>());
+                for li in 0..model.layers.len() {
+                    let (got, inplace) = backward_alloc(&model, li, t, lens.as_deref(), mm);
+                    let (g, tm) = model.layer_bwd_step_bytes(&model.layers[li], t, mm, lens32.as_deref());
+                    let slack = backward_slack(&model, li, t, lens.as_deref(), mm, inplace);
+                    cells += 1;
+                    if got as i64 - (g + tm) as i64 != slack {
+                        bad.push(format!(
+                            "{name} t={t} lens={lens:?} layer {li}: allocated {got}, grads {g} + temps {tm}, \
+                             expected got-bound {slack}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} of {cells} cells differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// What the cross-entropy phase allocates for `t` supervised rows
+    /// ([`Supervise::Rows`] over every row, so its `dh` is made): the
+    /// workspace, `dh`, and the GEMMs' temporaries across every vocabulary
+    /// chunk. The model's `vocab` is set to `vocab` and the head is a
+    /// matching `[vocab, hidden]` tensor of the embedding's dtype, so a
+    /// vocabulary past [`CE_CHUNK`] runs several chunks; the hidden rows and
+    /// the head gradient are made before the mark (the step holds them).
+    fn ce_alloc(model: &mut Qwen35Model, t: u32, vocab: u32, mm: GemmOperands) -> u64 {
+        model.cfg.vocab = vocab;
+        let (rt, h) = (model.rt.clone(), model.cfg.hidden as usize);
+        let head_w = rt
+            .alloc_tensor_unzeroed(&[vocab as usize, h], model.embed.dtype)
+            .unwrap();
+        let xf = tensor(&rt, &[t as usize, h]).unwrap();
+        let dw = tensor(&rt, &[vocab as usize, h]).unwrap();
+        let rows: Vec<u32> = (0..t).collect();
+        let targets: Vec<u32> = (0..t).map(|i| i % vocab).collect();
+        let before = requested(model);
+        let chunk = CE_CHUNK.min(vocab);
+        let ws = CeWorkspace::new(&rt, t, model.cfg.hidden, chunk, head_w.dtype, mm).unwrap();
+        let dh = tensor(&rt, &[t as usize, h]).unwrap();
+        let grads = CeGrads {
+            dh: &dh,
+            dw: &dw,
+            scale: 1.0,
+        };
+        let hidden = CeHidden { rows: &xf, off: 0 };
+        cross_entropy_rows(
+            &rt,
+            hidden,
+            &head_w,
+            &rows,
+            &targets,
+            Reduction::Sum,
+            mm,
+            &ws,
+            Some(grads),
+        )
+        .unwrap();
+        requested(model) - before
+    }
+
+    /// The cross-entropy allocates `ce_bytes(batched)` plus exactly the two
+    /// `u32` staging buffers the bound omits, on one chunk and on several (a
+    /// vocabulary of one chunk, a chunk and a bit, two and a bit). Unbatched
+    /// the bound counts one chunk's GEMM temporaries, so it equals the batched
+    /// one on a single chunk and never exceeds it. (The exact lane's GEMM
+    /// temporaries are zero on a TensorOps device and the bf16 lane's are
+    /// not counted per chunk, so this test asserts no batched/unbatched gap.)
+    #[test]
+    fn cross_entropy_bound_equals_the_bytes_the_cross_entropy_allocates() {
+        let mut bad = Vec::new();
+        let mut cells = 0;
+        for (name, precision, mm) in lanes() {
+            let mut model = tiny_model_as(precision);
+            for vocab in [64u32, CE_CHUNK, CE_CHUNK + 40, 2 * CE_CHUNK + 40] {
+                for t in [2u32, 17, 64, 300] {
+                    let got = ce_alloc(&mut model, t, vocab, mm);
+                    let bound = model.ce_bytes(t, mm, true);
+                    let single = model.ce_bytes(t, mm, false);
+                    // The bound does not count the two `u32` staging buffers
+                    // (`max_rows` long each) that `cross_entropy_rows`'s
+                    // `upload_u32` of the rows and the targets makes
+                    // (`tests/qwen35_train_bytes_pin.rs` pins the bound without
+                    // them): the allocated bytes exceed it by exactly these.
+                    let staging = 2 * GpuRuntime::allocated_bytes_for(t as usize * 4, BufferKind::Cold);
+                    cells += 1;
+                    let chunks = vocab.div_ceil(CE_CHUNK);
+                    if got != bound + staging || single > bound || (chunks == 1 && single != bound) {
+                        bad.push(format!(
+                            "{name} vocab={vocab} t={t}: allocated {got}, batched bound {bound}, unbatched {single}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} of {cells} cells differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The attention workspace bound is the bytes `AttnTrainWorkspace::new`
+    /// allocates, for a step's length and for each ragged sequence's.
+    #[test]
+    fn attention_workspace_bound_equals_the_bytes_it_allocates() {
+        let model = tiny_model();
+        for n in [1u32, 2, 5, 17, 64, 110, 300] {
+            let dims = model.attn_dims(n);
+            let before = requested(&model);
+            let _ws = AttnTrainWorkspace::new(&model.rt, dims).unwrap();
+            assert_eq!(
+                requested(&model) - before,
+                AttnTrainWorkspace::allocated_bytes_for(dims),
+                "n={n}"
+            );
+        }
     }
 
     /// The scratch bounds equal the bytes the allocators made, exactly: the

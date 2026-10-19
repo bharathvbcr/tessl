@@ -797,6 +797,12 @@ pub struct GpuRuntime {
     /// Highest [`Self::current_allocated_bytes`] seen at a fresh pool
     /// allocation since creation or [`Self::reset_peak_allocated_bytes`].
     peak_allocated: AtomicU64,
+    /// Test-only: the pool-rounded bytes of every successful
+    /// [`Self::alloc_buffer_kind`] request since creation, whether the pool
+    /// served it fresh or from its freelist (so the freelist cannot hide an
+    /// allocation). Read with [`Self::requested_alloc_bytes`].
+    #[cfg(test)]
+    requested_alloc: AtomicU64,
     /// [`Self::set_poison_unzeroed`]: fill [`Self::alloc_tensor_unzeroed`]
     /// allocations with NaN bits instead of leaving what the pool last held.
     poison_unzeroed: AtomicBool,
@@ -1040,6 +1046,8 @@ impl GpuRuntime {
             self_weak: self_weak.clone(),
             memory_info: Mutex::new(mem_info),
             peak_allocated: AtomicU64::new(0),
+            #[cfg(test)]
+            requested_alloc: AtomicU64::new(0),
             poison_unzeroed: AtomicBool::new(false),
         });
         Ok(rt)
@@ -1128,6 +1136,15 @@ impl GpuRuntime {
         self.peak_allocated
             .load(Ordering::Acquire)
             .max(self.current_allocated_bytes())
+    }
+
+    /// Test-only running total of the pool-rounded bytes every pool
+    /// allocation request has taken ([`Self::allocated_bytes_for`] at each
+    /// [`Self::alloc_buffer_kind`]); difference two readings around the work
+    /// to get what it allocated, independent of recycling.
+    #[cfg(test)]
+    pub(crate) fn requested_alloc_bytes(&self) -> u64 {
+        self.requested_alloc.load(Ordering::Acquire)
     }
 
     /// Restart [`Self::peak_allocated_bytes`] from what is allocated now.
@@ -1837,6 +1854,9 @@ impl GpuRuntime {
         self.recycle_if_idle()?;
         let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
         let (buffer, from_pool) = BufferPool::alloc(&mut pool, &self.device, nbytes, kind)?;
+        #[cfg(test)]
+        self.requested_alloc
+            .fetch_add(Self::allocated_bytes_for(nbytes, kind), Ordering::AcqRel);
         if !from_pool {
             // The device's figure only rises at a fresh buffer, so sampling
             // here sees every high-water mark.

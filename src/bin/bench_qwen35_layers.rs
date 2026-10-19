@@ -53,8 +53,9 @@
 //! dispatch at these shapes (the attention Q/K norm + RoPE with bf16 targets and
 //! with a position buffer, the GELU-tanh gated act in f32 and bf16, the f32
 //! residual add, shared-prefix attention, the scaled embedding gather, answer
-//! scoring over an f32 and a bf16 table). Each is checked to have written finite,
-//! non-zero output before it is timed.
+//! scoring over an f32 and a bf16 table). Each is checked against a host reference
+//! (exact for the residual add and the gather, a derived bound for the rest)
+//! before it is timed.
 //!
 //! Before anything is timed, one forward runs and its final norm and logits
 //! must be finite and not all zero; there is no timing without it.
@@ -1042,27 +1043,6 @@ const LANE_VOCAB: usize = 4096;
 const PREFIX_LEN: usize = 256;
 const SUFFIX_LEN: usize = 64;
 
-/// The first `n` f32 of `b` finite and not all zero.
-fn written_f32(what: &str, b: &GpuBuffer, n: usize) -> Res<()> {
-    finite_f32(what, b, n)?;
-    if b.read_f32()[..n].iter().all(|&x| x == 0.0) {
-        return Err(format!("{what}: all zeros"));
-    }
-    Ok(())
-}
-
-/// The first `n` bf16 of `b` finite and not all zero.
-fn written_bf16(what: &str, b: &GpuBuffer, n: usize) -> Res<()> {
-    let bits = b.contents_u16()[..n].to_vec();
-    if let Some(i) = bits.iter().position(|&h| h & 0x7F80 == 0x7F80) {
-        return Err(format!("{what}: element {i} of {n} is non-finite or never written"));
-    }
-    if bits.iter().all(|&h| h & 0x7FFF == 0) {
-        return Err(format!("{what}: all zeros"));
-    }
-    Ok(())
-}
-
 /// An f32 buffer of `n` bounded values seeded with `seed`.
 fn bounded(rt: &Arc<GpuRuntime>, n: usize, seed: u64, scale: f32) -> Res<GpuBuffer> {
     buf(rt, &common::fill_affine(n, seed, scale, 0.0))
@@ -1102,12 +1082,172 @@ fn op_lane(
     Ok(())
 }
 
+/// The first `n` f32 of `b` on the host.
+fn host_f32(b: &GpuBuffer, n: usize) -> Vec<f32> {
+    b.read_f32()[..n].to_vec()
+}
+
+/// The first `n` bf16 of `b`, widened, on the host.
+fn host_bf16(b: &GpuBuffer, n: usize) -> Vec<f32> {
+    b.contents_u16()[..n]
+        .iter()
+        .map(|&h| tessl::tensor::bf16_bits_to_f32(h))
+        .collect()
+}
+
+/// `got` within `tol` of `want`; a NaN `got` fails.
+fn close(what: &str, i: usize, got: f32, want: f64, tol: f64) -> Res<()> {
+    if (f64::from(got) - want).abs() <= tol {
+        Ok(())
+    } else {
+        Err(format!("{what}[{i}] = {got}, expected {want} within {tol:.3e}"))
+    }
+}
+
+/// `gelu_pytorch_tanh(x) * up` in f64: the formula of `tessl_gelu_pytorch_tanh`.
+fn gelu_glu_ref(x: f32, up: f32) -> f64 {
+    let x = f64::from(x);
+    let inner = 0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh()) * f64::from(up)
+}
+
+/// Where Q, K and V sit in a fused projection row, for [`check_qk_norm_rope`].
+struct QkGeometry {
+    t: usize,
+    ld: usize,
+    q_off: usize,
+    k_off: usize,
+    v_off: usize,
+}
+
+/// `attn_qk_norm_rope*` against its definition on the host, at positions
+/// `0..t`: RMSNorm of each head with `(1 + w)`, partial RoPE on the first
+/// `ROTARY_DIM` dims (pairs `p`, `p + 32`, frequencies `nn::rope_inv_freq`, the
+/// angle formed in f64), and V stored as projected (no `v_norm`).
+///
+/// Bounds, per element: the device forms the angle in f32 and the norm's mean
+/// square by a 32-lane f32 sum, so the rotation is allowed
+/// `angle * 2^-22 + 2^-16` of `|x0| + |x1|` (the angle's f32 rounding, and the
+/// norm's sum error over 256 terms with margin) and an unrotated element
+/// `2^-16` of itself. `round` adds a store rounding of that relative size:
+/// `0` for f32 caches, `2^-8` for bf16 (half an ulp is `2^-9`).
+#[allow(clippy::too_many_arguments)]
+fn check_qk_norm_rope(
+    what: &str,
+    g: &QkGeometry,
+    proj: &[f32],
+    (qnw, knw): (&[f32], &[f32]),
+    (got_q, got_k, got_v): (&[f32], &[f32], &[f32]),
+    round: f64,
+) -> Res<()> {
+    let (hd, hq, hkv) = (HEAD_DIM as usize, Q_HEADS as usize, KV_HEADS as usize);
+    let (rot, half) = (ROTARY_DIM as usize, ROTARY_DIM as usize / 2);
+    let freq = nn::rope_inv_freq(half as u32, ROTARY_DIM, ROPE_THETA);
+    let row_ref = |src: &[f32], w: &[f32], pos: usize| -> Vec<(f64, f64)> {
+        let ss: f64 = src.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+        let inv = 1.0 / (ss / hd as f64 + f64::from(NORM_EPS)).sqrt();
+        let normed = |d: usize| f64::from(src[d]) * inv * (1.0 + f64::from(w[d]));
+        let mut out = vec![(0.0, 0.0); hd];
+        for p in 0..half {
+            let (x0, x1) = (normed(p), normed(p + half));
+            let angle = pos as f64 * f64::from(freq[p]);
+            let (s, c) = angle.sin_cos();
+            let tol = (angle * 2f64.powi(-22) + 2f64.powi(-16)) * (x0.abs() + x1.abs());
+            let (a, b) = (x0 * c - x1 * s, x1 * c + x0 * s);
+            out[p] = (a, tol + round * a.abs());
+            out[p + half] = (b, tol + round * b.abs());
+        }
+        for (d, o) in out.iter_mut().enumerate().skip(rot) {
+            let a = normed(d);
+            *o = (a, (2f64.powi(-16) + round) * a.abs());
+        }
+        out
+    };
+    for t in 0..g.t {
+        let row = &proj[t * g.ld..(t + 1) * g.ld];
+        for j in 0..hq {
+            let want = row_ref(&row[g.q_off + j * 2 * hd..][..hd], qnw, t);
+            for (d, &(w, tol)) in want.iter().enumerate() {
+                close(
+                    &format!("{what} q"),
+                    (t * hq + j) * hd + d,
+                    got_q[(t * hq + j) * hd + d],
+                    w,
+                    tol,
+                )?;
+            }
+        }
+        for h in 0..hkv {
+            let want = row_ref(&row[g.k_off + h * hd..][..hd], knw, t);
+            for (d, &(w, tol)) in want.iter().enumerate() {
+                let i = (t * hkv + h) * hd + d;
+                close(&format!("{what} k"), i, got_k[i], w, tol)?;
+            }
+            for d in 0..hd {
+                let i = (t * hkv + h) * hd + d;
+                let w = f64::from(row[g.v_off + h * hd + d]);
+                close(&format!("{what} v"), i, got_v[i], w, round * w.abs())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Causal shared-prefix attention in f64: query `tq` sits at position
+/// `PREFIX_LEN + tq` and reads the whole prefix and suffix slots `0..=tq`.
+#[allow(clippy::too_many_arguments)]
+fn prefix_attention_ref(q: &[f32], (pk, pv): (&[f32], &[f32]), (sk, sv): (&[f32], &[f32]), scale: f32) -> Vec<f64> {
+    let (hd, hq, hkv) = (HEAD_DIM as usize, Q_HEADS as usize, KV_HEADS as usize);
+    let (qd, kvd) = (hq * hd, hkv * hd);
+    let mut out = vec![0.0; SUFFIX_LEN * qd];
+    for tq in 0..SUFFIX_LEN {
+        for h in 0..hq {
+            let kvh = h / (hq / hkv);
+            let qv = &q[tq * qd + h * hd..][..hd];
+            let key = |j: usize| -> (&[f32], &[f32]) {
+                if j < PREFIX_LEN {
+                    (&pk[j * kvd + kvh * hd..][..hd], &pv[j * kvd + kvh * hd..][..hd])
+                } else {
+                    let s = j - PREFIX_LEN;
+                    (&sk[s * kvd + kvh * hd..][..hd], &sv[s * kvd + kvh * hd..][..hd])
+                }
+            };
+            let n = PREFIX_LEN + tq + 1;
+            let scores: Vec<f64> = (0..n)
+                .map(|j| {
+                    let k = key(j).0;
+                    f64::from(scale)
+                        * qv.iter()
+                            .zip(k)
+                            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                            .sum::<f64>()
+                })
+                .collect();
+            let mx = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let w: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+            let z: f64 = w.iter().sum();
+            for (j, wj) in w.iter().enumerate() {
+                let v = key(j).1;
+                for d in 0..hd {
+                    out[tq * qd + h * hd + d] += wj / z * f64::from(v[d]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The single ops the layer stack does not reach at this model's own shapes
 /// but a consumer's own forward does, each through its public entry point at
 /// `t` rows: the attention Q/K norm + RoPE in its bf16-target and
 /// position-buffer forms, the GELU-tanh gated MLP act in both output dtypes,
 /// the exact-f32 residual add, shared-prefix attention, the scaled embedding
 /// gather and the answer-scoring head over an f32 and a bf16 table.
+///
+/// Every lane is checked against a host reference before it is timed:
+/// the residual add and the embedding gather exactly; the others within a
+/// bound derived at the check (see [`check_qk_norm_rope`]); no lane is left
+/// at finite and non-zero alone.
 fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
     let t32 = t as u32;
     println!();
@@ -1130,6 +1270,15 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
         bounded(rt, HEAD_DIM as usize, 72, 0.3)?,
         bounded(rt, HEAD_DIM as usize, 73, 0.3)?,
     );
+    let geometry = QkGeometry {
+        t,
+        ld: width,
+        q_off: layout.q_off() as usize,
+        k_off: layout.k_off() as usize,
+        v_off: layout.v_off() as usize,
+    };
+    let proj_host = host_f32(&proj, t * width);
+    let norms = (host_f32(&qnw, HEAD_DIM as usize), host_f32(&knw, HEAD_DIM as usize));
     {
         let (q_out, k_cache, v_cache) = (
             poisoned(rt, t * qd * 2)?,
@@ -1153,9 +1302,18 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
             iters,
             "attn_qk_norm_rope_bf16",
             || {
-                written_bf16("q_out", &q_out, t * qd)?;
-                written_bf16("k_cache", &k_cache, t * kvd)?;
-                written_bf16("v_cache", &v_cache, t * kvd)
+                check_qk_norm_rope(
+                    "attn_qk_norm_rope_bf16",
+                    &geometry,
+                    &proj_host,
+                    (&norms.0, &norms.1),
+                    (
+                        &host_bf16(&q_out, t * qd),
+                        &host_bf16(&k_cache, t * kvd),
+                        &host_bf16(&v_cache, t * kvd),
+                    ),
+                    2f64.powi(-8),
+                )
             },
             || {
                 qwen35::attn_qk_norm_rope_columns(
@@ -1193,9 +1351,18 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
             iters,
             "attn_qk_norm_rope_posbuf",
             || {
-                written_f32("q_out", &q_out, t * qd)?;
-                written_f32("k_cache", &k_cache, t * kvd)?;
-                written_f32("v_cache", &v_cache, t * kvd)
+                check_qk_norm_rope(
+                    "attn_qk_norm_rope_posbuf",
+                    &geometry,
+                    &proj_host,
+                    (&norms.0, &norms.1),
+                    (
+                        &host_f32(&q_out, t * qd),
+                        &host_f32(&k_cache, t * kvd),
+                        &host_f32(&v_cache, t * kvd),
+                    ),
+                    0.0,
+                )
             },
             || {
                 qwen35::attn_qk_norm_rope_posbuf(
@@ -1213,9 +1380,13 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
         )?;
     }
 
-    // The gated MLP activation (GELU-tanh) over the gate and up windows.
+    // The gated MLP activation (GELU-tanh) over the gate and up windows. Bound
+    // per element: the tanh is `precise::` and the cubic and product are a few
+    // f32 operations, so `1 + tanh` is allowed 2e-6 absolute (16 ulps at 1) on
+    // `0.5 |x up|`, plus `2^-23` of the result; a bf16 store adds `2^-8` of it.
     let gate = bounded(rt, t * INTER, 74, 1.0)?;
     let up = bounded(rt, t * INTER, 75, 1.0)?;
+    let (gate_host, up_host) = (host_f32(&gate, t * INTER), host_f32(&up, t * INTER));
     for (dtype, name, bytes) in [
         (DType::F32, "gelu_tanh_glu_f32", 4usize),
         (DType::BF16, "gelu_tanh_glu_bf16", 2),
@@ -1226,9 +1397,18 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
             t,
             iters,
             name,
-            || match dtype {
-                DType::BF16 => written_bf16("out", &out, t * INTER),
-                _ => written_f32("out", &out, t * INTER),
+            || {
+                let (got, round) = match dtype {
+                    DType::BF16 => (host_bf16(&out, t * INTER), 2f64.powi(-8)),
+                    _ => (host_f32(&out, t * INTER), 0.0),
+                };
+                for (i, &g) in got.iter().enumerate() {
+                    let want = gelu_glu_ref(gate_host[i], up_host[i]);
+                    let tol =
+                        0.5 * f64::from(gate_host[i] * up_host[i]).abs() * 2e-6 + want.abs() * (2f64.powi(-23) + round);
+                    close(name, i, g, want, tol)?;
+                }
+                Ok(())
             },
             || {
                 qwen35::gated_act(
@@ -1247,17 +1427,25 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
         )?;
     }
 
-    // The residual add after an exact-f32 output projection. `y` is small, so
-    // the repeated adds of the timed runs stay finite.
+    // The residual add after an exact-f32 output projection: one IEEE add per
+    // element, so exact. `y` is small, so the repeated adds of the timed runs
+    // stay finite.
     {
         let y = bounded(rt, t * HIDDEN, 76, 1e-3)?;
         let resid = bounded(rt, t * HIDDEN, 77, 1.0)?;
+        let (y_host, before) = (host_f32(&y, t * HIDDEN), host_f32(&resid, t * HIDDEN));
         op_lane(
             rt,
             t,
             iters,
             "residual_add_f32",
-            || written_f32("resid", &resid, t * HIDDEN),
+            || {
+                let got = host_f32(&resid, t * HIDDEN);
+                match (0..got.len()).find(|&i| got[i] != before[i] + y_host[i]) {
+                    Some(i) => Err(format!("resid[{i}] = {}, expected {}", got[i], before[i] + y_host[i])),
+                    None => Ok(()),
+                }
+            },
             || {
                 qwen35::residual_add(
                     rt,
@@ -1271,16 +1459,18 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
     }
 
     // Shared-prefix attention: SUFFIX_LEN queries after a PREFIX_LEN prefix.
+    // Bound per element: an f32 online softmax over at most 320 keys, `1e-5`
+    // absolute (V is in +-1) and `1e-4` of the result.
     {
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let q = bounded(rt, SUFFIX_LEN * qd, 78, scale)?;
+        let q = bounded(rt, SUFFIX_LEN * qd, 78, 1.0)?;
         let (pk, pv) = (
-            bounded(rt, PREFIX_LEN * kvd, 79, scale)?,
-            bounded(rt, PREFIX_LEN * kvd, 80, scale)?,
+            bounded(rt, PREFIX_LEN * kvd, 79, 1.0)?,
+            bounded(rt, PREFIX_LEN * kvd, 80, 1.0)?,
         );
         let (sk, sv) = (
-            bounded(rt, SUFFIX_LEN * kvd, 81, scale)?,
-            bounded(rt, SUFFIX_LEN * kvd, 82, scale)?,
+            bounded(rt, SUFFIX_LEN * kvd, 81, 1.0)?,
+            bounded(rt, SUFFIX_LEN * kvd, 82, 1.0)?,
         );
         let suffix_len = buf_u32(rt, &[SUFFIX_LEN as u32])?;
         let q_pos = buf_u32(rt, &[PREFIX_LEN as u32])?;
@@ -1293,12 +1483,24 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
             window: 0,
             scale,
         };
+        let want = prefix_attention_ref(
+            &host_f32(&q, SUFFIX_LEN * qd),
+            (&host_f32(&pk, PREFIX_LEN * kvd), &host_f32(&pv, PREFIX_LEN * kvd)),
+            (&host_f32(&sk, SUFFIX_LEN * kvd), &host_f32(&sv, SUFFIX_LEN * kvd)),
+            scale,
+        );
         op_lane(
             rt,
             t,
             iters,
             "attn_prefix_rows",
-            || written_f32("o", &o, SUFFIX_LEN * qd),
+            || {
+                let got = host_f32(&o, SUFFIX_LEN * qd);
+                for (i, &w) in want.iter().enumerate() {
+                    close("attn_prefix_rows o", i, got[i], w, 1e-5 + 1e-4 * w.abs())?;
+                }
+                Ok(())
+            },
             || {
                 qwen35::attn_prefix_rows(
                     rt,
@@ -1320,23 +1522,37 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
         )?;
     }
 
-    // The scaled embedding gather (bf16 table) and the answer scoring head.
+    // The scaled embedding gather (bf16 table): the exact widening times one
+    // f32 multiply, so exact.
     let table_bf = bounded_bf16(rt, LANE_VOCAB * HIDDEN, 83, 0.05)?;
     let table_f32 = bounded(rt, LANE_VOCAB * HIDDEN, 84, 0.05)?;
     {
         let ids: Vec<u32> = (0..t32).map(|i| (i * 7919) % LANE_VOCAB as u32).collect();
-        let ids = buf_u32(rt, &ids)?;
+        let ids_buf = buf_u32(rt, &ids)?;
+        let table_host = host_bf16(&table_bf, LANE_VOCAB * HIDDEN);
+        let scale = (HIDDEN as f32).sqrt();
         let out = poisoned(rt, t * HIDDEN * 4)?;
         op_lane(
             rt,
             t,
             iters,
             "embed_rows_bf16_scaled",
-            || written_f32("out", &out, t * HIDDEN),
+            || {
+                let got = host_f32(&out, t * HIDDEN);
+                for (r, &id) in ids.iter().enumerate() {
+                    for c in 0..HIDDEN {
+                        let want = table_host[id as usize * HIDDEN + c] * scale;
+                        if got[r * HIDDEN + c] != want {
+                            return Err(format!("out[{r}, {c}] = {}, expected {want}", got[r * HIDDEN + c]));
+                        }
+                    }
+                }
+                Ok(())
+            },
             || {
                 qwen35::embed_rows_scaled(
                     rt,
-                    &ids,
+                    &ids_buf,
                     t32,
                     qwen35::LmHead {
                         weight: &table_bf,
@@ -1344,26 +1560,39 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
                         vocab: LANE_VOCAB as u32,
                     },
                     HIDDEN as u32,
-                    (HIDDEN as f32).sqrt(),
+                    scale,
                     &out,
                 )
             },
         )?;
     }
+
+    // Answer scoring. Logits against a host RMSNorm and dot products in f64,
+    // within `1e-4` of the sum of the dot's absolute terms (times the norm's
+    // scale): the device splits the 2048-term dot over 32 lanes and the mean
+    // square over a threadgroup in f32, so `(64 + 2048 / 2 + 8) * 2^-24` =
+    // 6.6e-5 with margin. Log-probabilities against a host log-softmax of the
+    // device's own logits, within 2e-5 (a few ulps of fast `exp` and `log`).
     {
         const N_SLOTS: usize = 4;
         const N_ANSWERS: usize = 4;
         let hidden = bounded(rt, t * HIDDEN, 85, 1.0)?;
-        let slots: Vec<u32> = (0..N_SLOTS as u32)
+        let slot_rows: Vec<u32> = (0..N_SLOTS as u32)
             .map(|s| (s + 1) * (t32 / (N_SLOTS as u32 + 1)))
             .collect();
-        let slots = buf_u32(rt, &slots)?;
-        let answers = buf_u32(rt, &[3, 1000, 2047, 4000])?;
+        let slots = buf_u32(rt, &slot_rows)?;
+        let answer_ids = [3u32, 1000, 2047, 4000];
+        let answers = buf_u32(rt, &answer_ids)?;
         let norm_w = bounded(rt, HIDDEN, 86, 0.3)?;
+        let (hidden_host, nw_host) = (host_f32(&hidden, t * HIDDEN), host_f32(&norm_w, HIDDEN));
         for (head, dtype, name) in [
             (&table_f32, DType::F32, "score_rows_f32"),
             (&table_bf, DType::BF16, "score_rows_bf16"),
         ] {
+            let head_host = match dtype {
+                DType::BF16 => host_bf16(head, LANE_VOCAB * HIDDEN),
+                _ => host_f32(head, LANE_VOCAB * HIDDEN),
+            };
             let (logits, logprobs) = (
                 poisoned(rt, N_SLOTS * N_ANSWERS * 4)?,
                 poisoned(rt, N_SLOTS * N_ANSWERS * 4)?,
@@ -1374,8 +1603,36 @@ fn op_lanes(rt: &Arc<GpuRuntime>, t: usize, iters: usize) -> Res<()> {
                 iters,
                 name,
                 || {
-                    written_f32("logits", &logits, N_SLOTS * N_ANSWERS)?;
-                    written_f32("logprobs", &logprobs, N_SLOTS * N_ANSWERS)
+                    let (lg, lp) = (
+                        host_f32(&logits, N_SLOTS * N_ANSWERS),
+                        host_f32(&logprobs, N_SLOTS * N_ANSWERS),
+                    );
+                    for (s, &row) in slot_rows.iter().enumerate() {
+                        let h = &hidden_host[row as usize * HIDDEN..][..HIDDEN];
+                        let ss: f64 = h.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+                        let inv = 1.0 / (ss / HIDDEN as f64 + f64::from(NORM_EPS)).sqrt();
+                        for (a, &id) in answer_ids.iter().enumerate() {
+                            let e = &head_host[id as usize * HIDDEN..][..HIDDEN];
+                            let terms =
+                                (0..HIDDEN).map(|d| f64::from(h[d]) * (f64::from(nw_host[d]) + 1.0) * f64::from(e[d]));
+                            let (dot, abs): (f64, f64) = terms.fold((0.0, 0.0), |(s, m), x| (s + x, m + x.abs()));
+                            let i = s * N_ANSWERS + a;
+                            close(&format!("{name} logits"), i, lg[i], dot * inv, 1e-4 * abs * inv + 1e-7)?;
+                        }
+                        let row_lg = &lg[s * N_ANSWERS..][..N_ANSWERS];
+                        let mx = row_lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let lse = f64::from(mx)
+                            + row_lg
+                                .iter()
+                                .map(|&l| (f64::from(l) - f64::from(mx)).exp())
+                                .sum::<f64>()
+                                .ln();
+                        for a in 0..N_ANSWERS {
+                            let i = s * N_ANSWERS + a;
+                            close(&format!("{name} logprobs"), i, lp[i], f64::from(lg[i]) - lse, 2e-5)?;
+                        }
+                    }
+                    Ok(())
                 },
                 || {
                     qwen35::score_answer_rows(

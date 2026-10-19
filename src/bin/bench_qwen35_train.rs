@@ -1067,7 +1067,7 @@ fn dense_parameter_tensors(rt: &Arc<GpuRuntime>, model: &Qwen35Model) -> Res<Vec
 fn require_finite_nonzero(what: &str, ts: &[Tensor]) -> Res<()> {
     let mut any = false;
     for (i, t) in ts.iter().enumerate() {
-        for x in t.buffer.read_f32() {
+        for x in t.read_f32()? {
             if !x.is_finite() {
                 return Err(format!("--adamw-matrix: {what}: tensor {i} holds {x}"));
             }
@@ -1081,24 +1081,98 @@ fn require_finite_nonzero(what: &str, ts: &[Tensor]) -> Res<()> {
     }
 }
 
-/// Read every parameter out and write it back: the copies a checkpoint save and
+/// Every element of `ts`, host side, one vector per tensor.
+fn host_values(ts: &[Tensor]) -> Res<Vec<Vec<f32>>> {
+    ts.iter().map(Tensor::read_f32).collect()
+}
+
+/// Overwrite `ts` with `vals`.
+fn set_host_values(ts: &[Tensor], vals: &[Vec<f32>]) -> Res<()> {
+    ts.iter().zip(vals).try_for_each(|(t, v)| t.write_f32(v))
+}
+
+/// `vals` doubled: exact in f32 and in bf16 (an exponent step), and different
+/// from `vals` wherever it is non-zero, so a write that did nothing shows.
+fn doubled(vals: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    vals.iter().map(|v| v.iter().map(|x| 2.0 * x).collect()).collect()
+}
+
+/// The first element of `got` that is not `want` (by `==`, so a zero's sign is
+/// not compared), or within `tol(want)` of it.
+fn first_mismatch(got: &[Vec<f32>], want: &[Vec<f32>], tol: impl Fn(f32) -> f32) -> Option<String> {
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        if let Some(j) = (0..w.len()).find(|&j| {
+            let d = (g[j] - w[j]).abs();
+            d.is_nan() || d > tol(w[j])
+        }) {
+            return Some(format!("tensor {i} element {j}: read back {}, wrote {}", g[j], w[j]));
+        }
+    }
+    None
+}
+
+/// Write every parameter and read it back: the copies a checkpoint save and
 /// restore make (`qwen35_window_copy_*`, f32 to f32 on an f32 tower, f32 to bf16
-/// on a bf16 one).
+/// on a bf16 one). The values written are the parameters doubled, so a
+/// `write_parameters` that wrote nothing reads back the old values and fails; the
+/// originals are written back afterwards. Doubling is exact in both storages, so
+/// the read-back must equal what was written.
 fn parameter_roundtrip(rt: &Arc<GpuRuntime>, model: &Qwen35Model, label: &str) -> Res<()> {
     let dense = dense_parameter_tensors(rt, model)?;
     model.read_parameters(&dense)?;
     require_finite_nonzero(&format!("{label} parameters"), &dense)?;
+    let original = host_values(&dense)?;
+    let wrote = doubled(&original);
+    set_host_values(&dense, &wrote)?;
+    model.write_parameters(&dense)?;
+    let back = dense_parameter_tensors(rt, model)?;
+    model.read_parameters(&back)?;
+    if let Some(e) = first_mismatch(&host_values(&back)?, &wrote, |_| 0.0) {
+        return Err(format!("--adamw-matrix: {label} write_parameters: {e}"));
+    }
+    set_host_values(&dense, &original)?;
     model.write_parameters(&dense)
 }
 
-/// Read both of `state`'s moments out and write them back: the 8-bit moments'
-/// decode and encode kernels (`qwen35_moment_q8_*`), and a bf16 moment's copy.
+/// Write both of `state`'s moments (doubled) and read them back: the 8-bit
+/// moments' decode and encode kernels (`qwen35_moment_q8_*`), and a bf16
+/// moment's copy. Stored f32 and bf16 moments must read back what was written
+/// (a doubled bf16 value is exact). An 8-bit moment is quantized, so it reads
+/// back within the code's step of the block's maximum: first moment
+/// `s (q/127)|q/127|` is within `s (1/127 + 1/(4 * 127^2))` < 0.01 `s` of the
+/// value, and second moment `v = (s (q/255)^2)^2` within 0.008 `s^2` (the step
+/// of `u = sqrt(v)` is 0.0040 `s`, doubled by the square), `s` taken as the
+/// maximum over the whole tensor, which is at least every block's. And the
+/// documented property of the kernel (`qwen35_train_storage.metal`): encoding a
+/// decoded block gives the same codes and scale back, so writing what was read
+/// and reading again changes nothing.
 fn moment_roundtrip(rt: &Arc<GpuRuntime>, model: &Qwen35Model, state: &mut AdamW, label: &str) -> Res<()> {
+    let q8 = state.config().moments == MomentStorage::Block8;
     let dense = dense_parameter_tensors(rt, model)?;
     for which in [Moment::First, Moment::Second] {
+        let what = format!("{label} {which:?} moment");
         model.read_adamw_moment(state, which, &dense)?;
-        require_finite_nonzero(&format!("{label} {which:?} moment"), &dense)?;
+        require_finite_nonzero(&what, &dense)?;
+        let wrote = doubled(&host_values(&dense)?);
+        set_host_values(&dense, &wrote)?;
         model.write_adamw_moment(state, which, &dense)?;
+        let back = dense_parameter_tensors(rt, model)?;
+        model.read_adamw_moment(state, which, &back)?;
+        let got = host_values(&back)?;
+        let peak = wrote.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
+        let bound = if q8 { 0.01 * peak } else { 0.0 };
+        if let Some(e) = first_mismatch(&got, &wrote, |_| bound) {
+            return Err(format!("--adamw-matrix: {what} write_adamw_moment: {e}"));
+        }
+        // Idempotent: write what was read, read again.
+        model.write_adamw_moment(state, which, &back)?;
+        let again = dense_parameter_tensors(rt, model)?;
+        model.read_adamw_moment(state, which, &again)?;
+        if let Some(e) = first_mismatch(&host_values(&again)?, &got, |_| 0.0) {
+            return Err(format!(
+                "--adamw-matrix: {what} is not stable under read-then-write: {e}"
+            ));
+        }
     }
     Ok(())
 }

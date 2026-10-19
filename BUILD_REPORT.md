@@ -1,6 +1,48 @@
-# BUILD_REPORT — GitPulse backlog, waves 13–16 (2026-10-17/18)
+# BUILD_REPORT — GitPulse backlog, waves 13–17 (2026-10-17/18)
 
-`main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `a37a0c2` → **`bf091a2`**, all fast-forwards, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path).
+`main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `a37a0c2` → `bf091a2` → `0819992` (this report) → **`41d8866`**. Every move was a fast-forward, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path). ojas independently verified `bf091a2`: Metal 124/124 and ojas-qwen35 14/14, with its clip path switched to `parts_words`.
+
+## Waves 16C/D and 17, landed at `41d8866`
+
+**Gates**, run after the last merge:
+- fmt, release build, clippy ×2, doc.
+- Hosted (selection and completeness).
+- Dialect lint, kernel IR.
+- Emulator host contract plus the exact, model and fast-math cases.
+- Comparator 15, torch host 110, Go unit.
+- 979 device tests across 78 binaries, serial, release, plus `--lib`.
+- Python `test_qwen35` 21.
+- Two hosted-manifest fixes (new tests' selection).
+
+| Card | Wave | Result |
+|---|---|---|
+| ft-afb1c42d near-copies remainder | 16 C | gemm `_into` casts go through `cast_between`. They are bit-identical on all 65,536 bf16/f16 patterns and 393,216 f32 patterns recorded before the change. One `single_seq_gdn_dims`. Two bound tests: an exact structural test that the scratch bounds equal the bytes the allocators make, and a peak-vs-bound test. The adversarial pass showed the peak-vs-bound test alone missed a dropped `3·t·i` mirror, which led to the structural test. Layer fwd/bwd and CE bounds are not covered exactly (their GEMM temporaries live in no struct). |
+| ft-c8e7726b config.json dedupe | 16 D | One private `config_json` reader for BERT and Qwen3.5. Drift fixed: BERT silently read a non-literal `sinusoidal_pos_embds` as false, so learned positions ran on a sinusoidal model, and it treated `position_embedding_type: null` as absolute. Both now refuse; these are the only error-text changes. No cached real config relied on the old leniency. EmbedGemma2 parsing is out of scope. |
+| ft-9e79d8be ragged training, API | 17 E | Owner decision: new entry points. `tessl_qwen35_train_step_ragged` (C, ABI 12→13 additive; per-sequence losses as f64 to match the Rust API) and `tessl_torch` `Qwen35.train_step_ragged`. Every boundary attack refuses without writing outputs. Nothing pins ABI 12. |
+| ft-1a0f8c18 AC5 RMSNorm convention | 17 F | Owner decisions: `precise::rsqrt` for the RMSNorm and gated-norm forwards, and for the shared qk-norm row kernel in both directions, including EmbedGemma2's use. See the deltas below. |
+
+**ulp deltas from 17 F:**
+
+| Output | Change |
+|---|---|
+| RMSNorm forward | ≤ 2 ulp |
+| Gated-norm forward | ≤ 4 ulp |
+| qk forward | ≤ 42 ulp at eps 1e-12 |
+| qk backward dproj | ≤ 210 ulp at eps 1e-12 |
+| EmbedGemma2 ExactF32 embeddings | ~1e-3 relative |
+| Everything in bf16 | 0 |
+
+Accuracy against torch and f64 is unchanged within noise, and slightly better in several cases. One golden was re-pinned with old and new values recorded: the single-sequence training pin.
+
+An apparent "pre-existing flake" in that pin was a mis-measurement. The lane edited kernels during an in-flight cargo run. The pin was proven to move first at the lane's own commit, and 21 runs on `main` reproduced it.
+
+Follow-up for the owner: EmbedGemma2's own norms (eg2 text, vision and audio) are still fast rsqrt beside the now-precise qk-norm. That's inference-only, so it isn't a break.
+
+ft-c59ff950 `parts_words` landed in `bf091a2`, and ojas switched to it.
+
+**ojas verified `41d8866`** (run 9, ojas main 4123dfb): qwen35 CPU 42/42, Tape provider CPU 14/14 and Metal 5/5, clippy clean. Nothing moved numerically. `gpu_parity` was 9/10: the miss, `gpu_real_2b_single_step_matches_the_transformers_reference`, is environmental, because the disk cleanup deleted `tessl/target/qwen35_train_ref`. Regenerating it is a 17 GB CPU job that must run under the `mac_heavy` lock; the command has been handed to the owner.
+
+**Branches:** only `main` and the live eg2 session's fully merged `eg2/integrate` remain. Every deleted ref is under `refs/backup/2026-10-17-w14/`.
 
 ## How this run worked
 

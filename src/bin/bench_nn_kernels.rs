@@ -777,7 +777,8 @@ fn decode_lanes(rt: &Arc<GpuRuntime>, rows: &mut Vec<Row>, warmup: usize, iters:
     let tok = u32_buf(rt, &[u32::MAX])?;
     // One threadgroup reduces the whole row, so `n` is bounded by its lane count
     // (the full-vocabulary samplers are the multi-pass and one-pass argmax).
-    const SAMPLE_N: usize = 512;
+    // 256 is the largest valid n, so this lane sits on the boundary.
+    const SAMPLE_N: usize = 256;
     let run = || nn::softcap_sample(rt, &logits, &tok, &cap_buf, SAMPLE_N as u32);
     run()?;
     rt.synchronize()?;

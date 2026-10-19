@@ -1055,8 +1055,10 @@ fn bench_batch(rt: &Arc<GpuRuntime>, model: &Qwen35Model, b: BatchShape, operand
         })
         .collect();
     let at: Vec<u32> = [0, b.len / 3, b.len / 2, b.len - 2].iter().map(|&p| p as u32).collect();
-    let dh = tensor(rt, &[at.len(), HIDDEN], 7, 1e-3)?;
-    let hidden = rt.alloc_tensor_f32(&[at.len(), HIDDEN])?;
+    // The model's own hidden size: `--random-config` towers are not 2B-shaped.
+    let hid = model.config().hidden as usize;
+    let dh = tensor(rt, &[at.len(), hid], 7, 1e-3)?;
+    let hidden = rt.alloc_tensor_f32(&[at.len(), hid])?;
     let bank = tessl::qwen35_train::Qwen35Grads::zeros_like(model)?;
     let row = |i: usize| -> Res<()> {
         let (ids, accumulate) = (&rows[i], i > 0);

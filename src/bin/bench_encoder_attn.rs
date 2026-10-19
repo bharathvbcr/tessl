@@ -371,14 +371,7 @@ fn run() -> Result<(), String> {
         .unwrap_or_default();
     // The arm every ratio is against (default: the shape's first).
     let base_name = std::env::var("BENCH_BASE").unwrap_or_default();
-    let mut out_path: Option<String> = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--out" => out_path = Some(args.next().ok_or("--out needs a path")?),
-            other => return Err(format!("unknown argument {other:?}; expected --out PATH")),
-        }
-    }
+    let (out_path, coverage_probe) = parse_args(std::env::args().skip(1))?;
 
     let rt = GpuRuntime::new_inference()?;
     rt.set_async_encode(true)?;
@@ -654,16 +647,59 @@ fn run() -> Result<(), String> {
     if let Some(p) = out_path {
         common::atomic_write(std::path::Path::new(&p), format!("[{}]\n", json.join(",\n")).as_bytes())?;
     }
-    // A coverage probe (`kernel_coverage` sets TESSL_KERNEL_TRACE) runs two
+    // A coverage probe (`kernel_coverage` passes `--coverage-probe`) runs two
     // short rounds and is not a measurement: its spread is not a verdict.
-    if !tessl::runtime::kernel_trace_enabled() {
+    // TESSL_KERNEL_TRACE alone is a user variable and never skips the guard.
+    if coverage_probe {
+        println!("spread guard skipped: coverage probe");
+    } else {
         common::exit_if_unstable("bench_encoder_attn", &unstable);
     }
     Ok(())
+}
+
+/// `[--out PATH] [--coverage-probe]`: the JSON path and whether this run is a
+/// `kernel_coverage` probe (the only thing that skips the spread guard).
+fn parse_args(args: impl Iterator<Item = String>) -> Result<(Option<String>, bool), String> {
+    let (mut out_path, mut probe) = (None, false);
+    let mut args = args;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--out" => out_path = Some(args.next().ok_or("--out needs a path")?),
+            "--coverage-probe" => probe = true,
+            other => {
+                return Err(format!(
+                    "unknown argument {other:?}; expected --out PATH or --coverage-probe"
+                ))
+            }
+        }
+    }
+    Ok((out_path, probe))
 }
 
 fn main() -> Result<(), String> {
     let outcome = run();
     common::emit_kernel_trace();
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn parse(a: &[&str]) -> Result<(Option<String>, bool), String> {
+        parse_args(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn only_the_flag_marks_a_coverage_probe_never_the_environment() {
+        // TESSL_KERNEL_TRACE is not consulted by the parser at all: with it set
+        // to anything, a plain run is still not a probe.
+        std::env::set_var("TESSL_KERNEL_TRACE", "1");
+        assert_eq!(parse(&[]).unwrap(), (None, false));
+        assert_eq!(parse(&["--out", "x.json"]).unwrap(), (Some("x.json".into()), false));
+        assert_eq!(parse(&["--coverage-probe"]).unwrap(), (None, true));
+        assert!(parse(&["--out"]).is_err());
+        assert!(parse(&["--probe"]).is_err());
+    }
 }

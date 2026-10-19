@@ -710,6 +710,10 @@ fn the_suite_list_reaches_the_breadth_it_claims() {
         9,
         "every decode (lanes-per-key x chunk) pair is its own kernel"
     );
+    // The encoder attention's spread guard is skipped only by this explicit
+    // flag, never by TESSL_KERNEL_TRACE (a user variable that every suite sets).
+    let enc = s.iter().find(|x| x.name == "bench_encoder_attn").expect("suite");
+    assert!(enc.argv.contains(&"--coverage-probe"), "{:?}", enc.argv);
     // Every suite names a bench binary that exists as a source.
     for x in &s {
         assert!(

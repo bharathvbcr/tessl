@@ -747,7 +747,7 @@ pub fn suites() -> Vec<Suite> {
         // tiled kernels of each. Two rounds is the bench's minimum.
         suite(
             "bench_encoder_attn",
-            &[],
+            &["--coverage-probe"],
             &[
                 (
                     "BENCH_SHAPES",

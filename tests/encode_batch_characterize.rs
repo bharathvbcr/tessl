@@ -336,6 +336,25 @@ fn upload_segments_texts_and_bounds() {
     });
 }
 
+/// What both `upload_segments` put on the device: the exact `[n, 2]` u32
+/// words, `start` then `end` per segment, in order, and nothing else.
+#[test]
+fn upload_segments_writes_the_exact_words() {
+    with_gpu(|rt| {
+        let segs = [(0u32, 3u32), (3, 4), (4, 11), (11, 12)];
+        let want: Vec<u32> = vec![0, 3, 3, 4, 4, 11, 11, 12];
+        for (name, f) in [
+            ("bert", tessl::bert::upload_segments as UploadFn),
+            ("embedgemma2", tessl::embedgemma2::upload_segments as UploadFn),
+        ] {
+            let buf = f(rt, &segs, 12).unwrap();
+            assert_eq!(buf.read_u32()[..want.len()], want[..], "{name}");
+            let one = f(rt, &[(7, 9)], 9).unwrap();
+            assert_eq!(one.read_u32()[..2], [7, 9], "{name}: single segment");
+        }
+    });
+}
+
 /// `EmbedGemma2Model::encode`'s refusals before any GPU work, exact texts.
 #[test]
 fn embedgemma2_encode_refuses_a_bad_batch_with_exact_texts() {

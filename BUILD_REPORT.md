@@ -1,4 +1,29 @@
-# BUILD_REPORT — GitPulse backlog, waves 13–17 (2026-10-17/18)
+# BUILD_REPORT — GitPulse backlog, waves 13–18 (2026-10-17/19)
+
+## History scrub (2026-10-18 ~20:41, by the eg2 session) and wave 18
+
+**The scrub.** The eg2 session rewrote `main` and `eg2/integrate` with `git filter-branch` to remove an LGPL-derived `src/media/resample.rs` from history.
+- Every sha changed, and the tip tree is unchanged: `41d8866` (ojas-verified) → `a083088`, `4e99ca6` → `a1fccca`. **The shas cited in the sections below are pre-scrub.**
+- `refs/original/refs/scrub/*` and earlier sessions' `refs/backup/*` still resolve them, and ojas cites pre-scrub `42f1d52` as provenance. Keep those refs until the scrubbing session publishes an old→new map.
+- At your direction I deleted this run's own 54 `refs/backup/2026-10-17-w14/*` refs, because they kept the scrubbed blobs reachable.
+
+**How wave 18 landed.** Its lanes had been cut from the pre-scrub `4e99ca6`. Each lane's own commits were **cherry-picked** onto `a1fccca`, never merged, so the old history stays unreachable from `main`. A second tessl session (tessl-a3) coordinated with me: it lands the eg2 session's last commits and removes my lane worktrees.
+
+**`main` = `49d905e`**, ojas-acked before landing. The gates run after the last pick:
+- fmt, build, clippy ×2, doc.
+- Hosted: 106 invocations, 1210 tests.
+- Dialect lint, kernel IR (39 kernels).
+- Emulator: host contract plus the exact, model and fast-math cases.
+- Comparator lanes, torch host tests, Go unit.
+- 689 device tests in 60 binaries, plus `--lib` 272.
+
+| Card | Lane | Result |
+|---|---|---|
+| ft-6d88defb kernel coverage | A | Both broken lanes were bench bugs. `softcap_sample` asked n=512 of a 256-wide single-threadgroup kernel; `bench_qwen35_train` used the 2B hidden size on a tiny model. `kernel_coverage --check` now completes: 303 entry points, **49 with no lane** (list on the card) — your "lanes for all" work list. |
+| ft-fd8bde58 int4 TensorOps GEMM | B | Opt-in `nn::gemm_q4_mlx_tensorops` (G 32/64/128) with in-kernel xsum. Parity is within ~0.4% of a derived bound over 120 shapes. Refusals happen before any GPU work. A guard-region test proves partial tiles never write past `y`: the adversarial pass found that gap. **No timing:** the benchmark is still open. |
+| ft-c8e7726b, ft-a13c82af | C | EmbedGemma2 config readers now use the shared `config_json`. A new `encode_batch` is the single owner of `upload_segments` and `check_batch_shape`. Behaviour is byte-identical on 49 configs. `TESSL_ATTN_TILED` is documented as the A/B baseline. |
+| ft-afb1c42d bounds | D | Exact byte tests, using a test-only allocation counter, **found two under-counts** in the training OOM pre-flight: the GDN forward transients and the CE staging buffers. Fixed; the 2B bound rises 25–405 MB (≤3.8%). `qwen35_train_bytes_pin` re-pinned, old and new values recorded. A device-wide-peak flake already on `main` is fixed. |
+
 
 `main` moved `4d3543f` → `02b1e93` → `bf0b7b9` → `527de20` → `a37a0c2` → `bf091a2` → `0819992` (this report) → **`41d8866`**. Every move was a fast-forward, local only (nothing pushed). Each landing came after the gates below were green on the exact tree, and after the live ojas session acked the sha (ojas builds tessl by path). ojas independently verified `bf091a2`: Metal 124/124 and ojas-qwen35 14/14, with its clip path switched to `parts_words`.
 

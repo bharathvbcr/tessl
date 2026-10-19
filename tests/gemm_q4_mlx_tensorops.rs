@@ -213,6 +213,66 @@ fn matches_gemm_q4_mlx_and_f64_on_random_activations() {
     sweep(true);
 }
 
+/// The store at a partial tile must be clipped to `M x N`. `y` is allocated
+/// with `PAD_WORDS` of NaN-pattern sentinel after the `m * n` outputs (a full
+/// 32x32 tile plus 128 words, so any unclipped tile overrun lands inside it);
+/// every pad word must be bit-identical afterwards, and every output word
+/// written. `seeded`-sized buffers cannot see this: an overrun there lands in
+/// whatever neighbours the allocation, and only `[..m * n]` is read back.
+#[test]
+fn partial_tiles_never_write_past_y() {
+    const PAD_WORDS: usize = 32 * 32 + 128;
+    const PAD: u32 = 0x7fc0_dead;
+    with_gpu(|rt| {
+        for group in [32usize, 64, 128] {
+            for m in [1usize, 8, 33, 70] {
+                for n in [33usize, 40, 100] {
+                    let k = 256;
+                    let mut rng = SplitMix::new(0x9ad ^ (m * 131 + n * 7 + group) as u64);
+                    let x: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
+                    let nibbles: Vec<u8> = (0..n * k).map(|_| rng.range(0, 15) as u8).collect();
+                    let sb: Vec<f32> = (0..n * (k / group) * 2).map(|_| rng.unit() * 0.1).collect();
+                    let packed = rt.alloc_buffer(n * k / 2).unwrap();
+                    packed.write_bytes(&pack_nibbles(&nibbles));
+                    let sbb = buf_bf16(rt, &sb);
+                    let xb = buf_bf16(rt, &x);
+                    let total = m * n + PAD_WORDS;
+                    let y = rt.alloc_buffer(total * 4).unwrap();
+                    y.write_u32(&vec![PAD; total]);
+                    nn::gemm_q4_mlx_tensorops(
+                        rt,
+                        Q4MlxBank {
+                            packed: &packed,
+                            scales_biases: &sbb,
+                        },
+                        &xb,
+                        &y,
+                        QuantShape {
+                            rows: n as u32,
+                            cols: k as u32,
+                            group_size: group as u32,
+                        },
+                        m as u32,
+                    )
+                    .unwrap();
+                    rt.synchronize().unwrap();
+                    let words = y.read_u32();
+                    let first_bad = words[m * n..total].iter().position(|w| *w != PAD);
+                    assert!(
+                        first_bad.is_none(),
+                        "M={m} N={n} G={group}: pad word {:?} past y was overwritten",
+                        first_bad.map(|i| (i, words[m * n + i]))
+                    );
+                    assert!(
+                        words[..m * n].iter().all(|w| *w != PAD),
+                        "M={m} N={n} G={group}: an output word was left unwritten"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// A longer K, so many groups accumulate (and the xsum is over many groups).
 #[test]
 fn matches_at_a_long_k() {

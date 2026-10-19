@@ -4545,6 +4545,142 @@ pub unsafe fn gemm_q4_mlx_with_scalars(
     })
 }
 
+// ------------------------------------------- MLX Q4 GEMM on TensorOps ---
+
+/// Group sizes `kernels/gemm_q4_mlx_tensorops.metal` instantiates. The
+/// `matmul2d` descriptor's K is the group (one product per group), so each is a
+/// separate entry point; the MLX domain also admits 256 and 512, which are
+/// refused here rather than silently routed elsewhere.
+pub const GEMM_Q4_MLX_TENSOROPS_GROUP_SIZES: [u32; 3] = [32, 64, 128];
+
+/// Output tile edge of `gemm_q4_mlx_tensorops_g*` (32x32, four simdgroups).
+const Q4_TENSOROPS_TILE: usize = 32;
+
+/// Largest `cols` (K) [`gemm_q4_mlx_tensorops`] accepts for `m` activation rows,
+/// `n` output rows and `group_size`; the first refused K is this plus
+/// `group_size`.
+///
+/// # Derivation (int4)
+///
+/// Unlike [`gemm_i8_dequant`] there is no integer accumulator to wrap: the
+/// nibbles enter `matmul2d` as `uint4b_format` against a bf16 left operand and
+/// every product accumulates in f32, so there is no int32 exact-K bound (an
+/// `int8 x int4b -> int32` pairing would have one, `1024 * K <= i32::MAX` at
+/// `|a| <= 128, |q| <= 8`, but this kernel does not use it). What int32 does
+/// bound is the extent arithmetic: the kernel casts `M`, `N` and `K` to `int`
+/// for its tensor extents and strides, and indexes `x` at `row * K`, the weight
+/// tensor at `n * K` 4-bit elements, `y` at `m * N` and the scale/bias pairs at
+/// `n * (K / G)`. The binding ones are `m * K <= i32::MAX` and
+/// `n * K <= i32::MAX` (the others are no larger for `G >= 2`). With `K` a
+/// multiple of `G`, that is `K <= floor(i32::MAX / max(m, n))` rounded down to
+/// a multiple of `G`. `m * n` does not depend on K and is checked separately.
+pub fn gemm_q4_mlx_tensorops_max_k(m: u32, n: u32, group_size: u32) -> u32 {
+    let widest = u64::from(m.max(n).max(1));
+    let k = (i32::MAX as u64 / widest).min(u64::from(u32::MAX));
+    let g = u64::from(group_size.max(1));
+    (k / g * g) as u32
+}
+
+/// `Y[M, rows] = X[M, cols] @ W[rows, cols]^T` with MLX Q4 weights on the
+/// TensorOps matrix units: an opt-in companion to [`gemm_q4_mlx`] for larger `M`
+/// (no [`GEMM_Q4_MLX_MAX_M`] ceiling).
+///
+/// Same bank, activation (bf16), output (f32) and shape arguments as
+/// [`gemm_q4_mlx`], row-major bank only (no `layout`, no `resid`). The kernel
+/// reads the bank's packed bytes in place as `uint4b_format` (low nibble first,
+/// unsigned; measured in `tests/int4b_tensorops.rs`) and runs one `matmul2d`
+/// per K group, folding `s * P + b * xsum` in f32 registers, with `xsum`
+/// (the group's activation sum) computed in kernel. Ragged `M` and `rows` (not a
+/// multiple of 32) are handled: partial tiles are clipped, never read past
+/// `M` or `rows`.
+///
+/// Refused before any encode: no TensorOps on the device, `group_size` outside
+/// [`GEMM_Q4_MLX_TENSOROPS_GROUP_SIZES`], `cols == 0`, any operand or index
+/// extent over `i32::MAX` (see [`gemm_q4_mlx_tensorops_max_k`]), a short
+/// buffer, or `y` overlapping an input. `m == 0` or `rows == 0` is a no-op after
+/// validation.
+///
+/// Accuracy: f32 accumulation in an unspecified order, so each output is within
+/// `gamma_t * S` of the f64 product of the loaded operands, with
+/// `t = cols + 2 * cols / group_size + group_size`,
+/// `gamma_t = t * 2^-24 / (1 - t * 2^-24)` and
+/// `S = sum_g |s| sum|q x| + |b| sum|x|`.
+pub fn gemm_q4_mlx_tensorops(
+    rt: &Arc<GpuRuntime>,
+    bank: Q4MlxBank<'_>,
+    x_bf16: &GpuBuffer,
+    y: &GpuBuffer,
+    shape: QuantShape,
+    m: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "gemm_q4_mlx_tensorops";
+    if !rt.has_tensorops() {
+        return Err(format!("{WHAT}: TensorOps is unavailable on this device"));
+    }
+    shape.validate(WHAT)?;
+    let entry = match shape.group_size {
+        32 => "gemm_q4_mlx_tensorops_g32",
+        64 => "gemm_q4_mlx_tensorops_g64",
+        128 => "gemm_q4_mlx_tensorops_g128",
+        g => {
+            return Err(format!(
+                "{WHAT}: group_size {g} is not one of {GEMM_Q4_MLX_TENSOROPS_GROUP_SIZES:?}; the \
+                 matmul2d descriptor's K is the group, so each size is its own entry point"
+            ))
+        }
+    };
+    if shape.cols == 0 {
+        return Err(format!("{WHAT}: cols must be non-zero"));
+    }
+    let (n, k) = (shape.rows, shape.cols);
+    let groups = k / shape.group_size;
+    // The kernel's int32 extents and indices; see `gemm_q4_mlx_tensorops_max_k`.
+    // Checked before any buffer length so an oversize shape is named as such.
+    for (numel, what) in [
+        (elems(m, k, WHAT)?, "gemm_q4_mlx_tensorops x (m * cols)"),
+        (
+            elems(n, k, WHAT)?,
+            "gemm_q4_mlx_tensorops weights (rows * cols 4-bit elements)",
+        ),
+        (elems(m, n, WHAT)?, "gemm_q4_mlx_tensorops y (m * rows)"),
+        (
+            elems(n, groups, WHAT)?,
+            "gemm_q4_mlx_tensorops scale/bias pairs (rows * groups)",
+        ),
+    ] {
+        crate::gemm::require_i32_extent(numel, what)?;
+    }
+    bank.validate(rt, &shape, 1, WHAT)?;
+    let out_elems = elems(m, n, WHAT)?;
+    require::<u16>(rt, x_bf16, elems(m, k, WHAT)?, format_args!("{WHAT} x_bf16"))?;
+    require::<f32>(rt, y, out_elems, format_args!("{WHAT} y"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("y", y)],
+        &[
+            ("packed", bank.packed),
+            ("scales_biases", bank.scales_biases),
+            ("x_bf16", x_bf16),
+        ],
+    )?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline(entry)?;
+    let tiles_n = (n as usize).div_ceil(Q4_TENSOROPS_TILE);
+    let tiles_m = (m as usize).div_ceil(Q4_TENSOROPS_TILE);
+    // 128 threads = the kernel's four simdgroups.
+    dispatch_2d_tg(rt, &p, tiles_n, tiles_m, 128, |bnd| {
+        set_gpu_buf(bnd, bank.packed, 0);
+        set_gpu_buf(bnd, bank.scales_biases, 1);
+        set_gpu_buf(bnd, x_bf16, 2);
+        set_gpu_buf(bnd, y, 3);
+        set_u32(bnd, m, 4);
+        set_u32(bnd, n, 5);
+        set_u32(bnd, k, 6);
+    })
+}
+
 // ------------------------------------------------------------ Reductions ---
 
 /// Threadgroup scratch depth in `reduce.metal`. Every lane writes its own slot,

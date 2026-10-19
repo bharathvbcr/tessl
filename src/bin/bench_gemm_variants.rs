@@ -26,8 +26,9 @@ use tessl::gemm::{
     gemm_nt_train, gemm_tn_accum_train, gemm_tn_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
     GemmBackend,
 };
+use tessl::nn::{gemm_q4_mlx_tensorops, Q4MlxBank, QuantShape};
 use tessl::runtime::{GpuRuntime, PrecisionMode};
-use tessl::tensor::Tensor;
+use tessl::tensor::{f32_slice_to_bf16, GpuBuffer, Tensor};
 
 /// (M, N, K). One general shape, plus a split-K-eligible one: `prefer_tn_splitk`
 /// wants K >= 2048, M and N <= 384 and min(M, N) <= 128, so a single shape
@@ -35,6 +36,31 @@ use tessl::tensor::Tensor;
 const GENERAL: (usize, usize, usize) = (1024, 1024, 1024);
 const SPLITK: (usize, usize, usize) = (128, 256, 4096);
 const BATCHED: (usize, usize, usize, usize) = (256, 256, 256, 8);
+/// (M, N, K) of the MLX Q4 TensorOps lanes: M past `GEMM_Q4_MLX_MAX_M`, N and K
+/// multiples of every group size in `GEMM_Q4_MLX_TENSOROPS_GROUP_SIZES`.
+const Q4_TENSOROPS: (usize, usize, usize) = (256, 1024, 2048);
+
+/// An MLX Q4 bank over seeded random nibbles with finite bf16 scale/bias pairs
+/// (`Q4MlxBank` packing: two nibbles per byte, low first; one `bfloat2` per
+/// group), plus a bf16 activation buffer. Values are inputs to a timing lane,
+/// not a reference.
+fn q4_mlx_operands(
+    rt: &Arc<GpuRuntime>,
+    (m, n, k): (usize, usize, usize),
+    group: usize,
+) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer), String> {
+    let packed = rt.alloc_buffer(n * k / 2)?;
+    let bytes: Vec<u8> = fill_dist(n * k / 2, 21, Dist::Uniform)
+        .iter()
+        .map(|v| ((v + 1.0) * 127.5) as u8)
+        .collect();
+    packed.write_bytes(&bytes);
+    let sb = rt.alloc_buffer(n * (k / group) * 4)?;
+    sb.write_bf16_bits(&f32_slice_to_bf16(&fill_dist(n * (k / group) * 2, 22, Dist::Uniform)));
+    let x = rt.alloc_buffer(m * k * 2)?;
+    x.write_bf16_bits(&f32_slice_to_bf16(&fill_dist(m * k, 23, Dist::Uniform)));
+    Ok((packed, sb, x))
+}
 
 fn f32_tensor(rt: &Arc<GpuRuntime>, shape: &[usize], seed: u64) -> Result<Tensor, String> {
     let n: usize = shape.iter().product();
@@ -132,7 +158,39 @@ fn run() -> Result<(), String> {
     };
     let to = GemmBackend::TensorOps;
 
-    let lanes: Vec<Lane> = vec![
+    // MLX Q4 TensorOps GEMM, one lane per instantiated group size.
+    let (qm, qn, qk) = Q4_TENSOROPS;
+    let q4_ops = [32usize, 64, 128]
+        .map(|g| q4_mlx_operands(&rt, Q4_TENSOROPS, g))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let q4_y = rt.alloc_buffer(qm * qn * 4)?;
+    let q4_lane = |idx: usize, name: &'static str, group: u32| -> Lane {
+        let (packed, sb, x) = &q4_ops[idx];
+        let y = &q4_y;
+        let rt = &rt;
+        Lane {
+            name,
+            m: qm,
+            n: qn,
+            k: qk,
+            batch: 1,
+            run: Box::new(move || {
+                let bank = Q4MlxBank {
+                    packed,
+                    scales_biases: sb,
+                };
+                let shape = QuantShape {
+                    rows: qn as u32,
+                    cols: qk as u32,
+                    group_size: group,
+                };
+                gemm_q4_mlx_tensorops(rt, bank, x, y, shape, qm as u32)
+            }),
+        }
+    };
+
+    let mut lanes: Vec<Lane> = vec![
         // Simdgroup backend for TN: the explicit transpose + NN fallback, which
         // is the only path that dispatches `transpose2d_f32`.
         Lane {
@@ -314,6 +372,9 @@ fn run() -> Result<(), String> {
             run: Box::new(|| gemm_epilogue(&a, &b_narrow, &c_narrow, to, epi())),
         },
     ];
+    lanes.push(q4_lane(0, "q4_mlx_tensorops_g32", 32));
+    lanes.push(q4_lane(1, "q4_mlx_tensorops_g64", 64));
+    lanes.push(q4_lane(2, "q4_mlx_tensorops_g128", 128));
 
     let mut rows: Vec<String> = Vec::new();
     for l in &lanes {

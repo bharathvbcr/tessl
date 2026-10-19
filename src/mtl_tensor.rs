@@ -133,6 +133,13 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 /// per-group MLX scale and bias are not part of the operand, so a Q4 prefill
 /// GEMM needs a per-group `matmul2d` plus a register epilogue (the probe's
 /// `MLX_GROUP_LOOP` variant compiles that shape).
+///
+/// Since measured on a GPU (`tests/int4b_tensorops.rs`: low nibble first,
+/// `int4b` two's complement, per-group parity with `nn::gemm_q4_mlx`), the
+/// shape is built as the opt-in [`crate::nn::gemm_q4_mlx_tensorops`]
+/// (`kernels/gemm_q4_mlx_tensorops.metal`, in-kernel `xsum`). This flag stays
+/// `false`: it records that no *routing* uses a quantized TensorOps GEMM, and
+/// nothing has been timed.
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).

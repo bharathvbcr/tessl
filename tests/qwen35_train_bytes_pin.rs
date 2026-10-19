@@ -1,8 +1,9 @@
-//! `Qwen35Model::train_step_bytes` for one sequence is what it was before the
-//! ragged step existed: the pre-flight bound ojas-qwen35's `train_step`
-//! relies on. The values were printed by a37a0c2's `src/qwen35_train.rs` on
-//! the tiny fixture (default dispatch, this GPU's tensor-op capability and
-//! pool cap, which the bound reads), then pinned.
+//! `Qwen35Model::train_step_bytes` for one sequence is pinned: the
+//! pre-flight bound ojas-qwen35's `train_step` relies on. The values were
+//! first printed by a37a0c2's `src/qwen35_train.rs` on the tiny fixture
+//! (default dispatch, this GPU's tensor-op capability and pool cap, which the
+//! bound reads), and re-pinned when the bound began counting two allocations
+//! it had omitted (see `PINNED`).
 
 use std::path::Path;
 
@@ -12,15 +13,29 @@ use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
 /// `(t, bf16 operands, bytes)`.
+///
+/// Re-pinned: the bound omitted the GDN forward's kernel transients and the
+/// cross-entropy's two id staging buffers (found by the exact byte tests in
+/// `src/qwen35_train.rs`, which measure what each phase allocates). Old ->
+/// new, per `(t, bf16 operands)`:
+///
+/// * (2, false): 2149185792 -> 2149284608
+/// * (2, true): 2150339840 -> 2150438656
+/// * (17, false): 2150411008 -> 2150509824
+/// * (17, true): 2151967488 -> 2152066304
+/// * (256, false): 2163621888 -> 2164017152
+/// * (256, true): 2169847808 -> 2170243072
+/// * (4096, false): 2378167296 -> 2384491520
+/// * (4096, true): 2436969472 -> 2443293696
 const PINNED: [(u32, bool, u64); 8] = [
-    (2, false, 2149185792),
-    (2, true, 2150339840),
-    (17, false, 2150411008),
-    (17, true, 2151967488),
-    (256, false, 2163621888),
-    (256, true, 2169847808),
-    (4096, false, 2378167296),
-    (4096, true, 2436969472),
+    (2, false, 2149284608),
+    (2, true, 2150438656),
+    (17, false, 2150509824),
+    (17, true, 2152066304),
+    (256, false, 2164017152),
+    (256, true, 2170243072),
+    (4096, false, 2384491520),
+    (4096, true, 2443293696),
 ];
 
 #[test]

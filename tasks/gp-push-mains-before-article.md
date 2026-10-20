@@ -6,7 +6,7 @@ priority: 0
 severity: high
 type: chore
 owner: "unassigned"
-due: "before the LinkedIn article is posted"
+due: "none"
 labels:
   - "release"
   - "article"

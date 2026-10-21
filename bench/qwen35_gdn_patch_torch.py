@@ -63,7 +63,9 @@ clean tree and an even round count of at least 4):
 
     python bench/qwen35_gdn_patch_torch.py --check --seq-len 512
 
-(``--check`` holds both steps' gradients and the model, so it runs at 512:
+(``--check`` logs ``phase=<name> rss_mib=... rss_max_mib=... driver_mib=...
+tensor_mib=...`` on stderr at each phase boundary, to find where host memory
+goes. It holds both steps' gradients and the model, so it runs at 512:
 at 1024 and 2048 memguard's 32 GiB cap killed it.)
 
     target/release/bench_paired --format metrics --evidence --clean-env \\
@@ -82,6 +84,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -145,11 +148,23 @@ def metric_lines(step_ms, mem_peak_mib, mem_after_mib):
     ]
 
 
-def rel_err(got, want):
-    """test_gdn.py's rel_err: the largest absolute error over the want's peak."""
-    got = got.detach().cpu().double()
-    want = want.detach().cpu().double()
-    return (got - want).abs().max().item() / max(want.abs().max().item(), 1e-30)
+REL_ERR_SLICE = 1 << 24
+
+
+def rel_err(got, want, slice_elems=REL_ERR_SLICE):
+    """test_gdn.py's rel_err: the largest absolute error over the want's peak,
+    in double. The same value as widening whole tensors, taken a slice at a time:
+    the embedding gradient is 508M elements, and four whole-tensor double
+    temporaries of it were 16 GB of host memory."""
+    got = got.detach().cpu().reshape(-1)
+    want = want.detach().cpu().reshape(-1)
+    diff = peak = 0.0
+    for lo in range(0, want.numel(), slice_elems):
+        g = got[lo:lo + slice_elems].double()
+        w = want[lo:lo + slice_elems].double()
+        diff = max(diff, (g - w).abs().max().item())
+        peak = max(peak, w.abs().max().item())
+    return diff / max(peak, 1e-30)
 
 
 def compare_grads(got_loss, want_loss, got, want):
@@ -200,13 +215,14 @@ def text_config(snapshot, layers):
 def load_real_weights(model, snapshot, layers):
     """Copy the embedding, the first ``layers`` layers and the final norm from
     the checkpoint into a text-only model (bf16 on disk, float32 here)."""
+    import torch
     from safetensors import safe_open
 
     path = Path(snapshot) / "model.safetensors-00001-of-00001.safetensors"
     if not path.is_file():
         raise SystemExit(f"{path}: no checkpoint (use --init random or --snapshot)")
     state = model.state_dict()
-    wanted = {}
+    loaded = set()
     with safe_open(str(path), "pt") as f:
         for key in f.keys():
             if not key.startswith(_PREFIX):
@@ -217,12 +233,15 @@ def load_real_weights(model, snapshot, layers):
                 continue
             if name not in state:
                 raise SystemExit(f"checkpoint tensor {key} has no parameter {name} in the model")
-            wanted[name] = f.get_tensor(key).to(state[name].dtype)
+            # Straight into the parameter, one tensor at a time: no second
+            # float32 copy of the model is held.
+            with torch.no_grad():
+                state[name].copy_(f.get_tensor(key))
+            loaded.add(name)
     # The tied lm_head is the embedding; every other parameter must be covered.
-    missing = [n for n in state if n not in wanted and n != "lm_head.weight" and "rotary" not in n]
+    missing = [n for n in state if n not in loaded and n != "lm_head.weight" and "rotary" not in n]
     if missing:
         raise SystemExit(f"checkpoint lacks {len(missing)} parameters, first {missing[0]}")
-    model.load_state_dict(wanted, strict=False)
 
 
 def build_model(args, device):
@@ -371,8 +390,42 @@ def run_arm(args):
     return 0
 
 
+def host_copy(t):
+    """A host copy that owns its storage (``.cpu()`` of a device tensor is one
+    copy already; of a CPU tensor it is the tensor itself)."""
+    t = t.detach()
+    return t.cpu() if t.device.type != "cpu" else t.clone()
+
+
 def grads_of(model):
-    return {n: p.grad.detach().clone().cpu() for n, p in model.named_parameters() if p.grad is not None}
+    return {n: host_copy(p.grad) for n, p in model.named_parameters() if p.grad is not None}
+
+
+def rss_now_mib():
+    """This process's current resident set (ps; the stdlib has only the max)."""
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True, text=True, timeout=10)
+        return int(out.stdout.strip()) / 1024.0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return float("nan")
+
+
+def phase_log(name):
+    """One stderr line of memory at a phase boundary of ``--check``: the max and
+    current resident set, and, where MPS is up, the driver's and the live
+    tensors' allocation (all MiB)."""
+    import resource
+
+    import torch
+
+    mib = 1.0 / (1 << 20)
+    # ru_maxrss is bytes on macOS and KiB elsewhere.
+    rss_max = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (mib if sys.platform == "darwin" else 1 / 1024.0)
+    line = f"phase={name} rss_mib={rss_now_mib():.0f} rss_max_mib={rss_max:.0f}"
+    if torch.backends.mps.is_available():
+        line += (f" driver_mib={torch.mps.driver_allocated_memory() * mib:.0f}"
+                 f" tensor_mib={torch.mps.current_allocated_memory() * mib:.0f}")
+    print(line, file=sys.stderr, flush=True)
 
 
 def run_check(args):
@@ -383,17 +436,24 @@ def run_check(args):
 
     reference = mq.torch_chunk_gated_delta_rule
     counter, tessl_fn = spy_on(tessl_torch)
+    phase_log("start")
     model = build_model(args, device)
     ids = make_ids(args, model.config.vocab_size, device)
+    phase_log("model_built")
     want_loss = train_step(model, ids, device)
+    phase_log("unpatched_step")
     want = grads_of(model)
+    phase_log("unpatched_grads_on_host")
     unpatched_calls = counter.calls
     previous = tessl_torch.patch_transformers_qwen3_5()
+    phase_log("patched")
     try:
         if previous is not reference:
             sys.exit("check: the unpatched function was not transformers' torch fallback")
         got_loss = train_step(model, ids, device)
+        phase_log("patched_step")
         got = grads_of(model)
+        phase_log("patched_grads_on_host")
     finally:
         mq.torch_chunk_gated_delta_rule = previous
         tessl_torch.chunk_gated_delta_rule = tessl_fn
@@ -402,6 +462,7 @@ def run_check(args):
     miss = [e for e in (count_error(unpatched_calls, 0, "unpatched step"),
                         count_error(patched_calls, gdn_layers(model), "patched step")) if e]
     ok, name, err, reasons = compare_grads(got_loss, want_loss, got, want)
+    phase_log("compared")
     reasons = miss + reasons
     ok = not reasons
     print(f"loss unpatched {want_loss:.6f} patched {got_loss:.6f}")

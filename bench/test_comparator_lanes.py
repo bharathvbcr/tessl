@@ -365,6 +365,77 @@ class Qwen35GdnPatchLane(unittest.TestCase):
         cfg = types.SimpleNamespace(layer_types=["linear_attention"] * 3 + ["full_attention"])
         self.assertEqual(gdn_lane.gdn_layers(types.SimpleNamespace(config=cfg)), 3)
 
+    def test_the_sliced_rel_err_is_the_whole_tensor_rel_err(self):
+        import torch
+        g = torch.Generator().manual_seed(3)
+        want = torch.randn(1000, generator=g)
+        got = want + 1e-3 * torch.randn(1000, generator=g)
+        whole = ((got.double() - want.double()).abs().max() / want.double().abs().max()).item()
+        for n in (1, 7, 999, 1000, 5000):
+            self.assertEqual(gdn_lane.rel_err(got, want, slice_elems=n), whole)
+        self.assertEqual(gdn_lane.rel_err(torch.zeros(4), torch.zeros(4)), 0.0)
+        self.assertEqual(gdn_lane.rel_err(torch.ones(2, 3), torch.ones(2, 3), slice_elems=2), 0.0)
+
+    def test_host_copy_owns_its_storage_and_grads_of_matches_the_gradients(self):
+        import torch
+        t = torch.arange(4.0)
+        c = gdn_lane.host_copy(t)
+        c[0] = 9.0
+        self.assertEqual(t[0].item(), 0.0)
+        lin = torch.nn.Linear(2, 2)
+        lin(torch.ones(1, 2)).sum().backward()
+        grads = gdn_lane.grads_of(torch.nn.ModuleDict({"l": lin}))
+        self.assertEqual(set(grads), {"l.weight", "l.bias"})
+        self.assertTrue(torch.equal(grads["l.bias"], lin.bias.grad))
+
+    def test_phase_log_line_has_the_phase_and_both_resident_sets(self):
+        import torch
+        err = io.StringIO()
+        real = torch.backends.mps.is_available
+        torch.backends.mps.is_available = lambda: False  # no MPS call in a device-free test
+        try:
+            with contextlib.redirect_stderr(err):
+                gdn_lane.phase_log("model_built")
+        finally:
+            torch.backends.mps.is_available = real
+        line = err.getvalue().strip()
+        self.assertRegex(line, r"^phase=model_built rss_mib=\d+ rss_max_mib=\d+$")
+
+    def test_real_weights_load_straight_into_the_cut_model_and_skip_later_layers(self):
+        import tempfile
+        import types
+        import torch
+        from safetensors.torch import save_file
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+        cfg = mq.Qwen3_5TextConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"], num_attention_heads=2,
+            num_key_value_heads=1, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=2,
+            linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+            vocab_size=64, tie_word_embeddings=True)
+        model = mq.Qwen3_5ForCausalLM(cfg).float()
+        g = torch.Generator().manual_seed(5)
+        tensors = {}
+        for name, p in model.state_dict().items():
+            if name.startswith("model.") and "rotary" not in name:
+                tensors[gdn_lane._PREFIX + name[len("model."):]] = torch.randn(p.shape, generator=g).bfloat16()
+        late = gdn_lane._PREFIX + "layers.7.mlp.down_proj.weight"
+        tensors[late] = torch.zeros(1)
+        tensors["model.visual.x"] = torch.zeros(1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "model.safetensors-00001-of-00001.safetensors")
+            save_file(tensors, path)
+            gdn_lane.load_real_weights(model, d, 2)
+            for name, p in model.state_dict().items():
+                key = gdn_lane._PREFIX + name[len("model."):]
+                if key in tensors:
+                    self.assertTrue(torch.equal(p, tensors[key].float()), name)
+            del tensors[gdn_lane._PREFIX + "norm.weight"]
+            save_file(tensors, path)
+            with self.assertRaises(SystemExit) as cm:
+                gdn_lane.load_real_weights(model, d, 2)
+            self.assertIn("model.norm.weight", str(cm.exception))
+
     def test_the_cut_config_keeps_the_leading_layer_types(self):
         snap = gdn_lane.DEFAULT_SNAPSHOT
         if not (snap / "config.json").is_file():

@@ -887,7 +887,8 @@ exact-f32 GEMM reaches. A whole `train_step` at T = 2048 takes 7.2 s (284
 tokens/s, median of 3, allocations included): the projections' forward and
 backward GEMMs are about 25 TFLOP (3.8 s at that rate), the cross-entropy
 1.8 s, the GDN and attention cores 0.6 s with the sequential GDN kernels
-(about 0.4 s chunked).
+(the chunked kernels take 0.25 s off the whole step: 5.343 to 5.095 s, same
+results file).
 
 Activation recomputation was measured against keeping every layer's
 intermediates, on the same machine and T, one mode per process under

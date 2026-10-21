@@ -5,7 +5,7 @@
     {
       "name": "before",
       "argv": [
-        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/bench_before",
+        "/Users/bharath/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.sequential",
         "2048",
         "--step-only",
         "--step=2048"
@@ -15,7 +15,7 @@
     {
       "name": "after",
       "argv": [
-        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/bench_after",
+        "/Users/bharath/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.chunked",
         "2048",
         "--step-only",
         "--step=2048"
@@ -24,94 +24,104 @@
     }
   ],
   "env": {},
+  "max_ratio_spread": 1.1,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
   "summary": [
     {
       "workload": "train_step_s_t2048",
       "before": {
-        "value_median": 5.2919,
-        "value_min": 5.2824,
-        "value_max": 5.3415,
+        "value_median": 5.34255,
+        "value_min": 5.3227,
+        "value_max": 5.3549,
         "value_all": [
-          5.3415,
-          5.2932,
-          5.2906,
-          5.2824
+          5.3227,
+          5.3423,
+          5.3428,
+          5.3549
         ]
       },
       "after": {
-        "value_median": 5.046749999999999,
-        "value_min": 5.0329,
-        "value_max": 5.0692,
+        "value_median": 5.0950500000000005,
+        "value_min": 5.0615,
+        "value_max": 5.097,
         "value_all": [
-          5.0552,
-          5.0692,
-          5.0383,
-          5.0329
+          5.0615,
+          5.0953,
+          5.097,
+          5.0948
         ],
         "vs_base": {
-          "median": 0.9525396642145623,
-          "lo": 0.9464008237386502,
-          "hi": 0.9576815536915289
+          "median": 0.9525964482927565,
+          "lo": 0.9509271610272981,
+          "hi": 0.9539941603653515
         }
       }
     },
     {
       "workload": "device_peak_gib_t2048",
       "before": {
-        "value_median": 15.3472,
-        "value_min": 15.3472,
-        "value_max": 15.3472,
+        "value_median": 15.6773,
+        "value_min": 15.6773,
+        "value_max": 15.6773,
         "value_all": [
-          15.3472,
-          15.3472,
-          15.3472,
-          15.3472
+          15.6773,
+          15.6773,
+          15.6773,
+          15.6773
         ]
       },
       "after": {
-        "value_median": 15.2382,
-        "value_min": 15.2382,
-        "value_max": 15.2382,
+        "value_median": 15.5702,
+        "value_min": 15.5702,
+        "value_max": 15.5702,
         "value_all": [
-          15.2382,
-          15.2382,
-          15.2382,
-          15.2382
+          15.5702,
+          15.5702,
+          15.5702,
+          15.5702
         ],
         "vs_base": {
-          "median": 0.9928977272727273,
-          "lo": 0.9928977272727273,
-          "hi": 0.9928977272727273
+          "median": 0.9931684665089013,
+          "lo": 0.9931684665089013,
+          "hi": 0.9931684665089013
         }
       }
     },
     {
       "workload": "peak_footprint_gb_t2048",
       "before": {
-        "value_median": 19.71495,
-        "value_min": 19.7149,
-        "value_max": 19.715,
+        "value_median": 20.07,
+        "value_min": 20.07,
+        "value_max": 20.07,
         "value_all": [
-          19.7149,
-          19.715,
-          19.7149,
-          19.715
+          20.07,
+          20.07,
+          20.07,
+          20.07
         ]
       },
       "after": {
-        "value_median": 19.5981,
-        "value_min": 19.598,
-        "value_max": 19.5983,
+        "value_median": 19.9552,
+        "value_min": 19.9551,
+        "value_max": 19.9553,
         "value_all": [
-          19.598,
-          19.5983,
-          19.5981,
-          19.5981
+          19.9552,
+          19.9552,
+          19.9553,
+          19.9551
         ],
         "vs_base": {
-          "median": 0.9940730258066115,
-          "lo": 0.994070474615646,
-          "hi": 0.9940806492518386
+          "median": 0.9942800199302442,
+          "lo": 0.9942750373692079,
+          "hi": 0.9942850024912806
         }
       }
     }
@@ -119,52 +129,239 @@
   "raw": [
     {
       "before": {
-        "train_step_s_t2048": 5.3415,
-        "device_peak_gib_t2048": 15.3472,
-        "peak_footprint_gb_t2048": 19.7149
+        "train_step_s_t2048": 5.3227,
+        "device_peak_gib_t2048": 15.6773,
+        "peak_footprint_gb_t2048": 20.07
       },
       "after": {
-        "train_step_s_t2048": 5.0552,
-        "device_peak_gib_t2048": 15.2382,
-        "peak_footprint_gb_t2048": 19.598
+        "train_step_s_t2048": 5.0615,
+        "device_peak_gib_t2048": 15.5702,
+        "peak_footprint_gb_t2048": 19.9552
       }
     },
     {
       "before": {
-        "train_step_s_t2048": 5.2932,
-        "device_peak_gib_t2048": 15.3472,
-        "peak_footprint_gb_t2048": 19.715
+        "train_step_s_t2048": 5.3423,
+        "device_peak_gib_t2048": 15.6773,
+        "peak_footprint_gb_t2048": 20.07
       },
       "after": {
-        "train_step_s_t2048": 5.0692,
-        "device_peak_gib_t2048": 15.2382,
-        "peak_footprint_gb_t2048": 19.5983
+        "train_step_s_t2048": 5.0953,
+        "device_peak_gib_t2048": 15.5702,
+        "peak_footprint_gb_t2048": 19.9552
       }
     },
     {
       "before": {
-        "train_step_s_t2048": 5.2906,
-        "device_peak_gib_t2048": 15.3472,
-        "peak_footprint_gb_t2048": 19.7149
+        "train_step_s_t2048": 5.3428,
+        "device_peak_gib_t2048": 15.6773,
+        "peak_footprint_gb_t2048": 20.07
       },
       "after": {
-        "train_step_s_t2048": 5.0383,
-        "device_peak_gib_t2048": 15.2382,
-        "peak_footprint_gb_t2048": 19.5981
+        "train_step_s_t2048": 5.097,
+        "device_peak_gib_t2048": 15.5702,
+        "peak_footprint_gb_t2048": 19.9553
       }
     },
     {
       "before": {
-        "train_step_s_t2048": 5.2824,
-        "device_peak_gib_t2048": 15.3472,
-        "peak_footprint_gb_t2048": 19.715
+        "train_step_s_t2048": 5.3549,
+        "device_peak_gib_t2048": 15.6773,
+        "peak_footprint_gb_t2048": 20.07
       },
       "after": {
-        "train_step_s_t2048": 5.0329,
-        "device_peak_gib_t2048": 15.2382,
-        "peak_footprint_gb_t2048": 19.5981
+        "train_step_s_t2048": 5.0948,
+        "device_peak_gib_t2048": 15.5702,
+        "peak_footprint_gb_t2048": 19.9551
       }
     }
   ],
-  "lane_archive": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/step_paired.json.lanes"
+  "lane_archive": "$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_step_paired_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-21T11:10:16Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-gpurun/target/release/bench_paired' --format metrics --evidence --rounds 4 --out '$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_step_paired_m5pro.json' 'before=$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.sequential 2048 --step-only --step=2048' 'after=$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.chunked 2048 --step-only --step=2048'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+      "--format",
+      "metrics",
+      "--evidence",
+      "--rounds",
+      "4",
+      "--out",
+      "$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_step_paired_m5pro.json",
+      "before=$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.sequential 2048 --step-only --step=2048",
+      "after=$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.chunked 2048 --step-only --step=2048"
+    ],
+    "cwd": "$HOME/Code/research/tessl-gpurun",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 4,
+      "max_spread": 1.1,
+      "lane_timeout_secs": 3600,
+      "clean_env": false,
+      "format": "Metrics",
+      "lanes": [
+        {
+          "name": "before",
+          "argv": [
+            "/Users/bharath/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.sequential",
+            "2048",
+            "--step-only",
+            "--step=2048"
+          ],
+          "env": {}
+        },
+        {
+          "name": "after",
+          "argv": [
+            "/Users/bharath/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.chunked",
+            "2048",
+            "--step-only",
+            "--step=2048"
+          ],
+          "env": {}
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-gpurun",
+      "scope": ".",
+      "revision": "c2c16122417731456a7620b9ac05a09afcab6b63",
+      "dirty": false,
+      "status_porcelain": [],
+      "status_line_count": 0,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 4.623046875,
+        "loadavg_5m": 6.87451171875,
+        "loadavg_15m": 8.0810546875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2568359375,
+        "normalized_loadavg_5m": 0.3819173177083333,
+        "normalized_loadavg_15m": 0.4489474826388889
+      },
+      "finish": {
+        "loadavg_1m": 2.4775390625,
+        "loadavg_5m": 4.220703125,
+        "loadavg_15m": 6.4697265625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.1376410590277778,
+        "normalized_loadavg_5m": 0.23448350694444445,
+        "normalized_loadavg_15m": 0.3594292534722222
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792578392732125936,
+        "sha256": "01a539c67550a433334dff6590036a361f1046b67c737b462115cc6400a95c5a"
+      },
+      "lane:after:bench_qwen35_train.chunked": {
+        "path": "$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.chunked",
+        "size_bytes": 4412224,
+        "mtime_ns": 1792581016116961451,
+        "sha256": "0eb304712c36656c27e78ca4cdffadf364736ac35bf25356c6ae74bebf89663f"
+      },
+      "lane:before:bench_qwen35_train.sequential": {
+        "path": "$HOME/Code/research/tessl/target-gp/gpurun1c/bench_qwen35_train.sequential",
+        "size_bytes": 4411968,
+        "mtime_ns": 1792581016112957519,
+        "sha256": "cd2f71d82aa871de6c26be1e3ea22dd97814c79eae75a967dab50e8a38e0c52c"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-21T11:15:23Z"
+  }
 }

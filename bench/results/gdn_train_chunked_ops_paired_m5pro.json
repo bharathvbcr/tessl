@@ -28,88 +28,98 @@
     }
   ],
   "env": {},
+  "max_ratio_spread": 1.1,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
   "summary": [
     {
-      "workload": "op_gdn_train_forward_ms_t2048",
+      "workload": "op_gdn_train_forward_f32_ms_t2048",
       "sequential": {
-        "value_median": 6.3477,
-        "value_min": 6.3329,
-        "value_max": 6.3824,
+        "value_median": 6.32665,
+        "value_min": 6.3168,
+        "value_max": 6.3575,
         "value_all": [
-          6.3609,
-          6.3412,
-          6.3503,
-          6.3612,
-          6.3409,
-          6.3329,
-          6.3451,
-          6.3542,
-          6.3824,
-          6.3423
+          6.3554,
+          6.3208,
+          6.3168,
+          6.3568,
+          6.3177,
+          6.3314,
+          6.3575,
+          6.3294,
+          6.3181,
+          6.3239
         ]
       },
       "chunked": {
-        "value_median": 3.17265,
-        "value_min": 3.1296,
-        "value_max": 3.1937,
+        "value_median": 3.1557,
+        "value_min": 3.1201,
+        "value_max": 3.2186,
         "value_all": [
-          3.154,
-          3.1937,
-          3.1905,
-          3.1799,
-          3.1739,
-          3.1869,
-          3.1714,
-          3.1647,
-          3.1559,
-          3.1296
+          3.1201,
+          3.1897,
+          3.1342,
+          3.1294,
+          3.128,
+          3.165,
+          3.1686,
+          3.1906,
+          3.1464,
+          3.2186
         ],
         "vs_base": {
-          "median": 0.4998543578255898,
-          "lo": 0.4934487488765905,
-          "hi": 0.5036428436258122
+          "median": 0.4982006381394009,
+          "lo": 0.49093684111149566,
+          "hi": 0.5089580796660289
         }
       }
     },
     {
-      "workload": "op_gdn_train_backward_ms_t2048",
+      "workload": "op_gdn_train_backward_f32_ms_t2048",
       "sequential": {
-        "value_median": 19.66225,
-        "value_min": 19.4284,
-        "value_max": 19.9088,
+        "value_median": 19.5488,
+        "value_min": 19.3657,
+        "value_max": 19.8112,
         "value_all": [
-          19.665,
-          19.498,
-          19.6595,
-          19.6283,
-          19.4284,
-          19.8017,
-          19.8079,
-          19.4318,
-          19.9088,
-          19.7691
+          19.5554,
+          19.5245,
+          19.5422,
+          19.6607,
+          19.5048,
+          19.611,
+          19.8112,
+          19.3657,
+          19.5959,
+          19.5412
         ]
       },
       "chunked": {
-        "value_median": 11.898900000000001,
-        "value_min": 11.7016,
-        "value_max": 12.081,
+        "value_median": 11.7957,
+        "value_min": 11.6143,
+        "value_max": 11.9982,
         "value_all": [
-          11.999,
-          11.9121,
-          11.9266,
-          11.8376,
-          12.081,
-          11.798,
-          11.9101,
-          11.8354,
-          11.7016,
-          11.8877
+          11.6143,
+          11.9982,
+          11.7866,
+          11.7689,
+          11.8784,
+          11.9504,
+          11.9805,
+          11.6532,
+          11.6153,
+          11.8048
         ],
         "vs_base": {
-          "median": 0.604873378214443,
-          "lo": 0.587760186450213,
-          "hi": 0.6218216631323218
+          "median": 0.603616893134046,
+          "lo": 0.5927413387494322,
+          "hi": 0.6145202181874057
         }
       }
     }
@@ -117,104 +127,295 @@
   "raw": [
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3609,
-        "op_gdn_train_backward_ms_t2048": 19.665
+        "op_gdn_train_forward_f32_ms_t2048": 6.3554,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5554
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.154,
-        "op_gdn_train_backward_ms_t2048": 11.999
+        "op_gdn_train_forward_f32_ms_t2048": 3.1201,
+        "op_gdn_train_backward_f32_ms_t2048": 11.6143
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3412,
-        "op_gdn_train_backward_ms_t2048": 19.498
+        "op_gdn_train_forward_f32_ms_t2048": 6.3208,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5245
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1937,
-        "op_gdn_train_backward_ms_t2048": 11.9121
+        "op_gdn_train_forward_f32_ms_t2048": 3.1897,
+        "op_gdn_train_backward_f32_ms_t2048": 11.9982
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3503,
-        "op_gdn_train_backward_ms_t2048": 19.6595
+        "op_gdn_train_forward_f32_ms_t2048": 6.3168,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5422
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1905,
-        "op_gdn_train_backward_ms_t2048": 11.9266
+        "op_gdn_train_forward_f32_ms_t2048": 3.1342,
+        "op_gdn_train_backward_f32_ms_t2048": 11.7866
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3612,
-        "op_gdn_train_backward_ms_t2048": 19.6283
+        "op_gdn_train_forward_f32_ms_t2048": 6.3568,
+        "op_gdn_train_backward_f32_ms_t2048": 19.6607
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1799,
-        "op_gdn_train_backward_ms_t2048": 11.8376
+        "op_gdn_train_forward_f32_ms_t2048": 3.1294,
+        "op_gdn_train_backward_f32_ms_t2048": 11.7689
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3409,
-        "op_gdn_train_backward_ms_t2048": 19.4284
+        "op_gdn_train_forward_f32_ms_t2048": 6.3177,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5048
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1739,
-        "op_gdn_train_backward_ms_t2048": 12.081
+        "op_gdn_train_forward_f32_ms_t2048": 3.128,
+        "op_gdn_train_backward_f32_ms_t2048": 11.8784
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3329,
-        "op_gdn_train_backward_ms_t2048": 19.8017
+        "op_gdn_train_forward_f32_ms_t2048": 6.3314,
+        "op_gdn_train_backward_f32_ms_t2048": 19.611
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1869,
-        "op_gdn_train_backward_ms_t2048": 11.798
+        "op_gdn_train_forward_f32_ms_t2048": 3.165,
+        "op_gdn_train_backward_f32_ms_t2048": 11.9504
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3451,
-        "op_gdn_train_backward_ms_t2048": 19.8079
+        "op_gdn_train_forward_f32_ms_t2048": 6.3575,
+        "op_gdn_train_backward_f32_ms_t2048": 19.8112
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1714,
-        "op_gdn_train_backward_ms_t2048": 11.9101
+        "op_gdn_train_forward_f32_ms_t2048": 3.1686,
+        "op_gdn_train_backward_f32_ms_t2048": 11.9805
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3542,
-        "op_gdn_train_backward_ms_t2048": 19.4318
+        "op_gdn_train_forward_f32_ms_t2048": 6.3294,
+        "op_gdn_train_backward_f32_ms_t2048": 19.3657
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1647,
-        "op_gdn_train_backward_ms_t2048": 11.8354
+        "op_gdn_train_forward_f32_ms_t2048": 3.1906,
+        "op_gdn_train_backward_f32_ms_t2048": 11.6532
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3824,
-        "op_gdn_train_backward_ms_t2048": 19.9088
+        "op_gdn_train_forward_f32_ms_t2048": 6.3181,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5959
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1559,
-        "op_gdn_train_backward_ms_t2048": 11.7016
+        "op_gdn_train_forward_f32_ms_t2048": 3.1464,
+        "op_gdn_train_backward_f32_ms_t2048": 11.6153
       }
     },
     {
       "sequential": {
-        "op_gdn_train_forward_ms_t2048": 6.3423,
-        "op_gdn_train_backward_ms_t2048": 19.7691
+        "op_gdn_train_forward_f32_ms_t2048": 6.3239,
+        "op_gdn_train_backward_f32_ms_t2048": 19.5412
       },
       "chunked": {
-        "op_gdn_train_forward_ms_t2048": 3.1296,
-        "op_gdn_train_backward_ms_t2048": 11.8877
+        "op_gdn_train_forward_f32_ms_t2048": 3.2186,
+        "op_gdn_train_backward_f32_ms_t2048": 11.8048
       }
     }
   ],
-  "lane_archive": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/b46d2477-9b7a-48b0-aeac-9034ece344e6/scratchpad/w10a_out/gdn_ops_paired.json.lanes"
+  "lane_archive": "$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_ops_paired_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-21T11:07:52Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-gpurun/target/release/bench_paired' --format metrics --evidence --rounds 10 --out '$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_ops_paired_m5pro.json' 'sequential:BENCH_GDN_KERNEL=sequential=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward' 'chunked:BENCH_GDN_KERNEL=chunked=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+      "--format",
+      "metrics",
+      "--evidence",
+      "--rounds",
+      "10",
+      "--out",
+      "$HOME/Code/research/tessl/target-gp/gpurun1c/gdn_train_chunked_ops_paired_m5pro.json",
+      "sequential:BENCH_GDN_KERNEL=sequential=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward",
+      "chunked:BENCH_GDN_KERNEL=chunked=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward"
+    ],
+    "cwd": "$HOME/Code/research/tessl-gpurun",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 10,
+      "max_spread": 1.1,
+      "lane_timeout_secs": 3600,
+      "clean_env": false,
+      "format": "Metrics",
+      "lanes": [
+        {
+          "name": "sequential",
+          "argv": [
+            "target/release/bench_qwen35_train",
+            "2048",
+            "--op=gdn_train_forward",
+            "--op=gdn_train_backward"
+          ],
+          "env": {
+            "BENCH_GDN_KERNEL": "sequential"
+          }
+        },
+        {
+          "name": "chunked",
+          "argv": [
+            "target/release/bench_qwen35_train",
+            "2048",
+            "--op=gdn_train_forward",
+            "--op=gdn_train_backward"
+          ],
+          "env": {
+            "BENCH_GDN_KERNEL": "chunked"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-gpurun",
+      "scope": ".",
+      "revision": "c2c16122417731456a7620b9ac05a09afcab6b63",
+      "dirty": false,
+      "status_porcelain": [],
+      "status_line_count": 0,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 7.08056640625,
+        "loadavg_5m": 8.24951171875,
+        "loadavg_15m": 8.7138671875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.3933648003472222,
+        "normalized_loadavg_5m": 0.4583062065972222,
+        "normalized_loadavg_15m": 0.4841037326388889
+      },
+      "finish": {
+        "loadavg_1m": 5.5166015625,
+        "loadavg_5m": 7.32568359375,
+        "loadavg_15m": 8.29150390625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.3064778645833333,
+        "normalized_loadavg_5m": 0.406982421875,
+        "normalized_loadavg_15m": 0.4606391059027778
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792578392732125936,
+        "sha256": "01a539c67550a433334dff6590036a361f1046b67c737b462115cc6400a95c5a"
+      },
+      "lane:chunked:bench_qwen35_train": {
+        "path": "$HOME/Code/research/tessl-gpurun/target/release/bench_qwen35_train",
+        "size_bytes": 4412224,
+        "mtime_ns": 1792578373324676953,
+        "sha256": "0eb304712c36656c27e78ca4cdffadf364736ac35bf25356c6ae74bebf89663f"
+      },
+      "lane:sequential:bench_qwen35_train": {
+        "path": "$HOME/Code/research/tessl-gpurun/target/release/bench_qwen35_train",
+        "size_bytes": 4412224,
+        "mtime_ns": 1792578373324676953,
+        "sha256": "0eb304712c36656c27e78ca4cdffadf364736ac35bf25356c6ae74bebf89663f"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-21T11:09:34Z"
+  }
 }

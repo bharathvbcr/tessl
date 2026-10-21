@@ -725,14 +725,17 @@ tessl takes on; `tessl::cross_entropy` already removes the LM head's row.
 `gdn_train_forward` / `gdn_train_backward` are the gated delta rule at
 transformers' seam (`torch_chunk_gated_delta_rule` with
 `use_qk_l2norm_in_kernel=True`): `g` and `beta` arrive computed, and q/k are
-l2-normalized in the kernel. The forward is a token recurrence per (batch x
-head, 16 value columns) that saves the state every 64 tokens and nothing
-else: 32 MiB per layer at the 2B's shapes and T = 2048, against the 435 MiB
-the torch fallback saves. The backward walks the chunks in reverse,
+l2-normalized in the kernel. Both directions run the chunked (WY) kernels
+(`gdn_train_c_*`: matrix products per 64-token chunk, only the state
+sequential across chunks). The forward saves the state every 64 tokens and
+nothing else: 32 MiB per layer at the 2B's shapes and T = 2048, against the
+435 MiB the torch fallback saves. The backward walks the chunks in reverse,
 recomputes each chunk's states from its checkpoint into a bounded
-`GdnTrainWorkspace`, and runs the reverse-mode recurrence; the value slices'
-partial `dq`, `dk`, `dg`, `dbeta` are summed in a fixed order (no
-atomics), so gradients are deterministic.
+`GdnTrainWorkspace`; the value slices' partial gradients are summed in a
+fixed order (no atomics), so gradients are deterministic. The token-sequential
+kernels (a recurrence per (batch x head, 16 value columns)) stay as the oracle
+the chunked ones are held to, and `GdnTrainKernel` selects between them for
+the benchmark.
 
 From torch, `tessl_torch.chunk_gated_delta_rule` has transformers' signature
 and `tessl_torch.patch_transformers_qwen3_5()` swaps it in for the fallback
@@ -747,8 +750,8 @@ central finite differences to 3e-10 for every input and the initial state,
 and the kernels match it within 3.4e-7 of the largest magnitude (bound 1e-4)
 across chunk edges (T = 1, 63, 64, 65, 130) and at the 2B's 16 heads x 128.
 Eleven of twelve injected kernel defects fail it; the twelfth is equivalent.
-Both directions are token-sequential, so they are slower than the chunked
-inference forward; they have not been timed yet.
+The chunked kernels are timed against the sequential ones under "Training-path
+timing" below.
 
 ### Row-local backward: `tessl::qwen35_bwd`
 
@@ -858,8 +861,8 @@ with `caffeinate -d` (ms per call, median of 7):
 
 | op | ms |
 |---|---:|
-| `gdn_train` forward | 6.5 |
-| `gdn_train` backward | 21.0 |
+| `gdn_train` forward (chunked) | 3.16 |
+| `gdn_train` backward (chunked) | 11.80 |
 | `attn_train` forward | 3.0 |
 | `attn_train` backward | 13.9 |
 | cross-entropy + both gradients (vocab 248320) | 1845 |
@@ -869,14 +872,22 @@ with `caffeinate -d` (ms per call, median of 7):
 | `gated_rms_norm_bwd` | 0.8 |
 | `rms_norm_bwd`, `gdn_gates_bwd`, `embed_rows_bwd` | 0.2-0.5 each |
 
-The GDN core is 27.5 ms per layer forward and backward (both
-token-sequential), attention's 17 ms. The cross-entropy is four
+The GDN rows are a later paired run (`bench_paired --evidence`, 10 rounds, at
+c2c1612) than the others: the sequential kernels took 6.33 ms forward and
+19.55 ms backward in the same run, so chunking is 0.498x [0.491, 0.509] and
+0.604x [0.593, 0.615]. The GDN core is 14.95 ms per layer forward and backward
+(25.88 ms sequential), attention's 17 ms. On the whole 2B step (real checkpoint,
+T = 2048, 4 rounds, production routed to the sequential kernel against the
+chunked one) the chunked kernels take it from 5.343 to 5.095 s, 0.953x
+[0.951, 0.954], and the device peak from 15.68 to 15.57 GiB
+(`bench/results/gdn_train_chunked_m5pro.txt`). The cross-entropy is four
 `[2047, 2048] x [2048, 248320]` products (two logit walks, then dh and dW),
 about 8.3 TFLOP, so its 1.8 s is 4.5 TFLOP/s against the 6.4 TFLOP/s the
 exact-f32 GEMM reaches. A whole `train_step` at T = 2048 takes 7.2 s (284
 tokens/s, median of 3, allocations included): the projections' forward and
 backward GEMMs are about 25 TFLOP (3.8 s at that rate), the cross-entropy
-1.8 s, the GDN and attention cores 0.6 s.
+1.8 s, the GDN and attention cores 0.6 s with the sequential GDN kernels
+(about 0.4 s chunked).
 
 Activation recomputation was measured against keeping every layer's
 intermediates, on the same machine and T, one mode per process under

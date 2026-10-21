@@ -1,33 +1,55 @@
-# Chunked (WY) GDN training kernels vs the token-sequential ones, Qwen3.5-2B shapes — M5 Pro, 2026-10-16
+# Chunked (WY) GDN training kernels vs the token-sequential ones, Qwen3.5-2B shapes — M5 Pro, 2026-10-21
+#
+# This run supersedes the 2026-10-16 run, which was taken before the dg fix (kernel and host) and without
+# --evidence. Its numbers were 0.500x forward, 0.605x backward, 0.953x whole step: the dg fix cost nothing
+# measurable. Both runs below are --evidence runs (the JSON carries the git revision, dirty flag, host, power
+# and load); the two JSON files next to this one are the raw records and replace the 10-16 ones.
 #
 # Per-op (T = 2048, B = 1, 16 key and value heads of 128, Dv 128), bench_paired, 10 interleaved rounds
 # (forward on even rounds, reversed on odd), each lane value the median of 7 runs inside one process
-# (bench_qwen35_train's own timing); the ratio is the median of per-round ratios with [lowest, highest] round:
+# (bench_qwen35_train's own timing); the ratio is the median of per-round ratios with [lowest, highest] round
+# (gdn_train_chunked_ops_paired_m5pro.json):
 #
-#   target/release/bench_paired --format metrics --rounds 10 --out gdn_ops_paired.json \
+#   target/release/bench_paired --format metrics --evidence --rounds 10 --out gdn_train_chunked_ops_paired_m5pro.json \
 #     "sequential:BENCH_GDN_KERNEL=sequential=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward" \
 #     "chunked:BENCH_GDN_KERNEL=chunked=target/release/bench_qwen35_train 2048 --op=gdn_train_forward --op=gdn_train_backward"
 #
-# Whole step (real 2B checkpoint, T = 2048, 4 rounds), before = production routed to the sequential kernel,
-# after = chunked (two release builds differing only in GDN_TRAIN_PRODUCTION):
+# Whole step (real Qwen3.5-2B-Base checkpoint, snapshot b1485b2, T = 2048, 4 rounds), before = production routed
+# to the sequential kernel, after = chunked: two release builds of c2c1612 differing only in
+# GDN_TRAIN_PRODUCTION (src/gdn_train.rs:158, Sequential in "before")
+# (gdn_train_chunked_step_paired_m5pro.json):
 #
-#   bench_paired --format metrics --rounds 4 "before=BIN_BEFORE 2048 --step-only --step=2048" "after=BIN_AFTER 2048 --step-only --step=2048"
+#   bench_paired --format metrics --evidence --rounds 4 --out gdn_train_chunked_step_paired_m5pro.json \
+#     "before=BIN_SEQUENTIAL 2048 --step-only --step=2048" "after=BIN_CHUNKED 2048 --step-only --step=2048"
 #
-# Conditions: shared machine under the Lappi mac_heavy lock, one job at a time, load average ~27 at start.
-# Not run with --evidence (dirty-tree provenance not recorded); the lane stdout/stderr are under the .lanes dirs
-# in the session scratchpad, not committed.
+# Conditions: tessl c2c1612, clean tree (git.dirty false in both records), M5 Pro (Mac17,8, 18 CPUs, 64 GiB),
+# macOS 27.0.1 (Darwin 27.0.0), AC power, no thermal warning at start or finish, one locked GPU job at a time.
+# Load average (1 min) 7.08 -> 5.52 over the per-op run and 4.62 -> 2.48 over the step run. The provenance
+# blocks name /Users/bharath/Code/research/tessl-gpurun and .../target-gp/gpurun1c; the lane stdout/stderr are
+# under the .lanes dirs there, not committed.
 #
 # Result: the chunked kernels win on every lane, with the round spread nowhere near 1.0 (noise band: the
 # [lo, hi] columns). Production is routed to them.
 #
 #                 workload             sequential                chunked       vs base [lo, hi]
-# op_gdn_train_forward_ms_t2048                  6.348                  3.173  0.500x [0.493, 0.504]
-# op_gdn_train_backward_ms_t2048                 19.662                 11.899  0.605x [0.588, 0.622]
+# op_gdn_train_forward_f32_ms_t2048              6.327                  3.156  0.498x [0.491, 0.509]
+# op_gdn_train_backward_f32_ms_t2048            19.549                 11.796  0.604x [0.593, 0.615]
 #
 #                 workload                 before                  after       vs base [lo, hi]
-#       train_step_s_t2048                  5.292                  5.047  0.953x [0.946, 0.958]
-#    device_peak_gib_t2048                 15.347                 15.238  0.993x [0.993, 0.993]
-#  peak_footprint_gb_t2048                 19.715                 19.598  0.994x [0.994, 0.994]
+#       train_step_s_t2048                  5.343                  5.095  0.953x [0.951, 0.954]
+#    device_peak_gib_t2048                 15.677                 15.570  0.993x [0.993, 0.993]
+#  peak_footprint_gb_t2048                 20.070                 19.955  0.994x [0.994, 0.994]
 #
-# Memory: step peak footprint 19.715 GB before, 19.598 GB after (device peak 15.347 / 15.238 GiB), both far
-# under memguard's 32 GiB. The GDN workspace is smaller (no per-slice dq/dk partials): see docs text in the report.
+# The GDN core per layer at T = 2048 is 3.156 + 11.796 = 14.95 ms chunked against 6.327 + 19.549 = 25.88 ms
+# sequential in the same run.
+#
+# Memory: step peak footprint 20.070 GB before, 19.955 GB after (device peak 15.677 / 15.570 GiB), both far
+# under memguard's 32 GiB. The GDN workspace is smaller (no per-slice dq/dk partials).
+#
+# Fail-before for the dg fix (2026-10-21, gpurun3/failbefore_gdn_train.log): on branch gp/w20-gdn-failbefore
+# (dfc223a: the kernel and host dg fix reverted, its tests kept), `cargo test --release --test gdn_train` =
+# 10 passed, 2 failed:
+#   dg_survives_strong_decay: "g=-5 T=200: chunked dg error 4.59e-6 vs sequential 1.61e-7 (allowed 10x + 2e-6)"
+#   the_kernels_survive_adversarial_inputs: "grouped hv=4 hk=2 g=-50 T=130: chunked dg error 1.00e0 vs sequential 1.99e-7"
+# On gp/w20-gdn-owed (the fix in place) the same test binary passes in full, and the gdn_train::tests lib
+# tests (2, including the device byte test) pass.

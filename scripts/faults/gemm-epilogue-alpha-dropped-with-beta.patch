@@ -1,13 +1,13 @@
 diff --git a/kernels/gemm_coop.h b/kernels/gemm_coop.h
-index 4c884c8..f6b68f9 100644
+index 9a129c5..52e6e56 100644
 --- a/kernels/gemm_coop.h
 +++ b/kernels/gemm_coop.h
-@@ -305,7 +305,7 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
-             prevT.load(tC);
- #pragma clang loop unroll(full)
+@@ -323,7 +323,7 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
              for (uint16_t i = 0; i < cT.get_capacity(); ++i)
--                if (cT.is_valid_element(i)) cT[i] = cT[i] * alpha + beta * prevT[i];
-+                if (cT.is_valid_element(i)) cT[i] = cT[i] + beta * prevT[i];
+                 if (cT.is_valid_element(i)) {
+                     if (STRICT) cT[i] = epi_axpby_strict(cT[i], alpha, beta, prevT[i]);
+-                    else cT[i] = cT[i] * alpha + beta * prevT[i];
++                    else cT[i] = cT[i] + beta * prevT[i];
+                 }
          } else if (alpha != 1.0f) {
  #pragma clang loop unroll(full)
-             for (uint16_t i = 0; i < cT.get_capacity(); ++i)

@@ -26,6 +26,10 @@ use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer, Tensor};
 use tessl::GpuRuntime;
 
+// The one peak-footprint reader (also the bench bins'), included by path.
+#[path = "../src/bin/common/footprint.rs"]
+mod footprint;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train")
 }
@@ -80,10 +84,25 @@ fn by_name(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str) -> Vec<(String, Ve
 /// [`by_name`] for one part only: `Some(l)` is layer `l`'s gradients alone,
 /// `Some(usize::MAX)` the embedding and final norm alone; `None` everything.
 fn named(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str, part: Option<usize>) -> Vec<(String, Vec<f64>)> {
+    named_with(cfg, g, prefix, part, true)
+}
+
+/// [`named`], with the embedding's gradient left out when `embed` is false:
+/// the 2B's is 248320 x 2048, 4 GiB as f64 on the host, and a caller that
+/// compares only some rows of it, or streams it, reads it itself.
+fn named_with(
+    cfg: &Qwen35Config,
+    g: &Qwen35Grads,
+    prefix: &str,
+    part: Option<usize>,
+    embed: bool,
+) -> Vec<(String, Vec<f64>)> {
     let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
     let mut out = Vec::new();
     if part.is_none() || part == Some(usize::MAX) {
-        out.push((format!("{prefix}embed_tokens.weight"), read_t(&g.embed).2));
+        if embed {
+            out.push((format!("{prefix}embed_tokens.weight"), read_t(&g.embed).2));
+        }
         out.push((format!("{prefix}norm.weight"), read(&g.final_norm, h)));
         // An untied model's head sits at the checkpoint root, not under the tower.
         if let Some(head) = &g.lm_head {
@@ -144,11 +163,92 @@ fn named(cfg: &Qwen35Config, g: &Qwen35Grads, prefix: &str, part: Option<usize>)
     out
 }
 
+/// [`rel`] over a parameter fed in pieces: the largest `|got - want|` and the
+/// largest `|want|` so far.
+#[derive(Default)]
+struct RelAcc {
+    peak: f64,
+    diff: f64,
+}
+
+impl RelAcc {
+    fn push(&mut self, got: &[f64], want: &[f64]) {
+        assert_eq!(got.len(), want.len());
+        self.peak = want.iter().fold(self.peak, |m, x| m.max(x.abs()));
+        self.diff = got
+            .iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(self.diff, f64::max);
+    }
+
+    fn rel(&self) -> f64 {
+        self.diff / self.peak.max(1e-30)
+    }
+}
+
 /// Worst `|got - want| / max|want|` of one parameter.
 fn rel(got: &[f64], want: &[f64]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let peak = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
-    got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max) / peak
+    let mut acc = RelAcc::default();
+    acc.push(got, want);
+    acc.rel()
+}
+
+/// Elements `[start, start + len)` of `t`, widened to f64, read straight from
+/// the device mapping: the rest of the tensor is never copied.
+fn window_f64(t: &Tensor, start: usize, len: usize) -> Vec<f64> {
+    match t.dtype {
+        DType::BF16 => t.buffer.contents_u16()[start..start + len]
+            .iter()
+            .map(|&b| f64::from(bf16_bits_to_f32(b)))
+            .collect(),
+        _ => t.buffer.contents_f32()[start..start + len]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect(),
+    }
+}
+
+/// Calls `f(start, window)` over `t`'s elements as f32 (bf16 widened exactly),
+/// [`REL_WINDOW`] at a time. An f32 tensor's window is the device mapping
+/// itself, with no host copy; `f` must not touch the runtime.
+fn each_f32_window(t: &Tensor, mut f: impl FnMut(usize, &[f32])) {
+    let n = t.numel();
+    for start in (0..n).step_by(REL_WINDOW) {
+        let len = REL_WINDOW.min(n - start);
+        match t.dtype {
+            DType::BF16 => {
+                let w: Vec<f32> = t.buffer.contents_u16()[start..start + len]
+                    .iter()
+                    .map(|&b| bf16_bits_to_f32(b))
+                    .collect();
+                f(start, &w);
+            }
+            _ => f(start, &t.buffer.contents_f32()[start..start + len]),
+        }
+    }
+}
+
+/// Rows `rows` of a `[n, cols]` tensor as f64.
+fn rows_f64(t: &Tensor, rows: &[usize]) -> Vec<f64> {
+    let cols = t.shape()[1];
+    rows.iter().flat_map(|&r| window_f64(t, r * cols, cols)).collect()
+}
+
+/// Elements per host window of [`rel_streamed`]: 4 Mi, 32 MiB as f64.
+const REL_WINDOW: usize = 1 << 22;
+
+/// [`rel`] between two same-shaped tensors, a window at a time: the 2B's
+/// embedding gradient is 4 GiB as f64, and two of them are 8.
+fn rel_streamed(got: &Tensor, want: &Tensor) -> f64 {
+    assert_eq!(got.shape(), want.shape());
+    let n = got.numel();
+    let mut acc = RelAcc::default();
+    for start in (0..n).step_by(REL_WINDOW) {
+        let len = REL_WINDOW.min(n - start);
+        acc.push(&window_f64(got, start, len), &window_f64(want, start, len));
+    }
+    acc.rel()
 }
 
 fn load(dir: &Path, prefix: &str, cfg: Qwen35Config, precision: Precision) -> Qwen35Model {
@@ -1618,20 +1718,36 @@ fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
 
 /// Every reference gradient in `dir` against `step`'s, each as
 /// [`rel`], printed before anything is asserted; returns them and the worst.
+///
+/// One part at a time, as [`streamed_rel`] does: the gradients of the 2B are
+/// 1.88 B parameters, 14 GiB as f64, and held whole on the host they took
+/// this test's process past the footprint cap (the lock's kills at 30,168 and
+/// 33,080 MiB, docs/verification.md 2026-10-21). The embedding's 508 M
+/// gradients are not read at all beyond the rows the reference kept; the
+/// host holds one layer's gradients and its references at a time.
 fn real_2b_results(dir: &Path, cfg: &Qwen35Config, step: &TrainStep) -> (Vec<(String, f64)>, f64) {
     let mut results = Vec::new();
     // The embedding: only the rows the reference kept.
     let (_, rows) = npy_f64(&dir.join("embed_rows.npy"));
     let (_, want) = npy_f64(&dir.join("grad.model.embed_tokens.weight.rows.npy"));
-    let (_, h, all) = read_t(&step.grads.embed);
-    let got: Vec<f64> = rows.iter().flat_map(|&r| all[r as usize * h..][..h].to_vec()).collect();
+    let rows: Vec<usize> = rows.iter().map(|&r| r as usize).collect();
+    let got = rows_f64(&step.grads.embed, &rows);
     results.push(("model.embed_tokens.weight (kept rows)".to_string(), rel(&got, &want)));
+    // A whole-embedding reference would be compared by streaming, which this
+    // does not do for the reference's side: refuse it rather than skip it.
+    assert!(
+        !dir.join("grad.model.embed_tokens.weight.npy").exists(),
+        "{}: a whole-embedding reference gradient; this test compares the kept rows only",
+        dir.display()
+    );
     // transformers names the text tower's parameters `model.*`; the
     // checkpoint stores them under `model.language_model.*`.
-    for (name, got) in by_name(cfg, &step.grads, "model.") {
-        let path = dir.join(format!("grad.{name}.npy"));
-        if path.exists() {
-            results.push((name, rel(&got, &npy_f64(&path).1)));
+    for part in std::iter::once(usize::MAX).chain(0..step.grads.layers.len()) {
+        for (name, got) in named_with(cfg, &step.grads, "model.", Some(part), false) {
+            let path = dir.join(format!("grad.{name}.npy"));
+            if path.exists() {
+                results.push((name, rel(&got, &npy_f64(&path).1)));
+            }
         }
     }
     for (name, r) in &results {
@@ -1672,6 +1788,7 @@ fn real_2b_step_matches_transformers() {
     );
     eprintln!("      train vs transformers {r_train:.2e}, inference vs transformers {r_infer:.2e}, train vs inference {r_self:.2e}");
     let (results, _) = real_2b_results(&dir, &cfg, &step);
+    print_peak_footprint("real_2b_step_matches_transformers");
     // These bounds were set after the first run, from what it showed: the
     // training loss is the inference forward's (1.7e-7), which differs from
     // transformers' fp32 loss by 4.6e-5 because the two f32 forwards differ
@@ -1703,6 +1820,40 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// loss-curve test (docs/verification.md, 2026-10-17).
 const HOST_FOOTPRINT_OVER_DEVICE_BYTES: u64 = 2_600_000_000;
 
+/// Prints this process's lifetime peak footprint against memguard's cap.
+/// Unreadable is a panic, not a missing line: a report that could not be taken
+/// must not look like one that said "under the cap".
+fn print_peak_footprint(what: &str) {
+    let peak = footprint::peak_footprint().unwrap_or_else(|e| panic!("{what}: peak footprint unreadable: {e}"));
+    eprintln!(
+        "{what}: peak footprint {:.2} GiB (memguard cap {} GiB)",
+        peak as f64 / GIB,
+        MEMGUARD_CAP_BYTES >> 30
+    );
+}
+
+/// The pre-start footprint bound of a 2B arm: the sum of `parts` (each a
+/// label and its bytes) against `cap`. `Ok` is the total; `Err` is the
+/// message a test panics with when the arm cannot fit, which names every
+/// component so the number that does not fit is visible. Pure arithmetic: no
+/// device, so it is a hosted test.
+fn footprint_requirement(what: &str, parts: &[(&str, u64)], cap: u64) -> Result<u64, String> {
+    let total = parts.iter().fold(0u64, |a, &(_, b)| a.saturating_add(b));
+    if total <= cap {
+        return Ok(total);
+    }
+    let breakdown: Vec<String> = parts
+        .iter()
+        .map(|&(label, b)| format!("{label} {:.2} GiB", b as f64 / GIB))
+        .collect();
+    Err(format!(
+        "REQUIREMENT UNMET (not a pass): {what} needs {:.2} GiB, over the {:.2} GiB cap ({})",
+        total as f64 / GIB,
+        cap as f64 / GIB,
+        breakdown.join(" + ")
+    ))
+}
+
 /// The real 2B checkpoint, in `precision` as `load_tower` loads it (bf16 is
 /// how a bf16 model trains).
 fn real_2b_tower(rt: &Arc<GpuRuntime>, precision: Precision) -> Qwen35Model {
@@ -1730,13 +1881,15 @@ fn text_ids() -> Vec<u32> {
 
 /// [`rel`] for every parameter of `got` against `want`, one layer (or the
 /// embedding) at a time: the 2B's gradients do not fit on the host twice
-/// in f64.
+/// in f64. The embedding, 4 GiB as f64 each side, goes through
+/// [`rel_streamed`] a window at a time instead of through [`named`].
 fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Vec<(String, f64)> {
-    let mut out = Vec::new();
+    let mut out = vec![("embed_tokens.weight".to_string(), rel_streamed(&got.embed, &want.embed))];
     for part in std::iter::once(usize::MAX).chain(0..got.layers.len()) {
-        for ((name, a), (_, b)) in named(cfg, got, "", Some(part))
-            .into_iter()
-            .zip(named(cfg, want, "", Some(part)))
+        for ((name, a), (_, b)) in
+            named_with(cfg, got, "", Some(part), false)
+                .into_iter()
+                .zip(named_with(cfg, want, "", Some(part), false))
         {
             out.push((name, rel(&a, &b)));
         }
@@ -1798,6 +1951,7 @@ fn real_2b_step_on_bf16_storage_stays_near_the_f32_step() {
         eprintln!("{name}: storage {r:.2e}");
     }
     eprintln!("worst {worst:.3e}");
+    print_peak_footprint("real_2b_step_on_bf16_storage_stays_near_the_f32_step");
     assert!(r_loss <= 2f64.powi(-7), "loss {} vs f32 {}", step.loss, exact.loss);
     for (name, r) in &results {
         assert!(*r <= 2f64.powi(-4), "{name}: rel err {r:.3e} > 2^-4");
@@ -1900,6 +2054,51 @@ fn loss_curve_bound_ignores_whether_the_f32_held_out_falls() {
     assert_eq!(failures.len(), 1, "{failures:?}");
 }
 
+/// The pre-start bound of a 2B arm: under the cap it is the sum, over it it is
+/// the "REQUIREMENT UNMET (not a pass)" message with every component, and a
+/// total that overflows `u64` is over the cap rather than wrapped under it.
+#[test]
+fn footprint_requirement_sums_under_the_cap_and_names_every_part_over_it() {
+    let gib = 1u64 << 30;
+    let parts = [("model", 7 * gib), ("gradient bank", 7 * gib), ("host overhead", gib)];
+    assert_eq!(footprint_requirement("arm", &parts, 15 * gib), Ok(15 * gib));
+    let msg = footprint_requirement("seed 1: F32 storage", &parts, 14 * gib).unwrap_err();
+    assert!(
+        msg.starts_with("REQUIREMENT UNMET (not a pass): seed 1: F32 storage needs 15.00 GiB"),
+        "{msg}"
+    );
+    assert!(msg.contains("over the 14.00 GiB cap"), "{msg}");
+    assert!(
+        msg.contains("model 7.00 GiB + gradient bank 7.00 GiB + host overhead 1.00 GiB"),
+        "{msg}"
+    );
+    let wrapped = [("a", u64::MAX), ("b", 2)];
+    assert!(footprint_requirement("arm", &wrapped, 32 * gib).is_err());
+}
+
+/// The windowed accumulator is [`rel`]: any split of a parameter into pieces
+/// gives the whole's value, including a piece that holds the peak or the worst
+/// difference alone.
+#[test]
+fn windowed_rel_is_the_whole_rel() {
+    let want: Vec<f64> = (0..1000).map(|i| ((i * 37 % 101) as f64 - 50.0) * 0.25).collect();
+    let got: Vec<f64> = want
+        .iter()
+        .enumerate()
+        .map(|(i, w)| w + if i == 777 { 3.0 } else { 0.001 * (i % 7) as f64 })
+        .collect();
+    let whole = rel(&got, &want);
+    assert!(whole > 0.0);
+    for window in [1, 7, 333, 777, 778, 1000] {
+        let mut acc = RelAcc::default();
+        for (g, w) in got.chunks(window).zip(want.chunks(window)) {
+            acc.push(g, w);
+        }
+        assert_eq!(acc.rel().to_bits(), whole.to_bits(), "window {window}");
+    }
+    assert_eq!(rel(&[], &[]), 0.0);
+}
+
 /// 4352 natural-text ids for the loss curve: 34 chunks of 128
 /// (`tests/fixtures/qwen35_curve_ids.npy`, `tools/qwen35_ref/make_text_ids.py`).
 fn curve_ids() -> Vec<u32> {
@@ -1926,8 +2125,14 @@ fn curve_ids() -> Vec<u32> {
 /// stored precision's training loss within 2% and its held-out fall within
 /// 25% of an f32 fall of at least 0.05. Every step's losses are printed as
 /// CSV. Needs
-/// `QWEN35_2B_SAFETENSORS`; each run holds at most ~33 GB and is dropped
-/// before the next.
+/// `QWEN35_2B_SAFETENSORS`; each run is dropped before the next. The f32
+/// reference arm holds model, bank and both moments, 16 bytes per parameter
+/// (28 GiB for 1.88 B parameters; its measured device peak was 30.11 GiB,
+/// docs/verification.md 2026-10-17), which with the step's workspace and the
+/// host overhead does not fit memguard's 32 GiB cap on a
+/// 64 GiB machine: on it the test fails closed, before the arm's bank is
+/// allocated, with "REQUIREMENT UNMET (not a pass)" and the numbers. It is
+/// not a pass and not a skip.
 ///
 /// Two earlier curves repeated their data and were replaced (2026-10-08,
 /// M5 Pro). The first trained four chunks in turn and bounded the training
@@ -1984,19 +2189,44 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     };
     // Each step's training loss, and the held-out mean before training and
     // after every EVERY steps.
-    // `Err` names an arm whose footprint, read after its first step (every
-    // buffer the step needs exists by then), is past memguard's cap: the test
-    // then reports SKIPPED rather than being SIGTERMed mid-run or passing
-    // without its bound. The first step finishes well inside memguard's
-    // three-sample, ten-second grace.
-    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> Result<(Vec<f64>, Vec<f64>), String> {
+    // An arm whose footprint cannot fit memguard's cap fails the test, twice
+    // over. Before its first step, from the byte bounds: the model as loaded,
+    // a bank of the same size, [`AdamW::allocated_bytes_for`], the step's
+    // workspace ([`Qwen35Model::train_step_bytes`]) and the host overhead.
+    // And after its first step (every buffer the step needs exists by then),
+    // from the measured device peak. Both panic "REQUIREMENT UNMET (not a
+    // pass)": the arm was not measured, so the test must not pass, and it must
+    // not be killed mid-run either. memguard SIGTERMs a breach on its next
+    // 2 s sample, so there is no grace period to measure inside; the
+    // pre-start check is what stops the arm before the bank and the optimizer
+    // state are allocated. (fcb7a08's "ten-second grace" was wrong, and its
+    // SKIPPED report let a run end with no arm checked.)
+    let curve = |precision: Precision, config: AdamWConfig, seed: u64| -> (Vec<f64>, Vec<f64>) {
         rt.reset_peak_allocated_bytes();
+        let allocated_before = rt.current_allocated_bytes();
         let model = real_2b_tower(&rt, precision);
+        rt.synchronize().unwrap();
         let operands = if precision == Precision::F32 {
             GemmOperands::ExactF32
         } else {
             GemmOperands::Bf16
         };
+        let arm = format!("seed {seed}: {precision:?} storage with {config}");
+        // The bank holds every parameter in its weight's dtype
+        // (`Qwen35Grads::zeros_like`), so it is the model's size.
+        let model_bytes = rt.current_allocated_bytes().saturating_sub(allocated_before);
+        footprint_requirement(
+            &arm,
+            &[
+                ("model", model_bytes),
+                ("gradient bank", model_bytes),
+                ("optimizer state", AdamW::allocated_bytes_for(&model, config).unwrap()),
+                ("step workspace", model.train_step_bytes(128, operands)),
+                ("host overhead", HOST_FOOTPRINT_OVER_DEVICE_BYTES),
+            ],
+            MEMGUARD_CAP_BYTES,
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
         let held = || {
             held_out
                 .iter()
@@ -2017,16 +2247,15 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
             if s == 0 {
                 rt.synchronize().unwrap();
-                let footprint = rt.peak_allocated_bytes() + HOST_FOOTPRINT_OVER_DEVICE_BYTES;
-                if footprint > MEMGUARD_CAP_BYTES {
-                    return Err(format!(
-                        "{precision:?} storage with {} state peaks at {:.2} GiB device + {:.2} GiB host, over memguard's {} GiB cap",
-                        state.describe(),
-                        rt.peak_allocated_bytes() as f64 / GIB,
-                        HOST_FOOTPRINT_OVER_DEVICE_BYTES as f64 / GIB,
-                        MEMGUARD_CAP_BYTES >> 30
-                    ));
-                }
+                footprint_requirement(
+                    &format!("{arm} after step 0 (measured)"),
+                    &[
+                        ("device peak", rt.peak_allocated_bytes()),
+                        ("host overhead", HOST_FOOTPRINT_OVER_DEVICE_BYTES),
+                    ],
+                    MEMGUARD_CAP_BYTES,
+                )
+                .unwrap_or_else(|why| panic!("{why}"));
             }
             if (s + 1) % EVERY == 0 {
                 helds.push(held());
@@ -2042,7 +2271,8 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             rt.current_allocated_bytes() as f64 / GIB,
             rt.peak_allocated_bytes() as f64 / GIB
         );
-        Ok((losses, helds))
+        print_peak_footprint(&format!("{arm} (process lifetime peak so far)"));
+        (losses, helds)
     };
     let configs = |seed: u64| {
         [
@@ -2066,20 +2296,9 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     };
     let mut failures = Vec::new();
     for seed in SEEDS {
-        let skipped = |why: String| eprintln!("SKIPPED real_2b_loss_curve_tracks_the_f32_step (seed {seed}): {why}");
-        let (base, base_held) = match curve(Precision::F32, AdamWConfig::F32, seed) {
-            Ok(r) => r,
-            Err(why) => return skipped(why),
-        };
+        let (base, base_held) = curve(Precision::F32, AdamWConfig::F32, seed);
         let cs = configs(seed);
-        let runs = match cs
-            .iter()
-            .map(|&c| curve(Precision::Bf16, c, seed))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(r) => r,
-            Err(why) => return skipped(why),
-        };
+        let runs: Vec<_> = cs.iter().map(|&c| curve(Precision::Bf16, c, seed)).collect();
         println!("seed {seed}");
         println!(
             "step,f32,{}",
@@ -2101,6 +2320,7 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             .collect();
         failures.extend(loss_curve_bound_failures(seed, EVERY, &base, &base_held, &view));
     }
+    print_peak_footprint("real_2b_loss_curve_tracks_the_f32_step");
     assert!(
         failures.is_empty(),
         "{} bound(s) failed:\n{}",
@@ -2130,6 +2350,7 @@ fn real_2b_step_on_bf16_operands_stays_near_transformers() {
         step.loss
     );
     let (results, worst) = real_2b_results(&dir, &cfg, &step);
+    print_peak_footprint("real_2b_step_on_bf16_operands_stays_near_transformers");
     assert!(
         r_loss <= 2f64.powi(-7),
         "loss {} vs transformers {want_loss}",
@@ -2174,17 +2395,17 @@ fn real_2b_bank_accumulates_within_the_bound() {
     {
         let fb = model.train_step(&b, mm).unwrap();
         for ((_, y, _), sum) in bank_pairs(&fb.grads, &fb.grads).into_iter().zip(sums.iter_mut()) {
-            let y = widened(y);
-            assert_eq!(y.len(), sum.len());
-            scales.push(
-                sum.iter()
-                    .zip(&y)
-                    .map(|(p, q)| f64::from(p.abs() + q.abs()))
-                    .fold(0.0, f64::max),
-            );
-            for (s, q) in sum.iter_mut().zip(&y) {
-                *s += q;
-            }
+            assert_eq!(y.numel(), sum.len());
+            // Read through the device mapping a window at a time: a widened
+            // copy of the embedding is 2 GiB more on the host.
+            let mut scale = 0.0f64;
+            each_f32_window(y, |start, ys| {
+                for (s, &q) in sum[start..].iter_mut().zip(ys) {
+                    scale = scale.max(f64::from(s.abs() + q.abs()));
+                    *s += q;
+                }
+            });
+            scales.push(scale);
         }
     }
     let bank = Qwen35Grads::zeros_like(&model).unwrap();
@@ -2194,20 +2415,23 @@ fn real_2b_bank_accumulates_within_the_bound() {
     let got = bank_pairs(&bank, &bank);
     assert_eq!(got.len(), sums.len());
     for (((name, got, _), sum), scale) in got.into_iter().zip(&sums).zip(scales) {
-        let got = widened(got);
-        assert_eq!(got.len(), sum.len(), "{name}");
-        for (k, (&g, &want)) in got.iter().zip(sum).enumerate() {
-            let err = (f64::from(g) - f64::from(want)).abs();
-            assert!(
-                err <= ACCUMULATE_BOUND * U * scale,
-                "{name}[{k}]: {g} is {err:.3e} from {want}, over {ACCUMULATE_BOUND} u of {scale:.3e}"
-            );
-            if scale > 0.0 {
-                worst = worst.max(err / (U * scale));
+        assert_eq!(got.numel(), sum.len(), "{name}");
+        each_f32_window(got, |start, gs| {
+            for (k, (&g, &want)) in gs.iter().zip(&sum[start..]).enumerate() {
+                let err = (f64::from(g) - f64::from(want)).abs();
+                assert!(
+                    err <= ACCUMULATE_BOUND * U * scale,
+                    "{name}[{}]: {g} is {err:.3e} from {want}, over {ACCUMULATE_BOUND} u of {scale:.3e}",
+                    start + k
+                );
+                if scale > 0.0 {
+                    worst = worst.max(err / (U * scale));
+                }
             }
-        }
+        });
     }
     eprintln!("worst accumulated deviation: {worst:.2} u of the tensor's largest |x| + |y|");
+    print_peak_footprint("real_2b_bank_accumulates_within_the_bound");
 }
 
 // ------------------------------------------------------------ untied head ---

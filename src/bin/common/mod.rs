@@ -173,36 +173,22 @@ pub fn median(mut v: Vec<f64>) -> Result<f64, String> {
     })
 }
 
-/// Environment integers fail loud. This tree already lost a run to the opposite
-/// policy: a malformed `GEMM_FUZZ_SEED` was silently ignored and one seed ran
-/// eight times while the log claimed eight. (See [`env_usize`].)
-/// This process's lifetime peak physical footprint in bytes: the figure
-/// `/usr/bin/time -l` prints as `peak memory footprint`. Not `ru_maxrss`,
-/// which under-reads when macOS compresses or reclaims pages
-/// (bench/results/qwen35_load_rss_m5pro.txt saw 8.07 GB against 10.79 GB).
-pub fn peak_footprint() -> Result<u64, String> {
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `proc_pid_rusage` fills a `rusage_info_v4` for this flavor, and
-    // `info` is one, zero-initialised.
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            std::process::id() as libc::c_int,
-            libc::RUSAGE_INFO_V4,
-            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
-        )
-    };
-    if rc != 0 {
-        return Err(format!("proc_pid_rusage: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: zero-initialised and then filled by a successful call.
-    Ok(unsafe { info.assume_init() }.ri_lifetime_max_phys_footprint)
-}
+// The peak-footprint reader lives in its own file so the integration tests
+// that print their peak include the same source.
+#[path = "footprint.rs"]
+mod footprint;
+#[allow(unused_imports)] // Each bin uses a subset of `common`.
+pub use footprint::peak_footprint;
 
 /// The largest count any benchmark knob (`BENCH_ITERS`, `--rounds`, ...) may
 /// name. No bench runs a million of anything; the bound turns `2^64 - 1`, and a
 /// typo that adds digits, into an error instead of a run that never ends.
 pub const MAX_COUNT: usize = 999_999;
 
+/// Environment integers fail loud. This tree already lost a run to the opposite
+/// policy: a malformed `GEMM_FUZZ_SEED` was silently ignored and one seed ran
+/// eight times while the log claimed eight. (See [`env_usize`].)
+///
 /// The one strict count parser: ASCII digits only (no sign, no surrounding
 /// whitespace), no leading zero unless the whole value is `0`, between `min`
 /// and [`MAX_COUNT`]. `name` is the variable or flag, for the message.

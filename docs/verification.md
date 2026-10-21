@@ -820,6 +820,26 @@ The three SIGTERM exits are the memguard cap, not a test assertion; they are
 recorded as not completed, not as passes. The signal is the evidence: no
 memguard log was read.
 
+2026-10-21 (M5 Pro, 64 GiB): `real_2b_step_matches_transformers` was killed twice,
+both times in its comparison phase after printing its loss, by the machine lock
+`mac_heavy.sh` over its cap (the lock's kills, values as the lock reported them):
+
+```
+tree footprint 30,168 MiB (cap 28,672 MiB), 11.0 GiB host RSS
+tree footprint 33,080 MiB (cap 31,744 MiB), 14.3 GiB host RSS
+```
+
+Host RSS excludes Metal buffers, so the growth is host memory. The cause read
+from the code (inferred, not re-measured): `real_2b_results` read the whole
+embedding gradient to host f64 and then `by_name` every gradient as f64, 1.88 B
+parameters x 8 B = 14.0 GiB, though only the reference's files are compared.
+`real_2b_results` now streams per part, reads only the kept embedding rows, and
+`streamed_rel` compares the embedding a window at a time; the pre-start bound and
+peak-footprint line of the loss-curve test (`footprint_requirement`,
+`print_peak_footprint`) are in tests/qwen35_train.rs. The per-test results
+of the changed tests follow from the lead's locked run of them; none is
+recorded here until that run exists.
+
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
 transformers 3.81016612; train vs transformers 4.55e-5), the worst
 |got - want| / max|want| of each of its 149 parameters (worst 4.05e-3,

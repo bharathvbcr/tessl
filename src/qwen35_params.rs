@@ -576,6 +576,7 @@ impl Qwen35Model {
     /// optimizer step would leave behind ([`Self::load_tower`] loads without
     /// it).
     pub(crate) fn require_trainable(&self, what: &str) -> Result<(), String> {
+        self.check_untorn(what)?;
         if self.precision == Precision::Bf16 && self.lm_head_bf16.is_some() {
             return Err(format!(
                 "{what}: a bf16 model loaded with its packed LM head cannot change its weights (the head \

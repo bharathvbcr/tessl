@@ -218,6 +218,9 @@ pub struct AdamW {
     rt: Arc<GpuRuntime>,
     /// Bound to the kernel's unused buffer slots.
     dummy: GpuBuffer,
+    /// Why this state is part of a failed fused step ([`FusedAdamW::tear`]):
+    /// it refuses every later update.
+    torn: Option<String>,
 }
 
 /// One parameter-table entry's state buffers, in bytes, for `n` elements
@@ -327,6 +330,7 @@ impl AdamW {
             confirmed: std::cell::Cell::new(0),
             rt: Arc::clone(rt),
             dummy: zeroed(rt, 32)?,
+            torn: None,
         })
     }
 
@@ -415,6 +419,17 @@ impl AdamW {
 
     /// [`Self::check_model`] against `model`'s parameter slots already built
     /// (with or without gradients; only the parameter windows are read).
+    /// Refuse an update from a state a failed fused step tore.
+    fn check_untorn(&self, what: &str) -> Result<(), String> {
+        match &self.torn {
+            None => Ok(()),
+            Some(cause) => Err(format!(
+                "{what}: this AdamW state is part of a step that failed ({cause}); some entries moved and the rest did not; \
+                 make a new state for a reloaded model"
+            )),
+        }
+    }
+
     fn check_model_slots(&self, what: &str, model: &Qwen35Model, ps: &[Slot<'_>]) -> Result<(), String> {
         if model.precision() != self.precision
             || ps.len() != self.slots.len()
@@ -867,8 +882,8 @@ pub(crate) struct FusedAdamW<'a> {
     /// entry after the last layer (the final norm).
     layer_start: Vec<usize>,
     tail_start: usize,
-    /// An update has been encoded: the weights are no longer the forward's.
-    encoded: bool,
+    /// An update may have run: the weights are no longer the forward's.
+    touched: bool,
 }
 
 impl<'a> FusedAdamW<'a> {
@@ -895,6 +910,7 @@ impl<'a> FusedAdamW<'a> {
             ));
         }
         let ps = slots(model, None).map_err(|e| format!("{what}: {e}"))?;
+        state.check_untorn(what)?;
         state.check_model_slots(what, model, &ps)?;
         if weight_decay.len() != ps.len() {
             return Err(format!(
@@ -929,13 +945,13 @@ impl<'a> FusedAdamW<'a> {
             next,
             layer_start,
             tail_start: at,
-            encoded: false,
+            touched: false,
         })
     }
 
-    /// Whether any update has been encoded: the parameters have changed.
-    pub(crate) fn encoded(&self) -> bool {
-        self.encoded
+    /// Whether an update was dispatched (or its dispatch began): the parameters may have changed.
+    pub(crate) fn touched(&self) -> bool {
+        self.touched
     }
 
     /// Encode layer `l`'s update from its gradients `g` (a [`LayerGrads`] in
@@ -974,10 +990,26 @@ impl<'a> FusedAdamW<'a> {
         let state: &AdamW = self.state;
         let entries: Vec<_> = ps.iter().zip(indices).map(|(s, i)| (i, s, &state.slots[i])).collect();
         let plan = plan_adamw(what, &entries, state.config, &self.hyper, self.weight_decay, None)?;
-        model.encode_planned(what, &plan, state, self.next, || {})?;
-        self.encoded = true;
-        self.state.step = self.next;
-        Ok(())
+        // Encoding is not completion: once the first dispatch may have run,
+        // the weights, moments and count are no longer the step's start,
+        // whether or not every dispatch got encoded.
+        let mut touched = false;
+        let encoded = model.encode_planned(what, &plan, state, self.next, || touched = true);
+        if touched {
+            self.touched = true;
+            self.state.step = self.next;
+        }
+        encoded
+    }
+
+    /// The step failed with `cause` after an update could have run: latch the
+    /// model and the state as torn, so every later forward, training step and
+    /// optimizer step refuses until the model is reloaded. The count is left
+    /// as it is: the weights did move.
+    pub(crate) fn tear(&mut self, model: &Qwen35Model, cause: &str) {
+        let what = format!("fused AdamW step {} failed part way ({cause})", self.next);
+        model.mark_torn(what.clone());
+        self.state.torn = Some(what);
     }
 
     /// The step has run to its final wait: the count is confirmed.
@@ -1078,6 +1110,7 @@ impl Qwen35Model {
         self.require_trainable(what)?;
         check_hyper(what, hyper)?;
         let ps = slots(self, Some(grads)).map_err(|e| format!("{what}: {e}"))?;
+        state.check_untorn(what)?;
         state.check_model_slots(what, self, &ps)?;
         if weight_decay.len() != ps.len() {
             return Err(format!(

@@ -2075,9 +2075,8 @@ fn a_fused_step_failing_in_a_rebuild_leaves_the_top_updated_and_the_generation_m
 /// the half that was skipped is updated at a bias correction for step 2 with
 /// moments that have seen no step. Wanted: the failed step leaves a marker
 /// (poison the runtime or the state, or refuse the next step), or the count
-/// does not claim the step. Fails today.
+/// does not claim the step. Fixed: the model and the state latch as torn.
 #[test]
-#[ignore = "BREAK: a fused step failing mid-backward leaves a half-updated model that the next step continues from"]
 fn a_fused_step_failing_midway_is_not_continued_silently() {
     let (rt, model) = load();
     let wd = model.default_weight_decay(0.1).unwrap();
@@ -2106,6 +2105,41 @@ fn a_fused_step_failing_midway_is_not_continued_silently() {
         "the model is half updated (step count {}), the runtime is not poisoned, and the next step ran",
         state.step_count()
     );
+    // The refusal names the torn step, and covers every way to use the
+    // half-updated weights: a fused step, a bank step, an optimizer step, a
+    // forward, a train forward; and the state refuses a reloaded model.
+    let torn = again.unwrap_err();
+    assert!(torn.contains("failed part way") && torn.contains("reload"), "{torn}");
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let refusals = [
+        model
+            .train_step_into(&ids, GemmOperands::ExactF32, Supervise::Causal, &bank, false)
+            .map(|_| ()),
+        model.adamw_step(&bank, &mut state, &hyper(), &wd),
+        model.forward(&ids, false).map(|_| ()),
+        model
+            .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+            .map(|_| ()),
+    ];
+    for (i, r) in refusals.into_iter().enumerate() {
+        let e = r.err().unwrap_or_else(|| panic!("entry {i} ran on a torn model"));
+        assert!(e.contains("failed part way"), "entry {i}: {e}");
+    }
+    let (_rt2, fresh) = load();
+    let e = fresh
+        .train_step_fused_adamw(
+            &ids,
+            GemmOperands::ExactF32,
+            Supervise::Causal,
+            &mut state,
+            &hyper(),
+            &wd,
+        )
+        .unwrap_err();
+    assert!(
+        e.contains("failed part way"),
+        "a torn state ran on a reloaded model: {e}"
+    );
 }
 
 /// Attack 6, the break: a fused step has no moment between the loss and the
@@ -2113,9 +2147,8 @@ fn a_fused_step_failing_midway_is_not_continued_silently() {
 /// the caller test `grad_sq_norm` and skip `adamw_step`), so a non-finite
 /// loss, known after the forward, must be refused before the backward, or the
 /// update writes NaN into every parameter and moment. Wanted: an error and
-/// nothing moved. Fails today.
+/// nothing moved. Fixed: refused after the forward, before any update.
 #[test]
-#[ignore = "BREAK: a non-finite loss is not refused; the fused step updates every parameter and moment with NaN"]
 fn a_fused_step_on_a_non_finite_loss_moves_nothing() {
     let (rt, model) = load();
     let table = model.parameter_table().unwrap();

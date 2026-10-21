@@ -1493,9 +1493,27 @@ impl Qwen35Model {
         let head = bank_head(Some((&top, false)));
         let p = self.step_forward(ids, operands, sup, Sink::Fused(config), head, None)?;
         let loss = p.loss;
+        // A bank step lets the caller look at the gradients before
+        // `adamw_step`; this one has no such moment, and a non-finite loss
+        // would write NaN into every parameter and moment. Refused here,
+        // before the backward and any update, so nothing has moved.
+        if !loss.is_finite() {
+            return Err(format!(
+                "{WHAT}: the loss is {loss}, not finite; refused before any update, so the model and the state \
+                 are as they were"
+            ));
+        }
         let ran = self.backward(p, None, Some((&top, false)), Some(&mut fused));
-        if fused.encoded() {
+        if fused.touched() {
             self.bump_param_generation();
+        }
+        if let Err(e) = &ran {
+            // From the first update's dispatch on, a failure leaves some
+            // parameters and moments at the step and the rest before it: the
+            // model and the state refuse every later step until reloaded.
+            if fused.touched() {
+                fused.tear(self, e);
+            }
         }
         ran?;
         fused.confirm();

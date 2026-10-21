@@ -2904,6 +2904,12 @@ impl Qwen35Model {
     }
 }
 
+// The peak-footprint reader the bench bins and tests/ share, for the 2B test's
+// closing line.
+#[cfg(test)]
+#[path = "bin/common/footprint.rs"]
+mod footprint;
+
 #[cfg(test)]
 mod tests {
     //! Whether `train_step`'s gradients are the gradients of tessl's own
@@ -3795,5 +3801,10 @@ mod tests {
                 );
             }
         }
+        let peak = super::footprint::peak_footprint().unwrap_or_else(|e| panic!("peak footprint unreadable: {e}"));
+        eprintln!(
+            "real_2b_gradients_are_those_of_tessls_forward: peak footprint {:.2} GiB (memguard cap 32 GiB)",
+            peak as f64 / f64::from(1u32 << 30)
+        );
     }
 }

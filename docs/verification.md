@@ -824,21 +824,80 @@ f32_staged_and_decode_match_forward_on_the_real_2b         PASS
 deep_tiny_step_matches_transformers                        PASS (worst 2.64e-5; A_log/dt_bias 9.35e-4)
 real_2b_step_matches_transformers                          PASS (every parameter below)
 real_2b_step_on_bf16_operands_stays_near_transformers      PASS (loss rel 3.72e-4, worst gradient 5.39e-2)
-real_2b_step_on_bf16_storage_stays_near_the_f32_step       NOT COMPLETED: killed by SIGTERM (signal 15, the
-    32 GiB memguard cap) after printing "loss: bf16 storage 2.744981, f32 2.745267 (rel 1.04e-4)"
-real_2b_loss_curve_tracks_the_f32_step                     NOT COMPLETED: SIGTERM (signal 15) at seed 2, step 30,
-    before its assertions; the f32 side is ft-a9661824's open question
-real_2b_bank_accumulates_within_the_bound                  NOT COMPLETED: SIGTERM (signal 15), no output
-real_2b_gradients_are_those_of_tessls_forward              NOT RUN: it reads target/qwen35_train_ref from
-    CARGO_MANIFEST_DIR (src/qwen35_train.rs:2276) with no QWEN35_TRAIN_REF_DIR override, and the fixture was not
-    in this worktree: panicked on a missing ids.npy
+real_2b_step_on_bf16_storage_stays_near_the_f32_step       FAILED a bound (2026-10-21 run below; ft-8933ed6a)
+real_2b_loss_curve_tracks_the_f32_step                     FAILED closed before its first arm (2026-10-21 run below; ft-dafde771)
+real_2b_bank_accumulates_within_the_bound                  PASS (2026-10-21 run below)
+real_2b_gradients_are_those_of_tessls_forward              FAILED a bound (2026-10-21 run below; ft-1d2ab5b0)
 hosted_selection_has_no_device                             not run directly (needs the hosted sandbox)
 every_device_free_test_is_on_the_hosted_manifest           PASS via scripts/hosted_tests.sh --outside
 ```
 
-The three SIGTERM exits are the memguard cap, not a test assertion; they are
-recorded as not completed, not as passes. The signal is the evidence: no
-memguard log was read.
+The earlier run of these 16 had three SIGTERM exits (the memguard cap, not a
+test assertion), recorded then as not completed, not as passes, and one test
+not run for a missing reference. The four rows above that changed are from the
+2026-10-21 run below.
+
+2026-10-21 (M5 Pro, 64 GiB): `real_2b_step_matches_transformers` was killed twice,
+both times in its comparison phase after printing its loss, by the machine lock
+`mac_heavy.sh` over its cap (the lock's kills, values as the lock reported them):
+
+```
+tree footprint 30,168 MiB (cap 28,672 MiB), 11.0 GiB host RSS
+tree footprint 33,080 MiB (cap 31,744 MiB), 14.3 GiB host RSS
+```
+
+Host RSS excludes Metal buffers, so the growth is host memory. The cause read
+from the code (inferred, not re-measured): `real_2b_results` read the whole
+embedding gradient to host f64 and then `by_name` every gradient as f64, 1.88 B
+parameters x 8 B = 14.0 GiB, though only the reference's files are compared.
+`real_2b_results` now streams per part, reads only the kept embedding rows, and
+`streamed_rel` compares the embedding a window at a time; the pre-start bound and
+peak-footprint line of the loss-curve test (`footprint_requirement`,
+`print_peak_footprint`) are in tests/qwen35_train.rs.
+
+The locked run of gp/w20-2b-cap cfdb710, 2026-10-21 11:33-11:35Z, M5 Pro (Mac17,8,
+macOS 27.0.1, AC power), under the `mac_heavy` lock with
+`MAC_HEAVY_MAX_FOOTPRINT_MB=31744` (memguard cap 32 GiB).
+`QWEN35_2B_SAFETENSORS` = the Qwen3.5-2B-Base snapshot b1485b2.
+`QWEN35_TRAIN_REF_DIR` = a `make_train_fixture.py 2b --tokens 128` reference
+regenerated 2026-10-21 at c2c1612 from that snapshot (loss 3.810166120529175).
+Each test ran on its own with `--exact --ignored --nocapture --test-threads=1`
+under `/usr/bin/time -l`; "peak" is `/usr/bin/time -l`'s peak memory footprint
+in bytes.
+
+```
+test                                                        result   peak (bytes)
+real_2b_step_matches_transformers                           PASS     16261980248
+real_2b_step_on_bf16_operands_stays_near_transformers       PASS     16252428376
+real_2b_step_on_bf16_storage_stays_near_the_f32_step        FAILED   20702084000
+real_2b_bank_accumulates_within_the_bound                   PASS     25435753192
+real_2b_loss_curve_tracks_the_f32_step                      FAILED   7604754312
+qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
+                                                            FAILED   15818037632
+```
+
+- `real_2b_step_matches_transformers`: the test printed a peak footprint of
+  15.15 GiB. Loss: train 3.81033988, transformers 3.81016612. Worst gradient
+  4.05e-3 over 149 parameters. Earlier the same day, before this branch, it was
+  killed over the lock cap at 30,168 and 33,080 MiB tree footprint (above).
+- `real_2b_step_on_bf16_storage_stays_near_the_f32_step`: ran to its assertions
+  and failed one bound. Loss: bf16 storage 2.745187 vs f32 2.745268 (rel 2.93e-5,
+  the loss bound holds). `layers.1.post_attention_layernorm.weight` rel err
+  7.048e-2 > 2^-4. Bit-identical on a rerun. With `GDN_TRAIN_PRODUCTION =
+  Sequential` it is 8.429e-2, so the chunked GDN kernel is not the cause.
+  Tracked as ft-8933ed6a.
+- `real_2b_loss_curve_tracks_the_f32_step`: failed closed before the first arm:
+  "REQUIREMENT UNMET (not a pass): seed 1: F32 storage with update=f32
+  moments=f32 needs 34.91 GiB, over the 32.00 GiB cap (model 7.01 GiB +
+  gradient bank 7.01 GiB + optimizer state 14.02 GiB + step workspace 4.45 GiB +
+  host overhead 2.42 GiB)". Fitting the arm is tracked as ft-dafde771.
+- `qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward`
+  (ft-19f4bd16): ran to its assertions and failed.
+  `layers.20.linear_attn.conv1d.weight`: tessl's loss moves as -8.820058e-1
+  along v, its gradient says -8.807117e-1 (|fd - tessl| 1.29e-3 > 0.3 |d| =
+  1.09e-3; |d| 3.636e-3). The second assertion (the finite difference closer to
+  tessl than to torch) holds. It fails the same way on the sequential GDN
+  kernel. Tracked as ft-1d2ab5b0.
 
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
 transformers 3.81016612; train vs transformers 4.55e-5), the worst

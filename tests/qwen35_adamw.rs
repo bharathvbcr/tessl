@@ -1753,3 +1753,566 @@ fn fused_step_refusals_move_nothing() {
         "a refused fused step moved the model or the state"
     );
 }
+
+// ---- adversarial lane for the fused step (commit 8bf6214) --------------------
+//
+// Written against the tiny fixtures, built but not run by the lane that wrote
+// them (a locked job runs device tests). The ones that assert a behavior the
+// fused step does not have yet are `#[ignore]`d with the break they expose.
+
+fn dir_untied() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_untied")
+}
+
+fn dir_grouped() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train_grouped")
+}
+
+fn ids_in(dir: &Path) -> Vec<u32> {
+    read_npy(&dir.join("ids.npy"))
+        .unwrap()
+        .i64_slice()
+        .unwrap()
+        .iter()
+        .map(|&x| x as u32)
+        .collect()
+}
+
+/// A fixture as the trainer loads it: the f32 model whole, the bf16 one as a
+/// tower (no packed head copy).
+fn load_dir(dir: &Path, precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model) {
+    let rt = GpuRuntime::new().unwrap();
+    let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+    let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+    let model = match precision {
+        Precision::F32 => Qwen35Model::load(&rt, &st, "model.", cfg, precision),
+        Precision::Bf16 => Qwen35Model::load_tower(&rt, &st, "model.", cfg, precision),
+    }
+    .unwrap();
+    (rt, model)
+}
+
+/// One step's supervision, owned so a test can list several.
+#[derive(Clone)]
+enum Sup {
+    Causal,
+    Rows {
+        positions: Vec<u32>,
+        targets: Vec<u32>,
+        scale: f32,
+    },
+}
+
+impl Sup {
+    fn rows(positions: &[u32], targets: &[u32], scale: f32) -> Self {
+        Sup::Rows {
+            positions: positions.to_vec(),
+            targets: targets.to_vec(),
+            scale,
+        }
+    }
+
+    fn get(&self) -> Supervise<'_> {
+        match self {
+            Sup::Causal => Supervise::Causal,
+            Sup::Rows {
+                positions,
+                targets,
+                scale,
+            } => Supervise::Rows {
+                positions,
+                targets,
+                scale: *scale,
+            },
+        }
+    }
+}
+
+/// Every supervision shape a fused step must take: the causal loss, scored
+/// rows (a subset, in a non-monotone order), one row, and no row at all (the
+/// head adds nothing, the update still runs on zero gradients).
+fn sups_for(ids: &[u32]) -> Vec<Sup> {
+    let n = ids.len() as u32;
+    assert!(n >= 5, "the fixture's sequence is too short for the positions below");
+    vec![
+        Sup::Causal,
+        Sup::rows(&[n - 1, 1, 3], &[ids[0], ids[2], ids[4]], 0.5),
+        Sup::rows(&[2], &[ids[1]], 1.0),
+        Sup::rows(&[], &[], 1.0),
+    ]
+}
+
+/// Fill the pool's freelist with NaN-filled buffers of every parameter's
+/// size (f32 and bf16), so a `GpuRuntime::alloc_buffer` that is not zeroed
+/// (the fused step's raw-vector scratch, which `set_poison_unzeroed` does not
+/// reach) hands the step garbage it must overwrite before anything reads it.
+fn dirty_the_pool(rt: &Arc<GpuRuntime>, table: &[ParamInfo]) {
+    let junk: Vec<GpuBuffer> = table
+        .iter()
+        .flat_map(|p| {
+            let n: usize = p.shape.iter().product();
+            [n * 4, n * 2]
+        })
+        .map(|bytes| {
+            let b = rt.alloc_buffer(bytes.div_ceil(4).max(1) * 4).unwrap();
+            b.try_write_u32(&vec![0x7fc0_0000; b.nbytes() / 4]).unwrap();
+            b
+        })
+        .collect();
+    drop(junk);
+    rt.synchronize().unwrap();
+}
+
+/// A different decay for every table entry, so a layer's update that read the
+/// decay table at the wrong offset shows (the default table has two values).
+fn distinct_decay(table: &[ParamInfo]) -> Vec<f32> {
+    (0..table.len()).map(|i| 0.002 * (i as f32 + 1.0)).collect()
+}
+
+/// [`fused_equals_bank`] over any fixture, every supervision of
+/// [`sups_for`] (twice round), a distinct decay per entry and, when `dirty`,
+/// a pool full of NaN buffers for the fused arm.
+fn fused_equals_bank_on(dir: &Path, precision: Precision, config: AdamWConfig, mm: GemmOperands, dirty: bool) {
+    let (rt_a, a) = load_dir(dir, precision);
+    let (rt_b, b) = load_dir(dir, precision);
+    rt_b.set_poison_unzeroed(true);
+    let table = a.parameter_table().unwrap();
+    if dirty {
+        dirty_the_pool(&rt_b, &table);
+    }
+    let wd = distinct_decay(&table);
+    let (mut sa, mut sb) = (
+        AdamW::with_config(&a, config).unwrap(),
+        AdamW::with_config(&b, config).unwrap(),
+    );
+    let bank = Qwen35Grads::zeros_like(&a).unwrap();
+    let mut ids = ids_in(dir);
+    let sups = sups_for(&ids);
+    for (step, sup) in sups.iter().chain(sups.iter()).enumerate() {
+        ids.rotate_left(1);
+        let la = a.train_step_into(&ids, mm, sup.get(), &bank, false).unwrap();
+        a.adamw_step(&bank, &mut sa, &hyper(), &wd).unwrap();
+        let lb = b
+            .train_step_fused_adamw(&ids, mm, sup.get(), &mut sb, &hyper(), &wd)
+            .unwrap();
+        assert_eq!(
+            la.to_bits(),
+            lb.to_bits(),
+            "{} {config} step {step}: loss {la} vs {lb}",
+            dir.display()
+        );
+        assert!(lb.is_finite(), "step {step}: loss {lb}");
+        assert_eq!(sb.step_count(), step as u64 + 1, "once per step, not per layer");
+        let (want, got) = (state_bits(&rt_a, &a, &table, &sa), state_bits(&rt_b, &b, &table, &sb));
+        assert_eq!(want.len(), got.len());
+        for (k, (w, g)) in want.iter().zip(&got).enumerate() {
+            let (i, which) = (
+                k % table.len(),
+                ["parameter", "first moment", "second moment", "aux"][k / table.len()],
+            );
+            assert!(
+                w == g,
+                "{} {config} step {step}: {} {which} differs from the bank's step",
+                dir.display(),
+                table[i].name
+            );
+        }
+    }
+}
+
+/// Attack 2, 3: the untied head (its own update after the gather) and the
+/// grouped GDN heads, on f32 and on two bf16 state shapes, with every
+/// supervision shape, a distinct decay per entry and a dirty pool.
+#[test]
+fn fused_equals_bank_on_the_untied_and_grouped_fixtures() {
+    let bf16_configs = [
+        AdamWConfig {
+            update: UpdateRule::bf16_default(11),
+            moments: MomentStorage::F32,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Block8,
+        },
+    ];
+    for dir in [dir_untied(), dir_grouped()] {
+        fused_equals_bank_on(&dir, Precision::F32, AdamWConfig::F32, GemmOperands::ExactF32, true);
+        for config in bf16_configs {
+            fused_equals_bank_on(&dir, Precision::Bf16, config, GemmOperands::Bf16, true);
+        }
+    }
+}
+
+/// Attack 2: the tied fixture under the supervision shapes, a distinct decay
+/// per entry and a dirty pool (the existing parity tests run `Causal` and a
+/// two-valued decay).
+#[test]
+fn fused_equals_bank_on_the_tied_fixture_for_every_supervision() {
+    let dir = fixture();
+    fused_equals_bank_on(&dir, Precision::F32, AdamWConfig::F32, GemmOperands::ExactF32, true);
+    fused_equals_bank_on(
+        &dir,
+        Precision::Bf16,
+        AdamWConfig {
+            update: UpdateRule::bf16_default(3),
+            moments: MomentStorage::F32,
+        },
+        GemmOperands::Bf16,
+        true,
+    );
+}
+
+/// Attack 3: `parameter_table()` (what `slots` builds, and so what
+/// `adamw_step` and the fused step index by) is transformers' order and names
+/// on the tied, untied and grouped fixtures, f32 and bf16. The oracle is
+/// written from the config, not from `slots`.
+#[test]
+fn the_parameter_table_keeps_its_order_and_names() {
+    use tessl::qwen35_model::LayerKind;
+    for dir in [fixture(), dir_untied(), dir_grouped()] {
+        for precision in [Precision::F32, Precision::Bf16] {
+            let (_rt, model) = load_dir(&dir, precision);
+            let cfg = model.config();
+            let mut want: Vec<String> = vec!["embed_tokens.weight".into()];
+            for (l, kind) in cfg.layers.iter().enumerate() {
+                let mixer: &[&str] = match kind {
+                    LayerKind::LinearAttention => &[
+                        "linear_attn.in_proj_qkv.weight",
+                        "linear_attn.in_proj_z.weight",
+                        "linear_attn.in_proj_b.weight",
+                        "linear_attn.in_proj_a.weight",
+                        "linear_attn.out_proj.weight",
+                        "linear_attn.conv1d.weight",
+                        "linear_attn.A_log",
+                        "linear_attn.dt_bias",
+                        "linear_attn.norm.weight",
+                    ],
+                    LayerKind::FullAttention => &[
+                        "self_attn.q_proj.weight",
+                        "self_attn.k_proj.weight",
+                        "self_attn.v_proj.weight",
+                        "self_attn.o_proj.weight",
+                        "self_attn.q_norm.weight",
+                        "self_attn.k_norm.weight",
+                    ],
+                };
+                want.extend(mixer.iter().map(|s| format!("layers.{l}.{s}")));
+                want.extend(
+                    [
+                        "mlp.gate_proj.weight",
+                        "mlp.up_proj.weight",
+                        "mlp.down_proj.weight",
+                        "input_layernorm.weight",
+                        "post_attention_layernorm.weight",
+                    ]
+                    .iter()
+                    .map(|s| format!("layers.{l}.{s}")),
+                );
+            }
+            want.push("norm.weight".into());
+            if !cfg.tie_word_embeddings {
+                want.push("lm_head.weight".into());
+            }
+            let got: Vec<String> = model.parameter_table().unwrap().into_iter().map(|p| p.name).collect();
+            assert_eq!(got, want, "{} {precision:?}", dir.display());
+            // The default decay table follows the table by position.
+            let wd = model.default_weight_decay(0.1).unwrap();
+            assert_eq!(wd.len(), got.len());
+            for (name, d) in got.iter().zip(&wd) {
+                assert_eq!(*d == 0.0, excluded_from_weight_decay(name), "{name}");
+            }
+        }
+    }
+}
+
+/// Attack 4: a fused step that fails in a layer's rebuild after the layers
+/// above it were updated. Pins what holds: the error comes back, the
+/// generation moved (a forward taken before is refused), layers above the
+/// failure are updated and layers below, the embedding and the final norm are
+/// not. `fixture()` has two layers; the hook counts a forward and a rebuild
+/// per layer, so 3 lets the forward and the top layer's rebuild pass and
+/// fails layer 0's rebuild, after layer 1's update was encoded.
+#[test]
+fn a_fused_step_failing_in_a_rebuild_leaves_the_top_updated_and_the_generation_moved() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let ids = ids();
+    let pending = model
+        .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+        .unwrap();
+    let before = state_bits(&rt, &model, &table, &state);
+    model.fail_layer_after_for_test(3);
+    let err = model
+        .train_step_fused_adamw(
+            &ids,
+            GemmOperands::ExactF32,
+            Supervise::Causal,
+            &mut state,
+            &hyper(),
+            &wd,
+        )
+        .unwrap_err();
+    assert!(err.contains("injected fault"), "{err}");
+    rt.synchronize().unwrap();
+    let after = state_bits(&rt, &model, &table, &state);
+    // `state_bits` lists every table entry's parameter first.
+    for (i, p) in table.iter().enumerate() {
+        let moved = before[i] != after[i];
+        let above = p.name.starts_with("layers.1.");
+        assert_eq!(moved, above, "{}: moved {moved}, in an updated layer {above}", p.name);
+    }
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let refused = model.train_backward_into(pending, None, &bank, false).unwrap_err();
+    assert!(refused.contains("parameters were written"), "{refused}");
+}
+
+/// Attack 4, the break: after that failure the model is half updated and
+/// nothing says so. `state.step_count()` reports a whole step (1) although
+/// layer 0, the embedding and the final norm have no moment history, the
+/// runtime is not poisoned, and the next fused step runs on at count 2, so
+/// the half that was skipped is updated at a bias correction for step 2 with
+/// moments that have seen no step. Wanted: the failed step leaves a marker
+/// (poison the runtime or the state, or refuse the next step), or the count
+/// does not claim the step. Fails today.
+#[test]
+#[ignore = "BREAK: a fused step failing mid-backward leaves a half-updated model that the next step continues from"]
+fn a_fused_step_failing_midway_is_not_continued_silently() {
+    let (rt, model) = load();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let ids = ids();
+    model.fail_layer_after_for_test(3);
+    let first = model.train_step_fused_adamw(
+        &ids,
+        GemmOperands::ExactF32,
+        Supervise::Causal,
+        &mut state,
+        &hyper(),
+        &wd,
+    );
+    assert!(first.is_err());
+    let again = model.train_step_fused_adamw(
+        &ids,
+        GemmOperands::ExactF32,
+        Supervise::Causal,
+        &mut state,
+        &hyper(),
+        &wd,
+    );
+    assert!(
+        rt.is_poisoned() || state.step_count() == 0 || again.is_err(),
+        "the model is half updated (step count {}), the runtime is not poisoned, and the next step ran",
+        state.step_count()
+    );
+}
+
+/// Attack 6, the break: a fused step has no moment between the loss and the
+/// first update where a caller can look at the gradient (a bank step lets
+/// the caller test `grad_sq_norm` and skip `adamw_step`), so a non-finite
+/// loss, known after the forward, must be refused before the backward, or the
+/// update writes NaN into every parameter and moment. Wanted: an error and
+/// nothing moved. Fails today.
+#[test]
+#[ignore = "BREAK: a non-finite loss is not refused; the fused step updates every parameter and moment with NaN"]
+fn a_fused_step_on_a_non_finite_loss_moves_nothing() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let at = table.iter().position(|p| p.name == "norm.weight").unwrap();
+    let n: usize = table[at].shape.iter().product();
+    model.write_parameter_host(at, &vec![f32::INFINITY; n]).unwrap();
+    let before = state_bits(&rt, &model, &table, &state);
+    let out = model.train_step_fused_adamw(
+        &ids(),
+        GemmOperands::ExactF32,
+        Supervise::Causal,
+        &mut state,
+        &hyper(),
+        &wd,
+    );
+    rt.synchronize().unwrap();
+    assert!(out.is_err(), "a non-finite loss was accepted: {out:?}");
+    assert!(state_bits(&rt, &model, &table, &state) == before, "it moved the model");
+    assert_eq!(state.step_count(), 0);
+}
+
+/// Attack 6: every hostile input is refused with nothing moved: empty and
+/// out-of-range tokens, a position twice or past the tokens, a target past
+/// the vocabulary, a non-finite row scale, a NaN clip scale, an infinite or
+/// negative decay, a decay table one too long.
+#[test]
+fn fused_step_refuses_hostile_inputs_and_moves_nothing() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let ids = ids();
+    let vocab = model.config().vocab;
+    let n = ids.len() as u32;
+    let before = state_bits(&rt, &model, &table, &state);
+    let mut bad_token = ids.clone();
+    bad_token[2] = vocab;
+    let mut inf_decay = wd.clone();
+    *inf_decay.last_mut().unwrap() = f32::INFINITY;
+    let mut negative_decay = wd.clone();
+    negative_decay[0] = -0.5;
+    let mut long_decay = wd.clone();
+    long_decay.push(0.0);
+    let nan_clip = AdamWHyper {
+        grad_scale: f64::NAN,
+        ..hyper()
+    };
+    let cases: Vec<(&str, &[u32], Sup, AdamWHyper, &[f32])> = vec![
+        ("empty ids, causal", &[], Sup::Causal, hyper(), &wd),
+        ("empty ids, rows", &[], Sup::rows(&[], &[], 1.0), hyper(), &wd),
+        (
+            "an id past the vocabulary, causal",
+            &bad_token,
+            Sup::Causal,
+            hyper(),
+            &wd,
+        ),
+        (
+            "a target past the vocabulary",
+            &ids,
+            Sup::rows(&[1], &[vocab], 1.0),
+            hyper(),
+            &wd,
+        ),
+        ("a position twice", &ids, Sup::rows(&[1, 1], &[0, 0], 1.0), hyper(), &wd),
+        (
+            "a position past the tokens",
+            &ids,
+            Sup::rows(&[n], &[0], 1.0),
+            hyper(),
+            &wd,
+        ),
+        ("a NaN row scale", &ids, Sup::rows(&[1], &[0], f32::NAN), hyper(), &wd),
+        (
+            "an infinite row scale",
+            &ids,
+            Sup::rows(&[1], &[0], f32::INFINITY),
+            hyper(),
+            &wd,
+        ),
+        ("a NaN clip scale", &ids, Sup::Causal, nan_clip, &wd),
+        ("an infinite decay", &ids, Sup::Causal, hyper(), &inf_decay),
+        ("a negative decay", &ids, Sup::Causal, hyper(), &negative_decay),
+        ("a decay table one long", &ids, Sup::Causal, hyper(), &long_decay),
+        ("a decay table empty", &ids, Sup::Causal, hyper(), &[]),
+    ];
+    for (what, ids, sup, h, w) in cases {
+        let out = model.train_step_fused_adamw(ids, GemmOperands::ExactF32, sup.get(), &mut state, &h, w);
+        assert!(out.is_err(), "{what}: accepted");
+        rt.synchronize().unwrap();
+        assert_eq!(state.step_count(), 0, "{what}: the count moved");
+        assert!(
+            state_bits(&rt, &model, &table, &state) == before,
+            "{what}: the model or the state moved"
+        );
+    }
+}
+
+/// Attack 6: a state made for another model (other slots: the untied one) or
+/// on another runtime (the same shapes) is refused with nothing moved, and a
+/// bf16 model refuses an f32-config state.
+#[test]
+fn fused_step_refuses_a_state_that_is_not_its_models() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let ids = ids();
+    let before = {
+        let state = AdamW::new(&model).unwrap();
+        state_bits(&rt, &model, &table, &state)
+    };
+    let (_rt_u, untied) = load_dir(&dir_untied(), Precision::F32);
+    let (_rt_o, other_runtime) = load();
+    let mut foreign = [AdamW::new(&untied).unwrap(), AdamW::new(&other_runtime).unwrap()];
+    for (k, state) in foreign.iter_mut().enumerate() {
+        let out = model.train_step_fused_adamw(&ids, GemmOperands::ExactF32, Supervise::Causal, state, &hyper(), &wd);
+        assert!(out.is_err(), "foreign state {k} accepted");
+        assert_eq!(state.step_count(), 0);
+    }
+    rt.synchronize().unwrap();
+    let again = AdamW::new(&model).unwrap();
+    assert!(
+        state_bits(&rt, &model, &table, &again) == before,
+        "a refusal moved the model"
+    );
+
+    // A bf16 model with a state of the f32 config: refused at creation, or
+    // by the step before it writes.
+    let (rt16, bf16) = load_dir(&fixture(), Precision::Bf16);
+    let t16 = bf16.parameter_table().unwrap();
+    if let Ok(mut f32_state) = AdamW::with_config(&bf16, AdamWConfig::F32) {
+        let b0 = state_bits(&rt16, &bf16, &t16, &f32_state);
+        let out = bf16.train_step_fused_adamw(
+            &ids,
+            GemmOperands::Bf16,
+            Supervise::Causal,
+            &mut f32_state,
+            &hyper(),
+            &bf16.default_weight_decay(0.1).unwrap(),
+        );
+        assert!(out.is_err(), "an f32-config state on a bf16 model was accepted");
+        assert_eq!(f32_state.step_count(), 0);
+        assert!(state_bits(&rt16, &bf16, &t16, &f32_state) == b0);
+    }
+}
+
+/// Attack 1, async encode and dispatch batching: the update of layer L is
+/// encoded behind a barrier on the queue, so a step encoded in one async
+/// scope (every dispatch queued, one wait at the end) is the serialized
+/// step's bits (every dispatch committed and waited: nothing can overlap).
+#[test]
+fn a_fused_step_in_an_async_scope_is_the_serialized_steps_bits() {
+    for (dir, precision, config, mm) in [
+        (fixture(), Precision::F32, AdamWConfig::F32, GemmOperands::ExactF32),
+        (dir_untied(), Precision::F32, AdamWConfig::F32, GemmOperands::ExactF32),
+        (
+            dir_untied(),
+            Precision::Bf16,
+            AdamWConfig {
+                update: UpdateRule::bf16_default(9),
+                moments: MomentStorage::F32,
+            },
+            GemmOperands::Bf16,
+        ),
+    ] {
+        let (rt_a, a) = load_dir(&dir, precision);
+        let (rt_b, b) = load_dir(&dir, precision);
+        rt_a.set_serialized_dispatch(true).unwrap();
+        let table = a.parameter_table().unwrap();
+        let wd = distinct_decay(&table);
+        let (mut sa, mut sb) = (
+            AdamW::with_config(&a, config).unwrap(),
+            AdamW::with_config(&b, config).unwrap(),
+        );
+        let mut ids = ids_in(&dir);
+        for step in 1..=3 {
+            ids.rotate_left(1);
+            let la = a
+                .train_step_fused_adamw(&ids, mm, Supervise::Causal, &mut sa, &hyper(), &wd)
+                .unwrap();
+            let lb = {
+                let _scope = rt_b.async_scope();
+                let l = b
+                    .train_step_fused_adamw(&ids, mm, Supervise::Causal, &mut sb, &hyper(), &wd)
+                    .unwrap();
+                rt_b.synchronize().unwrap();
+                l
+            };
+            assert_eq!(la.to_bits(), lb.to_bits(), "{} step {step}: loss", dir.display());
+            let (want, got) = (state_bits(&rt_a, &a, &table, &sa), state_bits(&rt_b, &b, &table, &sb));
+            assert!(
+                want == got,
+                "{} {config} step {step}: async differs from serialized",
+                dir.display()
+            );
+        }
+    }
+}

@@ -2566,6 +2566,10 @@ impl Qwen35Model {
         attn_ws: Option<&AttnTrainWorkspace>,
         ragged: Option<&RaggedRef<'_>>,
     ) -> Result<(Saved, Option<Tensor>), String> {
+        // Test hook (`fail_layer_after_for_test`): off unless a test sets it.
+        // A step's forward runs each layer once and its backward rebuilds
+        // each, so a count past the layers fails a rebuild.
+        self.take_layer_fault()?;
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
         let x1 = tensor(rt, &[tu, h])?;

@@ -786,6 +786,73 @@ fn a_fused_step_peaks_under_its_bound() {
     }
 }
 
+/// Attack 5: the fused bound against the measured peak where the test above
+/// does not reach: a vocabulary past the cross-entropy's chunk (20000 against
+/// 8192: three chunks, the last short), tied and untied heads, f32 and bf16
+/// storage, one token (a one-row step) beside two, three and seventeen, and
+/// the encode mode batched (an open async scope: a wait only at each
+/// attention layer) beside the default. The bound is read in the mode the
+/// step runs in.
+#[test]
+fn a_fused_step_peaks_under_its_bound_untied_chunked_batched_and_on_one_token() {
+    use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
+    for tie in [true, false] {
+        for (precision, mm, config) in [
+            (Precision::F32, GemmOperands::ExactF32, AdamWConfig::F32),
+            (
+                Precision::Bf16,
+                GemmOperands::Bf16,
+                AdamWConfig {
+                    update: UpdateRule::bf16_default(5),
+                    moments: MomentStorage::F32,
+                },
+            ),
+        ] {
+            let cfg = Qwen35Config {
+                vocab: 20000,
+                tie_word_embeddings: tie,
+                ..tiny_config()
+            };
+            let rt = GpuRuntime::new().unwrap();
+            let model = Qwen35Model::random_tower(&rt, cfg.clone(), precision, 5).unwrap();
+            let mut state = AdamW::with_config(&model, config).unwrap();
+            let wd = model.default_weight_decay(0.1).unwrap();
+            for batched in [false, true] {
+                for t in [1u32, 2, 3, 17] {
+                    let ids: Vec<u32> = (0..t).map(|i| (i * 7919 + 3) % cfg.vocab).collect();
+                    let rows = [0u32];
+                    let targets = [ids[0]];
+                    let sup = if t == 1 {
+                        Supervise::Rows {
+                            positions: &rows,
+                            targets: &targets,
+                            scale: 1.0,
+                        }
+                    } else {
+                        Supervise::Causal
+                    };
+                    rt.synchronize().unwrap();
+                    let scope = batched.then(|| rt.async_scope());
+                    let bound = model.train_step_fused_adamw_bytes(t, mm, config);
+                    let before = rt.current_allocated_bytes();
+                    rt.reset_peak_allocated_bytes();
+                    model
+                        .train_step_fused_adamw(&ids, mm, sup, &mut state, &AdamWHyper::default(), &wd)
+                        .unwrap();
+                    rt.synchronize().unwrap();
+                    drop(scope);
+                    let peak = rt.peak_allocated_bytes().saturating_sub(before);
+                    eprintln!("tie {tie} {precision:?} batched {batched} T={t}: peak {peak} B, bound {bound} B");
+                    assert!(
+                        peak <= bound,
+                        "tie {tie} {precision:?} batched {batched} T={t}: peak {peak} over the bound {bound}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The step bound counts what is held between waits, so it follows whether a
 /// dispatch now batches, not the `async_encode` flag alone: an open
 /// `async_scope` batches as the flag does, and serialized dispatch does not

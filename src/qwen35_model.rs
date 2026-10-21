@@ -532,7 +532,7 @@ impl Qwen35Model {
         )
     }
 
-    fn take_layer_fault(&self) -> Result<(), String> {
+    pub(crate) fn take_layer_fault(&self) -> Result<(), String> {
         count_down_fault(&self.layer_fault, "layer: injected fault (fail_layer_after_for_test)")
     }
 }

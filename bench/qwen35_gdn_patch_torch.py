@@ -20,13 +20,21 @@ Timing (one process is one arm, so ``bench_paired`` interleaves the arms):
 ``--warmup`` and ``--steps`` default to ``BENCH_WARMUP`` (2) and
 ``BENCH_ITERS`` (5) where set. Each step is ``zero_grad``, the forward with
 ``labels=ids``, ``backward`` and ``torch.mps.synchronize()``, timed from a
-synchronized start. One further untimed step samples
-``torch.mps.driver_allocated_memory()`` after the forward and after the
-backward. The metrics, all lower-is-better:
+synchronized start. One further untimed step samples memory, after a
+``torch.mps.synchronize()``, after the forward and after the backward. The
+metrics on stdout, all lower-is-better:
 
     qwen35_gdn_step_ms_min, qwen35_gdn_step_ms_median
-    qwen35_gdn_driver_mib_peak   (larger of the two samples)
-    qwen35_gdn_driver_mib_after  (after the backward)
+    qwen35_gdn_tensor_mib_peak   (larger of the two samples)
+    qwen35_gdn_tensor_mib_after  (after the backward)
+
+The memory metrics are ``torch.mps.current_allocated_memory()``, the bytes
+live tensors hold, which is the same every round. The gated metrics must be
+that: ``torch.mps.driver_allocated_memory()`` includes the caching
+allocator's retained pool, which varied by 12% across torch rounds (16123 to
+18043 MiB) at the same work, and no drift gate passes that. The driver
+samples are printed on stderr only (``driver_mib_peak=... driver_mib_after=...``),
+so they land in the lane logs without being gated.
 
 ``--arm tessl`` calls ``tessl_torch.patch_transformers_qwen3_5()`` before the
 model is built (the layer looks the function up at call time). Build the
@@ -53,7 +61,10 @@ The commands for the locked GPU job, from the repository root with
 ``cargo build --release --bin bench_paired`` built (``--evidence`` wants a
 clean tree and an even round count of at least 4):
 
-    python bench/qwen35_gdn_patch_torch.py --check --seq-len 2048
+    python bench/qwen35_gdn_patch_torch.py --check --seq-len 512
+
+(``--check`` holds both steps' gradients and the model, so it runs at 512:
+at 1024 and 2048 memguard's 32 GiB cap killed it.)
 
     target/release/bench_paired --format metrics --evidence --clean-env \\
         --rounds 6 --compare tessl:torch \\
@@ -129,8 +140,8 @@ def metric_lines(step_ms, mem_peak_mib, mem_after_mib):
     return [
         f"METRIC qwen35_gdn_step_ms_min {lo:.3f}",
         f"METRIC qwen35_gdn_step_ms_median {med:.3f}",
-        f"METRIC qwen35_gdn_driver_mib_peak {mem_peak_mib:.1f}",
-        f"METRIC qwen35_gdn_driver_mib_after {mem_after_mib:.1f}",
+        f"METRIC qwen35_gdn_tensor_mib_peak {mem_peak_mib:.1f}",
+        f"METRIC qwen35_gdn_tensor_mib_after {mem_after_mib:.1f}",
     ]
 
 
@@ -263,19 +274,24 @@ def time_steps(model, ids, device, warmup, steps):
 
 
 def memory_step(model, ids, device):
-    """The MPS driver's allocation after the forward and after the backward of
-    one untimed step: (peak, after) in MiB."""
+    """Memory after the forward and after the backward of one untimed step, in
+    MiB, sampled after a synchronize: ``{"tensor": (peak, after), "driver":
+    (peak, after)}``. ``tensor`` is the live tensors' bytes (gated, repeatable),
+    ``driver`` the driver's allocation including the allocator's cache
+    (recorded, not gated)."""
     import torch
+
+    def sample():
+        sync(device)
+        mib = 1.0 / (1 << 20)
+        return torch.mps.current_allocated_memory() * mib, torch.mps.driver_allocated_memory() * mib
 
     model.zero_grad(set_to_none=True)
     loss = model(input_ids=ids, labels=ids).loss
-    sync(device)
-    mib = 1.0 / (1 << 20)
-    forward = torch.mps.driver_allocated_memory() * mib
+    t_fwd, d_fwd = sample()
     loss.backward()
-    sync(device)
-    after = torch.mps.driver_allocated_memory() * mib
-    return max(forward, after), after
+    t_after, d_after = sample()
+    return {"tensor": (max(t_fwd, t_after), t_after), "driver": (max(d_fwd, d_after), d_after)}
 
 
 def require_mps():
@@ -339,10 +355,12 @@ def run_arm(args):
     model = build_model(args, device)
     ids = make_ids(args, model.config.vocab_size, device)
     step_ms = time_steps(model, ids, device, args.warmup, args.steps)
-    peak, after = memory_step(model, ids, device)
+    mem = memory_step(model, ids, device)
+    peak, after = mem["tensor"]
     calls = counter.calls if counter else 0
     print(f"arm={args.arm} layers={args.layers} seq_len={args.seq_len} init={args.init} tessl_gdn_calls={calls}",
           file=sys.stderr)
+    print(f"driver_mib_peak={mem['driver'][0]:.1f} driver_mib_after={mem['driver'][1]:.1f}", file=sys.stderr)
     if counter:
         forwards = args.warmup + args.steps + 1
         err = count_error(calls, gdn_layers(model) * forwards, "arm tessl")

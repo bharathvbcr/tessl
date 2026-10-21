@@ -230,7 +230,8 @@ class Qwen35GdnPatchLane(unittest.TestCase):
             parsed[name] = float(value)
         self.assertEqual(parsed, {
             "qwen35_gdn_step_ms_min": 10.0, "qwen35_gdn_step_ms_median": 25.0,
-            "qwen35_gdn_driver_mib_peak": 1536.0, "qwen35_gdn_driver_mib_after": 1024.5})
+            "qwen35_gdn_tensor_mib_peak": 1536.0, "qwen35_gdn_tensor_mib_after": 1024.5})
+        self.assertFalse([name for name in parsed if "driver" in name], "driver memory is not gated")
         with self.assertRaises(ValueError):
             gdn_lane.metric_lines([], 1.0, 1.0)
 

@@ -741,6 +741,17 @@ autograd, every output and gradient within 1.0e-6 relative in f32 and within
 bf16 rounding in bf16; a small Qwen3.5 with grouped GDN heads trains with the
 same loss and parameter gradients, worst 1e-3, patched or not).
 
+Measured on an M5 Pro (2026-10-21; `bench/results/qwen35_gdn_patch_torch_m5pro.txt`
+and `.json`): a PyTorch user who swaps that one function trains a Qwen3.5-2B-Base
+cut to 4 layers (3 GDN + 1 attention, real weights, f32, B = 1, T = 2048) in
+1536 ms per step against 1999 ms for transformers' torch fallback (0.768x, round
+range 0.757-0.770, min of 5 over 6 interleaved rounds), with the framework tensor
+peak 7079 MiB against 7633 MiB (0.927x). One lane where tessl loses: MPS driver
+memory is 16215.7 MiB against 16123.3 MiB, 92 MiB (0.6%) larger, identical in every
+round. The `--check --seq-len 512` run on the same model passes: loss 14.735063
+unpatched against 14.735062 patched, worst parameter gradient error 1.8e-5 over 55
+parameters (bound 1e-3). One layer cut and one machine, not the full 24-layer model.
+
 `tests/gdn_train.rs`: the f64 reference's forward equals the
 transformers-anchored recurrence to 1e-12, its hand-derived backward equals
 central finite differences to 3e-10 for every input and the initial state,

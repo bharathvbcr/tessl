@@ -1,0 +1,58 @@
+# PyTorch user swaps one function: tessl_torch.patch_transformers_qwen3_5 vs transformers' torch GDN fallback — M5 Pro, 2026-10-21
+#
+# Workload: Qwen3.5-2B-Base (snapshot b1485b2) text config cut to 4 layers (3 GDN + 1 attention) with the real
+# weights, f32, B = 1, one forward + backward training step on MPS. Lane "torch" = transformers' own
+# torch_chunk_gated_delta_rule fallback; lane "tessl" = the same model after patch_transformers_qwen3_5()
+# (tessl GDN forward/backward kernels via libtessl.dylib). Only the GDN function differs.
+#
+# Conditions: M5 Pro (Mac17,8), macOS 27.0.1, AC power, Lappi mac_heavy lock, one job at a time.
+# Harness bench/qwen35_gdn_patch_torch.py at f79d65d (--evidence recorded in the JSON),
+# libtessl.dylib built from tessl c2c1612 (TESSL_LIB), venv torch 2.14.1 + transformers 5.19.0.
+#
+# Bench (6 interleaved rounds, lanes forward on even rounds and reversed on odd; each lane value is one
+# child process, BENCH_WARMUP=2, BENCH_ITERS=5; ratio = median of per-round ratios, [lowest, highest] round):
+#
+#   bench_paired --format metrics --evidence --clean-env --rounds 6 --out qwen35_gdn_patch_torch_s2048_m5pro.json \
+#     <lane torch>  BENCH_WARMUP=2 BENCH_ITERS=5                      python bench/qwen35_gdn_patch_torch.py --arm torch --seq-len 2048
+#     <lane tessl>  BENCH_WARMUP=2 BENCH_ITERS=5 TESSL_LIB=<c2c1612>/target/release/libtessl.dylib
+#                                                                     python bench/qwen35_gdn_patch_torch.py --arm tessl --seq-len 2048
+#
+# (python = /Users/bharath/.venvs/ml-2026-10/bin/python; the exact argv and env per lane are in the JSON next to
+# this file.) Wall time of the whole bench: 368 s.
+#
+#                 workload                  torch                  tessl       vs base [lo, hi]
+#   qwen35_gdn_step_ms_min               1998.649               1536.106  0.768x [0.757, 0.770]
+# qwen35_gdn_step_ms_median              2000.255               1538.603  0.769x [0.742, 0.771]
+# qwen35_gdn_tensor_mib_peak             7633.100               7079.200  0.927x [0.927, 0.927]
+# qwen35_gdn_tensor_mib_after            5650.200               5650.200  1.000x [1.000, 1.000]
+#
+# Result: with one function swapped, the training step is 23% faster (T = 2048) and the framework-visible
+# tensor peak is 554 MiB lower. Tensors held after the step are identical.
+#
+# A lane where tessl LOSES (recorded, not gated): MPS driver memory (stderr of each lane), identical in every round:
+#   torch  16123.3 MiB
+#   tessl  16215.7 MiB   -> tessl is 92.4 MiB (0.6%) larger.
+# The tensor peak above is torch's own accounting; the driver number is the whole process's GPU allocation,
+# and there tessl is slightly larger. Reported as measured, not explained away.
+#
+# An earlier attempt (harness 143df10, driver memory gated) was refused by the drift gate: torch driver memory
+# varied 16123-18043 MiB across rounds and one torch round took 4037 ms under load. It is not a result.
+#
+# Correctness: `python bench/qwen35_gdn_patch_torch.py --check --seq-len 512` (same model, same weights, f32):
+#   tessl GDN calls: unpatched step 0, patched step 3   (the patch is what ran: 3 GDN layers)
+#   loss unpatched 14.735063, patched 14.735062
+#   worst parameter gradient error 1.767e-05 (model.layers.0.linear_attn.in_proj_a.weight) over 55 parameters,
+#   bound 1e-3
+#   PASS
+#   peak footprint 22820381624 bytes (21.25 GiB); 19.95 s.
+#
+# Memory history of the --check (why it runs at 512): before f79d65d the comparison held whole-tensor double
+# temporaries, and memguard (SIGTERM above a 32 GiB footprint) killed it at seq-len 2048 (34.5 GiB),
+# 1024 (30.4 GiB, the lock cap) and 512 (32.2 GiB). f79d65d compares sliced, and 512 passes at 21.25 GiB.
+# The check was run at 512, not at the bench's 2048. Phase lines of the passing run (rss / MPS driver / tensor MiB):
+#   model_built 5259 / 2984 / 2825;  unpatched_step 5433 / 11068 / 5650;  patched_step 5443 / 11164 / 5650;
+#   compared 10764 / 11164 / 5650.
+# Log (unchanged, 2101 bytes): bench/results/qwen35_gdn_patch_torch_check_m5pro.log
+#
+# Scope: GDN training patch only, one 4-layer cut of the 2B, f32, B = 1, one machine. Not the full 24-layer
+# model, not bf16; the attention layer is identical in both lanes.

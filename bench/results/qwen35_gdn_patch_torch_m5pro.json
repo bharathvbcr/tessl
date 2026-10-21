@@ -1,0 +1,494 @@
+{
+  "rounds": 6,
+  "format": "Metrics",
+  "lanes": [
+    {
+      "name": "torch",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/qwen35_gdn_patch_torch.py",
+        "--arm",
+        "torch",
+        "--seq-len",
+        "2048"
+      ],
+      "env": {
+        "BENCH_WARMUP": "2",
+        "BENCH_ITERS": "5"
+      }
+    },
+    {
+      "name": "tessl",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/qwen35_gdn_patch_torch.py",
+        "--arm",
+        "tessl",
+        "--seq-len",
+        "2048"
+      ],
+      "env": {
+        "BENCH_WARMUP": "2",
+        "BENCH_ITERS": "5",
+        "TESSL_LIB": "/Users/bharath/Code/research/tessl-gpurun/target/release/libtessl.dylib"
+      }
+    }
+  ],
+  "env": {},
+  "max_ratio_spread": 1.1,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "qwen35_gdn_step_ms_min",
+      "torch": {
+        "value_median": 1998.649,
+        "value_min": 1994.476,
+        "value_max": 2031.358,
+        "value_all": [
+          1994.476,
+          1998.431,
+          1995.667,
+          2000.082,
+          1998.867,
+          2031.358
+        ]
+      },
+      "tessl": {
+        "value_median": 1536.1064999999999,
+        "value_min": 1533.545,
+        "value_max": 1536.846,
+        "value_all": [
+          1536.377,
+          1533.545,
+          1535.55,
+          1536.125,
+          1536.088,
+          1536.846
+        ],
+        "vs_base": {
+          "median": 0.76825517713834,
+          "lo": 0.7565608819321853,
+          "hi": 0.7703161131043943
+        }
+      }
+    },
+    {
+      "workload": "qwen35_gdn_step_ms_median",
+      "torch": {
+        "value_median": 2000.2555,
+        "value_min": 1997.045,
+        "value_max": 2073.567,
+        "value_all": [
+          1997.045,
+          2000.604,
+          1997.945,
+          2001.148,
+          1999.907,
+          2073.567
+        ]
+      },
+      "tessl": {
+        "value_median": 1538.6035,
+        "value_min": 1538.09,
+        "value_max": 1539.97,
+        "value_all": [
+          1539.397,
+          1538.677,
+          1538.289,
+          1539.97,
+          1538.09,
+          1538.53
+        ],
+        "vs_base": {
+          "median": 0.7693247560373035,
+          "lo": 0.7419726490631844,
+          "hi": 0.7708374122766387
+        }
+      }
+    },
+    {
+      "workload": "qwen35_gdn_tensor_mib_peak",
+      "torch": {
+        "value_median": 7633.1,
+        "value_min": 7633.1,
+        "value_max": 7633.1,
+        "value_all": [
+          7633.1,
+          7633.1,
+          7633.1,
+          7633.1,
+          7633.1,
+          7633.1
+        ]
+      },
+      "tessl": {
+        "value_median": 7079.2,
+        "value_min": 7079.2,
+        "value_max": 7079.2,
+        "value_all": [
+          7079.2,
+          7079.2,
+          7079.2,
+          7079.2,
+          7079.2,
+          7079.2
+        ],
+        "vs_base": {
+          "median": 0.9274344630621896,
+          "lo": 0.9274344630621896,
+          "hi": 0.9274344630621896
+        }
+      }
+    },
+    {
+      "workload": "qwen35_gdn_tensor_mib_after",
+      "torch": {
+        "value_median": 5650.2,
+        "value_min": 5650.2,
+        "value_max": 5650.2,
+        "value_all": [
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2
+        ]
+      },
+      "tessl": {
+        "value_median": 5650.2,
+        "value_min": 5650.2,
+        "value_max": 5650.2,
+        "value_all": [
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2,
+          5650.2
+        ],
+        "vs_base": {
+          "median": 1,
+          "lo": 1,
+          "hi": 1
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 1994.476,
+        "qwen35_gdn_step_ms_median": 1997.045,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1536.377,
+        "qwen35_gdn_step_ms_median": 1539.397,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    },
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 1998.431,
+        "qwen35_gdn_step_ms_median": 2000.604,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1533.545,
+        "qwen35_gdn_step_ms_median": 1538.677,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    },
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 1995.667,
+        "qwen35_gdn_step_ms_median": 1997.945,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1535.55,
+        "qwen35_gdn_step_ms_median": 1538.289,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    },
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 2000.082,
+        "qwen35_gdn_step_ms_median": 2001.148,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1536.125,
+        "qwen35_gdn_step_ms_median": 1539.97,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    },
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 1998.867,
+        "qwen35_gdn_step_ms_median": 1999.907,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1536.088,
+        "qwen35_gdn_step_ms_median": 1538.09,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    },
+    {
+      "torch": {
+        "qwen35_gdn_step_ms_min": 2031.358,
+        "qwen35_gdn_step_ms_median": 2073.567,
+        "qwen35_gdn_tensor_mib_peak": 7633.1,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      },
+      "tessl": {
+        "qwen35_gdn_step_ms_min": 1536.846,
+        "qwen35_gdn_step_ms_median": 1538.53,
+        "qwen35_gdn_tensor_mib_peak": 7079.2,
+        "qwen35_gdn_tensor_mib_after": 5650.2
+      }
+    }
+  ],
+  "lane_archive": "$HOME/Code/research/tessl/target-gp/gpurun3b/qwen35_gdn_patch_torch_s2048_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-21T12:26:38Z",
+    "invocation_shell": "'$HOME/Code/research/tessl-gpurun/target/release/bench_paired' --format metrics --evidence --clean-env --rounds 6 --out '$HOME/Code/research/tessl/target-gp/gpurun3b/qwen35_gdn_patch_torch_s2048_m5pro.json' 'torch:BENCH_WARMUP=2,BENCH_ITERS=5=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_gdn_patch_torch.py --arm torch --seq-len 2048' 'tessl:BENCH_WARMUP=2,BENCH_ITERS=5,TESSL_LIB=$HOME/Code/research/tessl-gpurun/target/release/libtessl.dylib=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_gdn_patch_torch.py --arm tessl --seq-len 2048'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+      "--format",
+      "metrics",
+      "--evidence",
+      "--clean-env",
+      "--rounds",
+      "6",
+      "--out",
+      "$HOME/Code/research/tessl/target-gp/gpurun3b/qwen35_gdn_patch_torch_s2048_m5pro.json",
+      "torch:BENCH_WARMUP=2,BENCH_ITERS=5=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_gdn_patch_torch.py --arm torch --seq-len 2048",
+      "tessl:BENCH_WARMUP=2,BENCH_ITERS=5,TESSL_LIB=$HOME/Code/research/tessl-gpurun/target/release/libtessl.dylib=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_gdn_patch_torch.py --arm tessl --seq-len 2048"
+    ],
+    "cwd": "$HOME/Code/research/tessl/.claude/worktrees/agent-a4fd11e206080bbf8",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 6,
+      "max_spread": 1.1,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Metrics",
+      "lanes": [
+        {
+          "name": "torch",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/qwen35_gdn_patch_torch.py",
+            "--arm",
+            "torch",
+            "--seq-len",
+            "2048"
+          ],
+          "env": {
+            "BENCH_WARMUP": "2",
+            "BENCH_ITERS": "5"
+          }
+        },
+        {
+          "name": "tessl",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/qwen35_gdn_patch_torch.py",
+            "--arm",
+            "tessl",
+            "--seq-len",
+            "2048"
+          ],
+          "env": {
+            "BENCH_WARMUP": "2",
+            "BENCH_ITERS": "5",
+            "TESSL_LIB": "/Users/bharath/Code/research/tessl-gpurun/target/release/libtessl.dylib"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl/.claude/worktrees/agent-a4fd11e206080bbf8",
+      "scope": ".",
+      "revision": "f79d65d0543b0eaf367cc9d5f96447a734b293dc",
+      "dirty": false,
+      "status_porcelain": [],
+      "status_line_count": 0,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      "python_packages:torch": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      },
+      "python_packages:tessl": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000980%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 3.96337890625,
+        "loadavg_5m": 4.0185546875,
+        "loadavg_15m": 4.21337890625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2201877170138889,
+        "normalized_loadavg_5m": 0.22325303819444445,
+        "normalized_loadavg_15m": 0.2340766059027778
+      },
+      "finish": {
+        "loadavg_1m": 3.501953125,
+        "loadavg_5m": 3.31591796875,
+        "loadavg_15m": 3.763671875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.1945529513888889,
+        "normalized_loadavg_5m": 0.18421766493055555,
+        "normalized_loadavg_15m": 0.20909288194444445
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl-gpurun/target/release/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792578392732125936,
+        "sha256": "01a539c67550a433334dff6590036a361f1046b67c737b462115cc6400a95c5a"
+      },
+      "lane:tessl:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      },
+      "lane:tessl:qwen35_gdn_patch_torch.py": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a4fd11e206080bbf8/bench/qwen35_gdn_patch_torch.py",
+        "size_bytes": 19927,
+        "mtime_ns": 1792583597038916385,
+        "sha256": "1a89a89092262eb95a415bb811cb5374d46ec23cf6e18d863811ad17bc95da76"
+      },
+      "lane:torch:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      },
+      "lane:torch:qwen35_gdn_patch_torch.py": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a4fd11e206080bbf8/bench/qwen35_gdn_patch_torch.py",
+        "size_bytes": 19927,
+        "mtime_ns": 1792583597038916385,
+        "sha256": "1a89a89092262eb95a415bb811cb5374d46ec23cf6e18d863811ad17bc95da76"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-21T12:32:46Z"
+  }
+}

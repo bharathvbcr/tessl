@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import gemm_sweep_mlx  # noqa: E402
+import qwen35_gdn_patch_torch as gdn_lane  # noqa: E402
 from flash_attn_torch_mlx import BY_LABEL, CFGS, keep_mask, live_pairs  # noqa: E402
 
 
@@ -187,6 +188,262 @@ class ExternalLaneWriter(unittest.TestCase):
     def test_the_default_lane_list_is_the_four_runtimes_the_scorer_knows(self):
         names = [lane for lane, _, _ in gemm_sweep_mlx.EXTERNAL_LANES]
         self.assertEqual(names, ["mlx-f32", "mlx-bf16", "torch-mps-f32", "torch-mps-bf16"])
+
+
+class Qwen35GdnPatchLane(unittest.TestCase):
+    """`qwen35_gdn_patch_torch.py` without MPS: its arguments, the METRIC lines
+    `bench_paired --format metrics` reads, and the bound it applies to a patched
+    step's gradients (scored here on synthetic CPU tensors)."""
+
+    def test_exactly_one_of_arm_and_check(self):
+        for argv in ([], ["--arm", "torch", "--check"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                gdn_lane.parse_args(argv)
+        self.assertEqual(gdn_lane.parse_args(["--arm", "tessl"]).arm, "tessl")
+        self.assertTrue(gdn_lane.parse_args(["--check"]).check)
+
+    def test_defaults_and_the_bench_env(self):
+        old = {k: os.environ.pop(k, None) for k in ("BENCH_ITERS", "BENCH_WARMUP")}
+        try:
+            a = gdn_lane.parse_args(["--arm", "torch"])
+            self.assertEqual((a.seq_len, a.layers, a.steps, a.warmup, a.init), (2048, 4, 5, 2, "real"))
+            os.environ["BENCH_ITERS"], os.environ["BENCH_WARMUP"] = "7", "1"
+            a = gdn_lane.parse_args(["--arm", "torch", "--seq-len", "512"])
+            self.assertEqual((a.seq_len, a.steps, a.warmup), (512, 7, 1))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_nonsense_counts_are_refused(self):
+        for bad in (["--steps", "0"], ["--seq-len", "0"], ["--layers", "0"], ["--warmup", "-1"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                gdn_lane.parse_args(["--arm", "torch"] + bad)
+
+    def test_metric_lines_are_name_value_pairs_with_the_min_and_median(self):
+        lines = gdn_lane.metric_lines([30.0, 10.0, 20.0, 40.0], 1536.0, 1024.5)
+        parsed = {}
+        for line in lines:
+            tag, name, value = line.split(" ")
+            self.assertEqual(tag, "METRIC")
+            parsed[name] = float(value)
+        self.assertEqual(parsed, {
+            "qwen35_gdn_step_ms_min": 10.0, "qwen35_gdn_step_ms_median": 25.0,
+            "qwen35_gdn_tensor_mib_peak": 1536.0, "qwen35_gdn_tensor_mib_after": 1024.5})
+        self.assertFalse([name for name in parsed if "driver" in name], "driver memory is not gated")
+        with self.assertRaises(ValueError):
+            gdn_lane.metric_lines([], 1.0, 1.0)
+
+    def grads(self):
+        import torch
+        g = torch.Generator().manual_seed(0)
+        return {"a": torch.randn(8, 4, generator=g), "b": torch.randn(16, generator=g)}
+
+    def test_equal_gradients_pass_and_the_bound_is_relative_to_the_peak(self):
+        want = self.grads()
+        ok, _, err, why = gdn_lane.compare_grads(1.0, 1.0, {k: v.clone() for k, v in want.items()}, want)
+        self.assertTrue(ok, why)
+        self.assertEqual(err, 0.0)
+        peak = want["b"].abs().max()
+        near = {k: v.clone() for k, v in want.items()}
+        near["b"][0] += 0.5 * gdn_lane.GRAD_REL * peak
+        ok, name, err, _ = gdn_lane.compare_grads(1.0, 1.0, near, want)
+        self.assertTrue(ok)
+        self.assertEqual(name, "b")
+        self.assertAlmostEqual(err, 0.5 * gdn_lane.GRAD_REL, delta=1e-6)
+        far = {k: v.clone() for k, v in want.items()}
+        far["b"][0] += 2 * gdn_lane.GRAD_REL * peak
+        ok, name, err, why = gdn_lane.compare_grads(1.0, 1.0, far, want)
+        self.assertFalse(ok)
+        self.assertIn("b: gradient error", why[0])
+
+    def test_loss_missing_extra_and_non_finite_gradients_each_fail(self):
+        import torch
+        want = self.grads()
+
+        def clone():
+            return {k: v.clone() for k, v in want.items()}
+
+        ok, _, _, why = gdn_lane.compare_grads(1.0 + 2e-4, 1.0, clone(), want)
+        self.assertFalse(ok)
+        self.assertIn("loss", why[0])
+        self.assertTrue(gdn_lane.compare_grads(1.0 + 5e-5, 1.0, clone(), want)[0])
+        self.assertFalse(gdn_lane.compare_grads(float("nan"), 1.0, clone(), want)[0])
+        short = clone()
+        del short["a"]
+        self.assertIn("a: no gradient in the patched model", gdn_lane.compare_grads(1.0, 1.0, short, want)[3])
+        extra = clone()
+        extra["c"] = torch.zeros(1)
+        self.assertIn("c: no gradient in the unpatched model", gdn_lane.compare_grads(1.0, 1.0, extra, want)[3])
+        bad = clone()
+        bad["a"][0, 0] = float("nan")
+        self.assertIn("a: non-finite gradient", gdn_lane.compare_grads(1.0, 1.0, bad, want)[3])
+
+    def test_a_train_step_and_the_timing_loop_run_on_cpu(self):
+        # A tiny Qwen3.5 (linear then full attention) through the lane's own step.
+        import torch
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+        cfg = mq.Qwen3_5TextConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"], num_attention_heads=2,
+            num_key_value_heads=1, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=2,
+            linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+            vocab_size=64, tie_word_embeddings=True)
+        torch.manual_seed(0)
+        model = mq.Qwen3_5ForCausalLM(cfg).float()
+        ids = torch.randint(0, 64, (1, 24))
+        cpu = torch.device("cpu")
+        ms = gdn_lane.time_steps(model, ids, cpu, warmup=1, steps=3)
+        self.assertEqual(len(ms), 3)
+        self.assertTrue(all(m > 0 for m in ms))
+        # The same step twice is the same loss and the same gradients: what
+        # --check relies on when only the GDN function differs.
+        a = gdn_lane.train_step(model, ids, cpu)
+        ga = gdn_lane.grads_of(model)
+        b = gdn_lane.train_step(model, ids, cpu)
+        self.assertEqual(a, b)
+        self.assertTrue(gdn_lane.compare_grads(b, a, gdn_lane.grads_of(model), ga)[0])
+
+    def fake_tessl(self, binds_early=False):
+        """A stand-in for tessl_torch whose patch installs the module's current
+        ``chunk_gated_delta_rule`` into a stand-in transformers module, as the
+        real patch does by global lookup; ``binds_early`` keeps a reference taken
+        before any spy, as a patch that bound at import would."""
+        import types
+        tessl = types.SimpleNamespace(chunk_gated_delta_rule=lambda *a, **k: "tessl")
+        early = tessl.chunk_gated_delta_rule
+        mq = types.SimpleNamespace(torch_chunk_gated_delta_rule=lambda *a, **k: "torch")
+
+        def patch():
+            previous = mq.torch_chunk_gated_delta_rule
+            mq.torch_chunk_gated_delta_rule = early if binds_early else tessl.chunk_gated_delta_rule
+            return previous
+
+        tessl.patch_transformers_qwen3_5 = patch
+        return tessl, mq
+
+    def forward(self, mq, layers=3):
+        for _ in range(layers):
+            mq.torch_chunk_gated_delta_rule()
+
+    def test_the_counter_sees_every_call_the_patch_routes_to_tessl(self):
+        tessl, mq = self.fake_tessl()
+        counter, original = gdn_lane.spy_on(tessl)
+        self.forward(mq)
+        self.assertEqual(counter.calls, 0)
+        self.assertIsNone(gdn_lane.count_error(counter.calls, 0, "unpatched"))
+        previous = tessl.patch_transformers_qwen3_5()
+        self.forward(mq)
+        self.assertEqual(counter.calls, 3)
+        self.assertIsNone(gdn_lane.count_error(counter.calls, 3, "patched"))
+        self.assertEqual(mq.torch_chunk_gated_delta_rule(), "tessl")
+        self.assertEqual(previous(), "torch")
+        setattr(tessl, "chunk_gated_delta_rule", original)
+        self.assertIs(tessl.chunk_gated_delta_rule, original)
+
+    def test_a_patch_that_takes_no_effect_is_an_error_not_a_pass(self):
+        # The patch installed something the counter never sees (a binding made
+        # before the spy): the model still runs, but zero calls reach tessl.
+        tessl, mq = self.fake_tessl(binds_early=True)
+        counter, _ = gdn_lane.spy_on(tessl)
+        tessl.patch_transformers_qwen3_5()
+        self.forward(mq)
+        self.assertEqual(counter.calls, 0)
+        msg = gdn_lane.count_error(counter.calls, 3, "patched step")
+        self.assertIn("patch is not taking effect", msg)
+        self.assertIn("0 tessl GDN calls", msg)
+
+    def test_the_count_bounds(self):
+        self.assertIsNone(gdn_lane.count_error(9, 9, "x"))
+        self.assertIsNone(gdn_lane.count_error(12, 9, "x"))
+        self.assertIn("expected at least 9", gdn_lane.count_error(8, 9, "x"))
+        self.assertIn("expected 0", gdn_lane.count_error(1, 0, "unpatched step"))
+
+    def test_gdn_layers_counts_the_linear_layers_of_the_cut(self):
+        import types
+        cfg = types.SimpleNamespace(layer_types=["linear_attention"] * 3 + ["full_attention"])
+        self.assertEqual(gdn_lane.gdn_layers(types.SimpleNamespace(config=cfg)), 3)
+
+    def test_the_sliced_rel_err_is_the_whole_tensor_rel_err(self):
+        import torch
+        g = torch.Generator().manual_seed(3)
+        want = torch.randn(1000, generator=g)
+        got = want + 1e-3 * torch.randn(1000, generator=g)
+        whole = ((got.double() - want.double()).abs().max() / want.double().abs().max()).item()
+        for n in (1, 7, 999, 1000, 5000):
+            self.assertEqual(gdn_lane.rel_err(got, want, slice_elems=n), whole)
+        self.assertEqual(gdn_lane.rel_err(torch.zeros(4), torch.zeros(4)), 0.0)
+        self.assertEqual(gdn_lane.rel_err(torch.ones(2, 3), torch.ones(2, 3), slice_elems=2), 0.0)
+
+    def test_host_copy_owns_its_storage_and_grads_of_matches_the_gradients(self):
+        import torch
+        t = torch.arange(4.0)
+        c = gdn_lane.host_copy(t)
+        c[0] = 9.0
+        self.assertEqual(t[0].item(), 0.0)
+        lin = torch.nn.Linear(2, 2)
+        lin(torch.ones(1, 2)).sum().backward()
+        grads = gdn_lane.grads_of(torch.nn.ModuleDict({"l": lin}))
+        self.assertEqual(set(grads), {"l.weight", "l.bias"})
+        self.assertTrue(torch.equal(grads["l.bias"], lin.bias.grad))
+
+    def test_phase_log_line_has_the_phase_and_both_resident_sets(self):
+        import torch
+        err = io.StringIO()
+        real = torch.backends.mps.is_available
+        torch.backends.mps.is_available = lambda: False  # no MPS call in a device-free test
+        try:
+            with contextlib.redirect_stderr(err):
+                gdn_lane.phase_log("model_built")
+        finally:
+            torch.backends.mps.is_available = real
+        line = err.getvalue().strip()
+        self.assertRegex(line, r"^phase=model_built rss_mib=\d+ rss_max_mib=\d+$")
+
+    def test_real_weights_load_straight_into_the_cut_model_and_skip_later_layers(self):
+        import tempfile
+        import types
+        import torch
+        from safetensors.torch import save_file
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+        cfg = mq.Qwen3_5TextConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"], num_attention_heads=2,
+            num_key_value_heads=1, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=2,
+            linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+            vocab_size=64, tie_word_embeddings=True)
+        model = mq.Qwen3_5ForCausalLM(cfg).float()
+        g = torch.Generator().manual_seed(5)
+        tensors = {}
+        for name, p in model.state_dict().items():
+            if name.startswith("model.") and "rotary" not in name:
+                tensors[gdn_lane._PREFIX + name[len("model."):]] = torch.randn(p.shape, generator=g).bfloat16()
+        late = gdn_lane._PREFIX + "layers.7.mlp.down_proj.weight"
+        tensors[late] = torch.zeros(1)
+        tensors["model.visual.x"] = torch.zeros(1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "model.safetensors-00001-of-00001.safetensors")
+            save_file(tensors, path)
+            gdn_lane.load_real_weights(model, d, 2)
+            for name, p in model.state_dict().items():
+                key = gdn_lane._PREFIX + name[len("model."):]
+                if key in tensors:
+                    self.assertTrue(torch.equal(p, tensors[key].float()), name)
+            del tensors[gdn_lane._PREFIX + "norm.weight"]
+            save_file(tensors, path)
+            with self.assertRaises(SystemExit) as cm:
+                gdn_lane.load_real_weights(model, d, 2)
+            self.assertIn("model.norm.weight", str(cm.exception))
+
+    def test_the_cut_config_keeps_the_leading_layer_types(self):
+        snap = gdn_lane.DEFAULT_SNAPSHOT
+        if not (snap / "config.json").is_file():
+            self.skipTest("no local Qwen3.5-2B-Base snapshot")
+        cfg = gdn_lane.text_config(snap, 4)
+        self.assertEqual(cfg.num_hidden_layers, 4)
+        self.assertEqual(list(cfg.layer_types), ["linear_attention"] * 3 + ["full_attention"])
+        self.assertEqual((cfg.hidden_size, cfg.linear_num_value_heads, cfg.linear_value_head_dim), (2048, 16, 128))
 
 
 if __name__ == "__main__":

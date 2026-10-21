@@ -2943,44 +2943,72 @@ mod tests {
         grad: &'a GpuBuffer,
         n: usize,
         torch: Vec<f64>,
-        steps: [f64; 4],
+        steps: [f64; 6],
     }
 
     /// What the finite-difference sweep of one parameter says.
     struct FdVerdict {
-        /// The two adjacent Richardson estimates (from the last three and the
-        /// middle three central differences).
-        extrap: f64,
-        extrap2: f64,
-        /// Their average: the value the bound compares.
+        /// Every adjacent Richardson estimate, coarsest h first.
+        estimates: Vec<f64>,
+        /// The value the bound compares: the mean of the three estimates in
+        /// the chosen window (the finest qualifying one when resolved, the
+        /// finest window otherwise).
         fd: f64,
-        /// True only when every difference is finite and the two estimates
-        /// agree within `0.3 |d|`.
+        /// Max minus min of the chosen window's estimates when resolved,
+        /// else the smallest spread over all windows.
+        spread: f64,
+        /// True only when every difference and `dn` are finite, `dn > 0`, and
+        /// some window of three consecutive estimates spans at most `0.3 |d|`.
         resolved: bool,
     }
 
     /// Richardson-extrapolate a halving sequence of central differences `fds`
-    /// (h, h/2, h/4, ...; at least three) and decide whether the sweep
-    /// resolves the parameter at the scale of `dn` = |d|, the norm of the
-    /// tessl-minus-torch gradient difference.
+    /// (h, h/2, h/4, ...; at least five, giving at least three estimates) and
+    /// decide whether the sweep resolves the parameter at the scale of
+    /// `dn` = |d|, the norm of the tessl-minus-torch gradient difference.
     ///
-    /// Resolved means the two adjacent estimates differ by at most 0.3 |d|.
-    /// That is the width of the bound the test then applies
-    /// (|fd - tessl| <= 0.3 |d|): an FD whose own estimates scatter by more
-    /// than that cannot place tessl against the bound, and cannot separate
-    /// tessl from torch (a distance of |d|) any finer than its scatter.
+    /// Resolved means three consecutive adjacent Richardson estimates all lie
+    /// within 0.3 |d| of each other (max minus min). 0.3 |d| is the width of
+    /// the bound the test then applies (|fd - tessl| <= 0.3 |d|): an FD whose
+    /// own estimates scatter by more than that cannot place tessl against the
+    /// bound, nor separate tessl from torch (a distance of |d|) any finer than
+    /// its scatter. Two agreeing estimates are not enough: on the GPU they
+    /// agreed within 0.3 |d| at layers.20 conv1d.weight by coincidence (the
+    /// successive-difference ratios were 1.96 and 3.7, not 4), and the bound
+    /// then failed. Of several qualifying windows the finest-h one is used.
     /// A non-finite difference, or a non-finite or zero `dn`, never resolves.
     fn fd_verdict(fds: &[f64], dn: f64) -> FdVerdict {
-        let n = fds.len();
-        assert!(n >= 3, "Richardson needs three central differences, got {n}");
-        let extrap = (4.0 * fds[n - 1] - fds[n - 2]) / 3.0;
-        let extrap2 = (4.0 * fds[n - 2] - fds[n - 3]) / 3.0;
-        let resolved =
-            fds.iter().all(|x| x.is_finite()) && dn.is_finite() && dn > 0.0 && (extrap - extrap2).abs() <= 0.3 * dn;
+        assert!(
+            fds.len() >= 5,
+            "three Richardson estimates need five central differences, got {}",
+            fds.len()
+        );
+        let mut estimates: Vec<f64> = fds.windows(2).map(|w| (4.0 * w[1] - w[0]) / 3.0).collect();
+        // Only the four finest estimates count (the owner's design for the
+        // six-step sweep: three windows of three); the coarsest h only feeds
+        // the printed differences.
+        estimates.drain(..estimates.len().saturating_sub(4));
+        let tol = 0.3 * dn;
+        let finite = fds.iter().all(|x| x.is_finite()) && dn.is_finite() && dn > 0.0;
+        let window = |w: &[f64]| {
+            let hi = w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let lo = w.iter().copied().fold(f64::INFINITY, f64::min);
+            (hi - lo, w.iter().sum::<f64>() / 3.0)
+        };
+        let windows: Vec<(f64, f64)> = estimates.windows(3).map(window).collect();
+        let best = windows.iter().rposition(|(s, _)| finite && *s <= tol);
+        let resolved = best.is_some();
+        let (spread, fd) = match best {
+            Some(i) => windows[i],
+            None => (
+                windows.iter().map(|w| w.0).fold(f64::INFINITY, f64::min),
+                windows[windows.len() - 1].1,
+            ),
+        };
         FdVerdict {
-            extrap,
-            extrap2,
-            fd: (extrap + extrap2) / 2.0,
+            estimates,
+            fd,
+            spread,
             resolved,
         }
     }
@@ -2988,20 +3016,36 @@ mod tests {
     #[test]
     fn fd_verdict_resolves_a_clean_h_squared_sequence_and_never_a_noisy_or_nan_one() {
         // fd(h) = g + c h^2: Richardson cancels the h^2 term exactly.
-        let clean: Vec<f64> = [1e-2f64, 5e-3, 2.5e-3, 1.25e-3]
+        let clean: Vec<f64> = [1e-2f64, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4]
             .iter()
             .map(|h| -0.88 + 40.0 * h * h)
             .collect();
         let v = fd_verdict(&clean, 3.6e-3);
-        assert!(v.resolved, "{} vs {}", v.extrap, v.extrap2);
+        assert!(v.resolved, "{:?}", v.estimates);
         assert!((v.fd + 0.88).abs() < 1e-12, "{}", v.fd);
         // The conv1d.weight of layer 20 (|d| 3.636e-3): central differences
         // that swing between -0.875 and -0.924 at fine h, rounding noise.
-        let noisy = [-0.875, -0.924, -0.89, -0.91];
+        let noisy = [-0.875, -0.924, -0.89, -0.91, -0.88, -0.93];
         let v = fd_verdict(&noisy, 3.636e-3);
-        assert!(!v.resolved, "{} vs {}", v.extrap, v.extrap2);
+        assert!(!v.resolved, "{:?}", v.estimates);
+        // Only two adjacent estimates agree and a third differs: a coincidence
+        // of the kind seen at conv20, so not resolved. Perturbing f[2] moves
+        // the first two of the four estimates, leaving the last two exact.
+        let mut two = clean.clone();
+        two[2] += 0.03;
+        let v = fd_verdict(&two, 3.6e-3);
+        assert!(
+            (v.estimates[2] - v.estimates[3]).abs() <= 0.3 * 3.6e-3,
+            "{:?}",
+            v.estimates
+        );
+        assert!(!v.resolved, "{:?}", v.estimates);
+        // A coarse outlier does not hide a finer agreeing window.
+        let mut late = clean.clone();
+        late[1] += 0.03;
+        assert!(fd_verdict(&late, 3.6e-3).resolved);
         // A NaN anywhere, even one the estimates would not otherwise show.
-        for i in 0..4 {
+        for i in 0..6 {
             let mut f = clean.clone();
             f[i] = f64::NAN;
             assert!(!fd_verdict(&f, 3.6e-3).resolved, "NaN at {i}");
@@ -3909,9 +3953,9 @@ mod tests {
                 // a parameter resolves is now measured by `fd_verdict`.
                 let norm = name.ends_with("layernorm.weight") || name == "model.norm.weight";
                 let steps = if norm || name.ends_with("linear_attn.norm.weight") {
-                    [0.4, 0.2, 0.1, 0.05]
+                    [0.4, 0.2, 0.1, 0.05, 0.025, 0.0125]
                 } else {
-                    [1e-2, 5e-3, 2.5e-3, 1.25e-3]
+                    [1e-2, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4]
                 };
                 FdCase {
                     name,
@@ -3935,7 +3979,7 @@ mod tests {
                 grad: g,
                 n: rows * cols,
                 torch: packed,
-                steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3],
+                steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4],
             });
         }
         let mut resolved_names: Vec<String> = Vec::new();
@@ -3981,12 +4025,12 @@ mod tests {
                 line += &format!(" h={step_h:e}: {fd:.5e}");
             }
             // Richardson: the central difference's h^2 term cancels between
-            // h and h/2. Four steps give exactly two adjacent estimates, so
-            // the step list needs no extra halving.
+            // h and h/2. Six steps give four adjacent estimates; three
+            // consecutive ones must agree for the parameter to resolve.
             let FdVerdict {
-                extrap,
-                extrap2,
+                estimates,
                 fd,
+                spread,
                 resolved,
             } = fd_verdict(&fds, dn);
             line += &format!(
@@ -4012,8 +4056,8 @@ mod tests {
                 );
             } else {
                 eprintln!(
-                    "UNRESOLVED {name}: adjacent Richardson estimates {extrap:.6e} and {extrap2:.6e} differ by {:.3e} > 0.3·|d| {:.3e}",
-                    (extrap - extrap2).abs(),
+                    "UNRESOLVED {name}: adjacent Richardson estimates {}; best window of three spans {spread:.3e} > 0.3·|d| {:.3e}",
+                    estimates.iter().map(|e| format!("{e:.6e}")).collect::<Vec<_>>().join(", "),
                     0.3 * dn
                 );
                 unresolved_names.push(name.clone());

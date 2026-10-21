@@ -1926,7 +1926,15 @@ fn streamed_rel(cfg: &Qwen35Config, got: &Qwen35Grads, want: &Qwen35Grads) -> Ve
 /// bf16-operand numbers exactly, which located it there. With the forward on
 /// the f32 stream and only the backward's rebuild on the bf16 inputs, it
 /// passes: loss 2.09e-4, worst gradient 4.47e-2
-/// (`layers.1.post_attention_layernorm.weight`). Needs
+/// (`layers.1.post_attention_layernorm.weight`). It fails under the
+/// `precise::rsqrt` norms (2026-10-21, M5 Pro): 7.048e-2 on the same layer
+/// (8.429e-2 with the sequential GDN kernel, 7.466e-2 on the instruct
+/// checkpoint). Reverting both precise-rsqrt commits gives 4.817e-2; reverting
+/// only the RMSNorm and gated-norm forward one gives 6.271e-2, so both
+/// contribute and neither alone restores it. The owner kept `precise::rsqrt`
+/// (it fixed the forward/backward rstd mismatch `qwen35_rstd_parity` pins), so
+/// the 2^-4 bound is unchanged and deliberately left failing until the owner
+/// sets one; docs/verification.md has the bisect. Needs
 /// `QWEN35_2B_SAFETENSORS`.
 #[test]
 #[ignore]

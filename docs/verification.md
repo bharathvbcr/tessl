@@ -898,6 +898,9 @@ qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
   1.09e-3; |d| 3.636e-3). The second assertion (the finite difference closer to
   tessl than to torch) holds. It fails the same way on the sequential GDN
   kernel. Tracked as ft-1d2ab5b0.
+  ft-1d2ab5b0 then replaced the static resolution (norms and conv1d assumed
+  resolved) with one measured from the sweep; its result follows from the
+  lead's next GPU run.
 
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
 transformers 3.81016612; train vs transformers 4.55e-5), the worst

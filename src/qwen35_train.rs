@@ -2935,16 +2935,82 @@ mod tests {
     }
 
     /// One parameter tensor to probe: the model's buffer, tessl's gradient,
-    /// transformers' gradient in tessl's layout, and whether the disagreement
-    /// is large enough for finite differences to resolve.
+    /// transformers' gradient in tessl's layout, and the finite-difference
+    /// steps to probe it with (whether they resolve is measured, not declared).
     struct FdCase<'a> {
         name: String,
         param: &'a GpuBuffer,
         grad: &'a GpuBuffer,
         n: usize,
         torch: Vec<f64>,
-        resolved: bool,
         steps: [f64; 4],
+    }
+
+    /// What the finite-difference sweep of one parameter says.
+    struct FdVerdict {
+        /// The two adjacent Richardson estimates (from the last three and the
+        /// middle three central differences).
+        extrap: f64,
+        extrap2: f64,
+        /// Their average: the value the bound compares.
+        fd: f64,
+        /// True only when every difference is finite and the two estimates
+        /// agree within `0.3 |d|`.
+        resolved: bool,
+    }
+
+    /// Richardson-extrapolate a halving sequence of central differences `fds`
+    /// (h, h/2, h/4, ...; at least three) and decide whether the sweep
+    /// resolves the parameter at the scale of `dn` = |d|, the norm of the
+    /// tessl-minus-torch gradient difference.
+    ///
+    /// Resolved means the two adjacent estimates differ by at most 0.3 |d|.
+    /// That is the width of the bound the test then applies
+    /// (|fd - tessl| <= 0.3 |d|): an FD whose own estimates scatter by more
+    /// than that cannot place tessl against the bound, and cannot separate
+    /// tessl from torch (a distance of |d|) any finer than its scatter.
+    /// A non-finite difference, or a non-finite or zero `dn`, never resolves.
+    fn fd_verdict(fds: &[f64], dn: f64) -> FdVerdict {
+        let n = fds.len();
+        assert!(n >= 3, "Richardson needs three central differences, got {n}");
+        let extrap = (4.0 * fds[n - 1] - fds[n - 2]) / 3.0;
+        let extrap2 = (4.0 * fds[n - 2] - fds[n - 3]) / 3.0;
+        let resolved =
+            fds.iter().all(|x| x.is_finite()) && dn.is_finite() && dn > 0.0 && (extrap - extrap2).abs() <= 0.3 * dn;
+        FdVerdict {
+            extrap,
+            extrap2,
+            fd: (extrap + extrap2) / 2.0,
+            resolved,
+        }
+    }
+
+    #[test]
+    fn fd_verdict_resolves_a_clean_h_squared_sequence_and_never_a_noisy_or_nan_one() {
+        // fd(h) = g + c h^2: Richardson cancels the h^2 term exactly.
+        let clean: Vec<f64> = [1e-2f64, 5e-3, 2.5e-3, 1.25e-3]
+            .iter()
+            .map(|h| -0.88 + 40.0 * h * h)
+            .collect();
+        let v = fd_verdict(&clean, 3.6e-3);
+        assert!(v.resolved, "{} vs {}", v.extrap, v.extrap2);
+        assert!((v.fd + 0.88).abs() < 1e-12, "{}", v.fd);
+        // The conv1d.weight of layer 20 (|d| 3.636e-3): central differences
+        // that swing between -0.875 and -0.924 at fine h, rounding noise.
+        let noisy = [-0.875, -0.924, -0.89, -0.91];
+        let v = fd_verdict(&noisy, 3.636e-3);
+        assert!(!v.resolved, "{} vs {}", v.extrap, v.extrap2);
+        // A NaN anywhere, even one the estimates would not otherwise show.
+        for i in 0..4 {
+            let mut f = clean.clone();
+            f[i] = f64::NAN;
+            assert!(!fd_verdict(&f, 3.6e-3).resolved, "NaN at {i}");
+        }
+        let mut f = clean.clone();
+        f[0] = f64::INFINITY;
+        assert!(!fd_verdict(&f, 3.6e-3).resolved);
+        assert!(!fd_verdict(&clean, f64::NAN).resolved);
+        assert!(!fd_verdict(&clean, 0.0).resolved);
     }
 
     /// The loss of the inference forward's logits (the training forward's
@@ -3828,11 +3894,8 @@ mod tests {
                 h,
             ),
         ];
-        // Resolved: the disagreement is large enough in absolute terms (|d| h
-        // well above the loss's f32 rounding, ~1e-6) for central differences
-        // to tell the two gradients apart. The conv and the matrices are; the
-        // 1-D tensors' |d| h is at the rounding level, so they are printed and
-        // not asserted.
+        // Whether a parameter resolves is measured from its own sweep
+        // (`fd_verdict`); unresolved ones are reported by name, never passed.
         let mut all_cases: Vec<FdCase<'_>> = cases
             .into_iter()
             .map(|(name, param, grad, n)| {
@@ -3841,11 +3904,10 @@ mod tests {
                 // 0.05-0.4 along a unit direction moves each of their 2048
                 // entries by at most ~0.01 and stays near-linear, while lifting
                 // |d| h far above the loss's f32 rounding. The GDN gated norm's
-                // 128 weights do not resolve: steps of 0.4-0.05 and 0.2-0.025
-                // extrapolate 4e-5 apart, more than its |d| (3e-5), the first
-                // nearer tessl's gradient and the second nearer transformers'.
+                // 128 weights did not resolve (steps of 0.4-0.05 and 0.2-0.025
+                // extrapolated 4e-5 apart, more than its |d| of 3e-5); whether
+                // a parameter resolves is now measured by `fd_verdict`.
                 let norm = name.ends_with("layernorm.weight") || name == "model.norm.weight";
-                let resolved = norm || name.ends_with("conv1d.weight");
                 let steps = if norm || name.ends_with("linear_attn.norm.weight") {
                     [0.4, 0.2, 0.1, 0.05]
                 } else {
@@ -3857,7 +3919,6 @@ mod tests {
                     grad,
                     n,
                     torch,
-                    resolved,
                     steps,
                 }
             })
@@ -3874,17 +3935,17 @@ mod tests {
                 grad: g,
                 n: rows * cols,
                 torch: packed,
-                resolved: true,
                 steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3],
             });
         }
+        let mut resolved_names: Vec<String> = Vec::new();
+        let mut unresolved_names: Vec<String> = Vec::new();
         for FdCase {
             name,
             param,
             grad,
             n,
             torch: g_torch,
-            resolved,
             steps,
         } in all_cases
         {
@@ -3920,11 +3981,14 @@ mod tests {
                 line += &format!(" h={step_h:e}: {fd:.5e}");
             }
             // Richardson: the central difference's h^2 term cancels between
-            // h and h/2.
-            let n_fd = fds.len();
-            let extrap = (4.0 * fds[n_fd - 1] - fds[n_fd - 2]) / 3.0;
-            let extrap2 = (4.0 * fds[n_fd - 2] - fds[n_fd - 3]) / 3.0;
-            let fd = (extrap + extrap2) / 2.0;
+            // h and h/2. Four steps give exactly two adjacent estimates, so
+            // the step list needs no extra halving.
+            let FdVerdict {
+                extrap,
+                extrap2,
+                fd,
+                resolved,
+            } = fd_verdict(&fds, dn);
             line += &format!(
                 "; extrapolated {fd:.5e}: off tessl {:+.2e}, off torch {:+.2e}",
                 fd - pt,
@@ -3937,6 +4001,7 @@ mod tests {
                 "{name}: the parameter was not restored"
             );
             if resolved {
+                resolved_names.push(name.clone());
                 assert!(
                     (fd - pt).abs() <= 0.3 * dn,
                     "{name}: tessl's loss moves as {fd:.6e} along v, its gradient says {pt:.6e}"
@@ -3945,8 +4010,30 @@ mod tests {
                     (fd - pt).abs() < (fd - pr).abs(),
                     "{name}: the finite difference is closer to transformers' gradient"
                 );
+            } else {
+                eprintln!(
+                    "UNRESOLVED {name}: adjacent Richardson estimates {extrap:.6e} and {extrap2:.6e} differ by {:.3e} > 0.3·|d| {:.3e}",
+                    (extrap - extrap2).abs(),
+                    0.3 * dn
+                );
+                unresolved_names.push(name.clone());
             }
         }
+        let total = resolved_names.len() + unresolved_names.len();
+        eprintln!(
+            "{} of {total} parameters resolved; unresolved: {}",
+            resolved_names.len(),
+            if unresolved_names.is_empty() {
+                "none".to_string()
+            } else {
+                unresolved_names.join(", ")
+            }
+        );
+        assert!(
+            !resolved_names.is_empty(),
+            "no parameter resolved: the test has no evidence (unresolved: {})",
+            unresolved_names.join(", ")
+        );
         let peak = super::footprint::peak_footprint().unwrap_or_else(|e| panic!("peak footprint unreadable: {e}"));
         eprintln!(
             "real_2b_gradients_are_those_of_tessls_forward: peak footprint {:.2} GiB (memguard cap 32 GiB)",

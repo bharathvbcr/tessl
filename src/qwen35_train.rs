@@ -3564,17 +3564,9 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
-    ///
-    /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
-    /// the largest), so their gradients differ too (up to 4e-3 of a
-    /// parameter's largest, tests/qwen35_train.rs). This decides whose side a
-    /// disagreement is on: along `v = (g_tessl - g_torch) / |d|` the two
-    /// gradients predict slopes `|d|` apart, and a Richardson-extrapolated
-    /// central difference of tessl's own loss must land on tessl's.
-    #[test]
-    #[ignore]
-    fn real_2b_gradients_are_those_of_tessls_forward() {
+    /// The reference directory, the runtime, the f32 2B model and the
+    /// reference ids, shared by the 2B finite-difference tests.
+    fn real_2b_setup() -> (std::path::PathBuf, Arc<GpuRuntime>, Qwen35Model, Vec<u32>) {
         let dir = train_reference_dir().unwrap_or_else(|e| panic!("{e}"));
         let st = SafeTensors::open(Path::new(
             &std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"),
@@ -3591,6 +3583,160 @@ mod tests {
         .unwrap();
         drop(st);
         let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
+        (dir, rt, model, ids)
+    }
+
+    /// Diagnostic for ft-1d2ab5b004a2f7bebbd1bf03896428ff: the central
+    /// difference's convergence for one parameter of the 2B model along the
+    /// same `v = (g_tessl - g_torch) / |d|` as the bound test. The parameter
+    /// is `TESSL_FD_PARAM` (default the layer-20 conv weight; a conv1d,
+    /// `input_layernorm`, `post_attention_layernorm` or `model.norm.weight`
+    /// name). It prints, and asserts only that the parameter is restored.
+    #[test]
+    #[ignore = "diagnostic: prints the FD convergence for one parameter"]
+    fn real_2b_fd_convergence_for_one_parameter() {
+        let name =
+            std::env::var("TESSL_FD_PARAM").unwrap_or_else(|_| "model.layers.20.linear_attn.conv1d.weight".into());
+        let (dir, _rt, model, ids) = real_2b_setup();
+        let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        let base = loss(&model, &ids);
+        let layer = || -> usize {
+            name.strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{name}: no layer index"))
+        };
+        let hidden = model.cfg.hidden as usize;
+        let (param, grad, n): (&GpuBuffer, &GpuBuffer, usize) = if name.ends_with("conv1d.weight") {
+            let l = layer();
+            match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
+                (Mixer::Gdn(w), MixerGrads::Gdn(g)) => (
+                    &w.conv_w,
+                    &g.conv_w,
+                    (model.cfg.gdn.conv_dim() * model.cfg.conv_kernel) as usize,
+                ),
+                _ => panic!("{name}: layer {l} is not a GDN layer"),
+            }
+        } else if name.ends_with(".input_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].input_norm, &step.grads.layers[l].input_norm, hidden)
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].post_norm, &step.grads.layers[l].post_norm, hidden)
+        } else if name == "model.norm.weight" {
+            (&model.final_norm, &step.grads.final_norm, hidden)
+        } else {
+            panic!("{name}: not a parameter this diagnostic knows")
+        };
+        let g_torch = npy(&dir.join(format!("grad.{name}.npy")));
+        let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
+        let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
+        let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let v: Vec<f64> = d.iter().map(|x| x / dn).collect();
+        let dot = |g: &[f64]| g.iter().zip(&v).map(|(a, b)| a * b).sum::<f64>();
+        let orig = param.read_f32()[..n].to_vec();
+        let max_abs = orig.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        eprintln!(
+            "{name}: n {n}, |d| {dn:.3e}, tessl.v {:.6e}, torch.v {:.6e}, base loss {base:.9e}, max|x| {max_abs:.3e}, max|v| {:.3e}, |g_tessl| {:.3e}",
+            dot(&g_tessl),
+            dot(&g_torch),
+            v.iter().fold(0.0f64, |a, &b| a.max(b.abs())),
+            g_tessl.iter().map(|x| x * x).sum::<f64>().sqrt(),
+        );
+        // Both perturbations are formed from the f32 original. "f64 once" is
+        // the bound test's: x + s*u in f64, rounded to f32 once. "f32
+        // arithmetic" rounds s*u to f32 first and adds in f32, so a differing
+        // row shows what the second rounding costs.
+        let perturb = |s: f64, f64_once: bool| -> Vec<f32> {
+            orig.iter()
+                .zip(&v)
+                .map(|(&x, &u)| {
+                    if f64_once {
+                        (f64::from(x) + s * u) as f32
+                    } else {
+                        x + (s * u) as f32
+                    }
+                })
+                .collect()
+        };
+        let write = |p: &[f32]| {
+            let mut all = param.read_f32();
+            all[..n].copy_from_slice(p);
+            param.write_f32(&all);
+        };
+        let hs: Vec<f64> = (0..=14)
+            .map(|k| 1e-1 / f64::from(1u32 << k))
+            .take_while(|&h| h >= 1e-5)
+            .collect();
+        for f64_once in [true, false] {
+            eprintln!(
+                "-- perturbation {}",
+                if f64_once {
+                    "f64 once, rounded once"
+                } else {
+                    "f32 arithmetic"
+                }
+            );
+            let mut fds: Vec<f64> = Vec::new();
+            for &h in &hs {
+                let (xp, xm) = (perturb(h, f64_once), perturb(-h, f64_once));
+                let unchanged = |p: &[f32]| p.iter().zip(&orig).filter(|(a, b)| a == b).count();
+                let (cp, cm) = (unchanged(&xp), unchanged(&xm));
+                // The step the f32 parameters really took along v.
+                let realised = xp
+                    .iter()
+                    .zip(&xm)
+                    .zip(&v)
+                    .map(|((&a, &b), &u)| (f64::from(a) - f64::from(b)) * u)
+                    .sum::<f64>()
+                    / 2.0;
+                write(&xp);
+                let up = loss(&model, &ids);
+                write(&xm);
+                let down = loss(&model, &ids);
+                write(&orig);
+                let fd = (up - down) / (2.0 * h);
+                let fd_real = (up - down) / (2.0 * realised);
+                // Observed order from three successive differences:
+                // (fd(4h') - fd(2h')) / (fd(2h') - fd(h')) = 2^p.
+                let k = fds.len();
+                let order = if k >= 2 {
+                    let r = (fds[k - 2] - fds[k - 1]) / (fds[k - 1] - fd);
+                    format!("diff ratio {r:.3} (order {:.2})", r.abs().log2())
+                } else {
+                    "-".to_string()
+                };
+                let rich = fds
+                    .last()
+                    .map_or("-".to_string(), |p| format!("{:.6e}", (4.0 * fd - p) / 3.0));
+                eprintln!(
+                    "h {h:.4e}: up-base {:+.3e} down-base {:+.3e} fd {fd:+.6e} fd(realised h) {fd_real:+.6e} (realised/h {:.6}) {order} richardson(2h,h) {rich} unchanged f32 elems +h {cp} -h {cm} of {n}",
+                    up - base,
+                    down - base,
+                    realised / h,
+                );
+                fds.push(fd);
+            }
+            assert_eq!(
+                loss(&model, &ids).to_bits(),
+                base.to_bits(),
+                "{name}: the parameter was not restored"
+            );
+        }
+    }
+
+    /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
+    ///
+    /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
+    /// the largest), so their gradients differ too (up to 4e-3 of a
+    /// parameter's largest, tests/qwen35_train.rs). This decides whose side a
+    /// disagreement is on: along `v = (g_tessl - g_torch) / |d|` the two
+    /// gradients predict slopes `|d|` apart, and a Richardson-extrapolated
+    /// central difference of tessl's own loss must land on tessl's.
+    #[test]
+    #[ignore]
+    fn real_2b_gradients_are_those_of_tessls_forward() {
+        let (dir, _rt, model, ids) = real_2b_setup();
         let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
         let base = loss(&model, &ids);
         // (name, the model's f32 buffer, tessl's gradient buffer, length).

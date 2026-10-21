@@ -169,11 +169,15 @@ fn named_with(
 struct RelAcc {
     peak: f64,
     diff: f64,
+    /// A NaN or infinity was seen in `got` or `want`. `f64::max` skips a NaN,
+    /// so without this a non-finite gradient would leave the bound intact.
+    nonfinite: bool,
 }
 
 impl RelAcc {
     fn push(&mut self, got: &[f64], want: &[f64]) {
         assert_eq!(got.len(), want.len());
+        self.nonfinite |= got.iter().chain(want).any(|x| !x.is_finite());
         self.peak = want.iter().fold(self.peak, |m, x| m.max(x.abs()));
         self.diff = got
             .iter()
@@ -182,7 +186,12 @@ impl RelAcc {
             .fold(self.diff, f64::max);
     }
 
+    /// Infinity when anything was non-finite: every `rel <= bound` check then
+    /// fails.
     fn rel(&self) -> f64 {
+        if self.nonfinite {
+            return f64::INFINITY;
+        }
         self.diff / self.peak.max(1e-30)
     }
 }
@@ -2099,6 +2108,35 @@ fn windowed_rel_is_the_whole_rel() {
     assert_eq!(rel(&[], &[]), 0.0);
 }
 
+/// A NaN or an infinity in either side makes `rel` exceed any finite bound,
+/// wherever it falls in a windowed pass, and the windowed form agrees.
+#[test]
+fn rel_fails_closed_on_a_non_finite_gradient() {
+    let want: Vec<f64> = (0..100).map(|i| (i as f64 - 40.0) * 0.5).collect();
+    let bound = 1e300;
+    assert!(rel(&want, &want) <= 1e-12);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for at in [0, 49, 99] {
+            let mut poisoned = want.clone();
+            poisoned[at] = bad;
+            for (got, want) in [(&poisoned, &want), (&want, &poisoned)] {
+                assert!(rel(got, want) > bound, "{bad} at {at}: whole {}", rel(got, want));
+                for window in [1, 7, 50, 100] {
+                    let mut acc = RelAcc::default();
+                    for (g, w) in got.chunks(window).zip(want.chunks(window)) {
+                        acc.push(g, w);
+                    }
+                    assert_eq!(
+                        acc.rel().to_bits(),
+                        rel(got, want).to_bits(),
+                        "{bad} at {at}, window {window}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// 4352 natural-text ids for the loss curve: 34 chunks of 128
 /// (`tests/fixtures/qwen35_curve_ids.npy`, `tools/qwen35_ref/make_text_ids.py`).
 fn curve_ids() -> Vec<u32> {
@@ -2394,13 +2432,20 @@ fn real_2b_bank_accumulates_within_the_bound() {
     let mut scales = Vec::with_capacity(sums.len());
     {
         let fb = model.train_step(&b, mm).unwrap();
-        for ((_, y, _), sum) in bank_pairs(&fb.grads, &fb.grads).into_iter().zip(sums.iter_mut()) {
+        for ((name, y, _), sum) in bank_pairs(&fb.grads, &fb.grads).into_iter().zip(sums.iter_mut()) {
             assert_eq!(y.numel(), sum.len());
             // Read through the device mapping a window at a time: a widened
             // copy of the embedding is 2 GiB more on the host.
             let mut scale = 0.0f64;
             each_f32_window(y, |start, ys| {
-                for (s, &q) in sum[start..].iter_mut().zip(ys) {
+                for (k, (s, &q)) in sum[start..].iter_mut().zip(ys).enumerate() {
+                    // `f64::max` skips a NaN, so a non-finite gradient would
+                    // leave the scale, and the bound with it, quietly intact.
+                    assert!(
+                        s.is_finite() && q.is_finite(),
+                        "{name}[{}]: non-finite fresh gradient ({s}, {q})",
+                        start + k
+                    );
                     scale = scale.max(f64::from(s.abs() + q.abs()));
                     *s += q;
                 }
@@ -2418,6 +2463,13 @@ fn real_2b_bank_accumulates_within_the_bound() {
         assert_eq!(got.numel(), sum.len(), "{name}");
         each_f32_window(got, |start, gs| {
             for (k, (&g, &want)) in gs.iter().zip(&sum[start..]).enumerate() {
+                // inf <= inf * 0 + ... would pass the bound below, and
+                // `worst.max` skips a NaN: refuse a non-finite value first.
+                assert!(
+                    g.is_finite() && want.is_finite(),
+                    "{name}[{}]: non-finite bank value {g} against {want}",
+                    start + k
+                );
                 let err = (f64::from(g) - f64::from(want)).abs();
                 assert!(
                     err <= ACCUMULATE_BOUND * U * scale,

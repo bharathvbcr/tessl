@@ -56,33 +56,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use common::logit_dev::{argmax, kl_rows, load_ref, load_ref_in, log_softmax, logit_dev, ref_dir};
 use common::with_gpu;
-use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout, GdnScanSlice};
 use tessl::qwen35_model::{LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
 use tessl::GpuRuntime;
 
 const PREFIX: &str = "model.language_model.";
-
-fn ref_dir() -> PathBuf {
-    std::env::var_os("QWEN35_REF_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_ref"))
-}
-
-fn load_ref(name: &str) -> (Vec<usize>, Vec<f64>) {
-    let path = ref_dir().join(format!("{name}.npy"));
-    let a = read_npy(&path).unwrap_or_else(|e| panic!("{e}\n(run python3 tools/qwen35_ref/make_reference.py first)"));
-    let data = if let Ok(s) = a.f32_slice() {
-        s.iter().map(|&x| x as f64).collect()
-    } else if let Some(i) = &a.data_i64 {
-        i.iter().map(|&x| x as f64).collect()
-    } else {
-        panic!("{name}: unexpected dtype")
-    };
-    (a.shape, data)
-}
 
 fn checkpoint() -> SafeTensors {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
@@ -106,34 +87,6 @@ fn rel(got: &[f32], want: &[f64]) -> f64 {
         .zip(want)
         .fold(0.0f64, |m, (&g, &w)| m.max((g as f64 - w).abs()));
     err / scale.max(f64::MIN_POSITIVE)
-}
-
-fn argmax(row: &[f64]) -> usize {
-    row.iter()
-        .enumerate()
-        .fold(
-            (0, f64::NEG_INFINITY),
-            |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) },
-        )
-        .0
-}
-
-fn log_softmax(row: &[f64]) -> Vec<f64> {
-    let m = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
-    row.iter().map(|v| v - lse).collect()
-}
-
-/// KL(p || q) from logits, per row.
-fn kl_rows(p_logits: &[f64], q_logits: &[f64], vocab: usize) -> Vec<f64> {
-    p_logits
-        .chunks(vocab)
-        .zip(q_logits.chunks(vocab))
-        .map(|(p, q)| {
-            let (lp, lq) = (log_softmax(p), log_softmax(q));
-            lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
-        })
-        .collect()
 }
 
 fn run(precision: Precision) -> (Vec<f32>, Vec<Vec<f32>>) {
@@ -228,6 +181,197 @@ fn bf16_forward_is_no_worse_than_transformers_bf16() {
         m_t <= m_h,
         "tessl bf16 misses more top-1 tokens ({m_t}) than transformers bf16 ({m_h})"
     );
+}
+
+// ------------------------------------------- real-2B logit deviation report ---
+
+// The one peak-footprint reader (also the bench bins'), included by path.
+#[path = "../src/bin/common/footprint.rs"]
+mod footprint;
+
+fn ids_in(dir: &Path) -> Vec<u32> {
+    let (_, ids) = load_ref_in(dir, "ids");
+    ids.iter()
+        .map(|&x| u32::try_from(x as i64).expect("token id fits u32"))
+        .collect()
+}
+
+/// One forward of the real 2B at `precision`, the logits only. The model and
+/// its runtime are dropped on return, so one model is resident at a time (two
+/// F32 copies of the 2B would be ~15 GB).
+fn real_2b_logits(ids: &[u32], precision: Precision) -> Vec<f32> {
+    let rt = GpuRuntime::new().unwrap();
+    let st = checkpoint();
+    let model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), precision).unwrap();
+    let logits = model.forward(ids, false).unwrap().logits;
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "{precision:?}: non-finite logits"
+    );
+    logits
+}
+
+fn to_f32(v: &[f64]) -> Vec<f32> {
+    v.iter().map(|&x| x as f32).collect()
+}
+
+/// For each of `variants`, one forward on the prompt in `dir`, against tessl's
+/// own F32 logits (computed once and kept on the host) and against
+/// transformers' `logits_f32.npy`; then the transformers noise floor,
+/// `logits_bf16.npy` against `logits_f32.npy`. Returns the failures of the F32
+/// gate: 1e-3 of the largest logit and no top-1 miss, the bounds of
+/// `f32_forward_matches_transformers_fp32_layer_by_layer`.
+fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<String> {
+    let ids = ids_in(dir);
+    let (shape, hf_f32) = load_ref_in(dir, "logits_f32");
+    let (shape_bf16, hf_bf16) = load_ref_in(dir, "logits_bf16");
+    assert_eq!(shape, shape_bf16, "{label}: logits_f32 and logits_bf16 shapes differ");
+    assert_eq!(shape.len(), 2, "{label}: logits are [positions, vocab]");
+    assert_eq!(shape[0], ids.len(), "{label}: logits rows != ids");
+    let vocab = shape[1];
+    eprintln!("== {label}: {} ({} positions, vocab {vocab})", dir.display(), ids.len());
+
+    let tessl_f32 = real_2b_logits(&ids, Precision::F32);
+    let tessl_f32_64: Vec<f64> = tessl_f32.iter().map(|&x| f64::from(x)).collect();
+    let mut failures = Vec::new();
+    for &variant in variants {
+        let fresh = (variant != Precision::F32).then(|| real_2b_logits(&ids, variant));
+        let got: &[f32] = fresh.as_deref().unwrap_or(&tessl_f32);
+        let vs_tessl = logit_dev(got, &tessl_f32_64, vocab);
+        let vs_hf = logit_dev(got, &hf_f32, vocab);
+        eprintln!("{}", vs_tessl.row(&format!("{variant:?} vs tessl F32")));
+        eprintln!("{}", vs_hf.row(&format!("{variant:?} vs transformers fp32")));
+        if variant == Precision::F32 {
+            if !(vs_hf.max_rel() <= 1e-3) {
+                failures.push(format!("{label}: F32 logits rel err {:.3e} > 1e-3", vs_hf.max_rel()));
+            }
+            if vs_hf.top1_misses() != 0 || !vs_hf.is_finite() {
+                failures.push(format!(
+                    "{label}: F32 top-1 differs at {} of {} positions (non-finite: {} got, {} want)",
+                    vs_hf.top1_misses(),
+                    vs_hf.positions,
+                    vs_hf.nonfinite_got,
+                    vs_hf.nonfinite_want
+                ));
+            }
+        }
+    }
+    let floor = logit_dev(&to_f32(&hf_bf16), &hf_f32, vocab);
+    eprintln!("{}", floor.row("transformers bf16 vs fp32 (floor)"));
+    failures
+}
+
+/// Real-2B logit deviation, one table per prompt: how far each precision
+/// variant's logits are from tessl's F32 and from transformers' fp32, next to
+/// transformers' own bf16-vs-fp32 noise floor. The report is the product; only
+/// the F32 row is asserted. Needs `QWEN35_2B_SAFETENSORS` and the reference
+/// directory of `QWEN35_REF_DIR` (`target/qwen35_ref`); with
+/// `QWEN35_REF_TEXT_DIR` set it repeats on that directory's prompt (the 512
+/// natural-text ids of `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy`),
+/// and prints NOT RUN for it when unset. Add a variant by extending `variants`.
+#[test]
+#[ignore]
+fn logit_deviation_report() {
+    let variants = [Precision::F32, Precision::Bf16];
+    let mut failures = logit_deviation_rows("default prompt", &ref_dir(), &variants);
+    match std::env::var_os("QWEN35_REF_TEXT_DIR") {
+        Some(dir) => failures.extend(logit_deviation_rows("text prompt", Path::new(&dir), &variants)),
+        None => eprintln!("== text prompt: NOT RUN (QWEN35_REF_TEXT_DIR is unset)"),
+    }
+    match footprint::peak_footprint() {
+        Ok(peak) => eprintln!(
+            "logit_deviation_report: peak footprint {:.2} GiB (memguard cap 32 GiB)",
+            peak as f64 / (1u64 << 30) as f64
+        ),
+        Err(e) => failures.push(format!("peak footprint unreadable: {e}")),
+    }
+    assert!(failures.is_empty(), "F32 gate failed:\n{}", failures.join("\n"));
+}
+
+// Device-free tests of `common::logit_dev`: they live in this one binary so the
+// others keep their test counts (see scripts/hosted_tests.txt).
+
+fn dev_rows() -> Vec<f64> {
+    vec![0.5, 2.0, -1.0, 0.0, 3.0, 1.0, -2.0, 0.5, 0.25, 1.5, -0.5, 0.0]
+}
+
+#[test]
+fn logit_dev_identical_rows_are_exact() {
+    let want = dev_rows();
+    let d = logit_dev(&to_f32(&want), &want, 4);
+    assert_eq!((d.positions, d.top1_agree), (3, 3));
+    assert_eq!((d.max_abs, d.mean_abs, d.max_kl, d.mean_kl), (0.0, 0.0, 0.0, 0.0));
+    assert_eq!(d.ref_scale, 3.0);
+    assert!(d.is_finite());
+    assert_eq!((d.max_rel(), d.top1_misses()), (0.0, 0));
+}
+
+#[test]
+fn logit_dev_one_flipped_argmax_is_one_miss_with_positive_kl() {
+    let want = dev_rows();
+    let mut got = to_f32(&want);
+    got[1] = -5.0; // row 0: argmax 1 -> 0
+    let d = logit_dev(&got, &want, 4);
+    assert_eq!((d.top1_agree, d.positions), (2, 3));
+    assert_eq!(d.top1_misses(), 1);
+    assert_eq!(d.max_abs, 7.0);
+    assert!((d.mean_abs - 7.0 / 12.0).abs() < 1e-12);
+    assert!((d.max_rel() - 7.0 / 3.0).abs() < 1e-12);
+    assert!(d.max_kl > 0.0 && d.mean_kl > 0.0 && d.mean_kl < d.max_kl);
+}
+
+#[test]
+fn logit_dev_nan_and_inf_never_pass_a_bound() {
+    let want = dev_rows();
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut got = to_f32(&want);
+        got[5] = bad;
+        let d = logit_dev(&got, &want, 4);
+        assert!(!d.is_finite() && d.nonfinite_got == 1 && d.nonfinite_want == 0);
+        assert!(!(d.max_rel() <= 1e-3), "{bad}: a bound must not pass");
+        assert!(!(d.mean_kl <= 1e-3) && !(d.max_kl <= 1e-3));
+        assert_eq!(d.top1_agree, 0);
+        assert!(d.row("x").contains("NON-FINITE"));
+    }
+    let mut w = want.clone();
+    w[0] = f64::NAN;
+    let d = logit_dev(&to_f32(&want), &w, 4);
+    assert!(d.nonfinite_want == 1 && !(d.max_rel() <= 1e-3));
+}
+
+#[test]
+fn logit_dev_nan_in_the_last_element_is_not_skipped_by_max() {
+    // f64::max(x, NaN) == x: the failure this guards against.
+    let want = dev_rows();
+    let mut got = to_f32(&want);
+    got[11] = f32::NAN;
+    assert!(logit_dev(&got, &want, 4).max_abs.is_infinite());
+}
+
+#[test]
+fn logit_dev_zero_reference_scale_only_matches_exactly() {
+    let want = vec![0.0f64; 8];
+    assert_eq!(logit_dev(&[0.0; 8], &want, 4).max_rel(), 0.0);
+    let off = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    assert!(logit_dev(&off, &want, 4).max_rel().is_infinite());
+}
+
+#[test]
+#[should_panic(expected = "differ in length")]
+fn logit_dev_shape_mismatch_panics() {
+    logit_dev(&[0.0; 8], &[0.0; 12], 4);
+}
+
+#[test]
+#[should_panic(expected = "does not divide")]
+fn logit_dev_vocab_not_dividing_len_panics() {
+    logit_dev(&[0.0; 10], &[0.0; 10], 4);
+}
+
+#[test]
+#[should_panic(expected = "no logits")]
+fn logit_dev_empty_panics() {
+    logit_dev(&[], &[], 4);
 }
 
 /// The real 2B at F32, on the staged and decode entry points the tiny tests

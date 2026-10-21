@@ -15,6 +15,12 @@ pub mod gdn;
 /// backward, in f64: the oracle for the training kernels.
 pub mod gdn_train;
 
+/// Logit deviation between two forwards (max/mean |d|, top-1, KL; fails closed on
+/// NaN) and the transformers reference-file loader the Qwen3.5 model tests share.
+/// Its device-free tests live in `tests/qwen35_model.rs`, so that one binary runs
+/// them and the others keep their test counts.
+pub mod logit_dev;
+
 /// f64 references for the Qwen3.5 kernels, anchored to transformers by fixture.
 pub mod qwen35;
 

@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import gemm_sweep_mlx  # noqa: E402
+import qwen35_gdn_patch_torch as gdn_lane  # noqa: E402
 from flash_attn_torch_mlx import BY_LABEL, CFGS, keep_mask, live_pairs  # noqa: E402
 
 
@@ -187,6 +188,130 @@ class ExternalLaneWriter(unittest.TestCase):
     def test_the_default_lane_list_is_the_four_runtimes_the_scorer_knows(self):
         names = [lane for lane, _, _ in gemm_sweep_mlx.EXTERNAL_LANES]
         self.assertEqual(names, ["mlx-f32", "mlx-bf16", "torch-mps-f32", "torch-mps-bf16"])
+
+
+class Qwen35GdnPatchLane(unittest.TestCase):
+    """`qwen35_gdn_patch_torch.py` without MPS: its arguments, the METRIC lines
+    `bench_paired --format metrics` reads, and the bound it applies to a patched
+    step's gradients (scored here on synthetic CPU tensors)."""
+
+    def test_exactly_one_of_arm_and_check(self):
+        for argv in ([], ["--arm", "torch", "--check"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                gdn_lane.parse_args(argv)
+        self.assertEqual(gdn_lane.parse_args(["--arm", "tessl"]).arm, "tessl")
+        self.assertTrue(gdn_lane.parse_args(["--check"]).check)
+
+    def test_defaults_and_the_bench_env(self):
+        old = {k: os.environ.pop(k, None) for k in ("BENCH_ITERS", "BENCH_WARMUP")}
+        try:
+            a = gdn_lane.parse_args(["--arm", "torch"])
+            self.assertEqual((a.seq_len, a.layers, a.steps, a.warmup, a.init), (2048, 4, 5, 2, "real"))
+            os.environ["BENCH_ITERS"], os.environ["BENCH_WARMUP"] = "7", "1"
+            a = gdn_lane.parse_args(["--arm", "torch", "--seq-len", "512"])
+            self.assertEqual((a.seq_len, a.steps, a.warmup), (512, 7, 1))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_nonsense_counts_are_refused(self):
+        for bad in (["--steps", "0"], ["--seq-len", "0"], ["--layers", "0"], ["--warmup", "-1"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                gdn_lane.parse_args(["--arm", "torch"] + bad)
+
+    def test_metric_lines_are_name_value_pairs_with_the_min_and_median(self):
+        lines = gdn_lane.metric_lines([30.0, 10.0, 20.0, 40.0], 1536.0, 1024.5)
+        parsed = {}
+        for line in lines:
+            tag, name, value = line.split(" ")
+            self.assertEqual(tag, "METRIC")
+            parsed[name] = float(value)
+        self.assertEqual(parsed, {
+            "qwen35_gdn_step_ms_min": 10.0, "qwen35_gdn_step_ms_median": 25.0,
+            "qwen35_gdn_driver_mib_peak": 1536.0, "qwen35_gdn_driver_mib_after": 1024.5})
+        with self.assertRaises(ValueError):
+            gdn_lane.metric_lines([], 1.0, 1.0)
+
+    def grads(self):
+        import torch
+        g = torch.Generator().manual_seed(0)
+        return {"a": torch.randn(8, 4, generator=g), "b": torch.randn(16, generator=g)}
+
+    def test_equal_gradients_pass_and_the_bound_is_relative_to_the_peak(self):
+        want = self.grads()
+        ok, _, err, why = gdn_lane.compare_grads(1.0, 1.0, {k: v.clone() for k, v in want.items()}, want)
+        self.assertTrue(ok, why)
+        self.assertEqual(err, 0.0)
+        peak = want["b"].abs().max()
+        near = {k: v.clone() for k, v in want.items()}
+        near["b"][0] += 0.5 * gdn_lane.GRAD_REL * peak
+        ok, name, err, _ = gdn_lane.compare_grads(1.0, 1.0, near, want)
+        self.assertTrue(ok)
+        self.assertEqual(name, "b")
+        self.assertAlmostEqual(err, 0.5 * gdn_lane.GRAD_REL, delta=1e-6)
+        far = {k: v.clone() for k, v in want.items()}
+        far["b"][0] += 2 * gdn_lane.GRAD_REL * peak
+        ok, name, err, why = gdn_lane.compare_grads(1.0, 1.0, far, want)
+        self.assertFalse(ok)
+        self.assertIn("b: gradient error", why[0])
+
+    def test_loss_missing_extra_and_non_finite_gradients_each_fail(self):
+        import torch
+        want = self.grads()
+
+        def clone():
+            return {k: v.clone() for k, v in want.items()}
+
+        ok, _, _, why = gdn_lane.compare_grads(1.0 + 2e-4, 1.0, clone(), want)
+        self.assertFalse(ok)
+        self.assertIn("loss", why[0])
+        self.assertTrue(gdn_lane.compare_grads(1.0 + 5e-5, 1.0, clone(), want)[0])
+        self.assertFalse(gdn_lane.compare_grads(float("nan"), 1.0, clone(), want)[0])
+        short = clone()
+        del short["a"]
+        self.assertIn("a: no gradient in the patched model", gdn_lane.compare_grads(1.0, 1.0, short, want)[3])
+        extra = clone()
+        extra["c"] = torch.zeros(1)
+        self.assertIn("c: no gradient in the unpatched model", gdn_lane.compare_grads(1.0, 1.0, extra, want)[3])
+        bad = clone()
+        bad["a"][0, 0] = float("nan")
+        self.assertIn("a: non-finite gradient", gdn_lane.compare_grads(1.0, 1.0, bad, want)[3])
+
+    def test_a_train_step_and_the_timing_loop_run_on_cpu(self):
+        # A tiny Qwen3.5 (linear then full attention) through the lane's own step.
+        import torch
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+        cfg = mq.Qwen3_5TextConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            layer_types=["linear_attention", "full_attention"], num_attention_heads=2,
+            num_key_value_heads=1, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=2,
+            linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+            vocab_size=64, tie_word_embeddings=True)
+        torch.manual_seed(0)
+        model = mq.Qwen3_5ForCausalLM(cfg).float()
+        ids = torch.randint(0, 64, (1, 24))
+        cpu = torch.device("cpu")
+        ms = gdn_lane.time_steps(model, ids, cpu, warmup=1, steps=3)
+        self.assertEqual(len(ms), 3)
+        self.assertTrue(all(m > 0 for m in ms))
+        # The same step twice is the same loss and the same gradients: what
+        # --check relies on when only the GDN function differs.
+        a = gdn_lane.train_step(model, ids, cpu)
+        ga = gdn_lane.grads_of(model)
+        b = gdn_lane.train_step(model, ids, cpu)
+        self.assertEqual(a, b)
+        self.assertTrue(gdn_lane.compare_grads(b, a, gdn_lane.grads_of(model), ga)[0])
+
+    def test_the_cut_config_keeps_the_leading_layer_types(self):
+        snap = gdn_lane.DEFAULT_SNAPSHOT
+        if not (snap / "config.json").is_file():
+            self.skipTest("no local Qwen3.5-2B-Base snapshot")
+        cfg = gdn_lane.text_config(snap, 4)
+        self.assertEqual(cfg.num_hidden_layers, 4)
+        self.assertEqual(list(cfg.layer_types), ["linear_attention"] * 3 + ["full_attention"])
+        self.assertEqual((cfg.hidden_size, cfg.linear_num_value_heads, cfg.linear_value_head_dim), (2048, 16, 128))
 
 
 if __name__ == "__main__":

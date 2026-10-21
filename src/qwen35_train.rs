@@ -3370,6 +3370,16 @@ mod tests {
         tiny_model_as(Precision::F32)
     }
 
+    /// [`tiny_model_as`] as [`Qwen35Model::load_tower`] loads it (no packed
+    /// LM head): the model a bf16 step can train, which `AdamW` accepts.
+    fn tiny_tower_as(precision: Precision) -> Qwen35Model {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
+        let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+        let rt = GpuRuntime::new().unwrap();
+        let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+        Qwen35Model::load_tower(&rt, &st, "model.", cfg, precision).unwrap()
+    }
+
     fn tiny_model_as(precision: Precision) -> Qwen35Model {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
         let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
@@ -3853,7 +3863,7 @@ mod tests {
     #[test]
     fn fused_bounds_equal_the_bytes_the_fused_step_allocates() {
         for (name, precision, mm) in lanes() {
-            let model = tiny_model_as(precision);
+            let model = tiny_tower_as(precision);
             let config = if precision == Precision::F32 {
                 AdamWConfig::F32
             } else {

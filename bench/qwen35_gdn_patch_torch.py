@@ -41,6 +41,12 @@ previous function restored afterwards), compared with the bounds of
 relative, and the worst parameter gradient within 1e-3 of its own peak
 (``max|got-want| / max|want|``). It prints the worst parameter and exits
 non-zero on a miss, on a missing or extra gradient, or on a non-finite value.
+Both modes also count the calls that reach tessl (a counting wrapper on
+``tessl_torch.chunk_gated_delta_rule``, which the patch installs) and fail
+when the patch is not taking effect: ``--check`` needs 0 calls in the
+unpatched step and at least one per GDN layer in the patched one, ``--arm
+tessl`` at least one per GDN layer per forward (3 for the 4-layer cut). The
+count is on stderr as ``tessl_gdn_calls`` (0 for the torch arm).
 Those bounds are for float32.
 
 The commands for the locked GPU job, from the repository root with
@@ -280,19 +286,71 @@ def require_mps():
     return torch.device("mps")
 
 
+class CallCounter:
+    """A transparent wrapper that counts calls into ``fn``."""
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.fn(*args, **kwargs)
+
+
+def spy_on(module, name="chunk_gated_delta_rule"):
+    """Replace ``module.<name>`` with a counting wrapper; returns the counter
+    and the original. ``patch_transformers_qwen3_5`` resolves the name in the
+    module at call time, so the function it installs is the counted one, and a
+    call that reaches tessl through the patch is counted. Put the original
+    back with ``setattr(module, name, original)``."""
+    original = getattr(module, name)
+    counter = CallCounter(original)
+    setattr(module, name, counter)
+    return counter, original
+
+
+def count_error(calls, at_least, label):
+    """A message when ``calls`` into tessl is not what the run needs, else
+    None. ``at_least == 0`` means the count must be exactly 0 (the unpatched
+    step); otherwise at least ``at_least`` calls (one per GDN layer per
+    forward) are required, or the patch is not taking effect."""
+    if at_least == 0:
+        return f"{label}: {calls} tessl GDN calls, expected 0" if calls else None
+    if calls < at_least:
+        return (f"{label}: {calls} tessl GDN calls, expected at least {at_least} "
+                "(one per GDN layer per forward): the patch is not taking effect")
+    return None
+
+
+def gdn_layers(model):
+    return list(model.config.layer_types).count("linear_attention")
+
+
 def run_arm(args):
     device = require_mps()
+    counter = None
     if args.arm == "tessl":
         sys.path.insert(0, str(ROOT / "python"))
         import tessl_torch
 
+        counter, _ = spy_on(tessl_torch)
         tessl_torch.patch_transformers_qwen3_5()
     model = build_model(args, device)
     ids = make_ids(args, model.config.vocab_size, device)
     step_ms = time_steps(model, ids, device, args.warmup, args.steps)
     peak, after = memory_step(model, ids, device)
-    print(f"arm={args.arm} layers={args.layers} seq_len={args.seq_len} init={args.init}", file=sys.stderr)
+    calls = counter.calls if counter else 0
+    print(f"arm={args.arm} layers={args.layers} seq_len={args.seq_len} init={args.init} tessl_gdn_calls={calls}",
+          file=sys.stderr)
+    if counter:
+        forwards = args.warmup + args.steps + 1
+        err = count_error(calls, gdn_layers(model) * forwards, "arm tessl")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
     print("\n".join(metric_lines(step_ms, peak, after)))
+    return 0
 
 
 def grads_of(model):
@@ -306,10 +364,12 @@ def run_check(args):
     from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
     reference = mq.torch_chunk_gated_delta_rule
+    counter, tessl_fn = spy_on(tessl_torch)
     model = build_model(args, device)
     ids = make_ids(args, model.config.vocab_size, device)
     want_loss = train_step(model, ids, device)
     want = grads_of(model)
+    unpatched_calls = counter.calls
     previous = tessl_torch.patch_transformers_qwen3_5()
     try:
         if previous is not reference:
@@ -318,7 +378,14 @@ def run_check(args):
         got = grads_of(model)
     finally:
         mq.torch_chunk_gated_delta_rule = previous
+        tessl_torch.chunk_gated_delta_rule = tessl_fn
+    patched_calls = counter.calls - unpatched_calls
+    print(f"tessl GDN calls: unpatched step {unpatched_calls}, patched step {patched_calls}")
+    miss = [e for e in (count_error(unpatched_calls, 0, "unpatched step"),
+                        count_error(patched_calls, gdn_layers(model), "patched step")) if e]
     ok, name, err, reasons = compare_grads(got_loss, want_loss, got, want)
+    reasons = miss + reasons
+    ok = not reasons
     print(f"loss unpatched {want_loss:.6f} patched {got_loss:.6f}")
     print(f"worst parameter gradient error {err:.3e} ({name}) over {len(want)} parameters, bound {GRAD_REL:g}")
     for r in reasons:
@@ -331,8 +398,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.check:
         return run_check(args)
-    run_arm(args)
-    return 0
+    return run_arm(args)
 
 
 if __name__ == "__main__":

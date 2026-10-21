@@ -304,6 +304,66 @@ class Qwen35GdnPatchLane(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertTrue(gdn_lane.compare_grads(b, a, gdn_lane.grads_of(model), ga)[0])
 
+    def fake_tessl(self, binds_early=False):
+        """A stand-in for tessl_torch whose patch installs the module's current
+        ``chunk_gated_delta_rule`` into a stand-in transformers module, as the
+        real patch does by global lookup; ``binds_early`` keeps a reference taken
+        before any spy, as a patch that bound at import would."""
+        import types
+        tessl = types.SimpleNamespace(chunk_gated_delta_rule=lambda *a, **k: "tessl")
+        early = tessl.chunk_gated_delta_rule
+        mq = types.SimpleNamespace(torch_chunk_gated_delta_rule=lambda *a, **k: "torch")
+
+        def patch():
+            previous = mq.torch_chunk_gated_delta_rule
+            mq.torch_chunk_gated_delta_rule = early if binds_early else tessl.chunk_gated_delta_rule
+            return previous
+
+        tessl.patch_transformers_qwen3_5 = patch
+        return tessl, mq
+
+    def forward(self, mq, layers=3):
+        for _ in range(layers):
+            mq.torch_chunk_gated_delta_rule()
+
+    def test_the_counter_sees_every_call_the_patch_routes_to_tessl(self):
+        tessl, mq = self.fake_tessl()
+        counter, original = gdn_lane.spy_on(tessl)
+        self.forward(mq)
+        self.assertEqual(counter.calls, 0)
+        self.assertIsNone(gdn_lane.count_error(counter.calls, 0, "unpatched"))
+        previous = tessl.patch_transformers_qwen3_5()
+        self.forward(mq)
+        self.assertEqual(counter.calls, 3)
+        self.assertIsNone(gdn_lane.count_error(counter.calls, 3, "patched"))
+        self.assertEqual(mq.torch_chunk_gated_delta_rule(), "tessl")
+        self.assertEqual(previous(), "torch")
+        setattr(tessl, "chunk_gated_delta_rule", original)
+        self.assertIs(tessl.chunk_gated_delta_rule, original)
+
+    def test_a_patch_that_takes_no_effect_is_an_error_not_a_pass(self):
+        # The patch installed something the counter never sees (a binding made
+        # before the spy): the model still runs, but zero calls reach tessl.
+        tessl, mq = self.fake_tessl(binds_early=True)
+        counter, _ = gdn_lane.spy_on(tessl)
+        tessl.patch_transformers_qwen3_5()
+        self.forward(mq)
+        self.assertEqual(counter.calls, 0)
+        msg = gdn_lane.count_error(counter.calls, 3, "patched step")
+        self.assertIn("patch is not taking effect", msg)
+        self.assertIn("0 tessl GDN calls", msg)
+
+    def test_the_count_bounds(self):
+        self.assertIsNone(gdn_lane.count_error(9, 9, "x"))
+        self.assertIsNone(gdn_lane.count_error(12, 9, "x"))
+        self.assertIn("expected at least 9", gdn_lane.count_error(8, 9, "x"))
+        self.assertIn("expected 0", gdn_lane.count_error(1, 0, "unpatched step"))
+
+    def test_gdn_layers_counts_the_linear_layers_of_the_cut(self):
+        import types
+        cfg = types.SimpleNamespace(layer_types=["linear_attention"] * 3 + ["full_attention"])
+        self.assertEqual(gdn_lane.gdn_layers(types.SimpleNamespace(config=cfg)), 3)
+
     def test_the_cut_config_keeps_the_leading_layer_types(self):
         snap = gdn_lane.DEFAULT_SNAPSHOT
         if not (snap / "config.json").is_file():

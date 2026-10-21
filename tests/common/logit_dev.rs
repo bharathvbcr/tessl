@@ -106,10 +106,19 @@ impl LogitDev {
     }
 
     fn rel(&self, abs: f64) -> f64 {
-        if !(self.ref_scale > 0.0) {
+        if self.ref_scale.is_nan() || self.ref_scale <= 0.0 {
             return if abs == 0.0 { 0.0 } else { f64::INFINITY };
         }
         abs / self.ref_scale
+    }
+
+    /// True only for finite input whose largest deviation is within `bound`
+    /// of the reference scale. False for any NaN or infinity in the logits, in
+    /// `ref_scale`, in the deviation, or in `bound`: every operand is checked
+    /// finite explicitly, so no comparison's NaN behaviour decides the result.
+    pub fn within_rel(&self, bound: f64) -> bool {
+        let rel = self.max_rel();
+        self.is_finite() && self.ref_scale.is_finite() && bound.is_finite() && rel.is_finite() && rel <= bound
     }
 
     pub fn top1_misses(&self) -> usize {
@@ -161,7 +170,10 @@ pub fn logit_dev(got: &[f32], want: &[f64], vocab: usize) -> LogitDev {
         return LogitDev {
             max_abs: f64::INFINITY,
             mean_abs: f64::INFINITY,
-            ref_scale: want.iter().filter(|x| x.is_finite()).fold(0.0, |m, x| f64::max(m, x.abs())),
+            ref_scale: want
+                .iter()
+                .filter(|x| x.is_finite())
+                .fold(0.0, |m, x| f64::max(m, x.abs())),
             top1_agree: 0,
             positions,
             max_kl: f64::INFINITY,

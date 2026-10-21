@@ -56,8 +56,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::logit_dev::{argmax, kl_rows, load_ref, load_ref_in, log_softmax, logit_dev, ref_dir};
+use common::logit_dev::{argmax, kl_rows, load_ref, load_ref_in, log_softmax, logit_dev, ref_dir, LogitDev};
 use common::with_gpu;
+use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout, GdnScanSlice};
 use tessl::qwen35_model::{LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
@@ -204,10 +205,7 @@ fn real_2b_logits(ids: &[u32], precision: Precision) -> Vec<f32> {
     let st = checkpoint();
     let model = Qwen35Model::load(&rt, &st, PREFIX, Qwen35Config::qwen35_2b().unwrap(), precision).unwrap();
     let logits = model.forward(ids, false).unwrap().logits;
-    assert!(
-        logits.iter().all(|x| x.is_finite()),
-        "{precision:?}: non-finite logits"
-    );
+    assert!(logits.iter().all(|x| x.is_finite()), "{precision:?}: non-finite logits");
     logits
 }
 
@@ -242,7 +240,7 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
         eprintln!("{}", vs_tessl.row(&format!("{variant:?} vs tessl F32")));
         eprintln!("{}", vs_hf.row(&format!("{variant:?} vs transformers fp32")));
         if variant == Precision::F32 {
-            if !(vs_hf.max_rel() <= 1e-3) {
+            if !vs_hf.within_rel(1e-3) {
                 failures.push(format!("{label}: F32 logits rel err {:.3e} > 1e-3", vs_hf.max_rel()));
             }
             if vs_hf.top1_misses() != 0 || !vs_hf.is_finite() {
@@ -328,15 +326,43 @@ fn logit_dev_nan_and_inf_never_pass_a_bound() {
         got[5] = bad;
         let d = logit_dev(&got, &want, 4);
         assert!(!d.is_finite() && d.nonfinite_got == 1 && d.nonfinite_want == 0);
-        assert!(!(d.max_rel() <= 1e-3), "{bad}: a bound must not pass");
-        assert!(!(d.mean_kl <= 1e-3) && !(d.max_kl <= 1e-3));
+        assert!(!d.within_rel(1e-3), "{bad}: a bound must not pass");
+        assert!(d.mean_kl.is_infinite() && d.max_kl.is_infinite());
         assert_eq!(d.top1_agree, 0);
         assert!(d.row("x").contains("NON-FINITE"));
     }
     let mut w = want.clone();
     w[0] = f64::NAN;
     let d = logit_dev(&to_f32(&want), &w, 4);
-    assert!(d.nonfinite_want == 1 && !(d.max_rel() <= 1e-3));
+    assert!(d.nonfinite_want == 1 && !d.within_rel(1e-3));
+}
+
+#[test]
+fn logit_dev_within_rel_is_false_for_nan_and_inf_operands() {
+    let want = dev_rows();
+    let d = logit_dev(&to_f32(&want), &want, 4);
+    assert!(d.within_rel(1e-3), "an exact match is within a finite bound");
+    assert!(!d.within_rel(f64::NAN));
+    assert!(!d.within_rel(f64::INFINITY));
+    assert!(!d.within_rel(f64::NEG_INFINITY));
+    // A NaN or infinite reference scale, with a zero deviation, must not pass.
+    for bad in [f64::NAN, f64::INFINITY] {
+        let e = LogitDev {
+            ref_scale: bad,
+            ..d.clone()
+        };
+        assert!(!e.within_rel(1e-3), "ref_scale {bad}");
+    }
+    // A NaN deviation.
+    let e = LogitDev {
+        max_abs: f64::NAN,
+        ..d.clone()
+    };
+    assert!(!e.within_rel(1e-3));
+    // Non-finite logits.
+    let mut got = to_f32(&want);
+    got[0] = f32::NAN;
+    assert!(!logit_dev(&got, &want, 4).within_rel(1e-3));
 }
 
 #[test]

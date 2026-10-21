@@ -844,8 +844,9 @@ differences (1e-7), and the kernels match it within 4e-6 of the largest
 magnitude (O, lse, dQ, dK, dV) from T = 1 through partial, exact and
 one-row blocks, two batch rows and the 2B's 8 query over 2 KV heads. Fourteen
 of fourteen injected defects (masking, scale, `Dr`, head grouping, the
-diagonal start, the log-sum-exp reads and store) fail it. The backward has
-not been timed yet.
+diagonal start, the log-sum-exp reads and store) fail it. The backward's
+timing is in the "Training-path timing" table below (`attn_train` backward,
+T = 2048).
 
 ### Fused dK/dV backward: not built (2026-10-21)
 

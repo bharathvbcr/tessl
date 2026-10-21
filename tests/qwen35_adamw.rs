@@ -2139,6 +2139,10 @@ fn a_fused_step_on_a_non_finite_loss_moves_nothing() {
     assert_eq!(state.step_count(), 0);
 }
 
+/// A hostile call: what it is, its tokens, supervision, hyperparameters and
+/// decay table.
+type Hostile<'a> = (&'a str, &'a [u32], Sup, AdamWHyper, &'a [f32]);
+
 /// Attack 6: every hostile input is refused with nothing moved: empty and
 /// out-of-range tokens, a position twice or past the tokens, a target past
 /// the vocabulary, a non-finite row scale, a NaN clip scale, an infinite or
@@ -2165,7 +2169,7 @@ fn fused_step_refuses_hostile_inputs_and_moves_nothing() {
         grad_scale: f64::NAN,
         ..hyper()
     };
-    let cases: Vec<(&str, &[u32], Sup, AdamWHyper, &[f32])> = vec![
+    let cases: Vec<Hostile<'_>> = vec![
         ("empty ids, causal", &[], Sup::Causal, hyper(), &wd),
         ("empty ids, rows", &[], Sup::rows(&[], &[], 1.0), hyper(), &wd),
         (

@@ -50,8 +50,11 @@ use objc2_metal::MTLBuffer;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_gpu_buf, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Precision, Qwen35Model};
-use crate::qwen35_params::{check, entry, slots, window_copy, window_read_host, window_write_host, Slot, Window};
-use crate::qwen35_train::Qwen35Grads;
+use crate::qwen35_params::{
+    check, check_grads_on_runtime, embed_slot, entry, layer_slots, slots, tail_slots, window_copy, window_read_host,
+    window_write_host, Slot, Window,
+};
+use crate::qwen35_train::{LayerGrads, Qwen35Grads};
 use crate::runtime::GpuRuntime;
 use crate::sq_norm::{sq_norm, SqWindow};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -753,6 +756,236 @@ fn state_window<'a>(buf: &'a GpuBuffer, dtype: DType, like: &Window<'_>) -> Wind
     }
 }
 
+/// One parameter-table entry of a step, checked and ready to encode.
+struct Planned<'a> {
+    /// The entry's parameter-table index: its weight-decay position and the
+    /// stochastic rounding's salt.
+    index: usize,
+    pw: Window<'a>,
+    gw: Window<'a>,
+    st: &'a SlotState,
+    kernel: &'static str,
+    hyper: AdamWHyper,
+    wd: f64,
+}
+
+/// Check each of `entries` (table index, slot with its gradient, state) and
+/// pick its step kernel. `weight_decay` and `lr_scale` are indexed by table
+/// index and already sized to the table; `lr_scale` `None` is every entry at
+/// 1.
+fn plan_adamw<'a>(
+    what: &str,
+    entries: &[(usize, &'a Slot<'a>, &'a SlotState)],
+    config: AdamWConfig,
+    hyper: &AdamWHyper,
+    weight_decay: &[f32],
+    lr_scale: Option<&[f64]>,
+) -> Result<Vec<Planned<'a>>, String> {
+    let mut plan = Vec::with_capacity(entries.len());
+    for &(i, s, st) in entries {
+        let name = &s.info.name;
+        let wd = weight_decay[i];
+        if !(wd.is_finite() && wd >= 0.0) {
+            return Err(format!("{what}: {name}: weight decay {wd} must be finite and >= 0"));
+        }
+        // torch param-group semantics: the group's lr forms both the
+        // decay factor and the step size, so the whole lr is scaled.
+        let entry_hyper = match lr_scale {
+            None => *hyper,
+            Some(scale) => {
+                let k = scale[i];
+                if !(k.is_finite() && k >= 0.0) {
+                    return Err(format!("{what}: {name}: lr scale {k} must be finite and >= 0"));
+                }
+                let h = AdamWHyper {
+                    lr: hyper.lr * k,
+                    ..*hyper
+                };
+                check_hyper(&format!("{what}: {name}"), &h)?;
+                h
+            }
+        };
+        let pw = s.param_window();
+        let gw = s
+            .grad_window()
+            .ok_or_else(|| format!("{what}: {name} has no gradient"))?;
+        pw.check(format_args!("{what}: {name} parameter"))?;
+        gw.check(format_args!("{what}: {name} gradient"))?;
+        if !gw.same_layout(&pw) {
+            return Err(format!("{what}: {name}: the gradient is not laid out as the parameter"));
+        }
+        let kernel = step_kernel(pw.dtype, gw.dtype, config).map_err(|e| format!("{what}: {name}: {e}"))?;
+        plan.push(Planned {
+            index: i,
+            pw,
+            gw,
+            st,
+            kernel,
+            hyper: entry_hyper,
+            wd: f64::from(wd),
+        });
+    }
+    Ok(plan)
+}
+
+/// Bytes of the slot tables a fused update of `ps` allocates (one per step
+/// kernel, [`SLOT_BYTES`] a slot, as [`Qwen35Model::encode_planned`] makes
+/// them), at the pool's rounding.
+pub(crate) fn fused_table_bytes(config: AdamWConfig, ps: &[Slot<'_>]) -> u64 {
+    let mut per_kernel: Vec<(&str, usize)> = Vec::new();
+    for s in ps {
+        let dtype = s.param_window().dtype;
+        // A parameter with no step kernel is refused before the step runs.
+        let Ok(kernel) = step_kernel(dtype, dtype, config) else {
+            continue;
+        };
+        match per_kernel.iter_mut().find(|(k, _)| *k == kernel) {
+            Some((_, n)) => *n += 1,
+            None => per_kernel.push((kernel, 1)),
+        }
+    }
+    per_kernel.iter().fold(0u64, |a, &(_, n)| {
+        a.saturating_add(GpuRuntime::allocated_bytes_for(
+            (n * SLOT_BYTES).max(4),
+            crate::runtime::BufferKind::Cold,
+        ))
+    })
+}
+
+/// An AdamW step applied while the backward runs
+/// ([`Qwen35Model::train_step_fused_adamw`]): each layer's update is encoded
+/// as soon as that layer's gradient exists, with the kernels, scalars, state
+/// and salts [`Qwen35Model::adamw_step`] uses, so every parameter, moment and
+/// auxiliary value ends as that call leaves it, bit for bit.
+pub(crate) struct FusedAdamW<'a> {
+    state: &'a mut AdamW,
+    hyper: AdamWHyper,
+    weight_decay: &'a [f32],
+    /// The step count the update runs at (torch's, after it increments).
+    next: u64,
+    /// Parameter-table index of each layer's first entry, and of the first
+    /// entry after the last layer (the final norm).
+    layer_start: Vec<usize>,
+    tail_start: usize,
+    /// An update has been encoded: the weights are no longer the forward's.
+    encoded: bool,
+}
+
+impl<'a> FusedAdamW<'a> {
+    /// Everything [`Qwen35Model::adamw_step`] checks, and what a fused step
+    /// cannot do, before anything is written: a non-unit `grad_scale` (the
+    /// clip coefficient needs the norm of every gradient, which a step that
+    /// updates a layer before the next layer's gradient exists does not
+    /// have), a state or weight-decay table not shaped like the model, and a
+    /// parameter whose step kernel does not exist under the state's config.
+    pub(crate) fn new(
+        what: &str,
+        model: &Qwen35Model,
+        state: &'a mut AdamW,
+        hyper: &AdamWHyper,
+        weight_decay: &'a [f32],
+    ) -> Result<Self, String> {
+        model.require_trainable(what)?;
+        check_hyper(what, hyper)?;
+        if hyper.grad_scale != 1.0 {
+            return Err(format!(
+                "{what}: grad_scale {} is a clip coefficient, and the global gradient norm it needs does not \
+                 exist until the backward has finished; clip with train_step_into, grad_sq_norm and adamw_step",
+                hyper.grad_scale
+            ));
+        }
+        let ps = slots(model, None).map_err(|e| format!("{what}: {e}"))?;
+        state.check_model_slots(what, model, &ps)?;
+        if weight_decay.len() != ps.len() {
+            return Err(format!(
+                "{what}: {} weight decays for {} parameters",
+                weight_decay.len(),
+                ps.len()
+            ));
+        }
+        for (s, &wd) in ps.iter().zip(weight_decay) {
+            let name = &s.info.name;
+            if !(wd.is_finite() && wd >= 0.0) {
+                return Err(format!("{what}: {name}: weight decay {wd} must be finite and >= 0"));
+            }
+            // The step's gradients are in the weight's dtype, as a bank's.
+            let dtype = s.param_window().dtype;
+            step_kernel(dtype, dtype, state.config).map_err(|e| format!("{what}: {name}: {e}"))?;
+        }
+        let next = state
+            .step
+            .checked_add(1)
+            .ok_or_else(|| format!("{what}: step count {} + 1 does not fit in u64", state.step))?;
+        let mut layer_start = Vec::with_capacity(model.layers.len());
+        let mut at = 1;
+        for l in 0..model.layers.len() {
+            layer_start.push(at);
+            at += layer_slots(model, l, None)?.len();
+        }
+        Ok(Self {
+            state,
+            hyper: *hyper,
+            weight_decay,
+            next,
+            layer_start,
+            tail_start: at,
+            encoded: false,
+        })
+    }
+
+    /// Whether any update has been encoded: the parameters have changed.
+    pub(crate) fn encoded(&self) -> bool {
+        self.encoded
+    }
+
+    /// Encode layer `l`'s update from its gradients `g` (a [`LayerGrads`] in
+    /// the weights' dtypes).
+    pub(crate) fn layer(&mut self, model: &Qwen35Model, l: usize, g: &LayerGrads) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::train_step_fused_adamw";
+        let ps = layer_slots(model, l, Some(g)).map_err(|e| format!("{WHAT}: {e}"))?;
+        let first = self.layer_start[l];
+        self.encode(WHAT, model, &ps, first..first + ps.len())
+    }
+
+    /// Encode the embedding's, the final norm's and an untied head's updates,
+    /// from their gradients.
+    pub(crate) fn top(
+        &mut self,
+        model: &Qwen35Model,
+        embed: &Tensor,
+        final_norm: &GpuBuffer,
+        lm_head: Option<&Tensor>,
+    ) -> Result<(), String> {
+        const WHAT: &str = "Qwen35Model::train_step_fused_adamw";
+        let mut ps = vec![embed_slot(model, Some(embed))];
+        ps.extend(tail_slots(model, Some((final_norm, lm_head))).map_err(|e| format!("{WHAT}: {e}"))?);
+        let indices = std::iter::once(0).chain(self.tail_start..self.tail_start + ps.len() - 1);
+        self.encode(WHAT, model, &ps, indices)
+    }
+
+    fn encode(
+        &mut self,
+        what: &str,
+        model: &Qwen35Model,
+        ps: &[Slot<'_>],
+        indices: impl Iterator<Item = usize>,
+    ) -> Result<(), String> {
+        check_grads_on_runtime(model, ps)?;
+        let state: &AdamW = self.state;
+        let entries: Vec<_> = ps.iter().zip(indices).map(|(s, i)| (i, s, &state.slots[i])).collect();
+        let plan = plan_adamw(what, &entries, state.config, &self.hyper, self.weight_decay, None)?;
+        model.encode_planned(what, &plan, state, self.next, || {})?;
+        self.encoded = true;
+        self.state.step = self.next;
+        Ok(())
+    }
+
+    /// The step has run to its final wait: the count is confirmed.
+    pub(crate) fn confirm(&self) {
+        self.state.confirmed.set(self.state.step);
+    }
+}
+
 impl Qwen35Model {
     /// One AdamW step on every parameter from `grads` (this model's
     /// [`Qwen35Model::train_step`] or a bank), with `weight_decay[i]` for
@@ -858,42 +1091,13 @@ impl Qwen35Model {
                 return Err(format!("{what}: {} lr scales for {} parameters", scale.len(), ps.len()));
             }
         }
-        let mut plan = Vec::with_capacity(ps.len());
-        for (i, ((s, st), &wd)) in ps.iter().zip(&state.slots).zip(weight_decay).enumerate() {
-            let name = &s.info.name;
-            if !(wd.is_finite() && wd >= 0.0) {
-                return Err(format!("{what}: {name}: weight decay {wd} must be finite and >= 0"));
-            }
-            // torch param-group semantics: the group's lr forms both the
-            // decay factor and the step size, so the whole lr is scaled.
-            let entry_hyper = match lr_scale {
-                None => *hyper,
-                Some(scale) => {
-                    let k = scale[i];
-                    if !(k.is_finite() && k >= 0.0) {
-                        return Err(format!("{what}: {name}: lr scale {k} must be finite and >= 0"));
-                    }
-                    let h = AdamWHyper {
-                        lr: hyper.lr * k,
-                        ..*hyper
-                    };
-                    check_hyper(&format!("{what}: {name}"), &h)?;
-                    h
-                }
-            };
-            let pw = s.param_window();
-            let gw = s
-                .grad_window()
-                .ok_or_else(|| format!("{what}: {name} has no gradient"))?;
-            pw.check(format_args!("{what}: {name} parameter"))?;
-            gw.check(format_args!("{what}: {name} gradient"))?;
-            if !gw.same_layout(&pw) {
-                return Err(format!("{what}: {name}: the gradient is not laid out as the parameter"));
-            }
-            let kernel = step_kernel(pw.dtype, gw.dtype, state.config).map_err(|e| format!("{what}: {name}: {e}"))?;
-            plan.push((pw, gw, st, kernel, entry_hyper, f64::from(wd)));
-        }
-
+        let entries: Vec<_> = ps
+            .iter()
+            .zip(&state.slots)
+            .enumerate()
+            .map(|(i, (s, st))| (i, s, st))
+            .collect();
+        let plan = plan_adamw(what, &entries, state.config, hyper, weight_decay, lr_scale)?;
         // torch: the step count increments, then the scalars are formed in f64.
         // `u64` wraps only at `u64::MAX`. A release build without overflow
         // checks used to turn that into t = 0, which zeroes the bias correction
@@ -902,14 +1106,43 @@ impl Qwen35Model {
             .step
             .checked_add(1)
             .ok_or_else(|| format!("{what}: step count {} + 1 does not fit in u64", state.step))?;
+        self.encode_planned(what, &plan, state, next, || self.bump_param_generation())?;
+        state.step = next;
+        Ok(())
+    }
+
+    /// Encode the update of `plan`'s entries at step `next`: one table-driven
+    /// dispatch per step kernel the entries need, each entry's salt its
+    /// parameter-table index (as the stochastic rounding keys it), so the
+    /// same entries update to the same bits whether they go in one call or
+    /// several. `before_dispatch` runs once the tables are built and before
+    /// the first dispatch, where a write that fails part way must already
+    /// have invalidated what read the old weights. Does not touch
+    /// `state.step`.
+    fn encode_planned(
+        &self,
+        what: &str,
+        plan: &[Planned<'_>],
+        state: &AdamW,
+        next: u64,
+        before_dispatch: impl FnOnce(),
+    ) -> Result<(), String> {
         let seed = match state.config.update {
             UpdateRule::Bf16Stochastic { seed } => seed,
             _ => 0,
         };
-        // The slot tables, one per kernel, each entry's salt its
-        // parameter-table index (as the stochastic rounding keys it).
+        // The slot tables, one per kernel.
         let mut tables: Vec<(&str, Vec<u32>, u32, u32)> = Vec::new();
-        for (salt, (pw, gw, st, kernel, entry_hyper, wd)) in plan.iter().enumerate() {
+        for Planned {
+            index: salt,
+            pw,
+            gw,
+            st,
+            kernel,
+            hyper: entry_hyper,
+            wd,
+        } in plan
+        {
             let at = match tables.iter().position(|(k, ..)| k == kernel) {
                 Some(at) => at,
                 None => {
@@ -946,7 +1179,7 @@ impl Qwen35Model {
                 (seed >> 32) as u32,
                 next as u32,
                 (next >> 32) as u32,
-                salt as u32,
+                *salt as u32,
                 0,
             ]);
             debug_assert_eq!(words.len() % (SLOT_BYTES / 4), 0);
@@ -965,14 +1198,13 @@ impl Qwen35Model {
                 *blocks,
             ));
         }
-        self.bump_param_generation();
+        before_dispatch();
         for (p, table, n_slots, blocks) in &encoded {
             dispatch_2d_tg(&self.rt, p, *blocks as usize, 1, MOMENT_BLOCK, |bnd| {
                 set_gpu_buf(bnd, table, 0);
                 set_u32(bnd, *n_slots, 1);
             })?;
         }
-        state.step = next;
         Ok(())
     }
 

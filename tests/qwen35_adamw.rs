@@ -22,7 +22,7 @@ use tessl::qwen35_adamw::{
 };
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
-use tessl::qwen35_train::{MixerGrads, Qwen35Grads};
+use tessl::qwen35_train::{MixerGrads, Qwen35Grads, Supervise};
 use tessl::safetensors::SafeTensors;
 use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, DType, GpuBuffer};
 use tessl::{GpuRuntime, Tensor};
@@ -1560,4 +1560,196 @@ fn per_entry_moment_host_calls_refuse_on_a_poisoned_runtime() {
         assert!(a.is_err(), "{moments:?}: read succeeded on a poisoned runtime");
         assert!(b.is_err(), "{moments:?}: write succeeded on a poisoned runtime");
     }
+}
+
+// ---- the fused step: AdamW applied as the backward runs ---------------------
+
+/// Every parameter, both moments and any auxiliary state as raw bits (the
+/// f32 widening of a bf16 value is exact, so equal bits are equal storage).
+fn state_bits(rt: &Arc<GpuRuntime>, model: &Qwen35Model, table: &[ParamInfo], s: &AdamW) -> Vec<Vec<u32>> {
+    let (p, m, v, x) = (
+        alloc_table(rt, table),
+        alloc_table(rt, table),
+        alloc_table(rt, table),
+        alloc_table(rt, table),
+    );
+    model.read_parameters(&p).unwrap();
+    model.read_adamw_moment(s, Moment::First, &m).unwrap();
+    model.read_adamw_moment(s, Moment::Second, &v).unwrap();
+    let mut all = vec![p, m, v];
+    if model.read_adamw_aux(s, &x).is_ok() {
+        all.push(x);
+    }
+    all.iter()
+        .flatten()
+        .map(|t| t.read_f32().unwrap().iter().map(|x| x.to_bits()).collect())
+        .collect()
+}
+
+/// `STEPS` steps of the fused step against the bank's `train_step_into` then
+/// `adamw_step`, on identical inputs from identical weights: the loss, every
+/// parameter, every moment and any auxiliary state are the same bits after
+/// each step. The fused arm runs with unzeroed allocations poisoned to NaN,
+/// so a scratch read before it is written shows as NaN in what follows.
+fn fused_equals_bank(precision: Precision, config: AdamWConfig, mm: GemmOperands) {
+    const STEPS: usize = 3;
+    let load_as = |p: Precision| match p {
+        Precision::F32 => load(),
+        Precision::Bf16 => load_bf16(),
+    };
+    let (rt_a, a) = load_as(precision);
+    let (rt_b, b) = load_as(precision);
+    rt_b.set_poison_unzeroed(true);
+    let table = a.parameter_table().unwrap();
+    let wd = a.default_weight_decay(0.1).unwrap();
+    let (mut sa, mut sb) = (
+        AdamW::with_config(&a, config).unwrap(),
+        AdamW::with_config(&b, config).unwrap(),
+    );
+    let bank = Qwen35Grads::zeros_like(&a).unwrap();
+    let mut ids = ids();
+    for step in 1..=STEPS {
+        // A different sequence each step.
+        ids.rotate_left(1);
+        let la = a.train_step_into(&ids, mm, Supervise::Causal, &bank, false).unwrap();
+        a.adamw_step(&bank, &mut sa, &hyper(), &wd).unwrap();
+        let lb = b
+            .train_step_fused_adamw(&ids, mm, Supervise::Causal, &mut sb, &hyper(), &wd)
+            .unwrap();
+        assert_eq!(la.to_bits(), lb.to_bits(), "{config} step {step}: loss {la} vs {lb}");
+        assert_eq!(sb.step_count(), step as u64);
+        let (want, got) = (state_bits(&rt_a, &a, &table, &sa), state_bits(&rt_b, &b, &table, &sb));
+        assert_eq!(want.len(), got.len(), "{config} step {step}: state kinds differ");
+        for (k, (w, g)) in want.iter().zip(&got).enumerate() {
+            let (i, which) = (
+                k % table.len(),
+                ["parameter", "first moment", "second moment", "aux"][k / table.len()],
+            );
+            assert!(
+                w == g,
+                "{config} step {step}: {} {which} differs from the bank's step",
+                table[i].name
+            );
+        }
+    }
+}
+
+#[test]
+fn a_fused_f32_step_is_the_banks_step_bit_for_bit() {
+    fused_equals_bank(Precision::F32, AdamWConfig::F32, GemmOperands::ExactF32);
+}
+
+#[test]
+fn a_fused_bf16_step_is_the_banks_step_bit_for_bit() {
+    // The documented default: stochastic rounding, f32 moments. Then the
+    // other state shapes (an f32 master, a Kahan compensation, 8-bit moments).
+    for config in [
+        AdamWConfig {
+            update: UpdateRule::bf16_default(11),
+            moments: MomentStorage::F32,
+        },
+        AdamWConfig {
+            update: UpdateRule::F32Master,
+            moments: MomentStorage::Bf16,
+        },
+        AdamWConfig {
+            update: UpdateRule::Bf16Kahan,
+            moments: MomentStorage::Block8,
+        },
+    ] {
+        fused_equals_bank(Precision::Bf16, config, GemmOperands::Bf16);
+    }
+}
+
+/// A forward taken before a fused step is of weights the step changed: the
+/// generation guard refuses its backward, as it does after `adamw_step`.
+#[test]
+fn a_forward_pending_before_a_fused_step_is_refused_after_it() {
+    let (_rt, model) = load();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let ids = ids();
+    let pending = model
+        .train_forward(&ids, GemmOperands::ExactF32, Supervise::Causal)
+        .unwrap();
+    model
+        .train_step_fused_adamw(
+            &ids,
+            GemmOperands::ExactF32,
+            Supervise::Causal,
+            &mut state,
+            &hyper(),
+            &wd,
+        )
+        .unwrap();
+    let bank = Qwen35Grads::zeros_like(&model).unwrap();
+    let err = model.train_backward_into(pending, None, &bank, false).unwrap_err();
+    assert!(
+        err.contains("parameters were written after the step's forward"),
+        "{err}"
+    );
+}
+
+/// What a fused step cannot do is refused before anything is written: a clip
+/// coefficient (the global norm does not exist mid-backward), a decay table
+/// of the wrong size, a state made for another model.
+#[test]
+fn fused_step_refusals_move_nothing() {
+    let (rt, model) = load();
+    let table = model.parameter_table().unwrap();
+    let wd = model.default_weight_decay(0.1).unwrap();
+    let mut state = AdamW::new(&model).unwrap();
+    let ids = ids();
+    let before = state_bits(&rt, &model, &table, &state);
+    let e = |r: Result<f64, String>, needle: &str| {
+        let m = r.err().unwrap_or_else(|| panic!("{needle}: accepted"));
+        assert!(m.contains(needle), "{m:?} lacks {needle:?}");
+    };
+    let step = |state: &mut AdamW, hyper: AdamWHyper, wd: &[f32]| {
+        model.train_step_fused_adamw(&ids, GemmOperands::ExactF32, Supervise::Causal, state, &hyper, wd)
+    };
+    e(
+        step(
+            &mut state,
+            AdamWHyper {
+                grad_scale: 0.5,
+                ..hyper()
+            },
+            &wd,
+        ),
+        "clip coefficient",
+    );
+    e(step(&mut state, hyper(), &wd[1..]), "weight decays for");
+    let mut bad = wd.clone();
+    bad[2] = f32::NAN;
+    e(step(&mut state, hyper(), &bad), "weight decay NaN");
+    e(
+        step(
+            &mut state,
+            AdamWHyper {
+                lr: f64::NAN,
+                ..hyper()
+            },
+            &wd,
+        ),
+        "lr NaN",
+    );
+    // A one-token sequence has no prediction: refused by the forward, before
+    // the first update.
+    e(
+        model.train_step_fused_adamw(
+            &ids[..1],
+            GemmOperands::ExactF32,
+            Supervise::Causal,
+            &mut state,
+            &hyper(),
+            &wd,
+        ),
+        "at least two tokens",
+    );
+    assert_eq!(state.step_count(), 0);
+    assert!(
+        state_bits(&rt, &model, &table, &state) == before,
+        "a refused fused step moved the model or the state"
+    );
 }

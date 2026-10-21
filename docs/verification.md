@@ -525,8 +525,12 @@ parallel split-K); `kernels/attn_tiled.h` (the FlashAttention-2 body behind
 `qwen35_attn_tiled_*`, the training `lse` forward and `encoder_attn_tiled_*`);
 `kernels/attn_rows.h` (the one-simdgroup-per-row step behind `flash_attn_rows_*`
 and `encoder_attn_rows_*`); and the split-KV reduce of
-`kernels/flash_attn_decode.metal`. Not covered: the exact-f32 NN/TN/NT kernels
-beyond the shared tile walk and split-K, the i8 and q4 kernels, `gemm_q4_mlx`,
+`kernels/flash_attn_decode.metal`. The shared `tile_from_linear_panel` walk is
+also covered through its exact-f32 and i8 callers (the panel-walk fault is
+caught by `gemm_ragged_shapes::exact_f32_column_panels_cover_every_tile` and
+`gemm_i8::column_panels_cover_every_tile_exactly` as well). Not covered: the
+exact-f32 NN/TN/NT kernel bodies beyond that walk and split-K, the i8-specific
+kernel bodies, the q4 kernels, `gemm_q4_mlx`,
 the GDN and backward attention kernels, and the SWA/global-h512 tiled variants
 of `flash_attn_*` (their bodies are not `attn_tiled.h`).
 

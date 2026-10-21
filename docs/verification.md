@@ -515,7 +515,8 @@ It builds no `GpuRuntime`, so the hosted CI `Host-only unit tests` step runs it.
 The suite is only worth its green tick if it can go red. Nineteen faults are
 injected into tessl's own cooperative/TensorOps GEMM and attention kernels, one
 at a time, and each is shown to make a named test fail on the GPU. **19 of 19
-caught (2026-10-16).**
+caught by a value assertion (2026-10-21; 18 at c2c1612, 1 at b0f307e).** No
+fault went uncaught in this run, so there is no missed-fault row to record.
 
 **Kernels covered.** `kernels/gemm_coop.h` (the cooperative-destination body,
 its epilogue, the tile walks) and `kernels/matmul_tensorops.metal` (the bf16 NN
@@ -524,8 +525,12 @@ parallel split-K); `kernels/attn_tiled.h` (the FlashAttention-2 body behind
 `qwen35_attn_tiled_*`, the training `lse` forward and `encoder_attn_tiled_*`);
 `kernels/attn_rows.h` (the one-simdgroup-per-row step behind `flash_attn_rows_*`
 and `encoder_attn_rows_*`); and the split-KV reduce of
-`kernels/flash_attn_decode.metal`. Not covered: the exact-f32 NN/TN/NT kernels
-beyond the shared tile walk and split-K, the i8 and q4 kernels, `gemm_q4_mlx`,
+`kernels/flash_attn_decode.metal`. The shared `tile_from_linear_panel` walk is
+also covered through its exact-f32 and i8 callers (the panel-walk fault is
+caught by `gemm_ragged_shapes::exact_f32_column_panels_cover_every_tile` and
+`gemm_i8::column_panels_cover_every_tile_exactly` as well). Not covered: the
+exact-f32 NN/TN/NT kernel bodies beyond that walk and split-K, the i8-specific
+kernel bodies, the q4 kernels, `gemm_q4_mlx`,
 the GDN and backward attention kernels, and the SWA/global-h512 tiled variants
 of `flash_attn_*` (their bodies are not `attn_tiled.h`).
 
@@ -542,36 +547,51 @@ still applies to the current kernels. Re-run with
 `MAC_HEAVY_MAX_LOAD=60 bash <Lappi>/tools/mac_heavy.sh <label> bash scripts/fault_inject.sh --out <dir>`;
 a mutated kernel is never committed.
 
-**Run.** 2026-10-16, Apple M5 Pro (Mac17,8, macOS 27.0.1), under the
-`mac_heavy` lock (holder: this run; load average at start 2.78 / 3.77 / 5.47).
-Eighteen rows were run in one pass at `f748ced` (`18 of 19 caught`, the 19th
-`MISSED`). The 19th, the softmax seed, was re-run alone at `5b01c99` after the
-test below was added (`1 of 1 caught`, load 3.57). Kernels were byte-identical to
-their pre-run hashes after both.
+**Runs.** Both on 2026-10-21, Apple M5 Pro (Mac17,8, macOS 27.0.1, AC power),
+under the `mac_heavy` lock.
+
+- Full run at `c2c1612` (clean tree), `bash scripts/fault_inject.sh --out <dir>`
+  (idle load average at start 10.88 / 22.32 / 42.22): 18 of 19 caught by a value
+  assertion, 0 by a non-assert failure; the 19th,
+  `gemm-epilogue-alpha-dropped-with-beta`, was `NOT RUN (patch stale)`.
+  `kernels/` was byte-identical to its pre-run hashes.
+- Re-run of that row alone at `b0f307e` (`c2c1612` plus only the regenerated
+  patch file), `--only gemm-epilogue-alpha-dropped-with-beta`: caught by
+  `gemm_epilogue::fused_epilogue_matches_the_unfused_sequence`; `kernels/`
+  byte-identical.
+
+Why two: `d385e4f` added the STRICT path in `kernels/gemm_coop.h`, so the old
+patch no longer applied; the regenerated patch mutates the same non-strict
+epilogue expression. The table's rows come from those two runs'
+`results.tsv` (kernel and fault from `scripts/faults/manifest.tsv`; the catching
+test is the first candidate that failed with an assertion). The result logs are
+not committed (the repo keeps no fault-run results files; bench results under
+`bench/results/` are benchmark JSON). The earlier composite "19 of 19"
+(2026-10-16, `f748ced` + `5b01c99`) is superseded by these runs.
 
 | kernel | injected fault | caught by | observed failure |
 | --- | --- | --- | --- |
-| matmul2d_tensorops_bf16_f32_64x64_sg4 (coop NN, narrow tile) | tile geometry drift: SM 64 -> 32 while the host still sizes the grid for 64 rows | `gemm_ragged_shapes::nn_bf16_straddles_the_narrow_wide_kernel_boundary` | `bf16 NN bound [... omitted end of long line]` |
-| tile_from_linear_panel (every coop and exact GEMM walk) | dropped M tail of the tile grid: the last partial column-panel band is decoded as a full band | `gemm_ragged_shapes::exact_f32_column_panels_cover_every_tile` | `f32 Nn pa [... omitted end of long line]` |
-| matmul2d_tensorops_tn_splitk_par_bf16_f32 | dropped K tail: a final partial K partition is skipped | `gemm_ragged_shapes::parallel_bf16_tn_partitions_cover_all_of_k` | `bf16 TN parallel split-K 100x300x2500, k_tile 256: elem [... omitted end of long line]` |
-| matmul2d_tensorops_nn_splitk_f32 | split-K partial-sum error: each K partition overwrites C instead of accumulating | `gemm_ragged_shapes::long_k_nn_partitions_cover_all_of_k` | `f32 NN split-K 40x16200@16200x520: element [9360 [... omitted end of long line]` |
-| matmul2d_tensorops_tn_splitk_par_f32 | split-K partial-sum error: partition p stores into slice p-1, so two partitions share a slice | `gemm_ragged_shapes::parallel_tn_partitions_cover_all_of_k` | `f32 TN parallel split- [... omitted end of long line]` |
-| coop_tile epilogue (every EPILOGUE coop kernel) | wrong epilogue: alpha is ignored whenever beta is nonzero | `gemm_epilogue::fused_epilogue_matches_the_unfused_sequence` | `128x64x64 act=None: worst /delta/ = 2.580 [... omitted end of long line]` |
-| coop_tile epilogue (every EPILOGUE coop kernel) | wrong epilogue: the beta == 0 guard is removed, so C_prev is read and multiplied by zero | `gemm_epilogue::beta_zero_ignores_whatever_c_held` | `beta=0: worst /delta/ = 9.77 [... omitted end of long line]` |
-| coop_tile epilogue, interior-tile bias view | swapped strides: the per-column bias view gets a row stride of N, so it indexes by row | `gemm_epilogue::bias_is_per_column_not_per_row` | `bias broadcast wrong at (1,0) for 256x12 [... omitted end of long line]` |
-| gemm_apply_activation (every EPILOGUE coop kernel) | wrong epilogue: the SiLU selector computes GELU | `gemm_epilogue::fused_epilogue_matches_the_unfused_sequence` | `128x64x64 act=Silu: worst /delta/ = 0.19317436 at 223 [... omitted end of long line]` |
-| matmul2d_tensorops_nt_bf16_f32 and nt_accum_bf16_f32 | swapped operands: the NT kernels read B untransposed | `gemm_correctness::nt_bf16_matches_cpu_reference` | `bf16 Nt 64x128@128x64: element [2356] is 78036.299x its error b [... omitted end of long line]` |
-| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | online-softmax rescale: the O accumulator is not rescaled when the running max moves | `attn_train::training_attention_matches_the_reference` | `b=1 t=64 hq=2 hkv=2 o:  [... omitted end of long line]` |
-| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | online-softmax rescale: the running sum l is not rescaled when the running max moves | `attn_train::training_attention_matches_the_reference` | `b=1 t=64 hq=2 hkv=2 o:  [... omitted end of long line]` |
-| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | masked-row guard removed: a row with no live key is divided by l = 0 | `attention::rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel` | `qwen35 tile [... omitted end of long line]` |
-| attn_tiled_body causal mode (qwen35_attn_tiled_*) | mask drift: the causal test is k < q instead of k <= q, so a query cannot see its own key | `attn_train::training_attention_matches_the_reference` | `b=1 t=1 hq=1 hkv=1 o: m [... omitted end of long line]` |
-| attn_tiled_body encoder mode (encoder_attn_tiled_*) | mask drift: the symmetric window loses its forward half | `embedgemma2_kernels::encoder_attn_matches_the_reference_at_the_real_window` | `Tiled random D=256 window=512  [... omitted end of long line]` |
-| attn_tiled_body training forward (qwen35_attn_tiled_lse_*) | wrong epilogue: the saved log-sum-exp adds l instead of log(l) | `attn_train::training_attention_matches_the_reference` | `b=1 t=1 hq=1 hkv=1 lse: max err 1.000e0 at 0 (go [... omitted end of long line]` |
-| attn_rows_step (flash_attn_rows_*, encoder_attn_rows_*) | masked-row guard removed: a masked key's weight is exp(s - m) instead of 0 | `attention::rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel` | `rows  [... omitted end of long line]` |
-| flash_attn_decode_reduce_* (split-KV combine) | split-K partial-sum error: the reduce adds each chunk's l without exp(m_c - m_all) | `attention::decode_matches_the_reference_and_the_general_kernel` | `decode r=8 c=64 w=No [... omitted end of long line]` |
+| matmul2d_tensorops_bf16_f32_64x64_sg4 (coop NN, narrow tile) | tile geometry drift: SM 64 -> 32 while the host still sizes the grid for 64 rows | `gemm_ragged_shapes::nn_bf16_straddles_the_narrow_wide_kernel_boundary` | `bf16 NN boundary 67x33@33x511: element [33892] is 321351.666x its error budget (got 0, want -7.505443096160889, \|a.b\| sum 9.557201862335205, tol 2.336e-5)` |
+| tile_from_linear_panel (every coop and exact GEMM walk) | dropped tile-grid tail: the last, shorter column-panel band is decoded as a full band (coop bf16/f16/relaxed with B >= 2^23 elements, exact f32, i8) | `gemm_ragged_shapes::nn_bf16_column_panels_cover_a_partial_band_at_the_b_size_gate` | `bf16 NN panel walk, 128x64 tile, 200x512@512x16384: element [2712774] is 9111.311x its error budget (got 0, want 35.65439246222377, \|a.b\| sum 126.25112960860133, tol 3.913e-3)` |
+| matmul2d_tensorops_tn_splitk_par_bf16_f32 | dropped K tail: a final partial K partition is skipped, and every partition when K < k_tile (the whole output then stays unwritten) | `gemm_ragged_shapes::parallel_bf16_tn_partitions_cover_all_of_k` | `bf16 TN parallel split-K 100x300x2500, k_tile 256: element [5700] is 121.757x its error budget (got 0.34591174, want -5.218534645624459, \|a.b\| sum 305.67179442290217, tol 4.570e-2)` |
+| matmul2d_tensorops_nn_splitk_f32 | split-K partial-sum error: each K partition overwrites C instead of accumulating | `gemm_ragged_shapes::long_k_nn_partitions_cover_all_of_k` | `f32 NN split-K 40x16200@16200x520: element [9360] is 30.939x its error budget (got -8.66033, want 52.4756461964785, \|a.b\| sum 2043.409290189152, tol 1.976e0)` |
+| matmul2d_tensorops_tn_splitk_par_f32 | split-K partial-sum error: partition p stores into slice p-1, so two partitions share a slice | `gemm_ragged_shapes::parallel_tn_partitions_cover_all_of_k` | `f32 TN parallel split-K 12x768x4096, k_tile None: element [7008] is 51.764x its error budget (got -11.53454, want -8.320268433654267, \|a.b\| sum 253.78295958095663, tol 6.209e-2)` |
+| coop_tile epilogue (every EPILOGUE coop kernel) | wrong epilogue: alpha is ignored whenever beta is nonzero | `gemm_epilogue::fused_epilogue_matches_the_unfused_sequence` | `128x64x64 act=None: worst \|delta\| = 2.580182 at 7591 (got -10.344316 want -7.7641335), tol 0.16` |
+| coop_tile epilogue (every EPILOGUE coop kernel) | wrong epilogue: the beta == 0 guard is removed, so C_prev is read and multiplied by zero | `gemm_epilogue::beta_zero_ignores_whatever_c_held` | `beta=0: worst \|delta\| = 9.77573 at 4083 (got 0 want 9.77573), tol 0.16` |
+| coop_tile epilogue, interior-tile bias view | swapped strides: the per-column bias view gets a row stride of N, so it indexes by row | `gemm_epilogue::bias_is_per_column_not_per_row` | `bias broadcast wrong at (1,0) for 256x128: got 0 want 1` |
+| gemm_apply_activation (every EPILOGUE coop kernel) | wrong epilogue: the SiLU selector computes GELU | `gemm_epilogue::fused_epilogue_matches_the_unfused_sequence` | `128x64x64 act=Silu: worst \|delta\| = 0.19317436 at 2232 (got 1.8958186 want 1.7026442), tol 0.16` |
+| matmul2d_tensorops_nt_bf16_f32 and nt_accum_bf16_f32 | swapped operands: the NT kernels read B untransposed | `gemm_correctness::nt_bf16_matches_cpu_reference` | `bf16 Nt 64x128@128x64: element [2356] is 78036.299x its error budget (got -10.705623, want 11.659647464752197, \|a.b\| sum 35.355334758758545, tol 2.866e-4)` |
 | attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | online-softmax seed: the running max starts at 0 instead of -FLT_MAX | `attn_tiled_extreme_scores::the_tiled_kernels_survive_scores_far_below_and_above_zero` | `all scores far below -88, tile Q32K32Sg4: [0] got 0 want -0.3732729` |
+| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | online-softmax rescale: the O accumulator is not rescaled when the running max moves | `attn_tiled_extreme_scores::the_prefill_tiles_match_the_reference_across_many_blocks` | `multi-block causal prefill, tile Q32K32Sg4: [38656] got 0.28557223 want 0.04790396` |
+| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | online-softmax rescale: the running sum l is not rescaled when the running max moves | `attn_tiled_extreme_scores::the_prefill_tiles_match_the_reference_across_many_blocks` | `multi-block causal prefill, tile Q32K32Sg4: [38656] got 0.02310131 want 0.04790396` |
+| attn_tiled_body (qwen35_attn_tiled_*, encoder_attn_tiled_*) | masked-row guard removed: a row with no live key is divided by l = 0 | `attention::rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel` | `qwen35 tiled Q32K32Sg4[0]: non-finite NaN` |
+| attn_tiled_body causal mode (qwen35_attn_tiled_*) | mask drift: the causal test is k < q instead of k <= q, so a query cannot see its own key | `attn_tiled_extreme_scores::the_prefill_tiles_match_the_reference_across_many_blocks` | `multi-block causal prefill, tile Q32K32Sg4: [0] got 0 want -0.24643564` |
+| attn_tiled_body encoder mode (encoder_attn_tiled_*) | mask drift: the symmetric window loses its forward half | `embedgemma2_kernels::encoder_attn_matches_the_reference_at_the_real_window` | `Tiled random D=256 window=512 lens=[1100, 513, 1, 600]: max abs error 2.342e0 at 3379643 exceeds 2e-5 * 2.994e0 (got 0.8556084632873535, want -1.486357206975958)` |
+| attn_tiled_body training forward (qwen35_attn_tiled_lse_*) | wrong epilogue: the saved log-sum-exp adds l instead of log(l) | `attn_train::training_attention_matches_the_reference` | `b=1 t=1 hq=1 hkv=1 lse: max err 1.000e0 at 0 (got -0.48906493 want -1.4890672876497488), 6.72e-1 of 1.489e0` |
+| attn_rows_step (flash_attn_rows_*, encoder_attn_rows_*) | masked-row guard removed: a masked key's weight is exp(s - m) instead of 0 | `attention::rows_with_no_key_beside_rows_with_keys_are_zero_in_every_kernel` | `rows d=128 r=8 g=8[2048]: got 0.2879946 want 0` |
+| flash_attn_decode_reduce_* (split-KV combine) | split-K partial-sum error: the reduce adds each chunk's l without exp(m_c - m_all) | `attention::decode_matches_the_reference_and_the_general_kernel` | `decode r=8 c=64 w=None sgs=None[0]: got -0.019816356 want -0.038298257` |
 
-**The one miss was a real gap, not a bad injection.** Seeding the online
+**The one miss of the 2026-10-16 run was a real gap, not a bad injection.** Seeding the online
 softmax's running max at 0 instead of `-FLT_MAX` passed every attention test:
 the softmax is shift-invariant, so with scores near zero the seed changes
 nothing. It does change a row whose scores are all below about -88, where
@@ -590,7 +610,7 @@ it had built from the mutated source and the next baseline ran against the
 fault (a new test failed its baseline, and an unrelated decode test failed with
 `decode large positive d=128: got 0.1629 want 0.6517`, which looked like a flake).
 The restore now bumps the mtime, the run touches every kernel before its
-baseline, and the self-test fails on the old behaviour. The 18-row run above was
+baseline, and the self-test fails on the old behaviour. The 2026-10-21 runs were
 made with that fix.
 
 Two earlier "faults" (from the first version of this table, which was never
@@ -897,7 +917,7 @@ a bounded range, not a per-step measurement.
 audit          PASS (re-run at 2972027): tile geometry, 33 kernels, 38 Rust
                dispatch pairs. Tile geometry is all it checks (section 1)
 GDN mutations  19 of 19 caught (section 6; 2026-10-06 pass, not re-run at 2972027)
-fault tests    19 of 19 caught (2026-10-16, f748ced and 5b01c99, M5 Pro; section "Fault injection")
+fault tests    19 of 19 caught by a value assertion (2026-10-21; 18 at c2c1612, 1 at b0f307e; M5 Pro; section "Fault injection")
 ```
 
 The fault-test line is a measured count over tessl's own kernels (a different

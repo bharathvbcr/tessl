@@ -52,7 +52,7 @@
 # The check was run at 512, not at the bench's 2048. Phase lines of the passing run (rss / MPS driver / tensor MiB):
 #   model_built 5259 / 2984 / 2825;  unpatched_step 5433 / 11068 / 5650;  patched_step 5443 / 11164 / 5650;
 #   compared 10764 / 11164 / 5650.
-# Log: target-gp/gpurun3b/check_512.log in the lead's checkout (not committed).
+# Log (unchanged, 2101 bytes): bench/results/qwen35_gdn_patch_torch_check_m5pro.log
 #
 # Scope: GDN training patch only, one 4-layer cut of the 2B, f32, B = 1, one machine. Not the full 24-layer
 # model, not bf16; the attention layer is identical in both lanes.

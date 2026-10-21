@@ -1276,3 +1276,95 @@ fn backward_chunked(
         set_u32(bnd, x.key_heads, 16);
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grouped shape: B = 2, T = 130 (three chunks), H = 4 value heads, Dv = 32 (two slices).
+    const DIMS: GdnTrainDims = GdnTrainDims {
+        batch: 2,
+        seq: 130,
+        heads: 4,
+        v_dim: 32,
+    };
+
+    /// The chunked workspace's element counts per key-head count, written out
+    /// buffer by buffer and not through `prep_lens` / `chunked_lens`: only the
+    /// normalized q and k scale with the key heads, and a workspace for fewer
+    /// key heads is strictly smaller. (The pool-rounded forms are checked
+    /// against the pool by the device test below.) Needs no device.
+    #[test]
+    fn the_chunked_workspace_bytes_follow_the_key_heads() {
+        assert_eq!(GDN_TRAIN_PRODUCTION, GdnTrainKernel::Chunked);
+        let (b, h, dv) = (2usize, 4usize, 32usize);
+        let (ck, tp, slices) = (3usize, 192usize, 2usize);
+        let (bh, mats) = (b * h, b * h * 3 * 64 * 64);
+        let elems = |hk: usize| {
+            let prep = 2 * (b * hk * tp * 128) + 2 * bh * tp + 2 * mats;
+            let beyond =
+                bh * ck * 128 * dv + 3 * bh * tp * dv + 4 * mats + 3 * slices * bh * tp + 2 * b * 130 * h * 128;
+            prep + beyond
+        };
+        for hk in [1u32, 2, 4] {
+            assert_eq!(
+                GdnTrainWorkspace::bytes_for_grouped(DIMS, hk),
+                4 * elems(hk as usize),
+                "workspace, {hk} key heads"
+            );
+        }
+        assert_eq!(
+            GdnTrainWorkspace::bytes_for(DIMS),
+            GdnTrainWorkspace::bytes_for_grouped(DIMS, DIMS.heads)
+        );
+        assert!(GdnTrainWorkspace::bytes_for_grouped(DIMS, 1) < GdnTrainWorkspace::bytes_for(DIMS));
+    }
+
+    /// What the constructor and the forward actually request from the pool
+    /// equals what the static bounds say, dense and grouped
+    /// ([`GpuRuntime::requested_alloc_bytes`] counts every request, recycled
+    /// or not). Needs a device.
+    #[test]
+    fn the_workspace_and_forward_transient_bounds_equal_the_bytes_allocated() {
+        let rt = GpuRuntime::new().unwrap();
+        let (b, t, h, dv) = (2usize, 130usize, 4usize, 32usize);
+        for hk in [1u32, 2, 4] {
+            let before = rt.requested_alloc_bytes();
+            let ws = GdnTrainWorkspace::new_grouped(&rt, DIMS, hk).unwrap();
+            assert_eq!(
+                rt.requested_alloc_bytes() - before,
+                GdnTrainWorkspace::allocated_bytes_for_grouped(DIMS, hk),
+                "workspace, {hk} key heads"
+            );
+            drop(ws);
+
+            let f32s = |shape: &[usize]| rt.alloc_tensor_unzeroed(shape, DType::F32).unwrap();
+            let (hk_us, dk) = (hk as usize, GDN_TRAIN_DK as usize);
+            let ld = (2 * hk_us * dk + h * dv) as u32;
+            let conv = f32s(&[b * t, ld as usize]);
+            let (g, beta) = (f32s(&[b, t, h]), f32s(&[b, t, h]));
+            let (o, ckpt) = (f32s(&[b, t, h, dv]), f32s(&DIMS.checkpoint_shape()));
+            let win = |off: usize| GdnWindow {
+                tensor: &conv,
+                ld,
+                off: off as u32,
+            };
+            let x = GdnTrainWindowedInputs {
+                q: win(0),
+                k: win(hk_us * dk),
+                v: win(2 * hk_us * dk),
+                key_heads: hk,
+                g: &g,
+                beta: &beta,
+                s0: None,
+            };
+            let before = rt.requested_alloc_bytes();
+            gdn_train_forward_windowed(&rt, DIMS, x, &o, None, &ckpt).unwrap();
+            assert_eq!(
+                rt.requested_alloc_bytes() - before,
+                gdn_train_forward_transient_bytes(DIMS, hk),
+                "forward transient, {hk} key heads"
+            );
+        }
+    }
+}

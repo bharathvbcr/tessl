@@ -8,6 +8,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **GDN training runs the chunked (WY) kernels** (`gdn_train_c_*`: matrix
+  products per 64-token chunk, only the state sequential across chunks).
+  `gdn_train_forward`, `gdn_train_forward_windowed` and the backward use them;
+  the token-sequential kernels stay as the oracle the parity tests hold them
+  to. Measured at T = 2048 on the M5 Pro, the forward is 0.498x and the backward
+  0.604x of the sequential time (6.33 to 3.16 ms, 19.55 to 11.80 ms) and the
+  whole 2B step 0.953x (5.34 to 5.10 s) (`bench/results/gdn_train_chunked_m5pro.txt`). The backward's
+  `GdnTrainWorkspace` holds the chunked buffers, so `GdnTrainWorkspace::new_grouped`
+  sizes the normalized q and k by key heads (`bytes_for_grouped`,
+  `allocated_bytes_for` and `allocated_bytes_for_grouped` report the bytes), and
+  `gdn_train_forward_transient_bytes` reports what the forward allocates and frees
+  inside the call; `Qwen35Model::train_step_bytes` counts both. Five `#[doc(hidden)]`
+  `pub` items exist for those tests and the benchmark and are not a stable API:
+  `GdnTrainKernel`, `GDN_TRAIN_PRODUCTION`, `GdnTrainWorkspace::new_for`,
+  `gdn_train_forward_with` and `gdn_train_forward_windowed_with`.
 - **C ABI 13** (additive; `TESSL_ABI_VERSION` 12 → 13): `tessl_qwen35_train_step_ragged`
   exposes `Qwen35Model::train_step_ragged_into` (card ft-9e79d8be). It takes the
   packed token ids, `cu_seqlens` (prefix offsets, `n_seq + 1` values: transformers'

@@ -22,6 +22,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import embedgemma2_torch as eg2_lane  # noqa: E402
 import gemm_sweep_mlx  # noqa: E402
 import qwen35_gdn_patch_torch as gdn_lane  # noqa: E402
 from flash_attn_torch_mlx import BY_LABEL, CFGS, keep_mask, live_pairs  # noqa: E402
@@ -444,6 +445,91 @@ class Qwen35GdnPatchLane(unittest.TestCase):
         self.assertEqual(cfg.num_hidden_layers, 4)
         self.assertEqual(list(cfg.layer_types), ["linear_attention"] * 3 + ["full_attention"])
         self.assertEqual((cfg.hidden_size, cfg.linear_num_value_heads, cfg.linear_value_head_dim), (2048, 16, 128))
+
+
+class Embedgemma2TorchMemory(unittest.TestCase):
+    """The memory fields of `embedgemma2_torch.py` without MPS or sentence-transformers:
+    `tensor_mib` (live tensor bytes, the metric) and `driver_mib` (recorded only)."""
+
+    MIB = 1 << 20
+
+    def toy(self):
+        import torch
+        return torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.ReLU())
+
+    def counter(self, values):
+        it = iter(values)
+        last = [values[0]]
+
+        def current():
+            last[0] = next(it, last[0])
+            return last[0]
+        return current
+
+    def test_the_tensor_metric_is_the_peak_at_a_module_boundary_above_the_baseline(self):
+        import torch
+        model = self.toy()
+        # The reads in order: the baseline, the sampler's opening read, six module
+        # boundaries (Sequential in, Linear in and out, ReLU in and out, Sequential
+        # out; the peak 400 is Linear's output), the closing read, the final read.
+        current = self.counter([v * self.MIB for v in (100, 100, 100, 250, 400, 300, 200, 150, 150, 150)])
+        driver_calls = []
+        mem = eg2_lane.memory_pass(
+            model, lambda: model(torch.zeros(1, 2)), current,
+            lambda: driver_calls.append(1) or 9000 * self.MIB, lambda: None)
+        self.assertEqual(mem, {"tensor_mib": 300.0, "tensor_base_mib": 100.0, "driver_mib": 9000.0})
+        self.assertEqual(driver_calls, [1])
+
+    def test_peak_sampler_reports_exactly_the_largest_sample_and_removes_its_hooks(self):
+        import torch
+        model = self.toy()
+        n_before = sum(len(m._forward_hooks) + len(m._forward_pre_hooks) for m in model.modules())
+        s = eg2_lane.PeakSampler(model, self.counter([5 * self.MIB, 2 * self.MIB, 40 * self.MIB, 7 * self.MIB]))
+        with s:
+            model(torch.zeros(1, 2))
+        self.assertEqual(s.peak, 40 * self.MIB)
+        self.assertEqual(sum(len(m._forward_hooks) + len(m._forward_pre_hooks) for m in model.modules()), n_before)
+
+    def test_hooks_are_removed_when_the_forward_raises(self):
+        import torch
+        model = self.toy()
+        with self.assertRaises(RuntimeError):
+            with eg2_lane.PeakSampler(model, lambda: 0):
+                model(torch.zeros(1, 3))  # wrong width
+        self.assertEqual(sum(len(m._forward_hooks) + len(m._forward_pre_hooks) for m in model.modules()), 0)
+
+    def test_tensor_mib_is_in_mib_above_the_baseline_and_never_negative(self):
+        model = self.toy()
+        base, peak = 1024 * self.MIB, 1536 * self.MIB
+        seq = [base, base, peak, base]
+        mem = eg2_lane.memory_pass(model, lambda: None, self.counter(seq), lambda: 0, lambda: None)
+        self.assertEqual((mem["tensor_mib"], mem["tensor_base_mib"]), (512.0, 1024.0))
+        low = eg2_lane.memory_pass(model, lambda: None, self.counter([2048 * self.MIB, 10 * self.MIB]),
+                                   lambda: 0, lambda: None)
+        self.assertEqual(low["tensor_mib"], 0.0)
+
+    def test_the_driver_figure_never_moves_the_gated_metric(self):
+        model = self.toy()
+        a = eg2_lane.memory_pass(model, lambda: None, lambda: 7 * self.MIB, lambda: 1 * self.MIB, lambda: None)
+        b = eg2_lane.memory_pass(model, lambda: None, lambda: 7 * self.MIB, lambda: 9000 * self.MIB, lambda: None)
+        self.assertEqual(a["tensor_mib"], b["tensor_mib"])
+        self.assertEqual((a["driver_mib"], b["driver_mib"]), (1.0, 9000.0))
+
+    def test_the_row_is_what_bench_paired_reads_with_both_memory_fields(self):
+        mem = {"tensor_mib": 812.5, "tensor_base_mib": 1990.2, "driver_mib": 4096.0}
+        row = eg2_lane.workload_row(" 8x1024 ", "bf16", [2.5, 3.0, 4.0], 10, 1, mem)
+        parsed = json.loads(json.dumps([row]))[0]
+        self.assertEqual(parsed["workload"], "8x1024")
+        self.assertEqual(parsed["backend"], "torch-mps-bf16")
+        self.assertEqual((parsed["ms_min"], parsed["ms_median"], parsed["iters"], parsed["forwards"]),
+                         (2.5, 3.0, 10, 1))
+        for k, v in mem.items():
+            self.assertEqual(parsed[k], v)
+        self.assertGreater(parsed["ms_min"], 0)
+
+    def test_the_script_imports_without_sentence_transformers_or_mps(self):
+        self.assertTrue(callable(eg2_lane.main))
+        self.assertNotIn("sentence_transformers", sys.modules.get("embedgemma2_torch").__dict__)
 
 
 if __name__ == "__main__":

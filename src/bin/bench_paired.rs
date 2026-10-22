@@ -23,7 +23,7 @@
 //! * `workloads` (default): the last stdout line is a JSON array of objects,
 //!   each with a string `workload` and a positive number `ms_min` (the
 //!   workload's fastest iteration in that process: min-of-N). Other numeric
-//!   fields (`device_peak_mib`, `peak_footprint_mib`, `forwards`) are carried
+//!   fields (`device_peak_mib`, `peak_footprint_mib`, `forwards`, `tensor_mib`) are carried
 //!   into the report. `bench_embedgemma2` and `bench/embedgemma2_torch.py`
 //!   print this.
 //! * `metrics`: stdout carries `METRIC name value` lines (`bench_nn_kernels`,
@@ -88,7 +88,7 @@ const SYNTAX: Syntax = Syntax {
 };
 
 /// Numeric fields of a workload row that are carried into the report.
-const EXTRA_FIELDS: [&str; 3] = ["device_peak_mib", "peak_footprint_mib", "forwards"];
+const EXTRA_FIELDS: [&str; 4] = ["device_peak_mib", "peak_footprint_mib", "forwards", "tensor_mib"];
 
 enum Fail {
     Usage(String),

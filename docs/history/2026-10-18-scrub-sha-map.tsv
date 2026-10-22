@@ -1,0 +1,120 @@
+# tessl 2026-10-18 history scrub: old -> new commit SHA map
+#
+# On 2026-10-18 the eg2 session rewrote `main` and `eg2/integrate` with `git filter-branch`
+# to remove an LGPL-derived src/media/resample.rs. Every commit from the first resampler
+# commit onward was renamed; commits before it keep their SHAs and are not listed.
+# The old history stays resolvable through refs/original/refs/scrub/{main,eg2-integrate}
+# and refs/backup/2026-10-18*/ (see BUILD_REPORT.md, "History scrub").
+#
+# Columns (tab separated): old full SHA, new full SHA, subject.  Rows are in topological order, oldest first.
+# 102 rows: the commits reachable from refs/original/refs/scrub/* and not from main, eg2/integrate or refs/scrub/*.
+#
+# How it was matched: filter-branch keeps author, committer, both dates and the message, so the key is
+# (author name, author email, author date, committer name, committer email, committer date, full message).
+# Every old commit matched exactly one rewritten commit (0 unmatched, 0 ambiguous), and for every row
+# the old commit's parents, mapped through this table (or left alone when they predate the rewrite), equal
+# the new commit's parents. Trees: 59 rows have an identical tree, 43 differ only in src/media/resample.rs.
+# Tips: 4e99ca6b2754c1e369fe61c93087bd90dc95da7d -> a1fccca8bb10bea601a231a25c5b5ceb0d936f83 (main),
+#       c4ed3f7a96226323e01e6597fd9b0903463cb0c6 -> 49763122b32401efe93825808288868e918ae1db (eg2-integrate).
+0c9237ae97c9e701b1fefbcdc7fda372ff4ee484	d571b2e4666235a0a7f7db6461b3e47841ea3f7b	media: libswresample's resampler and mono mix in Rust, bit-equal to ffmpeg; decode at the native rate, convert here
+67db4af99bad55c46909a56a2f9bee838d60a4f1	b9b9ab18c36da75b17a74212eb2ae98829ea7d90	media e2e: the reference mixes and resamples as torchcodec does (ffmpeg -ac 1); 44.1 kHz WAV meets 1e-4 / 0.99999, AAC and MP3 bounds from measurement
+85cd1161387d21e8d5d437e2fc704360240cf871	48294145e66dd68d40a5ce2090a4a3dc0470f38c	bench_media_resample and the media-resample figure: libswresample in Rust against the AudioToolbox converter
+e9d41511aad18d366b40148b218e5228633d38e5	3ce7cbb989ce24af2fb0a3c054c3e4bf43448a4e	tools: audio_loader_gap.py measures libswresample's decode against librosa/soxr_hq and torchaudio
+56e643955ca278d8adefa3ca64be735657ebbd79	c0f0c1b0d23ee87cd0059f27787ca193a2688a63	docs: Media decoding follows the torchcodec branch with libswresample in Rust; Opus root cause, MP3/AAC bounds, benchmark; clippy
+fcae39978be22fee1eb33df52af4bf4734d1f0c4	3ffb946a1ccac96686dcda08b2978fa3afbb0ca0	merge lane A: libswresample's resampler and mono mix in Rust, bit-equal to ffmpeg; audio decoded at the native rate and converted here
+aaccdcf5a27e8048064ca2e92cdcbfc2685ae7fa	8d71eccdb38830f13af918ba57c1efde37f38fc9	plot_results media-resample: the median key follows the theme (ink_line), as the other figures now do
+879ead21030fdded617923f85b260579bb4f2e4a	cb053393e2b1757bb8aa0c81d44633d57d164926	merge lane M: media from files and bytes, soft-token counts and text interleaved with media in the C ABI and Python
+4d066517e78bc2cc8e33a4900688f079a8935884	bb099ca42758aef328917e3d699c355255500653	merge lane V: video frames byte-equal to ffmpeg (VideoToolbox planes, exact YUV-to-RGB), video end to end against sentence-transformers
+92a9a73c9c470a77703fd25e4a59d7ccdab7a9db	e32ea3072295ab4b5649be59e324b9987ee88660	merge lane J: pure-Rust JPEG decoder byte-equal to libjpeg-turbo (torchvision), JPEG end to end at 2.1e-7
+e9ea9b74585c4baa6ce11531320e468bff22db48	4891ebd2bc02fc501762dbc5025319414d072cf3	scripts: black-box fixture generator for the clean-room resampler
+d4badc78c90aeb58f1335b2e70b0b24e56839106	fbf3c6306ad7d9aee8cf0c66b18e6e8673cf5fd8	scripts: non-finite and signed-zero cases in the clean-room fixtures
+64f64296238cd1167354cedbe5b266d7811d8071	a197411aa6adad87f27adebf9696fff3fa02cd4c	media: rewrite the resampler and downmix clean-room against the ffmpeg binary
+222bd862625b410a4fdb5556528a9a406326b510	c53c9a749a867f0063a6b61ba51e5041c94dacfe	tests: black-box parity of the resampler with ffmpeg on 105 clips and 2003 lengths
+5a035c22b95b87e056fc90d2c982c3b745db6dc0	4885bd1e77c717148367d1b57f0cf96b105904a8	docs: exact audio.rs lines in the clean-room record, and the infrastructure reads
+3f64d48e826784b696758a7244616b9597420a00	753344e0540ff547746c7adcaf4fcfa87f9d931e	merge lane CR: clean-room resampler and downmix, 0 ULP against the ffmpeg binary
+7bb5e683834b04bed96ad32c022244538f098b42	607dc0ed686e8d8c22147bb38cf405af7aae08e8	go: umbrella engine and Go binding for EmbeddingGemma 2 over gusset
+acf248c6e0c479be1fddec938c53f5188db4ec21	71365030b209a2dec51791f39c8b712b3cc5eba1	go: real-checkpoint, concurrency, cancellation and engine-containment tests
+8dfc6d7d1ba6edf9acad1e6c31f691a384c145c5	ddff7433fdfd0c947d72a8df70cba5600d7e0fe3	go: Model.Ping, the floor of the boundary, with its tests; tidy the module
+cb14d4e6f63bcec9376c38f747bec20909086de2	b504dc8165b35291a9388ca80b3fee7a01005cc7	go: overhead benchmark of the Go binding against the same calls from Rust
+03ecaf6ddb2df9416b68db77e1f6b5c6c58c03ec	989a43fb78e2b54a38d6e0ad80113b752b2ec840	plot_results go-overhead: the Go binding's boundary cost against the same calls from Rust
+74ee452e84d915da7c7b75b014ca6cc5be47a07f	6193fe814cb322f8f25d045f8dc0c07358c904dd	go: docs (Go section, go/README.md, README), ci_local wiring, keep go/ out of the crate
+5a303de52e844d4770a4ef3588b450b67294b240	fc4485f771ad52ccc5a21d378f0e3f88b270934e	bench: correct the account of how the Go overhead recording was taken
+ec4c3ec76e04cb8bdffe77d6748b1d64704c3543	bb2afb6a1bb349266c334295116b391d0243fdf4	merge lane G: Go binding for EmbeddingGemma 2 over gusset (umbrella engine, every entry, parity, concurrency)
+176cac53f733bda77d965b3b46a2e9c580d29ab2	20d961710b34ba9fa2b4a901bd8ff3ad03654c51	ci: a hosted Go job (make -C go unit) and the Go device tier in the gpu job; VideoToolbox on the Go link line
+a4993f64fb9626027a95c364fce4f340be692eeb	afc5dd2d4086580ac537975a0711bd9a65d8ce72	scripts: fixtures for 10-bit, 4:2:2 and 4:4:4 video, odd sizes, FCC and SMPTE 240M, flips and rotation of every layout
+7520266f186fd834ff7e616bd4afd6dc1eef0b3b	cfa0a96113ad433a114de600eeacd3c9c094cd05	scripts: refusal fixtures (12-bit, monochrome, MPEG-4) and a golden flag in facts
+52d8bcf8ea4735f00f7199391ac0e16c4a7d399a	2f281ccd162d77112bc6a261ce5ae327c1e0a83a	media: yuv converter exact for 10-bit, 4:2:2, 4:4:4, FCC and SMPTE 240M, threaded by row bands
+63e0349c1440567339b1902250d060b9ea99b523	793821c833482b467f3c04a3d9cf9aa5d87e6d17	media: VideoToolbox planes at the stream's own layout, no silent AVFoundation fallback
+cfbb5a19d022a0df085f6d66c935079cb49fa2df	15027948f311305a47bd9f3fc10badbd0356446a	bench: converter rows, exact1 path, 10-bit and 4:4:4 clips; video-color draws three bars when exact1 is timed; e2e cases
+b5231168059ed9360d102b642f6f1d2eb6b8382e	0c549823bdb885834efe80ea6262aa406ca3eded	tests: the 10-bit 4:2:0 filter test starts at the shortest height each filter converts
+6ee8cd272ef801215803e2030924e33fe3394fc6	11870904da1aff712f23d608c90352784e723686	tests: keep the plot_results test count; the three-bar case runs inside the video-color test
+6a5e00e2be0f75b4f83035e7ab2683683ee261e3	3965c2fb1a444c2cb625ab7aaf9c4fb42274c856	docs: media decoding and video for the exact path across layouts; AVAssetReader's chroma re-siting; refusal policy; threading
+719cf6e5d316173858b3cb0e8ff354da18fcac4b	96d7804c4aaa8463b55a591a356931764fef8d7e	scripts: a Motion JPEG fixture, a codec AVFoundation decodes and the exact conversion refuses
+4cf78ccabf0bb407bb1e013c9c177f3160cc8046	cec85b530013ede3e11c4b5de961c2b20493b76b	tests: Motion JPEG is refused by name; docs list it
+dfcd5a5e6fff053679ed7e87d1f77cb16b55e85d	5beb7ffe56cbc65b680387065455cd29a4c5ba81	docs: AVAssetReader chroma: what was measured, what is inferred
+c433eae9caefa2717d94a35f322d0f80a4eef299	7ea7be98920eec28b9b7cefb696ac5ecab892196	scripts: goldens in torchcodec's order (convert at the stored size with unset scaler flags, then turn the RGB)
+de83ce989b4f09ac5fec49c7b79cf09a300726e9	3bf66d63669ae73cd51b7419d8e00106f578dcd0	media: torchcodec's arrangement: bicubic (unset flags) by default, convert at the stored size then turn the RGB for every layout
+c1c8793ed7b9feda4413bd9625685ac88280fc57	4c53799eb4f64844a14eb5ca09b30c1ff92602dd	docs: leaks run on the final video test binary
+e2c345f143967c9459e4fbb39324731efe8f7916	8277ab6edf0e7f0bbe4f63dc9dfcb3e29095e865	merge lane V2: every VideoToolbox layout exact (8/10-bit 4:2:0, 4:2:2, 4:4:4, all five matrices), torchcodec's bicubic default and convert-then-rotate, no silent fallback
+f427407c8855620fc621cb7d1f399a47876de737	ccef857b259e5fceec07bc73cdcf6fe46c22cde0	gen_jpeg_fixtures: progressive and lossless writers, block-smoothing and lossless fixture cases
+bb04eaac0fa7ba63b09b1b504f1110a51d571292	406c6b81e35aa20fd6b230b302f644b4205212e9	gen_jpeg_fixtures: DC extremes within the DC category range, lossless point transform past the precision
+2e94476f2334643221b96e22a4ccbbfd81d738a3	40cb70f9d4a44b17cd188154a8926df99bc9e40a	gen_jpeg_fixtures: the lossless matrix in RGB, the colour spaces libjpeg-turbo's lossless decoder refuses, precisions and point transforms
+5914fbaf107ada0e854fe0d9b0e08b554e64e584	88620735e90d8fd7c6d3573d9fffcd8cfed93664	gen_jpeg_fixtures: truncated mid-scan cuts may be refused; lossless frames without markers are RGB
+a91531fe9375fd0546ce055cd5adb273ce31bd10	32be9ff94d10d717f030ba69a1145ca9bfce7ad1	gen_jpeg_fixtures: even luma block-row counts and 3 and 4 block rows per iMCU row for block smoothing; the cjpeg -grayscale lossless case is named for what it is
+d2b5664a6fced07736d222901d944b5859864f25	22857a6212cfec13c63eec66297e5fb6c3b50baa	gen_jpeg_fixtures: single components with 2 to 4 block rows per iMCU row at every height, for block smoothing's row logic
+a93c263e3c3d10f0870a7382a30db67b9ea112ec	8835c6788d9556345c0c342c1de643b9f6213ac6	gen_jpeg_fixtures: lossless without a DHT or with a component in no scan, scans cut short with later scans kept, the six-scan prefix, found by live fuzzing
+8f770d82ce8f25cc5f4ce7ebd27cb2a76546087a	23282ddec527bc82707df4b29b5b3439081d1dcb	tests: block smoothing and lossless JPEG fixtures from the oracle, byte-equality tests, no refusal left but the named ones
+9fe9c086f84f6a8f9bc18ae5d7fab4cd7d208dea	58ef1fcedab56b4e839ccf5a41056f4fd674e682	jpeg: libjpeg-turbo block smoothing and lossless JPEG (SOF3), byte for byte
+e9a2be844c6e81160b0b58f28d184ea2d066c410	c3e8015cb7571cbd94937e7df16fc1b45775dfe5	docs: JPEG block smoothing and lossless decoded byte for byte; the one lossless shape still refused by name
+f333b8cfd154db52ab665370f7fbe17e5732eaec	f2a3370fe638b170032305f8ae6556f7f9cc0eb8	merge lane J2: JPEG block smoothing and lossless (SOF3) byte for byte against libjpeg-turbo, one lossless shape refused by name
+65d7c950f5bd84cee564286bc60c630b4edd6d63	63453f619815abf6bb406d923df4a947bae54db9	CHANGELOG and audit: the multimodal media, JPEG, video, resampler, Go binding and figure work; the closing audit status
+79e69201323bd9c20eb400c988abf9b6a5421978	03e261faf0b5a9d691ee4f532f8463e7a7017520	docs: audio files are mixed and resampled as libswresample does, not by the channel mean; stale counts and claims
+0bb583279c34f9d75c67432efab7c8f46cab934f	2dfc2dd4d3ea9feff17644f09da84bdc023e6236	gen_jpeg_fixtures: lossless frames with a restart interval and components of different sizes, in several scans
+8699afe0025e4449e52caee7fdb8feac4a5c836c	82364b056e1f629819691b646e17ca71a2248f03	gen_jpeg_fixtures: large progressive pictures cut short at 2 to 4 block rows per iMCU row; the open lossless case's note
+93f043926de6538684ebeb553905103cdd34953d	598e2b02403fd4f732d99c00d55c54597a1157a7	JPEG lossless: undifference a scan one iMCU row at a time, as jddiffct.c does; the refusal is gone
+cfc20c7201bfad2355fafe1d56b5eaec08839703	fabf68592fdeae386a5aa11a9089d34b3ea865c5	JPEG: smoothing read against jdcoefct.c (row-formula test, provenance), docs, CHANGELOG, live-only fuzz bases
+2849fbebf091dd98ec449d2545b5c98b6f4b2b14	cccdffd0647c618eec79cfd8709a4dd06df4b3ac	fixtures/jpeg MANIFEST.json: names the final generator commit
+c4ed3f7a96226323e01e6597fd9b0903463cb0c6	49763122b32401efe93825808288868e918ae1db	bench: quiet-machine recordings of the branch (paired text and multimodal against 42f1d52, video colour with one-thread lane, JPEG, Go overhead); figures state only what their data records
+a37a0c27002d5825ba839c310764c850ca19d032	8c5131981d335b572d00247c79987385f661c0cf	Merge eg2/integrate
+26fdb161d34f018b1803b1b41043dfce6f95e8c4	ca08b22977666b568787513b27dbb809817fbea9	Merge L1 (201cbcd): q4/utils kernel templates
+3090b89d3d4e407c919cc76e2934c8f06220031c	7a9a9c71f17251e92aea314f534146635e8d529d	Merge L2 (dc1ba20): host near-copies
+7e480602a4d1f2484a34f07eac5584f5d7a424e1	97d442cdf50fdf4e2385a97035f794efc7ec4e05	Merge L3 (22f988e): int4b tensorops tests
+d7365567ffcbd7a4845ad1e786807458b2c745e9	4b01b84210210b3ab2685e7181a69a91ce82e991	hosted_tests manifest: npy::accessor_tests (1 test, device-free); 103 invocations, 1194 tests
+f7d845c5845258fbefef6dee0fdfcd092db0fe7b	38aedf869854610581d78108374ee4250a9e7206	Merge eg2/integrate (2849fbe): fixtures/jpeg manifest and related
+ecbce6e7ea254efe43359ad9d1716ccd23ce73eb	d385e4fd757c6cb86021de70c0cd1c71c919e155	gemm_epilogue: exact-f32 cooperative epilogue, bit-identical to separate passes
+490eee3d817e6e205e47387e3e07ad418772298c	a109c41db4100725a84802968f813122ce9be8fd	gemm_exact_f32_epilogue test: cover the 128x64 exact kernel (production N>512 route and forced tiles)
+236ce189f23cfeda49d201b819f4f4e9fcad78bb	e07f2450c4e4beb5c79d005f610d3aff5fc546f9	Merge L4 (490eee3): ExactF32 coop epilogue
+43220ad281b9870ef09784eb47b3ac1e42bd84d9	fe75590deca4217079cd656ef5a216bfa99ce9c2	sq_norm: SqNormPlan::parts_words, the one owner of the parts size encode requires
+dab702431b553f746c53055a742ee6668ee83faf	e26559265a8dbf811e65e96495519204cf18e54b	Merge 43220ad: sq_norm parts_words
+0b16f80ce9037dba364b173577248d0fb933e16c	37acf7461e52b95537d31f3418703f2347c8fd2c	tests: pin the single-sequence step's bits
+0abe15cc736f080576c797e57033b26e04025494	7aea19b39ca8fe47dd83cd67004fd764fb345599	qwen35_train: ragged steps over packed sequences (cu_seqlens)
+a49f3689632533153162f0342c2a835a19402575	0c7063ec821202013357b3661628ca58f714f4e7	qwen35_train: allow the extra ragged argument on train_layer_forward
+074604d41ac5ad12e70f7ecda0f49e04f5c816b8	ecae2dd84e078c54e7f7801f306aeb16bf8ae036	qwen35_train: ragged scratch views the packed gradient streams; bound counts the ragged step
+57a837097430d7738a7beca7645efd7000b3e04d	00e027fd6bf8721dea2d623f2000b72bd1bf85f1	tests: pin train_step_bytes scaffolding (values to follow)
+2044c461c83f5235acaf5859997098921c443f6b	7da7fa835b9e210dda3e41007211c8a7fdf6e096	tests: pin train_step_bytes at a37a0c2's values (single sequence unchanged)
+bf091a2af4ab5436b117830c9bdf60eeb597dfae	cef623ee701ee1f669fe421d5a88de45b6ee114a	Merge 2044c46: ragged Qwen3.5 training
+0819992ecb35b03806fd50324039126cbe14bcaa	e3dff5ac837100c34d0276ade8cedc9ae87ba703	BUILD_REPORT: waves 13-16 (GitPulse backlog run 2026-10-17/18)
+8e5ca91b5ef0b369800d1826d5d7a35cf4ab1391	155ee54010188e4a7ee827ad4c0a6392805f7322	tests: characterize the four device casts bit for bit (pre-refactor digests)
+32c02905d69b88deb3077b8b2b5e2d0ac70a1c4f	1833394ce559fa6e37cc28a4dce11d0dd5ceed38	gemm: the _into casts dispatch through cast_between
+11c558a04a50ac2c6917acb01af83246b0afd52a	be380404e6e9d136b59adad2f2b952d6f84642f1	qwen35_train: one single_seq_gdn_dims replaces the five GdnTrainDims literals
+bbf96743c7fbe7f15be8c13b674c2e9554c4d162	6bdd052dca44678104128d953b90aa3674d3da22	tests: step bounds cover measured peaks (single and ragged, two shapes) without the pool term
+c9d0ff35694588fbdf43f125b68afee099b65783	434b1468fc53fbd57cef5c7645d8d9b4732e236c	qwen35_train: exact structural test that the scratch bounds equal the bytes the scratch allocators make (single, packed and ragged)
+43a2ac32146ebf9a874acfa22cc145d640525c5f	08b4437b7d6f7d881ffe31bed5672eb9c2b499f8	merge wave 16 C: gemm casts via cast_between, single_seq_gdn_dims, bound tests
+15fac39237152c1f4a5c6d336361565bad5f0527	1f3cb73bf5b88cc817bf7d76152763dd632e03d0	tests: characterize BERT and Qwen3.5 config.json readers (two drift tests fail on the unmodified parsers)
+74de7f07600484abd58009cf921728854393a356	d6a7910159ab3a563599b3c60123271dc1d5ab95	config: one config.json reader for BERT and Qwen3.5; BERT now refuses non-boolean sinusoidal_pos_embds and null position_embedding_type
+de09e853d6b3012b58ddd23d36410f3301e4ce4d	df2109c98e1f0c5519bf35b5d146096e69984953	merge wave 16 D: config_json, BERT/Qwen3.5 from_config_json converged
+100e7f06c677d8b9af6f090234f46517c79ef310	b5b363693951482e5e76ecf14a7257bb53fedcd7	C ABI 13: tessl_qwen35_train_step_ragged and tessl_torch Qwen35.train_step_ragged
+82a593453e132aa815b1a6cd49d25ba13dc1ef98	b9aa907292480c9ada77c6f1564c4ef56f4a8e22	test_qwen35: packed-batch reference is the scaled rows path
+cd03ff05a6dee24917404233348a44f9881a58cc	a603209cdaa35f9ce122cc50220e6ac494267c8c	merge wave 17 E: tessl_qwen35_train_step_ragged C entry, ABI 13
+c0def135a8bb8cec397497860f65ce315f5bee8e	dd51be574de9f689f6108b2020a26f210c5299db	hosted_tests: qwen35_train unit selection by exact name (wave 16 C bound tests need a device)
+91d741e5b6fb126888dc1308f0741e0583aeec54	ce3b9c8dcf4ed6afffc49ef313f511d350d778aa	hosted_tests: select tests/config_json_parsers.rs (10 device-free tests)
+4aebbeb62150500587da62549b95915588644053	14748a9413ab4651642ca3575e0c096ca2560806	tests: Qwen3.5 RMSNorm rstd parity and bit characterization (the two parity tests FAIL on this commit: fast forward rsqrt vs precise backward; gated 70+ rows, rms 2 rows)
+cf405b1c932cc2b03cb3d759f74ec7905849ec33	864644bf427c0718816f08b416cda63491b7415d	tests: gated rstd parity uses silu(z) = 64, a power of two, so fast-math association cannot round the proxy
+7d9ef30b298b2f310483af31533138004d3adad7	4632d2e129d60818905977f875c430c0012f4f6c	qwen35: RMSNorm forward uses precise::rsqrt, like the backward (card ft-1a0f8c18 AC5)
+9633b5450e255bdaedab14e104557de06c51df27	0d26aa6220b31a091054d98e5e25c4c06f28152a	tests: allow too_many_arguments on the parity test's gated_fwd helper
+6003226d026b6b900b11b671d7acd2ed9e691b18	10069954d2bc0a024183657570bd362059752cd8	tests: qk-norm rstd parity and characterization (written during the quiet window, not yet compiled or run)
+40a0a5e2df66875acd9bffa598c0ab5bf45f1a3b	1ddda31826b36e777308a9940dfa1a2c38f456ea	tests: EmbeddingGemma 2 bit characterization through the qk-norm kernel; fmt
+e677f355477e2ee6b44f055bc85e22fdf72c5929	201bc61fba403c5adc4196a41ef13790008770d8	qwen35, embedgemma2: the shared qk-norm row kernel and its backward use precise::rsqrt (owner decision, card ft-1a0f8c18 AC5)
+54f2f481ce8516a791794c73b5f496a96339a186	f0f7678e942030524f2e8b67cf7a86c181060a98	tests: re-pin the single-sequence step to the precise::rsqrt norms
+41d88663ab410b4df46e71a520c6c0cb26bbf39b	a083088bcf0f0d03c6d9d26b1c20bdb8421b1609	merge wave 17 F: RMSNorm and shared qk-norm row kernel to precise::rsqrt
+4e99ca6b2754c1e369fe61c93087bd90dc95da7d	a1fccca8bb10bea601a231a25c5b5ceb0d936f83	BUILD_REPORT: waves 16C/D and 17 landed at 41d8866; ojas verified it

@@ -1,6 +1,18 @@
 # BUILD_REPORT — GitPulse backlog, waves 21–22: training follow-ups (2026-10-21/22)
 
-Wave 20 landed on `main` as `c0d8be5`. Its gate was `scripts/ci_local.sh`, run 21:50–03:45Z on the M5 Pro under the lock: ci:local OK, 3436 passed, 0 failed, 68 ignored, no skips. Waves 21–22 are integrated on `gp/w21-integrate` @ `e149146`. That branch lands after its own `ci_local.sh` gate and the ojas handshake.
+## Landed on `main` (each after a green `scripts/ci_local.sh` on the M5 Pro under the lock, and an ojas-7a ack)
+| move | tip | gate result |
+|---|---|---|
+| wave 20, fast-forward | `c0d8be5` | ci:local OK, 3436 passed / 0 failed / 68 ignored, no skips |
+| waves 21–22, `--no-ff` | `69f60b0` (tree = gated `e149146` + this report) | ci:local OK, 3472 / 0 / 70 |
+| wave 22b, fast-forward | `847cabe` | ci:local OK, 3472 / 0 / 72 |
+
+Every lane branch and worktree from these waves is gone. Branches were deleted with `-d` once they were on `main`. The unmerged evidence branches were bundled to `../tessl-backups/` before deletion: the fail-before tree and the two rsqrt probes.
+
+## Late results (wave 22b)
+- **ft-1d2ab5b0 → review.** The FD check stays red as a recorded limitation. The measured rule resolves 0 of 12. The noise comes from tessl's f32 forward roughness, about 3e-7 in the loss. Shift-averaging was refuted against thresholds set before the run (lag-1 about 0.8). Owner decision: a separate f64 torch autograd reference test. It **passes**: tessl loss is 1.40e-7 off f64 (transformers fp32 is 4.57e-5 off), and the worst gradient is 6.06e-5 against a 1e-2 bound over 149 parameters. Generator peak 20.56 GiB.
+- **ft-805b6ea4 step 1.** The logit harness ran on the real 2B. tessl Bf16 vs tessl F32 is 3.0e-3 rel max with top-1 155/155 and 510/512. That is about 3× under transformers' own bf16 floor (9.9e-3, 152/155 and 500/512). tessl F32 vs transformers fp32 is 2.0e-6.
+- **ojas side of the fused step.** ojas card ft-091e7fc2, filed by ojas-7a. A C ABI entry for it is left to the owner.
 
 ## Tasks moved to review
 | card | result | branch |

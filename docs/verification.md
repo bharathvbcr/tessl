@@ -828,6 +828,7 @@ real_2b_step_on_bf16_storage_stays_near_the_f32_step       FAILED a bound (2026-
 real_2b_loss_curve_tracks_the_f32_step                     FAILED closed before its first arm (2026-10-21 run below; ft-dafde771)
 real_2b_bank_accumulates_within_the_bound                  PASS (2026-10-21 run below)
 real_2b_gradients_are_those_of_tessls_forward              FAILED a bound (2026-10-21 run below; ft-1d2ab5b0)
+real_2b_step_matches_the_f64_gradient                      NOT RUN (added 2026-10-22; needs the --f64 reference)
 hosted_selection_has_no_device                             not run directly (needs the hosted sandbox)
 every_device_free_test_is_on_the_hosted_manifest           PASS via scripts/hosted_tests.sh --outside
 ```
@@ -927,6 +928,28 @@ qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
   estimates (4 steps) was shown on the GPU to be coincidental at
   layers.20 conv1d.weight (successive-difference ratios 1.96 and 3.7, not 4),
   hence three; its result follows from the lead's next GPU run.
+
+  Recorded limitation (owner decision, 2026-10-22): the 2B finite-difference
+  check cannot resolve the 2B's parameters: 0 of 12 resolve (as the owner
+  recorded it; the run's output is not in this file). tessl's f32 forward has a deterministic roughness of
+  about 3e-7 in the loss, so no step size gives a clean difference, and
+  averaging over shifted points was tried on the GPU and refuted.
+  `real_2b_gradients_are_those_of_tessls_forward` is unchanged and stays red
+  as that record. Its replacement question is
+  `real_2b_step_matches_the_f64_gradient` (ignored): tessl's ExactF32 step
+  against torch autograd run entirely in float64, the exact gradient, with no
+  step size and no forward roughness. The loss within 1e-4 relative and every
+  kept gradient within 1e-2 of its parameter's peak, the bounds of
+  `real_2b_step_matches_transformers`, set before any run; each row prints
+  tessl-vs-f64 beside transformers-fp32-vs-f64 when both fixtures are present.
+  Generation (about 22-23 GiB estimated, alone, under the machine lock;
+  meta.txt records the measured peak): `python3 tools/qwen35_ref/make_train_fixture.py
+  2b --tokens 128 --f64` writes `target/qwen35_train_ref_f64`
+  (`QWEN35_TRAIN_REF_F64_DIR` overrides it). The generator rewrites
+  transformers' float32 casts to float64 and raises on any floating
+  intermediate that is not float64; on a tiny Qwen3.5 model it matches both
+  the dense tied autograd (1.7e-16) and f64 central differences (1.6e-9 to
+  8e-7 relative on five parameters). Not yet run on the 2B.
 
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
 transformers 3.81016612; train vs transformers 4.55e-5), the worst

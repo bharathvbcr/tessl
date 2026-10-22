@@ -1821,6 +1821,13 @@ fn a_busy_or_poisoned_runtime_is_an_error_from_every_training_entry_point() {
 /// in f32 from `QWEN35_2B_SAFETENSORS`, and its config.
 fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
     let dir = tessl::qwen35_train::train_reference_dir().unwrap_or_else(|e| panic!("{e}"));
+    let (cfg, model) = real_2b_model();
+    (dir, cfg, model)
+}
+
+/// The model half of [`real_2b`], for a test whose reference directory is not
+/// the fp32 one.
+fn real_2b_model() -> (Qwen35Config, Qwen35Model) {
     let st_path = PathBuf::from(
         std::env::var("QWEN35_2B_SAFETENSORS")
             .expect("set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B-Base .safetensors file"),
@@ -1829,7 +1836,7 @@ fn real_2b() -> (PathBuf, Qwen35Config, Qwen35Model) {
     let st = SafeTensors::open(&st_path).unwrap();
     let cfg = Qwen35Config::qwen35_2b().unwrap();
     let model = Qwen35Model::load(&rt, &st, "model.language_model.", cfg.clone(), Precision::F32).unwrap();
-    (dir, cfg, model)
+    (cfg, model)
 }
 
 /// Every reference gradient in `dir` against `step`'s, each as
@@ -1923,6 +1930,96 @@ fn real_2b_step_matches_transformers() {
     assert!(r_train <= 1e-4, "loss {} vs transformers {want_loss}", step.loss);
     for (name, r) in &results {
         assert!(*r <= 1e-2, "{name}: rel err {r:.3e} > 1e-2");
+    }
+}
+
+/// The reference file a [`real_2b_results`] row was compared against.
+fn real_2b_reference_file(row: &str) -> String {
+    match row.strip_suffix(" (kept rows)") {
+        Some(name) => format!("grad.{name}.rows.npy"),
+        None => format!("grad.{row}.npy"),
+    }
+}
+
+/// tessl's ExactF32 step on the real 2B against the exact gradient: torch
+/// autograd in float64 (`python3 tools/qwen35_ref/make_train_fixture.py 2b
+/// --f64`, into `QWEN35_TRAIN_REF_F64_DIR`, else `target/qwen35_train_ref_f64`).
+/// This is the replacement question for
+/// `real_2b_gradients_are_those_of_tessls_forward`, whose finite differences
+/// cannot resolve the 2B's parameters (tessl's f32 forward is rough at about
+/// 3e-7 in the loss); an f64 autograd gradient has no step size and no forward
+/// roughness to resolve.
+///
+/// Bounds, written before the first run: the same as
+/// `real_2b_step_matches_transformers`, the loss within 1e-4 relative and
+/// every kept gradient within 1e-2 of its parameter's peak. The reasoning:
+/// tessl's f32 step against the true gradient should be no worse than tessl's
+/// against transformers' fp32 gradient, which is itself an f32 approximation
+/// of the true one, so the error of the first is the f32 error of tessl alone
+/// where the second adds transformers'. A pass shows tessl's gradients are the
+/// true ones to f32 accuracy; a fail at these bounds says tessl's f32 error is
+/// larger than the transformers comparison suggested, which is the finding.
+///
+/// Each row also prints transformers' fp32 gradient against the same f64
+/// reference when `QWEN35_TRAIN_REF_DIR` (or its default) holds that fixture,
+/// the fp32 noise floor beside tessl's number. Not asserted: it is context,
+/// and the test does not need the fp32 fixture to run.
+#[test]
+#[ignore]
+fn real_2b_step_matches_the_f64_gradient() {
+    // The reference first: a missing directory is a panic naming the
+    // variable, before the model or the device is touched.
+    let dir = tessl::qwen35_train::train_reference_f64_dir().unwrap_or_else(|e| panic!("{e}"));
+    let meta = std::fs::read_to_string(dir.join("meta.txt"))
+        .unwrap_or_else(|e| panic!("{}: meta.txt unreadable: {e}", dir.display()));
+    assert!(
+        meta.lines().any(|l| l.trim() == "dtype f64"),
+        "{} is not an f64 reference (its meta.txt has no `dtype f64` line); QWEN35_TRAIN_REF_F64_DIR must be what `make_train_fixture.py 2b --f64` wrote",
+        dir.display()
+    );
+    let (cfg, model) = real_2b_model();
+    let tokens = ids(&dir);
+    let step = model.train_step(&tokens, GemmOperands::ExactF32).unwrap();
+    let want_loss = npy_f64(&dir.join("loss.npy")).1[0];
+    let r_loss = (step.loss - want_loss).abs() / want_loss;
+    eprintln!(
+        "loss: tessl {:.10}, f64 autograd {want_loss:.10}, rel {r_loss:.2e}",
+        step.loss
+    );
+    let (results, _) = real_2b_results(&dir, &cfg, &step);
+    // The fp32 fixture beside it, when present and on the same ids.
+    if let Ok(fp32) = tessl::qwen35_train::train_reference_dir() {
+        if tokens == ids(&fp32) {
+            let fp32_loss = npy_f64(&fp32.join("loss.npy")).1[0];
+            eprintln!(
+                "loss: transformers fp32 {fp32_loss:.10} vs f64 {:.2e}",
+                (fp32_loss - want_loss).abs() / want_loss
+            );
+            eprintln!("per parameter: tessl-vs-f64 | transformers-fp32-vs-f64");
+            for (name, r) in &results {
+                let file = real_2b_reference_file(name);
+                let f64_ref = dir.join(&file);
+                let fp32_ref = fp32.join(&file);
+                let floor = if fp32_ref.is_file() {
+                    format!("{:.2e}", rel(&npy_f64(&fp32_ref).1, &npy_f64(&f64_ref).1))
+                } else {
+                    "(no fp32 file)".to_string()
+                };
+                eprintln!("{name}: {r:.2e} | {floor}");
+            }
+        } else {
+            eprintln!(
+                "the fp32 fixture at {} is on other ids; no side-by-side",
+                fp32.display()
+            );
+        }
+    } else {
+        eprintln!("no fp32 fixture present; no side-by-side");
+    }
+    print_peak_footprint("real_2b_step_matches_the_f64_gradient");
+    assert!(r_loss <= 1e-4, "loss {} vs the f64 autograd's {want_loss}", step.loss);
+    for (name, r) in &results {
+        assert!(*r <= 1e-2, "{name}: rel err {r:.3e} > 1e-2 against the f64 gradient");
     }
 }
 

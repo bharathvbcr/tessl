@@ -126,19 +126,54 @@ pub fn train_reference_dir() -> Result<std::path::PathBuf, String> {
 
 /// [`train_reference_dir`] with the variable's value passed in.
 fn reference_dir_from(var: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
+    reference_dir_named(
+        var,
+        "QWEN35_TRAIN_REF_DIR",
+        "target/qwen35_train_ref",
+        "make_train_fixture.py 2b",
+    )
+}
+
+/// The f64 autograd reference's directory (`make_train_fixture.py 2b --f64`):
+/// `QWEN35_TRAIN_REF_F64_DIR`, else `target/qwen35_train_ref_f64`. The same
+/// resolution and the same refusal as [`train_reference_dir`], under its own
+/// variable. Test support, not API.
+///
+/// # Errors
+/// The directory has no `ids.npy`: the message names the variable to set and
+/// the path tried.
+#[doc(hidden)]
+pub fn train_reference_f64_dir() -> Result<std::path::PathBuf, String> {
+    reference_dir_named(
+        std::env::var_os("QWEN35_TRAIN_REF_F64_DIR"),
+        "QWEN35_TRAIN_REF_F64_DIR",
+        "target/qwen35_train_ref_f64",
+        "make_train_fixture.py 2b --f64",
+    )
+}
+
+/// The one resolution behind both reference directories: `var` (the value of
+/// the variable `name`), else `default` under this crate; the directory must
+/// hold `ids.npy`.
+fn reference_dir_named(
+    var: Option<std::ffi::OsString>,
+    name: &str,
+    default: &str,
+    command: &str,
+) -> Result<std::path::PathBuf, String> {
     let (dir, from) = match var {
-        Some(d) => (std::path::PathBuf::from(d), "QWEN35_TRAIN_REF_DIR"),
+        Some(d) => (std::path::PathBuf::from(d), name.to_string()),
         None => (
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_train_ref"),
-            "the default target/qwen35_train_ref",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(default),
+            format!("the default {default}"),
         ),
     };
     if dir.join("ids.npy").is_file() {
         Ok(dir)
     } else {
         Err(format!(
-            "no 2B reference at {} (from {from}): set QWEN35_TRAIN_REF_DIR to the directory \
-             `tools/qwen35_ref/make_train_fixture.py 2b` wrote (it holds ids.npy)",
+            "no 2B reference at {} (from {from}): set {name} to the directory \
+             `tools/qwen35_ref/{command}` wrote (it holds ids.npy)",
             dir.display()
         ))
     }

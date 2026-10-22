@@ -6,6 +6,7 @@ gradient from transformers' autograd.
     python3 tools/qwen35_ref/make_train_fixture.py tiny --grouped   # tests/fixtures/qwen35_train_grouped/
     python3 tools/qwen35_ref/make_train_fixture.py tiny --untied    # tests/fixtures/qwen35_train_untied/
     python3 tools/qwen35_ref/make_train_fixture.py 2b --tokens 128   # target/qwen35_train_ref/
+    python3 tools/qwen35_ref/make_train_fixture.py 2b --tokens 128 --f64   # target/qwen35_train_ref_f64/
 
 `tiny` builds a small random `Qwen3_5ForCausalLM` of the 2B's shape family
 (head_dim 256, GDN key heads of 128 with as many value heads, grouped
@@ -42,18 +43,34 @@ gradients: every 1-D parameter and conv weight, every matrix of layers 0 (GDN)
 and 3 (attention), and the embedding gradient's rows for the prompt's ids and
 64 other ids. Run it alone: tessl's side loads the same model afterwards.
 
+`2b --f64` (target/qwen35_train_ref_f64/) is the same gradients from the exact
+function: the whole forward and backward in float64, for
+tests/qwen35_train.rs's `real_2b_step_matches_the_f64_gradient` (tessl's f32
+step against the true gradient, with no finite differences). transformers
+hard-codes float32 in the Qwen3.5 path (the GDN's `to(torch.float32)`, the
+gated norm, the softmax's `dtype=`, `.float()` in the norms, the rotary and
+the loss), so a float64 model alone would still round to float32 in the
+middle; `F64Only` rewrites every such request to float64 and raises on any
+floating result that is not float64. The model is the checkpoint's bf16
+values exactly (every bf16 is a float64). Only the parameters the fixture
+keeps carry gradients (see `step_f64` for the memory this buys). The files
+are the fp32 fixture's, the gradients float64, and meta.txt says `dtype f64`.
+
 Both run the loss exactly as `Qwen3_5ForCausalLM(input_ids=ids, labels=ids)`
 reports it: the mean cross-entropy of positions 0..T-2 predicting ids 1..T-1.
 The attention is transformers' eager implementation, in float32.
 """
 import argparse
+import collections
 import json
 import os
+import resource
 import sys
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
+from torch.overrides import TorchFunctionMode
 from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -201,14 +218,166 @@ def tiny(args):
     print(f"tiny: loss {loss:.6f}, {len(grads)} gradients -> {out}")
 
 
+def keep_parameter(name, ndim):
+    """The 2b fixture's kept gradients (the embedding is kept as rows, apart):
+    every 1-D parameter and conv weight, and every parameter of layers 0 (GDN)
+    and 3 (attention)."""
+    layer = name.split("layers.")[1].split(".")[0] if "layers." in name else None
+    return ndim == 1 or "conv1d" in name or layer in ("0", "3")
+
+
+def _floats(x):
+    if isinstance(x, torch.Tensor):
+        if x.is_floating_point():
+            yield x
+    elif isinstance(x, (tuple, list)):
+        for y in x:
+            yield from _floats(y)
+
+
+class F64Only(TorchFunctionMode):
+    """Runs everything under it in float64, or raises.
+
+    transformers 5.19.0's Qwen3.5 path (and its loss) ask for float32 in
+    places, which on a float64 model would round the middle of the computation
+    to float32 and make the "exact" gradient an fp32 one. Every torch call
+    under this mode has each float32 request (a positional or `dtype=` float32,
+    `torch.float` included) rewritten to float64 and `Tensor.float()` run as
+    `Tensor.double()`; and every floating tensor any call returns is checked
+    to be float64, so a cast this does not recognise (a half, a bfloat16, a
+    float32 made some other way) is a RuntimeError naming the call, never a
+    quiet float32. `sites` counts each rewrite by the transformers line that
+    asked for it; the cast sites (installed transformers 5.19.0, under
+    site-packages/transformers/). Rewritten on a tiny Qwen3.5 text model's
+    forward and backward (the other 2B-path sites run the same code):
+      models/qwen3_5/modeling_qwen3_5.py:  177 (rotary inv_freq
+      `torch.arange(dtype=torch.float)`), 186 (rotary positions `.float()` and
+      `inv_freq.to(dtype=torch.float)`), 217 and 222 (gated norm
+      `.to(torch.float32)`), 329 (chunked delta rule `.to(torch.float32)`), 609
+      (GDN decay `A_log.float()`, `a.float()`), 731 (eager attention
+      `softmax(dtype=torch.float32)`), 841 and 844 (RMSNorm `.float()`);
+      loss/loss_utils.py: 59 (`logits.float()`).
+    Present in the file and covered by the same rewrite, not reached by a
+    text-only no-cache step: 449 (the recurrent delta rule, one cached token)
+    and 113, 119, 122, 992, 993 (the vision tower's rotary).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.sites = collections.Counter()
+
+    def _site(self, what):
+        f = sys._getframe(1)
+        while f is not None and ("/torch/" in f.f_code.co_filename or f.f_code is self.__torch_function__.__code__):
+            f = f.f_back
+        where = "?"
+        if f is not None:
+            path = f.f_code.co_filename
+            where = f"{path.split('site-packages/')[-1]}:{f.f_lineno}"
+        self.sites[f"{where}  {what}"] += 1
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.Tensor.float:
+            self._site(".float() -> .double()")
+            func = torch.Tensor.double
+        if any(a is torch.float32 for a in args) or any(v is torch.float32 for v in kwargs.values()):
+            self._site(f"{getattr(func, '__name__', func)}(float32) -> float64")
+            args = tuple(torch.float64 if a is torch.float32 else a for a in args)
+            kwargs = {k: torch.float64 if v is torch.float32 else v for k, v in kwargs.items()}
+        out = func(*args, **kwargs)
+        for t in _floats(out):
+            if t.dtype != torch.float64:
+                raise RuntimeError(f"{getattr(func, '__name__', func)} returned {t.dtype}, not float64")
+        return out
+
+
+def step_f64(model, ids, rows):
+    """The loss and the kept gradients of a float64 model, exact: returns
+    (loss, {name: float64 array}, meta lines).
+
+    Memory (about 1.88 B parameters, 248,320 x 2048 embedding, 128 tokens;
+    estimated, not measured on this machine: the meta.txt it writes records
+    the peak resident set it actually had): the weights are 1.88e9 x 8 B =
+    14.0 GiB. Only the kept parameters have requires_grad: the embedding's
+    lm_head side (3.8 GiB dense) and layers 0 and 3 and the 1-D and conv
+    parameters (about 0.9 GiB), 4.7 GiB of gradients. The tied embedding is
+    split into two parameters on one storage (no copy), the lookup's with a
+    sparse gradient (only the rows the ids touch), so the 3.8 GiB tied
+    gradient is never built twice or summed out of place (that would have been
+    11.4 GiB at the end of the backward; the sum is taken on the kept rows
+    only). The activations (128 tokens: the 128 x 248,320 f64 logits are 0.24
+    GiB, and the loss keeps a few copies of them; the layers' are smaller) are
+    about 2-3 GiB. Peak about 14.0 + 4.7 + 3 + interpreter and torch about 1
+    = 22-23 GiB, under memguard's 32 GiB cap.
+    """
+    if not model.config.tie_word_embeddings:
+        sys.exit("--f64 handles the 2B's tied embedding; this model is untied")
+    emb_mod = model.get_input_embeddings()
+    head = model.get_output_embeddings()
+    if head.weight is not emb_mod.weight:
+        sys.exit("lm_head.weight is not the embedding: the tie this fixture splits is not there")
+    emb_name = "model.embed_tokens.weight"
+    for n, p in model.named_parameters():
+        if p.dtype != torch.float64:
+            sys.exit(f"{n} is {p.dtype}: the model was not loaded in float64")
+    model.requires_grad_(False)
+    kept = {n: p for n, p in model.named_parameters() if n != emb_name and keep_parameter(n, p.ndim)}
+    for p in kept.values():
+        p.requires_grad_(True)
+    # The tie split: lm_head's own Parameter over the embedding's storage.
+    head.weight = torch.nn.Parameter(emb_mod.weight.detach())
+    emb_mod.weight.requires_grad_(True)
+    emb_mod.sparse = True
+    # The rotary tables were built in float32 at construction; rebuild them in
+    # float64 (inv_freq = 1 / theta^(2i/d) is not exact in float32).
+    with F64Only() as mode:
+        for m in model.modules():
+            if hasattr(m, "compute_default_rope_parameters") and hasattr(m, "inv_freq"):
+                if m.rope_type != "default":
+                    sys.exit(f"rope type {m.rope_type}: only the default rotary is rebuilt in float64")
+                inv_freq, _ = m.compute_default_rope_parameters(m.config)
+                m.inv_freq = inv_freq
+                m.original_inv_freq = inv_freq.clone()
+        out = model(input_ids=ids[None], labels=ids[None], use_cache=False)
+        out.loss.backward()
+    sites = mode.sites
+    if out.loss.dtype != torch.float64:
+        sys.exit(f"the loss is {out.loss.dtype}")
+    loss = out.loss.item()
+    grads = {}
+    for n, p in kept.items():
+        if p.grad is None or p.grad.dtype != torch.float64:
+            sys.exit(f"{n}: gradient {None if p.grad is None else p.grad.dtype}, not a float64 gradient")
+        grads[n] = p.grad.detach().cpu().numpy()
+    # The tied embedding's gradient on the kept rows: lm_head's side plus the
+    # lookup's (the sparse rows, each id's rows summed by coalesce).
+    if not emb_mod.weight.grad.is_sparse or head.weight.grad.is_sparse:
+        sys.exit("the embedding's gradient layout is not the sparse lookup + dense head this assumes")
+    want = head.weight.grad[torch.from_numpy(rows)].clone()
+    look = emb_mod.weight.grad.coalesce()
+    idx = look.indices()[0].numpy()
+    pos = np.searchsorted(rows, idx)
+    if not (pos < len(rows)).all() or not (rows[pos] == idx).all():
+        sys.exit("the lookup touched a row outside the kept rows")
+    want[torch.from_numpy(pos)] += look.values()
+    grads[emb_name + ".rows"] = want.numpy()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gib = rss / 2**30 if sys.platform == "darwin" else rss / 2**20
+    notes = f"peak_rss_gib {rss_gib:.2f}\nf64_cast_sites_rewritten:\n" + "".join(
+        f"  {n}x {s}\n" for s, n in sorted(sites.items()))
+    return loss, grads, notes
+
+
 def two_b(args):
     sys.path.insert(0, os.path.dirname(__file__))
     import make_reference as mr  # noqa: E402
 
-    out = os.path.join(ROOT, "target", "qwen35_train_ref")
+    f64 = args.f64
+    out = os.path.join(ROOT, "target", "qwen35_train_ref_f64" if f64 else "qwen35_train_ref")
     os.makedirs(out, exist_ok=True)
     model_dir = args.model_dir or mr.find_snapshot()
-    model = mr.load(model_dir, torch.float32)
+    model = mr.load(model_dir, torch.float64 if f64 else torch.float32)
     model.config._attn_implementation = "eager"
     from transformers import AutoTokenizer
 
@@ -216,24 +385,27 @@ def two_b(args):
     ids = tok(mr.PROMPT, return_tensors="pt").input_ids[0][: args.tokens]
     if len(ids) < args.tokens:
         sys.exit(f"the prompt has {len(ids)} tokens, fewer than --tokens {args.tokens}")
-    loss, grads = step(model, ids)
-    write_common(out, loss, ids)
-    keep = {}
-    for n, g in grads.items():
-        layer = n.split("layers.")[1].split(".")[0] if "layers." in n else None
-        if g.ndim == 1 or "conv1d" in n or layer in ("0", "3"):
-            keep[n] = g
-    emb = [n for n in grads if n.endswith("embed_tokens.weight")][0]
+    emb = "model.embed_tokens.weight"
     gen = torch.Generator().manual_seed(7)
-    others = torch.randperm(grads[emb].shape[0], generator=gen)[:64].numpy()
+    others = torch.randperm(model.get_input_embeddings().weight.shape[0], generator=gen)[:64].numpy()
     rows = np.unique(np.concatenate([ids.numpy(), others])).astype(np.int64)
+    if f64:
+        loss, keep, notes = step_f64(model, ids, rows)
+        dtype = np.float64
+    else:
+        loss, grads = step(model, ids)
+        keep = {n: g for n, g in grads.items() if keep_parameter(n, g.ndim)}
+        keep[emb + ".rows"] = grads[emb][rows]
+        notes, dtype = "", np.float32
+    write_common(out, loss, ids)
     np.save(os.path.join(out, "embed_rows.npy"), rows)
-    keep[emb + ".rows"] = grads[emb][rows]
     for n, g in keep.items():
-        np.save(os.path.join(out, f"grad.{n}.npy"), g.astype(np.float32))
+        np.save(os.path.join(out, f"grad.{n}.npy"), g.astype(dtype))
     with open(os.path.join(out, "meta.txt"), "w") as f:
         f.write(f"model {model_dir}\ntokens {args.tokens}\nloss {loss!r}\ngradients {sorted(keep)}\n")
-    print(f"2b: loss {loss:.6f}, {len(keep)} gradients -> {out}")
+        if f64:
+            f.write(f"dtype f64\n{notes}")
+    print(f"2b{' f64' if f64 else ''}: loss {loss:.6f}, {len(keep)} gradients -> {out}")
 
 
 def main():
@@ -248,11 +420,16 @@ def main():
                     help="tiny: two GDN key heads over four value heads, the 4B's ratio")
     ap.add_argument("--untied", action="store_true",
                     help="tiny: tie_word_embeddings false, a separate lm_head.weight (the 9B's layout)")
+    ap.add_argument("--f64", action="store_true",
+                    help="2b: the exact reference, the whole forward and backward in float64, into "
+                         "target/qwen35_train_ref_f64 (about 23 GiB; see step_f64)")
     ap.add_argument("--out", help="tiny: where to write (default: the committed fixture)")
     ap.add_argument("--reproduces", metavar="DIR",
                     help="tiny, with --out: DIR is a committed fixture. Compare this run with it and write "
                          "DIR/MANIFEST.json recording the comparison (versions_role: reproduced)")
     args = ap.parse_args()
+    if args.f64 and args.which != "2b":
+        sys.exit("--f64 is for 2b only")
     torch.set_num_threads(max(1, os.cpu_count() // 2))
     (tiny if args.which == "tiny" else two_b)(args)
 

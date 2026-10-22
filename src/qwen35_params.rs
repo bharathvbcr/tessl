@@ -485,6 +485,7 @@ pub(crate) fn tail_slots<'a>(
 
 /// Every parameter in a fixed order, with its gradient in `grads` if given.
 pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
+    m.require_dense("Qwen35Model parameter table")?;
     if let Some(g) = grads {
         if g.layers.len() != m.layers.len() {
             return Err(format!(
@@ -577,6 +578,7 @@ impl Qwen35Model {
     /// it).
     pub(crate) fn require_trainable(&self, what: &str) -> Result<(), String> {
         self.check_untorn(what)?;
+        self.require_dense(what)?;
         if self.precision == Precision::Bf16 && self.lm_head_bf16.is_some() {
             return Err(format!(
                 "{what}: a bf16 model loaded with its packed LM head cannot change its weights (the head \

@@ -317,6 +317,7 @@ impl Qwen35Grads {
     /// weight's dtype (bf16 matrices on a bf16 model): a bank for
     /// [`Qwen35Model::train_step_into`], resident.
     pub fn zeros_like(model: &Qwen35Model) -> Result<Self, String> {
+        model.require_dense("Qwen35Grads::zeros_like")?;
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let mixer = match &layer.mixer {
@@ -346,7 +347,7 @@ impl Qwen35Grads {
         }
         Ok(Self {
             embed: zeros_tensor(&model.embed)?,
-            lm_head: model.lm_head.as_ref().map(zeros_tensor).transpose()?,
+            lm_head: model.lm_head.as_ref().map(|w| zeros_tensor(w)).transpose()?,
             final_norm: zeros_buf(model, &model.final_norm)?,
             layers,
         })
@@ -1002,6 +1003,7 @@ impl Qwen35Model {
 
     /// `bank` has a buffer of each weight's size for every weight.
     fn check_bank(&self, what: &str, bank: &Qwen35Grads) -> Result<(), String> {
+        self.require_dense(what)?;
         if bank.layers.len() != self.layers.len() {
             return Err(format!(
                 "{what}: the bank has {} layers, the model {}",
@@ -1620,7 +1622,7 @@ impl Qwen35Model {
     /// Bytes [`Self::fused_top_bank`] allocates, at the pool's rounding.
     fn fused_top_bank_bytes(&self) -> u64 {
         let mut parts = vec![tensor_part(&self.embed), buf_part(&self.final_norm)];
-        parts.extend(self.lm_head.as_ref().map(tensor_part));
+        parts.extend(self.lm_head.as_ref().map(|w| tensor_part(w)));
         parts.iter().fold(0u64, |a, p| a.saturating_add(scratch_part_bytes(p)))
     }
 
@@ -2136,6 +2138,11 @@ impl Qwen35Model {
         lens: Option<&[u32]>,
         fused: Option<AdamWConfig>,
     ) -> u64 {
+        // A quantized model has no step: the bound is "never fits" rather than
+        // a figure for weights it does not hold.
+        if self.is_mlx_q4() {
+            return u64::MAX;
+        }
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -3268,9 +3275,13 @@ impl Qwen35Model {
 
 // The peak-footprint reader the bench bins and tests/ share, for the 2B test's
 // closing line.
+// (`qwen35_q4` owns the in-library include of that file.)
 #[cfg(test)]
-#[path = "bin/common/footprint.rs"]
-mod footprint;
+mod footprint {
+    pub(super) fn peak_footprint() -> Result<u64, String> {
+        crate::qwen35_q4::peak_footprint_now()
+    }
+}
 
 #[cfg(test)]
 mod tests {

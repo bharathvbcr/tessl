@@ -94,10 +94,14 @@ use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
 use crate::json::Json;
 use crate::loader::Loader;
-use crate::nn::{AttnDims, DecodeScratch};
+use crate::nn::{AttnDims, DecodeScratch, GEMM_Q4_MLX_MAX_M};
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice, GdnWorkspace,
     LmHead, OutCols, SharedPrefix, StateIn,
+};
+use crate::qwen35_q4::{
+    classify_outside, peak_footprint_now, MlxNames, MlxQ4Error, MlxQ4LoadReport, MlxQuant, NormConvention, Q4Weight,
+    Weight,
 };
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::safetensors::TensorSource;
@@ -424,9 +428,47 @@ impl Precision {
     }
 }
 
+/// What a checkpoint's matrices are stored as, and so how [`Qwen35Model::load_impl`]
+/// reads them.
+#[derive(Clone, Copy)]
+enum Format {
+    /// Dense bf16 or f32 tensors, as transformers writes them.
+    Dense(Precision),
+    /// MLX affine 4-bit, group 64 ([`crate::qwen35_q4`]).
+    MlxQ4 {
+        convention: NormConvention,
+        names: MlxNames,
+    },
+}
+
+impl Format {
+    /// The forward's activation precision: a 4-bit model's activations are bf16.
+    fn precision(self) -> Precision {
+        match self {
+            Self::Dense(p) => p,
+            Self::MlxQ4 { .. } => Precision::Bf16,
+        }
+    }
+
+    fn convention(self) -> NormConvention {
+        match self {
+            Self::Dense(_) => NormConvention::Hf,
+            Self::MlxQ4 { convention, .. } => convention,
+        }
+    }
+
+    /// The untied head's name without its `.weight`.
+    fn head_name(self) -> &'static str {
+        match self {
+            Self::Dense(_) => "lm_head",
+            Self::MlxQ4 { names, .. } => names.head,
+        }
+    }
+}
+
 pub(crate) struct GdnWeights {
-    pub(crate) w_in: Tensor,
-    pub(crate) w_out: Tensor,
+    pub(crate) w_in: Weight,
+    pub(crate) w_out: Weight,
     pub(crate) conv_w: GpuBuffer,
     pub(crate) a_log: GpuBuffer,
     pub(crate) dt_bias: GpuBuffer,
@@ -434,8 +476,8 @@ pub(crate) struct GdnWeights {
 }
 
 pub(crate) struct AttnWeights {
-    pub(crate) w_in: Tensor,
-    pub(crate) w_out: Tensor,
+    pub(crate) w_in: Weight,
+    pub(crate) w_out: Weight,
     pub(crate) q_norm: GpuBuffer,
     pub(crate) k_norm: GpuBuffer,
 }
@@ -449,9 +491,9 @@ pub(crate) struct Layer {
     pub(crate) input_norm: GpuBuffer,
     pub(crate) post_norm: GpuBuffer,
     pub(crate) mixer: Mixer,
-    pub(crate) gate: Tensor,
-    pub(crate) up: Tensor,
-    pub(crate) down: Tensor,
+    pub(crate) gate: Weight,
+    pub(crate) up: Weight,
+    pub(crate) down: Weight,
 }
 
 /// A loaded model: weights on the device in the layouts the kernels read.
@@ -462,12 +504,15 @@ pub struct Qwen35Model {
     /// `[vocab, hidden]` in the forward's precision: the embedding (the
     /// gather's table; tied, also the head, in f32 the head GEMM's transposed
     /// operand, and what training reads and writes).
-    pub(crate) embed: Tensor,
+    ///
+    /// An MLX 4-bit model ([`Self::load_mlx_q4`]) holds it quantized, and its
+    /// head is that same bank (tied) or its own (untied): see [`Weight`].
+    pub(crate) embed: Weight,
     /// An untied model's own LM head (`lm_head.weight`), `[vocab, hidden]` in
     /// the forward's precision; `None` when tied, where `embed` is the head.
     /// Read through [`Self::head_table`]: the head GEMM (f32), the packed
     /// bf16 copy's source, `score_answers` and training's cross-entropy.
-    pub(crate) lm_head: Option<Tensor>,
+    pub(crate) lm_head: Option<Weight>,
     /// Bf16 only: the head (the tied embedding, or `lm_head`) packed `[hidden, vocab]` for an NN GEMM,
     /// which measured faster than the NT GEMM over `embed` at the 2B's
     /// head, even with the NT tile tuned for it (5-11%,
@@ -601,7 +646,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         precision: Precision,
     ) -> Result<Self, String> {
-        Self::load_impl(rt, st, prefix, cfg, precision, true)
+        Self::load_impl(rt, st, prefix, cfg, Format::Dense(precision), true).map(|(m, _)| m)
     }
 
     /// [`Self::load`] without the LM head: for a model that is read through
@@ -619,7 +664,113 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         precision: Precision,
     ) -> Result<Self, String> {
-        Self::load_impl(rt, st, prefix, cfg, precision, false)
+        Self::load_impl(rt, st, prefix, cfg, Format::Dense(precision), false).map(|(m, _)| m)
+    }
+
+    /// Load an MLX affine 4-bit checkpoint (what `mlx_lm.convert -q --q-bits 4
+    /// --q-group-size 64` writes, see [`crate::qwen35_q4`]) straight into the
+    /// Q4 kernels' banks: no bf16 or f32 copy of any matrix, on the host or
+    /// the device. The projections, the embedding and the head stay 4-bit; the
+    /// forward is [`Precision::Bf16`]'s otherwise (bf16 GEMM inputs, f32
+    /// accumulation and residual stream), decode runs the Q4 GEMV and prefill
+    /// the Q4 GEMM (the small-batch kernel up to 8 rows, the TensorOps one
+    /// above). Training, parameter access and the optimizer refuse it
+    /// ([`Self::require_dense`]); so does [`Staged::score_answers`], which
+    /// reads a dense head.
+    ///
+    /// The key spelling (mlx-lm's `language_model.model.*` or Hugging Face's
+    /// `model.language_model.*`) is detected from `st`; `quant_config_json`
+    /// is the checkpoint's `config.json` text, whose `quantization` must be
+    /// the one supported kind. `mtp.*` and vision tensors are skipped by name
+    /// and reported, never silently; every other tensor under the prefix is
+    /// still refused ([`Loader::refuse_unread`]).
+    pub fn load_mlx_q4(
+        rt: &Arc<GpuRuntime>,
+        st: &dyn TensorSource,
+        cfg: Qwen35Config,
+        quant_config_json: &str,
+    ) -> Result<(Self, MlxQ4LoadReport), String> {
+        MlxQuant::from_config_json(quant_config_json)?;
+        let names = MlxNames::detect(st.names())?;
+        let convention = Self::detect_convention(st, names.prefix, &cfg)?;
+        let before = peak_footprint_now()?;
+        let fmt = Format::MlxQ4 { convention, names };
+        let (model, outside) = Self::load_impl(rt, st, names.prefix, cfg, fmt, true)?;
+        let skipped = classify_outside(outside.iter().map(String::as_str))?;
+        let q4_bytes = model.q4_bytes();
+        Ok((
+            model,
+            MlxQ4LoadReport {
+                q4_bytes,
+                peak_footprint_before: before,
+                peak_footprint_after: peak_footprint_now()?,
+                skipped,
+                convention,
+                names,
+            },
+        ))
+    }
+
+    /// Device bytes of every quantized bank the model holds.
+    fn q4_bytes(&self) -> u64 {
+        fn mixer(m: &Mixer) -> [&Weight; 2] {
+            match m {
+                Mixer::Gdn(w) => [&w.w_in, &w.w_out],
+                Mixer::Attn(w) => [&w.w_in, &w.w_out],
+            }
+        }
+        let mut all: Vec<&Weight> = vec![&self.embed];
+        all.extend(self.lm_head.as_ref());
+        for l in &self.layers {
+            all.extend(mixer(&l.mixer));
+            all.extend([&l.gate, &l.up, &l.down]);
+        }
+        all.into_iter().filter_map(Weight::q4).map(Q4Weight::nbytes).sum()
+    }
+
+    /// Whether the weights are MLX 4-bit (no dense tensors to train or write).
+    pub fn is_mlx_q4(&self) -> bool {
+        self.embed.q4().is_some()
+    }
+
+    /// Refuse what reads the dense weights (training, the parameter table, the
+    /// optimizer) on a quantized model.
+    pub(crate) fn require_dense(&self, what: &str) -> Result<(), String> {
+        if self.is_mlx_q4() {
+            return Err(format!(
+                "{what}: this model's weights are MLX 4-bit ({} GEMV/GEMM banks, no dense tensors); training, \
+                 parameter access and the optimizer need a dense model",
+                self.layers.len() * 5 + 1
+            ));
+        }
+        Ok(())
+    }
+
+    /// Which conventions a quantized checkpoint's GDN layers are in; every
+    /// GDN layer must agree, and at least one must exist to tell.
+    fn detect_convention(
+        st: &dyn TensorSource,
+        prefix: &str,
+        cfg: &Qwen35Config,
+    ) -> Result<NormConvention, MlxQ4Error> {
+        let (conv_dim, kernel) = (cfg.gdn.conv_dim() as usize, cfg.conv_kernel as usize);
+        let mut found: Option<NormConvention> = None;
+        for (l, kind) in cfg.layers.iter().enumerate() {
+            if *kind != LayerKind::LinearAttention {
+                continue;
+            }
+            let name = format!("{prefix}layers.{l}.linear_attn.conv1d.weight");
+            let info = st.tensor_info(&name).map_err(|why| MlxQ4Error::Convention { why })?;
+            let c = NormConvention::from_conv_shape(&name, &info.shape, conv_dim, kernel)?;
+            if found.replace(c).is_some_and(|prev| prev != c) {
+                return Err(MlxQ4Error::Convention {
+                    why: format!("{name} is in a different layout than an earlier layer's"),
+                });
+            }
+        }
+        found.ok_or_else(|| MlxQ4Error::Convention {
+            why: "the config has no GDN layer, so the norm convention cannot be told from conv1d.weight".into(),
+        })
     }
 
     fn load_impl(
@@ -627,43 +778,67 @@ impl Qwen35Model {
         st: &dyn TensorSource,
         prefix: &str,
         cfg: Qwen35Config,
-        precision: Precision,
+        fmt: Format,
         with_head: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Vec<String>), String> {
         cfg.validate()?;
         let ld = Loader::new(rt, st, prefix);
         let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
+        let precision = fmt.precision();
+        let head_name = fmt.head_name();
 
         // The embedding: one [vocab, hidden] table in the model's precision,
         // which the gather reads by row and, tied, the LM head as the
         // transposed right operand of one GEMM. Untied, the head is its own
         // table read from the checkpoint root; a tied checkpoint carrying one
-        // is refused (it would be read by nothing).
+        // is refused (it would be read by nobody).
         let tied = cfg.tie_word_embeddings;
-        if tied && ld.has_root(LM_HEAD_NAME) {
+        if tied && ld.has_root(&format!("{head_name}.weight")) {
             return Err(format!(
-                "Qwen35Model::load: the config ties the word embeddings but the checkpoint carries {LM_HEAD_NAME}; \
+                "Qwen35Model::load: the config ties the word embeddings but the checkpoint carries {head_name}.weight; \
                  the tied forward would ignore it (tie_word_embeddings is false for such a model)"
             ));
         }
-        let (embed, tied_head_bf16) = Self::load_table(
-            rt,
-            &ld,
-            "embed_tokens.weight",
-            false,
-            [vocab, h],
-            precision,
-            with_head && tied,
-        )?;
-        let (lm_head, untied_head_bf16) = if tied {
-            (None, None)
-        } else {
-            let (t, packed) = Self::load_table(rt, &ld, LM_HEAD_NAME, true, [vocab, h], precision, with_head)?;
-            (Some(t), packed)
+        let (embed, tied_head_bf16, lm_head, untied_head_bf16) = match fmt {
+            Format::Dense(_) => {
+                let (embed, tied_head_bf16) = Self::load_table(
+                    rt,
+                    &ld,
+                    "embed_tokens.weight",
+                    false,
+                    [vocab, h],
+                    precision,
+                    with_head && tied,
+                )?;
+                let (lm_head, untied_head_bf16) = if tied {
+                    (None, None)
+                } else {
+                    let (t, packed) = Self::load_table(rt, &ld, LM_HEAD_NAME, true, [vocab, h], precision, with_head)?;
+                    (Some(Weight::Dense(t)), packed)
+                };
+                (Weight::Dense(embed), tied_head_bf16, lm_head, untied_head_bf16)
+            }
+            Format::MlxQ4 { .. } => {
+                let embed = Weight::Q4(ld.mlx_q4_root(&format!("{prefix}embed_tokens.weight"), vocab, h)?);
+                let lm_head = if tied {
+                    None
+                } else {
+                    Some(Weight::Q4(ld.mlx_q4_root(&format!("{head_name}.weight"), vocab, h)?))
+                };
+                (embed, None, lm_head, None)
+            }
         };
         let lm_head_bf16 = tied_head_bf16.or(untied_head_bf16);
-        let final_norm = ld.norm("norm.weight", h)?;
+        let final_norm = ld.unit_norm("norm.weight", h, fmt.convention())?;
 
+        // A projection's packed window: dense columns of one GEMM operand, or
+        // the same parts' rows concatenated in one quantized bank.
+        let lin = |parts: &[(&str, usize)], in_features: usize| -> Result<Weight, String> {
+            match fmt {
+                Format::Dense(p) => ld.linear(parts, in_features, p).map(Weight::Dense),
+                Format::MlxQ4 { .. } => ld.mlx_q4(parts, in_features).map(Weight::Q4),
+            }
+        };
         let (g, a) = (cfg.gdn, cfg.attn);
         let mut layers = Vec::with_capacity(cfg.layers.len());
         for (l, kind) in cfg.layers.iter().enumerate() {
@@ -675,7 +850,7 @@ impl Qwen35Model {
                     let kw = cfg.conv_kernel as usize;
                     let vh = g.v_heads() as usize;
                     Mixer::Gdn(GdnWeights {
-                        w_in: ld.linear(
+                        w_in: lin(
                             &[
                                 (&p("linear_attn.in_proj_qkv.weight"), pw[0]),
                                 (&p("linear_attn.in_proj_z.weight"), pw[1]),
@@ -683,14 +858,14 @@ impl Qwen35Model {
                                 (&p("linear_attn.in_proj_a.weight"), pw[3]),
                             ],
                             h,
-                            precision,
                         )?,
-                        w_out: ld.linear(
-                            &[(&p("linear_attn.out_proj.weight"), h)],
-                            g.value_dim() as usize,
-                            precision,
-                        )?,
-                        conv_w: ld.buf(&ld.f32(&p("linear_attn.conv1d.weight"), &[conv_dim, 1, kw])?)?,
+                        w_out: lin(&[(&p("linear_attn.out_proj.weight"), h)], g.value_dim() as usize)?,
+                        // `[conv_dim, 1, k]`, or `[conv_dim, k, 1]` in an MLX
+                        // checkpoint: the same bytes either way.
+                        conv_w: ld.buf(&ld.f32(
+                            &p("linear_attn.conv1d.weight"),
+                            &fmt.convention().conv_shape(conv_dim, kw),
+                        )?)?,
                         a_log: ld.buf(&ld.f32(&p("linear_attn.A_log"), &[vh])?)?,
                         dt_bias: ld.buf(&ld.f32(&p("linear_attn.dt_bias"), &[vh])?)?,
                         norm_w: ld.buf(&ld.f32(&p("linear_attn.norm.weight"), &[g.v_dim() as usize])?)?,
@@ -700,54 +875,58 @@ impl Qwen35Model {
                     let pw = a.part_widths();
                     let d = a.head_dim() as usize;
                     Mixer::Attn(AttnWeights {
-                        w_in: ld.linear(
+                        w_in: lin(
                             &[
                                 (&p("self_attn.q_proj.weight"), pw[0]),
                                 (&p("self_attn.k_proj.weight"), pw[1]),
                                 (&p("self_attn.v_proj.weight"), pw[2]),
                             ],
                             h,
-                            precision,
                         )?,
-                        w_out: ld.linear(
+                        w_out: lin(
                             &[(&p("self_attn.o_proj.weight"), h)],
                             (a.q_heads() * a.head_dim()) as usize,
-                            precision,
                         )?,
                         // The kernel applies (1 + w) itself.
-                        q_norm: ld.buf(&ld.f32(&p("self_attn.q_norm.weight"), &[d])?)?,
-                        k_norm: ld.buf(&ld.f32(&p("self_attn.k_norm.weight"), &[d])?)?,
+                        q_norm: ld.unit_norm(&p("self_attn.q_norm.weight"), d, fmt.convention())?,
+                        k_norm: ld.unit_norm(&p("self_attn.k_norm.weight"), d, fmt.convention())?,
                     })
                 }
             };
             layers.push(Layer {
-                input_norm: ld.norm(&p("input_layernorm.weight"), h)?,
-                post_norm: ld.norm(&p("post_attention_layernorm.weight"), h)?,
+                input_norm: ld.unit_norm(&p("input_layernorm.weight"), h, fmt.convention())?,
+                post_norm: ld.unit_norm(&p("post_attention_layernorm.weight"), h, fmt.convention())?,
                 mixer,
-                gate: ld.linear(&[(&p("mlp.gate_proj.weight"), inter)], h, precision)?,
-                up: ld.linear(&[(&p("mlp.up_proj.weight"), inter)], h, precision)?,
-                down: ld.linear(&[(&p("mlp.down_proj.weight"), h)], inter, precision)?,
+                gate: lin(&[(&p("mlp.gate_proj.weight"), inter)], h)?,
+                up: lin(&[(&p("mlp.up_proj.weight"), inter)], h)?,
+                down: lin(&[(&p("mlp.down_proj.weight"), h)], inter)?,
             });
         }
         // Every tensor under the prefix is a parameter of this model: a longer
         // layer stack, a bias or an extra norm is a different model.
         ld.refuse_unread()?;
+        // Outside it, what no read touched: handed back for the caller to
+        // sort (a quantized load skips `mtp.*` and the vision tower by name).
+        let outside: Vec<String> = ld.unread_outside().into_iter().map(str::to_string).collect();
         rt.synchronize()?;
-        Ok(Self {
-            cfg,
-            precision,
-            rt: Arc::clone(rt),
-            embed,
-            lm_head,
-            lm_head_bf16,
-            final_norm,
-            layers,
-            gdn_scan: GdnScanSlice::default(),
-            param_generation: AtomicU64::new(0),
-            layer_fault: AtomicUsize::new(usize::MAX),
-            read_fault: AtomicUsize::new(usize::MAX),
-            torn: OnceLock::new(),
-        })
+        Ok((
+            Self {
+                cfg,
+                precision,
+                rt: Arc::clone(rt),
+                embed,
+                lm_head,
+                lm_head_bf16,
+                final_norm,
+                layers,
+                gdn_scan: GdnScanSlice::default(),
+                param_generation: AtomicU64::new(0),
+                layer_fault: AtomicUsize::new(usize::MAX),
+                read_fault: AtomicUsize::new(usize::MAX),
+                torn: OnceLock::new(),
+            },
+            outside,
+        ))
     }
 
     /// One `[vocab, hidden]` table (the embedding, or an untied head at the
@@ -882,9 +1061,9 @@ impl Qwen35Model {
                 }
             }
         };
-        let mut tensor = |shape: &[usize], p: Precision| -> Result<Tensor, String> {
+        let mut tensor = |shape: &[usize], p: Precision| -> Result<Weight, String> {
             let data = uniform(shape.iter().product());
-            upload(shape, p, &data)
+            upload(shape, p, &data).map(Weight::Dense)
         };
         let zeros = |n: usize| -> Result<GpuBuffer, String> {
             let b = rt.alloc_buffer_hot(n.max(1) * 4)?;
@@ -892,7 +1071,7 @@ impl Qwen35Model {
             Ok(b)
         };
         let (g, a) = (cfg.gdn, cfg.attn);
-        let embed = upload(&[vocab, h], precision, &embed_data)?;
+        let embed = Weight::Dense(upload(&[vocab, h], precision, &embed_data)?);
         // Tied, the head is the embedding's own draw; an untied head is drawn
         // after every layer, so the tower's weights are the tied model's.
         let tied_head_bf16 = if with_head && cfg.tie_word_embeddings && precision == Precision::Bf16 {
@@ -910,7 +1089,9 @@ impl Qwen35Model {
         for kind in &cfg.layers {
             let mixer = match kind {
                 LayerKind::LinearAttention => {
-                    let conv_w = tensor(&[(g.conv_dim() * cfg.conv_kernel) as usize], Precision::F32)?.buffer;
+                    let conv_w = tensor(&[(g.conv_dim() * cfg.conv_kernel) as usize], Precision::F32)?
+                        .buffer
+                        .clone();
                     Mixer::Gdn(GdnWeights {
                         w_in: tensor(&[h, g.width() as usize], precision)?,
                         w_out: tensor(&[g.value_dim() as usize, h], precision)?,
@@ -946,7 +1127,7 @@ impl Qwen35Model {
             } else {
                 None
             };
-            (Some(upload(&[vocab, h], precision, &data)?), packed)
+            (Some(Weight::Dense(upload(&[vocab, h], precision, &data)?)), packed)
         };
         rt.synchronize()?;
         Ok(Self {
@@ -991,9 +1172,10 @@ impl Qwen35Model {
     pub fn describe(&self) -> String {
         let c = &self.cfg;
         let attn = c.layers.iter().filter(|&&k| k == LayerKind::FullAttention).count();
-        let matrices = match self.precision {
-            Precision::Bf16 => "bf16",
-            Precision::F32 => "f32",
+        let matrices = match (self.precision, self.is_mlx_q4()) {
+            (_, true) => "MLX affine 4-bit (group 64)",
+            (Precision::Bf16, false) => "bf16",
+            (Precision::F32, false) => "f32",
         };
         format!(
             "Qwen3.5 text: hidden {}, intermediate {}, vocab {}, {} layers ({} GDN, {attn} attention); \
@@ -1003,7 +1185,9 @@ impl Qwen35Model {
             c.vocab,
             c.layers.len(),
             c.layers.len() - attn,
-            if self.lm_head_bf16.is_some() {
+            if self.is_mlx_q4() {
+                "4-bit (the embedding's bank when tied, else its own)"
+            } else if self.lm_head_bf16.is_some() {
                 "packed bf16 copy"
             } else if self.precision == Precision::F32 {
                 if self.lm_head.is_some() {
@@ -1226,7 +1410,7 @@ impl Qwen35Model {
 
     /// Refuse what needs the LM head on a model loaded without one.
     fn require_head(&self, what: &str) -> Result<(), String> {
-        if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() {
+        if self.precision == Precision::Bf16 && self.lm_head_bf16.is_none() && !self.is_mlx_q4() {
             return Err(format!(
                 "{what}: this model was built without an LM head (load_tower or random_tower); use begin / advance_to / \
                  final_norm_f32, or Staged::score_answers"
@@ -1239,18 +1423,21 @@ impl Qwen35Model {
     /// `[ids.len(), hidden]`).
     fn embed_ids(&self, ids: &[u32], out: &Tensor) -> Result<(), String> {
         let id_buf = self.rt.alloc_buffer_from_u32(ids)?;
-        qwen35::embed_rows(
-            &self.rt,
-            &id_buf,
-            ids.len() as u32,
-            LmHead {
-                weight: &self.embed.buffer,
-                dtype: self.embed.dtype,
-                vocab: self.cfg.vocab,
-            },
-            self.cfg.hidden,
-            &out.buffer,
-        )
+        match &self.embed {
+            Weight::Q4(q) => q.gather(&self.rt, &id_buf, ids.len() as u32, &out.buffer),
+            Weight::Dense(embed) => qwen35::embed_rows(
+                &self.rt,
+                &id_buf,
+                ids.len() as u32,
+                LmHead {
+                    weight: &embed.buffer,
+                    dtype: embed.dtype,
+                    vocab: self.cfg.vocab,
+                },
+                self.cfg.hidden,
+                &out.buffer,
+            ),
+        }
     }
 
     /// Fresh state for [`Self::prefill`] of `t` tokens and `max_new` after
@@ -1342,16 +1529,26 @@ impl Qwen35Model {
     /// `[rows, vocab]`. Encoded, not waited for.
     fn head(&self, resid: &Tensor, x: &Tensor, out: &Tensor) -> Result<(), String> {
         self.norm(resid, &self.final_norm, x)?;
-        match &self.lm_head_bf16 {
-            Some(head) => gemm(x, head, out, BACKEND),
-            None => gemm_nt_f32(x, self.head_table(), out, BACKEND),
+        match (&self.lm_head_bf16, self.head_table()) {
+            (_, Weight::Q4(q)) => q.matmul(&self.rt, x, out, None),
+            (Some(head), _) => gemm(x, head, out, BACKEND),
+            (None, Weight::Dense(table)) => gemm_nt_f32(x, table, out, BACKEND),
         }
     }
 
     /// The `[vocab, hidden]` table the LM head reads: an untied model's own
     /// `lm_head`, else the tied embedding.
-    pub(crate) fn head_table(&self) -> &Tensor {
+    pub(crate) fn head_table(&self) -> &Weight {
         self.lm_head.as_ref().unwrap_or(&self.embed)
+    }
+
+    /// `out = x @ w` through whichever kind of weight `w` is, `out` f32: the
+    /// dense GEMM, or the Q4 GEMV / GEMM over the same activation.
+    fn project(&self, x: &Tensor, w: &Weight, out: &Tensor) -> Result<(), String> {
+        match w {
+            Weight::Dense(t) => gemm(x, t, out, BACKEND),
+            Weight::Q4(q) => q.matmul(&self.rt, x, out, None),
+        }
     }
 
     /// `out = rms_norm(x) * (1 + w)` in the forward's activation dtype.
@@ -1370,7 +1567,28 @@ impl Qwen35Model {
     }
 
     /// `resid += y @ w_out`.
-    fn project_residual(&self, y: &Tensor, w_out: &Tensor, a: &Acts) -> Result<(), String> {
+    fn project_residual(&self, y: &Tensor, w_out: &Weight, a: &Acts) -> Result<(), String> {
+        let w_out = match w_out {
+            Weight::Dense(t) => t,
+            // The Q4 kernels add the residual in the same dispatch for up to
+            // eight rows (the output is the residual itself, the one writable
+            // alias they allow); more rows go through the TensorOps GEMM into
+            // `proj_out` and the same add the F32 forward uses.
+            Weight::Q4(q) if a.t <= GEMM_Q4_MLX_MAX_M => {
+                return q.matmul(&self.rt, y, &a.resid, Some(&a.resid.buffer));
+            }
+            Weight::Q4(q) => {
+                q.matmul(&self.rt, y, &a.proj_out, None)?;
+                let width = self.cfg.hidden;
+                return qwen35::residual_add(
+                    &self.rt,
+                    Cols::dense(&a.proj_out.buffer, width),
+                    Cols::dense(&a.resid.buffer, width),
+                    a.t,
+                    width,
+                );
+            }
+        };
         match self.precision {
             Precision::Bf16 => qwen35::project_residual(y, w_out, &a.resid, BACKEND),
             Precision::F32 => {
@@ -1389,7 +1607,7 @@ impl Qwen35Model {
 
     fn gdn(&self, w: &GdnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
         let (rt, g, t) = (&self.rt, self.cfg.gdn, a.t);
-        gemm(&a.x, &w.w_in, &a.g_proj, BACKEND)?;
+        self.project(&a.x, &w.w_in, &a.g_proj)?;
         let proj = &a.g_proj.buffer;
         let x = Cols::dense(proj, g.width());
         let kw = self.cfg.conv_kernel;
@@ -1480,7 +1698,7 @@ impl Qwen35Model {
 
     fn attention(&self, w: &AttnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
         let (rt, l, t) = (&self.rt, self.cfg.attn, a.t);
-        gemm(&a.x, &w.w_in, &a.a_proj, BACKEND)?;
+        self.project(&a.x, &w.w_in, &a.a_proj)?;
         let pc = Cols::dense(&a.a_proj.buffer, l.width());
         let shape = AttnShape {
             batch: 1,
@@ -1584,8 +1802,8 @@ impl Qwen35Model {
 
     fn mlp(&self, layer: &Layer, a: &Acts) -> Result<(), String> {
         let inter = self.cfg.intermediate;
-        gemm(&a.x, &layer.gate, &a.m_gate, BACKEND)?;
-        gemm(&a.x, &layer.up, &a.m_up, BACKEND)?;
+        self.project(&a.x, &layer.gate, &a.m_gate)?;
+        self.project(&a.x, &layer.up, &a.m_up)?;
         qwen35::swiglu(
             &self.rt,
             Cols::dense(&a.m_gate.buffer, inter),
@@ -1881,6 +2099,11 @@ impl Staged<'_> {
         let (m, t) = (self.model, self.a.t);
         let (rt, cfg) = (&m.rt, &m.cfg);
         self.check_usable(WHAT)?;
+        let Weight::Dense(head) = m.head_table() else {
+            return Err(format!(
+                "{WHAT}: this model's LM head is MLX 4-bit; the answer scorer reads a dense head (use logits)"
+            ));
+        };
         if let Some(&bad) = rows.iter().find(|&&r| r >= t) {
             return Err(format!("{WHAT}: position {bad} >= {t} tokens"));
         }
@@ -1910,8 +2133,8 @@ impl Staged<'_> {
             1.0,
             cfg.rms_norm_eps,
             LmHead {
-                weight: &m.head_table().buffer,
-                dtype: m.head_table().dtype,
+                weight: &head.buffer,
+                dtype: head.dtype,
                 vocab: cfg.vocab,
             },
             &ans,

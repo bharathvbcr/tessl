@@ -16,6 +16,11 @@
    "published": true,
    "note": "Qwen3.5-2B-Base's real text config, the shape source for tests that need the 2B's dimensions"
   },
+  "config_qwen38_27b_mtp_4bit.json": {
+   "role": "config",
+   "published": true,
+   "note": "mlx-community/Qwen3.8-27B-MTP-4bit's config.json as published (snapshot b643c01): the 27B shape source (64 layers, hidden 5120, GDN 16 QK / 48 V heads, attention 24/4 of 256, untied head, quantization affine 4-bit group 64, mtp_num_hidden_layers 1)"
+  },
   "qwen35_gates_a.npy": {
    "role": "input",
    "published": true,

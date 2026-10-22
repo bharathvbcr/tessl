@@ -710,6 +710,116 @@ consumer wants the normed state, and a second read path would be one more
 buffer contract (f32 `[tokens, hidden]` aliasing live state) to keep honest.
 Revisit if a caller needs the raw residual without tracing every layer.
 
+### MLX 4-bit weights: `Qwen35Model::load_mlx_q4`
+
+`load_mlx_q4(rt, st, cfg, config_json)` loads what `mlx_lm.convert -q --q-bits 4
+--q-group-size 64` writes, straight from the safetensors into the Q4 banks
+(`nn::Q4MlxBank`): the packed words are read into the device buffer unchanged, the
+scales and biases are interleaved into the bank's `bfloat2` pairs as they are read
+(one part's at a time on the host), and no bf16 or f32 copy of any matrix exists. A
+projection's packed window is the same four (or three) checkpoint tensors as the
+dense one, with their rows concatenated in one bank instead of their columns in one
+GEMM operand. The forward is `Precision::Bf16`'s otherwise, so nothing in the layer
+order is written twice: `Weight` (`qwen35_q4.rs`) is either a dense tensor or a Q4
+bank, and the model's one `project` / `project_residual` / head / embedding seam
+dispatches on it. Decode (`Decode::step`, one row) runs `nn::gemv_q4_mlx_simd`;
+prefill runs `nn::gemm_q4_mlx` up to 8 rows and the opt-in TensorOps
+`nn::gemm_q4_mlx_tensorops` above (it is the existing kernel; the prefill-speed work on it
+is `gp-nax-int4-tensorops-and-exact-f32-epilogue`'s, not this one's). The residual add
+is fused into the GEMV / small-M GEMM and is a separate `residual_add` after the TensorOps
+one. The embedding gathers through `nn::embed_lookup_q4_mlx`, the tied head is the
+embedding's bank, and an untied head has its own.
+
+**The checkpoint layout, read from mlx-lm 0.32.0 (`mlx_lm/utils.py`, `models/qwen3_5.py`),
+not from memory.** Every `nn.Linear` and `nn.Embedding` whose last dimension is a
+multiple of the group becomes `X.weight` (U32, `[rows, cols / 8]`, eight 4-bit values per
+word, low bits first), `X.scales` and `X.biases` (the model dtype, bf16, `[rows, cols /
+64]`); `w = scale * q + bias`. That is all of a Qwen3.5 text model's projections, the
+embedding and an untied head, including the 16 or 48 row `in_proj_a` / `in_proj_b`. The
+norms, `conv1d.weight`, `A_log`, `dt_bias` and the GDN gated norm stay dense (none is a
+`Linear` or `Embedding`). `Qwen3_5.sanitize`, which the converter runs, also (a) moves
+`conv1d.weight` to `[conv_dim, k, 1]` (the same bytes as `[conv_dim, 1, k]`), (b) adds 1
+to `input_layernorm`, `post_attention_layernorm`, the final `norm`, `q_norm` and `k_norm`
+(MLX's RMSNorm multiplies by `w`; the kernels here add the 1 themselves, so the loader
+subtracts it, exactly: a bf16 value near 1 minus 1 is exact in f32), (c) renames the keys
+to `language_model.model.*` with the head at `language_model.lm_head`, and (d) drops
+`mtp.*`. The loader tells (a) and (b) from the conv layout of every GDN layer (they must
+agree), and detects (c) from the names; `tensors.txt`, written by the script below, lists
+every tensor of the real conversion for checking those three against the actual files.
+
+**Refusals, all typed (`qwen35_q4::MlxQ4Error`) and each naming the key or tensor:** `bits`
+other than 4, `group_size` other than 64, `mode` other than `affine`; per-layer entries in
+`quantization` (a mixed checkpoint); a projection or table that is dense in a quantized
+checkpoint, one with no `.scales` / `.biases`, with a wrong dtype or a wrong shape
+(including 8-bit widths and group-32 scales); disagreeing conv layouts; a checkpoint with no
+tower under either key prefix (the 239 MB `Qwen3.8-27B-MTP-4bit` drafter is one); a float16
+checkpoint. `Loader::refuse_unread` still refuses every unread tensor under the prefix. Outside
+it, `mtp.*` and the vision tower are skipped **by name** and returned in `MlxQ4LoadReport.skipped`
+(mtp by name, vision by count); anything else is refused. The report also carries the bytes of
+quantized banks and the process's lifetime peak footprint before and after the load
+(`bin/common/footprint.rs`, the figure `/usr/bin/time -l` prints).
+
+**The MTP head, decided.** It is not part of the tower: the config's `mtp_*`, `block_size` and
+`model_type` keys are read by nobody (`tests/qwen35_config.rs` pins that changing them changes
+nothing), and `mtp.*` tensors are skipped by name as above. The published
+`Qwen3.8-27B-MTP-4bit` snapshot on this machine is a drafter only (`model_type: qwen3_5_mtp`,
+one decoder layer plus `fc`, 239 MB total: `total_size` in its index), not an incomplete 27B.
+`output_gate_type: "swish"` in the 27B config is read by no implementation we have
+(mlx-lm 0.32.0, mlx-vlm 0.7.6, transformers' qwen3_5 were searched), all of which gate the
+attention output with `sigmoid`; the config parses and the sigmoid gate runs. Whether the 27B
+was trained with a swish gate is **unverified** (`tests/qwen35_config.rs` pins the current reading).
+
+A quantized model has no dense tensors, so training, the parameter table, the optimizer and
+`Staged::score_answers` refuse it with a message (`Qwen35Model::require_dense`), and the
+`*_bytes` bounds read `u64::MAX`.
+
+Verification, bounds written before any run:
+
+| test | what | bound |
+|---|---|---|
+| `tests/qwen35_mlx_q4_layout.rs` (host only, hosted CI) | config and header parsing, every refusal, the conventions, the skip lists | exact |
+| `tests/qwen35_config.rs` | the real 27B config parses to its shape; each unsupported key is refused by name | exact |
+| `mlx_q4_tiny_checkpoint_matches_its_dequantized_f32_model` | a synthetic checkpoint in the converter's layout vs the same weights dequantized into an F32 model, at 1, 5 and 70 rows | 3e-2 of the largest logit (bf16 activation rounding only; a wrong nibble, scale, window or norm convention is O(1)) |
+| `mlx_q4_tiny_prefill_then_decode_matches_forward_at_the_last_row` | prefill 1, 5, 8, 9, 70 then 3 decoded steps vs forward's last row | 2e-2 (the tiny Bf16 model's) |
+| `mlx_q4_load_refusals`, `mlx_q4_model_refuses_what_needs_dense_weights` | the refusals above at load, on the device | exact |
+| `mlx_q4_2b_matches_mlx_lm_logits` (ignored) | the real 2B, tessl vs mlx-lm on the same 4-bit files, default prompt (155) and text prompt (512) | max logit deviation <= 5e-2 of the largest logit; top-1 misses <= ceil(0.03 T); mean KL <= 2e-3; host peak footprint <= 3 GiB |
+| `mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row` (ignored) | the real 2B's decode smoke test | 2e-2, same greedy token unless the forward's top two are within it |
+
+Why those bounds: both sides use the identical 4-bit weights, so the quantization error
+cancels and what is left is activation precision. mlx-lm is bf16 throughout; tessl keeps the
+residual stream and accumulations in f32 and was measured 18x closer to fp32 than
+transformers' own bf16 forward (above), so the distance to mlx-lm is mostly mlx-lm's noise,
+which the transformers bf16-vs-fp32 floor stands for: 1e-2 of the largest logit, 3 top-1 misses
+of 155 (5 of 512), mean KL 5.7e-4 (3.7e-4). The bounds are 5x, about 1.7x, and 3.5x that
+floor. They are not measured results; no real-2B run has happened yet.
+
+Commands (the lead runs them; the conversion needs the mlx-lm venv, offline, ~5 GB of RAM):
+
+```sh
+/Users/bharath/.venvs/ml-2026-10/bin/python tools/qwen35_ref/make_mlx_q4.py    # target/qwen35_2b_mlx_q4/ and its ref/
+cargo test --release --test qwen35_mlx_q4_layout --test qwen35_config           # host only
+cargo test --release --test qwen35_mlx_q4 -- --test-threads=1                   # the synthetic checks, on the device
+cargo test --release --test qwen35_mlx_q4 -- --ignored --nocapture --test-threads=1   # the real 2B
+```
+
+`make_mlx_q4.py` is a fixture tool, not a shipped path: it converts the local
+`Qwen3.5-2B-Base` snapshot, refuses any hub access, and dumps mlx-lm's logits for the default
+prompt and `tests/fixtures/qwen35_text_ids.npy` (`QWEN35_2B_MLX_Q4_DIR` points the tests at
+another output directory).
+
+**Toward Qwen3.8-27B (AC2), what this stage leaves.** Config parse: done and tested on the real
+config. Quantized loader and Q4 kernels: shapes of the 27B (packed windows of 16480 GDN and 14336 attention rows,
+cols 5120 / 6144 / 17408, vocab 248320 rows) are inside every kernel's domain by inspection
+(`cols` multiples of 512, the TensorOps `K` bound 8648 against 5120); not run. GDN 16 QK / 48 V
+heads: host validation accepts it (`v_heads % k_heads == 0`, ratio 3), but the device tests
+exercise ratios 1 and 2 only (the 4B's 16/32 in the bench, random 1-2 in the model stress test), so
+ratio 3 needs a kernel test against the f64 oracle before it is trusted. Attention 24 / 4 of 256:
+head_dim 256 and partial RoPE 0.25 (rotary 64) are the 2B's, so they already run; the query to KV
+head ratio 6 is new (device tests cover 1, 2 and 4) and needs the same treatment. Untied head: the
+dense path loads and runs an untied head (checked on a tiny untied fixture only), and the Q4 head
+is exercised by the synthetic test (untied) at 64 rows, not at 248,320. The `swish` output gate
+and the sigmoid gate are the open question above. Decode speed against MLX is not touched here.
+
 ## Training memory: where torch's backward spends it
 
 `tools/qwen35_ref/saved_memory.py` attributes every tensor autograd saves

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::qwen35;
 use crate::qwen35_model::Precision;
+use crate::qwen35_q4::{self, NormConvention, Q4Weight};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::TensorSource;
 use crate::tensor::{GpuBuffer, Tensor};
@@ -203,6 +204,86 @@ impl<'a> Loader<'a> {
                 Ok(t)
             }
         }
+    }
+
+    /// Quantized `nn.Linear` weights, MLX affine 4-bit: each part `rest`
+    /// (`X.weight`, with `X.scales` and `X.biases` beside it) is
+    /// `[out_i, in_features]`; the parts' rows are concatenated into one
+    /// [`Q4Weight`] of `sum(out_i)` rows, the quantized form of the window
+    /// [`Self::linear`] packs. See [`Self::mlx_q4_named`].
+    pub(crate) fn mlx_q4(&self, parts: &[(&str, usize)], in_features: usize) -> Result<Q4Weight, String> {
+        let named: Vec<(String, usize)> = parts.iter().map(|&(r, o)| (self.prefixed(r), o)).collect();
+        self.mlx_q4_named(&named, in_features)
+    }
+
+    /// [`Self::mlx_q4`] for one matrix named as the checkpoint spells it
+    /// (no prefix): a table or head that lives beside the tower.
+    pub(crate) fn mlx_q4_root(&self, name: &str, rows: usize, cols: usize) -> Result<Q4Weight, String> {
+        self.mlx_q4_named(&[(name.to_string(), rows)], cols)
+    }
+
+    /// Read `parts` (full names, rows) into one bank. Each part's three
+    /// tensors are checked against their headers ([`qwen35_q4::check_part`])
+    /// before anything is read; the packed words go straight into the bank's
+    /// device storage, and the scales and biases (one part's at a time on the
+    /// host, `rows * cols / 64` bf16 each) are interleaved into the bank's
+    /// `bfloat2` pairs. All three names are recorded as read.
+    fn mlx_q4_named(&self, parts: &[(String, usize)], cols: usize) -> Result<Q4Weight, String> {
+        let total = parts
+            .iter()
+            .try_fold(0usize, |acc, (_, o)| acc.checked_add(*o))
+            .ok_or("mlx_q4: output widths overflow usize")?;
+        let group = qwen35_q4::MLX_Q4_GROUP as usize;
+        let groups = cols / group;
+        let w = Q4Weight::alloc(self.rt, total, cols)?;
+        let words_per_row = cols / 8;
+        let mut row0 = 0usize;
+        for (name, rows) in parts {
+            let (sn, bn) = qwen35_q4::sidecar_names(name)
+                .ok_or_else(|| format!("{name}: a quantized weight is named X.weight"))?;
+            let info = self.st.tensor_info(name)?;
+            let (s_info, b_info) = (self.st.tensor_info(&sn).ok(), self.st.tensor_info(&bn).ok());
+            qwen35_q4::check_part(name, &info, s_info.as_ref(), b_info.as_ref(), *rows, cols)?;
+            self.take_root(name);
+            let (sn, bn) = (self.take_root(&sn), self.take_root(&bn));
+            {
+                let mut words = w.packed().try_contents_u32()?;
+                self.st.read_u32_into(
+                    name,
+                    &[*rows, words_per_row],
+                    &mut words[row0 * words_per_row..(row0 + rows) * words_per_row],
+                )?;
+            }
+            let n = rows * groups;
+            let (mut scales, mut biases) = (vec![0u16; n], vec![0u16; n]);
+            self.st.read_bf16_bits_into(&sn, &[*rows, groups], &mut scales)?;
+            self.st.read_bf16_bits_into(&bn, &[*rows, groups], &mut biases)?;
+            let mut pairs = w.scales_biases().try_contents_u16()?;
+            let dst = &mut pairs[2 * row0 * groups..2 * (row0 + rows) * groups];
+            for (i, (s, b)) in scales.iter().zip(&biases).enumerate() {
+                dst[2 * i] = *s;
+                dst[2 * i + 1] = *b;
+            }
+            row0 += rows;
+        }
+        Ok(w)
+    }
+
+    /// A `[dim]` weight as a kernel that adds 1 itself wants it, from a
+    /// checkpoint stored in `convention` (see [`NormConvention`]).
+    pub(crate) fn unit_norm(&self, rest: &str, dim: usize, convention: NormConvention) -> Result<GpuBuffer, String> {
+        let stored = self.f32(rest, &[dim])?;
+        let w: Vec<f32> = stored.iter().map(|&v| convention.unshift(v)).collect();
+        self.buf(&w)
+    }
+
+    /// Tensors outside the prefix that no read touched, sorted.
+    pub(crate) fn unread_outside(&self) -> Vec<&str> {
+        let read = self.read.borrow();
+        self.st
+            .names()
+            .filter(|n| !n.starts_with(self.prefix) && !read.contains(*n))
+            .collect()
     }
 
     /// A tensor under the prefix that the forward never read would be a

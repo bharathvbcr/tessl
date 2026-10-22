@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::dispatch::{dispatch_2d, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
-use crate::qwen35_train::{MixerGrads, Qwen35Grads};
+use crate::qwen35_train::{LayerGrads, MixerGrads, Qwen35Grads};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
@@ -317,10 +317,174 @@ fn offsets<const N: usize>(widths: [usize; N]) -> [usize; N] {
     out
 }
 
+/// The embedding's slot (table index 0), with its gradient if given.
+pub(crate) fn embed_slot<'a>(m: &'a Qwen35Model, grad: Option<&'a Tensor>) -> Slot<'a> {
+    Slot {
+        info: info(
+            "embed_tokens.weight".into(),
+            &[m.cfg.vocab as usize, m.cfg.hidden as usize],
+            false,
+        ),
+        param: Src::Dense(&m.embed),
+        grad: grad.map(Src::Dense),
+    }
+}
+
+/// One layer's slots (table indices follow the previous layer's), with its
+/// gradients in `lg` if given.
+pub(crate) fn layer_slots<'a>(
+    m: &'a Qwen35Model,
+    l: usize,
+    lg: Option<&'a LayerGrads>,
+) -> Result<Vec<Slot<'a>>, String> {
+    let cfg = &m.cfg;
+    let (h, inter) = (cfg.hidden as usize, cfg.intermediate as usize);
+    let layer = &m.layers[l];
+    let mut out = Vec::new();
+    let p = |s: &str| format!("layers.{l}.{s}");
+    match &layer.mixer {
+        Mixer::Gdn(w) => {
+            let gg = match lg.map(|x| &x.mixer) {
+                None => None,
+                Some(MixerGrads::Gdn(gg)) => Some(gg),
+                Some(MixerGrads::Attn(_)) => return Err(format!("layer {l}: attention gradients for a GDN layer")),
+            };
+            let gd = cfg.gdn;
+            let widths = gd.part_widths();
+            let offs = offsets(widths);
+            for (i, part) in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
+                .iter()
+                .enumerate()
+            {
+                out.push(Slot {
+                    info: info(p(&format!("linear_attn.{part}.weight")), &[widths[i], h], true),
+                    param: Src::Packed(&w.w_in, offs[i]),
+                    grad: gg.map(|g| Src::Packed(&g.w_in, offs[i])),
+                });
+            }
+            let (vh, kw) = (gd.v_heads() as usize, cfg.conv_kernel as usize);
+            out.push(Slot {
+                info: info(p("linear_attn.out_proj.weight"), &[h, gd.value_dim() as usize], true),
+                param: Src::Packed(&w.w_out, 0),
+                grad: gg.map(|g| Src::Packed(&g.w_out, 0)),
+            });
+            out.push(Slot {
+                info: info(p("linear_attn.conv1d.weight"), &[gd.conv_dim() as usize, 1, kw], false),
+                param: Src::Raw(&w.conv_w),
+                grad: gg.map(|g| Src::Raw(&g.conv_w)),
+            });
+            out.push(Slot {
+                info: info(p("linear_attn.A_log"), &[vh], false),
+                param: Src::Raw(&w.a_log),
+                grad: gg.map(|g| Src::Raw(&g.a_log)),
+            });
+            out.push(Slot {
+                info: info(p("linear_attn.dt_bias"), &[vh], false),
+                param: Src::Raw(&w.dt_bias),
+                grad: gg.map(|g| Src::Raw(&g.dt_bias)),
+            });
+            out.push(Slot {
+                info: info(p("linear_attn.norm.weight"), &[gd.v_dim() as usize], false),
+                param: Src::Raw(&w.norm_w),
+                grad: gg.map(|g| Src::Raw(&g.norm_w)),
+            });
+        }
+        Mixer::Attn(w) => {
+            let ag = match lg.map(|x| &x.mixer) {
+                None => None,
+                Some(MixerGrads::Attn(ag)) => Some(ag),
+                Some(MixerGrads::Gdn(_)) => return Err(format!("layer {l}: GDN gradients for an attention layer")),
+            };
+            let at = cfg.attn;
+            let widths = at.part_widths();
+            let offs = offsets(widths);
+            for (i, part) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
+                out.push(Slot {
+                    info: info(p(&format!("self_attn.{part}.weight")), &[widths[i], h], true),
+                    param: Src::Packed(&w.w_in, offs[i]),
+                    grad: ag.map(|g| Src::Packed(&g.w_in, offs[i])),
+                });
+            }
+            let d = at.head_dim() as usize;
+            out.push(Slot {
+                info: info(p("self_attn.o_proj.weight"), &[h, at.q_heads() as usize * d], true),
+                param: Src::Packed(&w.w_out, 0),
+                grad: ag.map(|g| Src::Packed(&g.w_out, 0)),
+            });
+            out.push(Slot {
+                info: info(p("self_attn.q_norm.weight"), &[d], false),
+                param: Src::Raw(&w.q_norm),
+                grad: ag.map(|g| Src::Raw(&g.q_norm)),
+            });
+            out.push(Slot {
+                info: info(p("self_attn.k_norm.weight"), &[d], false),
+                param: Src::Raw(&w.k_norm),
+                grad: ag.map(|g| Src::Raw(&g.k_norm)),
+            });
+        }
+    }
+    out.push(Slot {
+        info: info(p("mlp.gate_proj.weight"), &[inter, h], true),
+        param: Src::Packed(&layer.gate, 0),
+        grad: lg.map(|g| Src::Packed(&g.gate, 0)),
+    });
+    out.push(Slot {
+        info: info(p("mlp.up_proj.weight"), &[inter, h], true),
+        param: Src::Packed(&layer.up, 0),
+        grad: lg.map(|g| Src::Packed(&g.up, 0)),
+    });
+    out.push(Slot {
+        info: info(p("mlp.down_proj.weight"), &[h, inter], true),
+        param: Src::Packed(&layer.down, 0),
+        grad: lg.map(|g| Src::Packed(&g.down, 0)),
+    });
+    out.push(Slot {
+        info: info(p("input_layernorm.weight"), &[h], false),
+        param: Src::Raw(&layer.input_norm),
+        grad: lg.map(|g| Src::Raw(&g.input_norm)),
+    });
+    out.push(Slot {
+        info: info(p("post_attention_layernorm.weight"), &[h], false),
+        param: Src::Raw(&layer.post_norm),
+        grad: lg.map(|g| Src::Raw(&g.post_norm)),
+    });
+    Ok(out)
+}
+
+/// The slots after the last layer: the final norm, then an untied model's
+/// head, with their gradients if given.
+pub(crate) fn tail_slots<'a>(
+    m: &'a Qwen35Model,
+    grads: Option<(&'a GpuBuffer, Option<&'a Tensor>)>,
+) -> Result<Vec<Slot<'a>>, String> {
+    let (h, vocab) = (m.cfg.hidden as usize, m.cfg.vocab as usize);
+    let mut out = vec![Slot {
+        info: info("norm.weight".into(), &[h], false),
+        param: Src::Raw(&m.final_norm),
+        grad: grads.map(|(norm, _)| Src::Raw(norm)),
+    }];
+    // An untied model's head is the last entry, so the tied table's indices
+    // are the untied one's.
+    if let Some(head) = &m.lm_head {
+        let grad = match grads {
+            None => None,
+            Some((_, g)) => Some(Src::Dense(g.ok_or(
+                "the model has an untied lm_head but the gradients carry none (Qwen35Grads::zeros_like of this model)",
+            )?)),
+        };
+        out.push(Slot {
+            info: info(crate::qwen35_model::LM_HEAD_NAME.into(), &[vocab, h], false),
+            param: Src::Dense(head),
+            grad,
+        });
+    } else if grads.is_some_and(|(_, g)| g.is_some()) {
+        return Err("the gradients carry an lm_head gradient but the model is tied".into());
+    }
+    Ok(out)
+}
+
 /// Every parameter in a fixed order, with its gradient in `grads` if given.
 pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
-    let cfg = &m.cfg;
-    let (h, inter, vocab) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.vocab as usize);
     if let Some(g) = grads {
         if g.layers.len() != m.layers.len() {
             return Err(format!(
@@ -330,152 +494,25 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
             ));
         }
     }
-    let mut out = vec![Slot {
-        info: info("embed_tokens.weight".into(), &[vocab, h], false),
-        param: Src::Dense(&m.embed),
-        grad: grads.map(|g| Src::Dense(&g.embed)),
-    }];
-    for (l, layer) in m.layers.iter().enumerate() {
-        let lg = grads.map(|g| &g.layers[l]);
-        let p = |s: &str| format!("layers.{l}.{s}");
-        match &layer.mixer {
-            Mixer::Gdn(w) => {
-                let gg = match lg.map(|x| &x.mixer) {
-                    None => None,
-                    Some(MixerGrads::Gdn(gg)) => Some(gg),
-                    Some(MixerGrads::Attn(_)) => return Err(format!("layer {l}: attention gradients for a GDN layer")),
-                };
-                let gd = cfg.gdn;
-                let widths = gd.part_widths();
-                let offs = offsets(widths);
-                for (i, part) in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
-                    .iter()
-                    .enumerate()
-                {
-                    out.push(Slot {
-                        info: info(p(&format!("linear_attn.{part}.weight")), &[widths[i], h], true),
-                        param: Src::Packed(&w.w_in, offs[i]),
-                        grad: gg.map(|g| Src::Packed(&g.w_in, offs[i])),
-                    });
-                }
-                let (vh, kw) = (gd.v_heads() as usize, cfg.conv_kernel as usize);
-                out.push(Slot {
-                    info: info(p("linear_attn.out_proj.weight"), &[h, gd.value_dim() as usize], true),
-                    param: Src::Packed(&w.w_out, 0),
-                    grad: gg.map(|g| Src::Packed(&g.w_out, 0)),
-                });
-                out.push(Slot {
-                    info: info(p("linear_attn.conv1d.weight"), &[gd.conv_dim() as usize, 1, kw], false),
-                    param: Src::Raw(&w.conv_w),
-                    grad: gg.map(|g| Src::Raw(&g.conv_w)),
-                });
-                out.push(Slot {
-                    info: info(p("linear_attn.A_log"), &[vh], false),
-                    param: Src::Raw(&w.a_log),
-                    grad: gg.map(|g| Src::Raw(&g.a_log)),
-                });
-                out.push(Slot {
-                    info: info(p("linear_attn.dt_bias"), &[vh], false),
-                    param: Src::Raw(&w.dt_bias),
-                    grad: gg.map(|g| Src::Raw(&g.dt_bias)),
-                });
-                out.push(Slot {
-                    info: info(p("linear_attn.norm.weight"), &[gd.v_dim() as usize], false),
-                    param: Src::Raw(&w.norm_w),
-                    grad: gg.map(|g| Src::Raw(&g.norm_w)),
-                });
-            }
-            Mixer::Attn(w) => {
-                let ag = match lg.map(|x| &x.mixer) {
-                    None => None,
-                    Some(MixerGrads::Attn(ag)) => Some(ag),
-                    Some(MixerGrads::Gdn(_)) => return Err(format!("layer {l}: GDN gradients for an attention layer")),
-                };
-                let at = cfg.attn;
-                let widths = at.part_widths();
-                let offs = offsets(widths);
-                for (i, part) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
-                    out.push(Slot {
-                        info: info(p(&format!("self_attn.{part}.weight")), &[widths[i], h], true),
-                        param: Src::Packed(&w.w_in, offs[i]),
-                        grad: ag.map(|g| Src::Packed(&g.w_in, offs[i])),
-                    });
-                }
-                let d = at.head_dim() as usize;
-                out.push(Slot {
-                    info: info(p("self_attn.o_proj.weight"), &[h, at.q_heads() as usize * d], true),
-                    param: Src::Packed(&w.w_out, 0),
-                    grad: ag.map(|g| Src::Packed(&g.w_out, 0)),
-                });
-                out.push(Slot {
-                    info: info(p("self_attn.q_norm.weight"), &[d], false),
-                    param: Src::Raw(&w.q_norm),
-                    grad: ag.map(|g| Src::Raw(&g.q_norm)),
-                });
-                out.push(Slot {
-                    info: info(p("self_attn.k_norm.weight"), &[d], false),
-                    param: Src::Raw(&w.k_norm),
-                    grad: ag.map(|g| Src::Raw(&g.k_norm)),
-                });
-            }
-        }
-        out.push(Slot {
-            info: info(p("mlp.gate_proj.weight"), &[inter, h], true),
-            param: Src::Packed(&layer.gate, 0),
-            grad: lg.map(|g| Src::Packed(&g.gate, 0)),
-        });
-        out.push(Slot {
-            info: info(p("mlp.up_proj.weight"), &[inter, h], true),
-            param: Src::Packed(&layer.up, 0),
-            grad: lg.map(|g| Src::Packed(&g.up, 0)),
-        });
-        out.push(Slot {
-            info: info(p("mlp.down_proj.weight"), &[h, inter], true),
-            param: Src::Packed(&layer.down, 0),
-            grad: lg.map(|g| Src::Packed(&g.down, 0)),
-        });
-        out.push(Slot {
-            info: info(p("input_layernorm.weight"), &[h], false),
-            param: Src::Raw(&layer.input_norm),
-            grad: lg.map(|g| Src::Raw(&g.input_norm)),
-        });
-        out.push(Slot {
-            info: info(p("post_attention_layernorm.weight"), &[h], false),
-            param: Src::Raw(&layer.post_norm),
-            grad: lg.map(|g| Src::Raw(&g.post_norm)),
-        });
+    let mut out = vec![embed_slot(m, grads.map(|g| &g.embed))];
+    for l in 0..m.layers.len() {
+        out.extend(layer_slots(m, l, grads.map(|g| &g.layers[l]))?);
     }
-    out.push(Slot {
-        info: info("norm.weight".into(), &[h], false),
-        param: Src::Raw(&m.final_norm),
-        grad: grads.map(|g| Src::Raw(&g.final_norm)),
-    });
-    // An untied model's head is the last entry, so the tied table's indices
-    // are the untied one's.
-    if let Some(head) = &m.lm_head {
-        let grad = match grads {
-            None => None,
-            Some(g) => Some(Src::Dense(g.lm_head.as_ref().ok_or(
-                "the model has an untied lm_head but the gradients carry none (Qwen35Grads::zeros_like of this model)",
-            )?)),
-        };
-        out.push(Slot {
-            info: info(crate::qwen35_model::LM_HEAD_NAME.into(), &[vocab, h], false),
-            param: Src::Dense(head),
-            grad,
-        });
-    } else if grads.is_some_and(|g| g.lm_head.is_some()) {
-        return Err("the gradients carry an lm_head gradient but the model is tied".into());
-    }
-    // `Qwen35Grads`' fields are public, and an `AdamW` made for another model
-    // carries that model's runtime: refuse either before anything reads or
-    // writes through them.
-    for s in &out {
+    out.extend(tail_slots(m, grads.map(|g| (&g.final_norm, g.lm_head.as_ref())))?);
+    check_grads_on_runtime(m, &out)?;
+    Ok(out)
+}
+
+/// `Qwen35Grads`' fields are public, and an `AdamW` made for another model
+/// carries that model's runtime: refuse either before anything reads or
+/// writes through them.
+pub(crate) fn check_grads_on_runtime(m: &Qwen35Model, slots: &[Slot<'_>]) -> Result<(), String> {
+    for s in slots {
         if let Some(g) = s.grad {
             require_runtime(&m.rt, g.buffer(), format_args!("{}'s gradient", s.info.name))?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Check the caller's tensors against the table before touching anything.
@@ -539,6 +576,7 @@ impl Qwen35Model {
     /// optimizer step would leave behind ([`Self::load_tower`] loads without
     /// it).
     pub(crate) fn require_trainable(&self, what: &str) -> Result<(), String> {
+        self.check_untorn(what)?;
         if self.precision == Precision::Bf16 && self.lm_head_bf16.is_some() {
             return Err(format!(
                 "{what}: a bf16 model loaded with its packed LM head cannot change its weights (the head \

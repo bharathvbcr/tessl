@@ -14,6 +14,8 @@
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tiles 2048  # METRIC per tile
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
+//! cargo run --release --bin bench_qwen35_layers -- --prefill-score --weights=DIR \
+//!     --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192   # workloads JSON
 //! ```
 //!
 //! The model under test is `Qwen35Model` itself, so the forward timed is the
@@ -91,6 +93,22 @@
 //! `--model-forward [T...]` runs the tower lane alone and prints its METRIC
 //! lines. Default T is 1024 and 2048.
 //!
+//! `--prefill-score --weights=DIR --ids=FILE [T...]` is the head-to-head lane
+//! against torch and MLX (`bench/qwen35_prefill_torch.py`,
+//! `bench/qwen35_prefill_mlx.py`): `begin` + every layer + `Staged::score_answers`
+//! at the last position for the file's 17 answer tokens (the embedding gather,
+//! 24 layers with state kept, the final norm and 17 answer rows; no full-vocabulary
+//! head), on the first T ids of the ids file all three lanes read
+//! (`common/prefill_ids.rs` states the contract; a length the file has no digest
+//! for is refused). Lengths alternate inside the process (the order reverses every
+//! other round); `--iters` (default `BENCH_ITERS`, 9) timed rounds follow
+//! `BENCH_WARMUP` (3) untimed. The last stdout line is `bench_paired --format
+//! workloads` input: per T a `prefill_score_t{T}` row (`ms_min` is the fastest
+//! round) and a `prefill_score_t{T}_median` row (`ms_min` is the median round),
+//! with `tokens`, `answers` and `ids_fnv1a32` carried as numbers. Every length's
+//! first round prints its answer log-probabilities to stderr as `SCORES`. Real
+//! weights only: random ones are refused.
+//!
 //! Earlier versions of this bench built their own 24 layers from the kernels
 //! and had `--attn-rows`, `--attn-tile=`, `--mlp-unfused` and `--gdn-scan16`
 //! switches that swapped kernels inside that wiring; the model has no such
@@ -98,6 +116,11 @@
 //! qwen35_fused_swiglu_gemm_m5pro.txt` hold those comparisons).
 
 mod common;
+#[path = "../json.rs"]
+#[allow(dead_code)]
+mod json;
+#[path = "common/prefill_ids.rs"]
+mod prefill_ids;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -755,6 +778,8 @@ struct Opts {
     scan: qwen35::GdnScanSlice,
     /// Samples per timing (after `WARMUP` warm-ups).
     iters: usize,
+    /// `--ids=FILE`, the `--prefill-score` ids file.
+    ids: Option<PathBuf>,
 }
 
 /// The one `*.safetensors` file in `dir`; none or several is an error.
@@ -1799,6 +1824,79 @@ fn run_model_forward(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o:
     Ok(())
 }
 
+/// `--prefill-score` defaults: the lengths of the head-to-head, and timed rounds.
+const PREFILL_SCORE_T: [usize; 4] = [200, 1024, 2048, 8192];
+const PREFILL_SCORE_ITERS: usize = 9;
+const PREFILL_SCORE_WARMUP: usize = 3;
+
+/// One `bench_paired --format workloads` row of a `--prefill-score` length.
+fn prefill_score_row(name: &str, ms: f64, iters: usize, t: usize, answers: usize, digest: u32) -> String {
+    format!(
+        "{{\"workload\":\"{name}\",\"backend\":\"tessl\",\"ms_min\":{},\"iters\":{iters},\"tokens\":{t},\"answers\":{answers},\"ids_fnv1a32\":{digest}}}",
+        common::jnum(ms)
+    )
+}
+
+/// `--prefill-score`: the prefill and answer scoring the torch and MLX lanes
+/// repeat, on the ids file's first T ids; see the module docs.
+fn run_prefill_score(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts) -> Res<()> {
+    let file = prefill_ids::PrefillIds::load(o.ids.as_deref().ok_or("--prefill-score needs --ids")?)?;
+    if file.vocab != model.config().vocab {
+        return Err(format!("ids file vocab {} but the model's is {}", file.vocab, model.config().vocab));
+    }
+    let warmup = common::env_usize("BENCH_WARMUP", PREFILL_SCORE_WARMUP, 0)?;
+    let layers = model.config().layers.len();
+    let mut runs = Vec::with_capacity(ts.len());
+    for &t in ts {
+        runs.push((t, file.prefix(t).map_err(|e| format!("T={t}: {e}"))?));
+    }
+    let one = |t: usize, ids: &[u32]| -> Res<(f64, Vec<f32>)> {
+        let t0 = Instant::now();
+        let mut s = model.begin(ids)?;
+        if s.tokens() as usize != t {
+            return Err(format!("T={t}: the session holds {} tokens", s.tokens()));
+        }
+        s.advance_to(layers)?;
+        let scores = s.score_answers(&[(t - 1) as u32], &file.answers)?;
+        Ok((t0.elapsed().as_secs_f64() * 1e3, scores.logprobs))
+    };
+    rt.set_async_encode(true)?;
+    let mut ms: Vec<Vec<f64>> = vec![Vec::new(); runs.len()];
+    for round in 0..warmup + o.iters {
+        let order: Vec<usize> = if round % 2 == 0 {
+            (0..runs.len()).collect()
+        } else {
+            (0..runs.len()).rev().collect()
+        };
+        for i in order {
+            let (t, ids) = runs[i];
+            let (elapsed, logprobs) = one(t, ids)?;
+            if logprobs.len() != file.answers.len() {
+                return Err(format!("T={t}: {} scores for {} answers", logprobs.len(), file.answers.len()));
+            }
+            finite_nonzero_slice(&format!("T={t}: answer log-probabilities"), &logprobs)?;
+            if round == 0 {
+                eprintln!("SCORES t={t} logprobs={logprobs:?}");
+            }
+            if round >= warmup {
+                ms[i].push(elapsed);
+            }
+        }
+    }
+    rt.set_async_encode(false)?;
+    let mut rows = Vec::new();
+    for (i, (t, ids)) in runs.iter().enumerate() {
+        let st = Stat::of(std::mem::take(&mut ms[i]))?;
+        println!("T={t}: min {:.3} ms, median {:.3} ms ({:.0} tok/s at min)", st.min, st.median, st.tok_s(*t));
+        let d = prefill_ids::fnv1a32(ids);
+        let n = file.answers.len();
+        rows.push(prefill_score_row(&format!("prefill_score_t{t}"), st.min, o.iters, *t, n, d));
+        rows.push(prefill_score_row(&format!("prefill_score_t{t}_median"), st.median, o.iters, *t, n, d));
+    }
+    println!("[{}]", rows.join(","));
+    Ok(())
+}
+
 /// Decode steps timed per run, after `DECODE_WARMUP`; and steps counted
 /// with `infer_trace` on, kept apart so tracing is not in the timed ones.
 const DECODE_STEPS: usize = 32;
@@ -1954,7 +2052,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         weights: Weights::Random,
         scan: qwen35::GdnScanSlice::default(),
         iters: ITERS,
+        ids: None,
     };
+    let mut prefill_score = false;
     let mut ts = Vec::new();
     let mut iters_given = false;
     for arg in std::env::args().skip(1) {
@@ -1964,6 +2064,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             paired_gate_up = true;
         } else if arg == "--model-forward" {
             model_forward = true;
+        } else if arg == "--prefill-score" {
+            prefill_score = true;
+        } else if let Some(f) = arg.strip_prefix("--ids=") {
+            if f.is_empty() {
+                return Err("--ids=FILE wants an ids file".into());
+            }
+            opts.ids = Some(PathBuf::from(f));
         } else if arg == "--decode" {
             decode = Some(4096);
         } else if let Some(p) = arg.strip_prefix("--decode=") {
@@ -1998,7 +2105,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-gdn-recurrent, --paired-gate-up, \
-                     --model-forward, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
+                     --model-forward, --prefill-score, --ids=FILE, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -2027,6 +2134,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let modes = [paired_gate_up, model_forward].iter().filter(|&&m| m).count();
     if modes > 1 || (modes == 1 && (check_only || paired_attn || paired_rec || decode.is_some())) {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
+    }
+    if prefill_score {
+        if check_only || paired_attn || paired_rec || paired_gate_up || model_forward || attn_tiles || decode.is_some() {
+            return Err("--prefill-score takes token counts, --weights, --ids and --iters only".into());
+        }
+        if !matches!(opts.weights, Weights::Dir { .. }) || opts.ids.is_none() {
+            return Err("--prefill-score needs --weights=DIR (a real snapshot) and --ids=FILE".into());
+        }
+        if !iters_given {
+            opts.iters = common::env_usize("BENCH_ITERS", PREFILL_SCORE_ITERS, 1)?;
+        }
+    } else if opts.ids.is_some() {
+        return Err("--ids applies to --prefill-score only".into());
     }
     let paired = paired_attn || attn_tiles || paired_rec || paired_gate_up;
     if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
@@ -2079,6 +2199,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let model = build_model(&rt, &opts)?;
     if let Some(prefix_len) = decode {
         return run_decode(&rt, &model, prefix_len, &opts).map_err(Into::into);
+    }
+    if prefill_score {
+        let ts = if ts.is_empty() { PREFILL_SCORE_T.to_vec() } else { ts };
+        return run_prefill_score(&rt, &model, &ts, &opts).map_err(Into::into);
     }
     if model_forward {
         let ts = if ts.is_empty() { vec![1024, 2048] } else { ts };

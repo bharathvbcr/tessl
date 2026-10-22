@@ -25,6 +25,12 @@
 //! lane computes the same way: a lane that produced other ids than the
 //! other would be caught by the comparison, not timed as if it had not.
 //!
+//! `BENCH_TOK_MODE=batch` times `Tokenizer::encode_batch` over the workload
+//! instead (the default, `loop`, is the one-thread loop above): it spreads the
+//! batch over the machine's cores (`TESSL_TOK_THREADS` sets the count), the
+//! lane to read against `bench/tok_hf_native` in `BENCH_TOK_HF_MODE=batch` or
+//! `batch_fast`. The hash is the same on every mode.
+//!
 //! What is timed: the encode of every text of the workload, from `&str` to
 //! `Vec<u32>`; not the corpus read and not the hash.
 
@@ -87,6 +93,14 @@ fn main() {
     let iters = env_count("BENCH_ITERS", 5);
     let load_iters = env_count("BENCH_LOAD_ITERS", 5);
     let json_path = snapshot.join("tokenizer.json");
+    let batch = match std::env::var("BENCH_TOK_MODE").as_deref() {
+        Err(_) | Ok("loop") => false,
+        Ok("batch") => true,
+        Ok(other) => {
+            eprintln!("BENCH_TOK_MODE={other:?}: expected loop or batch");
+            std::process::exit(2);
+        }
+    };
 
     let raw = std::fs::read(&corpus_path).unwrap_or_else(|e| {
         eprintln!("{}: {e}", corpus_path.display());
@@ -133,16 +147,28 @@ fn main() {
         // Warm-up pass, which also fixes the token count and the hash.
         let mut fnv = 2_166_136_261u32;
         let mut tokens = 0usize;
-        for t in texts {
-            let ids = tok.encode_raw(t, true);
-            tokens += ids.len();
-            fnv32(&mut fnv, &ids);
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        if batch {
+            for ids in tok.encode_batch(&refs).expect("encode_batch") {
+                tokens += ids.len();
+                fnv32(&mut fnv, &ids);
+            }
+        } else {
+            for t in texts {
+                let ids = tok.encode_raw(t, true);
+                tokens += ids.len();
+                fnv32(&mut fnv, &ids);
+            }
         }
         let mut times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            for t in texts {
-                black_box(tok.encode_raw(black_box(t), true));
+            if batch {
+                black_box(tok.encode_batch(black_box(&refs)).expect("encode_batch"));
+            } else {
+                for t in texts {
+                    black_box(tok.encode_raw(black_box(t), true));
+                }
             }
             times.push(t0.elapsed().as_secs_f64() * 1e3);
         }

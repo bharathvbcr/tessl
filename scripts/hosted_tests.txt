@@ -24,6 +24,7 @@ bin docs_name_real_tools 6
 bin embedgemma2_audio_fixtures 2
 bin embedgemma2_pre 5
 bin embedgemma2_tok_tiny 13
+bin embedgemma2_tok_batch 8
 bin gdn_fixtures 12
 bin fixture_manifests 8
 bin gdn_gates 22
@@ -110,6 +111,7 @@ lib embedgemma2_tok::tests:: 4
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib json::tests:: 4
+lib par_batch::tests:: 6
 lib media:: 19
 lib npy::accessor_tests:: 1
 lib parser_mutation:: 16

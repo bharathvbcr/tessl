@@ -263,6 +263,7 @@ pub mod mtl_tensor;
 pub mod nn;
 pub mod npy;
 pub mod ops;
+mod par_batch;
 #[cfg(test)]
 mod parser_mutation;
 mod plain;

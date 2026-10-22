@@ -1056,15 +1056,35 @@ impl Tokenizer {
 
     /// Each of `texts` as [`Self::encode_with_prompt`] encodes it, in order.
     /// The first error (naming the text's position) aborts the batch.
+    ///
+    /// A batch large enough to pay for it is spread over threads: contiguous
+    /// chunks balanced by byte length, joined in order, so the ids and the
+    /// error are those of a single thread. The thread count is the
+    /// `TESSL_TOK_THREADS` environment variable (1 to 64), by default the
+    /// machine's cores up to 32; a bad value is an error. An empty batch, one
+    /// text, or under 16 KiB of text runs on the calling thread and starts
+    /// none. See [`Self::encode_batch_with_threads`].
     pub fn encode_batch_with_prompt(&self, prompt_name: Option<&str>, texts: &[&str]) -> Result<Vec<Vec<u32>>, String> {
-        texts
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                self.encode_with_prompt(prompt_name, t)
-                    .map_err(|e| format!("text {i}: {e}"))
-            })
-            .collect()
+        if texts.len() < 2 {
+            return self.encode_batch_with_threads(prompt_name, texts, 1);
+        }
+        let threads = crate::par_batch::configured_threads()?;
+        self.encode_batch_with_threads(prompt_name, texts, threads)
+    }
+
+    /// [`Self::encode_batch_with_prompt`] over at most `threads` threads
+    /// (clamped to 1 to 64), whatever the environment says. The result does
+    /// not depend on `threads`.
+    pub fn encode_batch_with_threads(
+        &self,
+        prompt_name: Option<&str>,
+        texts: &[&str],
+        threads: usize,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        crate::par_batch::map_ordered(texts, threads, &|i, t| {
+            self.encode_with_prompt(prompt_name, t)
+                .map_err(|e| format!("text {i}: {e}"))
+        })
     }
 
     /// [`Self::encode_batch_with_prompt`] with no prompt.

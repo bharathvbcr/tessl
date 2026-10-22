@@ -825,6 +825,9 @@ cargo test --release --test qwen35_mlx_q4_layout --test qwen35_config           
 cargo test --release --test qwen35_mlx_q4 -- --test-threads=1                   # the synthetic checks, on the device
 cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_matches_mlx_lm_logits --nocapture   # the real 2B, alone in its process (the footprint is a lifetime peak)
 cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row --nocapture
+# attribution: mlx-lm run in float32 on the same weights (keeps the converted checkpoint)
+/Users/bharath/.venvs/ml-2026-10/bin/python tools/qwen35_ref/make_mlx_q4.py --refs-only
+cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_attribution_against_mlx_lm_float32 --nocapture
 ```
 
 `make_mlx_q4.py` is a fixture tool, not a shipped path: it converts the local

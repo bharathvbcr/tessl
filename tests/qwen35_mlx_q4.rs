@@ -307,21 +307,34 @@ impl Net {
     /// The same model as a dense F32 checkpoint under `model.`, each quantized
     /// matrix dequantized exactly, norms as transformers stores them.
     fn dense_entries(&self) -> Vec<Entry> {
+        self.dense_entries_as(false)
+    }
+
+    /// [`Self::dense_entries`] with the matrices (the tables and projections)
+    /// stored BF16, which is what a `Precision::Bf16` dense load requires
+    /// (`SafeTensors::read_bf16_bits_into` accepts BF16 only, and always did);
+    /// the small tensors stay as they are, since the f32 reads take either. The
+    /// dequantized values round to bf16 here, which is exact when the net is
+    /// `make_exact`.
+    fn dense_entries_bf16(&self) -> Vec<Entry> {
+        self.dense_entries_as(true)
+    }
+
+    fn dense_entries_as(&self, bf16: bool) -> Vec<Entry> {
+        let matrix = |name: String, m: &QMat| -> Entry {
+            let w = m.dequant();
+            let (dtype, bytes) = if bf16 {
+                ("BF16", bf16_bytes(&w))
+            } else {
+                ("F32", f32_bytes(&w))
+            };
+            (name, dtype, vec![m.rows, m.cols], bytes)
+        };
         let mut e: Vec<Entry> = Vec::new();
         for (n, m) in &self.mats {
-            e.push((
-                format!("model.{n}"),
-                "F32",
-                vec![m.rows, m.cols],
-                f32_bytes(&m.dequant()),
-            ));
+            e.push(matrix(format!("model.{n}"), m));
         }
-        e.push((
-            "lm_head.weight".to_string(),
-            "F32",
-            vec![self.head.rows, self.head.cols],
-            f32_bytes(&self.head.dequant()),
-        ));
+        e.push(matrix("lm_head.weight".to_string(), &self.head));
         let k = self.cfg.conv_kernel as usize;
         for (n, v) in &self.convs {
             e.push((format!("model.{n}"), "F32", vec![v.len() / k, 1, k], f32_bytes(v)));
@@ -741,6 +754,76 @@ fn mlx_q4_2b_matches_mlx_lm_logits() {
     });
 }
 
+/// Attribution for a gap between tessl and mlx-lm on the same 4-bit weights.
+/// `make_mlx_q4.py` also dumps mlx-lm run in FLOAT32 (`logits_mlx_f32.npy`: every
+/// floating parameter cast to float32, dtype checked at dump time), the exact
+/// computation on these weights up to float32 accumulation. This prints, per
+/// prompt, through the shared harness:
+///
+/// * tessl Q4 against mlx-lm float32;
+/// * mlx-lm bfloat16 (the file `mlx_q4_2b_matches_mlx_lm_logits` compares with)
+///   against mlx-lm float32;
+/// * tessl Q4 against mlx-lm bfloat16 (the gated figure, for reference);
+///
+/// and a verdict line saying which of the first two is closer on each of max
+/// deviation, top-1 misses and mean KL. tessl's Q4 forward rounds each GEMM's
+/// input to bf16 and keeps the residual stream and every accumulation in f32
+/// (`Format::precision`, `Acts`; `Q4Weight::matmul` takes a bf16 `x` and writes
+/// f32); mlx-lm bf16 rounds every layer output. If tessl is as close to the
+/// float32 reference as mlx-lm bf16 is, or closer, the misses against mlx-lm bf16
+/// are mlx-lm's rounding, not tessl's. A report, not a gate: it asserts only that
+/// both reference files exist, are finite and have the right shape. The bound of
+/// the gated test is the owner's to change with this evidence.
+#[test]
+#[ignore]
+fn mlx_q4_2b_attribution_against_mlx_lm_float32() {
+    with_gpu(|rt| {
+        let (model, _) = load_real(rt);
+        let vocab = model.config().vocab as usize;
+        for name in ["default", "text"] {
+            let dir = q4_dir().join("ref").join(name);
+            let ids = ref_ids(&dir);
+            let (shape, bf16) = load_ref_in(&dir, "logits_mlx");
+            let (shape32, f32_ref) = load_ref_in(&dir, "logits_mlx_f32");
+            assert_eq!(shape, vec![ids.len(), vocab], "{name}: bf16 reference shape");
+            assert_eq!(shape32, shape, "{name}: float32 reference shape");
+            let got = model.forward(&ids, false).unwrap().logits;
+            let mlx_bf16: Vec<f32> = bf16.iter().map(|&x| x as f32).collect();
+            let tessl_vs_f32 = logit_dev(&got, &f32_ref, vocab);
+            let bf16_vs_f32 = logit_dev(&mlx_bf16, &f32_ref, vocab);
+            let tessl_vs_bf16 = logit_dev(&got, &bf16, vocab);
+            for (label, d) in [
+                ("tessl Q4 vs mlx-lm float32", &tessl_vs_f32),
+                ("mlx-lm bf16 vs mlx-lm float32", &bf16_vs_f32),
+                ("tessl Q4 vs mlx-lm bf16 (gated)", &tessl_vs_bf16),
+            ] {
+                assert!(d.is_finite(), "{name}: {label}: non-finite");
+                eprintln!("{}", d.row(&format!("[{name} T={}] {label}", ids.len())));
+            }
+            let cmp = |what: &str, tessl: f64, mlx: f64| {
+                let v = if tessl < mlx {
+                    "closer"
+                } else if tessl == mlx {
+                    "equal"
+                } else {
+                    "farther"
+                };
+                format!("{what}: tessl {tessl:.3e} vs mlx bf16 {mlx:.3e} ({v})")
+            };
+            eprintln!(
+                "VERDICT [{name}] tessl Q4 against the float32 reference, relative to mlx-lm bf16 against it:\n  {}\n  {}\n  {}",
+                cmp("max logit deviation (rel)", tessl_vs_f32.max_rel(), bf16_vs_f32.max_rel()),
+                cmp(
+                    "top-1 misses",
+                    tessl_vs_f32.top1_misses() as f64,
+                    bf16_vs_f32.top1_misses() as f64
+                ),
+                cmp("mean KL", tessl_vs_f32.mean_kl, bf16_vs_f32.mean_kl),
+            );
+        }
+    });
+}
+
 /// The decode smoke test on the real 2B's 4-bit weights: prefill `n` tokens of
 /// the default prompt, decode three more, and each returned row must equal the
 /// Q4 forward's last row at that length to 2e-2 of the largest logit (the tiny
@@ -861,7 +944,9 @@ fn adv_mlx_q4_exact_weights_match_dense_bf16_and_a_swapped_window_does_not() {
         let mut net = Net::new(21);
         make_exact(&mut net, 22);
         let q4 = load_q4(rt, &net.mlx_entries()).unwrap();
-        let dense_st = safetensors(&net.dense_entries());
+        // BF16 matrices: the bf16 dense loader reads BF16 only. `make_exact`
+        // makes the dequantized values exact in bf16, so nothing is rounded.
+        let dense_st = safetensors(&net.dense_entries_bf16());
         let dense = Qwen35Model::load(rt, &dense_st, "model.", config(), Precision::Bf16).unwrap();
 
         let mut swapped = net.mlx_entries();
@@ -991,15 +1076,25 @@ fn adv_mlx_q4_a_huge_config_over_a_tiny_file_fails_before_allocating() {
 /// checked against the file's header before the tensor is allocated. A config
 /// whose vocabulary (the tables) or intermediate width (the MLP projections) is
 /// vast over a tiny dense file is refused with the tensor's name and the device
-/// allocates next to nothing, at both dense precisions. Run against the commit
-/// before this one (9d263c0) it allocates the table first; that run is the
-/// characterization of the unmodified order.
+/// allocates next to nothing, at both dense precisions. Each precision reads a
+/// checkpoint stored as it requires (BF16 matrices for `Precision::Bf16`, which
+/// loads BF16 only; F32 for `Precision::F32`), so the only thing wrong with
+/// the file is the config. The fail-before run is the branch
+/// `gp/w23-q4-failbefore` (this test on the commit before the fix).
 #[test]
 fn dense_load_with_a_huge_config_over_a_tiny_file_fails_before_allocating() {
     with_gpu(|rt| {
         let net = Net::new(52);
-        let st = safetensors(&net.dense_entries());
+        let (st_bf16, st_f32) = (
+            safetensors(&net.dense_entries_bf16()),
+            safetensors(&net.dense_entries()),
+        );
         for precision in [Precision::Bf16, Precision::F32] {
+            let st = if precision == Precision::Bf16 {
+                &st_bf16
+            } else {
+                &st_f32
+            };
             for (cfg, needle) in [
                 (
                     Qwen35Config {
@@ -1018,7 +1113,7 @@ fn dense_load_with_a_huge_config_over_a_tiny_file_fails_before_allocating() {
             ] {
                 rt.reset_peak_allocated_bytes();
                 let before = rt.peak_allocated_bytes();
-                let e = Qwen35Model::load(rt, &st, "model.", cfg, precision)
+                let e = Qwen35Model::load(rt, st, "model.", cfg, precision)
                     .err()
                     .expect("loaded");
                 assert!(e.contains(needle), "{precision:?}: {e}");
@@ -1029,6 +1124,31 @@ fn dense_load_with_a_huge_config_over_a_tiny_file_fails_before_allocating() {
                 );
             }
         }
+    });
+}
+
+/// What the bf16 dense loader accepts did not change: an F32 matrix in a
+/// `Precision::Bf16` load is refused with the dtype message (it is not cast),
+/// and a valid BF16 checkpoint loads. The header-first shape check
+/// (`Loader::expect_shape`) checks shape only, so it neither adds nor removes
+/// a dtype refusal: the same file with a hostile config is refused for its
+/// shape, and with the right config for its dtype.
+#[test]
+fn dense_bf16_load_refuses_an_f32_matrix_as_it_always_did() {
+    with_gpu(|rt| {
+        let net = Net::new(53);
+        let f32_file = safetensors(&net.dense_entries());
+        let e = Qwen35Model::load(rt, &f32_file, "model.", config(), Precision::Bf16)
+            .err()
+            .expect("an F32 matrix loaded at Bf16");
+        assert!(
+            e.contains("embed_tokens.weight") && e.contains("expected BF16, found F32"),
+            "{e}"
+        );
+        let bf16_file = safetensors(&net.dense_entries_bf16());
+        Qwen35Model::load(rt, &bf16_file, "model.", config(), Precision::Bf16).unwrap();
+        // And F32 still reads a BF16 file by widening (the f32 reads take either).
+        Qwen35Model::load(rt, &bf16_file, "model.", config(), Precision::F32).unwrap();
     });
 }
 
@@ -1080,14 +1200,35 @@ fn adv_mlx_q4_footprint_report_is_a_lifetime_max_an_earlier_allocation_hides_the
         let net = Net::new(71);
         let st = safetensors(&net.mlx_entries());
         let (_, r) = Qwen35Model::load_mlx_q4(rt, &st, config(), QUANT_JSON).unwrap();
+        const MIB: u64 = 1 << 20;
+        // What a lifetime maximum guarantees, each part of it:
+        // 1. the earlier 384 MiB is still in the figure read before the load;
         assert!(
-            r.peak_footprint_before >= 384 << 20,
+            r.peak_footprint_before >= 384 * MIB,
             "before = {}",
             r.peak_footprint_before
         );
-        assert_eq!(
-            r.peak_footprint_after, r.peak_footprint_before,
-            "a tiny load cannot raise a 384 MiB peak"
+        // 2. it never goes down across the load;
+        assert!(r.peak_footprint_after >= r.peak_footprint_before, "{r:?}");
+        // 3. a load of a few hundred KiB adds almost nothing to it: the report
+        //    after is the earlier peak plus at most the load's own small excess
+        //    (the host's incidental allocations in between, not 384 MiB), so the
+        //    figure says nothing about what the load itself used;
+        let grew = r.peak_footprint_after - r.peak_footprint_before;
+        assert!(
+            grew <= 64 * MIB,
+            "a tiny load raised the lifetime peak by {grew} B; before {} after {}",
+            r.peak_footprint_before,
+            r.peak_footprint_after
+        );
+        // 4. and a second load in the same process reads at least what the
+        //    first left behind (the counter is the process's, not the load's).
+        let (_, r2) = Qwen35Model::load_mlx_q4(rt, &st, config(), QUANT_JSON).unwrap();
+        assert!(
+            r2.peak_footprint_before >= r.peak_footprint_after,
+            "second load's before {} < first load's after {}",
+            r2.peak_footprint_before,
+            r.peak_footprint_after
         );
     });
 }

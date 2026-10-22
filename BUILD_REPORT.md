@@ -1,4 +1,108 @@
-# BUILD_REPORT — GitPulse backlog, waves 13–19 (2026-10-17/19)
+# BUILD_REPORT — GitPulse backlog, waves 21–22: training follow-ups (2026-10-21/22)
+
+Wave 20 landed on `main` as `c0d8be5`. Its gate was `scripts/ci_local.sh`, run 21:50–03:45Z on the M5 Pro under the lock: ci:local OK, 3436 passed, 0 failed, 68 ignored, no skips. Waves 21–22 are integrated on `gp/w21-integrate` @ `e149146`. That branch lands after its own `ci_local.sh` gate and the ojas handshake.
+
+## Tasks moved to review
+| card | result | branch |
+|---|---|---|
+| ft-dafde771 fit the 2B loss curve's f32 arm | New public `Qwen35Model::train_step_fused_adamw` (+ `_bytes`). It applies AdamW per layer as the backward delivers each gradient, so there is no full gradient bank, and bumps `param_generation` once. GPU results: byte-identical params, m, v and aux against bank + `adamw_step` over 3 steps, f32 and bf16, tied, untied and grouped (13/13 tests). The adversarial pass found 2 BREAKs, both fixed: a part-way failure now latches the model and state as torn, and a non-finite loss is refused before any update. Peak ≤ bound. Bound = allocated. Every affected suite green. The 2B curve's f32 arm now runs at **25.33 GiB** (it needed 34.91), and the curve reaches its assertions. | `gp/w21-fused-adamw-2` 04840ca |
+| ft-8933ed6a bf16-storage bound | GPU bisect. Head 7.05e-2. Reverting both precise::rsqrt commits gives 4.82e-2 (pass). Reverting only the forward (4632d2e) gives 6.27e-2 (fail). Not the GDN kernel, not the checkpoint. **Owner: keep precise::rsqrt and record it. The 2^-4 bound is left failing.** | `gp/w21-bf16-bisect-record` 26c5e8f |
+
+## In progress
+- **ft-1d2ab5b0 FD check.** A 15-step diagnostic sweep showed the method can't resolve layer-20 conv1d; resolution had been static. The owner decided resolution is now measured. The agreement-only rule false-resolved conv20 on the GPU. The owner chose a 6-step sweep where 3 consecutive Richardson estimates must agree, on `gp/w21-fd-resolved` 5bf0267. Its GPU rerun (job 10b) is pending.
+- **ft-805b6ea4 bf16 activation inputs.** Step 1 is the shared real-2B logit-deviation harness (`tests/common/logit_dev.rs`, `logit_deviation_report`), on `gp/w22-logit-harness` a01826b. Its device-free tests pass; the GPU report (job 12) is pending. The spike found that a bf16-input norm cannot remove the widen, because `resid_in` also feeds the residual add, whose `C` must be f32.
+- **ft-f3e14014 attention.** Fable closed the fused dK/dV item as not worth it, with the analysis committed on `gp/w22-dkdv-result` 44f4b67. Without atomics it saves 1 of 8 GEMMs, about 0.1% of a step, and needs 128 registers per thread. The bf16-tiles item waits for the harness.
+
+## Evidence logged for owner decisions
+- **ft-a96618 (bf16 storage default and curve bounds).** With the fused step, the 2B curve reached its assertions and failed 3 held-out bounds at seed 1, step 15. In all three, the round-to-nearest arms were about 1.07% *better* than f32. The default stochastic rule passed everything. Open: should the bound be one-sided?
+- **ft-bf6bc26b (licence provenance of `resample.rs`).** Deferred. Only the owner or the eg2 session can attest how the file was written.
+- **ft-05f5b770 AC1.** Needs torch 2.15 and mlx-lm installed, which is a dependency decision.
+
+## Fable's decisions
+- **Fused step.** Build it now, owning the whole step with one generation bump, and expose it in ojas in the same work.
+- **Fused dK/dV.** Close it and commit the analysis.
+- **bf16 tiles.** Wait for the harness.
+
+## Cleanup
+- **Worktrees.** 16 lane worktrees removed. Locked ones were unlocked only after GitPulse showed 0 dirty files.
+- **`worktree-agent-*` branches.** 16 deleted with `-d`. All pointed at post-scrub `a8fc965`.
+- **Probe branches.** Bundled to `../tessl-backups/` before deletion: `gp-w20-gdn-failbefore-dfc223a.bundle` and `gp-w21-bisect-rsqrt-probes.bundle`.
+- **Merged `gp/w2*` branches.** Deleted with `-d` as they land.
+
+## Machine notes
+- **Lock footprint cap.** `mac_heavy.sh` now caps a locked job at 28 GiB footprint. The 2B jobs need `MAC_HEAVY_MAX_FOOTPRINT_MB=31744`.
+- **Cargo slots.** Every cargo call takes one of 2 machine-wide slots, and lanes compiling delay locked jobs by hours. Gate 1 waited about 7 h.
+
+# Earlier: wave 20 — in-progress and training work (2026-10-20/21)
+
+Scope, as the owner set it: "fix in-progress work and priority work for training". That covered the four `in_progress` cards (ft-62af7c2e, ft-02b223f0, ft-19f4bd16, ft-380e34f4) and the training criterion (AC2) of P1 ft-05f5b770. All of it was GPU-bound. The code on the four cards had landed on main on 10-16/17, and their locked runs never got the lock. Every run below was on the M5 Pro (Mac17,8, macOS 27.0.1, AC power), under the `mac_heavy` lock, from a detached `c2c1612` worktree or a lane branch on it. **Nothing was merged to `main`**: every branch below is Opus-approved and waits for the owner.
+
+## Tasks moved to review (evidence in each card's log)
+
+| card | result | branches to land |
+|---|---|---|
+| ft-62af7c2e chunked (WY) GDN training kernel | Every AC has GPU evidence. Suites: 9 binaries, 109 passed. The fail-before tree (1002838's dg fix reverted, tests kept) fails exactly `dg_survives_strong_decay` and `the_kernels_survive_adversarial_inputs` (grouped g=-50: dg error 1.00 vs 1.99e-7) and passes the other 10. The q/k norm-once test passes. Paired benches below. | `gp/w20-gdn-owed` 61b49e7 (CHANGELOG names the 5 `doc(hidden)` items, key-head workspace byte tests), `gp/w20-gdn-results` cbbe4a5 (results, docs) |
+| ft-380e34f4 fault set for tessl's own kernels | **19 of 19 caught by a value assertion**: 18 at c2c1612 (06:16–10:27Z, kernels/ byte-identical after) and 1 at b0f307e (the one stale patch regenerated: d385e4f had added the STRICT epilogue path). 0 missed, 0 non-assert. | `gp/w20-fault-refresh` b0f307e, `gp/w20-fault-docs` b1c0419 (19-row table from both results.tsv files) |
+| ft-02b223f0 real-2B tests SIGTERMed | Cause: test helpers held every gradient on the host as f64, about 14 GiB. The lock killed `real_2b_step_matches_transformers` at 30,168 and 33,080 MiB. With streamed comparisons and unchanged bounds, peaks (bytes, `/usr/bin/time -l`) are step_matches PASS 16.26e9, bf16_operands PASS 16.25e9, bank PASS 25.44e9, bf16_storage 20.70e9 (runs, fails a bound: ft-8933ed6a), loss curve 7.60e9 (fails closed: REQUIREMENT UNMET, 34.91 GiB needed). Also fixed: `rel` passed a NaN gradient (`f64::max` skips NaN), and fcb7a08's SKIPPED early return reported as `ok`. | `gp/w20-2b-cap` fde0d65 |
+| ft-19f4bd16 2B reference dir | The reference was regenerated (Base b1485b2, loss 3.810166 = transformers). The test runs to its assertions and fails the FD check at layer 20 conv1d (0.36 of \|d\|, bound 0.3); it is the same on the sequential GDN kernel. Tracked as ft-1d2ab5b0. | `gp/w20-2b-cap` fde0d65 |
+
+**ft-05f5b770 stays `in_progress`.** AC2 (the training patch) is done; AC1 is deferred (below). Branch: `gp/w20-gdn-torch-bench` f79d65d (harness) and `gp/w20-gdn-torch-results` d8f2437 (results, docs).
+
+## Benchmarks (all `bench_paired --evidence`, drift gate passed)
+
+| what | before | after | ratio [lo, hi] |
+|---|---|---|---|
+| `gdn_train` forward, T=2048 (sequential → chunked, 10 rounds) | 6.327 ms | 3.156 ms | 0.498× [0.491, 0.509] |
+| `gdn_train` backward | 19.549 ms | 11.796 ms | 0.604× [0.593, 0.615] |
+| 2B train step, real Base checkpoint, T=2048 (4 rounds) | 5.343 s | 5.095 s | 0.953× [0.951, 0.954] |
+| 2B step device peak | 15.677 GiB | 15.570 GiB | 0.993× |
+| transformers Qwen3.5 4-layer fwd+bwd on MPS, torch → tessl patch (6 rounds) | 1998.6 ms | 1536.1 ms | 0.768× [0.757, 0.770] |
+| same, tensor memory peak | 7633.1 MiB | 7079.2 MiB | 0.927× |
+| same, **MPS driver memory (tessl loses)** | 16123.3 MiB | 16215.7 MiB | +92 MiB (+0.6%), recorded, not gated |
+
+The GDN numbers match the 10-16 run on the pre-fix kernels (0.500×, 0.605×, 0.953×): the dg fix cost nothing measurable. No touched hot path regressed.
+
+Two runs were refused and are not results:
+- **Torch bench at harness 143df10:** the drift gate refused it. It gated MPS driver memory, which includes the caching allocator, and the torch arm's driver memory varied from 16.1 to 18.0 GiB across rounds.
+- **The first 2B and `--check` attempts:** these were killed over the lock or memguard caps.
+
+## New tasks filed
+- **ft-dafde771:** fit the 2B loss curve's f32 reference arm (16 B/param, about 29.8 GiB device) under 32 GiB. Split from ft-02b223f0 by Fable.
+- **ft-8933ed6a:** the bf16-storage 2B step fails 2^-4 on `layers.1.post_attention_layernorm.weight`.
+  - The miss is 7.05e-2 on the chunked kernel and 8.43e-2 on the sequential one, so it is not the GDN kernel.
+  - The f32 loss is unchanged since 10-16 (2.745268 vs 2.745267). The bf16-storage loss moved (2.744981 → 2.745187), so the bf16 path changed after 10-16.
+  - Suspects (untested): the precise::rsqrt norms (4632d2e, 201bc61), or the 10-08 pass having used the instruct checkpoint.
+- **ft-1d2ab5b0:** the FD check fails at layer 20 conv1d on both GDN kernels. Successive FD differences shrink by about 2× per halving of h, not the 4× that Richardson extrapolation assumes.
+
+## Fable's decisions
+- **ft-02b223f0's loss curve fails closed now.** Its f32 reference arm is 16 B/param, about 29.8 GiB on the device, at the cap by construction.
+- **Fitting that arm is a separate card** (ft-dafde771).
+- **No committed f32 fixture.** It would freeze the reference, and generating it needs an over-cap process anyway.
+- **Every SKIPPED early return is replaced** with `REQUIREMENT UNMET (not a pass)`, checked before start from a computed bound and again after step 0.
+
+## Decisions taken in the run
+- **Lock cap override.** `MAC_HEAVY_MAX_FOOTPRINT_MB=31744` was set per job, through the lock's documented setting, for the 2B and torch-check jobs. The lock's default (memguard's cap minus 4 GiB, so 28 GiB) kills the 28–32 GiB tests on every locked run. memguard was not touched.
+- **Sequence lengths.** The torch `--check` runs at T=512 and the bench at T=2048. The AC names no length; the check holds two gradient sets in one process.
+
+## Owner decisions pending
+1. **Land the 8 approved branches.** This is a merge to `main`, and ojas builds tessl by path, so announce the sha to ojas first.
+   - `gp/w20-gdn-owed` → `gp/w20-gdn-results`
+   - `gp/w20-fault-refresh` → `gp/w20-fault-docs`
+   - `gp/w20-2b-cap`
+   - `gp/w20-gdn-torch-bench` → `gp/w20-gdn-torch-results`
+   - `gp/w20-gdn-failbefore` is evidence only. **Do not merge it.**
+
+   Not run on the branches: the full `scripts/hosted_tests.sh` and `scripts/ci_local.sh`.
+2. **ft-05f5b770 AC1.** The prefill+score head-to-head needs torch 2.15 and mlx-lm 0.32 installed, which is a dependency decision. It is inference scope, so it was deferred.
+3. **Done is evidence-gated by Manvi.** The four cards are in `review` and stay there until the branches land.
+
+## Not done / unverified
+- **`docs/qwen35.md`.** Its older "7.2 s step" sentence predates and does not reconcile with today's 5.1 s step. It was left in place and flagged on ft-62af7c2e.
+- **memguard's log** was reset at the 2026-10-20 reboot, so the 10-16 kill lines no longer exist. ft-02b223f0's cause rests on today's lock kill lines plus a code reading.
+- **Cleanup for the owner.** The lane worktrees under `.claude/worktrees/agent-*`, plus `../tessl-gpurun` and `../tessl-owed`, hold build output, and the disk went to 95% mid-run. Remove their `target*/` dirs (and the worktrees once landed).
+- **Shared reference copy.** For ojas-7a's `gpu_parity`, `tessl/target/qwen35_train_ref` was regenerated. That is the same reference, copied into the main tree.
+
+# Earlier run: GitPulse backlog, waves 13–19 (2026-10-17/19)
 
 ## Wave 19: a bench lane for every kernel (`main` = `1c4d03e`)
 

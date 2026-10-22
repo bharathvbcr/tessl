@@ -318,16 +318,16 @@ fn offsets<const N: usize>(widths: [usize; N]) -> [usize; N] {
 }
 
 /// The embedding's slot (table index 0), with its gradient if given.
-pub(crate) fn embed_slot<'a>(m: &'a Qwen35Model, grad: Option<&'a Tensor>) -> Slot<'a> {
-    Slot {
+pub(crate) fn embed_slot<'a>(m: &'a Qwen35Model, grad: Option<&'a Tensor>) -> Result<Slot<'a>, String> {
+    Ok(Slot {
         info: info(
             "embed_tokens.weight".into(),
             &[m.cfg.vocab as usize, m.cfg.hidden as usize],
             false,
         ),
-        param: Src::Dense(&m.embed),
+        param: Src::Dense(m.embed.dense()?),
         grad: grad.map(Src::Dense),
-    }
+    })
 }
 
 /// One layer's slots (table indices follow the previous layer's), with its
@@ -358,14 +358,14 @@ pub(crate) fn layer_slots<'a>(
             {
                 out.push(Slot {
                     info: info(p(&format!("linear_attn.{part}.weight")), &[widths[i], h], true),
-                    param: Src::Packed(&w.w_in, offs[i]),
+                    param: Src::Packed(w.w_in.dense()?, offs[i]),
                     grad: gg.map(|g| Src::Packed(&g.w_in, offs[i])),
                 });
             }
             let (vh, kw) = (gd.v_heads() as usize, cfg.conv_kernel as usize);
             out.push(Slot {
                 info: info(p("linear_attn.out_proj.weight"), &[h, gd.value_dim() as usize], true),
-                param: Src::Packed(&w.w_out, 0),
+                param: Src::Packed(w.w_out.dense()?, 0),
                 grad: gg.map(|g| Src::Packed(&g.w_out, 0)),
             });
             out.push(Slot {
@@ -401,14 +401,14 @@ pub(crate) fn layer_slots<'a>(
             for (i, part) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
                 out.push(Slot {
                     info: info(p(&format!("self_attn.{part}.weight")), &[widths[i], h], true),
-                    param: Src::Packed(&w.w_in, offs[i]),
+                    param: Src::Packed(w.w_in.dense()?, offs[i]),
                     grad: ag.map(|g| Src::Packed(&g.w_in, offs[i])),
                 });
             }
             let d = at.head_dim() as usize;
             out.push(Slot {
                 info: info(p("self_attn.o_proj.weight"), &[h, at.q_heads() as usize * d], true),
-                param: Src::Packed(&w.w_out, 0),
+                param: Src::Packed(w.w_out.dense()?, 0),
                 grad: ag.map(|g| Src::Packed(&g.w_out, 0)),
             });
             out.push(Slot {
@@ -425,17 +425,17 @@ pub(crate) fn layer_slots<'a>(
     }
     out.push(Slot {
         info: info(p("mlp.gate_proj.weight"), &[inter, h], true),
-        param: Src::Packed(&layer.gate, 0),
+        param: Src::Packed(layer.gate.dense()?, 0),
         grad: lg.map(|g| Src::Packed(&g.gate, 0)),
     });
     out.push(Slot {
         info: info(p("mlp.up_proj.weight"), &[inter, h], true),
-        param: Src::Packed(&layer.up, 0),
+        param: Src::Packed(layer.up.dense()?, 0),
         grad: lg.map(|g| Src::Packed(&g.up, 0)),
     });
     out.push(Slot {
         info: info(p("mlp.down_proj.weight"), &[h, inter], true),
-        param: Src::Packed(&layer.down, 0),
+        param: Src::Packed(layer.down.dense()?, 0),
         grad: lg.map(|g| Src::Packed(&g.down, 0)),
     });
     out.push(Slot {
@@ -474,7 +474,7 @@ pub(crate) fn tail_slots<'a>(
         };
         out.push(Slot {
             info: info(crate::qwen35_model::LM_HEAD_NAME.into(), &[vocab, h], false),
-            param: Src::Dense(head),
+            param: Src::Dense(head.dense()?),
             grad,
         });
     } else if grads.is_some_and(|(_, g)| g.is_some()) {
@@ -485,6 +485,7 @@ pub(crate) fn tail_slots<'a>(
 
 /// Every parameter in a fixed order, with its gradient in `grads` if given.
 pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
+    m.require_dense("Qwen35Model parameter table")?;
     if let Some(g) = grads {
         if g.layers.len() != m.layers.len() {
             return Err(format!(
@@ -494,7 +495,7 @@ pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> R
             ));
         }
     }
-    let mut out = vec![embed_slot(m, grads.map(|g| &g.embed))];
+    let mut out = vec![embed_slot(m, grads.map(|g| &g.embed))?];
     for l in 0..m.layers.len() {
         out.extend(layer_slots(m, l, grads.map(|g| &g.layers[l]))?);
     }
@@ -577,6 +578,7 @@ impl Qwen35Model {
     /// it).
     pub(crate) fn require_trainable(&self, what: &str) -> Result<(), String> {
         self.check_untorn(what)?;
+        self.require_dense(what)?;
         if self.precision == Precision::Bf16 && self.lm_head_bf16.is_some() {
             return Err(format!(
                 "{what}: a bf16 model loaded with its packed LM head cannot change its weights (the head \

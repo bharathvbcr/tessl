@@ -61,6 +61,7 @@ use crate::qwen35_bwd::{
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
 use crate::qwen35_params::{embed_slot, layer_slots, tail_slots};
+use crate::qwen35_q4::Weight;
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -286,30 +287,33 @@ impl LayerGrads {
 }
 
 /// A layer's weights, in the order [`LayerGrads::parts`] walks its gradients.
-fn layer_weight_parts(layer: &Layer) -> Vec<Part<'_>> {
+///
+/// # Errors
+/// A quantized layer: it has no dense tensors.
+fn layer_weight_parts(layer: &Layer) -> Result<Vec<Part<'_>>, String> {
     let mut v = vec![buf_part(&layer.input_norm), buf_part(&layer.post_norm)];
     match &layer.mixer {
         Mixer::Gdn(w) => v.extend([
-            tensor_part(&w.w_in),
-            tensor_part(&w.w_out),
+            tensor_part(w.w_in.dense()?),
+            tensor_part(w.w_out.dense()?),
             buf_part(&w.conv_w),
             buf_part(&w.a_log),
             buf_part(&w.dt_bias),
             buf_part(&w.norm_w),
         ]),
         Mixer::Attn(w) => v.extend([
-            tensor_part(&w.w_in),
-            tensor_part(&w.w_out),
+            tensor_part(w.w_in.dense()?),
+            tensor_part(w.w_out.dense()?),
             buf_part(&w.q_norm),
             buf_part(&w.k_norm),
         ]),
     }
     v.extend([
-        tensor_part(&layer.gate),
-        tensor_part(&layer.up),
-        tensor_part(&layer.down),
+        tensor_part(layer.gate.dense()?),
+        tensor_part(layer.up.dense()?),
+        tensor_part(layer.down.dense()?),
     ]);
-    v
+    Ok(v)
 }
 
 impl Qwen35Grads {
@@ -317,20 +321,21 @@ impl Qwen35Grads {
     /// weight's dtype (bf16 matrices on a bf16 model): a bank for
     /// [`Qwen35Model::train_step_into`], resident.
     pub fn zeros_like(model: &Qwen35Model) -> Result<Self, String> {
+        model.require_dense("Qwen35Grads::zeros_like")?;
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let mixer = match &layer.mixer {
                 Mixer::Gdn(w) => MixerGrads::Gdn(GdnGrads {
-                    w_in: zeros_tensor(&w.w_in)?,
-                    w_out: zeros_tensor(&w.w_out)?,
+                    w_in: zeros_tensor(w.w_in.dense()?)?,
+                    w_out: zeros_tensor(w.w_out.dense()?)?,
                     conv_w: zeros_buf(model, &w.conv_w)?,
                     a_log: zeros_buf(model, &w.a_log)?,
                     dt_bias: zeros_buf(model, &w.dt_bias)?,
                     norm_w: zeros_buf(model, &w.norm_w)?,
                 }),
                 Mixer::Attn(w) => MixerGrads::Attn(AttnGrads {
-                    w_in: zeros_tensor(&w.w_in)?,
-                    w_out: zeros_tensor(&w.w_out)?,
+                    w_in: zeros_tensor(w.w_in.dense()?)?,
+                    w_out: zeros_tensor(w.w_out.dense()?)?,
                     q_norm: zeros_buf(model, &w.q_norm)?,
                     k_norm: zeros_buf(model, &w.k_norm)?,
                 }),
@@ -339,14 +344,18 @@ impl Qwen35Grads {
                 input_norm: zeros_buf(model, &layer.input_norm)?,
                 post_norm: zeros_buf(model, &layer.post_norm)?,
                 mixer,
-                gate: zeros_tensor(&layer.gate)?,
-                up: zeros_tensor(&layer.up)?,
-                down: zeros_tensor(&layer.down)?,
+                gate: zeros_tensor(layer.gate.dense()?)?,
+                up: zeros_tensor(layer.up.dense()?)?,
+                down: zeros_tensor(layer.down.dense()?)?,
             });
         }
         Ok(Self {
-            embed: zeros_tensor(&model.embed)?,
-            lm_head: model.lm_head.as_ref().map(zeros_tensor).transpose()?,
+            embed: zeros_tensor(model.embed.dense()?)?,
+            lm_head: model
+                .lm_head
+                .as_ref()
+                .map(|w| w.dense().and_then(zeros_tensor))
+                .transpose()?,
             final_norm: zeros_buf(model, &model.final_norm)?,
             layers,
         })
@@ -1002,6 +1011,7 @@ impl Qwen35Model {
 
     /// `bank` has a buffer of each weight's size for every weight.
     fn check_bank(&self, what: &str, bank: &Qwen35Grads) -> Result<(), String> {
+        self.require_dense(what)?;
         if bank.layers.len() != self.layers.len() {
             return Err(format!(
                 "{what}: the bank has {} layers, the model {}",
@@ -1010,11 +1020,11 @@ impl Qwen35Model {
             ));
         }
         let mut top = vec![
-            ("embed", tensor_part(&bank.embed), tensor_part(&self.embed)),
+            ("embed", tensor_part(&bank.embed), tensor_part(self.embed.dense()?)),
             ("final_norm", buf_part(&bank.final_norm), buf_part(&self.final_norm)),
         ];
         match (&bank.lm_head, &self.lm_head) {
-            (Some(g), Some(w)) => top.push(("lm_head", tensor_part(g), tensor_part(w))),
+            (Some(g), Some(w)) => top.push(("lm_head", tensor_part(g), tensor_part(w.dense()?))),
             (None, None) => {}
             (Some(_), None) => return Err(format!("{what}: the bank has an lm_head gradient, the model is tied")),
             (None, Some(_)) => {
@@ -1033,7 +1043,7 @@ impl Qwen35Model {
             }
         }
         for (i, (g, layer)) in bank.layers.iter().zip(&self.layers).enumerate() {
-            let (have, want) = (g.parts(), layer_weight_parts(layer));
+            let (have, want) = (g.parts(), layer_weight_parts(layer)?);
             if have.len() != want.len() {
                 return Err(format!("{what}: layer {i}'s gradients are not its mixer's"));
             }
@@ -1267,8 +1277,8 @@ impl Qwen35Model {
             &id_buf,
             t,
             qwen35::LmHead {
-                weight: &self.embed.buffer,
-                dtype: self.embed.dtype,
+                weight: &self.embed.dense()?.buffer,
+                dtype: self.embed.dense()?.dtype,
                 vocab: cfg.vocab,
             },
             cfg.hidden,
@@ -1344,7 +1354,7 @@ impl Qwen35Model {
             }
             _ => zero_part(rt, tensor_part(&dxf))?,
         }
-        let head_w = self.head_table();
+        let head_w = self.head_table().dense()?;
         let ce = |rows: &[u32], targets: &[u32], reduction, dh: &Tensor, scale| {
             let chunk = CE_CHUNK.min(cfg.vocab);
             let ws = CeWorkspace::new(rt, rows.len() as u32, cfg.hidden, chunk, head_w.dtype, operands)?;
@@ -1423,7 +1433,7 @@ impl Qwen35Model {
             token_rows,
             loss,
             attn_ws,
-            embed: self.embed.buffer.clone(),
+            embed: self.embed.dense()?.buffer.clone(),
             param_generation,
             ragged: ragged.map(|spans| RaggedPending {
                 spans: spans.to_vec(),
@@ -1566,6 +1576,10 @@ impl Qwen35Model {
     /// excludes the model and `config`'s state, which [`AdamW::allocated_bytes_for`]
     /// bounds, and the gradient bank a step into one needs: this step has
     /// none.
+    ///
+    /// A quantized (MLX 4-bit) model has no training step: every bound in this
+    /// family returns `u64::MAX` for one, which no memory check passes (it fails
+    /// closed), and the step itself is refused with a message.
     pub fn train_step_fused_adamw_bytes(&self, t: u32, operands: GemmOperands, config: AdamWConfig) -> u64 {
         self.step_bytes(t, operands, false, self.fused_head_kind(), None, Some(config))
     }
@@ -1573,7 +1587,7 @@ impl Qwen35Model {
     /// Where a fused step's head gradient goes: its top bank's embedding is
     /// f32 or bf16 as the weight is.
     fn fused_head_kind(&self) -> HeadKind {
-        if self.embed.dtype == DType::F32 {
+        if self.table_dtype() == DType::F32 {
             HeadKind::InPlace
         } else {
             HeadKind::ByChunk
@@ -1601,8 +1615,12 @@ impl Qwen35Model {
     /// head and the gather write into. Held through the step.
     fn fused_top_bank(&self) -> Result<Qwen35Grads, String> {
         Ok(Qwen35Grads {
-            embed: self.scratch_like(&self.embed)?,
-            lm_head: self.lm_head.as_ref().map(|t| self.scratch_like(t)).transpose()?,
+            embed: self.scratch_like(self.embed.dense()?)?,
+            lm_head: self
+                .lm_head
+                .as_ref()
+                .map(|w| self.scratch_like(w.dense()?))
+                .transpose()?,
             final_norm: self.scratch_buf(&self.final_norm)?,
             layers: Vec::new(),
         })
@@ -1619,8 +1637,15 @@ impl Qwen35Model {
 
     /// Bytes [`Self::fused_top_bank`] allocates, at the pool's rounding.
     fn fused_top_bank_bytes(&self) -> u64 {
-        let mut parts = vec![tensor_part(&self.embed), buf_part(&self.final_norm)];
-        parts.extend(self.lm_head.as_ref().map(tensor_part));
+        // A quantized model has no step to size: "never fits".
+        let Ok(embed) = self.embed.dense() else {
+            return u64::MAX;
+        };
+        let mut parts = vec![tensor_part(embed), buf_part(&self.final_norm)];
+        match self.lm_head.as_ref().map(Weight::dense).transpose() {
+            Ok(head) => parts.extend(head.map(tensor_part)),
+            Err(_) => return u64::MAX,
+        }
         parts.iter().fold(0u64, |a, p| a.saturating_add(scratch_part_bytes(p)))
     }
 
@@ -1630,16 +1655,16 @@ impl Qwen35Model {
     fn layer_scratch(&self, layer: &Layer) -> Result<LayerGrads, String> {
         let mixer = match &layer.mixer {
             Mixer::Gdn(w) => MixerGrads::Gdn(GdnGrads {
-                w_in: self.scratch_like(&w.w_in)?,
-                w_out: self.scratch_like(&w.w_out)?,
+                w_in: self.scratch_like(w.w_in.dense()?)?,
+                w_out: self.scratch_like(w.w_out.dense()?)?,
                 conv_w: self.scratch_buf(&w.conv_w)?,
                 a_log: self.scratch_buf(&w.a_log)?,
                 dt_bias: self.scratch_buf(&w.dt_bias)?,
                 norm_w: self.scratch_buf(&w.norm_w)?,
             }),
             Mixer::Attn(w) => MixerGrads::Attn(AttnGrads {
-                w_in: self.scratch_like(&w.w_in)?,
-                w_out: self.scratch_like(&w.w_out)?,
+                w_in: self.scratch_like(w.w_in.dense()?)?,
+                w_out: self.scratch_like(w.w_out.dense()?)?,
                 q_norm: self.scratch_buf(&w.q_norm)?,
                 k_norm: self.scratch_buf(&w.k_norm)?,
             }),
@@ -1648,9 +1673,9 @@ impl Qwen35Model {
             input_norm: self.scratch_buf(&layer.input_norm)?,
             post_norm: self.scratch_buf(&layer.post_norm)?,
             mixer,
-            gate: self.scratch_like(&layer.gate)?,
-            up: self.scratch_like(&layer.up)?,
-            down: self.scratch_like(&layer.down)?,
+            gate: self.scratch_like(layer.gate.dense()?)?,
+            up: self.scratch_like(layer.up.dense()?)?,
+            down: self.scratch_like(layer.down.dense()?)?,
         })
     }
 
@@ -1659,7 +1684,11 @@ impl Qwen35Model {
     /// ([`Self::layer_bwd_bytes`]) already charges every gradient at f32, so
     /// only the bf16 buffers are added to it.
     fn layer_scratch_bytes(&self, layer: &Layer) -> (u64, u64) {
-        layer_weight_parts(layer).iter().fold((0u64, 0u64), |(f, b), p| {
+        // A quantized layer has no dense gradients to size: "never fits".
+        let Ok(parts) = layer_weight_parts(layer) else {
+            return (u64::MAX, u64::MAX);
+        };
+        parts.iter().fold((0u64, 0u64), |(f, b), p| {
             let n = scratch_part_bytes(p);
             if p.3 == DType::BF16 {
                 (f, b.saturating_add(n))
@@ -1680,7 +1709,10 @@ impl Qwen35Model {
     /// The bytes the update after the gather adds: the embedding's, the
     /// final norm's and an untied head's slot tables.
     fn fused_tail_bytes(&self, config: AdamWConfig) -> u64 {
-        let mut ps = vec![embed_slot(self, None)];
+        let Ok(embed) = embed_slot(self, None) else {
+            return u64::MAX;
+        };
+        let mut ps = vec![embed];
         ps.extend(tail_slots(self, None).unwrap_or_default());
         fused_table_bytes(config, &ps)
     }
@@ -1692,7 +1724,7 @@ impl Qwen35Model {
         p: &PendingStep,
         dh: Option<(&[u32], &Tensor)>,
     ) -> Result<(), String> {
-        if !p.embed.aliases(&self.embed.buffer) || p.inputs.len() != self.layers.len() {
+        if !p.embed.aliases(&self.embed.dense()?.buffer) || p.inputs.len() != self.layers.len() {
             return Err(format!("{what}: the pending step is another model's"));
         }
         if p.param_generation != self.param_generation() {
@@ -2084,6 +2116,9 @@ impl Qwen35Model {
     /// cap when called. [`Self::train_forward`] refuses a step whose bound
     /// and the device's current allocation exceed its recommended working
     /// set.
+    ///
+    /// `u64::MAX` for a quantized (MLX 4-bit) model, which has no training
+    /// step (see [`Self::train_step_fused_adamw_bytes`]).
     pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
         self.step_bytes(t, operands, false, HeadKind::Fresh, None, None)
     }
@@ -2096,6 +2131,8 @@ impl Qwen35Model {
     ///
     /// # Errors
     /// `cu_seqlens` is malformed for `total` tokens.
+    ///
+    /// `u64::MAX` for a quantized (MLX 4-bit) model, as [`Self::train_step_bytes`].
     pub fn train_step_ragged_bytes(
         &self,
         cu_seqlens: &[u32],
@@ -2136,6 +2173,11 @@ impl Qwen35Model {
         lens: Option<&[u32]>,
         fused: Option<AdamWConfig>,
     ) -> u64 {
+        // A quantized model has no step: the bound is "never fits" rather than
+        // a figure for weights it does not hold.
+        if self.is_mlx_q4() {
+            return u64::MAX;
+        }
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -2298,7 +2340,7 @@ impl Qwen35Model {
     fn layer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands, output: bool) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
-        let wd = self.embed.dtype;
+        let wd = self.table_dtype();
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         let mut b = vec![
             f(tu * h), // x1
@@ -2321,7 +2363,7 @@ impl Qwen35Model {
     fn mixer_fwd_bytes(&self, layer: &Layer, t: u32, mm: GemmOperands) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let h = cfg.hidden as usize;
-        let wd = self.embed.dtype;
+        let wd = self.table_dtype();
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         let mut b = Vec::new();
         match &layer.mixer {
@@ -2379,7 +2421,7 @@ impl Qwen35Model {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, i) = (cfg.hidden as usize, cfg.intermediate as usize);
         let tc = self.rt.has_tensorops();
-        let wd = self.embed.dtype;
+        let wd = self.table_dtype();
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         // down, gate, up, post_norm, input_norm.
         let mut grads = vec![f(i * h), f(h * i), f(h * i), f(h), f(h)];
@@ -2402,7 +2444,7 @@ impl Qwen35Model {
         let (cfg, tu) = (&self.cfg, t as usize);
         let h = cfg.hidden as usize;
         let tc = self.rt.has_tensorops();
-        let wd = self.embed.dtype;
+        let wd = self.table_dtype();
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
         let mut grads = Vec::new();
         let mut temps = Vec::new();
@@ -2527,7 +2569,7 @@ impl Qwen35Model {
             per_chunk(chunk as usize)
         };
         [
-            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.embed.dtype, mm),
+            CeWorkspace::allocated_bytes_for(t, cfg.hidden, chunk, self.table_dtype(), mm),
             gemms,
             GpuRuntime::allocated_bytes_for(n * h * 4, BufferKind::Cold),
             // `cross_entropy_rows` stages its row and target ids through two
@@ -2632,13 +2674,13 @@ impl Qwen35Model {
             (mixer, Some(r)) => self.ragged_mixer_forward(mixer, op(&x1, &x1_16), &resid_in, mm, r)?,
             (Mixer::Gdn(w), None) => {
                 let s = self.gdn_forward(w, op(&x1, &x1_16), t, mm)?;
-                let r = self.residual(&resid_in, op(&s.y, &s.y16), &w.w_out, t, mm)?;
+                let r = self.residual(&resid_in, op(&s.y, &s.y16), w.w_out.dense()?, t, mm)?;
                 (SavedMixer::Gdn(Box::new(s)), r)
             }
             (Mixer::Attn(w), None) => {
                 let ws = attn_ws.ok_or("Qwen35Model::train_step: an attention layer without the step's workspace")?;
                 let s = self.attn_forward(w, op(&x1, &x1_16), t, mm, ws)?;
-                let r = self.residual(&resid_in, op(&s.y, &s.y16), &w.w_out, t, mm)?;
+                let r = self.residual(&resid_in, op(&s.y, &s.y16), w.w_out.dense()?, t, mm)?;
                 (SavedMixer::Attn(s), r)
             }
         };
@@ -2646,8 +2688,8 @@ impl Qwen35Model {
         self.norm_f32(&resid_mid, &layer.post_norm, &x2, t)?;
         let x2_16 = bf16_twin(mm, &x2)?;
         let (m_gate, m_up, m_mid) = (tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?, tensor(rt, &[tu, i])?);
-        mm.nn(op(&x2, &x2_16), &layer.gate, &m_gate)?;
-        mm.nn(op(&x2, &x2_16), &layer.up, &m_up)?;
+        mm.nn(op(&x2, &x2_16), layer.gate.dense()?, &m_gate)?;
+        mm.nn(op(&x2, &x2_16), layer.up.dense()?, &m_up)?;
         qwen35::swiglu(
             rt,
             Cols::dense(&m_gate.buffer, cfg.intermediate),
@@ -2660,7 +2702,7 @@ impl Qwen35Model {
             cfg.intermediate,
         )?;
         let resid_out = if output {
-            Some(self.residual(&resid_mid, &m_mid, &layer.down, t, mm)?)
+            Some(self.residual(&resid_mid, &m_mid, layer.down.dense()?, t, mm)?)
         } else {
             None
         };
@@ -2707,7 +2749,7 @@ impl Qwen35Model {
             let sv = match mixer {
                 Mixer::Gdn(w) => {
                     let s = self.gdn_forward(w, &x_k, nu, mm)?;
-                    self.residual_into(&rin, op(&s.y, &s.y16), &w.w_out, &out_k, mm)?;
+                    self.residual_into(&rin, op(&s.y, &s.y16), w.w_out.dense()?, &out_k, mm)?;
                     SavedMixer::Gdn(Box::new(s))
                 }
                 Mixer::Attn(w) => {
@@ -2715,7 +2757,7 @@ impl Qwen35Model {
                         "Qwen35Model::train_step_ragged_into: an attention layer without a sequence's workspace",
                     )?;
                     let s = self.attn_forward(w, &x_k, nu, mm, ws)?;
-                    self.residual_into(&rin, op(&s.y, &s.y16), &w.w_out, &out_k, mm)?;
+                    self.residual_into(&rin, op(&s.y, &s.y16), w.w_out.dense()?, &out_k, mm)?;
                     SavedMixer::Attn(s)
                 }
             };
@@ -2770,7 +2812,7 @@ impl Qwen35Model {
         let (rt, g) = (&self.rt, self.cfg.gdn);
         let (tu, hv, dv) = (t as usize, g.v_heads() as usize, g.v_dim() as usize);
         let proj = tensor(rt, &[tu, g.width() as usize])?;
-        mm.nn(x1, &w.w_in, &proj)?;
+        mm.nn(x1, w.w_in.dense()?, &proj)?;
         let conv = tensor(rt, &[tu, g.conv_dim() as usize])?;
         qwen35::conv1d_silu(
             rt,
@@ -2859,7 +2901,7 @@ impl Qwen35Model {
             (a.kv_heads() * a.head_dim()) as usize,
         );
         let proj = tensor(rt, &[tu, a.width() as usize])?;
-        mm.nn(x1, &w.w_in, &proj)?;
+        mm.nn(x1, w.w_in.dense()?, &proj)?;
         let (q, k, v) = (f32s(rt, tu * qd)?, f32s(rt, tu * kvd)?, f32s(rt, tu * kvd)?);
         qwen35::attn_qk_norm_rope(
             rt,
@@ -2962,7 +3004,7 @@ impl Qwen35Model {
         let into = |pick: fn(&LayerGrads) -> &Tensor| bank.map(|(b, add)| (pick(b), add));
         let dresid16 = bf16_twin(mm, &sc.mx.dresid)?;
         let down = self.weight_grad(mm, &s.m_mid, op(&sc.mx.dresid, &dresid16), into(|b| &b.down))?;
-        mm.nt(op(&sc.mx.dresid, &dresid16), &layer.down, &sc.d_mid)?;
+        mm.nt(op(&sc.mx.dresid, &dresid16), layer.down.dense()?, &sc.d_mid)?;
         swiglu_bwd(
             rt,
             Cols::dense(&s.m_gate.buffer, i),
@@ -2978,8 +3020,8 @@ impl Qwen35Model {
         let gate = self.weight_grad(mm, x2, op(&sc.d_gate, &d_gate16), into(|b| &b.gate))?;
         let up = self.weight_grad(mm, x2, op(&sc.d_up, &d_up16), into(|b| &b.up))?;
         // dx = d_gate @ gate^T + d_up @ up^T, the second added in its GEMM.
-        mm.nt(op(&sc.d_gate, &d_gate16), &layer.gate, &sc.mx.dx)?;
-        mm.nt_acc(op(&sc.d_up, &d_up16), &layer.up, &sc.mx.dx)?;
+        mm.nt(op(&sc.d_gate, &d_gate16), layer.gate.dense()?, &sc.mx.dx)?;
+        mm.nt_acc(op(&sc.d_up, &d_up16), layer.up.dense()?, &sc.mx.dx)?;
         let post_norm = vec_grad(rt, hu, bank.map(|(b, add)| (&b.post_norm, add)))?;
         rms_norm_bwd(
             rt,
@@ -3068,7 +3110,7 @@ impl Qwen35Model {
             op(&sc.dresid, &dresid16),
             bank.map(|(b, add)| (&b.w_out, add)),
         )?;
-        mm.nt(op(&sc.dresid, &dresid16), &w.w_out, &gs.dy)?;
+        mm.nt(op(&sc.dresid, &dresid16), w.w_out.dense()?, &gs.dy)?;
         // y = gated_rms_norm(o, z): d_o, and dz into the projection gradient.
         let norm_w = vec_grad(rt, g.v_dim() as usize, bank.map(|(b, add)| (&b.norm_w, add)))?;
         let dproj = &gs.dproj.buffer;
@@ -3161,7 +3203,7 @@ impl Qwen35Model {
         )?;
         let dproj16 = bf16_twin(mm, &gs.dproj)?;
         let w_in = self.weight_grad(mm, x1, op(&gs.dproj, &dproj16), bank.map(|(b, add)| (&b.w_in, add)))?;
-        mm.nt(op(&gs.dproj, &dproj16), &w.w_in, &sc.dx)?;
+        mm.nt(op(&gs.dproj, &dproj16), w.w_in.dense()?, &sc.dx)?;
         Ok(GdnGrads {
             w_in,
             w_out,
@@ -3199,7 +3241,7 @@ impl Qwen35Model {
             op(&sc.dresid, &dresid16),
             bank.map(|(b, add)| (&b.w_out, add)),
         )?;
-        mm.nt(op(&sc.dresid, &dresid16), &w.w_out, &asc.dy)?;
+        mm.nt(op(&sc.dresid, &dresid16), w.w_out.dense()?, &asc.dy)?;
         let proj = Cols::dense(&s.proj.buffer, a.width());
         let dproj = &asc.dproj.buffer;
         // y = o * sigmoid(gate): d_o, and the gate columns of dproj.
@@ -3256,7 +3298,7 @@ impl Qwen35Model {
         )?;
         let dproj16 = bf16_twin(mm, &asc.dproj)?;
         let w_in = self.weight_grad(mm, x1, op(&asc.dproj, &dproj16), bank.map(|(b, add)| (&b.w_in, add)))?;
-        mm.nt(op(&asc.dproj, &dproj16), &w.w_in, &sc.dx)?;
+        mm.nt(op(&asc.dproj, &dproj16), w.w_in.dense()?, &sc.dx)?;
         Ok(AttnGrads {
             w_in,
             w_out,
@@ -3268,9 +3310,13 @@ impl Qwen35Model {
 
 // The peak-footprint reader the bench bins and tests/ share, for the 2B test's
 // closing line.
+// (`qwen35_q4` owns the in-library include of that file.)
 #[cfg(test)]
-#[path = "bin/common/footprint.rs"]
-mod footprint;
+mod footprint {
+    pub(super) fn peak_footprint() -> Result<u64, String> {
+        crate::qwen35_q4::peak_footprint_now()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3844,7 +3890,7 @@ mod tests {
         model.cfg.vocab = vocab;
         let (rt, h) = (model.rt.clone(), model.cfg.hidden as usize);
         let head_w = rt
-            .alloc_tensor_unzeroed(&[vocab as usize, h], model.embed.dtype)
+            .alloc_tensor_unzeroed(&[vocab as usize, h], model.table_dtype())
             .unwrap();
         let xf = tensor(&rt, &[t as usize, h]).unwrap();
         let dw = tensor(&rt, &[vocab as usize, h]).unwrap();
@@ -4510,21 +4556,21 @@ mod tests {
         let matrices: Vec<(String, &GpuBuffer, &GpuBuffer, usize, usize)> = vec![
             (
                 "model.layers.0.mlp.gate_proj.weight".into(),
-                &model.layers[0].gate.buffer,
+                &model.layers[0].gate.dense().unwrap().buffer,
                 &step.grads.layers[0].gate.buffer,
                 h,
                 i,
             ),
             (
                 "model.layers.0.mlp.down_proj.weight".into(),
-                &model.layers[0].down.buffer,
+                &model.layers[0].down.dense().unwrap().buffer,
                 &step.grads.layers[0].down.buffer,
                 i,
                 h,
             ),
             (
                 "model.layers.3.self_attn.o_proj.weight".into(),
-                &attn(3).0.w_out.buffer,
+                &attn(3).0.w_out.dense().unwrap().buffer,
                 &attn(3).1.w_out.buffer,
                 qd,
                 h,

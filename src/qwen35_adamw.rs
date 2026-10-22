@@ -973,7 +973,7 @@ impl<'a> FusedAdamW<'a> {
         lm_head: Option<&Tensor>,
     ) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::train_step_fused_adamw";
-        let mut ps = vec![embed_slot(model, Some(embed))];
+        let mut ps = vec![embed_slot(model, Some(embed)).map_err(|e| format!("{WHAT}: {e}"))?];
         ps.extend(tail_slots(model, Some((final_norm, lm_head))).map_err(|e| format!("{WHAT}: {e}"))?);
         let indices = std::iter::once(0).chain(self.tail_start..self.tail_start + ps.len() - 1);
         self.encode(WHAT, model, &ps, indices)

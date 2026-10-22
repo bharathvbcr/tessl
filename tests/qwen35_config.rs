@@ -324,3 +324,142 @@ fn malformed_configs_are_refused() {
         "duplicate key",
     );
 }
+
+// ------------------------------------------------ the real 27B config ---
+
+/// `mlx-community/Qwen3.8-27B-MTP-4bit`'s `config.json` as published (snapshot
+/// b643c01): `model_type` `qwen3_5_mtp`, the 27B's `text_config`, the MLX
+/// `quantization` block and `mtp_num_hidden_layers: 1`.
+const Q27B: &str = include_str!("fixtures/qwen35/config_qwen38_27b_mtp_4bit.json");
+
+fn edited27(pairs: &[(&str, &str)]) -> String {
+    let mut s = Q27B.to_string();
+    for (from, to) in pairs {
+        assert_eq!(s.matches(from).count(), 1, "fixture edit {from:?} must match once");
+        s = s.replace(from, to);
+    }
+    s
+}
+
+#[test]
+fn the_real_27b_config_parses_to_the_27b_shape() {
+    let c = Qwen35Config::from_config_json(Q27B).expect("the real 27B config.json");
+    assert_eq!((c.hidden, c.intermediate, c.vocab), (5120, 17408, 248_320));
+    assert_eq!(c.layers.len(), 64);
+    // Every fourth layer is full attention: 16 attention, 48 GDN.
+    for (l, kind) in c.layers.iter().enumerate() {
+        let want = if l % 4 == 3 {
+            LayerKind::FullAttention
+        } else {
+            LayerKind::LinearAttention
+        };
+        assert_eq!(*kind, want, "layer {l}");
+    }
+    assert_eq!(c.layers.iter().filter(|k| **k == LayerKind::FullAttention).count(), 16);
+    // GDN: 16 key heads, 48 value heads of 128 (three value heads per key head).
+    assert_eq!((c.gdn.k_heads(), c.gdn.v_heads(), c.gdn.v_dim()), (16, 48, 128));
+    assert_eq!(c.gdn.conv_dim(), 2 * 16 * 128 + 48 * 128);
+    // Attention: 24 query and 4 KV heads of 256, a quarter of each head rotated.
+    assert_eq!((c.attn.q_heads(), c.attn.kv_heads(), c.attn.head_dim()), (24, 4, 256));
+    assert_eq!(c.rotary_dim, 64);
+    assert_eq!(c.conv_kernel, 4);
+    assert_eq!(c.rope_theta, 1e7);
+    assert_eq!(c.rms_norm_eps, 1e-6);
+    // Untied: its own 248,320-row head.
+    assert!(!c.tie_word_embeddings);
+}
+
+/// The decision on the MTP head: it is not part of the tower. The config's
+/// `mtp_*` keys (and `block_size`, `model_type`) describe a drafter the forward
+/// does not run, so they are read by nobody, on purpose, and changing them
+/// changes nothing; the checkpoint's `mtp.*` tensors are skipped by name and
+/// reported at load (`classify_outside`, `tests/qwen35_mlx_q4_layout.rs`).
+#[test]
+fn the_mtp_keys_are_ignored_on_purpose_and_change_nothing() {
+    let base = Qwen35Config::from_config_json(Q27B).unwrap();
+    for pairs in [
+        &[("\"mtp_num_hidden_layers\": 1", "\"mtp_num_hidden_layers\": 3")][..],
+        &[(
+            "\"mtp_use_dedicated_embeddings\": false",
+            "\"mtp_use_dedicated_embeddings\": true",
+        )],
+        &[("\"block_size\": 3", "\"block_size\": 5")],
+        &[("\"model_type\": \"qwen3_5_mtp\"", "\"model_type\": \"qwen3_5\"")],
+    ] {
+        assert_eq!(
+            Qwen35Config::from_config_json(&edited27(pairs)).unwrap(),
+            base,
+            "{pairs:?}"
+        );
+    }
+}
+
+/// `output_gate_type: "swish"` is in the 27B config only. No reader of it exists
+/// in mlx-lm 0.32.0, mlx-vlm 0.7.6 or transformers' qwen3_5 (checked with a
+/// source search), all of which gate the attention output with `sigmoid(gate)`
+/// whatever the key says. So the config parses and the forward is the sigmoid
+/// one; whether the 27B's weights were trained with a swish gate is
+/// unverified. This pins the current reading so a change to it is a decision.
+#[test]
+fn output_gate_type_is_not_read_and_the_sigmoid_gate_is_what_runs() {
+    let with = Qwen35Config::from_config_json(Q27B).unwrap();
+    let without = Qwen35Config::from_config_json(&edited27(&[("\"output_gate_type\": \"swish\",", "")])).unwrap();
+    assert_eq!(with, without);
+    let other = Qwen35Config::from_config_json(&edited27(&[(
+        "\"output_gate_type\": \"swish\"",
+        "\"output_gate_type\": \"sigmoid\"",
+    )]))
+    .unwrap();
+    assert_eq!(with, other);
+}
+
+#[test]
+fn the_27b_config_refuses_what_the_forward_lacks_by_key() {
+    for (pairs, needle) in [
+        (
+            &[("\"attention_bias\": false", "\"attention_bias\": true")][..],
+            "attention_bias",
+        ),
+        (
+            &[("\"attn_output_gate\": true", "\"attn_output_gate\": false")],
+            "ungated attention",
+        ),
+        (
+            &[("\"hidden_act\": \"silu\"", "\"hidden_act\": \"gelu\"")],
+            "hidden_act \"gelu\"",
+        ),
+        (
+            &[("\"rope_type\": \"default\"", "\"rope_type\": \"yarn\"")],
+            "rope_type",
+        ),
+        (
+            &[("\"linear_key_head_dim\": 128", "\"linear_key_head_dim\": 64")],
+            "linear_key_head_dim 64",
+        ),
+        (
+            &[("\"head_dim\": 256", "\"head_dim\": 128")],
+            "head_dim 128 is not supported",
+        ),
+        (
+            &[("\"mamba_ssm_dtype\": \"float32\"", "\"mamba_ssm_dtype\": \"bfloat16\"")],
+            "mamba_ssm_dtype",
+        ),
+        (
+            &[("\"num_hidden_layers\": 64", "\"num_hidden_layers\": 63")],
+            "has 64 entries but num_hidden_layers is 63",
+        ),
+        // Untied is stated at the root and in text_config; one flipped disagrees.
+        (
+            &[(
+                "\"tie_word_embeddings\": false,\n    \"vision_config\"",
+                "\"tie_word_embeddings\": true,\n    \"vision_config\"",
+            )],
+            "disagrees",
+        ),
+    ] {
+        match Qwen35Config::from_config_json(&edited27(pairs)) {
+            Ok(c) => panic!("expected {needle:?}, parsed {c:?}"),
+            Err(e) => assert!(e.contains(needle), "{e:?} lacks {needle:?}"),
+        }
+    }
+}

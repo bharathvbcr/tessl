@@ -421,6 +421,19 @@ impl SafeTensors {
         self.read_into(name, info, dst)
     }
 
+    /// [`Self::read_u32`] into `dst` (a device buffer's shared storage, say)
+    /// after checking the dtype and `shape`.
+    pub(crate) fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String> {
+        let info = self.info(name)?;
+        if info.dtype != Dtype::U32 {
+            return Err(format!("{name}: expected U32, found {:?}", info.dtype));
+        }
+        if info.shape != shape {
+            return Err(format!("{name}: shape {:?}, expected {shape:?}", info.shape));
+        }
+        self.read_into(name, info, dst)
+    }
+
     /// A floating tensor widened exactly to f32 (F32, BF16 or F16; every value
     /// of the narrower types is representable in f32).
     ///
@@ -484,6 +497,11 @@ pub trait TensorSource {
     fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String>;
     /// [`Self::read_bf16_bits`] into `dst`, after checking the dtype and `shape`.
     fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String>;
+    /// `name`'s dtype and shape, from the header alone (no tensor data is read).
+    fn tensor_info(&self, name: &str) -> Result<TensorInfo, String>;
+    /// A U32 tensor (MLX packs eight 4-bit weights per element) into `dst`,
+    /// after checking the dtype and `shape`.
+    fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String>;
 }
 
 impl TensorSource for SafeTensors {
@@ -501,6 +519,12 @@ impl TensorSource for SafeTensors {
     }
     fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
         SafeTensors::read_bf16_bits_into(self, name, shape, dst)
+    }
+    fn tensor_info(&self, name: &str) -> Result<TensorInfo, String> {
+        self.info(name).cloned()
+    }
+    fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String> {
+        SafeTensors::read_u32_into(self, name, shape, dst)
     }
 }
 
@@ -679,6 +703,12 @@ impl TensorSource for CheckpointView {
     }
     fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
         self.shard(name)?.read_bf16_bits_into(name, shape, dst)
+    }
+    fn tensor_info(&self, name: &str) -> Result<TensorInfo, String> {
+        self.shard(name)?.info(name).cloned()
+    }
+    fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String> {
+        self.shard(name)?.read_u32_into(name, shape, dst)
     }
 }
 

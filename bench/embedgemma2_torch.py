@@ -23,6 +23,21 @@ The MPS cache is emptied between workloads, outside the timed region, so one
 workload's cached buffers are not held through the next. Each workload's
 starting MPS driver memory goes to stderr.
 
+Memory, per workload, from one further untimed pass after the timed iterations
+(`memory_pass`): `tensor_mib` is the most `torch.mps.current_allocated_memory()`
+(the bytes live tensors hold) read at any module boundary of the forward, above
+what was live before the pass (the weights and the padded input batches);
+`tensor_base_mib` is that baseline; `driver_mib` is
+`torch.mps.driver_allocated_memory()` after the pass. `tensor_mib` is the
+memory metric: it is the same every round, and `bench_paired` carries it into
+its report (`tensor_mib_max`). `driver_mib` includes the caching allocator's
+retained pool, which does not repeat from round to round at the same work, so
+it is recorded in the row (kept verbatim in the report's raw rows and in the
+lane's stdout under `bench_paired --out PATH.lanes/`) and on stderr, and is
+not summarised (no `driver_mib_max`). `tensor_mib` is
+a lower bound on the true peak (torch has no MPS peak counter, and a module's
+internal temporaries are seen only at its boundaries).
+
 --dtype f32 is the like-for-like lane (tessl's forward is f32 with exact-f32
 GEMMs); bf16 is the checkpoint's dtype, reported as what a torch deployment
 would run. Attention is transformers' default implementation for the model
@@ -37,7 +52,6 @@ import sys
 import time
 
 import torch
-from sentence_transformers import SentenceTransformer
 
 
 def ids(seq, length):
@@ -56,6 +70,61 @@ def lengths(workload):
         lo, hi = int(lo), int(hi or lo)
         lens += [lo + (i * 2654435761) % (hi - lo + 1) for i in range(int(b))]
     return lens
+
+
+def mib(n):
+    return n / 2**20
+
+
+class PeakSampler:
+    """Largest `current()` seen at the entry and exit of every module of `model`
+    while the context is open. The hooks are removed on exit, also on an error."""
+
+    def __init__(self, model, current):
+        self.model, self.current, self.peak, self.handles = model, current, 0, []
+
+    def sample(self, *_):
+        self.peak = max(self.peak, self.current())
+
+    def __enter__(self):
+        self.sample()
+        for m in self.model.modules():
+            self.handles.append(m.register_forward_pre_hook(self.sample))
+            self.handles.append(m.register_forward_hook(self.sample))
+        return self
+
+    def __exit__(self, *exc):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+        self.sample()
+        return False
+
+
+def memory_pass(model, run, current, driver, sync):
+    """One untimed `run()` with the live tensor bytes (`current`, bytes) sampled
+    at every module boundary. Returns {tensor_mib, tensor_base_mib, driver_mib}:
+    the peak sample above the bytes live before the pass, that baseline, and the
+    driver's allocation (`driver`, bytes) after the pass, which is recorded, not
+    gated."""
+    sync()
+    base = current()
+    with PeakSampler(model, current) as s:
+        run()
+        sync()
+    peak = max(s.peak, current())
+    return {"tensor_mib": round(mib(max(peak - base, 0)), 1),
+            "tensor_base_mib": round(mib(base), 1),
+            "driver_mib": round(mib(driver()), 1)}
+
+
+def workload_row(workload, dtype, ms_sorted, iters, forwards, mem):
+    """The row `bench_paired --format workloads` reads: `ms_min` is the fastest
+    of the sorted `ms_sorted`, and the `memory_pass` fields ride along
+    (`tensor_mib` is carried into the report, `driver_mib` is recorded only)."""
+    return {"workload": workload.strip(), "backend": f"torch-mps-{dtype}",
+            "ms_min": round(ms_sorted[0], 4), "ms_median": round(statistics.median(ms_sorted), 4),
+            "iters": iters, "forwards": forwards, **mem}
 
 
 def snapshot():
@@ -80,6 +149,8 @@ def main():
     args = ap.parse_args()
     if not torch.backends.mps.is_available():
         raise SystemExit("MPS is not available")
+
+    from sentence_transformers import SentenceTransformer
 
     kwargs = {"dtype": torch.float32 if args.dtype == "f32" else torch.bfloat16}
     if args.attn:
@@ -121,9 +192,11 @@ def main():
             run()
             ms.append((time.perf_counter() - t0) * 1e3)
         ms.sort()
-        rows.append({"workload": w.strip(), "backend": f"torch-mps-{args.dtype}",
-                     "ms_min": round(ms[0], 4), "ms_median": round(statistics.median(ms), 4),
-                     "iters": args.iters, "forwards": len(batches)})
+        mem = memory_pass(model, run, torch.mps.current_allocated_memory,
+                          torch.mps.driver_allocated_memory, torch.mps.synchronize)
+        print(f"{w}: tensor_mib={mem['tensor_mib']} (above {mem['tensor_base_mib']}) "
+              f"driver_mib={mem['driver_mib']} (recorded, not gated)", file=sys.stderr, flush=True)
+        rows.append(workload_row(w, args.dtype, ms, args.iters, len(batches), mem))
         batches.clear()
         del e
         torch.mps.empty_cache()

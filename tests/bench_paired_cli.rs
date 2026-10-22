@@ -886,3 +886,29 @@ fn counts_are_one_strict_bounded_grammar_for_rounds_and_bench_iters() {
         assert_eq!(o.status.code(), Some(2), "--rounds {bad:?}");
     }
 }
+
+#[test]
+fn workload_lanes_carry_tensor_mib_into_the_report_and_leave_unlisted_fields_out() {
+    let d = scratch("tensor-mib");
+    let row = |ms: &str, tensor: &str| {
+        format!("echo '[{{\"workload\":\"w\",\"ms_min\":{ms},\"tensor_mib\":{tensor},\"driver_mib\":9999.0}}]'")
+    };
+    let a = script(&d, "a", &row("2.0", "1024.5"));
+    let b = script(&d, "b", &row("1.0", "512.25"));
+    let json = d.join("report.json");
+    let out = run(&strs(&[
+        "--rounds",
+        "2",
+        "--out",
+        json.to_str().unwrap(),
+        &format!("a={}", a.display()),
+        &format!("b={}", b.display()),
+    ]));
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("0.500x [0.500, 0.500]"), "{}", stdout(&out));
+    let text: String = fs::read_to_string(&json).unwrap().split_whitespace().collect();
+    assert!(text.contains("\"tensor_mib_max\":1024.5"), "{text}");
+    assert!(text.contains("\"tensor_mib_max\":512.25"), "{text}");
+    assert!(!text.contains("driver_mib_max"), "driver memory is recorded in the raw rows, not summarised: {text}");
+    assert!(text.contains("\"driver_mib\":9999.0"), "the raw row keeps the driver figure: {text}");
+}

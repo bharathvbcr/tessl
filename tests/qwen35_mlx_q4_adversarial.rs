@@ -123,7 +123,10 @@ fn dim(rng: &mut Rng) -> usize {
 /// layout table in the module docs and nothing else.
 fn oracle_ok(w: &TensorInfo, s: Option<&TensorInfo>, b: Option<&TensorInfo>, rows: usize, cols: usize) -> bool {
     let fits = |t: &TensorInfo, dt: Dtype, last: usize| t.dtype == dt && t.shape == [rows, last];
-    cols % 64 == 0
+    // An empty matrix has nothing to load (`zero_row_and_zero_column_parts_are_refused`).
+    rows != 0
+        && cols != 0
+        && cols % 64 == 0
         && cols % 8 == 0
         && fits(w, Dtype::U32, cols / 8)
         && s.is_some_and(|t| fits(t, Dtype::BF16, cols / 64))

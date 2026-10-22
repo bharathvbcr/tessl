@@ -850,6 +850,15 @@ impl Qwen35Model {
                 Format::MlxQ4 { .. } => ld.mlx_q4(parts, in_features).map(Weight::Q4),
             }
         };
+        // The GDN layer's small dense tensors: a quantized checkpoint's are
+        // checked finite (its scales, biases and norms are, so every value the
+        // kernels read is); the dense formats read them as they always did.
+        let small = |rest: &str, shape: &[usize]| -> Result<Vec<f32>, String> {
+            match fmt {
+                Format::Dense(_) => ld.f32(rest, shape),
+                Format::MlxQ4 { .. } => ld.f32_finite(rest, shape),
+            }
+        };
         let (g, a) = (cfg.gdn, cfg.attn);
         let mut layers = Vec::with_capacity(cfg.layers.len());
         for (l, kind) in cfg.layers.iter().enumerate() {
@@ -873,13 +882,13 @@ impl Qwen35Model {
                         w_out: lin(&[(&p("linear_attn.out_proj.weight"), h)], g.value_dim() as usize)?,
                         // `[conv_dim, 1, k]`, or `[conv_dim, k, 1]` in an MLX
                         // checkpoint: the same bytes either way.
-                        conv_w: ld.buf(&ld.f32(
+                        conv_w: ld.buf(&small(
                             &p("linear_attn.conv1d.weight"),
                             &fmt.convention().conv_shape(conv_dim, kw),
                         )?)?,
-                        a_log: ld.buf(&ld.f32(&p("linear_attn.A_log"), &[vh])?)?,
-                        dt_bias: ld.buf(&ld.f32(&p("linear_attn.dt_bias"), &[vh])?)?,
-                        norm_w: ld.buf(&ld.f32(&p("linear_attn.norm.weight"), &[g.v_dim() as usize])?)?,
+                        a_log: ld.buf(&small(&p("linear_attn.A_log"), &[vh])?)?,
+                        dt_bias: ld.buf(&small(&p("linear_attn.dt_bias"), &[vh])?)?,
+                        norm_w: ld.buf(&small(&p("linear_attn.norm.weight"), &[g.v_dim() as usize])?)?,
                     })
                 }
                 LayerKind::FullAttention => {
@@ -955,6 +964,8 @@ impl Qwen35Model {
         pack: bool,
     ) -> Result<(Tensor, Option<Tensor>), String> {
         let [vocab, h] = shape;
+        // The header before the allocation: `vocab` comes from the config.
+        ld.expect_shape(&if root { name.to_string() } else { ld.prefixed(name) }, &[vocab, h])?;
         match precision {
             Precision::Bf16 => {
                 let t = rt.alloc_tensor_bf16_hot(&[vocab, h])?;

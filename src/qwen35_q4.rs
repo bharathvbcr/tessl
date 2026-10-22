@@ -602,13 +602,17 @@ impl Weight {
 pub struct MlxQ4LoadReport {
     /// Device bytes of the quantized banks (packed nibbles and scale/bias pairs).
     pub q4_bytes: u64,
-    /// This process's lifetime peak physical footprint before the load began
-    /// (what had already happened in it), in bytes.
+    /// The PROCESS LIFETIME peak physical footprint (`ri_lifetime_max_phys_footprint`,
+    /// what `/usr/bin/time -l` prints) read before the load began, in bytes. It
+    /// is a maximum over everything the process has ever done, not a measure of
+    /// the load.
     pub peak_footprint_before: u64,
-    /// The same, after the weights were on the device and the load had
-    /// synchronized: the load's own peak is this when it exceeds the figure
-    /// before (the counter is a lifetime maximum), else the load stayed under
-    /// what the process had already reached.
+    /// The process lifetime peak read after the weights were on the device and
+    /// the load had synchronized. It measures the load only when it exceeds
+    /// [`Self::peak_footprint_before`]; equal means the load stayed under what
+    /// the process had already reached and says nothing about its own peak. A
+    /// meaningful figure needs a process with nothing large allocated before
+    /// the load.
     pub peak_footprint_after: u64,
     /// `mtp.*` and vision tensors present and skipped, every one by name.
     pub skipped: OutsideTensors,

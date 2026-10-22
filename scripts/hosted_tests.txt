@@ -49,7 +49,7 @@ bin plot_results_resample 7
 bin reader_bounds 12
 bin qwen35_config 12
 bin qwen35_mlx_q4_layout 15
-bin qwen35_mlx_q4_adversarial 10
+bin qwen35_mlx_q4_adversarial 15
 bin relaxed_predicate 1
 bin results_report 17
 bin release_check 14

@@ -72,7 +72,7 @@ impl<'a> Loader<'a> {
     }
 
     /// `rest` under this loader's prefix.
-    fn prefixed(&self, rest: &str) -> String {
+    pub(crate) fn prefixed(&self, rest: &str) -> String {
         format!("{}{rest}", self.prefix)
     }
 
@@ -108,6 +108,20 @@ impl<'a> Loader<'a> {
             .read_bf16_bits_into(&name, shape, &mut t.buffer.try_contents_u16()?)
     }
 
+    /// Check tensor `name` (as the checkpoint spells it) has `shape`, from the
+    /// header alone: no data is read and nothing is recorded as read. Every
+    /// loader that allocates a tensor the *config* sizes calls this first, so a
+    /// hostile config over a small file is refused before the allocation, not
+    /// by the device running out of memory. The message is the one the reads
+    /// give for the same mismatch.
+    pub(crate) fn expect_shape(&self, name: &str, shape: &[usize]) -> Result<(), String> {
+        let got = self.st.tensor_info(name)?.shape;
+        if got != shape {
+            return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
+        }
+        Ok(())
+    }
+
     /// A tensor widened to f32, with its shape checked.
     pub(crate) fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let name = self.take(rest);
@@ -118,7 +132,7 @@ impl<'a> Loader<'a> {
     pub(crate) fn f32_finite(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let data = self.f32(rest, shape)?;
         if let Some(i) = data.iter().position(|v| !v.is_finite()) {
-            return Err(format!("{}{rest}: element {i} is {}", self.prefix, data[i]));
+            return Err(format!("{}{rest}: element {i} is {}, not finite", self.prefix, data[i]));
         }
         Ok(data)
     }
@@ -177,6 +191,10 @@ impl<'a> Loader<'a> {
             .iter()
             .try_fold(0usize, |acc, &(_, o)| acc.checked_add(o))
             .ok_or("linear: output widths overflow usize")?;
+        // Headers first: the operand below is sized by the config.
+        for &(rest, out) in parts {
+            self.expect_shape(&self.prefixed(rest), &[out, in_features])?;
+        }
         let mut col0 = 0;
         match precision {
             Precision::Bf16 => {
@@ -235,15 +253,23 @@ impl<'a> Loader<'a> {
             .ok_or("mlx_q4: output widths overflow usize")?;
         let group = qwen35_q4::MLX_Q4_GROUP as usize;
         let groups = cols / group;
-        let w = Q4Weight::alloc(self.rt, total, cols)?;
-        let words_per_row = cols / 8;
-        let mut row0 = 0usize;
+        // Every part's three headers are checked against the config's shape
+        // before anything is allocated: the config sizes the bank, and a
+        // hostile one over a tiny file must be refused here, not by the device
+        // running out of memory.
+        let mut names = Vec::with_capacity(parts.len());
         for (name, rows) in parts {
             let (sn, bn) = qwen35_q4::sidecar_names(name)
                 .ok_or_else(|| format!("{name}: a quantized weight is named X.weight"))?;
             let info = self.st.tensor_info(name)?;
             let (s_info, b_info) = (self.st.tensor_info(&sn).ok(), self.st.tensor_info(&bn).ok());
             qwen35_q4::check_part(name, &info, s_info.as_ref(), b_info.as_ref(), *rows, cols)?;
+            names.push((sn, bn));
+        }
+        let w = Q4Weight::alloc(self.rt, total, cols)?;
+        let words_per_row = cols / 8;
+        let mut row0 = 0usize;
+        for ((name, rows), (sn, bn)) in parts.iter().zip(names) {
             self.take_root(name);
             let (sn, bn) = (self.take_root(&sn), self.take_root(&bn));
             {
@@ -258,6 +284,19 @@ impl<'a> Loader<'a> {
             let (mut scales, mut biases) = (vec![0u16; n], vec![0u16; n]);
             self.st.read_bf16_bits_into(&sn, &[*rows, groups], &mut scales)?;
             self.st.read_bf16_bits_into(&bn, &[*rows, groups], &mut biases)?;
+            // A bf16 with every exponent bit set is an infinity or a NaN. One
+            // in a scale or bias would turn every logit it touches into NaN.
+            let nonfinite = |bits: u16| bits & 0x7f80 == 0x7f80;
+            for (tensor, v) in [(&sn, &scales), (&bn, &biases)] {
+                if let Some(i) = v.iter().position(|&b| nonfinite(b)) {
+                    return Err(format!(
+                        "{tensor}: element {i} (row {}, group {}) is {}, not finite",
+                        i / groups,
+                        i % groups,
+                        crate::tensor::bf16_bits_to_f32(v[i])
+                    ));
+                }
+            }
             let mut pairs = w.scales_biases().try_contents_u16()?;
             let dst = &mut pairs[2 * row0 * groups..2 * (row0 + rows) * groups];
             for (i, (s, b)) in scales.iter().zip(&biases).enumerate() {
@@ -272,7 +311,7 @@ impl<'a> Loader<'a> {
     /// A `[dim]` weight as a kernel that adds 1 itself wants it, from a
     /// checkpoint stored in `convention` (see [`NormConvention`]).
     pub(crate) fn unit_norm(&self, rest: &str, dim: usize, convention: NormConvention) -> Result<GpuBuffer, String> {
-        let stored = self.f32(rest, &[dim])?;
+        let stored = self.f32_finite(rest, &[dim])?;
         let w: Vec<f32> = stored.iter().map(|&v| convention.unshift(v)).collect();
         self.buf(&w)
     }

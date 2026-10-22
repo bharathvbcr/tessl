@@ -650,10 +650,18 @@ fn ref_ids(dir: &Path) -> Vec<u32> {
 ///   plus the a margin for a second noisy side);
 /// * mean per-position KL(mlx-lm || tessl) <= 2e-3 (3.5x the floor's 5.7e-4).
 ///
-/// Also asserted: the host peak footprint over the whole load stays under 3 GiB
+/// Also asserted: the host peak footprint after the load stays under 3 GiB
 /// (the bf16 2B load peaked at 5.86 GB; with no dense intermediate the 4-bit
 /// load holds the ~1.4 GB of banks plus the runtime), and is recorded in the
 /// printed line.
+///
+/// The footprint is the PROCESS LIFETIME peak, so it measures the load only
+/// when nothing large was allocated earlier in the process. Run this test alone
+/// in its own process (`-- --ignored --exact mlx_q4_2b_matches_mlx_lm_logits`,
+/// as the doc's commands do); it loads first, before any other work, and
+/// asserts the figure before the load was under 1 GiB and that the load raised
+/// it, so a run that shares a process with a bigger earlier allocation fails
+/// instead of reporting a number that is not the load's.
 #[test]
 #[ignore]
 fn mlx_q4_2b_matches_mlx_lm_logits() {
@@ -661,8 +669,16 @@ fn mlx_q4_2b_matches_mlx_lm_logits() {
     const MISS_FRACTION: f64 = 0.03;
     const MEAN_KL: f64 = 2e-3;
     const PEAK_FOOTPRINT: u64 = 3 << 30;
+    const PEAK_BEFORE: u64 = 1 << 30;
     with_gpu(|rt| {
         let (model, report) = load_real(rt);
+        assert!(
+            report.peak_footprint_before <= PEAK_BEFORE && report.peak_footprint_after > report.peak_footprint_before,
+            "the process lifetime peak was {} B before the load and {} B after: run this test alone in a fresh \
+             process, or the figure is not the load's",
+            report.peak_footprint_before,
+            report.peak_footprint_after
+        );
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         eprintln!(
             "load: {}\n  quantized banks {:.2} GiB, host peak footprint {:.2} GiB after (before: {:.2} GiB), \
@@ -907,7 +923,6 @@ fn adv_mlx_q4_routing_boundaries_and_ragged_row_counts_match_dense() {
 /// refuses each by tensor name. (The dense F32/bf16 loaders do not check
 /// either; this is the Q4 loader's own boundary.)
 #[test]
-#[ignore = "BREAK: non-finite scales, biases and norms load and produce NaN logits"]
 fn adv_mlx_q4_nonfinite_scales_biases_and_norms_are_refused() {
     with_gpu(|rt| {
         let net = Net::new(41);
@@ -947,7 +962,6 @@ fn adv_mlx_q4_nonfinite_scales_biases_and_norms_are_refused() {
 /// `check_part` on the header, so a tiny file under a hostile config first
 /// asks the device for up to its max buffer length.
 #[test]
-#[ignore = "BREAK: Q4Weight::alloc runs before check_part, so a config sizes the allocation"]
 fn adv_mlx_q4_a_huge_config_over_a_tiny_file_fails_before_allocating() {
     with_gpu(|rt| {
         let net = Net::new(51);
@@ -969,6 +983,52 @@ fn adv_mlx_q4_a_huge_config_over_a_tiny_file_fails_before_allocating() {
             grew < 8 << 20,
             "the refused load still allocated {grew} bytes on the device"
         );
+    });
+}
+
+/// The dense loaders have the Q4 loader's order problem, and the fix is in the
+/// shared `Loader`: a config that sizes a table or a packed projection is
+/// checked against the file's header before the tensor is allocated. A config
+/// whose vocabulary (the tables) or intermediate width (the MLP projections) is
+/// vast over a tiny dense file is refused with the tensor's name and the device
+/// allocates next to nothing, at both dense precisions. Run against the commit
+/// before this one (9d263c0) it allocates the table first; that run is the
+/// characterization of the unmodified order.
+#[test]
+fn dense_load_with_a_huge_config_over_a_tiny_file_fails_before_allocating() {
+    with_gpu(|rt| {
+        let net = Net::new(52);
+        let st = safetensors(&net.dense_entries());
+        for precision in [Precision::Bf16, Precision::F32] {
+            for (cfg, needle) in [
+                (
+                    Qwen35Config {
+                        vocab: 1 << 22,
+                        ..config()
+                    },
+                    "embed_tokens",
+                ),
+                (
+                    Qwen35Config {
+                        intermediate: 1 << 22,
+                        ..config()
+                    },
+                    "gate_proj",
+                ),
+            ] {
+                rt.reset_peak_allocated_bytes();
+                let before = rt.peak_allocated_bytes();
+                let e = Qwen35Model::load(rt, &st, "model.", cfg, precision)
+                    .err()
+                    .expect("loaded");
+                assert!(e.contains(needle), "{precision:?}: {e}");
+                let grew = rt.peak_allocated_bytes().saturating_sub(before);
+                assert!(
+                    grew < 8 << 20,
+                    "{precision:?} {needle}: the refused load still allocated {grew} bytes on the device"
+                );
+            }
+        }
     });
 }
 

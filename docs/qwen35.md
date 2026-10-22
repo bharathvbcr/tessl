@@ -753,11 +753,35 @@ other than 4, `group_size` other than 64, `mode` other than `affine`; per-layer 
 checkpoint, one with no `.scales` / `.biases`, with a wrong dtype or a wrong shape
 (including 8-bit widths and group-32 scales); disagreeing conv layouts; a checkpoint with no
 tower under either key prefix (the 239 MB `Qwen3.8-27B-MTP-4bit` drafter is one); a float16
-checkpoint. `Loader::refuse_unread` still refuses every unread tensor under the prefix. Outside
-it, `mtp.*` and the vision tower are skipped **by name** and returned in `MlxQ4LoadReport.skipped`
-(mtp by name, vision by count); anything else is refused. The report also carries the bytes of
-quantized banks and the process's lifetime peak footprint before and after the load
-(`bin/common/footprint.rs`, the figure `/usr/bin/time -l` prints).
+checkpoint; a matrix with no rows or no columns; a NaN or infinity in any scale, bias or norm
+(and in the GDN conv, `A_log`, `dt_bias` and gated norm), by tensor name and index, checked
+as the values are copied; and a device without TensorOps, refused at load because every
+prefill of more than 8 rows needs the TensorOps GEMM (`MlxQ4Error::NoTensorOps`), not
+mid-forward. Every part's headers are checked against the config's shape **before** its bank
+is allocated, so a config that is wrong for the file is refused by name with the device
+untouched; the dense loader had the same allocate-then-check order for its tables and packed
+projections and now checks `Loader::expect_shape` first too
+(`dense_load_with_a_huge_config_over_a_tiny_file_fails_before_allocating`). One side effect
+on the dense loaders: the norms are read through the finite check as well. `Loader::refuse_unread` still
+refuses every unread tensor under the prefix. Outside it, `mtp.*` and the vision tower are
+skipped and every skipped tensor is **named** in `MlxQ4LoadReport.skipped`; anything else is
+refused. The report also carries the bytes of quantized banks and the process **lifetime**
+peak footprint (`ri_lifetime_max_phys_footprint`, `bin/common/footprint.rs`, the figure
+`/usr/bin/time -l` prints) read before and after the load. It is a maximum over everything
+the process has ever done: it measures the load only when `after` exceeds `before`, and a
+process that had already allocated more hides the load completely
+(`adv_mlx_q4_footprint_report_is_a_lifetime_max_an_earlier_allocation_hides_the_load` pins
+that). The real-2B test therefore runs alone in a fresh process and asserts both.
+
+**Limitation: a convention mismatch is undetectable.** The loader reads whether the norms
+carry the converter's `+1` from the `conv1d.weight` layout alone (`[c, k, 1]` means
+sanitized, so shifted). A checkpoint with the sanitized conv layout but norms that were never
+shifted (a third-party conversion, or mlx-vlm's `should_offset_norm_weight` skipping them)
+loads without complaint as a different, wrong model, because nothing in the header says
+otherwise. It is pinned by
+`adv_mlx_q4_conv_and_norm_convention_disagreement_loads_silently_as_a_wrong_model`; the only
+defence is the logit comparison against mlx-lm that the real-2B test makes, so run it on any
+new converter's output.
 
 **The MTP head, decided.** It is not part of the tower: the config's `mtp_*`, `block_size` and
 `model_type` keys are read by nobody (`tests/qwen35_config.rs` pins that changing them changes
@@ -799,7 +823,8 @@ Commands (the lead runs them; the conversion needs the mlx-lm venv, offline, ~5 
 /Users/bharath/.venvs/ml-2026-10/bin/python tools/qwen35_ref/make_mlx_q4.py    # target/qwen35_2b_mlx_q4/ and its ref/
 cargo test --release --test qwen35_mlx_q4_layout --test qwen35_config           # host only
 cargo test --release --test qwen35_mlx_q4 -- --test-threads=1                   # the synthetic checks, on the device
-cargo test --release --test qwen35_mlx_q4 -- --ignored --nocapture --test-threads=1   # the real 2B
+cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_matches_mlx_lm_logits --nocapture   # the real 2B, alone in its process (the footprint is a lifetime peak)
+cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row --nocapture
 ```
 
 `make_mlx_q4.py` is a fixture tool, not a shipped path: it converts the local

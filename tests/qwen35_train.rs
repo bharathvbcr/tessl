@@ -746,6 +746,113 @@ fn a_bf16_step_peaks_under_its_bound_and_below_the_f32_steps() {
     }
 }
 
+/// A fused step's measured peak stays under its own bound
+/// ([`Qwen35Model::train_step_fused_adamw_bytes`], what the curve's gate
+/// trusts), on an f32 model and on a bf16-stored one, at the lengths the
+/// bank step's test uses. Peak is read above what the model and the
+/// optimizer's state already hold.
+#[test]
+fn a_fused_step_peaks_under_its_bound() {
+    use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
+    let dir = fixture();
+    let cfg = tiny_config();
+    for (precision, mm, config) in [
+        (Precision::F32, GemmOperands::ExactF32, AdamWConfig::F32),
+        (
+            Precision::Bf16,
+            GemmOperands::Bf16,
+            AdamWConfig {
+                update: UpdateRule::bf16_default(5),
+                moments: MomentStorage::F32,
+            },
+        ),
+    ] {
+        let (rt, model) = load_tower(&dir, cfg.clone(), precision);
+        let mut state = AdamW::with_config(&model, config).unwrap();
+        let wd = model.default_weight_decay(0.1).unwrap();
+        for t in [8u32, 64, 512] {
+            let bound = model.train_step_fused_adamw_bytes(t, mm, config);
+            let ids: Vec<u32> = (0..t).map(|i| (i * 7 + 3) % cfg.vocab).collect();
+            rt.synchronize().unwrap();
+            let before = rt.current_allocated_bytes();
+            rt.reset_peak_allocated_bytes();
+            model
+                .train_step_fused_adamw(&ids, mm, Supervise::Causal, &mut state, &AdamWHyper::default(), &wd)
+                .unwrap();
+            let peak = rt.peak_allocated_bytes().saturating_sub(before);
+            eprintln!("{precision:?} T={t}: peak {peak} B, fused bound {bound} B");
+            assert!(peak <= bound, "{precision:?} T={t}: peak {peak} over the bound {bound}");
+        }
+    }
+}
+
+/// Attack 5: the fused bound against the measured peak where the test above
+/// does not reach: a vocabulary past the cross-entropy's chunk (20000 against
+/// 8192: three chunks, the last short), tied and untied heads, f32 and bf16
+/// storage, one token (a one-row step) beside two, three and seventeen, and
+/// the encode mode batched (an open async scope: a wait only at each
+/// attention layer) beside the default. The bound is read in the mode the
+/// step runs in.
+#[test]
+fn a_fused_step_peaks_under_its_bound_untied_chunked_batched_and_on_one_token() {
+    use tessl::qwen35_adamw::{AdamW, AdamWConfig, AdamWHyper, MomentStorage, UpdateRule};
+    for tie in [true, false] {
+        for (precision, mm, config) in [
+            (Precision::F32, GemmOperands::ExactF32, AdamWConfig::F32),
+            (
+                Precision::Bf16,
+                GemmOperands::Bf16,
+                AdamWConfig {
+                    update: UpdateRule::bf16_default(5),
+                    moments: MomentStorage::F32,
+                },
+            ),
+        ] {
+            let cfg = Qwen35Config {
+                vocab: 20000,
+                tie_word_embeddings: tie,
+                ..tiny_config()
+            };
+            let rt = GpuRuntime::new().unwrap();
+            let model = Qwen35Model::random_tower(&rt, cfg.clone(), precision, 5).unwrap();
+            let mut state = AdamW::with_config(&model, config).unwrap();
+            let wd = model.default_weight_decay(0.1).unwrap();
+            for batched in [false, true] {
+                for t in [1u32, 2, 3, 17] {
+                    let ids: Vec<u32> = (0..t).map(|i| (i * 7919 + 3) % cfg.vocab).collect();
+                    let rows = [0u32];
+                    let targets = [ids[0]];
+                    let sup = if t == 1 {
+                        Supervise::Rows {
+                            positions: &rows,
+                            targets: &targets,
+                            scale: 1.0,
+                        }
+                    } else {
+                        Supervise::Causal
+                    };
+                    rt.synchronize().unwrap();
+                    let scope = batched.then(|| rt.async_scope());
+                    let bound = model.train_step_fused_adamw_bytes(t, mm, config);
+                    let before = rt.current_allocated_bytes();
+                    rt.reset_peak_allocated_bytes();
+                    model
+                        .train_step_fused_adamw(&ids, mm, sup, &mut state, &AdamWHyper::default(), &wd)
+                        .unwrap();
+                    rt.synchronize().unwrap();
+                    drop(scope);
+                    let peak = rt.peak_allocated_bytes().saturating_sub(before);
+                    eprintln!("tie {tie} {precision:?} batched {batched} T={t}: peak {peak} B, bound {bound} B");
+                    assert!(
+                        peak <= bound,
+                        "tie {tie} {precision:?} batched {batched} T={t}: peak {peak} over the bound {bound}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The step bound counts what is held between waits, so it follows whether a
 /// dispatch now batches, not the `async_encode` flag alone: an open
 /// `async_scope` batches as the flag does, and serialized dispatch does not
@@ -1829,6 +1936,15 @@ const GIB: f64 = (1u64 << 30) as f64;
 /// loss-curve test (docs/verification.md, 2026-10-17).
 const HOST_FOOTPRINT_OVER_DEVICE_BYTES: u64 = 2_600_000_000;
 
+/// What the pre-start gate keeps free under memguard's cap on top of the
+/// byte bounds (1.5 GiB). The bounds count what the step allocates on the
+/// device; they do not count what the process holds beyond that and what the
+/// bound's slack does not cover (the host figure above is one measurement of
+/// one arm). Without it a bound that just passes can become a SIGTERM
+/// mid-test, which memguard issues at its next 2 s sample, with no run left
+/// to learn from; with it that arm is refused before it allocates.
+const FOOTPRINT_BOUND_HEADROOM_BYTES: u64 = 3 << 29;
+
 /// Prints this process's lifetime peak footprint against memguard's cap.
 /// Unreadable is a panic, not a missing line: a report that could not be taken
 /// must not look like one that said "under the cap".
@@ -2163,14 +2279,20 @@ fn curve_ids() -> Vec<u32> {
 /// stored precision's training loss within 2% and its held-out fall within
 /// 25% of an f32 fall of at least 0.05. Every step's losses are printed as
 /// CSV. Needs
-/// `QWEN35_2B_SAFETENSORS`; each run is dropped before the next. The f32
-/// reference arm holds model, bank and both moments, 16 bytes per parameter
-/// (28 GiB for 1.88 B parameters; its measured device peak was 30.11 GiB,
-/// docs/verification.md 2026-10-17), which with the step's workspace and the
-/// host overhead does not fit memguard's 32 GiB cap on a
-/// 64 GiB machine: on it the test fails closed, before the arm's bank is
-/// allocated, with "REQUIREMENT UNMET (not a pass)" and the numbers. It is
-/// not a pass and not a skip.
+/// `QWEN35_2B_SAFETENSORS`; each run is dropped before the next. Every arm
+/// steps with [`Qwen35Model::train_step_fused_adamw`], which is the bank's
+/// `train_step_into` then `adamw_step` bit for bit
+/// (`tests/qwen35_adamw.rs`) with no gradient bank. The f32 reference arm
+/// with a bank held model, bank and both moments, 16 bytes per parameter
+/// (28 GiB for 1.88 B parameters; its measured device peak was 30.11 GiB and
+/// its footprint 32.53 GiB, docs/verification.md 2026-10-17), which with the
+/// step's workspace and the host overhead did not fit memguard's 32 GiB cap
+/// on a 64 GiB machine. Fused, it holds model and moments (12 bytes per
+/// parameter), the embedding's gradient and one layer's. The pre-start gate
+/// still fails closed, before the arm's optimizer state is allocated, with
+/// "REQUIREMENT UNMET (not a pass)" and the numbers, when the bounds plus
+/// [`FOOTPRINT_BOUND_HEADROOM_BYTES`] pass the cap. It is not a pass and not
+/// a skip.
 ///
 /// Two earlier curves repeated their data and were replaced (2026-10-08,
 /// M5 Pro). The first trained four chunks in turn and bounded the training
@@ -2205,6 +2327,11 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     const EVERY: usize = 5;
     const SEEDS: [u64; 3] = [1, 2, 3];
     let rt = GpuRuntime::new().unwrap();
+    // The step bounds add the freelist's cap (default 2 GiB) to what a step
+    // holds, and the footprint can reach it: recycled buffers stay resident.
+    // At 256 MiB both the bound and the footprint are smaller by up to
+    // 1.75 GiB; what that costs in speed is not measured.
+    rt.set_pool_cache_cap_bytes(256 << 20);
     let ids = curve_ids();
     let chunks: Vec<Vec<u32>> = ids.chunks(128).map(<[u32]>::to_vec).collect();
     assert_eq!(chunks.len(), STEPS + 4);
@@ -2229,8 +2356,9 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
     // after every EVERY steps.
     // An arm whose footprint cannot fit memguard's cap fails the test, twice
     // over. Before its first step, from the byte bounds: the model as loaded,
-    // a bank of the same size, [`AdamW::allocated_bytes_for`], the step's
-    // workspace ([`Qwen35Model::train_step_bytes`]) and the host overhead.
+    // [`AdamW::allocated_bytes_for`], the fused step's workspace and
+    // gradients ([`Qwen35Model::train_step_fused_adamw_bytes`]), the host
+    // overhead and a headroom ([`FOOTPRINT_BOUND_HEADROOM_BYTES`]).
     // And after its first step (every buffer the step needs exists by then),
     // from the measured device peak. Both panic "REQUIREMENT UNMET (not a
     // pass)": the arm was not measured, so the test must not pass, and it must
@@ -2250,17 +2378,22 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
             GemmOperands::Bf16
         };
         let arm = format!("seed {seed}: {precision:?} storage with {config}");
-        // The bank holds every parameter in its weight's dtype
-        // (`Qwen35Grads::zeros_like`), so it is the model's size.
         let model_bytes = rt.current_allocated_bytes().saturating_sub(allocated_before);
+        // The fused step has no gradient bank: its bound is the step's
+        // working set with the head gradient in place, the embedding's
+        // gradient it holds throughout, one layer's gradient scratch and the
+        // update's slot tables. It reads the pool cap set above.
         footprint_requirement(
             &arm,
             &[
                 ("model", model_bytes),
-                ("gradient bank", model_bytes),
                 ("optimizer state", AdamW::allocated_bytes_for(&model, config).unwrap()),
-                ("step workspace", model.train_step_bytes(128, operands)),
+                (
+                    "fused step workspace and gradients",
+                    model.train_step_fused_adamw_bytes(128, operands, config),
+                ),
                 ("host overhead", HOST_FOOTPRINT_OVER_DEVICE_BYTES),
+                ("bound headroom", FOOTPRINT_BOUND_HEADROOM_BYTES),
             ],
             MEMGUARD_CAP_BYTES,
         )
@@ -2272,17 +2405,17 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
                 .sum::<f64>()
                 / held_out.len() as f64
         };
-        let bank = Qwen35Grads::zeros_like(&model).unwrap();
         let mut state = AdamW::with_config(&model, config).unwrap();
         let wd = model.default_weight_decay(0.0).unwrap();
         let (mut losses, mut helds) = (Vec::with_capacity(STEPS), vec![held()]);
         for (s, &c) in order(seed).iter().enumerate() {
+            // Bit for bit the bank's `train_step_into` then `adamw_step`
+            // (`tests/qwen35_adamw.rs`), without the bank.
             losses.push(
                 model
-                    .train_step_into(&train[c], operands, Supervise::Causal, &bank, false)
+                    .train_step_fused_adamw(&train[c], operands, Supervise::Causal, &mut state, &hyper, &wd)
                     .unwrap(),
             );
-            model.adamw_step(&bank, &mut state, &hyper, &wd).unwrap();
             if s == 0 {
                 rt.synchronize().unwrap();
                 footprint_requirement(
@@ -2301,7 +2434,6 @@ fn real_2b_loss_curve_tracks_the_f32_step() {
         }
         eprintln!("seed {seed}: {}: {}", state.describe(), model.describe());
         drop(state);
-        drop(bank);
         drop(model);
         rt.synchronize().unwrap();
         eprintln!(

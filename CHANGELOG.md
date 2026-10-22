@@ -8,6 +8,25 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`Qwen35Model::train_step_fused_adamw`** (card ft-dafde7719192ece85330e1df5db96e05):
+  `train_step_into` then `adamw_step` without the gradient bank. The backward
+  updates each layer from a gradient scratch the pool reuses from layer to layer,
+  as soon as that layer's gradient exists, with the kernels, step scalars,
+  per-parameter state and stochastic-rounding salts `adamw_step` uses; the
+  embedding, the final norm and an untied head follow the gather. Parameters,
+  moments, auxiliary state and the loss come out bit for bit those of the two
+  calls (`tests/qwen35_adamw.rs`, f32 storage and bf16 storage, three steps each).
+  On the 2B in f32 the 7 GiB bank is not held, which is what lets the loss
+  curve's f32 reference arm fit under memguard's 32 GiB cap.
+  `train_step_fused_adamw_bytes(t, operands, config)` is its pre-flight bound. It
+  refuses before anything is written what it cannot do: a `grad_scale` other than
+  1 (a clip coefficient needs the global norm, which does not exist until the
+  backward ends; clip with `train_step_into`, `grad_sq_norm` and `adamw_step`) and
+  a state or decay table not shaped like the model. A `PendingStep` taken before
+  a fused step is refused after it, as after `adamw_step`: the generation guard is
+  unchanged and the step bumps it once, at its end. One sequence per call; there
+  is no ragged form. The C ABI and `tessl_torch` are unchanged (this is not in
+  them yet).
 - **GDN training runs the chunked (WY) kernels** (`gdn_train_c_*`: matrix
   products per 64-token chunk, only the state sequential across chunks).
   `gdn_train_forward`, `gdn_train_forward_windowed` and the backward use them;

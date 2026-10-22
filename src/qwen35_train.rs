@@ -52,6 +52,7 @@ use crate::gdn_train::{
 use crate::gemm::{cast_bf16_to_f32_into, cast_f32_to_bf16_into, GemmOperands};
 use crate::nn::require_runtime;
 use crate::qwen35::{self, AttnShape, AttnTargets, Cols, GdnParams, OutCols, StateIn};
+use crate::qwen35_adamw::{fused_table_bytes, AdamW, AdamWConfig, AdamWHyper, FusedAdamW};
 use crate::qwen35_bwd::{
     attn_gate_bwd, attn_qk_norm_rope_bwd, attn_qk_norm_rope_bwd_part_len, check_scatter_rows, conv1d_silu_bwd,
     conv1d_silu_bwd_part_len, embed_rows_bwd_once, gated_rms_norm_bwd, gated_rms_norm_bwd_part_len, gdn_gates_bwd,
@@ -59,6 +60,7 @@ use crate::qwen35_bwd::{
     EmbedBwdWorkspace,
 };
 use crate::qwen35_model::{AttnWeights, GdnWeights, Layer, Mixer, Precision, Qwen35Model};
+use crate::qwen35_params::{embed_slot, layer_slots, tail_slots};
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
 
@@ -177,6 +179,13 @@ fn tensor_part(t: &Tensor) -> Part<'_> {
 
 fn buf_part(b: &GpuBuffer) -> Part<'_> {
     (b, 0, b.nbytes() / 4, DType::F32)
+}
+
+/// Bytes the pool makes a fresh buffer for `part`'s elements (a fused
+/// step's scratch is each weight's size and dtype).
+fn scratch_part_bytes(&(_, _, n, dtype): &Part<'_>) -> u64 {
+    let elem = if dtype == DType::BF16 { 2 } else { 4 };
+    GpuRuntime::allocated_bytes_for(n.saturating_mul(elem), BufferKind::Cold)
 }
 
 /// A bank tensor for weight `t`, in `t`'s dtype: a bf16 model's matrices
@@ -546,6 +555,31 @@ fn bank_head(bank: Option<(&Qwen35Grads, bool)>) -> Head<'_> {
             } else {
                 Head::ByChunk(target, add)
             }
+        }
+    }
+}
+
+/// Where a step's backward puts the gradients, for the pre-flight's count.
+#[derive(Clone, Copy)]
+enum Sink {
+    /// Into a bank the caller made (or one the forward does not know yet).
+    Bank,
+    /// Fresh tensors, returned to the caller.
+    Fresh,
+    /// Into per-layer scratch each layer's AdamW update (under this config)
+    /// consumes ([`Qwen35Model::train_step_fused_adamw`]).
+    Fused(AdamWConfig),
+}
+
+impl Sink {
+    fn fresh(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+
+    fn fused(self) -> Option<AdamWConfig> {
+        match self {
+            Self::Fused(c) => Some(c),
+            _ => None,
         }
     }
 }
@@ -989,9 +1023,16 @@ impl Qwen35Model {
         bank: Option<(&Qwen35Grads, bool)>,
     ) -> Result<(f64, Option<Qwen35Grads>), String> {
         let head = bank_head(bank);
-        let p = self.step_forward(ids, operands, sup, bank.is_none(), head, None)?;
+        let p = self.step_forward(
+            ids,
+            operands,
+            sup,
+            if bank.is_none() { Sink::Fresh } else { Sink::Bank },
+            head,
+            None,
+        )?;
         let loss = p.loss;
-        Ok((loss, self.backward(p, None, bank)?))
+        Ok((loss, self.backward(p, None, bank, None)?))
     }
 
     /// A step's forward and its loss (`sup`), kept for
@@ -1010,7 +1051,7 @@ impl Qwen35Model {
         operands: GemmOperands,
         sup: Supervise<'_>,
     ) -> Result<PendingStep, String> {
-        self.step_forward(ids, operands, sup, false, Head::Fresh, None)
+        self.step_forward(ids, operands, sup, Sink::Bank, Head::Fresh, None)
     }
 
     /// A training step on several sequences packed end to end in `ids`, cut
@@ -1068,7 +1109,7 @@ impl Qwen35Model {
             scale,
         };
         let head = bank_head(Some((bank, accumulate)));
-        let p = self.step_forward(ids, operands, sup, false, head, Some(&spans))?;
+        let p = self.step_forward(ids, operands, sup, Sink::Bank, head, Some(&spans))?;
         let per_row = p
             .ragged
             .as_ref()
@@ -1082,12 +1123,13 @@ impl Qwen35Model {
             at += n - 1;
         }
         let loss = per_row.iter().sum::<f64>() / per_row.len() as f64;
-        self.backward(p, None, Some((bank, accumulate)))?;
+        self.backward(p, None, Some((bank, accumulate)), None)?;
         Ok(RaggedLoss { loss, per_sequence })
     }
 
-    /// [`Self::train_forward`]; `fresh` when the backward will return fresh
-    /// gradients rather than deliver them into a bank, which the pre-flight
+    /// [`Self::train_forward`]; `sink` says where the backward will put the
+    /// gradients, which the pre-flight counts: [`Sink::Fresh`] when it will
+    /// return fresh gradients rather than deliver them into a bank, which the pre-flight
     /// then counts too. `head` says where the head gradient goes: into a
     /// bank's embedding, there is no `[vocab, hidden]` tensor and no copy of
     /// it (2 GB on the 2B).
@@ -1096,7 +1138,7 @@ impl Qwen35Model {
         ids: &[u32],
         operands: GemmOperands,
         sup: Supervise<'_>,
-        fresh: bool,
+        sink: Sink,
         head: Head<'_>,
         ragged: Option<&[(usize, usize)]>,
     ) -> Result<PendingStep, String> {
@@ -1164,9 +1206,17 @@ impl Qwen35Model {
         // allocation read next is what the step really starts from.
         id_buf.try_write_u32(ids)?;
         let lens: Option<Vec<u32>> = ragged.map(|s| s.iter().map(|&(_, n)| n as u32).collect());
+        let fused = sink.fused();
         let (have, need) = (
             rt.current_allocated_bytes(),
-            self.step_bytes(t, operands, fresh, head.kind(), lens.as_deref()),
+            // A fused step made its top bank before the forward, so the
+            // allocation read above already holds it.
+            self.step_bytes(t, operands, sink.fresh(), head.kind(), lens.as_deref(), fused)
+                .saturating_sub(if fused.is_some() {
+                    self.fused_top_bank_bytes()
+                } else {
+                    0
+                }),
         );
         let limit = rt.memory_info().recommended_working_set;
         if have.saturating_add(need) > limit {
@@ -1369,7 +1419,235 @@ impl Qwen35Model {
         const WHAT: &str = "Qwen35Model::train_backward_into";
         self.check_pending(WHAT, &p, dh)?;
         self.check_bank(WHAT, bank)?;
-        self.backward(p, dh, Some((bank, accumulate))).map(|_| ())
+        self.backward(p, dh, Some((bank, accumulate)), None).map(|_| ())
+    }
+
+    /// One training step that updates the model with AdamW as the backward
+    /// runs: [`Self::train_step_into`] then [`Self::adamw_step`] without the
+    /// gradient bank. Each layer's gradients are written to a scratch that
+    /// the pool reuses from layer to layer, and the layer is updated from it
+    /// at once, with the kernels, step scalars, per-parameter state and
+    /// stochastic-rounding salts `adamw_step` uses; the embedding, the final
+    /// norm and an untied head are updated after the gather. What stays
+    /// allocated beyond the step's own working set is one layer's gradients
+    /// and the embedding's (and an untied head's), not every parameter's
+    /// ([`Self::train_step_fused_adamw_bytes`]). On the 2B in f32 that is
+    /// the 7 GiB bank saved.
+    ///
+    /// Every parameter, moment and auxiliary value ends bit for bit as the
+    /// two calls would leave it, and the loss (as `sup` defines it, returned)
+    /// is the same. `state`'s step count advances by one.
+    ///
+    /// # Why updating mid-backward is sound
+    ///
+    /// The backward walks the layers top-down, and each layer reads only its
+    /// own weights: the rebuild of layer `L`'s forward from its saved input,
+    /// then its backward. After `train_layer_backward(L)` has delivered
+    /// layer `L`'s gradient, nothing later reads layer `L`'s weights again:
+    /// the layers below read their own, the gather's backward reads no
+    /// weight, and the final norm's backward (the one read of a weight
+    /// outside the layers) ran before the first layer. The embedding and the
+    /// tied head are read in the forward alone. The GPU runs the update
+    /// after the layer's backward (the runtime's encoder barrier orders
+    /// dependent dispatches), and the update writes only that layer's
+    /// parameters and state. So every gradient is that of the weights the
+    /// forward ran on, which is what [`PendingStep`]'s generation guard
+    /// protects: the guard stays as it is for every other entry point, and
+    /// this step, which never leaves a forward pending, bumps the
+    /// generation once at its end (even on failure after an update was
+    /// encoded), so a [`PendingStep`] taken before it is refused after.
+    ///
+    /// # Refused before anything is written
+    ///
+    /// `hyper.grad_scale` other than 1 (a clip coefficient needs the global
+    /// gradient norm, which does not exist until the backward ends; clip
+    /// with [`Self::train_step_into`], [`Self::grad_sq_norm`] and
+    /// [`Self::adamw_step`]), a `state` or `weight_decay` not shaped like the
+    /// model, a parameter whose step kernel does not exist under the state's
+    /// config, and everything [`Self::train_forward`] refuses (including a
+    /// step the bound does not fit). One sequence only: a ragged batch has
+    /// no entry here, because its mixers deliver gradients per sequence into
+    /// a bank that is summed layer by layer, which a scratch that is
+    /// updated and dropped per layer does not hold.
+    ///
+    /// `weight_decay[i]` is for [`Self::parameter_table`] entry `i`.
+    ///
+    /// # Errors
+    /// As above, and a failed dispatch. A failure after the first layer's
+    /// update was encoded leaves the model partly updated (as a failed
+    /// [`Self::adamw_step`] does); the generation has moved, so no stale
+    /// pending step runs on it.
+    pub fn train_step_fused_adamw(
+        &self,
+        ids: &[u32],
+        operands: GemmOperands,
+        sup: Supervise<'_>,
+        state: &mut AdamW,
+        hyper: &AdamWHyper,
+        weight_decay: &[f32],
+    ) -> Result<f64, String> {
+        const WHAT: &str = "Qwen35Model::train_step_fused_adamw";
+        let config = state.config();
+        let mut fused = FusedAdamW::new(WHAT, self, state, hyper, weight_decay)?;
+        let top = self.fused_top_bank()?;
+        let head = bank_head(Some((&top, false)));
+        let p = self.step_forward(ids, operands, sup, Sink::Fused(config), head, None)?;
+        let loss = p.loss;
+        // A bank step lets the caller look at the gradients before
+        // `adamw_step`; this one has no such moment, and a non-finite loss
+        // would write NaN into every parameter and moment. Refused here,
+        // before the backward and any update, so nothing has moved.
+        if !loss.is_finite() {
+            return Err(format!(
+                "{WHAT}: the loss is {loss}, not finite; refused before any update, so the model and the state \
+                 are as they were"
+            ));
+        }
+        let ran = self.backward(p, None, Some((&top, false)), Some(&mut fused));
+        if fused.touched() {
+            self.bump_param_generation();
+        }
+        if let Err(e) = &ran {
+            // From the first update's dispatch on, a failure leaves some
+            // parameters and moments at the step and the rest before it: the
+            // model and the state refuse every later step until reloaded.
+            if fused.touched() {
+                fused.tear(self, e);
+            }
+        }
+        ran?;
+        fused.confirm();
+        Ok(loss)
+    }
+
+    /// A bound on the device bytes [`Self::train_step_fused_adamw`] on `t`
+    /// tokens allocates on top of what is allocated when it starts, as
+    /// [`Self::train_step_bytes`] bounds a step into a bank (every buffer at
+    /// the size the pool makes it): the step's working set with the head
+    /// gradient going into the embedding gradient in place (f32 weights) or
+    /// a chunk at a time (bf16), plus the top gradients it holds throughout
+    /// (the embedding's, an untied head's, the final norm's), plus each
+    /// layer's gradient scratch and AdamW's slot tables between waits. It
+    /// excludes the model and `config`'s state, which [`AdamW::allocated_bytes_for`]
+    /// bounds, and the gradient bank a step into one needs: this step has
+    /// none.
+    pub fn train_step_fused_adamw_bytes(&self, t: u32, operands: GemmOperands, config: AdamWConfig) -> u64 {
+        self.step_bytes(t, operands, false, self.fused_head_kind(), None, Some(config))
+    }
+
+    /// Where a fused step's head gradient goes: its top bank's embedding is
+    /// f32 or bf16 as the weight is.
+    fn fused_head_kind(&self) -> HeadKind {
+        if self.embed.dtype == DType::F32 {
+            HeadKind::InPlace
+        } else {
+            HeadKind::ByChunk
+        }
+    }
+
+    /// A buffer of `like`'s size and dtype that a kernel fills before
+    /// anything reads it: a fused step's gradient storage. Not zeroed (the
+    /// step writes over it, as it does a bank it does not accumulate into).
+    fn scratch_like(&self, like: &Tensor) -> Result<Tensor, String> {
+        let dtype = if like.dtype == DType::BF16 {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        self.rt.alloc_tensor_unzeroed(like.shape(), dtype)
+    }
+
+    fn scratch_buf(&self, like: &GpuBuffer) -> Result<GpuBuffer, String> {
+        self.rt.alloc_buffer(like.nbytes())
+    }
+
+    /// A fused step's gradients for everything but the layers, which each
+    /// have a scratch of their own ([`Self::layer_scratch`]): the bank the
+    /// head and the gather write into. Held through the step.
+    fn fused_top_bank(&self) -> Result<Qwen35Grads, String> {
+        Ok(Qwen35Grads {
+            embed: self.scratch_like(&self.embed)?,
+            lm_head: self.lm_head.as_ref().map(|t| self.scratch_like(t)).transpose()?,
+            final_norm: self.scratch_buf(&self.final_norm)?,
+            layers: Vec::new(),
+        })
+    }
+
+    /// The fused step's update of what is not a layer, from the top bank `b`
+    /// the gather has just finished: nothing when the step is not fused.
+    fn fused_top(&self, fused: Option<&mut FusedAdamW<'_>>, b: &Qwen35Grads) -> Result<(), String> {
+        match fused {
+            Some(f) => f.top(self, &b.embed, &b.final_norm, b.lm_head.as_ref()),
+            None => Ok(()),
+        }
+    }
+
+    /// Bytes [`Self::fused_top_bank`] allocates, at the pool's rounding.
+    fn fused_top_bank_bytes(&self) -> u64 {
+        let mut parts = vec![tensor_part(&self.embed), buf_part(&self.final_norm)];
+        parts.extend(self.lm_head.as_ref().map(tensor_part));
+        parts.iter().fold(0u64, |a, p| a.saturating_add(scratch_part_bytes(p)))
+    }
+
+    /// One layer's gradients, in the layer's weights' dtypes (as
+    /// [`Qwen35Grads::zeros_like`] makes a bank's, but from the pool and not
+    /// zeroed): a fused step's scratch, released once the layer is updated.
+    fn layer_scratch(&self, layer: &Layer) -> Result<LayerGrads, String> {
+        let mixer = match &layer.mixer {
+            Mixer::Gdn(w) => MixerGrads::Gdn(GdnGrads {
+                w_in: self.scratch_like(&w.w_in)?,
+                w_out: self.scratch_like(&w.w_out)?,
+                conv_w: self.scratch_buf(&w.conv_w)?,
+                a_log: self.scratch_buf(&w.a_log)?,
+                dt_bias: self.scratch_buf(&w.dt_bias)?,
+                norm_w: self.scratch_buf(&w.norm_w)?,
+            }),
+            Mixer::Attn(w) => MixerGrads::Attn(AttnGrads {
+                w_in: self.scratch_like(&w.w_in)?,
+                w_out: self.scratch_like(&w.w_out)?,
+                q_norm: self.scratch_buf(&w.q_norm)?,
+                k_norm: self.scratch_buf(&w.k_norm)?,
+            }),
+        };
+        Ok(LayerGrads {
+            input_norm: self.scratch_buf(&layer.input_norm)?,
+            post_norm: self.scratch_buf(&layer.post_norm)?,
+            mixer,
+            gate: self.scratch_like(&layer.gate)?,
+            up: self.scratch_like(&layer.up)?,
+            down: self.scratch_like(&layer.down)?,
+        })
+    }
+
+    /// Bytes [`Self::layer_scratch`] allocates for `layer`, at the pool's
+    /// rounding: (in f32 buffers, in bf16 ones). A step's bound
+    /// ([`Self::layer_bwd_bytes`]) already charges every gradient at f32, so
+    /// only the bf16 buffers are added to it.
+    fn layer_scratch_bytes(&self, layer: &Layer) -> (u64, u64) {
+        layer_weight_parts(layer).iter().fold((0u64, 0u64), |(f, b), p| {
+            let n = scratch_part_bytes(p);
+            if p.3 == DType::BF16 {
+                (f, b.saturating_add(n))
+            } else {
+                (f.saturating_add(n), b)
+            }
+        })
+    }
+
+    /// The bytes a fused step's update of `layer` adds to a step's bound
+    /// beyond [`Self::layer_bwd_bytes`]: its bf16 scratch buffers and its
+    /// AdamW slot tables.
+    fn fused_layer_bytes(&self, l: usize, config: AdamWConfig) -> u64 {
+        let tables = layer_slots(self, l, None).map_or(0, |ps| fused_table_bytes(config, &ps));
+        self.layer_scratch_bytes(&self.layers[l]).1.saturating_add(tables)
+    }
+
+    /// The bytes the update after the gather adds: the embedding's, the
+    /// final norm's and an untied head's slot tables.
+    fn fused_tail_bytes(&self, config: AdamWConfig) -> u64 {
+        let mut ps = vec![embed_slot(self, None)];
+        ps.extend(tail_slots(self, None).unwrap_or_default());
+        fused_table_bytes(config, &ps)
     }
 
     /// `p` is this model's, and `dh` fits it.
@@ -1401,11 +1679,19 @@ impl Qwen35Model {
 
     /// The backward of `p`, with `dh` added at the final norm's output
     /// first: into fresh gradients (returned) or into `bank`.
+    ///
+    /// With `fused` (and `bank` the step's top bank, [`Self::fused_top_bank`],
+    /// with no layers), each layer's gradients go into a scratch of their own
+    /// ([`Self::layer_scratch`]), and the layer's AdamW update is encoded as
+    /// soon as the scratch is filled; the embedding's, the final norm's and
+    /// an untied head's follow the gather. See
+    /// [`Self::train_step_fused_adamw`] for why that is sound.
     fn backward(
         &self,
         p: PendingStep,
         dh: Option<(&[u32], &Tensor)>,
         bank: Option<(&Qwen35Grads, bool)>,
+        mut fused: Option<&mut FusedAdamW<'_>>,
     ) -> Result<Option<Qwen35Grads>, String> {
         let (rt, cfg) = (&self.rt, &self.cfg);
         let PendingStep {
@@ -1520,16 +1806,29 @@ impl Qwen35Model {
                         .0
                 }
             };
-            let into = bank.map(|(b, add)| (&b.layers[li], add));
+            // A fused step's layer gradients go to a scratch of the layer's
+            // own, replaced in the pool by the next layer's.
+            let scratch = match fused {
+                Some(_) => Some(self.layer_scratch(layer)?),
+                None => None,
+            };
+            let dest = match (&scratch, bank) {
+                (Some(sg), _) => Some((sg, false)),
+                (None, Some((b, add))) => Some((&b.layers[li], add)),
+                (None, None) => None,
+            };
             let ragged_step = rscratch.is_some();
-            let g = self.train_layer_backward(layer, &s, &mut sc, operands, into, rscratch.as_mut())?;
-            match bank {
+            let g = self.train_layer_backward(layer, &s, &mut sc, operands, dest, rscratch.as_mut())?;
+            match dest {
                 // A ragged step's mixer gradients went in per sequence.
-                Some((b, add)) if ragged_step => {
-                    deliver(rt, &g.parts_without_mixer(), &b.layers[li].parts_without_mixer(), add)?;
+                Some((d, add)) if ragged_step => {
+                    deliver(rt, &g.parts_without_mixer(), &d.parts_without_mixer(), add)?;
                 }
-                Some((b, add)) => deliver(rt, &g.parts(), &b.layers[li].parts(), add)?,
+                Some((d, add)) => deliver(rt, &g.parts(), &d.parts(), add)?,
                 None => layers.push(g),
+            }
+            if let (Some(f), Some(sg)) = (fused.as_deref_mut(), &scratch) {
+                f.layer(self, li, sg)?;
             }
         }
         layers.reverse();
@@ -1607,6 +1906,7 @@ impl Qwen35Model {
                     cfg.hidden,
                 )?;
                 token_rows_to_bank(rt, &b.embed, add, &rows)?;
+                self.fused_top(fused, b)?;
                 rt.synchronize()?;
                 return Ok(None);
             }
@@ -1623,6 +1923,7 @@ impl Qwen35Model {
             if !direct {
                 deliver(rt, &[tensor_part(&dw)], &[tensor_part(&b.embed)], add)?;
             }
+            self.fused_top(fused, b)?;
             rt.synchronize()?;
             return Ok(None);
         }
@@ -1749,7 +2050,7 @@ impl Qwen35Model {
     /// and the device's current allocation exceed its recommended working
     /// set.
     pub fn train_step_bytes(&self, t: u32, operands: GemmOperands) -> u64 {
-        self.step_bytes(t, operands, false, HeadKind::Fresh, None)
+        self.step_bytes(t, operands, false, HeadKind::Fresh, None, None)
     }
 
     /// [`Self::train_step_bytes`] for [`Self::train_step_ragged_into`] on
@@ -1770,7 +2071,7 @@ impl Qwen35Model {
         let ranges = check_cu_seqlens(cu_seqlens, total)?;
         let lens: Vec<u32> = ranges.iter().map(|r| r.len() as u32).collect();
         let head = if in_place { HeadKind::InPlace } else { HeadKind::ByChunk };
-        Ok(self.step_bytes(total as u32, operands, false, head, Some(&lens)))
+        Ok(self.step_bytes(total as u32, operands, false, head, Some(&lens), None))
     }
 
     /// [`Self::train_step_bytes`]; `fresh` adds every layer's gradients held
@@ -1786,7 +2087,20 @@ impl Qwen35Model {
     /// mixer's forward, backward and scratch, and the attention workspace,
     /// are counted once per sequence at its own length (each buffer at the
     /// pool's rounding), the row-wise parts once over `t` rows.
-    fn step_bytes(&self, t: u32, mm: GemmOperands, fresh: bool, head: HeadKind, lens: Option<&[u32]>) -> u64 {
+    ///
+    /// `fused` is a [`Self::train_step_fused_adamw`] under that config: the
+    /// top bank it holds throughout, each layer's bf16 scratch and slot
+    /// tables between waits (its f32 scratch is the gradients
+    /// [`Self::layer_bwd_bytes`] already charges), and the tail's tables.
+    fn step_bytes(
+        &self,
+        t: u32,
+        mm: GemmOperands,
+        fresh: bool,
+        head: HeadKind,
+        lens: Option<&[u32]>,
+        fused: Option<AdamWConfig>,
+    ) -> u64 {
         let (cfg, tu) = (&self.cfg, t as usize);
         let (h, v) = (cfg.hidden as usize, cfg.vocab as usize);
         let f = |n: usize| GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold);
@@ -1824,20 +2138,28 @@ impl Qwen35Model {
             HeadKind::ByChunk if self.lm_head.is_none() => sum(&[th, f(tu)]),
             HeadKind::ByChunk => 0,
         };
+        let top_bank = if fused.is_some() {
+            self.fused_top_bank_bytes()
+        } else {
+            0
+        };
         let held = sum(&[
             f(tu),
             kept.saturating_mul(layers),
             th.saturating_mul(3),
             head_held,
             attn_ws,
+            top_bank,
         ]);
         let fwd: Vec<u64> = self.layers.iter().map(|l| layer_fwd(l, true)).collect();
         let bwd: Vec<(u64, u64)> = self
             .layers
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(li, l)| {
                 let (grads, temps) = self.layer_bwd_step_bytes(l, t, mm, lens);
-                (grads, sum(&[layer_fwd(l, false), grads, temps, widened]))
+                let fused_extra = fused.map_or(0, |c| self.fused_layer_bytes(li, c));
+                (grads, sum(&[layer_fwd(l, false), grads, temps, widened, fused_extra]))
             })
             .collect();
         let fresh_grads = if fresh {
@@ -1899,6 +2221,7 @@ impl Qwen35Model {
             f(h),
             EmbedBwdWorkspace::allocated_bytes_for(t),
             fresh_grads,
+            fused.map_or(0, |c| self.fused_tail_bytes(c)),
         ]);
         let pool = self.rt.memory_info().pool_cache_cap as u64;
         sum(&[held, fwd_most.max(ce).max(backward_held.saturating_add(bwd_most)), pool])
@@ -2261,6 +2584,10 @@ impl Qwen35Model {
         attn_ws: Option<&AttnTrainWorkspace>,
         ragged: Option<&RaggedRef<'_>>,
     ) -> Result<(Saved, Option<Tensor>), String> {
+        // Test hook (`fail_layer_after_for_test`): off unless a test sets it.
+        // A step's forward runs each layer once and its backward rebuilds
+        // each, so a count past the layers fails a rebuild.
+        self.take_layer_fault()?;
         let (rt, cfg) = (&self.rt, &self.cfg);
         let (tu, h, i) = (t as usize, cfg.hidden as usize, cfg.intermediate as usize);
         let x1 = tensor(rt, &[tu, h])?;
@@ -2920,6 +3247,7 @@ mod tests {
 
     use super::*;
     use crate::npy::read_npy;
+    use crate::qwen35_adamw::{MomentStorage, UpdateRule};
     use crate::qwen35_model::Qwen35Config;
     use crate::safetensors::SafeTensors;
 
@@ -3040,6 +3368,16 @@ mod tests {
 
     fn tiny_model() -> Qwen35Model {
         tiny_model_as(Precision::F32)
+    }
+
+    /// [`tiny_model_as`] as [`Qwen35Model::load_tower`] loads it (no packed
+    /// LM head): the model a bf16 step can train, which `AdamW` accepts.
+    fn tiny_tower_as(precision: Precision) -> Qwen35Model {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
+        let cfg = Qwen35Config::from_config_file(&dir.join("config.json")).unwrap();
+        let rt = GpuRuntime::new().unwrap();
+        let st = SafeTensors::open(&dir.join("model.safetensors")).unwrap();
+        Qwen35Model::load_tower(&rt, &st, "model.", cfg, precision).unwrap()
     }
 
     fn tiny_model_as(precision: Precision) -> Qwen35Model {
@@ -3512,6 +3850,77 @@ mod tests {
                 mixer_held(&model, &mx),
                 model.mixer_scratch_bytes(t),
                 "mixer_scratch_bytes at t={t}"
+            );
+        }
+    }
+
+    /// What a fused step allocates beyond a bank step's working set equals
+    /// its bounds, exactly: the top bank, each layer's scratch (whose f32
+    /// buffers are the gradients `layer_bwd_bytes` already charges, and whose
+    /// bf16 ones the fused bound adds) and the slot tables of each layer's
+    /// update and of the tail's. Read off the runtime's request counter, so
+    /// recycled buffers hide nothing.
+    #[test]
+    fn fused_bounds_equal_the_bytes_the_fused_step_allocates() {
+        for (name, precision, mm) in lanes() {
+            let model = tiny_tower_as(precision);
+            let config = if precision == Precision::F32 {
+                AdamWConfig::F32
+            } else {
+                AdamWConfig {
+                    update: UpdateRule::bf16_default(3),
+                    moments: MomentStorage::F32,
+                }
+            };
+            let before = requested(&model);
+            let top = model.fused_top_bank().unwrap();
+            assert_eq!(
+                requested(&model) - before,
+                model.fused_top_bank_bytes(),
+                "{name}: the top bank"
+            );
+            let mut state = AdamW::with_config(&model, config).unwrap();
+            let wd = vec![0.0f32; model.parameter_table().unwrap().len()];
+            let mut fused = FusedAdamW::new("test", &model, &mut state, &AdamWHyper::default(), &wd).unwrap();
+            for (li, layer) in model.layers.iter().enumerate() {
+                let before = requested(&model);
+                let scratch = model.layer_scratch(layer).unwrap();
+                let (in_f32, in_bf16) = model.layer_scratch_bytes(layer);
+                assert_eq!(
+                    requested(&model) - before,
+                    in_f32 + in_bf16,
+                    "{name}: layer {li}'s scratch"
+                );
+                let (grads, _) = model.layer_bwd_bytes(layer, 8, mm);
+                if precision == Precision::F32 {
+                    assert_eq!(
+                        in_f32, grads,
+                        "{name}: layer {li}: the f32 scratch is what the bound charges"
+                    );
+                } else {
+                    assert!(
+                        in_f32 <= grads,
+                        "{name}: layer {li}: f32 scratch {in_f32} over the charge {grads}"
+                    );
+                }
+                let before = requested(&model);
+                fused.layer(&model, li, &scratch).unwrap();
+                let tables = fused_table_bytes(config, &layer_slots(&model, li, None).unwrap());
+                assert_eq!(requested(&model) - before, tables, "{name}: layer {li}'s slot tables");
+                assert_eq!(
+                    model.fused_layer_bytes(li, config),
+                    in_bf16 + tables,
+                    "{name}: layer {li}'s fused bound"
+                );
+            }
+            let before = requested(&model);
+            fused
+                .top(&model, &top.embed, &top.final_norm, top.lm_head.as_ref())
+                .unwrap();
+            assert_eq!(
+                requested(&model) - before,
+                model.fused_tail_bytes(config),
+                "{name}: the tail's slot tables"
             );
         }
     }

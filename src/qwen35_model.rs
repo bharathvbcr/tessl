@@ -87,7 +87,7 @@
 //! packed head.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::config_json::{self, field, float};
 use crate::cross_entropy::gather_rows_f32;
@@ -490,9 +490,33 @@ pub struct Qwen35Model {
     /// Test hook ([`Self::fail_host_read_after_for_test`]): host reads still
     /// to succeed before one fails; `usize::MAX` is off.
     read_fault: AtomicUsize,
+    /// Why the weights are part updated, once a fused training step failed
+    /// after its first update could have run
+    /// ([`Self::mark_torn`]). Every later forward, training step and
+    /// optimizer step refuses ([`Self::check_untorn`]); reload the model.
+    torn: OnceLock<String>,
 }
 
 impl Qwen35Model {
+    /// Record that a step failed after some of the weights were updated and
+    /// the rest were not: the model is no longer any step's weights. The
+    /// first cause is kept. The same latch as a [`Staged`] or [`Decode`]
+    /// session's `broken`, on the model, since what tore is the weights.
+    pub(crate) fn mark_torn(&self, cause: String) {
+        let _ = self.torn.set(cause);
+    }
+
+    /// Refuse when the weights are part updated ([`Self::mark_torn`]).
+    pub(crate) fn check_untorn(&self, what: &str) -> Result<(), String> {
+        match self.torn.get() {
+            None => Ok(()),
+            Some(cause) => Err(format!(
+                "{what}: the model's weights are part of the way through a step that failed ({cause}); \
+                 some parameters were updated and the rest were not; reload the model"
+            )),
+        }
+    }
+
     /// How many times the weights have been written since load.
     pub(crate) fn param_generation(&self) -> u64 {
         self.param_generation.load(Ordering::Relaxed)
@@ -532,7 +556,7 @@ impl Qwen35Model {
         )
     }
 
-    fn take_layer_fault(&self) -> Result<(), String> {
+    pub(crate) fn take_layer_fault(&self) -> Result<(), String> {
         count_down_fault(&self.layer_fault, "layer: injected fault (fail_layer_after_for_test)")
     }
 }
@@ -722,6 +746,7 @@ impl Qwen35Model {
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicUsize::new(usize::MAX),
+            torn: OnceLock::new(),
         })
     }
 
@@ -937,6 +962,7 @@ impl Qwen35Model {
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicUsize::new(usize::MAX),
+            torn: OnceLock::new(),
         })
     }
 
@@ -1185,6 +1211,7 @@ impl Qwen35Model {
     /// each below the vocabulary, and exact-f32 GEMMs for the F32 forward.
     /// Returns the token count.
     fn check_ids(&self, what: &str, ids: &[u32]) -> Result<u32, String> {
+        self.check_untorn(what)?;
         if ids.is_empty() {
             return Err(format!("{what}: no tokens"));
         }

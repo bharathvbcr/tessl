@@ -858,8 +858,41 @@ differences (1e-7), and the kernels match it within 4e-6 of the largest
 magnitude (O, lse, dQ, dK, dV) from T = 1 through partial, exact and
 one-row blocks, two batch rows and the 2B's 8 query over 2 KV heads. Fourteen
 of fourteen injected defects (masking, scale, `Dr`, head grouping, the
-diagonal start, the log-sum-exp reads and store) fail it. The backward has
-not been timed yet.
+diagonal start, the log-sum-exp reads and store) fail it. The backward's
+timing is in the "Training-path timing" table below (`attn_train` backward,
+T = 2048).
+
+### Fused dK/dV backward: not built (2026-10-21)
+
+Card ft-f3e140142a65bd0684bf58c56e7ee13d, item 2, asked whether one kernel
+producing dK and dV together beats the split. It was closed on this analysis
+without building it or running the GPU; the split is kept, as the card's
+acceptance allows.
+
+- **Verified** (`kernels/qwen35_attn_bwd.metal:14-20`): every gradient is
+  written once by the threadgroup that owns it, with no atomics, so results
+  are the same on every run. dK and dV are separate kernels with one
+  accumulator each, to keep the forward's register footprint.
+- **Verified**, GEMM count per (key block, query block): the dQ kernel issues
+  S = Q·Kᵀ (`:118`), dP = dO·Vᵀ (`:122`) and dQ += dS·K (`:133`), which is 3.
+  The dK/dV kernel issues S (`:201`), dP only when DK (`:206`) and the
+  accumulate (`:218` for dK, `:220` for dV), so dK is 3 and dV is 2. 8 in
+  total.
+- FlashAttention-2 reaches 5 only by accumulating dQ with atomics, which this
+  repo forbids. A fused dK/dV kernel would need 4 (S and dP once, then
+  dV += Pᵀ·dO and dK += dSᵀ·Q), and dQ stays a separate 3, so the floor here
+  is 7: one GEMM saved of 8.
+- **Unverified**, from the card: about 13.9 ms per attention layer × 6 layers
+  at T = 2048 on the 2B, so the best-case saving is about 10 ms, roughly 0.1%
+  of a step. (The timing table below reports the 13.9 ms; it was not re-run
+  for this decision.)
+- **Inferred** (tile sizes in `src/attn_train.rs:36-38`, head dim 256): two
+  32×256 fp32 accumulators across 128 threads are 128 registers per thread
+  against 64 today. Spills and occupancy are **unverified**, and the repo has
+  no spill-statistics tool (`scripts/check_kernel_ir.sh` emits LLVM IR only).
+
+Decision: the split is kept. The best case is one GEMM of eight, about a tenth
+of a percent of a step, against a doubled accumulator that may spill.
 
 ### Training-path timing
 

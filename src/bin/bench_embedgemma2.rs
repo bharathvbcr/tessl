@@ -427,12 +427,16 @@ fn run_text_kernels(warmup: usize, iters: usize) -> Result<(), String> {
 
     // The per-layer inputs' scale and norm: `rms(x * scale) * w`, in place.
     let lane = "eg2t_scale_rms_norm_f32";
-    let x = upload_f32(&rt, &y)?;
+    // Rows small enough that `eps` is a visible share of the mean square: rms(x * s) is
+    // scale-invariant only while eps is negligible beside it, so with `|x| <= 2e-3` an
+    // ignored (or doubled) scale moves the output by tens of percent and the check sees it.
+    let y_small = common::fill_affine(n, 35, 2e-3, 0.0);
+    let x = upload_f32(&rt, &y_small)?;
     scale_rms_norm_inplace(&rt, &x, &w_next_b, ROWS, DIM, EPS, SCALE)?;
     rt.synchronize()?;
     let want: Vec<f64> = (0..rows)
         .flat_map(|r| {
-            let scaled: Vec<f64> = y[r * dim..(r + 1) * dim]
+            let scaled: Vec<f64> = y_small[r * dim..(r + 1) * dim]
                 .iter()
                 .map(|&v| f64::from(v) * f64::from(SCALE))
                 .collect();

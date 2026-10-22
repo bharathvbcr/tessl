@@ -130,14 +130,14 @@ Owner decision: bench lanes for **all** kernel entry points. `kernel_coverage --
 - `bench_embedgemma2{,_audio,_vision} --kernels`.
 - `bench_encoder_attn`: the tiled variants.
 
-Every lane checks its result before timing. Most compare against a host reference or a derived bound. Three EmbedGemma2 audio kernels get only finite and range checks, which do catch NaN.
+Every lane checks its result before timing. Most compare against a host reference or a derived bound. Three EmbedGemma2 audio kernels (`eg2a_sub_conv0_ln_relu`, `eg2a_sub_conv1_ln_relu`, `eg2a_attn`) got only finite and range checks, which catch NaN; wave 24 gave them f64 host references too.
 
 The adversarial pass on both lanes found three problems, all fixed before landing:
 - AdamW / moment write-backs that were never read back. They are now read back and bit-checked.
 - Op lanes that checked only finite, non-zero output. They now have host references.
 - `bench_encoder_attn` skipped its 10% spread guard whenever `TESSL_KERNEL_TRACE` was set. It now skips only on an explicit `--coverage-probe`, which `kernel_coverage` passes, and says so when it does.
 
-Accepted as unobservable: `eg2t_scale_rms_norm_f32` can't detect an ignored scale, because `rms(x·s)` is scale-invariant. Accepted by convention: `bench_gemm_variants` lanes are timing-only, and their correctness is covered in `tests/`.
+Wave 19 accepted `eg2t_scale_rms_norm_f32` as unobservable because `rms(x·s)` is scale-invariant. It is invariant only while `eps` is negligible; wave 24 runs the lane on rows of `|x| <= 2e-3`, where an ignored scale moves the output by about a quarter, so it is checked. `bench_gemm_variants` lanes are timing-only except `nn_f16`, `nn_f16_narrow`, `epi_f16` and `epi_bf16`, which wave 24 checks against a sampled host reference; the module docs name the covering test for every other lane.
 
 **Changed:** bench binaries, `src/bin/common`, `tests/kernel_coverage.rs`, the allowlist, and `hosted_tests.txt` `bins` 261 → 262. No library code, no kernels. No timing claims.
 

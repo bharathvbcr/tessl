@@ -3,8 +3,9 @@
 # On 2026-10-18 the eg2 session rewrote `main` and `eg2/integrate` with `git filter-branch`
 # to remove an LGPL-derived src/media/resample.rs. Every commit from the first resampler
 # commit onward was renamed; commits before it keep their SHAs and are not listed.
-# The old history stays resolvable through refs/original/refs/scrub/{main,eg2-integrate}
-# and refs/backup/2026-10-18*/ (see BUILD_REPORT.md, "History scrub").
+# The old SHAs were held by refs/original/refs/scrub/{main,eg2-integrate} and refs/backup/2026-10-18*/
+# until those refs were pruned (see BUILD_REPORT.md, "History scrub"); after the prune this table is the
+# record of them, and the old SHAs no longer resolve in this repository.
 #
 # Columns (tab separated): old full SHA, new full SHA, subject.  Rows are in topological order, oldest first.
 # 102 rows: the commits reachable from refs/original/refs/scrub/* and not from main, eg2/integrate or refs/scrub/*.

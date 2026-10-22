@@ -3263,16 +3263,126 @@ mod tests {
     }
 
     /// One parameter tensor to probe: the model's buffer, tessl's gradient,
-    /// transformers' gradient in tessl's layout, and whether the disagreement
-    /// is large enough for finite differences to resolve.
+    /// transformers' gradient in tessl's layout, and the finite-difference
+    /// steps to probe it with (whether they resolve is measured, not declared).
     struct FdCase<'a> {
         name: String,
         param: &'a GpuBuffer,
         grad: &'a GpuBuffer,
         n: usize,
         torch: Vec<f64>,
+        steps: [f64; 6],
+    }
+
+    /// What the finite-difference sweep of one parameter says.
+    struct FdVerdict {
+        /// Every adjacent Richardson estimate, coarsest h first.
+        estimates: Vec<f64>,
+        /// The value the bound compares: the mean of the three estimates in
+        /// the chosen window (the finest qualifying one when resolved, the
+        /// finest window otherwise).
+        fd: f64,
+        /// Max minus min of the chosen window's estimates when resolved,
+        /// else the smallest spread over all windows.
+        spread: f64,
+        /// True only when every difference and `dn` are finite, `dn > 0`, and
+        /// some window of three consecutive estimates spans at most `0.3 |d|`.
         resolved: bool,
-        steps: [f64; 4],
+    }
+
+    /// Richardson-extrapolate a halving sequence of central differences `fds`
+    /// (h, h/2, h/4, ...; at least five, giving at least three estimates) and
+    /// decide whether the sweep resolves the parameter at the scale of
+    /// `dn` = |d|, the norm of the tessl-minus-torch gradient difference.
+    ///
+    /// Resolved means three consecutive adjacent Richardson estimates all lie
+    /// within 0.3 |d| of each other (max minus min). 0.3 |d| is the width of
+    /// the bound the test then applies (|fd - tessl| <= 0.3 |d|): an FD whose
+    /// own estimates scatter by more than that cannot place tessl against the
+    /// bound, nor separate tessl from torch (a distance of |d|) any finer than
+    /// its scatter. Two agreeing estimates are not enough: on the GPU they
+    /// agreed within 0.3 |d| at layers.20 conv1d.weight by coincidence (the
+    /// successive-difference ratios were 1.96 and 3.7, not 4), and the bound
+    /// then failed. Of several qualifying windows the finest-h one is used.
+    /// A non-finite difference, or a non-finite or zero `dn`, never resolves.
+    fn fd_verdict(fds: &[f64], dn: f64) -> FdVerdict {
+        assert!(
+            fds.len() >= 5,
+            "three Richardson estimates need five central differences, got {}",
+            fds.len()
+        );
+        let mut estimates: Vec<f64> = fds.windows(2).map(|w| (4.0 * w[1] - w[0]) / 3.0).collect();
+        // Only the four finest estimates count (the owner's design for the
+        // six-step sweep: three windows of three); the coarsest h only feeds
+        // the printed differences.
+        estimates.drain(..estimates.len().saturating_sub(4));
+        let tol = 0.3 * dn;
+        let finite = fds.iter().all(|x| x.is_finite()) && dn.is_finite() && dn > 0.0;
+        let window = |w: &[f64]| {
+            let hi = w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let lo = w.iter().copied().fold(f64::INFINITY, f64::min);
+            (hi - lo, w.iter().sum::<f64>() / 3.0)
+        };
+        let windows: Vec<(f64, f64)> = estimates.windows(3).map(window).collect();
+        let best = windows.iter().rposition(|(s, _)| finite && *s <= tol);
+        let resolved = best.is_some();
+        let (spread, fd) = match best {
+            Some(i) => windows[i],
+            None => (
+                windows.iter().map(|w| w.0).fold(f64::INFINITY, f64::min),
+                windows[windows.len() - 1].1,
+            ),
+        };
+        FdVerdict {
+            estimates,
+            fd,
+            spread,
+            resolved,
+        }
+    }
+
+    #[test]
+    fn fd_verdict_resolves_a_clean_h_squared_sequence_and_never_a_noisy_or_nan_one() {
+        // fd(h) = g + c h^2: Richardson cancels the h^2 term exactly.
+        let clean: Vec<f64> = [1e-2f64, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4]
+            .iter()
+            .map(|h| -0.88 + 40.0 * h * h)
+            .collect();
+        let v = fd_verdict(&clean, 3.6e-3);
+        assert!(v.resolved, "{:?}", v.estimates);
+        assert!((v.fd + 0.88).abs() < 1e-12, "{}", v.fd);
+        // The conv1d.weight of layer 20 (|d| 3.636e-3): central differences
+        // that swing between -0.875 and -0.924 at fine h, rounding noise.
+        let noisy = [-0.875, -0.924, -0.89, -0.91, -0.88, -0.93];
+        let v = fd_verdict(&noisy, 3.636e-3);
+        assert!(!v.resolved, "{:?}", v.estimates);
+        // Only two adjacent estimates agree and a third differs: a coincidence
+        // of the kind seen at conv20, so not resolved. Perturbing f[2] moves
+        // the first two of the four estimates, leaving the last two exact.
+        let mut two = clean.clone();
+        two[2] += 0.03;
+        let v = fd_verdict(&two, 3.6e-3);
+        assert!(
+            (v.estimates[2] - v.estimates[3]).abs() <= 0.3 * 3.6e-3,
+            "{:?}",
+            v.estimates
+        );
+        assert!(!v.resolved, "{:?}", v.estimates);
+        // A coarse outlier does not hide a finer agreeing window.
+        let mut late = clean.clone();
+        late[1] += 0.03;
+        assert!(fd_verdict(&late, 3.6e-3).resolved);
+        // A NaN anywhere, even one the estimates would not otherwise show.
+        for i in 0..6 {
+            let mut f = clean.clone();
+            f[i] = f64::NAN;
+            assert!(!fd_verdict(&f, 3.6e-3).resolved, "NaN at {i}");
+        }
+        let mut f = clean.clone();
+        f[0] = f64::INFINITY;
+        assert!(!fd_verdict(&f, 3.6e-3).resolved);
+        assert!(!fd_verdict(&clean, f64::NAN).resolved);
+        assert!(!fd_verdict(&clean, 0.0).resolved);
     }
 
     /// The loss of the inference forward's logits (the training forward's
@@ -3973,17 +4083,9 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
-    ///
-    /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
-    /// the largest), so their gradients differ too (up to 4e-3 of a
-    /// parameter's largest, tests/qwen35_train.rs). This decides whose side a
-    /// disagreement is on: along `v = (g_tessl - g_torch) / |d|` the two
-    /// gradients predict slopes `|d|` apart, and a Richardson-extrapolated
-    /// central difference of tessl's own loss must land on tessl's.
-    #[test]
-    #[ignore]
-    fn real_2b_gradients_are_those_of_tessls_forward() {
+    /// The reference directory, the runtime, the f32 2B model and the
+    /// reference ids, shared by the 2B finite-difference tests.
+    fn real_2b_setup() -> (std::path::PathBuf, Arc<GpuRuntime>, Qwen35Model, Vec<u32>) {
         let dir = train_reference_dir().unwrap_or_else(|e| panic!("{e}"));
         let st = SafeTensors::open(Path::new(
             &std::env::var("QWEN35_2B_SAFETENSORS").expect("QWEN35_2B_SAFETENSORS"),
@@ -4000,6 +4102,160 @@ mod tests {
         .unwrap();
         drop(st);
         let ids: Vec<u32> = npy(&dir.join("ids.npy")).iter().map(|&x| x as u32).collect();
+        (dir, rt, model, ids)
+    }
+
+    /// Diagnostic for ft-1d2ab5b004a2f7bebbd1bf03896428ff: the central
+    /// difference's convergence for one parameter of the 2B model along the
+    /// same `v = (g_tessl - g_torch) / |d|` as the bound test. The parameter
+    /// is `TESSL_FD_PARAM` (default the layer-20 conv weight; a conv1d,
+    /// `input_layernorm`, `post_attention_layernorm` or `model.norm.weight`
+    /// name). It prints, and asserts only that the parameter is restored.
+    #[test]
+    #[ignore = "diagnostic: prints the FD convergence for one parameter"]
+    fn real_2b_fd_convergence_for_one_parameter() {
+        let name =
+            std::env::var("TESSL_FD_PARAM").unwrap_or_else(|_| "model.layers.20.linear_attn.conv1d.weight".into());
+        let (dir, _rt, model, ids) = real_2b_setup();
+        let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        let base = loss(&model, &ids);
+        let layer = || -> usize {
+            name.strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{name}: no layer index"))
+        };
+        let hidden = model.cfg.hidden as usize;
+        let (param, grad, n): (&GpuBuffer, &GpuBuffer, usize) = if name.ends_with("conv1d.weight") {
+            let l = layer();
+            match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
+                (Mixer::Gdn(w), MixerGrads::Gdn(g)) => (
+                    &w.conv_w,
+                    &g.conv_w,
+                    (model.cfg.gdn.conv_dim() * model.cfg.conv_kernel) as usize,
+                ),
+                _ => panic!("{name}: layer {l} is not a GDN layer"),
+            }
+        } else if name.ends_with(".input_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].input_norm, &step.grads.layers[l].input_norm, hidden)
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].post_norm, &step.grads.layers[l].post_norm, hidden)
+        } else if name == "model.norm.weight" {
+            (&model.final_norm, &step.grads.final_norm, hidden)
+        } else {
+            panic!("{name}: not a parameter this diagnostic knows")
+        };
+        let g_torch = npy(&dir.join(format!("grad.{name}.npy")));
+        let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
+        let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
+        let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let v: Vec<f64> = d.iter().map(|x| x / dn).collect();
+        let dot = |g: &[f64]| g.iter().zip(&v).map(|(a, b)| a * b).sum::<f64>();
+        let orig = param.read_f32()[..n].to_vec();
+        let max_abs = orig.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        eprintln!(
+            "{name}: n {n}, |d| {dn:.3e}, tessl.v {:.6e}, torch.v {:.6e}, base loss {base:.9e}, max|x| {max_abs:.3e}, max|v| {:.3e}, |g_tessl| {:.3e}",
+            dot(&g_tessl),
+            dot(&g_torch),
+            v.iter().fold(0.0f64, |a, &b| a.max(b.abs())),
+            g_tessl.iter().map(|x| x * x).sum::<f64>().sqrt(),
+        );
+        // Both perturbations are formed from the f32 original. "f64 once" is
+        // the bound test's: x + s*u in f64, rounded to f32 once. "f32
+        // arithmetic" rounds s*u to f32 first and adds in f32, so a differing
+        // row shows what the second rounding costs.
+        let perturb = |s: f64, f64_once: bool| -> Vec<f32> {
+            orig.iter()
+                .zip(&v)
+                .map(|(&x, &u)| {
+                    if f64_once {
+                        (f64::from(x) + s * u) as f32
+                    } else {
+                        x + (s * u) as f32
+                    }
+                })
+                .collect()
+        };
+        let write = |p: &[f32]| {
+            let mut all = param.read_f32();
+            all[..n].copy_from_slice(p);
+            param.write_f32(&all);
+        };
+        let hs: Vec<f64> = (0..=14)
+            .map(|k| 1e-1 / f64::from(1u32 << k))
+            .take_while(|&h| h >= 1e-5)
+            .collect();
+        for f64_once in [true, false] {
+            eprintln!(
+                "-- perturbation {}",
+                if f64_once {
+                    "f64 once, rounded once"
+                } else {
+                    "f32 arithmetic"
+                }
+            );
+            let mut fds: Vec<f64> = Vec::new();
+            for &h in &hs {
+                let (xp, xm) = (perturb(h, f64_once), perturb(-h, f64_once));
+                let unchanged = |p: &[f32]| p.iter().zip(&orig).filter(|(a, b)| a == b).count();
+                let (cp, cm) = (unchanged(&xp), unchanged(&xm));
+                // The step the f32 parameters really took along v.
+                let realised = xp
+                    .iter()
+                    .zip(&xm)
+                    .zip(&v)
+                    .map(|((&a, &b), &u)| (f64::from(a) - f64::from(b)) * u)
+                    .sum::<f64>()
+                    / 2.0;
+                write(&xp);
+                let up = loss(&model, &ids);
+                write(&xm);
+                let down = loss(&model, &ids);
+                write(&orig);
+                let fd = (up - down) / (2.0 * h);
+                let fd_real = (up - down) / (2.0 * realised);
+                // Observed order from three successive differences:
+                // (fd(4h') - fd(2h')) / (fd(2h') - fd(h')) = 2^p.
+                let k = fds.len();
+                let order = if k >= 2 {
+                    let r = (fds[k - 2] - fds[k - 1]) / (fds[k - 1] - fd);
+                    format!("diff ratio {r:.3} (order {:.2})", r.abs().log2())
+                } else {
+                    "-".to_string()
+                };
+                let rich = fds
+                    .last()
+                    .map_or("-".to_string(), |p| format!("{:.6e}", (4.0 * fd - p) / 3.0));
+                eprintln!(
+                    "h {h:.4e}: up-base {:+.3e} down-base {:+.3e} fd {fd:+.6e} fd(realised h) {fd_real:+.6e} (realised/h {:.6}) {order} richardson(2h,h) {rich} unchanged f32 elems +h {cp} -h {cm} of {n}",
+                    up - base,
+                    down - base,
+                    realised / h,
+                );
+                fds.push(fd);
+            }
+            assert_eq!(
+                loss(&model, &ids).to_bits(),
+                base.to_bits(),
+                "{name}: the parameter was not restored"
+            );
+        }
+    }
+
+    /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.
+    ///
+    /// tessl's and transformers' f32 forwards differ (logits by 1.9e-6 of
+    /// the largest), so their gradients differ too (up to 4e-3 of a
+    /// parameter's largest, tests/qwen35_train.rs). This decides whose side a
+    /// disagreement is on: along `v = (g_tessl - g_torch) / |d|` the two
+    /// gradients predict slopes `|d|` apart, and a Richardson-extrapolated
+    /// central difference of tessl's own loss must land on tessl's.
+    #[test]
+    #[ignore]
+    fn real_2b_gradients_are_those_of_tessls_forward() {
+        let (dir, _rt, model, ids) = real_2b_setup();
         let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
         let base = loss(&model, &ids);
         // (name, the model's f32 buffer, tessl's gradient buffer, length).
@@ -4091,11 +4347,8 @@ mod tests {
                 h,
             ),
         ];
-        // Resolved: the disagreement is large enough in absolute terms (|d| h
-        // well above the loss's f32 rounding, ~1e-6) for central differences
-        // to tell the two gradients apart. The conv and the matrices are; the
-        // 1-D tensors' |d| h is at the rounding level, so they are printed and
-        // not asserted.
+        // Whether a parameter resolves is measured from its own sweep
+        // (`fd_verdict`); unresolved ones are reported by name, never passed.
         let mut all_cases: Vec<FdCase<'_>> = cases
             .into_iter()
             .map(|(name, param, grad, n)| {
@@ -4104,15 +4357,14 @@ mod tests {
                 // 0.05-0.4 along a unit direction moves each of their 2048
                 // entries by at most ~0.01 and stays near-linear, while lifting
                 // |d| h far above the loss's f32 rounding. The GDN gated norm's
-                // 128 weights do not resolve: steps of 0.4-0.05 and 0.2-0.025
-                // extrapolate 4e-5 apart, more than its |d| (3e-5), the first
-                // nearer tessl's gradient and the second nearer transformers'.
+                // 128 weights did not resolve (steps of 0.4-0.05 and 0.2-0.025
+                // extrapolated 4e-5 apart, more than its |d| of 3e-5); whether
+                // a parameter resolves is now measured by `fd_verdict`.
                 let norm = name.ends_with("layernorm.weight") || name == "model.norm.weight";
-                let resolved = norm || name.ends_with("conv1d.weight");
                 let steps = if norm || name.ends_with("linear_attn.norm.weight") {
-                    [0.4, 0.2, 0.1, 0.05]
+                    [0.4, 0.2, 0.1, 0.05, 0.025, 0.0125]
                 } else {
-                    [1e-2, 5e-3, 2.5e-3, 1.25e-3]
+                    [1e-2, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4]
                 };
                 FdCase {
                     name,
@@ -4120,7 +4372,6 @@ mod tests {
                     grad,
                     n,
                     torch,
-                    resolved,
                     steps,
                 }
             })
@@ -4137,17 +4388,17 @@ mod tests {
                 grad: g,
                 n: rows * cols,
                 torch: packed,
-                resolved: true,
-                steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3],
+                steps: [1e-2, 5e-3, 2.5e-3, 1.25e-3, 6.25e-4, 3.125e-4],
             });
         }
+        let mut resolved_names: Vec<String> = Vec::new();
+        let mut unresolved_names: Vec<String> = Vec::new();
         for FdCase {
             name,
             param,
             grad,
             n,
             torch: g_torch,
-            resolved,
             steps,
         } in all_cases
         {
@@ -4183,11 +4434,14 @@ mod tests {
                 line += &format!(" h={step_h:e}: {fd:.5e}");
             }
             // Richardson: the central difference's h^2 term cancels between
-            // h and h/2.
-            let n_fd = fds.len();
-            let extrap = (4.0 * fds[n_fd - 1] - fds[n_fd - 2]) / 3.0;
-            let extrap2 = (4.0 * fds[n_fd - 2] - fds[n_fd - 3]) / 3.0;
-            let fd = (extrap + extrap2) / 2.0;
+            // h and h/2. Six steps give four adjacent estimates; three
+            // consecutive ones must agree for the parameter to resolve.
+            let FdVerdict {
+                estimates,
+                fd,
+                spread,
+                resolved,
+            } = fd_verdict(&fds, dn);
             line += &format!(
                 "; extrapolated {fd:.5e}: off tessl {:+.2e}, off torch {:+.2e}",
                 fd - pt,
@@ -4200,6 +4454,7 @@ mod tests {
                 "{name}: the parameter was not restored"
             );
             if resolved {
+                resolved_names.push(name.clone());
                 assert!(
                     (fd - pt).abs() <= 0.3 * dn,
                     "{name}: tessl's loss moves as {fd:.6e} along v, its gradient says {pt:.6e}"
@@ -4208,8 +4463,30 @@ mod tests {
                     (fd - pt).abs() < (fd - pr).abs(),
                     "{name}: the finite difference is closer to transformers' gradient"
                 );
+            } else {
+                eprintln!(
+                    "UNRESOLVED {name}: adjacent Richardson estimates {}; best window of three spans {spread:.3e} > 0.3·|d| {:.3e}",
+                    estimates.iter().map(|e| format!("{e:.6e}")).collect::<Vec<_>>().join(", "),
+                    0.3 * dn
+                );
+                unresolved_names.push(name.clone());
             }
         }
+        let total = resolved_names.len() + unresolved_names.len();
+        eprintln!(
+            "{} of {total} parameters resolved; unresolved: {}",
+            resolved_names.len(),
+            if unresolved_names.is_empty() {
+                "none".to_string()
+            } else {
+                unresolved_names.join(", ")
+            }
+        );
+        assert!(
+            !resolved_names.is_empty(),
+            "no parameter resolved: the test has no evidence (unresolved: {})",
+            unresolved_names.join(", ")
+        );
         let peak = super::footprint::peak_footprint().unwrap_or_else(|e| panic!("peak footprint unreadable: {e}"));
         eprintln!(
             "real_2b_gradients_are_those_of_tessls_forward: peak footprint {:.2} GiB (memguard cap 32 GiB)",

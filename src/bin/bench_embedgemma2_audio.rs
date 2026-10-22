@@ -64,20 +64,36 @@ const SOFT_BOUND: f64 = 1e-4;
 /// `tests/embedgemma2_audio_model.rs` holds them to.
 const SOFT_COS_FLOOR: f64 = 0.9997;
 
+/// `x` centred, scaled by `1 / sqrt(biased variance + eps)` and `gamma`, then
+/// rectified: the subsampling convs' `LayerNorm(eps, weight, no bias)` + ReLU
+/// over one position's channels, in f64.
+fn host_ln_relu(x: &[f64], gamma: &[f32], eps: f64) -> Vec<f64> {
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let inv = 1.0 / (x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n + eps).sqrt();
+    x.iter()
+        .zip(gamma)
+        .map(|(v, &g)| ((v - mean) * inv * f64::from(g)).max(0.0))
+        .collect()
+}
+
 /// `--kernels`: the six `eg2a_*` kernels the tower's stages launch
 /// (`eg2a_sub_conv0_ln_relu`, `eg2a_sub_conv1_ln_relu`, `eg2a_rms_norm`,
 /// `eg2a_ew`, `eg2a_lconv`, `eg2a_attn`) through their public functions on
 /// random operands over a two-clip table, with no checkpoint. Each is run once
-/// into a NaN-poisoned output and checked before it is timed: `rms_norm`,
-/// `ew` and `lconv` against an f64 host reference of the formula in their doc
-/// comments; the two subsampling convs and the attention (whose references are
-/// the model-level tests') for a finite, non-trivial output (non-negative for
-/// the convs' ReLU). One `METRIC eg2a_{kernel}_ms` per kernel.
+/// into a NaN-poisoned output and checked before it is timed, all six against
+/// an f64 host reference of the formula in their doc comments (the kernels'
+/// own, written out from `kernels/embedgemma2_audio.metal`): `rms_norm`, `ew`
+/// and `lconv` as before; the two subsampling convs over a frame mask with
+/// holes (conv1 fed conv0's read-back output, so the two are checked apart);
+/// the attention over a key mask with holes, including a query that sees no
+/// key (`key_visible` is the visibility rule). One `METRIC eg2a_{kernel}_ms`
+/// per kernel.
 fn run_audio_kernels(warmup: usize, iters: usize) -> Result<(), String> {
     use common::{check_against, check_lane_output, fill_affine, host_rms, poisoned_f32, time_lane, upload_f32};
     use tessl::embedgemma2_audio::{
-        attention, conv_out, ew, lconv, rms_norm, sub_conv0_ln_relu, sub_conv1_ln_relu, AttentionSpec, Clamp,
-        ClipTable, Ew, Lconv, RmsNorm,
+        attention, conv_out, ew, key_visible, lconv, rms_norm, sub_conv0_ln_relu, sub_conv1_ln_relu, AttentionSpec,
+        Clamp, ClipTable, Ew, Lconv, RmsNorm,
     };
 
     const EPS: f32 = 1e-6;
@@ -93,16 +109,18 @@ fn run_audio_kernels(warmup: usize, iters: usize) -> Result<(), String> {
         let (mels, c0, c1) = (16usize, 8usize, 4usize);
         let mels1 = conv_out(mels);
         let mels2 = conv_out(mels1);
-        let feats = upload_f32(&rt, &fill_affine(table.frames * mels, 51, 1.5, 0.0))?;
-        let fmask = rt.alloc_buffer_from_u32(&vec![1u32; table.frames])?;
-        let (w0, g0) = (
-            upload_f32(&rt, &fill_affine(c0 * 9, 52, 0.5, 0.0))?,
-            upload_f32(&rt, &fill_affine(c0, 53, 0.3, 1.0))?,
-        );
-        let (w1, g1) = (
-            upload_f32(&rt, &fill_affine(9 * c0 * c1, 54, 0.5, 0.0))?,
-            upload_f32(&rt, &fill_affine(c1, 55, 0.3, 1.0))?,
-        );
+        let feats_h = fill_affine(table.frames * mels, 51, 1.5, 0.0);
+        // Some frames masked, one of them a whole 3x3 patch's rows: a kernel
+        // that ignored the mask would read the features there.
+        let fmask_h: Vec<u32> = (0..table.frames)
+            .map(|f| u32::from(f % 7 != 3 && f % 11 != 4))
+            .collect();
+        let (w0_h, g0_h) = (fill_affine(c0 * 9, 52, 0.5, 0.0), fill_affine(c0, 53, 0.3, 1.0));
+        let (w1_h, g1_h) = (fill_affine(9 * c0 * c1, 54, 0.5, 0.0), fill_affine(c1, 55, 0.3, 1.0));
+        let feats = upload_f32(&rt, &feats_h)?;
+        let fmask = rt.alloc_buffer_from_u32(&fmask_h)?;
+        let (w0, g0) = (upload_f32(&rt, &w0_h)?, upload_f32(&rt, &g0_h)?);
+        let (w1, g1) = (upload_f32(&rt, &w1_h)?, upload_f32(&rt, &g1_h)?);
         let mid = poisoned_f32(&rt, table.mid_rows * mels1 * c0)?;
         let out = poisoned_f32(&rt, rows * mels2 * c1)?;
         let conv0 = || sub_conv0_ln_relu(&rt, &feats, &fmask, &w0, &g0, &mid, &table, mels as u32, c0 as u32, EPS);
@@ -124,21 +142,66 @@ fn run_audio_kernels(warmup: usize, iters: usize) -> Result<(), String> {
         conv0()?;
         conv1()?;
         rt.synchronize()?;
-        for (lane, got) in [
-            (
-                "eg2a_sub_conv0_ln_relu",
-                mid.read_f32()[..table.mid_rows * mels1 * c0].to_vec(),
-            ),
-            ("eg2a_sub_conv1_ln_relu", out.read_f32()[..rows * mels2 * c1].to_vec()),
-        ] {
-            check_lane_output(lane, &got)?;
-            if let Some(i) = got.iter().position(|&x| x < 0.0) {
-                return Err(format!(
-                    "{lane}: element {i} is {}; a ReLU output is never negative",
-                    got[i]
-                ));
+        let mid_got = mid.read_f32()[..table.mid_rows * mels1 * c0].to_vec();
+        let out_got = out.read_f32()[..rows * mels2 * c1].to_vec();
+        check_lane_output("eg2a_sub_conv0_ln_relu", &mid_got)?;
+        check_lane_output("eg2a_sub_conv1_ln_relu", &out_got)?;
+        // conv0 from the features; conv1 from conv0's own output (read back), so a
+        // conv0 error cannot hide a conv1 one or be counted twice.
+        let mut want_mid = vec![0.0f64; mid_got.len()];
+        let mut want_out = vec![0.0f64; out_got.len()];
+        for clip in &table.clips {
+            for t1 in 0..clip.mid_rows {
+                for f1 in 0..mels1 {
+                    let mut patch = [0.0f64; 9];
+                    for kh in 0..3 {
+                        for kw in 0..3 {
+                            let (r, col) = ((2 * t1 + kh).checked_sub(1), (2 * f1 + kw).checked_sub(1));
+                            if let (Some(r), Some(col)) = (r, col) {
+                                if r < clip.frames && col < mels && fmask_h[clip.frame0 + r] != 0 {
+                                    patch[kh * 3 + kw] = f64::from(feats_h[(clip.frame0 + r) * mels + col]);
+                                }
+                            }
+                        }
+                    }
+                    let conv: Vec<f64> = (0..c0)
+                        .map(|co| (0..9).map(|k| f64::from(w0_h[co * 9 + k]) * patch[k]).sum())
+                        .collect();
+                    let at = ((clip.mid0 + t1) * mels1 + f1) * c0;
+                    want_mid[at..at + c0].copy_from_slice(&host_ln_relu(&conv, &g0_h, f64::from(EPS)));
+                }
+            }
+            for t2 in 0..clip.rows {
+                for f2 in 0..mels2 {
+                    let mut conv = vec![0.0f64; c1];
+                    for kh in 0..3 {
+                        let Some(r1) = (2 * t2 + kh).checked_sub(1).filter(|&r| r < clip.mid_rows) else {
+                            continue;
+                        };
+                        // The first layer's row r1 sits at frame 2 * r1 (`mask[::2]`).
+                        if fmask_h[clip.frame0 + 2 * r1] == 0 {
+                            continue;
+                        }
+                        for kw in 0..3 {
+                            let Some(f) = (2 * f2 + kw).checked_sub(1).filter(|&f| f < mels1) else {
+                                continue;
+                            };
+                            let src = ((clip.mid0 + r1) * mels1 + f) * c0;
+                            for ci in 0..c0 {
+                                let a = f64::from(mid_got[src + ci]);
+                                for (co, acc) in conv.iter_mut().enumerate() {
+                                    *acc += a * f64::from(w1_h[((kh * 3 + kw) * c0 + ci) * c1 + co]);
+                                }
+                            }
+                        }
+                    }
+                    let at = ((clip.row0 + t2) * mels2 + f2) * c1;
+                    want_out[at..at + c1].copy_from_slice(&host_ln_relu(&conv, &g1_h, f64::from(EPS)));
+                }
             }
         }
+        check_against("eg2a_sub_conv0_ln_relu", &mid_got, &want_mid, 1e-4, 1e-3)?;
+        check_against("eg2a_sub_conv1_ln_relu", &out_got, &want_out, 1e-4, 1e-3)?;
         time_lane(&rt, "eg2a_sub_conv0_ln_relu", warmup, iters, conv0)?;
         time_lane(&rt, "eg2a_sub_conv1_ln_relu", warmup, iters, conv1)?;
     }
@@ -256,14 +319,20 @@ fn run_audio_kernels(warmup: usize, iters: usize) -> Result<(), String> {
         let ctx = chunk + past;
         let rel_rows = ctx / 2 + 1;
         let lane = "eg2a_attn";
-        let (q, k, v) = (
-            upload_f32(&rt, &fill_affine(rows * hidden, 62, 2.0, 0.0))?,
-            upload_f32(&rt, &fill_affine(rows * hidden, 63, 2.0, 0.0))?,
-            upload_f32(&rt, &fill_affine(rows * hidden, 64, 2.0, 0.0))?,
+        let (q_h, k_h, v_h) = (
+            fill_affine(rows * hidden, 62, 2.0, 0.0),
+            fill_affine(rows * hidden, 63, 2.0, 0.0),
+            fill_affine(rows * hidden, 64, 2.0, 0.0),
         );
-        let rel = upload_f32(&rt, &fill_affine(rel_rows * hidden, 65, 0.5, 0.0))?;
-        let q_mult = upload_f32(&rt, &fill_affine(head_dim, 66, 0.3, 0.6))?;
-        let omask = rt.alloc_buffer_from_u32(&vec![1u32; rows])?;
+        let rel_h = fill_affine(rel_rows * hidden, 65, 0.5, 0.0);
+        let q_mult_h = fill_affine(head_dim, 66, 0.3, 0.6);
+        // Rows 2..=5 of clip 0 masked: query 5 then sees no key (the uniform-weight
+        // branch) and queries 3..=4 see fewer than `past`; row 12 of clip 1 too.
+        let omask_h: Vec<bool> = (0..rows).map(|r| !(2..=5).contains(&r) && r != 12).collect();
+        let (q, k, v) = (upload_f32(&rt, &q_h)?, upload_f32(&rt, &k_h)?, upload_f32(&rt, &v_h)?);
+        let rel = upload_f32(&rt, &rel_h)?;
+        let q_mult = upload_f32(&rt, &q_mult_h)?;
+        let omask = rt.alloc_buffer_from_u32(&omask_h.iter().map(|&m| u32::from(m)).collect::<Vec<_>>())?;
         let out = poisoned_f32(&rt, rows * hidden)?;
         let spec = AttentionSpec {
             heads: heads as u32,
@@ -287,13 +356,68 @@ fn run_audio_kernels(warmup: usize, iters: usize) -> Result<(), String> {
         rt.synchronize()?;
         let got = out.read_f32();
         check_lane_output(lane, &got[..rows * hidden])?;
-        // The output clamp bounds every element.
-        if let Some(i) = got[..rows * hidden]
-            .iter()
-            .position(|&x| x < spec.out.lo || x > spec.out.hi)
-        {
-            return Err(format!("{lane}: element {i} is {}, outside the output clamp", got[i]));
+        // Per (query, head): the window of `ctx` slots, the visible ones by
+        // `key_visible`, logit softcap(ac + bd), softmax, weighted clamped values.
+        let (q_mult64, k_scale) = (as_f64(&q_mult_h), f64::from(spec.k_scale));
+        let cap = f64::from(spec.cap);
+        let mut want = vec![0.0f64; rows * hidden];
+        for clip in &table.clips {
+            let clip_mask = &omask_h[clip.row0..clip.row0 + clip.rows];
+            for t in 0..clip.rows {
+                let (blk, i) = (t / chunk, t % chunk);
+                for h in 0..heads {
+                    let col0 = h * head_dim;
+                    let qs: Vec<f64> = (0..head_dim)
+                        .map(|d| clamp(f64::from(q_h[(clip.row0 + t) * hidden + col0 + d]), spec.q) * q_mult64[d])
+                        .collect();
+                    let slot = |j: usize| (blk * chunk + j) as i64 - past as i64;
+                    let mut logits = Vec::new();
+                    for j in 0..ctx {
+                        let kp = slot(j);
+                        if !key_visible(t, kp, past, clip.rows, clip_mask) {
+                            continue;
+                        }
+                        let kp = kp as usize;
+                        let mut s: f64 = (0..head_dim)
+                            .map(|d| {
+                                let kv = clamp(f64::from(k_h[(clip.row0 + kp) * hidden + col0 + d]), spec.k);
+                                qs[d] * kv * k_scale
+                            })
+                            .sum();
+                        // `rel[j - i]`, the relative-position term, when the table has the row.
+                        if j >= i && j - i < rel_rows {
+                            s += (0..head_dim)
+                                .map(|d| qs[d] * f64::from(rel_h[(j - i) * hidden + col0 + d]))
+                                .sum::<f64>();
+                        }
+                        logits.push((kp, (s / cap).tanh() * cap));
+                    }
+                    let mut acc = vec![0.0f64; head_dim];
+                    let value =
+                        |kp: usize, d: usize| clamp(f64::from(v_h[(clip.row0 + kp) * hidden + col0 + d]), spec.v);
+                    if logits.is_empty() {
+                        // Nothing visible: the uniform weight over the window slots inside the clip.
+                        for kp in (0..ctx).map(slot).filter(|&kp| kp >= 0 && (kp as usize) < clip.rows) {
+                            for (d, a) in acc.iter_mut().enumerate() {
+                                *a += value(kp as usize, d) / ctx as f64;
+                            }
+                        }
+                    } else {
+                        let m = logits.iter().map(|&(_, s)| s).fold(f64::NEG_INFINITY, f64::max);
+                        let den: f64 = logits.iter().map(|&(_, s)| (s - m).exp()).sum();
+                        for &(kp, s) in &logits {
+                            for (d, a) in acc.iter_mut().enumerate() {
+                                *a += (s - m).exp() / den * value(kp, d);
+                            }
+                        }
+                    }
+                    for (d, a) in acc.into_iter().enumerate() {
+                        want[(clip.row0 + t) * hidden + col0 + d] = clamp(a, spec.out);
+                    }
+                }
+            }
         }
+        check_against(lane, &got[..rows * hidden], &want, 1e-4, 1e-3)?;
         time_lane(&rt, lane, warmup, iters, dispatch)?;
     }
     Ok(())

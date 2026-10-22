@@ -283,6 +283,103 @@ fn readme_names_no_removed_icb_scaffold_or_flag() {
     );
 }
 
+/// The unsigned integer ending exactly at `end` (spaces before it skipped).
+fn number_before(text: &str, end: usize) -> Option<usize> {
+    let head = text[..end].trim_end_matches(' ');
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head[head.len() - digits..].parse().ok()
+}
+
+/// The unsigned integer starting exactly at `start`.
+fn number_at(text: &str, start: usize) -> Option<usize> {
+    let tail = &text[start..];
+    let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    tail[..digits].parse().ok()
+}
+
+/// Every place the README quotes the build's kernel source and entry-point
+/// counts, as `(where, sources, entries)`: the Neural-Network Kernel Library
+/// bullet (`N Metal source files providing M kernel entry points`) and the
+/// architecture diagram node (`N Kernel Sources (M Entry Points)`). The two were
+/// hand-written and drifted apart (39/303 against 35/256); the original check
+/// only looked for the bullet's wording, so the diagram was never compared.
+fn quoted_kernel_counts(text: &str) -> Vec<(&'static str, usize, usize)> {
+    let mut found = Vec::new();
+    let shapes: [(&'static str, &str, &str); 2] = [
+        ("text", " Metal source files providing ", " kernel entry points"),
+        ("diagram", " Kernel Sources (", " Entry Points)"),
+    ];
+    for (place, mid, tail) in shapes {
+        for (at, _) in text.match_indices(mid) {
+            let after = at + mid.len();
+            if let (Some(s), Some(e)) = (number_before(text, at), number_at(text, after)) {
+                if text[after + e.to_string().len()..].starts_with(tail) {
+                    found.push((place, s, e));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Messages for every quoted count that is not the build's, and for a README
+/// that no longer quotes both places (a check that found nothing is not a pass).
+fn readme_kernel_count_drift(file: &str, text: &str, sources: usize, entries: usize) -> Vec<String> {
+    let quoted = quoted_kernel_counts(text);
+    let mut out = Vec::new();
+    for place in ["text", "diagram"] {
+        if !quoted.iter().any(|(p, _, _)| *p == place) {
+            out.push(format!(
+                "{file} no longer quotes the kernel counts in its {place}; did the wording move?"
+            ));
+        }
+    }
+    for (place, s, e) in quoted {
+        if s != sources {
+            out.push(format!(
+                "{file} ({place}) quotes {s} kernel sources, but the build has {sources}"
+            ));
+        }
+        if e != entries {
+            out.push(format!(
+                "{file} ({place}) quotes {e} entry points, but the build has {entries}"
+            ));
+        }
+    }
+    out
+}
+
+/// The README check must fail on a wrong count in either place, naming the
+/// file, the quoted number and the real one.
+#[test]
+fn a_planted_wrong_kernel_count_fails_the_readme_check() {
+    let ok = "- 39 Metal source files providing 303 kernel entry points - x\n\
+              N[\"39 Kernel Sources (303 Entry Points)<br/>y\"]";
+    assert!(readme_kernel_count_drift("R.md", ok, 39, 303).is_empty());
+
+    // The shipped contradiction: diagram 35/256, text 39/303.
+    let drifted = ok.replace("39 Kernel Sources (303 Entry", "35 Kernel Sources (256 Entry");
+    let msgs = readme_kernel_count_drift("R.md", &drifted, 39, 303);
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert!(msgs.contains(&"R.md (diagram) quotes 35 kernel sources, but the build has 39".to_string()));
+    assert!(msgs.contains(&"R.md (diagram) quotes 256 entry points, but the build has 303".to_string()));
+
+    // A wrong count in the text alone is caught too.
+    let text_only = ok.replace(
+        "39 Metal source files providing 303",
+        "39 Metal source files providing 300",
+    );
+    let msgs = readme_kernel_count_drift("R.md", &text_only, 39, 303);
+    assert_eq!(
+        msgs,
+        vec!["R.md (text) quotes 300 entry points, but the build has 303".to_string()]
+    );
+
+    // Reworded away: fails rather than passing on nothing.
+    let msgs = readme_kernel_count_drift("R.md", "no counts here", 39, 303);
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+}
+
 /// The kernel counts the crate docs and README quote are the build's, not a
 /// snapshot: they said 21 sources and 83 entry points long after the Qwen3.5
 /// and cross-entropy kernels had joined the build.
@@ -315,12 +412,12 @@ fn the_kernel_counts_the_docs_quote_are_the_builds() {
     let readme = std::fs::read_to_string(crate_root().join("README.md")).expect("README");
     let lib_claim = format!("{sources} Metal sources compile to {entries} kernel entry points");
     let nn_claim = format!("through {nn_fns} shape-checked functions");
-    let readme_claim = format!("{sources} Metal source files providing {entries} kernel entry points");
     let readme_nn_claim = format!("through {nn_fns} shape-checked entry points in `tessl::nn`");
     let lib_flat = lib.replace("\n//! ", " ");
     assert!(lib_flat.contains(&lib_claim), "src/lib.rs should say `{lib_claim}`");
     assert!(lib_flat.contains(&nn_claim), "src/lib.rs should say `{nn_claim}`");
-    assert!(readme.contains(&readme_claim), "README.md should say `{readme_claim}`");
+    let drift = readme_kernel_count_drift("README.md", &readme, sources, entries);
+    assert!(drift.is_empty(), "{}", drift.join("\n"));
     assert!(
         readme.contains(&readme_nn_claim),
         "README.md should say `{readme_nn_claim}`"

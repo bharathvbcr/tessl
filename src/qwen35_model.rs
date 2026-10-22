@@ -728,6 +728,14 @@ impl Qwen35Model {
         all.into_iter().filter_map(Weight::q4).map(Q4Weight::nbytes).sum()
     }
 
+    /// The dtype of the dense embedding (bf16 or f32). A quantized model has no
+    /// dense embedding and answers f32: its callers are the training byte
+    /// bounds, which return `u64::MAX` for a quantized model before using it
+    /// (fail closed: no step "fits"), and the entry points that refuse it first.
+    pub(crate) fn table_dtype(&self) -> DType {
+        self.embed.dense().map_or(DType::F32, |t| t.dtype)
+    }
+
     /// Whether the weights are MLX 4-bit (no dense tensors to train or write).
     pub fn is_mlx_q4(&self) -> bool {
         self.embed.q4().is_some()
@@ -1090,6 +1098,7 @@ impl Qwen35Model {
             let mixer = match kind {
                 LayerKind::LinearAttention => {
                     let conv_w = tensor(&[(g.conv_dim() * cfg.conv_kernel) as usize], Precision::F32)?
+                        .dense()?
                         .buffer
                         .clone();
                     Mixer::Gdn(GdnWeights {

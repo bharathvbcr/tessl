@@ -45,7 +45,6 @@
 //! is dense, a wrong dtype or shape.
 
 use std::fmt;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::config_json;
@@ -545,10 +544,11 @@ impl Q4Weight {
 
 /// One weight of the model: dense in the forward's precision, or MLX 4-bit.
 ///
-/// Dense is what every training path reads, and `Deref` hands them its
-/// tensor unchanged. A quantized weight has no dense tensor: dereferencing one
-/// panics, and every training, parameter and optimizer entry point refuses a
-/// quantized model first ([`crate::qwen35_model::Qwen35Model::require_dense`]).
+/// Training, the parameter table and the optimizer read dense tensors only.
+/// They reach them through [`Weight::dense`], which returns a typed error for a
+/// quantized weight, so a path that forgets the up-front
+/// [`crate::qwen35_model::Qwen35Model::require_dense`] refusal still fails with
+/// a message, never a crash.
 pub(crate) enum Weight {
     Dense(Tensor),
     Q4(Q4Weight),
@@ -561,20 +561,16 @@ impl Weight {
             Self::Dense(_) => None,
         }
     }
-}
 
-impl Deref for Weight {
-    type Target = Tensor;
-
-    #[track_caller]
-    fn deref(&self) -> &Tensor {
+    /// The dense tensor, or an error for a quantized weight.
+    pub(crate) fn dense(&self) -> Result<&Tensor, String> {
         match self {
-            Self::Dense(t) => t,
-            Self::Q4(q) => panic!(
+            Self::Dense(t) => Ok(t),
+            Self::Q4(q) => Err(format!(
                 "a [{}, {}] MLX 4-bit weight has no dense tensor: training, parameter and optimizer paths run on \
-                 dense models only (Qwen35Model::require_dense refuses a quantized one before they get here)",
+                 dense models only",
                 q.rows, q.cols
-            ),
+            )),
         }
     }
 }

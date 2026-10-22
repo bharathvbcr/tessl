@@ -642,26 +642,45 @@ fn ref_ids(dir: &Path) -> Vec<u32> {
 /// mlx-lm's own logits on the same files: the default prompt (155 tokens) and
 /// the natural-text prompt (512), `tools/qwen35_ref/make_mlx_q4.py`'s `ref/`.
 ///
+/// # The reference is mlx-lm run in FLOAT32 (owner decision, on this evidence)
+///
+/// The gate compares tessl with `logits_mlx_f32.npy`: mlx-lm on the same 4-bit
+/// weights with every floating parameter cast to float32 (written by
+/// `make_mlx_q4.py`, rewritten without reconverting by `--refs-only`). It first
+/// compared with mlx-lm's bfloat16 logits, and the default prompt missed the
+/// top-1 bound by one (6 misses against 5). The attribution run
+/// (`mlx_q4_2b_attribution_against_mlx_lm_float32`, job 18) against the float32
+/// reference settled whose rounding that was:
+///
+/// | | tessl Q4 | mlx-lm bf16 |
+/// |---|---|---|
+/// | default, 155: top-1 misses / max rel / mean KL | 0 / 3.2e-3 / 3.7e-5 | 6 / 1.28e-2 / 7.8e-4 |
+/// | text, 512: top-1 misses / max rel / mean KL | 3 / 3.8e-3 / 3.0e-5 | 10 / 1.15e-2 / 4.6e-4 |
+///
+/// tessl is closer to the exact computation on these weights than mlx-lm's own
+/// bf16 forward is, on every figure and both prompts, so the misses against
+/// mlx-lm bf16 are its activation rounding. The bounds below are the ones
+/// written before the first run, UNCHANGED; only the reference moved. The
+/// comparison with mlx-lm bf16 is still printed, as context, and not gated.
+///
 /// # Bounds, fixed before the first run
 ///
 /// Both sides compute from the identical 4-bit weights, so the quantization
-/// error cancels; what is left is each side's activation precision. mlx-lm runs
-/// bf16 end to end (residual stream included); tessl keeps the residual stream
-/// and every accumulation in f32 and rounds only each GEMM's input to bf16.
-/// `docs/qwen35.md` measures tessl's bf16 forward 18x closer to fp32 than
-/// transformers' own bf16 forward, so tessl here is the near-exact side and the
-/// distance to mlx-lm is mostly mlx-lm's bf16 noise: the transformers
-/// bf16-vs-fp32 floor, 1e-2 of the largest logit, 152/155 top-1 (3 misses) and
-/// mean KL 5.7e-4 on the default prompt (3.7e-4 and 5 misses of 512 on the
-/// text). The bounds are a small multiple of that floor; a mis-read weight,
-/// scale, bias, norm or conv layout puts the logits far outside them (the
-/// synthetic test above shows O(1) errors for those).
+/// error cancels; what is left is each side's activation precision. tessl keeps
+/// the residual stream and every accumulation in f32 and rounds only each
+/// GEMM's input to bf16. `docs/qwen35.md` measures tessl's bf16 forward 18x
+/// closer to fp32 than transformers' own bf16 forward. The bounds were set as a
+/// small multiple of the transformers bf16-vs-fp32 floor: 1e-2 of the largest
+/// logit, 152/155 top-1 (3 misses) and mean KL 5.7e-4 on the default prompt
+/// (3.7e-4 and 5 misses of 512 on the text). A mis-read weight, scale, bias,
+/// norm or conv layout puts the logits far outside them (the synthetic test
+/// above shows O(1) errors for those).
 ///
 /// * every logit finite on both sides;
 /// * max |dlogit| / max |logit| <= 5e-2 (5x the floor's 1e-2);
 /// * top-1 misses <= ceil(0.03 * T): 5 of 155, 16 of 512 (the floor's 3 and 5,
 ///   plus the a margin for a second noisy side);
-/// * mean per-position KL(mlx-lm || tessl) <= 2e-3 (3.5x the floor's 5.7e-4).
+/// * mean per-position KL(mlx-lm float32 || tessl) <= 2e-3 (3.5x the floor's 5.7e-4).
 ///
 /// Also asserted: the host peak footprint after the load stays under 3 GiB
 /// (the bf16 2B load peaked at 5.86 GB; with no dense intermediate the 4-bit
@@ -717,15 +736,38 @@ fn mlx_q4_2b_matches_mlx_lm_logits() {
         for name in ["default", "text"] {
             let dir = q4_dir().join("ref").join(name);
             let ids = ref_ids(&dir);
-            let (shape, want) = load_ref_in(&dir, "logits_mlx");
+            let f32_path = dir.join("logits_mlx_f32.npy");
+            assert!(
+                f32_path.exists(),
+                "{}: missing. The gate compares with mlx-lm in float32; write it with \
+                 `python tools/qwen35_ref/make_mlx_q4.py --refs-only` (keeps the converted checkpoint)",
+                f32_path.display()
+            );
+            let (shape, want) = load_ref_in(&dir, "logits_mlx_f32");
             assert_eq!(
                 shape,
                 vec![ids.len(), vocab],
                 "{name}: reference logits are [positions, vocab]"
             );
             let got = model.forward(&ids, false).unwrap().logits;
+            // Context, not gated: the same forward against mlx-lm's bfloat16 logits.
+            let (shape_bf16, bf16) = load_ref_in(&dir, "logits_mlx");
+            assert_eq!(shape_bf16, shape, "{name}: bf16 reference shape");
+            eprintln!(
+                "{}",
+                logit_dev(&got, &bf16, vocab).row(&format!(
+                    "Q4 vs mlx-lm bf16 ({name}, {} positions; context, not gated)",
+                    ids.len()
+                ))
+            );
             let d: LogitDev = logit_dev(&got, &want, vocab);
-            eprintln!("{}", d.row(&format!("Q4 vs mlx-lm ({name}, {} positions)", ids.len())));
+            eprintln!(
+                "{}",
+                d.row(&format!(
+                    "Q4 vs mlx-lm float32 ({name}, {} positions; gated)",
+                    ids.len()
+                ))
+            );
             let max_misses = (MISS_FRACTION * ids.len() as f64).ceil() as usize;
             if !d.is_finite() {
                 failures.push(format!(

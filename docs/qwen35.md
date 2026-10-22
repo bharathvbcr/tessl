@@ -806,21 +806,35 @@ Verification, bounds written before any run:
 | `mlx_q4_tiny_checkpoint_matches_its_dequantized_f32_model` | a synthetic checkpoint in the converter's layout vs the same weights dequantized into an F32 model, at 1, 5 and 70 rows | 3e-2 of the largest logit (bf16 activation rounding only; a wrong nibble, scale, window or norm convention is O(1)) |
 | `mlx_q4_tiny_prefill_then_decode_matches_forward_at_the_last_row` | prefill 1, 5, 8, 9, 70 then 3 decoded steps vs forward's last row | 2e-2 (the tiny Bf16 model's) |
 | `mlx_q4_load_refusals`, `mlx_q4_model_refuses_what_needs_dense_weights` | the refusals above at load, on the device | exact |
-| `mlx_q4_2b_matches_mlx_lm_logits` (ignored) | the real 2B, tessl vs mlx-lm on the same 4-bit files, default prompt (155) and text prompt (512) | max logit deviation <= 5e-2 of the largest logit; top-1 misses <= ceil(0.03 T); mean KL <= 2e-3; host peak footprint <= 3 GiB |
+| `mlx_q4_2b_matches_mlx_lm_logits` (ignored) | the real 2B, tessl vs mlx-lm **float32** (`logits_mlx_f32.npy`) on the same 4-bit files, default prompt (155) and text prompt (512); the bf16 comparison is printed as context | max logit deviation <= 5e-2 of the largest logit; top-1 misses <= ceil(0.03 T); mean KL <= 2e-3; host peak footprint <= 3 GiB |
 | `mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row` (ignored) | the real 2B's decode smoke test | 2e-2, same greedy token unless the forward's top two are within it |
 
 Why those bounds: both sides use the identical 4-bit weights, so the quantization error
-cancels and what is left is activation precision. mlx-lm is bf16 throughout; tessl keeps the
-residual stream and accumulations in f32 and was measured 18x closer to fp32 than
-transformers' own bf16 forward (above), so the distance to mlx-lm is mostly mlx-lm's noise,
-which the transformers bf16-vs-fp32 floor stands for: 1e-2 of the largest logit, 3 top-1 misses
-of 155 (5 of 512), mean KL 5.7e-4 (3.7e-4). The bounds are 5x, about 1.7x, and 3.5x that
-floor. They are not measured results; no real-2B run has happened yet.
+cancels and what is left is activation precision. They were written before the first run as a
+small multiple of the transformers bf16-vs-fp32 floor: 1e-2 of the largest logit, 3 top-1
+misses of 155 (5 of 512), mean KL 5.7e-4 (3.7e-4), i.e. 5x, about 1.7x and 3.5x.
+
+**The reference is mlx-lm in float32 (owner decision).** The first run compared with mlx-lm's
+bf16 logits and the default prompt missed the top-1 bound by one (6 misses against 5; max
+1.205e-2, mean KL 8.3e-4; the text prompt passed with 9 of 16). The attribution run
+(`mlx_q4_2b_attribution_against_mlx_lm_float32`), against mlx-lm run in float32 on the same
+4-bit weights (every floating parameter cast to float32, dtype checked when the file is
+written), measured, per prompt:
+
+| | tessl Q4 | mlx-lm bf16 |
+|---|---|---|
+| default, 155: top-1 misses / max rel / mean KL | 0 / 3.2e-3 / 3.7e-5 | 6 / 1.28e-2 / 7.8e-4 |
+| text, 512: top-1 misses / max rel / mean KL | 3 / 3.8e-3 / 3.0e-5 | 10 / 1.15e-2 / 4.6e-4 |
+
+tessl (bf16 GEMM inputs, f32 residual stream and accumulations) is closer to the exact
+computation than mlx-lm's bf16 forward is, on every figure, so the misses against mlx-lm bf16
+were its activation rounding. AC3 therefore gates against the float32 reference with the same
+bounds, unchanged, and the bf16 comparison stays printed as context.
 
 Commands (the lead runs them; the conversion needs the mlx-lm venv, offline, ~5 GB of RAM):
 
 ```sh
-/Users/bharath/.venvs/ml-2026-10/bin/python tools/qwen35_ref/make_mlx_q4.py    # target/qwen35_2b_mlx_q4/ and its ref/
+/Users/bharath/.venvs/ml-2026-10/bin/python tools/qwen35_ref/make_mlx_q4.py    # target/qwen35_2b_mlx_q4/ and its ref/ (bf16 and float32 logits)
 cargo test --release --test qwen35_mlx_q4_layout --test qwen35_config           # host only
 cargo test --release --test qwen35_mlx_q4 -- --test-threads=1                   # the synthetic checks, on the device
 cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_matches_mlx_lm_logits --nocapture   # the real 2B, alone in its process (the footprint is a lifetime peak)

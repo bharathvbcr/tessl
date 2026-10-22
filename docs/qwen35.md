@@ -593,6 +593,22 @@ QWEN35_2B_SAFETENSORS=.../model.safetensors-00001-of-00001.safetensors \
   cargo test --release --test qwen35_model -- --ignored --test-threads=1
 ```
 
+The shared logit-deviation harness is `tests/common/logit_dev.rs`
+(`logit_dev(got, want, vocab)`: max and mean |Δ|, absolute and against the
+reference's largest logit, top-1 agreement, mean and max KL; NaN or inf on
+either side makes every figure infinite instead of passing). Its report is the
+ignored `logit_deviation_report`, which prints for each precision variant one
+forward against tessl's F32 logits and against transformers' fp32, plus the
+transformers bf16-vs-fp32 noise floor, and asserts only the F32 row (1e-3, no
+top-1 miss). `QWEN35_REF_TEXT_DIR` adds the 512-token text prompt (its
+reference made as the `--ids` form in the test's header); unset, it prints
+`NOT RUN`:
+
+```sh
+QWEN35_2B_SAFETENSORS=... QWEN35_REF_TEXT_DIR=target/qwen35_ref_text \
+  cargo test --release --test qwen35_model logit_deviation_report -- --ignored --nocapture --test-threads=1
+```
+
 Loading holds little beyond the device weights. Each projection part is
 placed into its packed GEMM operand as it is read and then dropped, and the
 embedding goes straight into its device tensor, except for the one host copy

@@ -446,5 +446,250 @@ class Qwen35GdnPatchLane(unittest.TestCase):
         self.assertEqual((cfg.hidden_size, cfg.linear_num_value_heads, cfg.linear_value_head_dim), (2048, 16, 128))
 
 
+import prefill_lane as pl  # noqa: E402
+import qwen35_prefill_mlx as mlx_prefill  # noqa: E402
+import qwen35_prefill_torch as torch_prefill  # noqa: E402
+
+REPO = os.path.dirname(HERE)
+
+
+def read_text(path):
+    with open(path) as f:
+        return f.read()
+
+
+def tiny_ids(n=300, vocab=1000, answers=(3, 4, 5), lengths=(100, 200)):
+    ids = [(i * 7919 + 13) % vocab for i in range(n)]
+    return {"schema": pl.SCHEMA, "vocab": vocab, "ids": ids, "answers": list(answers),
+            "digests": {str(t): pl.fnv1a32(ids[:t]) for t in lengths}}
+
+
+def write_json(d, doc, name="ids.json"):
+    path = os.path.join(d, name)
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    return path
+
+
+class PrefillIdsContract(unittest.TestCase):
+    """One ids file, read by tessl, torch and MLX alike; a mismatch is an error, not a shorter run."""
+
+    def test_the_committed_file_verifies_at_every_head_to_head_length(self):
+        doc = pl.load_ids(pl.DEFAULT_IDS)
+        self.assertEqual((doc["vocab"], len(doc["answers"]), len(doc["ids"])), (248320, 17, 8192))
+        for t in pl.LENGTHS:
+            self.assertEqual(len(pl.prefix(doc, t)), t)
+
+    def test_both_python_lanes_default_to_the_committed_file(self):
+        for mod in (torch_prefill, mlx_prefill):
+            args = mod.build_parser().parse_args([])
+            self.assertEqual(os.path.realpath(args.ids), os.path.realpath(
+                os.path.join(REPO, "tests", "fixtures", "qwen35_prefill_ids.json")))
+            self.assertEqual(args.lengths, [200, 1024, 2048, 8192])
+
+    def test_fnv_vectors_match_the_rust_reader(self):
+        vectors = {(): 2166136261, (1, 2, 3): 2034659765, (248319,): 3941604598}
+        for ids, want in vectors.items():
+            self.assertEqual(pl.fnv1a32(list(ids)), want)
+        src = read_text(os.path.join(REPO, "src", "bin", "common", "prefill_ids.rs"))
+        for want in vectors.values():
+            self.assertIn(f"{want:_}", src)
+
+    def test_a_file_shorter_than_the_length_is_refused(self):
+        doc = tiny_ids(n=150, lengths=(100,))
+        doc["digests"]["200"] = 0
+        with self.assertRaises(SystemExit) as cm:
+            pl.prefix(doc, 200)
+        self.assertIn("150 ids", str(cm.exception))
+
+    def test_a_length_without_a_digest_or_with_a_wrong_one_is_refused(self):
+        doc = tiny_ids()
+        with self.assertRaises(SystemExit) as cm:
+            pl.prefix(doc, 150)
+        self.assertIn("no digest", str(cm.exception))
+        doc["digests"]["100"] ^= 1
+        with self.assertRaises(SystemExit) as cm:
+            pl.prefix(doc, 100)
+        self.assertIn("digest", str(cm.exception))
+
+    def test_a_token_outside_the_vocabulary_or_a_wrong_schema_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            doc = tiny_ids()
+            doc["ids"][5] = 1000
+            with self.assertRaises(SystemExit):
+                pl.load_ids(write_json(d, doc))
+            doc = tiny_ids()
+            doc["schema"] = "other"
+            with self.assertRaises(SystemExit):
+                pl.load_ids(write_json(d, doc))
+            doc = tiny_ids()
+            doc["answers"] = []
+            with self.assertRaises(SystemExit):
+                pl.load_ids(write_json(d, doc))
+
+    def test_prepare_returns_the_same_prefix_for_every_lane(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = write_json(d, tiny_ids())
+            outs = []
+            for mod in (torch_prefill, mlx_prefill):
+                args = mod.build_parser().parse_args(["--ids", path, "--lengths", "100,200"])
+                _, ids, digests = pl.prepare(args)
+                outs.append((ids, digests))
+            self.assertEqual(outs[0], outs[1])
+            self.assertEqual(outs[0][0][100], tiny_ids()["ids"][:100])
+
+    def test_the_rust_lane_reads_the_same_file_and_flags(self):
+        src = read_text(os.path.join(REPO, "src", "bin", "bench_qwen35_layers.rs"))
+        for needle in ('"--prefill-score"', 'strip_prefix("--ids=")', "prefill_ids::PrefillIds::load",
+                       "file.prefix(t)", "s.tokens() as usize != t", "prefill_score_t{t}_median"):
+            self.assertIn(needle, src)
+
+
+class PrefillArgs(unittest.TestCase):
+    def test_defaults_and_overrides(self):
+        args = torch_prefill.build_parser().parse_args([])
+        self.assertEqual((args.dtype, args.device, args.attn), ("bf16", "gpu", None))
+        args = torch_prefill.build_parser().parse_args(
+            ["--lengths", "8,16", "--iters", "5", "--warmup", "1", "--dtype", "f32", "--device", "cpu"])
+        self.assertEqual((args.lengths, args.iters, args.warmup, args.dtype, args.device),
+                         ([8, 16], 5, 1, "f32", "cpu"))
+
+    def test_bad_lengths_are_refused(self):
+        for bad in ("0,5", "5,5", "a,b", "-3", ""):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                mlx_prefill.build_parser().parse_args(["--lengths", bad])
+
+    def test_iteration_env_and_flags(self):
+        ns = type("A", (), {"iters": None, "warmup": None})()
+        old = {k: os.environ.pop(k, None) for k in ("BENCH_ITERS", "BENCH_WARMUP")}
+        try:
+            self.assertEqual(pl.resolve_counts(ns), (9, 3))
+            os.environ["BENCH_ITERS"], os.environ["BENCH_WARMUP"] = "5", "0"
+            self.assertEqual(pl.resolve_counts(ns), (5, 0))
+            for bad in ("0", "05", "-1", "x", ""):
+                os.environ["BENCH_ITERS"] = bad
+                with self.assertRaises(SystemExit):
+                    pl.resolve_counts(ns)
+            ns.iters, ns.warmup = 4, 2
+            os.environ["BENCH_ITERS"] = "7"
+            self.assertEqual(pl.resolve_counts(ns), (4, 2))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+
+class PrefillOutput(unittest.TestCase):
+    """The lane's stdout must be what `bench_paired --format workloads` parses."""
+
+    def lane_output(self, lengths=(100, 200), iters=4, warmup=2, ran=None, lp=None):
+        ids = {t: list(range(t)) for t in lengths}
+        digests = {t: pl.fnv1a32(ids[t]) for t in lengths}
+        order, clock = [], iter(range(1, 10_000))
+
+        def one(t):
+            order.append(t)
+            return float(next(clock)), [-1.0, -2.0, -3.0] if lp is None else lp, t if ran is None else ran
+
+        samples = pl.run_rounds(list(lengths), iters, warmup, one)
+        return order, pl.format_rows("fake", list(lengths), samples, iters, 3, digests)
+
+    def test_lengths_alternate_and_reverse_every_other_round(self):
+        order, _ = self.lane_output(lengths=(100, 200, 300), iters=2, warmup=1)
+        self.assertEqual(order, [100, 200, 300, 300, 200, 100, 100, 200, 300])
+
+    def test_rows_follow_the_workloads_grammar(self):
+        _, rows = self.lane_output()
+        line = json.loads(json.dumps(rows))  # what the last stdout line carries
+        names = [r["workload"] for r in line]
+        self.assertEqual(names, ["prefill_score_t100", "prefill_score_t100_median",
+                                 "prefill_score_t200", "prefill_score_t200_median"])
+        self.assertEqual(len(set(names)), len(names))
+        for r in line:
+            self.assertIsInstance(r["workload"], str)
+            self.assertGreater(r["ms_min"], 0)
+            self.assertEqual(r["iters"], 4)
+            self.assertIn(r["tokens"], (100, 200))
+            self.assertEqual(r["answers"], 3)
+            self.assertEqual(r["ids_fnv1a32"], pl.fnv1a32(list(range(r["tokens"]))))
+
+    def test_min_and_median_are_per_lane_statistics_of_the_timed_rounds_only(self):
+        # 100 and 200 alternate; warmup rounds take clock ticks 1..4 and are dropped.
+        _, rows = self.lane_output(iters=4, warmup=2)
+        by = {r["workload"]: r for r in rows}
+        # Even rounds put 100 first (ticks 5, 9), odd rounds put it second (ticks 8, 12).
+        self.assertEqual(by["prefill_score_t100"]["ms_min"], 5)
+        self.assertEqual(by["prefill_score_t100_median"]["ms_min"], (8 + 9) / 2)
+        self.assertEqual(by["prefill_score_t100"]["ms_median"], (8 + 9) / 2)
+
+    def test_a_forward_at_the_wrong_length_aborts_the_lane(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.lane_output(ran=99)
+        self.assertIn("ran on 99 tokens", str(cm.exception))
+
+    def test_non_finite_or_all_zero_scores_abort_the_lane(self):
+        for bad in ([float("nan"), -1.0], [0.0, 0.0], []):
+            with self.assertRaises(SystemExit):
+                self.lane_output(lp=bad)
+
+    def test_equal_sample_counts_are_enforced(self):
+        with self.assertRaises(SystemExit):
+            pl.format_rows("x", [100], {100: [1.0, 2.0]}, 3, 3, {100: 1})
+
+    def test_emit_prints_one_json_array_as_the_last_line(self):
+        _, rows = self.lane_output()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print("log line")
+            pl.emit(rows)
+        last = [l for l in out.getvalue().splitlines() if l.strip()][-1]
+        self.assertEqual(json.loads(last), rows)
+
+
+class PrefillDocstringCommands(unittest.TestCase):
+    """The commands the report quotes must parse under the real parsers."""
+
+    def lane_lines(self):
+        lines = [l.strip().rstrip("\\").strip().strip('"') for l in pl.__doc__.splitlines()
+                 if l.strip().startswith(('"tessl:', '"torch:', '"mlx:'))]
+        self.assertEqual(len(lines), 3)
+        return lines
+
+    def test_bench_paired_command_is_an_evidence_run_with_even_rounds(self):
+        doc = pl.__doc__
+        self.assertIn("target/release/bench_paired --evidence --rounds 6", doc)
+        rounds = int(doc.split("--rounds ")[1].split()[0])
+        self.assertTrue(rounds >= 4 and rounds % 2 == 0)
+        self.assertIn("--out bench/results/", doc)
+        self.assertIn("torch 2.15: NOT RUN", doc)
+
+    def test_lane_lines_use_the_bench_paired_grammar_and_the_lane_parsers(self):
+        import re
+        import shlex
+        sub = {"$SNAP": "/snap", "$IDS": "ids.json", "$PY": "python"}
+        parsers = {"torch": torch_prefill.build_parser(), "mlx": mlx_prefill.build_parser()}
+        names = []
+        for line in self.lane_lines():
+            m = re.fullmatch(r"(\w+):(BENCH_ITERS=9,BENCH_WARMUP=3)=(.+)", line)
+            self.assertIsNotNone(m, line)
+            name, _, cmd = m.groups()
+            for k, v in sub.items():
+                cmd = cmd.replace(k, v)
+            argv = shlex.split(cmd)
+            names.append(name)
+            if name == "tessl":
+                self.assertEqual(argv[0], "target/release/bench_qwen35_layers")
+                self.assertIn("--prefill-score", argv)
+                self.assertIn("--weights=/snap", argv)
+                self.assertIn("--ids=ids.json", argv)
+                self.assertEqual([a for a in argv if a.isdigit()], ["200", "1024", "2048", "8192"])
+            else:
+                self.assertTrue(argv[1].endswith(f"qwen35_prefill_{name}.py"))
+                args = parsers[name].parse_args(argv[2:])
+                self.assertEqual((args.snapshot, args.ids, args.lengths), ("/snap", "ids.json", [200, 1024, 2048, 8192]))
+        self.assertEqual(names, ["tessl", "torch", "mlx"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4105,6 +4105,45 @@ mod tests {
         (dir, rt, model, ids)
     }
 
+    /// The model's f32 buffer, tessl's gradient buffer and the element count
+    /// for a parameter the 2B finite-difference diagnostics know: a conv1d,
+    /// GDN gated-norm, `input_layernorm`, `post_attention_layernorm` or
+    /// `model.norm.weight` name. Panics on any other.
+    fn fd_param<'a>(model: &'a Qwen35Model, step: &'a TrainStep, name: &str) -> (&'a GpuBuffer, &'a GpuBuffer, usize) {
+        let layer = || -> usize {
+            name.strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{name}: no layer index"))
+        };
+        let hidden = model.cfg.hidden as usize;
+        let gdn = |l: usize| match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
+            (Mixer::Gdn(w), MixerGrads::Gdn(g)) => (w, g),
+            _ => panic!("{name}: layer {l} is not a GDN layer"),
+        };
+        if name.ends_with("conv1d.weight") {
+            let (w, g) = gdn(layer());
+            (
+                &w.conv_w,
+                &g.conv_w,
+                (model.cfg.gdn.conv_dim() * model.cfg.conv_kernel) as usize,
+            )
+        } else if name.ends_with("linear_attn.norm.weight") {
+            let (w, g) = gdn(layer());
+            (&w.norm_w, &g.norm_w, 128)
+        } else if name.ends_with(".input_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].input_norm, &step.grads.layers[l].input_norm, hidden)
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            let l = layer();
+            (&model.layers[l].post_norm, &step.grads.layers[l].post_norm, hidden)
+        } else if name == "model.norm.weight" {
+            (&model.final_norm, &step.grads.final_norm, hidden)
+        } else {
+            panic!("{name}: not a parameter this diagnostic knows")
+        }
+    }
+
     /// Diagnostic for ft-1d2ab5b004a2f7bebbd1bf03896428ff: the central
     /// difference's convergence for one parameter of the 2B model along the
     /// same `v = (g_tessl - g_torch) / |d|` as the bound test. The parameter
@@ -4119,34 +4158,7 @@ mod tests {
         let (dir, _rt, model, ids) = real_2b_setup();
         let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
         let base = loss(&model, &ids);
-        let layer = || -> usize {
-            name.strip_prefix("model.layers.")
-                .and_then(|r| r.split('.').next())
-                .and_then(|n| n.parse().ok())
-                .unwrap_or_else(|| panic!("{name}: no layer index"))
-        };
-        let hidden = model.cfg.hidden as usize;
-        let (param, grad, n): (&GpuBuffer, &GpuBuffer, usize) = if name.ends_with("conv1d.weight") {
-            let l = layer();
-            match (&model.layers[l].mixer, &step.grads.layers[l].mixer) {
-                (Mixer::Gdn(w), MixerGrads::Gdn(g)) => (
-                    &w.conv_w,
-                    &g.conv_w,
-                    (model.cfg.gdn.conv_dim() * model.cfg.conv_kernel) as usize,
-                ),
-                _ => panic!("{name}: layer {l} is not a GDN layer"),
-            }
-        } else if name.ends_with(".input_layernorm.weight") {
-            let l = layer();
-            (&model.layers[l].input_norm, &step.grads.layers[l].input_norm, hidden)
-        } else if name.ends_with(".post_attention_layernorm.weight") {
-            let l = layer();
-            (&model.layers[l].post_norm, &step.grads.layers[l].post_norm, hidden)
-        } else if name == "model.norm.weight" {
-            (&model.final_norm, &step.grads.final_norm, hidden)
-        } else {
-            panic!("{name}: not a parameter this diagnostic knows")
-        };
+        let (param, grad, n) = fd_param(&model, &step, &name);
         let g_torch = npy(&dir.join(format!("grad.{name}.npy")));
         let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
         let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
@@ -4242,6 +4254,142 @@ mod tests {
                 "{name}: the parameter was not restored"
             );
         }
+    }
+
+    /// Decorrelation probe for ft-1d2ab5b004a2f7bebbd1bf03896428ff. The
+    /// central difference along `v` has a deterministic roughness (~3e-7 in
+    /// the loss, rounding flips across the f32 layers). Averaging K central
+    /// differences, each taken about a shifted base `x0 + delta_k v` with the
+    /// same `h`, removes it only if the roughness decorrelates between nearby
+    /// points. For `TESSL_FD_PARAM` (default `model.norm.weight`) at the bound
+    /// test's finest `h` for that class and at 2x and 4x it, this prints the
+    /// K shifted differences, their mean, std, std/sqrt(K), the lag-1
+    /// autocorrelation (in run order and in `delta` order), a disjoint-halves
+    /// check and the mean's distance from the unshifted difference. The
+    /// unshifted difference is also taken K times and must be bit-identical
+    /// (the run itself is deterministic). The `delta` grid is 12 magnitudes in
+    /// [h/64, h/4], each used with both signs, so the linear (`f''`) shift
+    /// bias cancels and the `h^2` term remains.
+    #[test]
+    #[ignore = "diagnostic: FD noise decorrelation probe"]
+    fn real_2b_fd_noise_decorrelation_probe() {
+        const K: usize = 24;
+        let name = std::env::var("TESSL_FD_PARAM").unwrap_or_else(|_| "model.norm.weight".into());
+        let (dir, _rt, model, ids) = real_2b_setup();
+        let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
+        let base = loss(&model, &ids);
+        let (param, grad, n) = fd_param(&model, &step, &name);
+        let g_torch = npy(&dir.join(format!("grad.{name}.npy")));
+        let g_tessl: Vec<f64> = grad.read_f32()[..n].iter().map(|&x| f64::from(x)).collect();
+        let d: Vec<f64> = g_tessl.iter().zip(&g_torch).map(|(a, b)| a - b).collect();
+        let dn = d.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let v: Vec<f64> = d.iter().map(|x| x / dn).collect();
+        let orig = param.read_f32()[..n].to_vec();
+        // The bound test's finest step for this parameter class.
+        let h0 = if name.ends_with("layernorm.weight")
+            || name == "model.norm.weight"
+            || name.ends_with("linear_attn.norm.weight")
+        {
+            0.0125
+        } else {
+            3.125e-4
+        };
+        let write = |s: f64| {
+            let p: Vec<f32> = orig
+                .iter()
+                .zip(&v)
+                .map(|(&x, &u)| (f64::from(x) + s * u) as f32)
+                .collect();
+            let mut all = param.read_f32();
+            all[..n].copy_from_slice(&p);
+            param.write_f32(&all);
+        };
+        let mut forwards = 0usize;
+        let mut fd_at = |delta: f64, h: f64| -> f64 {
+            write(delta + h);
+            let up = loss(&model, &ids);
+            write(delta - h);
+            let down = loss(&model, &ids);
+            forwards += 2;
+            (up - down) / (2.0 * h)
+        };
+        let mean = |x: &[f64]| x.iter().sum::<f64>() / x.len() as f64;
+        let std = |x: &[f64]| {
+            let m = mean(x);
+            (x.iter().map(|a| (a - m).powi(2)).sum::<f64>() / (x.len() - 1) as f64).sqrt()
+        };
+        let lag1 = |x: &[f64]| {
+            let m = mean(x);
+            let num: f64 = x.windows(2).map(|w| (w[0] - m) * (w[1] - m)).sum();
+            num / x.iter().map(|a| (a - m).powi(2)).sum::<f64>()
+        };
+        let t0 = std::time::Instant::now();
+        eprintln!(
+            "{name}: n {n}, |d| {dn:.3e}, 0.3|d| {:.3e}, base loss {base:.9e}, K {K}",
+            0.3 * dn
+        );
+        for mult in [1.0, 2.0, 4.0] {
+            let h = h0 * mult;
+            let unshifted: Vec<f64> = (0..K).map(|_| fd_at(0.0, h)).collect();
+            assert!(
+                unshifted.iter().all(|x| x.to_bits() == unshifted[0].to_bits()),
+                "{name}: h {h}: the unshifted difference is not deterministic: {unshifted:?}"
+            );
+            let fd0 = unshifted[0];
+            // 12 magnitudes in [h/64, h/4], each with both signs, run order
+            // alternating + and -.
+            let mags: Vec<f64> = (0..K / 2)
+                .map(|j| h / 64.0 + (h / 4.0 - h / 64.0) * j as f64 / (K / 2 - 1) as f64)
+                .collect();
+            let deltas: Vec<f64> = (0..K)
+                .map(|k| if k % 2 == 0 { mags[k / 2] } else { -mags[k / 2] })
+                .collect();
+            let fds: Vec<f64> = deltas.iter().map(|&dl| fd_at(dl, h)).collect();
+            let mut by_delta: Vec<(f64, f64)> = deltas.iter().copied().zip(fds.iter().copied()).collect();
+            by_delta.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let sorted: Vec<f64> = by_delta.iter().map(|p| p.1).collect();
+            let (m, sd) = (mean(&fds), std(&fds));
+            let se = sd / (K as f64).sqrt();
+            let (ra, rb) = (lag1(&fds), lag1(&sorted));
+            // Disjoint halves by magnitude-index parity (each holds both signs).
+            let half = |par: usize| -> Vec<f64> { (0..K).filter(|k| (k / 2) % 2 == par).map(|k| fds[k]).collect() };
+            let (ma, mb) = (mean(&half(0)), mean(&half(1)));
+            eprintln!(
+                "-- h {h:.5e} (x{mult}), shifts |delta| in [{:.3e}, {:.3e}]",
+                h / 64.0,
+                h / 4.0
+            );
+            eprintln!("unshifted fd (x{K}, bit-identical): {fd0:+.6e}");
+            for (k, (dl, f)) in deltas.iter().zip(&fds).enumerate() {
+                eprintln!("  k {k:2} delta {dl:+.4e} fd {f:+.6e} (fd-unshifted {:+.3e})", f - fd0);
+            }
+            eprintln!(
+                "mean {m:+.6e} std {sd:.3e} std/sqrtK {se:.3e} (single/mean {:.2}) lag1 run-order {ra:+.3} delta-order {rb:+.3}",
+                sd / se
+            );
+            eprintln!(
+                "halves (|delta| index parity): mean_a {ma:+.6e} mean_b {mb:+.6e} diff {:+.3e}, expected sd of diff if independent {:.3e}",
+                ma - mb,
+                sd * (2.0 / (K / 2) as f64).sqrt()
+            );
+            eprintln!(
+                "mean - unshifted {:+.3e} ({:.2} std/sqrtK); 3 std/sqrtK {:.3e} vs 0.3|d| {:.3e}",
+                m - fd0,
+                (m - fd0) / se,
+                3.0 * se,
+                0.3 * dn
+            );
+        }
+        write(0.0);
+        assert_eq!(
+            loss(&model, &ids).to_bits(),
+            base.to_bits(),
+            "{name}: the parameter was not restored"
+        );
+        eprintln!(
+            "cost: {forwards} forwards for the probes (+1 train_step, 2 base loss), {:.1}s wall",
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     /// Qwen3.5-2B-Base against `make_train_fixture.py 2b`'s gradients.

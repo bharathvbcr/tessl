@@ -775,3 +775,259 @@ fn mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row() {
         }
     });
 }
+
+// ------------------------------------------------- adversarial lane (w23) ---
+//
+// Device tests added by the adversarial review of 485dbf5; the lead runs them
+// under the machine lock. Tests marked `#[ignore = "BREAK: ..."]` assert what a
+// fail-closed loader does and fail today; run them with `--ignored`.
+
+/// Make every quantized matrix of `net` exactly representable in bf16 once
+/// dequantized (power-of-two scales, bias a whole multiple of the scale, so
+/// `w = scale * (q - k)` is a small integer times a power of two), and every
+/// norm a multiple of 2^-6 (so the converter's bf16 `1 + w` is exact). The
+/// dequantized dense checkpoint is then bf16 bit for bit, and the Q4 and dense
+/// bf16 models differ only in accumulation order. The GDN `in_proj_b` and
+/// `in_proj_a` windows get large, opposite-signed weights so a window placed in
+/// the wrong rows moves the logits by far more than the accumulation noise.
+fn make_exact(net: &mut Net, seed: u64) {
+    let mut rng = Rng(seed);
+    let mut fix = |name: &str, m: &mut QMat| {
+        let (scale_exp, k): (&[i32], &[f32]) = if name.contains("in_proj_b") {
+            (&[-5], &[2.0])
+        } else if name.contains("in_proj_a") {
+            (&[-5], &[12.0])
+        } else {
+            (&[-8, -7, -6], &[0.0, 2.0, 8.0])
+        };
+        for (s, b) in m.scales.iter_mut().zip(m.biases.iter_mut()) {
+            let sc = 2.0f32.powi(scale_exp[rng.next() as usize % scale_exp.len()]);
+            *s = sc;
+            *b = -k[rng.next() as usize % k.len()] * sc;
+        }
+    };
+    for (name, m) in net.mats.iter_mut() {
+        fix(name, m);
+    }
+    fix("lm_head", &mut net.head);
+    for (_, w) in net.norms.iter_mut() {
+        for v in w.iter_mut() {
+            *v = ((rng.next() % 39) as f32 - 19.0) / 64.0;
+        }
+    }
+}
+
+/// Swap two same-shaped tensors' payloads under their names.
+fn swap_payloads(entries: &mut [Entry], a: &str, b: &str) {
+    let (ia, ib) = (
+        entries.iter().position(|e| e.0 == a).unwrap(),
+        entries.iter().position(|e| e.0 == b).unwrap(),
+    );
+    let (da, ds, db) = (entries[ia].1, entries[ia].2.clone(), entries[ia].3.clone());
+    entries[ia].1 = entries[ib].1;
+    entries[ia].2 = entries[ib].2.clone();
+    entries[ia].3 = entries[ib].3.clone();
+    entries[ib].1 = da;
+    entries[ib].2 = ds;
+    entries[ib].3 = db;
+}
+
+/// Attack 3 (packed-window concatenation): with weights exact in bf16, the Q4
+/// model and the dense Bf16 model on the same values must agree to
+/// accumulation-order noise, at every row count the routing distinguishes.
+/// Control: the same Q4 checkpoint with `in_proj_a` and `in_proj_b` swapped in
+/// every GDN layer must miss by at least four times the matched error, so the
+/// bound has the power to see a window in the wrong rows.
+#[test]
+fn adv_mlx_q4_exact_weights_match_dense_bf16_and_a_swapped_window_does_not() {
+    const MATCH_BOUND: f64 = 1e-2;
+    with_gpu(|rt| {
+        let mut net = Net::new(21);
+        make_exact(&mut net, 22);
+        let q4 = load_q4(rt, &net.mlx_entries()).unwrap();
+        let dense_st = safetensors(&net.dense_entries());
+        let dense = Qwen35Model::load(rt, &dense_st, "model.", config(), Precision::Bf16).unwrap();
+
+        let mut swapped = net.mlx_entries();
+        for l in [0usize, 2] {
+            for sfx in ["weight", "scales", "biases"] {
+                swap_payloads(
+                    &mut swapped,
+                    &format!("language_model.model.layers.{l}.linear_attn.in_proj_a.{sfx}"),
+                    &format!("language_model.model.layers.{l}.linear_attn.in_proj_b.{sfx}"),
+                );
+            }
+        }
+        let bad = load_q4(rt, &swapped).unwrap();
+
+        let (mut worst, mut worst_ctl) = (0.0f64, f64::MAX);
+        for t in [1usize, 2, 7, 8, 9, 33, 70] {
+            let ids = seq(t);
+            let want = dense.forward(&ids, false).unwrap().logits;
+            let got = q4.forward(&ids, false).unwrap().logits;
+            let ctl = bad.forward(&ids, false).unwrap().logits;
+            assert!(got.iter().all(|x| x.is_finite()), "t={t}: non-finite logits");
+            let (r, c) = (rel(&got, &want), rel(&ctl, &want));
+            eprintln!("t={t}: exact match err {r:.3e}, swapped-window control {c:.3e}");
+            assert!(r <= MATCH_BOUND, "t={t}: Q4 vs dense bf16 on exact weights: {r:.3e}");
+            worst = worst.max(r);
+            worst_ctl = worst_ctl.min(c);
+        }
+        assert!(
+            worst_ctl >= 4.0 * worst.max(1e-3),
+            "the control cannot tell a swapped window from noise: control {worst_ctl:.3e} vs match {worst:.3e}"
+        );
+    });
+}
+
+/// Attack 5 (routing): every row count around both cuts, and large ragged
+/// ones, run Q4 and agree with the dequantized F32 model. 7 / 8 are the last
+/// small-M sizes, 9 the first TensorOps one; 33, 129 and 300 are ragged against
+/// the 32-row tile and past the GDN chunk.
+#[test]
+fn adv_mlx_q4_routing_boundaries_and_ragged_row_counts_match_dense() {
+    with_gpu(|rt| {
+        let net = Net::new(31);
+        let q4 = load_q4(rt, &net.mlx_entries()).unwrap();
+        let dense_st = safetensors(&net.dense_entries());
+        let dense = Qwen35Model::load(rt, &dense_st, "model.", config(), Precision::F32).unwrap();
+        for t in [1usize, 2, 7, 8, 9, 10, 31, 32, 33, 64, 65, 129, 300] {
+            let ids = seq(t);
+            let got = q4.forward(&ids, false).unwrap().logits;
+            let want = dense.forward(&ids, false).unwrap().logits;
+            let r = rel(&got, &want);
+            assert!(r <= TINY_BOUND, "t={t}: rel err {r:.3e} > {TINY_BOUND:.0e}");
+        }
+    });
+}
+
+/// Attack 1 (NaN / inf scales, biases and norms): a non-finite scale or bias
+/// would be copied to the bank unchecked and a non-finite norm to the kernel,
+/// and the model would answer with NaN logits. A loader that fails closed
+/// refuses each by tensor name. (The dense F32/bf16 loaders do not check
+/// either; this is the Q4 loader's own boundary.)
+#[test]
+#[ignore = "BREAK: non-finite scales, biases and norms load and produce NaN logits"]
+fn adv_mlx_q4_nonfinite_scales_biases_and_norms_are_refused() {
+    with_gpu(|rt| {
+        let net = Net::new(41);
+        let ok = net.mlx_entries();
+        let poison = |name: &str, v: f32| {
+            let mut e = ok.clone_entries();
+            let hit = e.iter_mut().find(|e| e.0 == name).unwrap();
+            hit.3[..2].copy_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+            e
+        };
+        for (name, v) in [
+            ("language_model.model.layers.0.mlp.gate_proj.scales", f32::NAN),
+            ("language_model.model.layers.0.mlp.gate_proj.scales", f32::INFINITY),
+            (
+                "language_model.model.layers.1.self_attn.o_proj.biases",
+                f32::NEG_INFINITY,
+            ),
+            ("language_model.model.embed_tokens.scales", f32::NAN),
+            ("language_model.lm_head.biases", f32::INFINITY),
+            ("language_model.model.norm.weight", f32::NAN),
+            ("language_model.model.layers.0.input_layernorm.weight", f32::INFINITY),
+        ] {
+            let r = load_q4(rt, &poison(name, v));
+            let e = r.err().unwrap_or_else(|| panic!("{name} = {v} loaded"));
+            assert!(
+                e.contains(name.rsplit('.').next().unwrap()) && e.contains("finite"),
+                "{name}: {e}"
+            );
+        }
+    });
+}
+
+/// Attack 1 (a huge declared shape on a tiny file; the config is as untrusted
+/// as the file): a config whose vocabulary is vast must be refused against the
+/// header before the first bank is allocated. `Loader::mlx_q4_named` sizes and
+/// allocates the whole bank (`Q4Weight::alloc`) and only then runs
+/// `check_part` on the header, so a tiny file under a hostile config first
+/// asks the device for up to its max buffer length.
+#[test]
+#[ignore = "BREAK: Q4Weight::alloc runs before check_part, so a config sizes the allocation"]
+fn adv_mlx_q4_a_huge_config_over_a_tiny_file_fails_before_allocating() {
+    with_gpu(|rt| {
+        let net = Net::new(51);
+        let st = safetensors(&net.mlx_entries());
+        let cfg = Qwen35Config {
+            vocab: 1 << 22,
+            ..config()
+        };
+        rt.reset_peak_allocated_bytes();
+        let before = rt.peak_allocated_bytes();
+        let e = Qwen35Model::load_mlx_q4(rt, &st, cfg, QUANT_JSON)
+            .err()
+            .expect("loaded");
+        assert!(e.contains("embed_tokens"), "{e}");
+        let grew = rt.peak_allocated_bytes().saturating_sub(before);
+        // The embedding at 2^22 x 64 is 128 MiB packed; the whole tiny file is
+        // a few hundred KiB.
+        assert!(
+            grew < 8 << 20,
+            "the refused load still allocated {grew} bytes on the device"
+        );
+    });
+}
+
+/// Attack 2 (a conv layout of one convention, norms of the other): the loader
+/// reads the convention from `conv1d.weight`'s shape alone. A checkpoint with
+/// the sanitized `[c, k, 1]` conv but norms that were never shifted (a
+/// third-party conversion, or mlx-vlm's `should_offset_norm_weight` skipping
+/// them) loads without complaint and is a different model: this test pins that
+/// it is silent and far off, so a mitigation (a norm-statistics plausibility
+/// check, or refusing the HF key spelling under the MLX conv layout) has a
+/// failing test to turn.
+#[test]
+fn adv_mlx_q4_conv_and_norm_convention_disagreement_loads_silently_as_a_wrong_model() {
+    with_gpu(|rt| {
+        let net = Net::new(61);
+        let dense_st = safetensors(&net.dense_entries());
+        let dense = Qwen35Model::load(rt, &dense_st, "model.", config(), Precision::F32).unwrap();
+        // Norms left as `w` (no +1) beside the `[c, k, 1]` conv layout.
+        let mut e = net.mlx_entries();
+        for (n, v) in &net.norms {
+            let hit = e
+                .iter_mut()
+                .find(|x| x.0 == format!("language_model.model.{n}"))
+                .unwrap();
+            hit.3 = bf16_bytes(v);
+        }
+        let wrong = load_q4(rt, &e).expect("a convention disagreement is undetectable from the header");
+        let ids = seq(9);
+        let got = wrong.forward(&ids, false).unwrap().logits;
+        let want = dense.forward(&ids, false).unwrap().logits;
+        let r = rel(&got, &want);
+        eprintln!("convention disagreement: rel err {r:.3e}");
+        assert!(r > 0.3, "expected garbage, got rel err {r:.3e}");
+    });
+}
+
+/// Attack 7 (footprint report): the host peak is the process's LIFETIME max
+/// (`ri_lifetime_max_phys_footprint`), so anything allocated earlier in the
+/// process hides the load's own peak: the report's "after" cannot be below
+/// "before", and a load that stays under an earlier peak shows no growth
+/// whatever it used. Characterizes the property the doc comment states.
+#[test]
+fn adv_mlx_q4_footprint_report_is_a_lifetime_max_an_earlier_allocation_hides_the_load() {
+    with_gpu(|rt| {
+        // Touch 384 MiB on the host, drop it: the lifetime max keeps it.
+        let ballast = vec![1u8; 384 << 20];
+        assert!(ballast.iter().step_by(4096).all(|&b| b == 1));
+        drop(ballast);
+        let net = Net::new(71);
+        let st = safetensors(&net.mlx_entries());
+        let (_, r) = Qwen35Model::load_mlx_q4(rt, &st, config(), QUANT_JSON).unwrap();
+        assert!(
+            r.peak_footprint_before >= 384 << 20,
+            "before = {}",
+            r.peak_footprint_before
+        );
+        assert_eq!(
+            r.peak_footprint_after, r.peak_footprint_before,
+            "a tiny load cannot raise a 384 MiB peak"
+        );
+    });
+}

@@ -886,6 +886,28 @@ qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
   7.048e-2 > 2^-4. Bit-identical on a rerun. With `GDN_TRAIN_PRODUCTION =
   Sequential` it is 8.429e-2, so the chunked GDN kernel is not the cause.
   Tracked as ft-8933ed6a.
+  Cause (bisect), 2026-10-21, locked M5 Pro jobs, the same test and ids, the
+  bound 2^-4 = 6.25e-2 written before the first run, worst gradient
+  `layers.1.post_attention_layernorm.weight` unless noted:
+
+  ```
+  build                                                         worst rel err
+  head c0d8be5 (both precise::rsqrt commits)                    7.048e-2 FAILED
+  head, GDN_TRAIN_PRODUCTION = Sequential                       8.429e-2 FAILED
+  head, instruct checkpoint (15852e8c)                          7.466e-2 FAILED
+                                      (layers.20.linear_attn.conv1d.weight)
+  probe 59699d5: 4632d2e and 201bc61 kernel hunks reverted      4.817e-2 PASS
+  probe 7b43e48: only 4632d2e reverted (RMSNorm and gated-norm
+    forward fast; qk-norm forward and backward still precise)   6.271e-2 FAILED
+  ```
+
+  Both commits contribute (about 0.8e-2 and 1.45e-2) and neither alone restores
+  the bound; with both reverted the figure, 4.817e-2, matches the 10-08 pass
+  (about 4.47e-2). Owner decision, 2026-10-21: keep `precise::rsqrt`. It fixed
+  the real forward/backward rstd mismatch that tests/qwen35_rstd_parity.rs pins
+  (ft-1a0f8c18 AC5). The pre-written 2^-4 bound does not hold under precise
+  norms; the test stays red until the owner sets a bound. The probes are on
+  gp/w21-bisect-rsqrt and gp/w21-bisect-rsqrt-fwd, not merged.
 - `real_2b_loss_curve_tracks_the_f32_step`: failed closed before the first arm:
   "REQUIREMENT UNMET (not a pass): seed 1: F32 storage with update=f32
   moments=f32 needs 34.91 GiB, over the 32.00 GiB cap (model 7.01 GiB +

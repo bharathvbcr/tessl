@@ -89,7 +89,9 @@ impl PrefillIds {
         };
         let mut digests = Vec::new();
         for (k, v) in kv {
-            let len: usize = k.parse().map_err(|_| format!("prefill ids file: digest key {k:?} is not a length"))?;
+            let len: usize = k
+                .parse()
+                .map_err(|_| format!("prefill ids file: digest key {k:?} is not a length"))?;
             let d = v
                 .exact_int()
                 .and_then(|n| u32::try_from(n).ok())

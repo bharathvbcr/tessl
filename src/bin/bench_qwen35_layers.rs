@@ -1842,7 +1842,11 @@ fn prefill_score_row(name: &str, ms: f64, iters: usize, t: usize, answers: usize
 fn run_prefill_score(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o: &Opts) -> Res<()> {
     let file = prefill_ids::PrefillIds::load(o.ids.as_deref().ok_or("--prefill-score needs --ids")?)?;
     if file.vocab != model.config().vocab {
-        return Err(format!("ids file vocab {} but the model's is {}", file.vocab, model.config().vocab));
+        return Err(format!(
+            "ids file vocab {} but the model's is {}",
+            file.vocab,
+            model.config().vocab
+        ));
     }
     let warmup = common::env_usize("BENCH_WARMUP", PREFILL_SCORE_WARMUP, 0)?;
     let layers = model.config().layers.len();
@@ -1872,7 +1876,11 @@ fn run_prefill_score(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o:
             let (t, ids) = runs[i];
             let (elapsed, logprobs) = one(t, ids)?;
             if logprobs.len() != file.answers.len() {
-                return Err(format!("T={t}: {} scores for {} answers", logprobs.len(), file.answers.len()));
+                return Err(format!(
+                    "T={t}: {} scores for {} answers",
+                    logprobs.len(),
+                    file.answers.len()
+                ));
             }
             finite_nonzero_slice(&format!("T={t}: answer log-probabilities"), &logprobs)?;
             if round == 0 {
@@ -1887,11 +1895,30 @@ fn run_prefill_score(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ts: &[usize], o:
     let mut rows = Vec::new();
     for (i, (t, ids)) in runs.iter().enumerate() {
         let st = Stat::of(std::mem::take(&mut ms[i]))?;
-        println!("T={t}: min {:.3} ms, median {:.3} ms ({:.0} tok/s at min)", st.min, st.median, st.tok_s(*t));
+        println!(
+            "T={t}: min {:.3} ms, median {:.3} ms ({:.0} tok/s at min)",
+            st.min,
+            st.median,
+            st.tok_s(*t)
+        );
         let d = prefill_ids::fnv1a32(ids);
         let n = file.answers.len();
-        rows.push(prefill_score_row(&format!("prefill_score_t{t}"), st.min, o.iters, *t, n, d));
-        rows.push(prefill_score_row(&format!("prefill_score_t{t}_median"), st.median, o.iters, *t, n, d));
+        rows.push(prefill_score_row(
+            &format!("prefill_score_t{t}"),
+            st.min,
+            o.iters,
+            *t,
+            n,
+            d,
+        ));
+        rows.push(prefill_score_row(
+            &format!("prefill_score_t{t}_median"),
+            st.median,
+            o.iters,
+            *t,
+            n,
+            d,
+        ));
     }
     println!("[{}]", rows.join(","));
     Ok(())
@@ -2136,7 +2163,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
     if prefill_score {
-        if check_only || paired_attn || paired_rec || paired_gate_up || model_forward || attn_tiles || decode.is_some() {
+        if check_only || paired_attn || paired_rec || paired_gate_up || model_forward || attn_tiles || decode.is_some()
+        {
             return Err("--prefill-score takes token counts, --weights, --ids and --iters only".into());
         }
         if !matches!(opts.weights, Weights::Dir { .. }) || opts.ids.is_none() {

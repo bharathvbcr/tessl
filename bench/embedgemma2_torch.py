@@ -32,8 +32,9 @@ what was live before the pass (the weights and the padded input batches);
 memory metric: it is the same every round, and `bench_paired` carries it into
 its report (`tensor_mib_max`). `driver_mib` includes the caching allocator's
 retained pool, which does not repeat from round to round at the same work, so
-it is recorded in the row (the lane's stdout under `bench_paired --out
-PATH.lanes/`) and on stderr and is not carried into the report. `tensor_mib` is
+it is recorded in the row (kept verbatim in the report's raw rows and in the
+lane's stdout under `bench_paired --out PATH.lanes/`) and on stderr, and is
+not summarised (no `driver_mib_max`). `tensor_mib` is
 a lower bound on the true peak (torch has no MPS peak counter, and a module's
 internal temporaries are seen only at its boundaries).
 

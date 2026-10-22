@@ -909,5 +909,6 @@ fn workload_lanes_carry_tensor_mib_into_the_report_and_leave_unlisted_fields_out
     let text: String = fs::read_to_string(&json).unwrap().split_whitespace().collect();
     assert!(text.contains("\"tensor_mib_max\":1024.5"), "{text}");
     assert!(text.contains("\"tensor_mib_max\":512.25"), "{text}");
-    assert!(!text.contains("driver_mib"), "driver memory stays in the lane log, not the report: {text}");
+    assert!(!text.contains("driver_mib_max"), "driver memory is recorded in the raw rows, not summarised: {text}");
+    assert!(text.contains("\"driver_mib\":9999.0"), "the raw row keeps the driver figure: {text}");
 }

@@ -258,7 +258,6 @@ fn scales_and_biases_with_the_wrong_rows_or_groups_are_refused_by_name() {
 /// `Qwen35Config` (every width is non-zero), so this is a hardening gap at the
 /// boundary, not a reachable load.
 #[test]
-#[ignore = "BREAK (hardening): check_part accepts rows == 0 and cols == 0"]
 fn zero_row_and_zero_column_parts_are_refused() {
     for (rows, cols) in [(0usize, 64usize), (8, 0), (0, 0)] {
         let w = info(Dtype::U32, &[rows, cols / 8]);
@@ -564,7 +563,7 @@ fn the_skip_list_is_exact_prefix_and_misspellings_are_refused() {
             "mtp.layers.0.mlp.up_proj.weight".to_string()
         ]
     );
-    assert_eq!(r.vision, 1);
+    assert_eq!(r.vision, vec!["vision_tower.blocks.0.attn.qkv.weight".to_string()]);
     for near in [
         "mtp",
         "mtpx.fc.weight",
@@ -596,7 +595,6 @@ fn the_skip_list_is_exact_prefix_and_misspellings_are_refused() {
 /// 8 with the count carried beside it. A skipped tensor that is not named is a
 /// tensor an auditor cannot find.
 #[test]
-#[ignore = "BREAK (reporting): OutsideTensors names mtp.* tensors but only counts vision tensors"]
 fn every_skipped_tensor_is_named_in_the_report() {
     let r = classify_outside(["mtp.a", "vision_tower.b", "visual.c"]).unwrap();
     // A `Vec<String>` of vision names would let this compile; today the field

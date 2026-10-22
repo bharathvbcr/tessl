@@ -97,6 +97,13 @@ pub enum MlxQ4Error {
         found: Vec<usize>,
         want: Vec<usize>,
     },
+    /// The device has no TensorOps, which every prefill of more than 8 rows
+    /// needs ([`crate::nn::gemm_q4_mlx_tensorops`]); refused at load rather
+    /// than mid-forward.
+    NoTensorOps,
+    /// A matrix with no rows or no columns: nothing to load, so a config that
+    /// asks for one is wrong.
+    Empty { tensor: String, rows: usize, cols: usize },
     /// `cols` is not a multiple of the group size, so no group layout exists.
     Cols { tensor: String, cols: usize },
     /// The checkpoint's conv and norm conventions disagree between layers, or
@@ -149,6 +156,14 @@ impl fmt::Display for MlxQ4Error {
                 "{tensor}: shape {found:?}, expected {want:?} (4-bit packs eight values per U32 word; a \
                  different width means other bits)"
             ),
+            Self::NoTensorOps => write!(
+                f,
+                "this device has no TensorOps, which the Q4 prefill GEMM (more than 8 rows) needs; an MLX 4-bit \
+                 model is refused at load rather than failing mid-forward"
+            ),
+            Self::Empty { tensor, rows, cols } => {
+                write!(f, "{tensor}: a [{rows}, {cols}] matrix has nothing to load")
+            }
             Self::Cols { tensor, cols } => write!(
                 f,
                 "{tensor}: {cols} columns is not a multiple of the group size {MLX_Q4_GROUP}"
@@ -322,14 +337,14 @@ impl NormConvention {
 }
 
 /// The tensors outside the tower's prefix that a quantized load skipped, by
-/// name or count: never silently. See [`classify_outside`].
+/// name: never silently. See [`classify_outside`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OutsideTensors {
     /// `mtp.*` (the multi-token-prediction head: a drafter, not this forward),
     /// by name.
     pub mtp: Vec<String>,
-    /// Vision-tower tensors, by count.
-    pub vision: usize,
+    /// Vision-tower tensors, by name.
+    pub vision: Vec<String>,
 }
 
 /// Sort `unread`, the checkpoint's tensors outside the tower's prefix that no
@@ -343,7 +358,7 @@ pub fn classify_outside<'a>(unread: impl IntoIterator<Item = &'a str>) -> Result
         if n.starts_with("mtp.") {
             out.mtp.push(n.to_string());
         } else if VISION.iter().any(|p| n.starts_with(p)) {
-            out.vision += 1;
+            out.vision.push(n.to_string());
         } else {
             other.push(n.to_string());
         }
@@ -375,6 +390,13 @@ pub fn check_part(
     cols: usize,
 ) -> Result<(), MlxQ4Error> {
     let group = MLX_Q4_GROUP as usize;
+    if rows == 0 || cols == 0 {
+        return Err(MlxQ4Error::Empty {
+            tensor: weight_name.into(),
+            rows,
+            cols,
+        });
+    }
     if cols % group != 0 || cols % NIBBLES_PER_WORD != 0 {
         return Err(MlxQ4Error::Cols {
             tensor: weight_name.into(),
@@ -588,7 +610,7 @@ pub struct MlxQ4LoadReport {
     /// before (the counter is a lifetime maximum), else the load stayed under
     /// what the process had already reached.
     pub peak_footprint_after: u64,
-    /// `mtp.*` and vision tensors present and skipped, by name or count.
+    /// `mtp.*` and vision tensors present and skipped, every one by name.
     pub skipped: OutsideTensors,
     /// The conventions the checkpoint was read under.
     pub convention: NormConvention,

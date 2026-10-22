@@ -295,7 +295,11 @@ fn mtp_and_vision_tensors_are_skipped_by_name_and_counted() {
                 "mtp.layers.0.mlp.down_proj.weight".into(),
                 "mtp.norm.weight".into()
             ],
-            vision: 3
+            vision: vec![
+                "model.visual.blocks.0.attn.qkv.weight".into(),
+                "model.visual.blocks.1.attn.qkv.weight".into(),
+                "vision_tower.merger.weight".into()
+            ]
         }
     );
     assert_eq!(classify_outside(Vec::<&str>::new()).unwrap(), OutsideTensors::default());

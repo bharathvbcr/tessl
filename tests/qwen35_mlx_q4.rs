@@ -374,7 +374,7 @@ fn mlx_q4_tiny_checkpoint_matches_its_dequantized_f32_model() {
         assert_eq!(report.convention, NormConvention::MlxShifted);
         assert_eq!(report.names.prefix, "language_model.model.");
         assert_eq!(report.names.head, "language_model.lm_head");
-        assert!(report.skipped.mtp.is_empty() && report.skipped.vision == 0);
+        assert!(report.skipped.mtp.is_empty() && report.skipped.vision.is_empty());
         assert!(report.q4_bytes > 0, "no quantized bank was counted");
         assert!(report.peak_footprint_after >= report.peak_footprint_before && report.peak_footprint_after > 0);
         eprintln!("tiny load: {}", q4.describe());
@@ -674,7 +674,7 @@ fn mlx_q4_2b_matches_mlx_lm_logits() {
             report.convention,
             report.names,
             report.skipped.mtp.len(),
-            report.skipped.vision
+            report.skipped.vision.len()
         );
         assert!(report.peak_footprint_after > 0, "the peak footprint was not recorded");
         assert!(

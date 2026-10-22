@@ -691,6 +691,9 @@ impl Qwen35Model {
         quant_config_json: &str,
     ) -> Result<(Self, MlxQ4LoadReport), String> {
         MlxQuant::from_config_json(quant_config_json)?;
+        if !rt.has_tensorops() {
+            return Err(MlxQ4Error::NoTensorOps.into());
+        }
         let names = MlxNames::detect(st.names())?;
         let convention = Self::detect_convention(st, names.prefix, &cfg)?;
         let before = peak_footprint_now()?;

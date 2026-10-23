@@ -13,7 +13,7 @@ ignored hosted_selection hosted_selection_has_no_device
 bin audit_gemm_tiles 17
 bin bench_clip_2048_result 11
 bin bench_env_validation 2
-bin bench_paired_cli 30
+bin bench_paired_cli 31
 bin bench_attn_cli 2
 bin build_artifact_contract 2
 bin capi_contract 80
@@ -101,7 +101,7 @@ exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 262
+bins 271
 
 # Library tests.
 lib ab_flags::tests:: 10

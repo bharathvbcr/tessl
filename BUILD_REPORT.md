@@ -1,4 +1,58 @@
-# BUILD_REPORT — GitPulse backlog, waves 21–22: training follow-ups (2026-10-21/22)
+# BUILD_REPORT — GitPulse backlog, waves 23–24 (2026-10-22/23)
+
+## Landed: `main` = `fc778a2`
+- **Method:** fast-forward from `e636223`.
+- **Gate:** `ci:local OK`, 3602 passed / 0 failed / 75 ignored, no skips, M5 Pro under the lock.
+- **ojas:** ojas-7a acked. ojas main `42d5a9f` then built and tested green against it: `cargo check --workspace --all-targets` clean, ojas-qwen35 18 suites, ojas-model 43, ojas-metal 36, GPU sharded load 1/1, Tape provider 5/5.
+- **Earlier gate failures:** gate 4 failed three times before that, each caught by a ci_local step the lanes hadn't run:
+  1. `cargo fmt` on two lanes' files;
+  2. a rustdoc link to private items, which `-D warnings` rejects;
+  3. two stale counts in `scripts/hosted_tests.txt`, one of them in `bins`.
+- **Rule from now on:** a lane is approved only after the full ci_local step set (fmt, both clippys, doc, hosted manifest), not just its tests.
+
+| card | result |
+|---|---|
+| ft-34875eec (P1) MLX 4-bit in the Qwen3.5 tower | 2B stage done; see the row below. 27B (AC2/4/5) waits for the weights download, an owner decision. |
+| ft-faf24ae5 SHA map + prune | Map on main. ojas annotated its 4 citations. **Prune done 2026-10-23** (details below). |
+| ft-05f5b770 AC1 prefill+score head-to-head | Published, see the bullets after this table. torch 2.15: NOT RUN. |
+| ft-8a423664 tokenizer `encode_batch` across cores | Correct: identical ids hash on the real corpus. Timing vs HF all-core is unmeasurable as specified on this shared machine (refused at 1.27–8×, tessl and HF lanes alike). A fixed-thread-count method needs an owner or Fable decision. |
+| ft-70df7d9f bench evidence holes | Host refs for 3 EG2 audio kernels. The "scale-invariant" note was wrong and is corrected. The gemm_variants lane→test map, plus sampled f64 checks. Self-checks green on the GPU. |
+| ft-4ba2db45 README kernel counts | Diagram and text both checked against the build (39 sources / 303 entry points). |
+| ft-3aa3f738 EG2 quiet evidence | Lanes and torch memory merged. The drift-gated reruns (fusion as `5229a1c`→`72ea81d`, vision, vs-torch memory) are waiting for an idle host. |
+
+**ft-34875eec, 2B stage:**
+- **Loader:** `load_mlx_q4` loads MLX affine 4-bit directly. Banks 0.99 GiB, host footprint 1.04 GiB (lifetime peak).
+- **Adversarial pass:** 6 BREAKs, all fixed. Validate-before-allocate is proven by a fail-before: the pre-fix code allocated 512 MiB on a refused load.
+- **Gate (owner decision):** against mlx-lm float32 on the same 4-bit weights. Default prompt 155/155 top-1, KL 3.7e-5. Text prompt 509/512, KL 3.0e-5. Against mlx-lm bf16, tessl misses 0 where mlx bf16 misses 6.
+
+**ft-05f5b770, the published head-to-head:**
+- **Run:** `--max-spread 1.25`, declared beforehand by Fable; GPU idle checked inside the lock.
+- **vs torch 2.14.1:** tessl is 4.5–5.3× faster.
+- **vs mlx-lm 0.32:** tessl is slower at every length (mlx takes 0.836–0.896× of tessl's time).
+- **Earlier claim:** this supersedes the unpaired 8k claim. ft-2bc8f1e9 is widened to all lengths.
+- **Record:** `bench/results/qwen35_prefill_score_h2h_m5pro.txt`.
+
+**History prune (ft-faf24ae5), 2026-10-23, owner-approved, Fable's amended order:**
+1. A fresh bundle of exactly the 12 refs that reached the LGPL blobs `c8dd865`/`58b292b`: `tessl-backups/tessl-scrub-12refs-20261023T094756Z.bundle`, verified, 12 heads, private and unpushed.
+2. Deleted:
+   - `refs/original/refs/scrub/{main,eg2-integrate}`
+   - `refs/backup/2026-10-18/pre-scrub/{main,eg2-integrate}`
+   - `refs/backup/2026-10-18T2150/backup/eg2-integrate-unsquashed`
+   - seven `refs/backup/2026-10-18T2150/worktree-agent-*`
+3. `reflog expire --expire=now --all` and `gc --prune=now`.
+
+Afterwards both blobs are absent in the main repo and in every linked worktree. The 102 pre-rewrite SHAs no longer resolve; `docs/history/2026-10-18-scrub-sha-map.tsv` is their record. Kept: the 10-13, 10-16T2305 and 10-17 sets and the clean `2026-10-18T2150/{main,eg2/integrate,eg2/squash}`.
+
+**Owner decisions pending:**
+- the 27B weights download (about 15 GB) for ft-34875eec;
+- `output_gate_type: "swish"` in the 27B config: every reference implementation uses sigmoid, and so does tessl;
+- the tokenizer bench method;
+- torch 2.15 install;
+- ft-a96618 curve bounds (one-sided?);
+- ft-bf6bc26b licence provenance;
+- a C ABI entry for the fused step.
+
+# Earlier: waves 21–22 (2026-10-21/22)
 
 ## Landed on `main` (each after a green `scripts/ci_local.sh` on the M5 Pro under the lock, and an ojas-7a ack)
 | move | tip | gate result |

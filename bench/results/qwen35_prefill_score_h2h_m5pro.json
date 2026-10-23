@@ -1,0 +1,819 @@
+{
+  "rounds": 6,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "tessl",
+      "argv": [
+        "target/release/bench_qwen35_layers",
+        "--prefill-score",
+        "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+        "--ids=tests/fixtures/qwen35_prefill_ids.json",
+        "200",
+        "1024",
+        "2048",
+        "8192"
+      ],
+      "env": {
+        "BENCH_ITERS": "21",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "torch",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/qwen35_prefill_torch.py",
+        "--snapshot",
+        "/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+        "--ids",
+        "tests/fixtures/qwen35_prefill_ids.json",
+        "--lengths",
+        "200,1024,2048,8192"
+      ],
+      "env": {
+        "BENCH_ITERS": "21",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "mlx",
+      "argv": [
+        "/Users/bharath/.venvs/ml-2026-10/bin/python",
+        "bench/qwen35_prefill_mlx.py",
+        "--snapshot",
+        "/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+        "--ids",
+        "tests/fixtures/qwen35_prefill_ids.json",
+        "--lengths",
+        "200,1024,2048,8192"
+      ],
+      "env": {
+        "BENCH_ITERS": "21",
+        "BENCH_WARMUP": "3"
+      }
+    }
+  ],
+  "env": {},
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "prefill_score_t200",
+      "tessl": {
+        "ms_min_median": 35.9943125,
+        "ms_min_min": 35.402,
+        "ms_min_max": 36.944458,
+        "ms_min_all": [
+          35.402,
+          36.523542,
+          35.465083,
+          36.5585,
+          35.460042,
+          36.944458
+        ]
+      },
+      "torch": {
+        "ms_min_median": 183.35405,
+        "ms_min_min": 183.0339,
+        "ms_min_max": 183.9777,
+        "ms_min_all": [
+          183.3243,
+          183.3838,
+          183.0339,
+          183.1077,
+          183.7992,
+          183.9777
+        ],
+        "vs_base": {
+          "median": 5.090967975038399,
+          "lo": 4.979845691605491,
+          "hi": 5.183276432667508
+        }
+      },
+      "mlx": {
+        "ms_min_median": 32.0537,
+        "ms_min_min": 31.148,
+        "ms_min_max": 32.9303,
+        "ms_min_all": [
+          32.7235,
+          31.148,
+          32.9303,
+          31.7412,
+          32.3662,
+          31.6684
+        ],
+        "vs_base": {
+          "median": 0.8904908432381302,
+          "lo": 0.8528198059213424,
+          "hi": 0.928527363096824
+        },
+        "vs_prev": {
+          "median": 0.17472129792189484,
+          "lo": 0.1698514263528185,
+          "hi": 0.17991366626619443
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t200_median",
+      "tessl": {
+        "ms_min_median": 36.7117505,
+        "ms_min_min": 35.861375,
+        "ms_min_max": 37.836417,
+        "ms_min_all": [
+          35.863667,
+          37.530167,
+          35.861375,
+          37.836417,
+          35.893334,
+          37.568292
+        ]
+      },
+      "torch": {
+        "ms_min_median": 186.4687,
+        "ms_min_min": 185.1754,
+        "ms_min_max": 187.3647,
+        "ms_min_all": [
+          185.1754,
+          186.907,
+          187.3647,
+          186.3659,
+          186.5715,
+          185.5465
+        ],
+        "vs_base": {
+          "median": 5.071747535698782,
+          "lo": 4.925569458651437,
+          "hi": 5.224693699000666
+        }
+      },
+      "mlx": {
+        "ms_min_median": 33.1926,
+        "ms_min_min": 32.0189,
+        "ms_min_max": 34.0007,
+        "ms_min_all": [
+          33.5492,
+          32.0189,
+          33.807,
+          32.836,
+          34.0007,
+          32.204
+        ],
+        "vs_base": {
+          "median": 0.9016530065459836,
+          "lo": 0.8531510131569626,
+          "hi": 0.9472705990477229
+        },
+        "vs_prev": {
+          "median": 0.17831261598747922,
+          "lo": 0.1713092607553489,
+          "hi": 0.18223951675363068
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t1024",
+      "tessl": {
+        "ms_min_median": 138.26656300000002,
+        "ms_min_min": 135.171167,
+        "ms_min_max": 142.209458,
+        "ms_min_all": [
+          135.371541,
+          141.719625,
+          135.171167,
+          142.209458,
+          135.500542,
+          141.032584
+        ]
+      },
+      "torch": {
+        "ms_min_median": 740.495,
+        "ms_min_min": 738.4769,
+        "ms_min_max": 741.5597,
+        "ms_min_all": [
+          739.1038,
+          740.7737,
+          740.2163,
+          741.037,
+          741.5597,
+          738.4769
+        ],
+        "vs_base": {
+          "median": 5.348015736207776,
+          "lo": 5.210884074953721,
+          "hi": 5.476140484900896
+        }
+      },
+      "mlx": {
+        "ms_min_median": 122.93545,
+        "ms_min_min": 119.0581,
+        "ms_min_max": 127.561,
+        "ms_min_all": [
+          124.8876,
+          119.5316,
+          127.561,
+          120.9833,
+          126.1681,
+          119.0581
+        ],
+        "vs_base": {
+          "median": 0.8866472505311297,
+          "lo": 0.8434371739270408,
+          "hi": 0.9436997758553051
+        },
+        "vs_prev": {
+          "median": 0.1661169118570185,
+          "lo": 0.16122115668073028,
+          "hi": 0.17232935832404664
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t1024_median",
+      "tessl": {
+        "ms_min_median": 141.44225,
+        "ms_min_min": 136.956208,
+        "ms_min_max": 146.180416,
+        "ms_min_all": [
+          137.615167,
+          145.269333,
+          136.956208,
+          145.746,
+          137.106083,
+          146.180416
+        ]
+      },
+      "torch": {
+        "ms_min_median": 746.2992,
+        "ms_min_min": 744.595,
+        "ms_min_max": 748.1277,
+        "ms_min_all": [
+          744.595,
+          748.1277,
+          746.3554,
+          746.243,
+          745.8307,
+          746.7497
+        ],
+        "vs_base": {
+          "median": 5.280320004750532,
+          "lo": 5.108411375707125,
+          "hi": 5.449591595000936
+        }
+      },
+      "mlx": {
+        "ms_min_median": 126.7719,
+        "ms_min_min": 121.3072,
+        "ms_min_max": 132.6352,
+        "ms_min_all": [
+          130.3401,
+          121.3072,
+          132.6352,
+          123.2037,
+          131.7591,
+          121.4489
+        ],
+        "vs_base": {
+          "median": 0.8962331524686947,
+          "lo": 0.8308151209530009,
+          "hi": 0.9684497105819402
+        },
+        "vs_prev": {
+          "median": 0.1700734744733835,
+          "lo": 0.16214771889879226,
+          "hi": 0.17771051164096888
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t2048",
+      "tessl": {
+        "ms_min_median": 277.34591650000004,
+        "ms_min_min": 270.101667,
+        "ms_min_max": 287.381666,
+        "ms_min_all": [
+          270.101667,
+          284.012625,
+          270.665125,
+          287.374584,
+          270.679208,
+          287.381666
+        ]
+      },
+      "torch": {
+        "ms_min_median": 1483.9152,
+        "ms_min_min": 1481.6915,
+        "ms_min_max": 1491.7655,
+        "ms_min_all": [
+          1481.6915,
+          1482.3269,
+          1481.8592,
+          1491.7655,
+          1486.2787,
+          1485.5035
+        ],
+        "vs_base": {
+          "median": 5.347054671846617,
+          "lo": 5.169096277700611,
+          "hi": 5.490923041270314
+        }
+      },
+      "mlx": {
+        "ms_min_median": 249.3933,
+        "ms_min_min": 239.9141,
+        "ms_min_max": 257.114,
+        "ms_min_all": [
+          254.1313,
+          239.9141,
+          257.114,
+          244.6553,
+          256.4595,
+          242.2796
+        ],
+        "vs_base": {
+          "median": 0.8961095477963175,
+          "lo": 0.8430586521827735,
+          "hi": 0.9499339820747131
+        },
+        "vs_prev": {
+          "median": 0.16775908652908206,
+          "lo": 0.16184965677948634,
+          "hi": 0.1735077124736277
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t2048_median",
+      "tessl": {
+        "ms_min_median": 287.333833,
+        "ms_min_min": 276.842416,
+        "ms_min_max": 296.0665,
+        "ms_min_all": [
+          279.286458,
+          296.0665,
+          276.842416,
+          295.669166,
+          277.331917,
+          295.381208
+        ]
+      },
+      "torch": {
+        "ms_min_median": 1515.46875,
+        "ms_min_min": 1506.841,
+        "ms_min_max": 1516.3814,
+        "ms_min_all": [
+          1506.841,
+          1516.3814,
+          1515.1908,
+          1514.0328,
+          1516.2598,
+          1515.7467
+        ],
+        "vs_base": {
+          "median": 5.263408793085722,
+          "lo": 5.120698990979668,
+          "hi": 5.473116518387847
+        }
+      },
+      "mlx": {
+        "ms_min_median": 255.351,
+        "ms_min_min": 244.4278,
+        "ms_min_max": 269.1155,
+        "ms_min_all": [
+          263.6049,
+          244.4278,
+          269.1155,
+          247.0971,
+          266.4738,
+          244.8399
+        ],
+        "vs_base": {
+          "median": 0.8897864599073849,
+          "lo": 0.8255841170818041,
+          "hi": 0.972089118020123
+        },
+        "vs_prev": {
+          "median": 0.16907167552545305,
+          "lo": 0.1611915049868061,
+          "hi": 0.17761162488578994
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t8192",
+      "tessl": {
+        "ms_min_median": 1298.435354,
+        "ms_min_min": 1265.903458,
+        "ms_min_max": 1338.675083,
+        "ms_min_all": [
+          1266.423917,
+          1330.78825,
+          1265.903458,
+          1325.51175,
+          1271.358958,
+          1338.675083
+        ]
+      },
+      "torch": {
+        "ms_min_median": 5800.37865,
+        "ms_min_min": 5796.7775,
+        "ms_min_max": 5811.7197,
+        "ms_min_all": [
+          5811.7197,
+          5803.959,
+          5796.7775,
+          5798.5205,
+          5802.2368,
+          5798.4845
+        ],
+        "vs_base": {
+          "median": 4.4691796155059205,
+          "lo": 4.331509993452234,
+          "hi": 4.589079234832549
+        }
+      },
+      "mlx": {
+        "ms_min_median": 1082.2867500000002,
+        "ms_min_min": 1053.2335,
+        "ms_min_max": 1121.6538,
+        "ms_min_all": [
+          1101.0367,
+          1053.2335,
+          1121.6538,
+          1063.5368,
+          1111.051,
+          1059.8305
+        ],
+        "vs_base": {
+          "median": 0.8358827537527478,
+          "lo": 0.791435827600672,
+          "hi": 0.886050032418823
+        },
+        "vs_prev": {
+          "median": 0.18643315109589573,
+          "lo": 0.181468115126244,
+          "hi": 0.19349609330356393
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t8192_median",
+      "tessl": {
+        "ms_min_median": 1334.5181874999998,
+        "ms_min_min": 1283.547625,
+        "ms_min_max": 1377.424125,
+        "ms_min_all": [
+          1299.567458,
+          1377.424125,
+          1283.690667,
+          1374.062916,
+          1283.547625,
+          1369.468917
+        ]
+      },
+      "torch": {
+        "ms_min_median": 5824.456099999999,
+        "ms_min_min": 5817.5038,
+        "ms_min_max": 5828.6318,
+        "ms_min_all": [
+          5825.731,
+          5817.5038,
+          5821.8781,
+          5828.6318,
+          5823.1812,
+          5826.049
+        ],
+        "vs_base": {
+          "median": 4.3685313793850185,
+          "lo": 4.223465884191625,
+          "hi": 4.536786237285119
+        }
+      },
+      "mlx": {
+        "ms_min_median": 1112.6299,
+        "ms_min_min": 1069.0908,
+        "ms_min_max": 1166.7146,
+        "ms_min_all": [
+          1142.9582,
+          1070.4166,
+          1166.7146,
+          1082.3016,
+          1156.6195,
+          1069.0908
+        ],
+        "vs_base": {
+          "median": 0.8335782431565412,
+          "lo": 0.7771147467015651,
+          "hi": 0.9088751908796109
+        },
+        "vs_prev": {
+          "median": 0.19093922796366325,
+          "lo": 0.18350185520238502,
+          "hi": 0.20040175695193618
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.402000,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":35.863667,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":135.371541,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":137.615167,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":270.101667,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":279.286458,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1266.423917,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1299.567458,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.3243, "ms_median": 185.1754, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 185.1754, "ms_median": 185.1754, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 739.1038, "ms_median": 744.595, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 744.595, "ms_median": 744.595, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1481.6915, "ms_median": 1506.841, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1506.841, "ms_median": 1506.841, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5811.7197, "ms_median": 5825.731, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5825.731, "ms_median": 5825.731, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.7235, "ms_median": 33.5492, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 33.5492, "ms_median": 33.5492, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 124.8876, "ms_median": 130.3401, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 130.3401, "ms_median": 130.3401, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 254.1313, "ms_median": 263.6049, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 263.6049, "ms_median": 263.6049, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1101.0367, "ms_median": 1142.9582, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1142.9582, "ms_median": 1142.9582, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    },
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.523542,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":37.530167,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":141.719625,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":145.269333,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":284.012625,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":296.066500,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1330.788250,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1377.424125,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.3838, "ms_median": 186.907, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 186.907, "ms_median": 186.907, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 740.7737, "ms_median": 748.1277, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 748.1277, "ms_median": 748.1277, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1482.3269, "ms_median": 1516.3814, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1516.3814, "ms_median": 1516.3814, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5803.959, "ms_median": 5817.5038, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5817.5038, "ms_median": 5817.5038, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 31.148, "ms_median": 32.0189, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.0189, "ms_median": 32.0189, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 119.5316, "ms_median": 121.3072, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 121.3072, "ms_median": 121.3072, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 239.9141, "ms_median": 244.4278, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 244.4278, "ms_median": 244.4278, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1053.2335, "ms_median": 1070.4166, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1070.4166, "ms_median": 1070.4166, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    },
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.465083,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":35.861375,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":135.171167,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":136.956208,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":270.665125,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":276.842416,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1265.903458,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1283.690667,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.0339, "ms_median": 187.3647, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 187.3647, "ms_median": 187.3647, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 740.2163, "ms_median": 746.3554, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 746.3554, "ms_median": 746.3554, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1481.8592, "ms_median": 1515.1908, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1515.1908, "ms_median": 1515.1908, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5796.7775, "ms_median": 5821.8781, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5821.8781, "ms_median": 5821.8781, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.9303, "ms_median": 33.807, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 33.807, "ms_median": 33.807, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 127.561, "ms_median": 132.6352, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 132.6352, "ms_median": 132.6352, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 257.114, "ms_median": 269.1155, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 269.1155, "ms_median": 269.1155, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1121.6538, "ms_median": 1166.7146, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1166.7146, "ms_median": 1166.7146, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    },
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.558500,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":37.836417,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":142.209458,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":145.746000,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":287.374584,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":295.669166,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1325.511750,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1374.062916,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.1077, "ms_median": 186.3659, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 186.3659, "ms_median": 186.3659, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 741.037, "ms_median": 746.243, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 746.243, "ms_median": 746.243, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1491.7655, "ms_median": 1514.0328, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1514.0328, "ms_median": 1514.0328, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5798.5205, "ms_median": 5828.6318, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5828.6318, "ms_median": 5828.6318, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 31.7412, "ms_median": 32.836, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.836, "ms_median": 32.836, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 120.9833, "ms_median": 123.2037, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 123.2037, "ms_median": 123.2037, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 244.6553, "ms_median": 247.0971, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 247.0971, "ms_median": 247.0971, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1063.5368, "ms_median": 1082.3016, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1082.3016, "ms_median": 1082.3016, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    },
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.460042,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":35.893334,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":135.500542,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":137.106083,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":270.679208,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":277.331917,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1271.358958,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1283.547625,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.7992, "ms_median": 186.5715, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 186.5715, "ms_median": 186.5715, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 741.5597, "ms_median": 745.8307, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 745.8307, "ms_median": 745.8307, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1486.2787, "ms_median": 1516.2598, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1516.2598, "ms_median": 1516.2598, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5802.2368, "ms_median": 5823.1812, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5823.1812, "ms_median": 5823.1812, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.3662, "ms_median": 34.0007, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 34.0007, "ms_median": 34.0007, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 126.1681, "ms_median": 131.7591, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 131.7591, "ms_median": 131.7591, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 256.4595, "ms_median": 266.4738, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 266.4738, "ms_median": 266.4738, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1111.051, "ms_median": 1156.6195, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1156.6195, "ms_median": 1156.6195, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    },
+    {
+      "tessl": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.944458,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":37.568292,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":141.032584,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":146.180416,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":287.381666,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":295.381208,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1338.675083,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1369.468917,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "torch": [{"workload": "prefill_score_t200", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 183.9777, "ms_median": 185.5465, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 185.5465, "ms_median": 185.5465, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 738.4769, "ms_median": 746.7497, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 746.7497, "ms_median": 746.7497, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1485.5035, "ms_median": 1515.7467, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 1515.7467, "ms_median": 1515.7467, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5798.4845, "ms_median": 5826.049, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "torch-2.14.1-5.19.0-mps-bf16", "ms_min": 5826.049, "ms_median": 5826.049, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}],
+      "mlx": [{"workload": "prefill_score_t200", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 31.6684, "ms_median": 32.204, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t200_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 32.204, "ms_median": 32.204, "iters": 21, "tokens": 200, "answers": 17, "ids_fnv1a32": 1757866882}, {"workload": "prefill_score_t1024", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 119.0581, "ms_median": 121.4489, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t1024_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 121.4489, "ms_median": 121.4489, "iters": 21, "tokens": 1024, "answers": 17, "ids_fnv1a32": 1800809562}, {"workload": "prefill_score_t2048", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 242.2796, "ms_median": 244.8399, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t2048_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 244.8399, "ms_median": 244.8399, "iters": 21, "tokens": 2048, "answers": 17, "ids_fnv1a32": 2655569077}, {"workload": "prefill_score_t8192", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1059.8305, "ms_median": 1069.0908, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}, {"workload": "prefill_score_t8192_median", "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16", "ms_min": 1069.0908, "ms_median": 1069.0908, "iters": 21, "tokens": 8192, "answers": 17, "ids_fnv1a32": 2900155900}]
+    }
+  ],
+  "lane_archive": "$HOME/Code/research/tessl/target-gp/gpurun15/qwen35_prefill_score_h2h.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-23T10:38:11Z",
+    "invocation_shell": "'$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/target/release/bench_paired' --evidence --max-spread 1.25 --rounds 6 --clean-env --out '$HOME/Code/research/tessl/target-gp/gpurun15/qwen35_prefill_score_h2h.json' 'tessl:BENCH_ITERS=21,BENCH_WARMUP=3=target/release/bench_qwen35_layers --prefill-score --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192' 'torch:BENCH_ITERS=21,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_prefill_torch.py --snapshot $HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids tests/fixtures/qwen35_prefill_ids.json --lengths 200,1024,2048,8192' 'mlx:BENCH_ITERS=21,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_prefill_mlx.py --snapshot $HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids tests/fixtures/qwen35_prefill_ids.json --lengths 200,1024,2048,8192'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/target/release/bench_paired",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--rounds",
+      "6",
+      "--clean-env",
+      "--out",
+      "$HOME/Code/research/tessl/target-gp/gpurun15/qwen35_prefill_score_h2h.json",
+      "tessl:BENCH_ITERS=21,BENCH_WARMUP=3=target/release/bench_qwen35_layers --prefill-score --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192",
+      "torch:BENCH_ITERS=21,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_prefill_torch.py --snapshot $HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids tests/fixtures/qwen35_prefill_ids.json --lengths 200,1024,2048,8192",
+      "mlx:BENCH_ITERS=21,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/qwen35_prefill_mlx.py --snapshot $HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids tests/fixtures/qwen35_prefill_ids.json --lengths 200,1024,2048,8192"
+    ],
+    "cwd": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 6,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "tessl",
+          "argv": [
+            "target/release/bench_qwen35_layers",
+            "--prefill-score",
+            "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+            "--ids=tests/fixtures/qwen35_prefill_ids.json",
+            "200",
+            "1024",
+            "2048",
+            "8192"
+          ],
+          "env": {
+            "BENCH_ITERS": "21",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "torch",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/qwen35_prefill_torch.py",
+            "--snapshot",
+            "/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+            "--ids",
+            "tests/fixtures/qwen35_prefill_ids.json",
+            "--lengths",
+            "200,1024,2048,8192"
+          ],
+          "env": {
+            "BENCH_ITERS": "21",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "mlx",
+          "argv": [
+            "/Users/bharath/.venvs/ml-2026-10/bin/python",
+            "bench/qwen35_prefill_mlx.py",
+            "--snapshot",
+            "/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+            "--ids",
+            "tests/fixtures/qwen35_prefill_ids.json",
+            "--lengths",
+            "200,1024,2048,8192"
+          ],
+          "env": {
+            "BENCH_ITERS": "21",
+            "BENCH_WARMUP": "3"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e",
+      "scope": ".",
+      "revision": "e010952387ab84cdaf553d8c09919260a32d0c66",
+      "dirty": false,
+      "status_porcelain": [],
+      "status_line_count": 0,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      "python_packages:torch": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      },
+      "python_packages:mlx": {
+        "numpy": "2.5.3",
+        "torch": "2.14.1",
+        "mlx": "0.32.3"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 4.9599609375,
+        "loadavg_5m": 5.16357421875,
+        "loadavg_15m": 5.86376953125,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2755533854166667,
+        "normalized_loadavg_5m": 0.286865234375,
+        "normalized_loadavg_15m": 0.3257649739583333
+      },
+      "finish": {
+        "loadavg_1m": 4.14013671875,
+        "loadavg_5m": 4.15625,
+        "loadavg_15m": 4.138671875,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2300075954861111,
+        "normalized_loadavg_5m": 0.2309027777777778,
+        "normalized_loadavg_15m": 0.2299262152777778
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/target/release/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792739102986860695,
+        "sha256": "6c52f3e579028721544839dcd839529ab01835a82687fa783868d326d063891b"
+      },
+      "lane:mlx:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      },
+      "lane:mlx:qwen35_prefill_ids.json": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/tests/fixtures/qwen35_prefill_ids.json",
+        "size_bytes": 36323,
+        "mtime_ns": 1792677247208692746,
+        "sha256": "fbd6a4c794b35c88c3b647a4074475d2a2c0952175bf3a7c0072c2a2bc419fc7"
+      },
+      "lane:mlx:qwen35_prefill_mlx.py": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/bench/qwen35_prefill_mlx.py",
+        "size_bytes": 3094,
+        "mtime_ns": 1792677242670864161,
+        "sha256": "1dd1ead233ef447d3b52d872e5887bb3c84e76e1c4dbb47172fd8f40ff53b300"
+      },
+      "lane:tessl:bench_qwen35_layers": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/target/release/bench_qwen35_layers",
+        "size_bytes": 4052112,
+        "mtime_ns": 1792739101979997761,
+        "sha256": "433ab4775e78e00135846db399580056469ed75e68a584b56b9cd41a89437427"
+      },
+      "lane:torch:python": {
+        "path": "$HOME/.venvs/ml-2026-10/bin/python",
+        "size_bytes": 34640,
+        "mtime_ns": 1791677228881524328,
+        "sha256": "1b5cb11d163e5ba34e2a05fc533c0ed89574d4425f9749a9d89405f651980e0d"
+      },
+      "lane:torch:qwen35_prefill_ids.json": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/tests/fixtures/qwen35_prefill_ids.json",
+        "size_bytes": 36323,
+        "mtime_ns": 1792677247208692746,
+        "sha256": "fbd6a4c794b35c88c3b647a4074475d2a2c0952175bf3a7c0072c2a2bc419fc7"
+      },
+      "lane:torch:qwen35_prefill_torch.py": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-a5790e135874d637e/bench/qwen35_prefill_torch.py",
+        "size_bytes": 3465,
+        "mtime_ns": 1792677235351015856,
+        "sha256": "e4275563da7f30094bcac1fd459e72e76e8aac262756165286ca3efad9c0d253"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-23T11:07:56Z"
+  }
+}

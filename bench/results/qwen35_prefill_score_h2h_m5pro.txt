@@ -1,0 +1,34 @@
+# Qwen3.5-2B prefill+score: tessl vs torch 2.14.1 (MPS) vs mlx-lm 0.32, M5 Pro, 2026-10-23
+#
+# Card ft-05f5b7709a71a3774120e617a5342816, AC1. JSON with full provenance: qwen35_prefill_score_h2h_m5pro.json
+# (revision e010952, clean tree; the harness is on main from fc778a2).
+#
+# Work per lane (the definition the 2026-10-04 ojas run used): embedding gather, the 24 layers with state
+# kept, the final norm, then 17 answer-letter rows (A..Q) at the last position only (no full-vocab head).
+# Model: Qwen3.5-2B-Base snapshot b1485b2, bf16. Ids: tests/fixtures/qwen35_prefill_ids.json, read by all
+# three lanes, FNV-1a digest checked per length (a lane refuses on any mismatch).
+# Lanes: tessl `bench_qwen35_layers --prefill-score`; torch 2.14.1 + transformers 5.19.0 on MPS, bf16, sdpa;
+# mlx-lm 0.32.0 / mlx 0.32.3 on the checkpoint's own bf16 weights (not quantized).
+#
+#   bench_paired --evidence --max-spread 1.25 --rounds 6 --clean-env <tessl> <torch> <mlx>
+#   each lane BENCH_ITERS=21 BENCH_WARMUP=3; lengths interleaved inside each process, order reversed on odd rounds
+#
+# Gate: --max-spread 1.25, declared in the run log BEFORE the run (Fable, 2026-10-23). The 1.10 default sat
+# under the measured idle-machine round-to-round noise of the mlx lane (1.11-1.24 at 7% GPU). Every ratio is
+# shown with its [lowest, highest] round; a difference inside that interval would be reported as noise.
+# Conditions: mac_heavy lock; GPU utilization re-checked INSIDE the lock, 0% after a 60 s wait; load 6.8.
+# Earlier attempts (loaded machine, GPU busy from outside jobs, or under the 1.10 gate) were refused and
+# are not results.
+#
+# Result, min rounds (median rounds agree within the interval):
+#
+#   T      tessl ms   torch ms   tessl vs torch            mlx ms    mlx / tessl [lo, hi]
+#   200      35.99     183.35    5.09x faster [4.98,5.18]    32.05   0.890 [0.853, 0.929]
+#   1024    138.27     740.50    5.35x faster [5.21,5.48]   122.94   0.887 [0.843, 0.944]
+#   2048    277.35    1483.92    5.35x faster [5.17,5.49]   249.39   0.896 [0.843, 0.950]
+#   8192   1298.44    5800.38    4.47x faster [4.33,4.59]  1082.29   0.836 [0.791, 0.886]
+#
+# tessl LOSES to mlx-lm at every length (10-16%; every interval is entirely below 1). This supersedes the
+# unpaired 8k comparison in docs/qwen35.md (tessl 6,213 vs MLX 5,285 tok/s), which does not hold paired.
+# Follow-up: ft-2bc8f1e951d0f5afff0f72303155f940 (profile the MLX lead at 1k and 8k).
+# torch 2.15: NOT RUN (not installed; installing it is the owner's dependency decision).

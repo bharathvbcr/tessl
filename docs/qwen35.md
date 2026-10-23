@@ -1532,6 +1532,16 @@ unresolved until re-run. For comparison, on the same machine MLX measured
 7,606 / 7,528 / 5,285 tok/s at 1k / 2k / 8k, and torch MPS about 2.8k at 1k
 (both by the Lappi project).
 
+That comparison was unpaired, and it is superseded. The paired, interleaved
+prefill+score run of 2026-10-23 used the same Base snapshot, the same token
+ids on every side and an idle GPU checked inside the lock, with
+`bench_paired --evidence --max-spread 1.25` declared before the run
+(`bench/results/qwen35_prefill_score_h2h_m5pro.txt`). It puts **mlx-lm 0.32
+ahead of tessl at every length**, by 0.890× / 0.887× / 0.896× / 0.836× of
+tessl's time at T = 200 / 1024 / 2048 / 8192, each interval entirely below 1.
+In the same run, tessl is 5.09× / 5.35× / 5.35× / 4.47× faster than torch
+2.14.1 on MPS. The 8k lead in the table above does not hold against MLX.
+
 A second session at c6fc555 ran with the GPU 93–99% busy from the desktop
 compositor and app renderers, so its absolute times are not recorded here.
 Its same-session stage ratios are: the GDN chunk scan is ~75% of the chunked

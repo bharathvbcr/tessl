@@ -675,7 +675,7 @@ impl Qwen35Model {
     /// accumulation and residual stream), decode runs the Q4 GEMV and prefill
     /// the Q4 GEMM (the small-batch kernel up to 8 rows, the TensorOps one
     /// above). Training, parameter access and the optimizer refuse it
-    /// ([`Self::require_dense`]); so does [`Staged::score_answers`], which
+    /// (`require_dense`); so does [`Staged::score_answers`], which
     /// reads a dense head.
     ///
     /// The key spelling (mlx-lm's `language_model.model.*` or Hugging Face's
@@ -683,7 +683,7 @@ impl Qwen35Model {
     /// is the checkpoint's `config.json` text, whose `quantization` must be
     /// the one supported kind. `mtp.*` and vision tensors are skipped by name
     /// and reported, never silently; every other tensor under the prefix is
-    /// still refused ([`Loader::refuse_unread`]).
+    /// still refused (`Loader::refuse_unread`).
     pub fn load_mlx_q4(
         rt: &Arc<GpuRuntime>,
         st: &dyn TensorSource,

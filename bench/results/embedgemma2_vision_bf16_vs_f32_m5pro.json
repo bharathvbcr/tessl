@@ -1,0 +1,574 @@
+{
+  "rounds": 6,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "f32",
+      "argv": [
+        "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+      ],
+      "env": {
+        "BENCH_PRECISION": "f32",
+        "BENCH_ITERS": "20",
+        "BENCH_WARMUP": "2"
+      }
+    },
+    {
+      "name": "f32_control",
+      "argv": [
+        "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+      ],
+      "env": {
+        "BENCH_PRECISION": "f32",
+        "BENCH_ITERS": "20",
+        "BENCH_WARMUP": "2"
+      }
+    },
+    {
+      "name": "bf16",
+      "argv": [
+        "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+      ],
+      "env": {
+        "BENCH_PRECISION": "bf16",
+        "BENCH_ITERS": "20",
+        "BENCH_WARMUP": "2"
+      }
+    }
+  ],
+  "env": {},
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "1img",
+      "f32": {
+        "ms_min_median": 157.1078,
+        "ms_min_min": 156.6573,
+        "ms_min_max": 157.4025,
+        "ms_min_all": [
+          157.4025,
+          157.2585,
+          157.1015,
+          156.6699,
+          157.1141,
+          156.6573
+        ],
+        "device_peak_mib_max": 151.3,
+        "peak_footprint_mib_max": 876.7,
+        "forwards_max": 1
+      },
+      "f32_control": {
+        "ms_min_median": 157.01139999999998,
+        "ms_min_min": 156.6807,
+        "ms_min_max": 157.2185,
+        "ms_min_all": [
+          156.6807,
+          157.1803,
+          157.1676,
+          157.2185,
+          156.7025,
+          156.8552
+        ],
+        "device_peak_mib_max": 151.3,
+        "peak_footprint_mib_max": 876.7,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.9999617383394035,
+          "lo": 0.9954143040930099,
+          "hi": 1.0035016298599795
+        }
+      },
+      "bf16": {
+        "ms_min_median": 53.583200000000005,
+        "ms_min_min": 53.1823,
+        "ms_min_max": 54.0962,
+        "ms_min_all": [
+          53.6019,
+          54.0962,
+          53.3617,
+          53.5645,
+          54.0713,
+          53.1823
+        ],
+        "device_peak_mib_max": 127.2,
+        "peak_footprint_mib_max": 557.5,
+        "forwards_max": 1,
+        "vs_base": {
+          "median": 0.34121717110609817,
+          "lo": 0.3394817860386972,
+          "hi": 0.34415307092106945
+        },
+        "vs_prev": {
+          "median": 0.3414050709588877,
+          "lo": 0.33905347097195376,
+          "hi": 0.3450570348271406
+        }
+      }
+    },
+    {
+      "workload": "8img",
+      "f32": {
+        "ms_min_median": 1267.7314000000001,
+        "ms_min_min": 1265.7037,
+        "ms_min_max": 1268.1893,
+        "ms_min_all": [
+          1267.7279,
+          1265.7037,
+          1268.1467,
+          1267.7349,
+          1266.3335,
+          1268.1893
+        ],
+        "device_peak_mib_max": 1096.1,
+        "peak_footprint_mib_max": 1892.3,
+        "forwards_max": 2
+      },
+      "f32_control": {
+        "ms_min_median": 1267.8555000000001,
+        "ms_min_min": 1266.1987,
+        "ms_min_max": 1268.8913,
+        "ms_min_all": [
+          1266.1987,
+          1267.68,
+          1268.8913,
+          1268.7853,
+          1268.031,
+          1267.1475
+        ],
+        "device_peak_mib_max": 1096.1,
+        "peak_footprint_mib_max": 1892.1,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 1.000707860219491,
+          "lo": 0.9987937474595296,
+          "hi": 1.0015614238940758
+        }
+      },
+      "bf16": {
+        "ms_min_median": 431.56010000000003,
+        "ms_min_min": 430.3084,
+        "ms_min_max": 433.7498,
+        "ms_min_all": [
+          433.6312,
+          431.3047,
+          430.3084,
+          431.8155,
+          431.1542,
+          433.7498
+        ],
+        "device_peak_mib_max": 910.1,
+        "peak_footprint_mib_max": 1417.8,
+        "forwards_max": 2,
+        "vs_base": {
+          "median": 0.3406912428380459,
+          "lo": 0.33932067953967787,
+          "hi": 0.34205384294216445
+        },
+        "vs_prev": {
+          "median": 0.34028462416175564,
+          "lo": 0.33912156226463214,
+          "hi": 0.342466944564072
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":157.4025,"ms_median":158.3109,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.7},{"workload":"8img","backend":"tessl-f32","ms_min":1267.7279,"ms_median":1271.1442,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1884.4}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":156.6807,"ms_median":157.0072,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.2},{"workload":"8img","backend":"tessl-f32","ms_min":1266.1987,"ms_median":1271.8901,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1890.8}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":53.6019,"ms_median":54.2069,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":556.9},{"workload":"8img","backend":"tessl-bf16","ms_min":433.6312,"ms_median":437.8533,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1409.5}]
+    },
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":157.2585,"ms_median":157.4774,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.1},{"workload":"8img","backend":"tessl-f32","ms_min":1265.7037,"ms_median":1271.6404,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1884.3}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":157.1803,"ms_median":157.3983,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.1},{"workload":"8img","backend":"tessl-f32","ms_min":1267.6800,"ms_median":1271.6100,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1890.2}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":54.0962,"ms_median":54.4222,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":556.3},{"workload":"8img","backend":"tessl-bf16","ms_min":431.3047,"ms_median":436.7579,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1409.3}]
+    },
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":157.1015,"ms_median":157.4610,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.2},{"workload":"8img","backend":"tessl-f32","ms_min":1268.1467,"ms_median":1271.9009,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1890.8}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":157.1676,"ms_median":157.4377,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.1},{"workload":"8img","backend":"tessl-f32","ms_min":1268.8913,"ms_median":1271.7973,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1888.4}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":53.3617,"ms_median":55.6210,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":557.5},{"workload":"8img","backend":"tessl-bf16","ms_min":430.3084,"ms_median":448.8025,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1413.6}]
+    },
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":156.6699,"ms_median":157.1550,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.1},{"workload":"8img","backend":"tessl-f32","ms_min":1267.7349,"ms_median":1272.1493,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1891.2}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":157.2185,"ms_median":158.3093,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.6},{"workload":"8img","backend":"tessl-f32","ms_min":1268.7853,"ms_median":1272.8329,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1888.0}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":53.5645,"ms_median":56.0185,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":556.9},{"workload":"8img","backend":"tessl-bf16","ms_min":431.8155,"ms_median":449.8223,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1413.8}]
+    },
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":157.1141,"ms_median":157.4511,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.0},{"workload":"8img","backend":"tessl-f32","ms_min":1266.3335,"ms_median":1271.2349,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1887.5}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":156.7025,"ms_median":156.9788,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.1},{"workload":"8img","backend":"tessl-f32","ms_min":1268.0310,"ms_median":1271.9917,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1891.2}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":54.0713,"ms_median":54.8425,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":556.9},{"workload":"8img","backend":"tessl-bf16","ms_min":431.1542,"ms_median":441.0736,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1417.8}]
+    },
+    {
+      "f32": [{"workload":"1img","backend":"tessl-f32","ms_min":156.6573,"ms_median":157.0725,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.6},{"workload":"8img","backend":"tessl-f32","ms_min":1268.1893,"ms_median":1271.1286,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1892.3}],
+      "f32_control": [{"workload":"1img","backend":"tessl-f32","ms_min":156.8552,"ms_median":157.5899,"iters":20,"forwards":1,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":151.3,"peak_footprint_mib":876.7},{"workload":"8img","backend":"tessl-f32","ms_min":1267.1475,"ms_median":1272.0572,"iters":20,"forwards":2,"weight_mib":609.9,"loaded_mib":626.4,"device_peak_mib":1096.1,"peak_footprint_mib":1892.1}],
+      "bf16": [{"workload":"1img","backend":"tessl-bf16","ms_min":53.1823,"ms_median":54.1601,"iters":20,"forwards":1,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":127.2,"peak_footprint_mib":556.4},{"workload":"8img","backend":"tessl-bf16","ms_min":433.7498,"ms_median":438.6120,"iters":20,"forwards":2,"weight_mib":320.1,"loaded_mib":336.6,"device_peak_mib":910.1,"peak_footprint_mib":1417.8}]
+    }
+  ],
+  "lane_archive": "bench/results/embedgemma2_vision_bf16_vs_f32_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-23T11:58:11Z",
+    "invocation_shell": "'$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_paired' --evidence --max-spread 1.25 --clean-env --rounds 6 --out bench/results/embedgemma2_vision_bf16_vs_f32_m5pro.json 'f32:BENCH_PRECISION=f32,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision' 'f32_control:BENCH_PRECISION=f32,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision' 'bf16:BENCH_PRECISION=bf16,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision'",
+    "invocation_argv": [
+      "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_paired",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--clean-env",
+      "--rounds",
+      "6",
+      "--out",
+      "bench/results/embedgemma2_vision_bf16_vs_f32_m5pro.json",
+      "f32:BENCH_PRECISION=f32,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision",
+      "f32_control:BENCH_PRECISION=f32,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision",
+      "bf16:BENCH_PRECISION=bf16,BENCH_ITERS=20,BENCH_WARMUP=2=$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+    ],
+    "cwd": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 6,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "f32",
+          "argv": [
+            "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+          ],
+          "env": {
+            "BENCH_PRECISION": "f32",
+            "BENCH_ITERS": "20",
+            "BENCH_WARMUP": "2"
+          }
+        },
+        {
+          "name": "f32_control",
+          "argv": [
+            "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+          ],
+          "env": {
+            "BENCH_PRECISION": "f32",
+            "BENCH_ITERS": "20",
+            "BENCH_WARMUP": "2"
+          }
+        },
+        {
+          "name": "bf16",
+          "argv": [
+            "/Users/bharath/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision"
+          ],
+          "env": {
+            "BENCH_PRECISION": "bf16",
+            "BENCH_ITERS": "20",
+            "BENCH_WARMUP": "2"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a",
+      "scope": ".",
+      "revision": "010129e9ce104d0b8216b238a77662aea72686b3",
+      "dirty": true,
+      "status_porcelain": [
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r01-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r02-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r03-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r04-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r05-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-0-base_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-0-base_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-0-base_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-1-control_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-1-control_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-1-control_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-2-fused_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-2-fused_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-2-fused_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-3-tip_bf16.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-3-tip_bf16.stderr",
+        "?? bench/results/embedgemma2_text_fusion_bf16_m5pro.json.lanes/r06-3-tip_bf16.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.attempt.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r01-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r02-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r03-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r04-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r05-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-0-base_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-0-base_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-0-base_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-1-control_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-1-control_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-1-control_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-2-fused_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-2-fused_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-2-fused_f32.stdout",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-3-tip_f32.meta.json",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-3-tip_f32.stderr",
+        "?? bench/results/embedgemma2_text_fusion_f32_m5pro.json.lanes/r06-3-tip_f32.stdout",
+        "?? bench/results/embedgemma2_vision_bf16_vs_f32_m5pro.json.attempt.json"
+      ],
+      "status_line_count": 148,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 5.19091796875,
+        "loadavg_5m": 4.48681640625,
+        "loadavg_15m": 5.38720703125,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.2883843315972222,
+        "normalized_loadavg_5m": 0.249267578125,
+        "normalized_loadavg_15m": 0.2992892795138889
+      },
+      "finish": {
+        "loadavg_1m": 6.0712890625,
+        "loadavg_5m": 4.89599609375,
+        "loadavg_15m": 5.07958984375,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.3372938368055556,
+        "normalized_loadavg_5m": 0.2719997829861111,
+        "normalized_loadavg_15m": 0.2821994357638889
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_paired",
+        "size_bytes": 890128,
+        "mtime_ns": 1792754552056855569,
+        "sha256": "7b51dd82c51788de42c9afec377fdaa36e382a418accfff66f05c21815a2bd20"
+      },
+      "lane:bf16:bench_embedgemma2_vision": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision",
+        "size_bytes": 3761520,
+        "mtime_ns": 1792754552065089978,
+        "sha256": "a8351475ee3a388bc9a94cd91a223ab46447cb68f6aded9a1c27bb28db13eecd"
+      },
+      "lane:f32:bench_embedgemma2_vision": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision",
+        "size_bytes": 3761520,
+        "mtime_ns": 1792754552065089978,
+        "sha256": "a8351475ee3a388bc9a94cd91a223ab46447cb68f6aded9a1c27bb28db13eecd"
+      },
+      "lane:f32_control:bench_embedgemma2_vision": {
+        "path": "$HOME/Code/research/tessl/.claude/worktrees/agent-aa6723288403e556a/target-gp/eg2_frozen/bench_embedgemma2_vision",
+        "size_bytes": 3761520,
+        "mtime_ns": 1792754552065089978,
+        "sha256": "a8351475ee3a388bc9a94cd91a223ab46447cb68f6aded9a1c27bb28db13eecd"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-23T12:06:07Z"
+  }
+}

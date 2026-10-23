@@ -1423,6 +1423,14 @@ result. Measured by the same bench: process peak footprint 1029 to 685 MiB at
 one image and 2996 to 2329 MiB at eight, device peak 302 to 254 MiB and 2192 to
 1820 MiB (`ExactF32` to `Bf16`); resident weights 609.9 to 320.1 MiB.
 
+The clean-round figures above came from a loaded run. They are now confirmed by a drift-gated run
+on a quiet host, 2026-10-23 (card ft-3aa3f738,
+`bench/results/embedgemma2_vision_bf16_vs_f32_m5pro.json`):
+- **Gate:** `bench_paired --evidence --rounds 6 --max-spread 1.25 --clean-env`.
+- **Lanes:** `ExactF32`, an `ExactF32` control (the same binary again), and `Bf16`.
+- **Published:** `Bf16` takes **0.341x** of `ExactF32`'s time at 1 image [0.339, 0.344] (157.1 against 53.6 ms) and 0.341x at 8 images [0.339, 0.342] (1267.7 against 431.6 ms). That is 2.9x faster.
+- **Control:** 1.000x [0.995, 1.004] and 1.001x.
+
 **Where the rest of the time is** (not done, with the evidence): under `Bf16`
 the bf16 attention (`encoder_attn_bf16`, 13.5 to 14.9 TFLOP/s against the GEMMs'
 25 to 26) is the largest stage at 30%, and it is the text encoder's kernel; the
@@ -2323,6 +2331,22 @@ is itself taken on the shared GPU: about 1 % of the `ExactF32` forward and about
 `Bf16` forward at 8x1024 are the most the row passes can give (inferred from the stage
 sums, not measured end to end). `bench_paired --evidence --rounds 6 --max-spread 1.25`
 on an idle host is the run that settles it.
+
+**That run, 2026-10-23 (card ft-3aa3f738).** Idle host: 1-minute load 3.77 at the start, the GPU
+idle checked before taking the lock. Same gate, `--evidence --rounds 6 --max-spread 1.25 --clean-env`.
+The lanes, in order:
+- **base:** `5229a1c`;
+- **control:** a byte copy of the base;
+- **fused:** the fusion commit `72ea81d` itself, whose parent is `5229a1c`, so `vs_base` is the fusion alone;
+- **tip:** main.
+
+- **`Bf16`, published** (`bench/results/embedgemma2_text_fusion_bf16_m5pro.json`). The fusion is
+  0.950x / 0.902x / 0.898x / 0.915x / 0.930x / 0.915x / 0.927x / 0.938x of the base's time on the eight
+  workloads (1x16, 64x32, 32x256, 8x1024, 2x4096, 128x8-512, 1x4096+63x32, ragged). Every interval
+  is entirely below 1.0, so it is **5 to 10 % faster end to end**. The control reads 0.996x to 1.011x. The
+  tip matches the fused build to within the spread, so no later commit moved it.
+- **`ExactF32`, refused, with its numbers.** One series was over the limit: the *tip* lane against the
+  base at 1x16 spread 1.259x. Nothing from the `ExactF32` run is published.
 
 ### What is left (text-encoder fusion)
 

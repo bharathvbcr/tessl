@@ -4703,7 +4703,8 @@ pub(crate) fn reduce_tptg(max_threads: usize, cols: usize) -> usize {
 ///
 /// A row whose exponentials sum to zero — every entry `-inf`, which is what a
 /// fully masked attention row looks like — yields a uniform distribution rather
-/// than NaN.
+/// than NaN. That is the only row the fallback covers: a row holding a NaN or
+/// a `+inf` is NaN throughout (as in torch), never a valid-looking distribution.
 ///
 /// `x` and `out` may be the same buffer.
 ///

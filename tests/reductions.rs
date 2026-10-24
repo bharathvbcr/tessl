@@ -261,10 +261,11 @@ fn run_reductions(
 /// scratch or a mis-strided read.
 ///
 /// Kernels compile with fast math (`build.rs`), so the compiler is allowed to assume no NaN or
-/// inf: IEEE propagation is therefore pinned only where the arithmetic is unambiguous (the sum
-/// and the +inf maximum). Where a fast-math `fmax` or a NaN denominator may legitimately take
-/// either of two results, the test pins the set of acceptable results and nothing else, so a
-/// value invented from nowhere still fails.
+/// inf, yet the device was observed to propagate them: the sum is NaN/+inf/-inf/NaN by row, the
+/// +inf maximum wins, and softmax is NaN throughout for any row holding a NaN or +inf. Only the
+/// max of a NaN row is left as a set (NaN, or the finite maximum, which is what `fmax` gives):
+/// that is the one result fast math may legitimately take either way. The all--inf row is
+/// tested above (`row_max_and_softmax_of_masked_rows_never_invent_a_value`) and unchanged.
 #[test]
 fn planted_non_finite_inputs_poison_exactly_their_rows() {
     with_gpu(|rt| {
@@ -323,28 +324,28 @@ fn planted_non_finite_inputs_poison_exactly_their_rows() {
                 m[1]
             );
 
-            // Softmax of a poisoned row: no invented probability. Each entry is NaN, or the
-            // row is the uniform fallback the kernel documents for a non-positive
-            // denominator (a NaN denominator compares false against zero), or, for -inf
-            // alone, the finite entries' own softmax with a zero at the -inf position.
-            let uniform = 1.0 / cols as f32;
-            for r in 1..=4usize {
+            // Softmax: a row holding a NaN or a +inf is NaN in every entry (torch's answer),
+            // never a valid-looking distribution. Before the kernel fix these three rows came
+            // back as the uniform 1/cols with no NaN at all (observed on the device, cols 33,
+            // 1000 and 5000): the all--inf fallback caught any non-positive denominator,
+            // NaN included.
+            for (r, what) in [(1usize, "a NaN"), (2, "a +inf"), (4, "a +inf and a -inf")] {
                 let out = row(&sm, r);
-                let all_uniform = out.iter().all(|p| (p - uniform).abs() <= 1e-6 * uniform.max(1.0));
-                let any_nan = out.iter().any(|p| p.is_nan());
-                let finite_valid = out.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p))
-                    && (out.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() < 1e-4;
-                eprintln!(
-                    "OBSERVED softmax {label} row {r}: nan_count={} all_uniform={all_uniform} finite_valid={finite_valid}",
-                    out.iter().filter(|p| p.is_nan()).count()
-                );
                 assert!(
-                    any_nan || all_uniform || finite_valid,
-                    "{label}: softmax of poisoned row {r} is neither NaN, uniform nor a distribution: {:?}",
+                    out.iter().all(|p| p.is_nan()),
+                    "{label}: softmax of a row holding {what} must be NaN throughout, got {} NaN of {cols}, first {:?}",
+                    out.iter().filter(|p| p.is_nan()).count(),
                     &out[..4.min(cols)]
                 );
             }
-            // The -inf row: its -inf position carries exactly zero mass.
+            // A -inf next to finite entries is an ordinary masked row: a distribution over the
+            // finite entries with exactly zero mass at the -inf position.
+            let out3 = row(&sm, 3);
+            assert!(
+                out3.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                    && (out3.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() < 1e-4,
+                "{label}: softmax of a masked row is not a distribution"
+            );
             assert_eq!(sm[at(3, c_ninf)], 0.0, "{label}: softmax at a planted -inf");
         }
     });
@@ -353,6 +354,11 @@ fn planted_non_finite_inputs_poison_exactly_their_rows() {
 /// Subnormal inputs. Fast math may flush them to zero, so the result is either the f32
 /// reference or the flushed one; what it must never be is a magnitude the input does not
 /// have. Budget: `reduction_bound(n, scale)` with scale = sum of |terms|.
+///
+/// Observed on the device (Apple GPU, fast math): `row_sum_f32` flushes subnormal inputs to
+/// zero (the row of 1000 x 1e-40 sums to 0), while `row_max_f32` keeps a subnormal (max of
+/// that row is 1e-40). The assertions accept both branches, so the test records and does not
+/// change this behaviour.
 #[test]
 fn subnormal_inputs_are_summed_or_flushed_never_invented() {
     with_gpu(|rt| {

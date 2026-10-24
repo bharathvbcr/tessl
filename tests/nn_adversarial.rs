@@ -475,6 +475,10 @@ fn oversize_threadgroup_names_the_kernel_the_request_and_the_limit() {
 /// squares to zero (flushed or not), so `inv = rsqrt(eps)` and `out = x * inv * w`; fast math
 /// may flush the input itself, so the result is that or exactly 0. Budget for the subnormal
 /// row: `reduction_bound(dim, |reference|)` (scale = the reference output).
+///
+/// Observed on the device (fast math): the subnormal row is flushed completely, 1000 of 1000
+/// outputs are exactly 0 and none equals the reference. The assertion accepts either branch;
+/// the test records that behaviour and does not change it.
 #[test]
 fn rms_norm_planted_non_finite_and_subnormal_rows() {
     with_gpu(|rt| {

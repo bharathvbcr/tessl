@@ -201,6 +201,132 @@ it).
   the process's main thread is within 1.8% of it, either way. An earlier recording
   at a load of 70 to 99 put the boundary at 32 to 113 us.
 
+## tessl-embed: the Ollama `/api/embed` server
+
+`cmd/tessl-embed` serves the text encoder over Ollama's embedding protocol, so a
+client that speaks to Ollama (DevPrism's `native_agent/ollama.rs`, kb-sync's
+`kb-ingest-devprism`) switches to tessl by base URL and model name alone.
+
+```sh
+EMBEDGEMMA2_SNAPSHOT=~/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/<rev> make -C go serve
+# or: go/engine/target/release/tessl-embed -snapshot <dir> [-port 11435] [-max-tokens 8192] [-pidfile f]
+curl -s http://127.0.0.1:11435/api/embed -d '{"model":"embeddinggemma-2-tessl:query","input":["how do I speed up attention?"]}'
+```
+
+It listens on `127.0.0.1` only (port 11435 by default; 11434, Ollama's, is
+refused) and loads the snapshot `TextOnly` in exact f32 (about 0.8 GB on the
+device). The snapshot directory comes from `-snapshot` or `EMBEDGEMMA2_SNAPSHOT`;
+nothing is hard-coded. A client points at it with base URL
+`http://127.0.0.1:11435` and one of these model names:
+
+| name | prompt written in front of each text |
+|---|---|
+| `embeddinggemma-2-tessl` (or `:latest`) | the snapshot's default prompt: none for `google/embeddinggemma-2` (`default_prompt_name: null`), which is also what Ollama's `embeddinggemma-2` does (`TEMPLATE {{ .Prompt }}`) |
+| `embeddinggemma-2-tessl:document` | `title: none \| text: ` (the model card's document prompt) |
+| `embeddinggemma-2-tessl:query` | `task: search result \| query: ` (the model card's retrieval query prompt) |
+| `embeddinggemma-2-tessl:<name>` | any other prompt the snapshot's `config_sentence_transformers.json` names (`STS`, `Clustering`, `CodeRetrieval`, ...), served but not listed |
+
+**Why roles live in the name.** Ollama's request has no field for a task prompt,
+and the model card asks for different prompts on the two sides of a retrieval
+(`query` for searches, `document` for the corpus). A client that uses one name
+for both its stored vectors and its searches (DevPrism records one model in
+`career_meta` and searches with it) gets the untagged name: no prompt on either
+side, consistent, and comparable with Ollama's own build. Using `:document` to
+ingest and `:query` to search is what the model card recommends for retrieval;
+it needs a client that sends two names, and stored vectors are only valid for
+searches made with the matching pair. The name is not Ollama's
+`embeddinggemma-2` on purpose: Ollama's is an nvfp4 MLX build, a different
+vector for the same text, and a store must never mix the two under one label.
+
+What it answers, and how it differs from Ollama:
+
+- `POST /api/embed`: `{"model", "input": "text" | ["text", ...], "truncate"
+  (default true), "dimensions"}`; `keep_alive` and `options` are accepted and
+  ignored. The reply is Ollama's `{"model", "embeddings", "total_duration",
+  "load_duration", "prompt_eval_count"}`: L2-normalized float32 rows (JSON
+  carries each value exactly), 768 wide or the `dimensions` Matryoshka prefix,
+  renormalized; `total_duration` is the server's wall time in ns; `load_duration`
+  is always 0 (the model loads once, at start); `prompt_eval_count` is the tokens
+  the encoder was given, prompt, `<bos>` and `<eos>` included.
+- Text is tokenized by tessl's tokenizer, which is held to Hugging Face's
+  (see docs/embedgemma2.md, Tokenizer), then encoded: `Tokenize` + `Encode`,
+  bit for bit `EmbedTexts`. A text longer than `-max-tokens` (default 8192, the
+  model card's context) is cut to its first `max-tokens - 1` ids and `<eos>` when
+  `truncate` is true, and refused with Ollama's `the input length exceeds the
+  context length` when it is false (sentence-transformers itself does not
+  truncate this checkpoint).
+- Refused with a JSON `{"error"}`: an unknown model (404, `model 'x' not found`),
+  a missing, `null`, `""` or `[]` input (400; Ollama answers those 200 with no
+  embeddings, as a model-load ping, and this server has nothing to load), a
+  non-string input, more than `-max-batch` texts (default and maximum 256,
+  tessl's `MaxBatch`), more than `-max-request-tokens` tokens (default 262144),
+  `dimensions` past 768 (Ollama's wording) or negative, a body past
+  `-max-body-bytes` (413, default 32 MiB), a text with a media placeholder such
+  as `<|image|>` (400, tessl's message). An empty string inside a non-empty batch
+  is a text and gets its row (`<bos> <eos>`).
+- Load: `-max-concurrent` requests (default 2) work on the model at once,
+  `-max-queue` (default 64) wait, more get 503; each request has `-timeout`
+  (default 120 s, waiting included) and then gets 504. A client that disconnects
+  cancels its call: still queued, it never reaches the device; already running
+  on the GPU, it finishes and is discarded (see Cancellation).
+- `GET /api/tags` lists `:latest`, `:document`, `:query` in that order (DevPrism
+  picks the first name containing `embed`), with `capabilities: ["embedding"]`,
+  `details.embedding_length` and `context_length`; `POST /api/show` answers
+  `capabilities`, `model_info` (`embeddinggemma2.context_length`, `.embedding_length`)
+  and which prompt the name applies; `GET /api/version` the server's version.
+- A tessl panic or a poisoned runtime answers 500 once and the process exits
+  non-zero (supervise it, e.g. with launchd); it does not keep answering from a
+  dead model. Request texts are never logged: one line per request with method,
+  path, status and time.
+
+Tests (`cmd/tessl-embed`): `make -C go unit` runs the HTTP contract against a
+fake model (shapes, every refusal, limits, the queue, timeouts, a client that
+leaves, error mapping, `/api/tags` and `/api/show`, and a replica of
+kb-ingest-devprism's `embed_texts()` request); `make -C go device` runs the
+server on the tiny checkpoint, bit for bit against `EmbedTexts` under every name
+and a Matryoshka width, and its truncation against `Encode` of the cut ids;
+`make -C go serve-real` (with `EMBEDGEMMA2_SNAPSHOT`) holds it, over HTTP, to
+sentence-transformers on the real checkpoint (`testdata/hf_reference.json`,
+written by `scripts/gen_tessl_embed_fixtures.py`: 10 texts with CJK, Devanagari,
+Bengali, emoji ZWJ sequences, combining marks, whitespace runs, code and the
+empty text, under each of the three names) and bit for bit to `EmbedTexts`.
+Recorded 2026-10-24 on snapshot `914f7f89`: the ids of all 30 cases (522 ids)
+equal sentence-transformers', every row is at cosine 1.000000000 and at most
+5.4e-7 max abs from `SentenceTransformer.encode` in float32, and every row over
+HTTP equals `EmbedTexts` bit for bit. kb-sync's own `apply.py` `embed_texts()`,
+imported and called against the running server (tiny checkpoint), got 8 rows for
+8 texts, unit norm, and a 404 for an unknown model.
+
+`make -C go serve-bench` starts the server, runs `cmd/embed_bench` against it and
+Ollama on 11434 (`nomic-embed-text` and `embeddinggemma-2:270m`, the same seeded
+synthetic texts: one 10-word query, 8 and 64 chunks of 120 words), interleaved,
+min-of-N, with the load average recorded and gated (`MAX_LOAD`), and writes
+`bench/results/tessl_embed_m5pro.{json,txt}`; it then stops the server by its
+pid.
+
+Recorded 2026-10-24 on the M5 Pro, snapshot `914f7f89`, Ollama 0.40.6, 9 rounds
+(180, 72 and 18 calls per arm), **on a busy machine**: the load gate was off
+(`MAX_LOAD=0`) and the 1-minute load average was 42.6 before and 60.9 after, from
+other sessions' builds. Wall time per request over HTTP, minimum (median of round
+medians):
+
+| workload | tessl-embed (f32) | Ollama embeddinggemma-2:270m (nvfp4, MLX) | Ollama nomic-embed-text (F16) |
+|---|---|---|---|
+| 1 query, 13 tokens | 4.60 ms (5.26) | 13.42 ms (22.76) | 8.38 ms (20.83) |
+| 8 chunks, 1019 tokens | 59.6 ms (61.4) | 351.2 ms (421.7) | 85.8 ms (174.9) |
+| 64 chunks, 8184 tokens | 441.6 ms (452.6) | 3241.8 ms (3487.6) | 713.9 ms (1288.9) |
+
+Against the same model under Ollama, tessl-embed is 2.9x faster on a query and
+5.9x to 7.3x faster on batches by minimum. Against nomic-embed-text, a different
+model with 137M parameters and its own tokenizer (more tokens for the same texts),
+it is 1.8x faster on a query and 1.4x to 1.6x on batches. Its medians sit within
+15% of its minima, while Ollama's are 1.2x to 2.5x theirs, so the median ratios are
+larger. Both EmbeddingGemma 2 servers count the same tokens (13, 1019, 8184), so
+they were given the same ids. Their rows agree at cosine 0.9825 to 0.9886 (f32
+against nvfp4), which is why the two must not share a vector store. Taken under
+load, these are ratios of minima, not predictions; rerun with the gate on
+(`MAX_LOAD=12`) on a quiet machine to replace them.
+
 ## Not done
 
 - Linux and Windows: tessl is Metal.

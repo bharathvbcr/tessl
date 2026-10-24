@@ -1,0 +1,209 @@
+{
+ "agreement": [
+  {
+   "mean_cosine": 0.988627,
+   "min_cosine": 0.988627,
+   "ollama_tokens": 13,
+   "rows": 1,
+   "tessl_tokens": 13,
+   "workload": "query"
+  },
+  {
+   "mean_cosine": 0.98498,
+   "min_cosine": 0.982532,
+   "ollama_tokens": 1019,
+   "rows": 8,
+   "tessl_tokens": 1019,
+   "workload": "chunks8"
+  }
+ ],
+ "arms": [
+  {
+   "label": "tessl-embed",
+   "base_url": "http://127.0.0.1:11435",
+   "model": "embeddinggemma-2-tessl",
+   "engine": "tessl Metal, EmbeddingGemma 2, f32, text encoder only"
+  },
+  {
+   "label": "ollama-eg2",
+   "base_url": "http://127.0.0.1:11434",
+   "model": "embeddinggemma-2:270m",
+   "engine": "Ollama MLX runner, EmbeddingGemma 2, nvfp4"
+  },
+  {
+   "label": "ollama-nomic",
+   "base_url": "http://127.0.0.1:11434",
+   "model": "nomic-embed-text",
+   "engine": "Ollama ggml runner, nomic-embed-text v1.5 (137M), F16"
+  }
+ ],
+ "benchmark": "tessl_embed_vs_ollama",
+ "date": "2026-10-24T17:31:57Z",
+ "host": {
+  "arch": "arm64",
+  "chip": "Apple M5 Pro",
+  "go": "go1.27.3",
+  "loadavg_after": "{ 60.88 44.59 42.58 }",
+  "loadavg_before": "{ 42.58 36.25 39.95 }",
+  "max_load_gate": 0,
+  "memsize": "68719476736",
+  "model": "Mac17,8",
+  "os": "darwin"
+ },
+ "method": "Three Ollama-protocol servers embed the same seeded synthetic texts (a vocabulary of career-KB words; no real data): one HTTP client, POST /api/embed {model, input}, wall time around the whole request including JSON both ways. Rounds rotate the arm order; every arm runs every workload iters times per round, one request at a time, after a warm-up. min_ms is the minimum over all calls; median_ms the median of the rounds' medians. tokens is each server's own prompt_eval_count (different tokenizers count differently; nomic and EmbeddingGemma are different models). Ollama's arms are sent keep_alive 60m; max_load_duration_ms \u003e 0 would mean a model was reloaded during measurement. The cosine rows compare tessl-embed with Ollama's embeddinggemma-2:270m on the same raw texts (no prompt on either): information about precision (f32 against nvfp4), not a gate.",
+ "rounds": 9,
+ "rows": [
+  {
+   "arm": "tessl-embed",
+   "workload": "query",
+   "batch": 1,
+   "tokens": 13,
+   "min_ms": 4.603,
+   "median_ms": 5.263,
+   "texts_per_s_at_min": 217,
+   "tokens_per_s_at_min": 2824,
+   "server_total_duration_min_ms": 4.407,
+   "max_load_duration_ms": 0,
+   "min_ms_over_tessl_min_ms": 1,
+   "samples": 180
+  },
+  {
+   "arm": "ollama-eg2",
+   "workload": "query",
+   "batch": 1,
+   "tokens": 13,
+   "min_ms": 13.417,
+   "median_ms": 22.757,
+   "texts_per_s_at_min": 75,
+   "tokens_per_s_at_min": 969,
+   "server_total_duration_min_ms": 13.039,
+   "max_load_duration_ms": 7.341,
+   "min_ms_over_tessl_min_ms": 2.915,
+   "samples": 180
+  },
+  {
+   "arm": "ollama-nomic",
+   "workload": "query",
+   "batch": 1,
+   "tokens": 17,
+   "min_ms": 8.379,
+   "median_ms": 20.828,
+   "texts_per_s_at_min": 119,
+   "tokens_per_s_at_min": 2029,
+   "server_total_duration_min_ms": 8.07,
+   "max_load_duration_ms": 5.161,
+   "min_ms_over_tessl_min_ms": 1.82,
+   "samples": 180
+  },
+  {
+   "arm": "tessl-embed",
+   "workload": "chunks8",
+   "batch": 8,
+   "tokens": 1019,
+   "min_ms": 59.563,
+   "median_ms": 61.408,
+   "texts_per_s_at_min": 134,
+   "tokens_per_s_at_min": 17108,
+   "server_total_duration_min_ms": 58.727,
+   "max_load_duration_ms": 0,
+   "min_ms_over_tessl_min_ms": 1,
+   "samples": 72
+  },
+  {
+   "arm": "ollama-eg2",
+   "workload": "chunks8",
+   "batch": 8,
+   "tokens": 1019,
+   "min_ms": 351.179,
+   "median_ms": 421.676,
+   "texts_per_s_at_min": 23,
+   "tokens_per_s_at_min": 2902,
+   "server_total_duration_min_ms": 349.138,
+   "max_load_duration_ms": 12.183,
+   "min_ms_over_tessl_min_ms": 5.896,
+   "samples": 72
+  },
+  {
+   "arm": "ollama-nomic",
+   "workload": "chunks8",
+   "batch": 8,
+   "tokens": 1172,
+   "min_ms": 85.812,
+   "median_ms": 174.933,
+   "texts_per_s_at_min": 93,
+   "tokens_per_s_at_min": 13658,
+   "server_total_duration_min_ms": 83.739,
+   "max_load_duration_ms": 3.558,
+   "min_ms_over_tessl_min_ms": 1.441,
+   "samples": 72
+  },
+  {
+   "arm": "tessl-embed",
+   "workload": "chunks64",
+   "batch": 64,
+   "tokens": 8184,
+   "min_ms": 441.558,
+   "median_ms": 452.599,
+   "texts_per_s_at_min": 145,
+   "tokens_per_s_at_min": 18534,
+   "server_total_duration_min_ms": 432.88,
+   "max_load_duration_ms": 0,
+   "min_ms_over_tessl_min_ms": 1,
+   "samples": 18
+  },
+  {
+   "arm": "ollama-eg2",
+   "workload": "chunks64",
+   "batch": 64,
+   "tokens": 8184,
+   "min_ms": 3241.791,
+   "median_ms": 3487.593,
+   "texts_per_s_at_min": 20,
+   "tokens_per_s_at_min": 2525,
+   "server_total_duration_min_ms": 3230.653,
+   "max_load_duration_ms": 13.649,
+   "min_ms_over_tessl_min_ms": 7.342,
+   "samples": 18
+  },
+  {
+   "arm": "ollama-nomic",
+   "workload": "chunks64",
+   "batch": 64,
+   "tokens": 9589,
+   "min_ms": 713.917,
+   "median_ms": 1288.874,
+   "texts_per_s_at_min": 90,
+   "tokens_per_s_at_min": 13432,
+   "server_total_duration_min_ms": 705.278,
+   "max_load_duration_ms": 3.531,
+   "min_ms_over_tessl_min_ms": 1.617,
+   "samples": 18
+  }
+ ],
+ "seed": 20261024,
+ "servers": {
+  "ollama": "0.40.6",
+  "tessl-embed": "0.1.0"
+ },
+ "warmup": 3,
+ "workloads": [
+  {
+   "Name": "query",
+   "Batch": 1,
+   "Words": 10,
+   "Iters": 20
+  },
+  {
+   "Name": "chunks8",
+   "Batch": 8,
+   "Words": 120,
+   "Iters": 8
+  },
+  {
+   "Name": "chunks64",
+   "Batch": 64,
+   "Words": 120,
+   "Iters": 2
+  }
+ ]
+}

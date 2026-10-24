@@ -1210,3 +1210,79 @@ fn a_nan_logit_is_an_error() {
         }
     });
 }
+
+/// Timing of the two cross-entropy kernels at Qwen3.5's vocabulary, for the
+/// before/after comparison of a kernel change. Run on purpose
+/// (`--ignored --nocapture`), under the GPU lock. The hidden width is 16, so
+/// the GEMMs are a sliver of the step and `ce_lse_update` and `ce_softmax_grad`
+/// (one pass each over `[16, 248 320]` logits) dominate. Prints
+/// `METRIC ce_fwd_ms` (forward only) and `METRIC ce_fwd_bwd_ms` (with
+/// gradients), each the minimum of 15 runs after 3 warmups.
+#[test]
+#[ignore = "timing run, not a correctness test"]
+fn ce_kernel_timing_at_the_real_vocabulary() {
+    with_gpu(|rt| {
+        let (n, vocab, chunk) = (16usize, 248_320usize, 8192usize);
+        let z: Vec<Vec<f32>> = (0..n)
+            .map(|r| {
+                random_f32(vocab, 0x71 + r as u64)
+                    .into_iter()
+                    .map(|x| x * 4.0)
+                    .collect()
+            })
+            .collect();
+        let mut h = vec![0.0f32; n * LW];
+        for r in 0..n {
+            h[r * LW + r] = 1.0;
+        }
+        let mut w = vec![0.0f32; vocab * LW];
+        for (r, zr) in z.iter().enumerate() {
+            for (j, &l) in zr.iter().enumerate() {
+                w[j * LW + r] = l;
+            }
+        }
+        let ht = upload_at(rt, &h, DType::F32, &[n, LW], 0);
+        let wt = upload_at(rt, &w, DType::F32, &[vocab, LW], 0);
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let targets: Vec<u32> = (0..n as u32).map(|r| r * 15_000 + 3).collect();
+        let ws = CeWorkspace::new(
+            rt,
+            n as u32,
+            LW as u32,
+            chunk as u32,
+            DType::F32,
+            GemmOperands::ExactF32,
+        )
+        .unwrap();
+        let dh = sentinel_tensor(rt, &[n, LW]);
+        let dw = sentinel_tensor(rt, &[vocab, LW]);
+        let run = |grads: bool| {
+            let g = grads.then_some(CeGrads {
+                dh: &dh,
+                dw: &dw,
+                scale: 1.0,
+            });
+            let t0 = std::time::Instant::now();
+            cross_entropy_rows(
+                rt,
+                CeHidden { rows: &ht, off: 0 },
+                &wt,
+                &rows,
+                &targets,
+                Reduction::Mean,
+                GemmOperands::ExactF32,
+                &ws,
+                g,
+            )
+            .unwrap();
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        for (name, grads) in [("ce_fwd_ms", false), ("ce_fwd_bwd_ms", true)] {
+            for _ in 0..3 {
+                run(grads);
+            }
+            let best = (0..15).map(|_| run(grads)).fold(f64::INFINITY, f64::min);
+            println!("METRIC {name} {best:.4}");
+        }
+    });
+}

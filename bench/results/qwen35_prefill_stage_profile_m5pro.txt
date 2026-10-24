@@ -1,0 +1,127 @@
+# Qwen3.5-2B prefill+score stage profile: tessl vs mlx-lm 0.32, M5 Pro, 2026-10-24
+#
+# Card ft-2bc8f1e951d0f5afff0f72303155f940. DIAGNOSTIC: one non-paired run per lane, not a speed claim
+# (the paired numbers are bench/results/qwen35_prefill_score_h2h_m5pro.txt). JSON with provenance:
+# qwen35_prefill_stage_profile_m5pro.json.
+# Revision 34e84ec (clean tree), base f00244e. Snapshot Qwen3.5-2B-Base b1485b2, bf16. Ids
+# tests/fixtures/qwen35_prefill_ids.json, fnv1a32 1800809562 (T=1024) / 2900155900 (T=8192).
+# Lanes: bench_qwen35_layers --stage-profile (replica of one GDN layer, one attention layer, one MLP built from the
+# model's own public ops, cross-checked against Staged::encode_part on the real checkpoint) and
+# bench/qwen35_prefill_mlx_profile.py (mlx-lm's own modules). 3 warmup + 9 timed, median; 8 calls per command
+# buffer / per mx.eval. Merge: bench/qwen35_stage_profile_report.py.
+# Conditions: GPU-idle wait passed 07:30:54Z, mac_heavy lock from 07:32:35Z, each lane alone in the lock, load 7.8 -> 4.1,
+# GPU 0-1% at each lane's start. The "GPU 90% / 92%" readings at the start of T=8192 are each lane's own T=1024
+# work just finished, not outside load.
+#
+# Cross-checks: tessl replica vs the real model's parts per layer, within 3% (8k: GDN 22.53 vs 22.40, attention 52.13 vs
+# 52.05, MLP 22.08 vs 22.10 ms; 1k: 3.03/2.94, 2.10/2.08, 2.97/2.94). mlx stage sums vs its real layers: 8k GDN 44.05 vs
+# 41.50, attention 46.11 vs 45.11 ms (standalone mlx stages overstate by ~6% on GDN layers, so per-stage mlx rows
+# are upper bounds; the real-layer difference below is the cleaner attribution).
+#
+# Gap by real layer (tessl encode_part norm+mixer + norm+MLP, minus mlx real layer), ms per forward:
+#   T=8192  whole forward tessl 1262.6 vs mlx 1031.4 (gap 231.2)
+#     GDN layer  tessl 22.40+22.10 = 44.50 vs mlx 41.50: +3.0 ms x 18 =  54 ms
+#     attn layer tessl 52.05+22.10 = 74.15 vs mlx 45.11: +29.0 ms x 6 = 174 ms
+#   T=1024  whole forward tessl 134.6 vs mlx 117.2 (gap 17.5)
+#     GDN layer  5.88 vs 5.24: +0.64 x 18 = 11.6 ms;  attn layer 5.02 vs 4.29: +0.73 x 6 = 4.4 ms
+#
+# Named causes (evidence in the table below):
+#  1. Prefill attention (sdpa): tessl 42.41 ms/layer vs mlx 13.07 at 8k (3.2x; 254 vs 78 ms per forward, 176 of the 231
+#     ms gap, 76%); 0.804 vs 0.258 at 1k (3.1x; 3.3 of 17.5 ms). tessl runs attn_prefill on f32 Q/K/V/O buffers
+#     (Acts a_q/a_k/a_v/a_o, out_bf16=false), mlx runs bf16 mx.fast sdpa. This is a kernel being slower (and wider operands),
+#     not an extra pass.
+#  2. GDN core (conv excluded): tessl 7.80 vs mlx 5.55 ms/layer at 8k (1.4x, 41 ms per forward); 1.07 vs 0.74 at 1k.
+#     tessl's chunked rule is two dispatches, prep 1.98 + scan 5.86 ms; mlx's sequential recurrence kernel alone is 3.97
+#     and its q/k l2norm another 1.51 (tessl folds the norms and gates into prep). The scan alone is slower than
+#     mlx's whole recurrence kernel. A kernel difference.
+#  3. swiglu: tessl 1.92 vs mlx 1.14 ms/layer at 8k (19 ms per forward); 0.266 vs 0.158 at 1k. Both sides run it as one
+#     elementwise pass, so it is NOT a missing fusion. The bytes explain it: tessl reads two f32 [T,6144] tensors
+#     (403 MB) and writes bf16 (100 MB), mlx reads two bf16 ones (201 MB) and writes 101 MB; 503 vs 302 MB moved
+#     is 1.67x, the time ratio is 1.69x, at the same ~265 GB/s. The cause is tessl's f32 gate/up GEMM outputs.
+# Not causes: the GEMMs. in_proj 8.71 vs 8.93, gate_up 12.95 vs 12.99 (8k), 1.13 vs 1.16 and 1.69 vs 1.68 (1k) are at
+# parity, so the earlier "GEMM stages 10-20% slower" does not reproduce on a quiet GPU. tessl is faster at gated_norm
+# (0.745 vs 1.429 at 8k) and, standalone, down_proj (6.78 vs 8.54; the mlx figure is inflated in standalone timing,
+# see the cross-check). No host cost: tessl begin 0.13 ms and advance_to return 0.14 ms (8k; encode 1-4 us per dispatch per stage,
+# one dispatch per stage but GDN core 2 and gate_up 2); mlx Python graph build 0.64 ms. Neither side loses time to sync or encode at these sizes. tessl has no
+# extra dtype-cast or norm dispatch: every tessl stage is 1 dispatch except GDN core and gate_up (2 each) (tessl log).
+# tessl total minus parts x layers is 16.8 ms at 8k and -1.4 ms at 1k (gather, final norm + score, begin).
+#
+# Small-fix estimate (NOT implemented; the decode-fusion lane owns src/qwen35*.rs): bf16 Q/K/V tiles for attention
+# (ft-f3e14014 item 1) is the one that moves the number: if tessl's sdpa reached mlx's 13 ms the 8k forward would drop
+# ~176 ms (to ~1087 ms, near mlx's 1031) and the 1k forward ~3.3 ms. Writing the gate/up GEMM outputs as bf16 would
+# take ~40% off swiglu (~8 ms at 8k) but changes numerics; a faster scan is a larger item.
+#
+# Not run: mx.metal capture (Xcode-only .gputrace); paired (interleaved) repeats of the profile; T = 200 and 2048.
+#
+=== T = 1024 ===
+group  stage                     tessl ms    mlx ms count  tessl tot   mlx tot  mlx-tessl mlx/tessl
+embed  gather                      0.0708    0.0944     1      0.071     0.094      0.024      1.33
+gdn    input_norm                  0.0644    0.0771    18      1.158     1.388      0.229      1.20
+gdn    in_proj_gemm                1.1280    1.1649    18     20.303    20.968      0.665      1.03
+gdn    conv1d_silu                 0.3206    0.2750    18      5.771     4.949     -0.822      0.86
+gdn    gdn_core_prep               0.3631         -    18      6.535         -          -         -
+gdn    gdn_core_scan               0.7255         -    18     13.060         -          -         -
+gdn    gdn_core                    1.0697    0.7412    18     19.254    13.341     -5.913      0.69
+gdn    gated_norm                  0.0964    0.1723    18      1.735     3.102      1.367      1.79
+gdn    out_proj_resid              0.3558    0.3383    18      6.404     6.090     -0.314      0.95
+attn   input_norm                  0.0592    0.0424     6      0.355     0.254     -0.101      0.72
+attn   in_proj_gemm                0.7162    0.7079     6      4.297     4.247     -0.050      0.99
+attn   qk_norm_rope                0.0957    0.1801     6      0.574     1.081      0.507      1.88
+attn   sdpa                        0.8041    0.2581     6      4.825     1.548     -3.277      0.32
+attn   out_gate                    0.0740    0.0774     6      0.444     0.465      0.021      1.05
+attn   out_proj_resid              0.3548    0.3365     6      2.129     2.019     -0.110      0.95
+mlp    post_norm                   0.0596    0.0417    24      1.429     1.001     -0.429      0.70
+mlp    gate_up_gemm                1.6899    1.6790    24     40.558    40.295     -0.262      0.99
+mlp    swiglu                      0.2655    0.1576    24      6.371     3.781     -2.590      0.59
+mlp    down_proj_resid             0.9585    1.0590    24     23.005    25.416      2.411      1.10
+detail gdn_qk_l2norm                    -    0.1969    18          -     3.544          -         -
+detail gdn_gate_prep                    -    0.0272    18          -     0.489          -         -
+detail gdn_recurrence_kernel            -    0.6147    18          -    11.064          -         -
+detail gdn_in_proj_qkv                  -    0.8413    18          -    15.144          -         -
+detail gdn_in_proj_z                    -    0.3032    18          -     5.458          -         -
+detail gdn_in_proj_ba                   -    0.0448    18          -     0.807          -         -
+detail gdn_out_proj_gemm_only           -    0.3050    18          -     5.490          -         -
+detail resid_add_only                   -    0.0525    48          -     2.520          -         -
+detail mlp_gate_gemm                    -    0.8447    24          -    20.274          -         -
+detail mlp_up_gemm                      -    0.8452    24          -    20.285          -         -
+sum of comparable stages x counts: tessl 138.68 ms, mlx 130.04 ms, mlx-tessl -8.64 ms
+whole forward (min sample, this process): tessl 134.64 ms, mlx 117.16 ms, mlx/tessl 0.870 (h2h min-round ratio reported separately)
+tessl timeline: begin 0.04, encode-return 0.10, score wait 134.49; submit floor 0.000 ms
+mlx forward: python graph build 0.62 (serial before the GPU), eval 116.28, tolist 0.26
+
+=== T = 8192 ===
+group  stage                     tessl ms    mlx ms count  tessl tot   mlx tot  mlx-tessl mlx/tessl
+embed  gather                      0.4589    0.2259     1      0.459     0.226     -0.233      0.49
+gdn    input_norm                  0.4234    0.2536    18      7.622     4.565     -3.057      0.60
+gdn    in_proj_gemm                8.7144    8.9288    18    156.858   160.718      3.859      1.02
+gdn    conv1d_silu                 2.3673    2.4011    18     42.611    43.219      0.608      1.01
+gdn    gdn_core_prep               1.9773         -    18     35.592         -          -         -
+gdn    gdn_core_scan               5.8596         -    18    105.473         -          -         -
+gdn    gdn_core                    7.8021    5.5453    18    140.437    99.816    -40.621      0.71
+gdn    gated_norm                  0.7450    1.4292    18     13.409    25.725     12.316      1.92
+gdn    out_proj_resid              2.4794    2.5862    18     44.629    46.552      1.923      1.04
+attn   input_norm                  0.4210    0.2294     6      2.526     1.376     -1.149      0.54
+attn   in_proj_gemm                5.4140    5.4521     6     32.484    32.712      0.228      1.01
+attn   qk_norm_rope                0.8036    1.2709     6      4.821     7.626      2.804      1.58
+attn   sdpa                       42.4086   13.0715     6    254.452    78.429   -176.023      0.31
+attn   out_gate                    0.6764    0.6273     6      4.058     3.764     -0.294      0.93
+attn   out_proj_resid              2.4060    2.5523     6     14.436    15.314      0.878      1.06
+mlp    post_norm                   0.4243    0.2328    24     10.183     5.587     -4.595      0.55
+mlp    gate_up_gemm               12.9491   12.9906    24    310.778   311.773      0.995      1.00
+mlp    swiglu                      1.9242    1.1412    24     46.181    27.388    -18.794      0.59
+mlp    down_proj_resid             6.7831    8.5395    24    162.795   204.947     42.152      1.26
+detail gdn_qk_l2norm                    -    1.5063    18          -    27.113          -         -
+detail gdn_gate_prep                    -    0.0252    18          -     0.453          -         -
+detail gdn_recurrence_kernel            -    3.9702    18          -    71.464          -         -
+detail gdn_in_proj_qkv                  -    6.5180    18          -   117.324          -         -
+detail gdn_in_proj_z                    -    2.1917    18          -    39.451          -         -
+detail gdn_in_proj_ba                   -    0.2638    18          -     4.749          -         -
+detail gdn_out_proj_gemm_only           -    2.1991    18          -    39.584          -         -
+detail resid_add_only                   -    0.2951    48          -    14.167          -         -
+detail mlp_gate_gemm                    -    6.5162    24          -   156.388          -         -
+detail mlp_up_gemm                      -    6.5151    24          -   156.362          -         -
+sum of comparable stages x counts: tessl 1248.74 ms, mlx 1069.74 ms, mlx-tessl -179.00 ms
+whole forward (min sample, this process): tessl 1262.64 ms, mlx 1031.43 ms, mlx/tessl 0.817 (h2h min-round ratio reported separately)
+tessl timeline: begin 0.13, encode-return 0.14, score wait 1262.38; submit floor 0.000 ms
+mlx forward: python graph build 0.64 (serial before the GPU), eval 1030.56, tolist 0.23
+

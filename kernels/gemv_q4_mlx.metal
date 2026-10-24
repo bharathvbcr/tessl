@@ -440,6 +440,32 @@ kernel void gemv_q4_mlx_simd_gate_up_gelu(
         mid_as_bf16, rows, cols, group_size, q4_simd_row0(tgid, sgid), lane);
 }
 
+// Qwen3.5's gate∥up: `silu(gate) * up`, one dispatch for the two GEMVs and the
+// activation. Row-major only (the layout Qwen3.5's bank has); same buffer slots
+// as `gemv_q4_mlx_simd_gate_up_gelu`.
+kernel void gemv_q4_mlx_simd_gate_up_silu(
+    device const uchar *gate_packed [[buffer(0)]],
+    device const bfloat2 *gate_sb [[buffer(1)]],
+    device const bfloat *gate_biases_unused [[buffer(2)]],
+    device const uchar *up_packed [[buffer(3)]],
+    device const bfloat2 *up_sb [[buffer(4)]],
+    device const bfloat *up_biases_unused [[buffer(5)]],
+    device const bfloat *x [[buffer(6)]],
+    device float *mid [[buffer(7)]],
+    constant uint &rows [[buffer(8)]],
+    constant uint &cols [[buffer(9)]],
+    constant uint &group_size [[buffer(10)]],
+    constant uint &mid_as_bf16 [[buffer(11)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    (void)gate_biases_unused; (void)up_biases_unused;
+    q4_simd_gemv<Q4Layout::RowMajor, Q4Epi::GateUpSilu>(
+        Q4Bank{gate_packed, gate_sb}, Q4Bank{up_packed, up_sb}, x, mid, nullptr,
+        mid_as_bf16, rows, cols, group_size, q4_simd_row0(tgid, sgid), lane);
+}
+
 // Fused K∥V (default-on product path). Bank-partitioned like QKV so each TG
 // runs a *solo* gemv reduce (math ≡ `gemv_q4_mlx_simd`). Prior dual-accumulate
 // (K+V in one thread loop) drifted ~1 ULP vs solo at Hot E4B k[41].

@@ -120,3 +120,165 @@ kernel void NAME(                                                               
 
 QWEN35_RMS_NORM_KERNEL(qwen35_rms_norm_f32, float)
 QWEN35_RMS_NORM_KERNEL(qwen35_rms_norm_bf16, bfloat)
+
+/// Decode's residual add and the norm after it in one pass:
+/// `resid[r, :] += y[r, :]`, then `out[r, :] = rms_norm(resid[r, :]) * (1 + w)`
+/// with `qwen35_rms_norm_*`'s arithmetic, so the pair of dispatches it
+/// replaces (`qwen35_residual_add_f32`, then `qwen35_rms_norm_*`) and this one
+/// give the same bits: the sum is the same f32 add, the sum of squares walks
+/// the same lanes in the same order and folds with the same `reduce_row_add`,
+/// and the scale is `precise::rsqrt` of the same expression.
+///
+/// Each element of `resid` is read and written by the lane that later reads it
+/// back, so the second pass needs no barrier. `y`, `weight` and `resid` are
+/// distinct buffers and `out` overlaps none of them.
+///
+/// Grid: one threadgroup per row.
+#define QWEN35_ADD_RMS_NORM_KERNEL(NAME, OUT_T)                                   \
+kernel void NAME(                                                                 \
+    device const float *y [[buffer(0)]],                                          \
+    device float *resid [[buffer(1)]],                                            \
+    device const float *weight [[buffer(2)]],                                     \
+    device OUT_T *out [[buffer(3)]],                                              \
+    constant uint &rows [[buffer(4)]],                                            \
+    constant uint &dim [[buffer(5)]],                                             \
+    constant float &eps [[buffer(6)]],                                            \
+    uint row [[threadgroup_position_in_grid]],                                    \
+    uint lid [[thread_position_in_threadgroup]],                                  \
+    uint sgid [[simdgroup_index_in_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]],                                      \
+    uint tptg [[threads_per_threadgroup]])                                        \
+{                                                                                 \
+    if (row >= rows) return;                                                      \
+    threadgroup float scratch[REDUCE_MAX_SIMDGROUPS];                             \
+    device const float *yin = y + (ulong)row * dim;                               \
+    device float *rin = resid + (ulong)row * dim;                                 \
+    device OUT_T *xout = out + (ulong)row * dim;                                  \
+    float ss = 0.0f;                                                              \
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {                              \
+        const float v = rin[d] + yin[d];                                          \
+        rin[d] = v;                                                               \
+        ss += v * v;                                                              \
+    }                                                                             \
+    const float inv = precise::rsqrt(reduce_row_add(ss, scratch, sgid, lane, tptg) / (float)dim + eps); \
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {                              \
+        const float wp = 1.0f + weight[d];                                        \
+        xout[d] = (OUT_T)(rin[d] * inv * wp);                                     \
+    }                                                                             \
+}
+
+QWEN35_ADD_RMS_NORM_KERNEL(qwen35_add_rms_norm_f32, float)
+QWEN35_ADD_RMS_NORM_KERNEL(qwen35_add_rms_norm_bf16, bfloat)
+
+/// Decode's MLP front half in one dispatch, one token:
+/// `out[n] = silu(sum_k x[k] * w_gate[k, n]) * (sum_k x[k] * w_up[k, n])`:
+/// the two GEMMs `x @ w_gate` and `x @ w_up` and `qwen35_swiglu_*` between
+/// them, with the `[1, n]` gate and up vectors never written out. `x`, both
+/// weights and `out` are one dtype (f32 for the exact-f32 forward, bf16 for the
+/// bf16 one, as every operand of the GEMMs they replace is); the sums are f32
+/// either way and the product is rounded once, to `out`'s type.
+///
+/// Weights are the model's `[k, n]` row-major (`x @ w`). A threadgroup owns
+/// QG_COLS columns of both: a simdgroup is 8 column groups of QG_VEC adjacent
+/// columns by 4 k-lanes, and the eight simdgroups stride k by 32 between them,
+/// so a threadgroup walks k with 32 k-lanes. The four k-lanes of a simdgroup
+/// fold with two xor shuffles, the eight simdgroups through threadgroup memory
+/// in simdgroup order: a fixed order, so the result is deterministic. It is
+/// not the TensorOps GEMM's order, so the two agree to f32 rounding of the
+/// sums (the gate's and up's, before the activation), not bit for bit.
+///
+/// A column group past `n`, and a row pitch that is not a multiple of QG_VEC
+/// (`n % 8 != 0`, which would misalign the 16-byte loads), take the scalar
+/// path: same sums, same order.
+///
+/// Grid: ceil(n / QG_COLS) threadgroups of QG_TPTG threads.
+#define QG_VEC 8u
+#define QG_COLS 64u
+#define QG_TPTG 256u
+
+/// Eight consecutive elements as f32, from one 16-byte load (two for f32).
+inline void qg_load8(device const float *p, thread float *v)
+{
+    const float4 a = *(device const float4 *)p;
+    const float4 b = *(device const float4 *)(p + 4);
+    v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+    v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+
+inline void qg_load8(device const bfloat *p, thread float *v)
+{
+    const uint4 a = *(device const uint4 *)p;
+    for (uint i = 0u; i < 4u; ++i) {
+        v[2u * i] = as_type<float>(a[i] << 16);
+        v[2u * i + 1u] = as_type<float>(a[i] & 0xffff0000u);
+    }
+}
+
+#define QWEN35_GATE_UP_SILU_KERNEL(NAME, T)                                       \
+kernel void NAME(                                                                 \
+    device const T *x [[buffer(0)]],                                              \
+    device const T *w_gate [[buffer(1)]],                                         \
+    device const T *w_up [[buffer(2)]],                                           \
+    device T *out [[buffer(3)]],                                                  \
+    constant uint &k [[buffer(4)]],                                               \
+    constant uint &n [[buffer(5)]],                                               \
+    uint tg [[threadgroup_position_in_grid]],                                     \
+    uint sgid [[simdgroup_index_in_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]],                                      \
+    uint lid [[thread_position_in_threadgroup]])                                  \
+{                                                                                 \
+    threadgroup float red[8][2][QG_COLS];                                         \
+    const uint cg = lane & 7u;                                                    \
+    const uint kl = lane >> 3;                                                    \
+    const ulong col0 = (ulong)tg * QG_COLS + (ulong)cg * QG_VEC;                  \
+    const bool vec = ((n & (QG_VEC - 1u)) == 0u) && (col0 + QG_VEC <= (ulong)n);  \
+    float ag[QG_VEC];                                                             \
+    float au[QG_VEC];                                                             \
+    for (uint j = 0u; j < QG_VEC; ++j) { ag[j] = 0.0f; au[j] = 0.0f; }            \
+    for (uint kk = sgid * 4u + kl; kk < k; kk += 32u) {                           \
+        const float xv = (float)x[kk];                                            \
+        const ulong base = (ulong)kk * n + col0;                                  \
+        if (vec) {                                                                \
+            float wg[QG_VEC];                                                     \
+            float wu[QG_VEC];                                                     \
+            qg_load8(w_gate + base, wg);                                          \
+            qg_load8(w_up + base, wu);                                            \
+            for (uint j = 0u; j < QG_VEC; ++j) {                                  \
+                ag[j] = fma(xv, wg[j], ag[j]);                                    \
+                au[j] = fma(xv, wu[j], au[j]);                                    \
+            }                                                                     \
+        } else {                                                                  \
+            for (uint j = 0u; j < QG_VEC; ++j) {                                  \
+                if (col0 + j < (ulong)n) {                                        \
+                    ag[j] = fma(xv, (float)w_gate[base + j], ag[j]);              \
+                    au[j] = fma(xv, (float)w_up[base + j], au[j]);                \
+                }                                                                 \
+            }                                                                     \
+        }                                                                         \
+    }                                                                             \
+    for (uint j = 0u; j < QG_VEC; ++j) {                                          \
+        ag[j] += simd_shuffle_xor(ag[j], 8u);                                     \
+        ag[j] += simd_shuffle_xor(ag[j], 16u);                                    \
+        au[j] += simd_shuffle_xor(au[j], 8u);                                     \
+        au[j] += simd_shuffle_xor(au[j], 16u);                                    \
+    }                                                                             \
+    if (kl == 0u) {                                                               \
+        for (uint j = 0u; j < QG_VEC; ++j) {                                      \
+            red[sgid][0][cg * QG_VEC + j] = ag[j];                                \
+            red[sgid][1][cg * QG_VEC + j] = au[j];                                \
+        }                                                                         \
+    }                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                              \
+    if (lid < QG_COLS) {                                                          \
+        const ulong col = (ulong)tg * QG_COLS + lid;                              \
+        if (col < (ulong)n) {                                                     \
+            float g = 0.0f;                                                       \
+            float u = 0.0f;                                                       \
+            for (uint s = 0u; s < 8u; ++s) { g += red[s][0][lid]; u += red[s][1][lid]; } \
+            out[col] = (T)(tessl_silu(g) * u);                                    \
+        }                                                                         \
+    }                                                                             \
+}
+
+QWEN35_GATE_UP_SILU_KERNEL(qwen35_gate_up_silu_f32, float)
+QWEN35_GATE_UP_SILU_KERNEL(qwen35_gate_up_silu_bf16, bfloat)

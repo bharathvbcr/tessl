@@ -41,7 +41,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 | --- | --- |
 | **Status** | [`0.2.0`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
-| **Tests** | 701 `#[test]` functions across 62 integration files and the library, plus doc tests (`cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac) |
+| **Tests** | 2,081 `#[test]` attributes by source count on 2026-10-23: 1,727 across 168 integration test files and 354 in `src/` (299 in the library, 55 in bench and profile binaries and their shared helpers), plus doc tests; `ignore` is not subtracted. The last full GPU run on record (2026-10-15, `60a6240`, [docs/verification.md](docs/verification.md)) passed 1,255 with 0 failed and 16 ignored. Run it with `cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac. |
 | **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
@@ -62,7 +62,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **BERT & DistilBERT Sparse Encoders (`tessl::bert`):** `BertForMaskedLM` and `DistilBertForMaskedLM` checkpoints producing exact vocabulary term weights (`max_t log1p(relu(logits))`) directly from safetensors. Features fused LayerNorms, exact erf GELU, and segmented sparse vocabulary reductions without materializing full logit tensors — see [BERT Encoders](docs/bert.md).
 - **Qwen3.5 bf16 Storage Training & Optimizers:** Trains `Precision::Bf16` models with matrices kept in bf16 and arithmetic in f32. Supports `UpdateRule` strategies (`F32Master`, `Bf16Kahan`, `Bf16Stochastic`) and `MomentStorage::Block8` (8-bit quantized moments with one f32 scale per 256 elements), fitting 4B training into a 48 GiB working set. Features scaled per-parameter learning rates (`adamw_step_scaled`) and unwaited AdamW execution.
 - **Device AdamW (`tessl::qwen35_adamw`):** `adamw_step` on any f32 tensor, and `Qwen35Model::adamw_step` over the model's own parameters in place — packed windows included — with `clip_grad_norm_`-style clipping and checkpoint/restore of the moments and step count. Params, gradients and both moments for the 2B come to 32 GB, which is what lets it fit a 64 GB Mac.
-- **bf16 Operands per Call (`GemmOperands`):** `gemm_bf16`, `gemm_tn_bf16`, `gemm_nt_bf16` and `qwen35_train` / `cross_entropy` options choose bf16 operands (f32 accumulate) for one call without changing the model's f32 storage; the 2B `train_step` on bf16 operands measures 2.44× the exact step at T = 2048.
+- **bf16 Operands per Call (`GemmOperands`):** `gemm_bf16`, `gemm_tn_bf16`, `gemm_nt_bf16` and `qwen35_train` / `cross_entropy` options choose bf16 operands (f32 accumulate) for one call without changing the model's f32 storage; the 2B `train_step` on bf16 operands measured 2.44× the exact step at T = 2048 on 2026-09-30 (both runs on battery in low-power mode, so the ratio is the claim, not the seconds; `bench/results/qwen35_train_step_bf16_m5pro.txt`; not re-measured since).
 - **C ABI and torch binding (`src/capi.rs`, `python/tessl_torch`):** `libtessl.dylib` exposes, at ABI version 13 (`tessl_abi_version`), the training path — cross-entropy, `chunk_gated_delta_rule` at transformers' own seam (`patch_transformers_qwen3_5()`), `Qwen35.train_step`, the two-phase step, the gradient bank and AdamW — so a torch loop can call into tessl, and EmbeddingGemma 2 from raw texts, pixels, PCM and video frames (`tessl_embedgemma2_*`). See [python/README.md](python/README.md).
 - **Go binding (`go/`):** `github.com/bharathvbcr/tessl/go/embedgemma2` embeds text, images, audio, video (with or without timestamps), mixed items and files or bytes from Go, in-process on Metal with no Python, through [gusset](https://github.com/bharathvbcr/gusset) and a one-archive Rust engine (`go/engine`). Concurrent goroutines share one worker thread per model, `ctx` cancellation is bounded by what a GPU wait allows (documented), and errors are typed with tessl's own message. Equal to the Rust C ABI bit for bit, and to sentence-transformers within 4e-7 on the real checkpoint — see [the Go README](go/README.md) and [EmbeddingGemma 2 from Go](docs/embedgemma2.md#go).
 - **Embedded Metallib:** `GpuRuntime::new` loads the shader library from bytes included at compile time (`newLibraryWithData`), so a binary no longer depends on the build directory's `.metallib` still existing. `add_metallib_bytes` is the same load for an overlay.
@@ -92,7 +92,7 @@ flowchart TD
     subgraph TesslAPI["tessl Public API Surface"]
         GpuRt["GpuRuntime<br/>(Device, Allocator, Encoder Lease)"]
         GemmAPI["GEMM Suite<br/>gemm() · gemm_epilogue() · gemm_batched()"]
-        NnAPI["tessl::nn (86 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
+        NnAPI["tessl::nn (89 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
         BertAPI["tessl::bert (Sparse Encoders)<br/>BERT · DistilBERT · OpenSearch"]
         TensorTypes["Tensor &lt;T&gt; / GpuBuffer<br/>(DType: F32, BF16, F16, I8, I32)"]
         IcbAPI["DecodeIcb &amp; PingPongCbReplay<br/>(ICB Capture &amp; Dual-Slot Replay)"]
@@ -132,26 +132,49 @@ flowchart TD
 ## Performance vs. PyTorch MPS & MLX
 
 Apple M5 Pro, `bench_paired --format rows:shape,backend,gflops` (recipe in
-[docs/benchmarking.md](docs/benchmarking.md)) against torch 2.13 (MPS) and MLX, re-measured 2026-09-01. The harness interleaves
-`tessl` and the baseline round by round so thermal throttling and frequency
-scaling hit both lanes alike — see [Benchmarking](docs/benchmarking.md).
+[docs/benchmarking.md](docs/benchmarking.md)) against PyTorch (MPS) and MLX. The
+harness interleaves `tessl` and the baseline round by round so thermal throttling
+and frequency scaling hit both lanes alike — see [Benchmarking](docs/benchmarking.md).
+The torch and MLX versions are not recorded in the result files.
 
-*Geomean of per-shape medians over 5 rounds across an 8-shape ladder:*
+*Geomean of per-shape medians over 5 rounds across an 8-shape ladder, two runs
+(`bench/results/gemm_speed_ladder_m5pro.json` and `..._b.json`), each figure
+rounded down. These two files were imported from the MLSystemsLab copy of this
+crate, so they are that copy's measurements, not a run of this tree's kernels
+(see the provenance note in [docs/benchmarking.md](docs/benchmarking.md)):*
 
-| Comparison | Geomean | Worst shape | Best shape | Shapes below 1.0 |
+| Comparison | Geomean (run 1 / run 2) | Worst shape | Best shape | Shapes below 1.0 |
 |---|---|---|---|---|
-| **bf16 vs. PyTorch MPS bf16** | **1.03×** | 0.86× | 1.16× | **4 of 8** |
-| **f32 exact vs. PyTorch MPS f32** | **1.12×** | 0.87× | 1.78× | 2 of 8 |
-| **tf32-relaxed vs. PyTorch MPS f32** | **2.11×** | 1.76× | 2.45× | 0 of 8 |
-| **bf16 vs. MLX bf16** | **2.55×** | 1.12× | 3.67× | 0 of 8 |
+| **bf16 vs. PyTorch MPS bf16** | **0.99× / 0.97×** | 0.89–0.91× | 1.03–1.06× | **3 / 5 of 8** |
+| **f32 exact vs. PyTorch MPS f32** | **1.07× / 1.04×** | 0.90–0.93× | 1.24–1.62× | 4 / 3 of 8 |
+| **tf32-relaxed vs. PyTorch MPS f32** | **2.09× / 2.14×** | 1.60–1.65× | 2.30–2.53× | 0 / 0 of 8 |
+| **bf16 vs. MLX bf16** | **2.66× / 2.63×** | 1.23–1.27× | 3.49–3.94× | 0 / 0 of 8 |
+| **f32 exact vs. MLX f32** | **0.97× / 0.99×** | 0.88–0.92× | 1.04–1.14× | 4 / 4 of 8 |
+
+A separate 9-round bf16-only run (`bench/results/gemm_speed_bf16_confirm_m5pro.json`)
+read 1.02× against PyTorch MPS bf16, worst shape 0.85× (8192×3072×768), best 1.34×,
+4 of 8 below 1.0.
 
 > [!IMPORTANT]
 > **bf16 against MPS is parity, not a win.** An earlier version of this table
 > claimed 1.11× with a worst shape of 1.01×, which reads as "never loses". Re-run
-> with the same harness it is 1.03× and it loses on half the ladder, by as much as
-> 0.86× at 8192×3072×768. The number that is worth something is the **tf32 lane at
-> 2.11×**, which wins on every shape — and the MLX comparison at 2.55×, also clean.
-> Apple's own bf16 GEMM is well tuned; matching it is the honest claim.
+> with the same harness it is 0.97–1.02× and it loses on 3 to 5 of the 8 shapes,
+> by as much as 0.85× at 8192×3072×768. The number that is worth something is the
+> **tf32 lane at 2.09–2.14×**, which wins on every shape, and the bf16 comparison
+> against MLX at 2.63–2.66×, also clean. Apple's own bf16 GEMM is well tuned;
+> matching it is the honest claim, and exact f32 is at parity with both MPS and MLX.
+
+**End to end, tessl is not the fastest Mac runtime.** Qwen3.5-2B prefill plus
+scoring of 17 answer rows, bf16, M5 Pro, 2026-10-23: paired and interleaved
+(`bench_paired --evidence --max-spread 1.25 --rounds 6`), the same Base snapshot,
+token ids and work on every lane, GPU idle checked inside the lock, min of
+rounds. tessl is 5.09× / 5.35× / 5.35× / 4.47× faster than torch 2.14.1 on MPS at
+200 / 1,024 / 2,048 / 8,192 tokens, **but mlx-lm 0.32 beats tessl at every
+length**: it takes 0.890× / 0.887× / 0.896× / 0.836× of tessl's time, each
+interval entirely below 1. This supersedes the earlier unpaired 8k comparison.
+Raw file: `bench/results/qwen35_prefill_score_h2h_m5pro.txt`, which also records the
+open follow-up to profile the MLX lead at 1k and 8k. The same comparison is in
+[docs/qwen35.md](docs/qwen35.md).
 
 Peak observed throughput, `cargo run --release --bin bench_gemm_sweep`, medians
 over 50 iterations after 10 warmup:

@@ -188,7 +188,7 @@ func (s *server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	resp, herr := s.embed(r, start)
+	resp, herr := s.embed(w, r, start)
 	if herr != nil {
 		if herr.status == 0 {
 			// The client went away: nobody reads an answer.
@@ -200,11 +200,11 @@ func (s *server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *server) embed(r *http.Request, start time.Time) (*embedResponse, *httpError) {
+func (s *server) embed(w http.ResponseWriter, r *http.Request, start time.Time) (*embedResponse, *httpError) {
 	if s.dead.Load() {
 		return nil, refuse(http.StatusServiceUnavailable, "the model is unusable and the server is shutting down")
 	}
-	req, herr := s.decode(r)
+	req, herr := s.decode(w, r)
 	if herr != nil {
 		return nil, herr
 	}
@@ -270,8 +270,8 @@ func (s *server) embed(r *http.Request, start time.Time) (*embedResponse, *httpE
 	}, nil
 }
 
-func (s *server) decode(r *http.Request) (*embedRequest, *httpError) {
-	body := http.MaxBytesReader(nil, r.Body, s.lim.MaxBodyBytes)
+func (s *server) decode(w http.ResponseWriter, r *http.Request) (*embedRequest, *httpError) {
+	body := http.MaxBytesReader(w, r.Body, s.lim.MaxBodyBytes)
 	dec := json.NewDecoder(body)
 	var req embedRequest
 	if err := dec.Decode(&req); err != nil {
@@ -476,7 +476,7 @@ func (s *server) handleShow(w http.ResponseWriter, r *http.Request) {
 		Model string `json:"model"`
 		Name  string `json:"name"`
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 64<<10))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err := dec.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

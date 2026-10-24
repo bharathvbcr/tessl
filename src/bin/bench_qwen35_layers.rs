@@ -109,6 +109,13 @@
 //! first round prints its answer log-probabilities to stderr as `SCORES`. Real
 //! weights only: random ones are refused.
 //!
+//! `--stage-profile --weights=DIR --ids=FILE [T...]` splits that work into
+//! stages (norm, in-projection, conv, chunked recurrence, attention, output
+//! projection, MLP GEMMs and the elementwise ops, plus the host timeline of
+//! begin / encode / wait) on a replica of one layer of each kind, checked
+//! against `Staged::encode_part` on the real model; see
+//! `common/qwen35_stage_profile.rs`. Default T is 1024 and 8192.
+//!
 //! Earlier versions of this bench built their own 24 layers from the kernels
 //! and had `--attn-rows`, `--attn-tile=`, `--mlp-unfused` and `--gdn-scan16`
 //! switches that swapped kernels inside that wiring; the model has no such
@@ -121,6 +128,8 @@ mod common;
 mod json;
 #[path = "common/prefill_ids.rs"]
 mod prefill_ids;
+#[path = "common/qwen35_stage_profile.rs"]
+mod qwen35_stage_profile;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -2082,6 +2091,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ids: None,
     };
     let mut prefill_score = false;
+    let mut stage_profile = false;
     let mut ts = Vec::new();
     let mut iters_given = false;
     for arg in std::env::args().skip(1) {
@@ -2093,6 +2103,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model_forward = true;
         } else if arg == "--prefill-score" {
             prefill_score = true;
+        } else if arg == "--stage-profile" {
+            stage_profile = true;
         } else if let Some(f) = arg.strip_prefix("--ids=") {
             if f.is_empty() {
                 return Err("--ids=FILE wants an ids file".into());
@@ -2132,7 +2144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-gdn-recurrent, --paired-gate-up, \
-                     --model-forward, --prefill-score, --ids=FILE, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
+                     --model-forward, --prefill-score, --stage-profile, --ids=FILE, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -2162,7 +2174,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if modes > 1 || (modes == 1 && (check_only || paired_attn || paired_rec || decode.is_some())) {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
-    if prefill_score {
+    if stage_profile {
+        if prefill_score
+            || check_only
+            || paired_attn
+            || paired_rec
+            || paired_gate_up
+            || model_forward
+            || attn_tiles
+            || decode.is_some()
+        {
+            return Err("--stage-profile takes token counts, --weights, --ids and --iters only".into());
+        }
+        if !matches!(opts.weights, Weights::Dir { .. }) || opts.ids.is_none() {
+            return Err("--stage-profile needs --weights=DIR (a real snapshot) and --ids=FILE".into());
+        }
+        if !iters_given {
+            opts.iters = common::env_usize("BENCH_ITERS", PREFILL_SCORE_ITERS, 1)?;
+        }
+    } else if prefill_score {
         if check_only || paired_attn || paired_rec || paired_gate_up || model_forward || attn_tiles || decode.is_some()
         {
             return Err("--prefill-score takes token counts, --weights, --ids and --iters only".into());
@@ -2174,7 +2204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             opts.iters = common::env_usize("BENCH_ITERS", PREFILL_SCORE_ITERS, 1)?;
         }
     } else if opts.ids.is_some() {
-        return Err("--ids applies to --prefill-score only".into());
+        return Err("--ids applies to --prefill-score and --stage-profile only".into());
     }
     let paired = paired_attn || attn_tiles || paired_rec || paired_gate_up;
     if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
@@ -2227,6 +2257,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let model = build_model(&rt, &opts)?;
     if let Some(prefix_len) = decode {
         return run_decode(&rt, &model, prefix_len, &opts).map_err(Into::into);
+    }
+    if stage_profile {
+        let ts = if ts.is_empty() { vec![1024, 8192] } else { ts };
+        let ids = opts.ids.as_deref().ok_or("--stage-profile needs --ids")?;
+        return qwen35_stage_profile::run(&rt, &model, &ts, opts.iters, ids).map_err(Into::into);
     }
     if prefill_score {
         let ts = if ts.is_empty() { PREFILL_SCORE_T.to_vec() } else { ts };

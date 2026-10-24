@@ -828,15 +828,16 @@ real_2b_step_on_bf16_storage_stays_near_the_f32_step       FAILED a bound (2026-
 real_2b_loss_curve_tracks_the_f32_step                     FAILED closed before its first arm (2026-10-21 run below; ft-dafde771)
 real_2b_bank_accumulates_within_the_bound                  PASS (2026-10-21 run below)
 real_2b_gradients_are_those_of_tessls_forward              FAILED a bound (2026-10-21 run below; ft-1d2ab5b0)
-real_2b_step_matches_the_f64_gradient                      NOT RUN (added 2026-10-22; needs the --f64 reference)
+real_2b_step_matches_the_f64_gradient                      PASS (2026-10-22 run below; ft-1d2ab5b0)
 hosted_selection_has_no_device                             not run directly (needs the hosted sandbox)
 every_device_free_test_is_on_the_hosted_manifest           PASS via scripts/hosted_tests.sh --outside
 ```
 
 The earlier run of these 16 had three SIGTERM exits (the memguard cap, not a
 test assertion), recorded then as not completed, not as passes, and one test
-not run for a missing reference. The four rows above that changed are from the
-2026-10-21 run below.
+not run for a missing reference. The four rows above that changed in the
+earlier pass are from the 2026-10-21 run below; the f64-gradient row is from the
+2026-10-22 run, described after them.
 
 2026-10-21 (M5 Pro, 64 GiB): `real_2b_step_matches_transformers` was killed twice,
 both times in its comparison phase after printing its loss, by the machine lock
@@ -949,7 +950,22 @@ qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
   transformers' float32 casts to float64 and raises on any floating
   intermediate that is not float64; on a tiny Qwen3.5 model it matches both
   the dense tied autograd (1.7e-16) and f64 central differences (1.6e-9 to
-  8e-7 relative on five parameters). Not yet run on the 2B.
+  8e-7 relative on five parameters).
+
+  Run on the 2B, 2026-10-22 (gp/w22-f64-grad-ref 152d66a, clean tree, now an
+  ancestor of main; Base snapshot b1485b2, 128 tokens). The generator
+  ran in 100 s (meta peak RSS 20.56 GiB) and the test, run alone with
+  `--exact --ignored --nocapture --test-threads=1`, exited 0: `1 passed; 0
+  failed`, 40.64 s, peak footprint 15.10 GiB (memguard cap 32 GiB). Loss:
+  tessl 3.8103398752, f64 autograd 3.8103404083, rel 1.40e-7 (transformers
+  fp32 vs f64: 4.57e-5). Worst gradient over the 149 parameters: tessl vs f64
+  6.06e-5, against the 1e-2 bound set before any run. Evidence, on the
+  recording machine only (`target-gp/` is gitignored, so a clone does not
+  have it): `target-gp/gpurun14/test_f64.log` (result line 310, loss line 5,
+  worst line 155), `meta_f64.txt`, `header.txt`, driver
+  `target-gp/gpurun14.sh`. The same figures are in BUILD_REPORT.md under
+  "Late results (wave 22b)". This is one run on one fixture, not a repeated
+  measurement.
 
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,
 transformers 3.81016612; train vs transformers 4.55e-5), the worst

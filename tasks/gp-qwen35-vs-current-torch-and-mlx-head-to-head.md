@@ -38,6 +38,7 @@ Source: research session 2026-10-20 (LinkedIn article audit, Qwen3.8-27B inferen
 
 ## Description
 The 2.12–2.22x Qwen3.5-2B prefill+score result against PyTorch (ojas/bench/results/2026-10-03-lappi-inference-rerun/research-notes.md) has these limits:
+- **Update 2026-10-23:** `bench/results/qwen35_prefill_score_h2h_m5pro.txt` (Oct 23) supersedes the 2.12–2.22x figure with 4.47–5.35x vs torch 2.14.1 (T=200 to 8192), and its paired run has mlx-lm 0.32 10–16% faster than tessl at every length, which also supersedes the unpaired 8k MLX comparison below. The limits listed here describe the old Oct 4 run.
 - it ran against torch **2.12.1**
 - one hand-run session
 - 7 vs 10 samples per side

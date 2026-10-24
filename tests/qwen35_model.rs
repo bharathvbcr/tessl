@@ -211,6 +211,10 @@ fn real_2b_logits(ids: &[u32], precision: Precision) -> Vec<f32> {
     logits
 }
 
+/// Largest allowed gap between tessl's Q4 EAR and mlx-lm's own Q4 EAR (float32
+/// activations), both against transformers fp32, on a prompt's mean.
+const EAR_Q4_PARITY_DELTA: f64 = 5e-3;
+
 /// One forward of the MLX affine 4-bit 2B in `dir` (`tools/qwen35_ref/make_mlx_q4.py`'s
 /// output, built from the same bf16 weights as the reference), the logits only.
 fn q4_2b_logits(dir: &Path, ids: &[u32]) -> Vec<f32> {
@@ -241,7 +245,7 @@ fn to_f32(v: &[f64]) -> Vec<f32> {
 /// `logits_bf16.npy` against `logits_f32.npy`. Returns the failures of the F32
 /// gate: 1e-3 of the largest logit and no top-1 miss, the bounds of
 /// `f32_forward_matches_transformers_fp32_layer_by_layer`.
-fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<String> {
+fn logit_deviation_rows(label: &str, dir: &Path, q4_sub: &str, variants: &[Precision]) -> Vec<String> {
     let ids = ids_in(dir);
     let (shape, hf_f32) = load_ref_in(dir, "logits_f32");
     let (shape_bf16, hf_bf16) = load_ref_in(dir, "logits_bf16");
@@ -257,11 +261,20 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
     let mut failures = Vec::new();
     // EAR (SLQ's Expected Acceptance Rate, top-10) against the bf16 model: transformers'
     // bf16 forward, `logits_bf16`. Reported, not gated.
+    // Each candidate is also scored against transformers fp32: the bf16 reference is itself
+    // noisy at the 0.99 bar (even exact fp32 misses it), so the fp32 rows are what separate
+    // exact models from lossy ones.
     let mut ear_rows = Vec::new();
+    let ear_both = |ear_rows: &mut Vec<String>, name: &str, got: &[f32]| {
+        ear_rows.push(ear(got, &hf_bf16, vocab, EAR_TOP_K).row(&format!("{name} vs transformers bf16")));
+        let vs_f32 = ear(got, &hf_f32, vocab, EAR_TOP_K);
+        ear_rows.push(vs_f32.row(&format!("{name} vs transformers fp32")));
+        vs_f32.mean
+    };
     for &variant in variants {
         let fresh = (variant != Precision::F32).then(|| real_2b_logits(&ids, variant));
         let got: &[f32] = fresh.as_deref().unwrap_or(&tessl_f32);
-        ear_rows.push(ear(got, &hf_bf16, vocab, EAR_TOP_K).row(&format!("{variant:?} vs transformers bf16")));
+        ear_both(&mut ear_rows, &format!("{variant:?}"), got);
         let vs_tessl = logit_dev(got, &tessl_f32_64, vocab);
         let vs_hf = logit_dev(got, &hf_f32, vocab);
         eprintln!("{}", vs_tessl.row(&format!("{variant:?} vs tessl F32")));
@@ -283,12 +296,41 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
     }
     let floor = logit_dev(&hf_bf16_ref, &hf_f32, vocab);
     eprintln!("{}", floor.row("transformers bf16 vs fp32 (floor)"));
-    ear_rows.push(ear(&to_f32(&hf_f32), &hf_bf16, vocab, EAR_TOP_K).row("transformers fp32 vs bf16 (floor)"));
+    ear_both(&mut ear_rows, "transformers bf16 (floor)", &hf_bf16_ref);
     let q4 = q4_dir();
     if q4.join("config.json").is_file() {
         let got = q4_2b_logits(&q4, &ids);
         eprintln!("{}", logit_dev(&got, &hf_f32, vocab).row("MLX Q4 vs transformers fp32"));
-        ear_rows.push(ear(&got, &hf_bf16, vocab, EAR_TOP_K).row("MLX Q4 vs transformers bf16"));
+        let tessl_q4 = ear_both(&mut ear_rows, "tessl MLX Q4", &got);
+        // mlx-lm's own forward on the same 4-bit weights and ids (make_mlx_q4.py): bf16
+        // activations and float32 activations. Host files only.
+        let mlx_dir = q4.join("ref").join(q4_sub);
+        let (mlx_ids, _) = load_ref_in(&mlx_dir, "ids");
+        assert_eq!(mlx_ids.len(), ids.len(), "{label}: mlx-lm ids length differs");
+        let mut mlx_f32_mean = None;
+        for (file, name) in [
+            ("logits_mlx", "mlx-lm Q4 (bf16 acts)"),
+            ("logits_mlx_f32", "mlx-lm Q4 (f32 acts)"),
+        ] {
+            let (mshape, mlx) = load_ref_in(&mlx_dir, file);
+            assert_eq!(mshape, shape, "{label}: {file} shape differs from the reference");
+            let mlx32 = to_f32(&mlx);
+            let m = ear_both(&mut ear_rows, name, &mlx32);
+            if file == "logits_mlx_f32" {
+                mlx_f32_mean = Some(m);
+                ear_rows.push(ear(&got, &mlx, vocab, EAR_TOP_K).row("tessl MLX Q4 vs mlx-lm Q4 (f32 acts)"));
+            }
+        }
+        // Pinned before the first run: tessl's Q4 forward is the same format as mlx-lm's, so
+        // its EAR against fp32 is within 5e-3 of mlx-lm's float32-activation forward. A
+        // faithful kernel moves the mean far less than the 4-bit format itself moves it.
+        let m = mlx_f32_mean.unwrap();
+        let gap = (tessl_q4 - m).abs();
+        if !gap.is_finite() || gap > EAR_Q4_PARITY_DELTA {
+            failures.push(format!(
+                "{label}: tessl Q4 EAR vs fp32 {tessl_q4:.6} differs from mlx-lm Q4 {m:.6} by more than {EAR_Q4_PARITY_DELTA}"
+            ));
+        }
     } else {
         eprintln!("MLX Q4: NOT RUN ({} has no config.json)", q4.display());
     }
@@ -310,9 +352,9 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
 #[ignore]
 fn logit_deviation_report() {
     let variants = [Precision::F32, Precision::Bf16];
-    let mut failures = logit_deviation_rows("default prompt", &ref_dir(), &variants);
+    let mut failures = logit_deviation_rows("default prompt", &ref_dir(), "default", &variants);
     match std::env::var_os("QWEN35_REF_TEXT_DIR") {
-        Some(dir) => failures.extend(logit_deviation_rows("text prompt", Path::new(&dir), &variants)),
+        Some(dir) => failures.extend(logit_deviation_rows("text prompt", Path::new(&dir), "text", &variants)),
         None => eprintln!("== text prompt: NOT RUN (QWEN35_REF_TEXT_DIR is unset)"),
     }
     match footprint::peak_footprint() {

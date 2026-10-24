@@ -204,6 +204,16 @@ pub fn round_trip_bf16(data: &[f32]) -> Vec<f32> {
     f32_slice_to_bf16(data).into_iter().map(bf16_bits_to_f32).collect()
 }
 
+/// Error budget of an f32-accumulated reduction of `n` terms: `4 * eps * sqrt(n) * scale`,
+/// with `eps = f32::EPSILON` and `scale` the caller's stated magnitude (the sum of the
+/// absolute terms for a sum or a dot product, `max |x|` for a max or a norm output).
+/// Rounding errors of a reassociated sum add as a random walk, `sqrt(n)`, not linearly;
+/// the factor 4 covers the tree's two stages. A test names its `scale` instead of
+/// picking a number, and never widens this to make a case pass.
+pub fn reduction_bound(n: usize, scale: f64) -> f64 {
+    4.0 * f64::from(f32::EPSILON) * (n as f64).sqrt() * scale
+}
+
 pub fn tensor_f32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
     let t = rt.alloc_tensor_f32(shape).expect("alloc_tensor_f32");
     t.buffer.write_f32(data);

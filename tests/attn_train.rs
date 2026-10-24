@@ -12,7 +12,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{buf, buf_u32, random_f32, seeded, with_gpu};
+use common::{buf, buf_u32, random_f32, reduction_bound, seeded, with_gpu};
 use tessl::attn_train::{
     attn_train_backward, attn_train_forward, AttnTrainDims, AttnTrainGrads, AttnTrainWorkspace, ATTN_TRAIN_HEAD_DIM,
 };
@@ -580,5 +580,189 @@ fn randomized_shapes_stress() {
             );
             run(rt, b, t, hkv * group, hkv, s);
         }
+    });
+}
+
+/// Runs the training forward and backward once and returns `(o, dq, dk, dv)`.
+fn fwd_bwd(
+    rt: &Arc<GpuRuntime>,
+    dm: &AttnTrainDims,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    d_o: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (nq, nkv) = (q.len(), k.len());
+    let (qb, kb, vb, dob) = (buf(rt, q), buf(rt, k), buf(rt, v), buf(rt, d_o));
+    let (ob, lseb) = (seeded(rt, nq, SENTINEL), seeded(rt, dm.lse_len(), SENTINEL));
+    let ws = AttnTrainWorkspace::new(rt, *dm).unwrap();
+    attn_train_forward(rt, dm, &qb, &kb, &vb, &ob, &lseb, &ws).unwrap();
+    let (dqb, dkb, dvb) = (
+        seeded(rt, nq, SENTINEL),
+        seeded(rt, nkv, SENTINEL),
+        seeded(rt, nkv, SENTINEL),
+    );
+    let grads = AttnTrainGrads {
+        dq: &dqb,
+        dk: &dkb,
+        dv: &dvb,
+    };
+    attn_train_backward(rt, dm, &qb, &kb, &vb, &ob, &lseb, &dob, &grads, &ws).unwrap();
+    rt.synchronize().unwrap();
+    (ob.read_f32(), dqb.read_f32(), dkb.read_f32(), dvb.read_f32())
+}
+
+/// GProj's "one-key row" test (arXiv:2609.34272, Appendix I.3, and the first-row identity of
+/// I.2): a causal first query row has a single legal key, so `P = 1`, the output is exactly
+/// `V[0]` and the query and key gradients are exactly zero, whatever the scores. The paper's
+/// prescribed construction: every query coordinate `c * 2^k` and every key coordinate 1, for
+/// `c` in {3, 5, 7}, `k` in 0..16, at sequence lengths 1 and 128, with the incoming derivative
+/// nonzero only at the first query. (The paper uses head dim 64; this kernel's is
+/// `ATTN_TRAIN_HEAD_DIM`.)
+///
+/// Pinned bit for bit: `o[0] == V[0]`, `dV[0] == dO[0]` (both multiply by `P = exp(0) = 1`),
+/// `dQ[0] == 0` and `dK[0] == 0` exactly (the paper requires zero; the device returned exact
+/// zeros in all 96 configurations, so no budget is needed), and every gradient row the
+/// derivative does not reach is exactly 0.
+#[test]
+fn one_key_row_gives_output_v_and_zero_query_and_key_gradients() {
+    with_gpu(|rt| {
+        for t in [1usize, 128] {
+            let dm = dims(1, t, 1, 1);
+            let v = random_f32(t * D, 0x0E0 + t as u64);
+            let mut d_o = vec![0.0f32; t * D];
+            d_o[..D].copy_from_slice(&random_f32(D, 0x0E1));
+            for c in [3.0f32, 5.0, 7.0] {
+                for k in 0..16 {
+                    let qv = c * (1u32 << k) as f32;
+                    let q = vec![qv; t * D];
+                    let key = vec![1.0f32; t * D];
+                    let (o, dq, dk, dv) = fwd_bwd(rt, &dm, &q, &key, &v, &d_o);
+                    let label = format!("t={t} c={c} k={k}");
+                    assert!(
+                        o[..D].iter().zip(&v[..D]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{label}: o[0] != V[0]"
+                    );
+                    assert!(
+                        dv[..D].iter().zip(&d_o[..D]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{label}: dV[0] != dO[0]"
+                    );
+                    // Observed exactly 0 on the device in every configuration, as the paper
+                    // requires: dS = scale * P * (dO.V - dO.o) is a difference of identical dots.
+                    assert!(dq[..D].iter().all(|g| *g == 0.0), "{label}: dQ[0] is not exactly 0");
+                    assert!(dk[..D].iter().all(|g| *g == 0.0), "{label}: dK[0] is not exactly 0");
+                    // Rows past the first receive no derivative: exactly zero, not "small".
+                    assert!(dq[D..].iter().all(|g| *g == 0.0), "{label}: dQ past row 0 is not 0");
+                    assert!(dk[D..].iter().all(|g| *g == 0.0), "{label}: dK past row 0 is not 0");
+                    assert!(dv[D..].iter().all(|g| *g == 0.0), "{label}: dV past row 0 is not 0");
+                }
+            }
+        }
+    });
+}
+
+/// GProj's exact "-24 witness" (arXiv:2609.34272, Section 3.4 and Appendix A.1). Four keys
+/// `k_j = (65536, j-1)`, `q = 0` (uniform attention), `alpha = 1/8`, `eta = 3/1024`, values
+/// `(4, 4*eta)`, `(-4, 0)`, `(-4*eta, 0)`, `(0, 0)`, upstream derivative `u = (1, 1)`, all
+/// exactly representable in bf16 and f32. The score gradient is `g = (1+eta, -1, -eta, 0)`,
+/// which sums to zero, so the true first query-gradient coordinate is exactly 0. Casting `g`
+/// to bf16 rounds `1+eta` to 1, leaves a row mass `rho = -eta` and a first coordinate of
+/// `alpha * rho * 65536 = -24`; this test checks that arithmetic on the host, then that the
+/// f32 backward does not leak it: `dQ[3][0]` is within `reduction_bound(4, sum_j |alpha g_j
+/// k_j0|)` of 0 (scale: the four terms' magnitudes, about 1.6e4), which is far below 24.
+/// The remaining coordinates and `o` are checked against the f64 reference. Head-dim
+/// coordinates past the second are zero. Tokens 0-2 are the first three keys with `dO = 0`.
+#[test]
+fn the_minus_24_witness_leaves_no_query_gradient_in_the_first_coordinate() {
+    use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits};
+    let (alpha, eta) = (0.125f32, 3.0f32 / 1024.0);
+    let vals = [[4.0, 4.0 * eta], [-4.0, 0.0], [-4.0 * eta, 0.0], [0.0, 0.0]];
+    // The score gradient of the setup, derived from the values rather than written down: with
+    // uniform P = 1/4 and u = (1, 1), a_j = u.v_j, g_j = P (a_j - mean(a)). If the values stop
+    // being the paper's, g stops being (1+eta, -1, -eta, 0) and the checks below say so.
+    let a: Vec<f64> = vals.iter().map(|v| f64::from(v[0]) + f64::from(v[1])).collect();
+    let mu = a.iter().sum::<f64>() / 4.0;
+    let g: Vec<f32> = a.iter().map(|aj| ((aj - mu) / 4.0) as f32).collect();
+    assert_eq!(g, [1.0 + eta, -1.0, -eta, 0.0], "g of the paper's values");
+    assert_eq!(g.iter().sum::<f32>(), 0.0, "g sums to zero, so the true dQ[0] is 0");
+    let t: Vec<f32> = g.iter().map(|x| bf16_bits_to_f32(f32_to_bf16_bits(*x))).collect();
+    let rho: f32 = t.iter().sum();
+    assert_eq!(t, [1.0, -1.0, -eta, 0.0], "bf16 rounds 1+eta to 1");
+    assert_eq!(rho, -eta);
+    assert_eq!(alpha * rho * 65536.0, -24.0, "the witness value");
+
+    with_gpu(|rt| {
+        let tn = 4usize;
+        let dm = AttnTrainDims {
+            batch: 1,
+            seq: tn as u32,
+            q_heads: 1,
+            kv_heads: 1,
+            scale: alpha,
+        };
+        let s = Shape {
+            b: 1,
+            t: tn,
+            hq: 1,
+            hkv: 1,
+            d: D,
+            scale: f64::from(alpha),
+        };
+        let mut k = vec![0.0f32; tn * D];
+        let mut v = vec![0.0f32; tn * D];
+        for j in 0..tn {
+            k[j * D] = 65536.0;
+            k[j * D + 1] = j as f32;
+            v[j * D..j * D + 2].copy_from_slice(&vals[j]);
+        }
+        let q = vec![0.0f32; tn * D];
+        let mut d_o = vec![0.0f32; tn * D];
+        d_o[3 * D] = 1.0;
+        d_o[3 * D + 1] = 1.0;
+
+        let (o, dq, dk, dv) = fwd_bwd(rt, &dm, &q, &k, &v, &d_o);
+        let (q64, k64, v64, do64) = (f64s(&q), f64s(&k), f64s(&v), f64s(&d_o));
+        let (want_o, _) = attn_fwd(&s, &q64, &k64, &v64);
+        let (want_dq, want_dk, want_dv) = attn_bwd(&s, &q64, &k64, &v64, &do64);
+        assert_eq!(want_dq[3 * D], 0.0, "reference: the first coordinate is exactly 0");
+
+        eprintln!(
+            "OBSERVED witness dQ[3][0]={:e} dQ[3][1]={:e} (reference {:e})",
+            dq[3 * D],
+            dq[3 * D + 1],
+            want_dq[3 * D + 1]
+        );
+        let term_scale: f64 = g
+            .iter()
+            .map(|x| (f64::from(alpha) * f64::from(*x) * 65536.0).abs())
+            .sum();
+        let bound = reduction_bound(tn, term_scale);
+        assert!(bound < 1.0, "the budget must sit far below the witness 24, got {bound}");
+        // The true first coordinate, from the setup's own g (not 0 by construction): the f64
+        // value of alpha * sum_j g_j * k_j0, which is exactly 0 for the paper's values.
+        let host_dq0: f64 = g.iter().map(|x| f64::from(alpha) * f64::from(*x) * 65536.0).sum();
+        assert_eq!(host_dq0, 0.0, "the setup's true dQ[3][0]");
+        assert!(
+            (f64::from(dq[3 * D]) - host_dq0).abs() <= bound,
+            "dQ[3][0] = {} vs true {host_dq0} (the bf16-cast witness would be -24), bound {bound:e}",
+            dq[3 * D]
+        );
+        // Everything else, against the f64 reference, with the same stated scale.
+        let dq1_scale: f64 = g
+            .iter()
+            .enumerate()
+            .map(|(j, x)| (f64::from(alpha) * f64::from(*x) * j as f64).abs())
+            .sum();
+        let b1 = reduction_bound(tn, dq1_scale);
+        assert!(
+            (f64::from(dq[3 * D + 1]) - want_dq[3 * D + 1]).abs() <= b1,
+            "dQ[3][1] = {}, want {} +- {b1:e}",
+            dq[3 * D + 1],
+            want_dq[3 * D + 1]
+        );
+        assert!(dq[..3 * D].iter().all(|x| *x == 0.0), "rows 0-2 get no derivative");
+        close("witness o", &o, &want_o);
+        close("witness dk", &dk, &want_dk);
+        close("witness dv", &dv, &want_dv);
     });
 }

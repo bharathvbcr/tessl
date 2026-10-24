@@ -7,8 +7,10 @@
 
 mod common;
 
-use common::{buf, empty, random_f32, with_gpu};
+use common::{buf, empty, random_f32, reduction_bound, tensor_f32, with_gpu};
+use tessl::gemm::{gemm, GemmBackend};
 use tessl::nn;
+use tessl::tensor::{f16_bits_to_f32, f32_slice_to_f16, f32_to_f16_bits};
 
 /// f64 reference, so the comparison is against better arithmetic than the
 /// kernel's rather than against the same rounding.
@@ -227,5 +229,244 @@ fn reductions_reject_empty_and_undersized_operands() {
         let err = nn::softmax_rows_f32(rt, &short, &full, 4, 16).expect_err("short x");
         assert!(err.contains("buffer holds"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// Bit patterns of a read-back row, so "untouched" means bit-identical (NaN included).
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// One run of the three row reductions over `rows x cols`: `(sum, max, softmax)`.
+fn run_reductions(
+    rt: &std::sync::Arc<tessl::GpuRuntime>,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let xb = buf(rt, x);
+    let (s, m, sm) = (empty(rt, rows), empty(rt, rows), empty(rt, rows * cols));
+    nn::row_sum_f32(rt, &xb, &s, rows as u32, cols as u32).unwrap();
+    nn::row_max_f32(rt, &xb, &m, rows as u32, cols as u32).unwrap();
+    nn::softmax_rows_f32(rt, &xb, &sm, rows as u32, cols as u32).unwrap();
+    rt.synchronize().unwrap();
+    (s.read_f32(), m.read_f32(), sm.read_f32())
+}
+
+/// NaN, +inf and -inf planted at known positions of known rows.
+///
+/// Rows: 0 clean, 1 one NaN, 2 one +inf, 3 one -inf (not at the maximum), 4 +inf and -inf,
+/// 5 clean. The same data without the plants is run first; rows 0 and 5 must come back
+/// bit-identical to it, so a poisoned row cannot leak into a neighbour through a shared
+/// scratch or a mis-strided read.
+///
+/// Kernels compile with fast math (`build.rs`), so the compiler is allowed to assume no NaN or
+/// inf, yet the device was observed to propagate them: the sum is NaN/+inf/-inf/NaN by row, the
+/// +inf maximum wins, and softmax is NaN throughout for any row holding a NaN or +inf. Only the
+/// max of a NaN row is left as a set (NaN, or the finite maximum, which is what `fmax` gives):
+/// that is the one result fast math may legitimately take either way. The all--inf row is
+/// tested above (`row_max_and_softmax_of_masked_rows_never_invent_a_value`) and unchanged.
+#[test]
+fn planted_non_finite_inputs_poison_exactly_their_rows() {
+    with_gpu(|rt| {
+        for cols in [33usize, 1000, 5000] {
+            let rows = 6usize;
+            let clean = random_f32(rows * cols, 0xBAD + cols as u64);
+            let mut x = clean.clone();
+            let at = |r: usize, c: usize| r * cols + c;
+            let (c_nan, c_pinf, c_ninf, c_a, c_b) = (cols / 3, cols - 1, 1, 0, cols / 2);
+            x[at(1, c_nan)] = f32::NAN;
+            x[at(2, c_pinf)] = f32::INFINITY;
+            x[at(3, c_ninf)] = f32::NEG_INFINITY;
+            x[at(4, c_a)] = f32::INFINITY;
+            x[at(4, c_b)] = f32::NEG_INFINITY;
+
+            let (cs, cm, csm) = run_reductions(rt, &clean, rows, cols);
+            let (s, m, sm) = run_reductions(rt, &x, rows, cols);
+            let row = |v: &[f32], r: usize| v[r * cols..(r + 1) * cols].to_vec();
+            let label = format!("cols={cols}");
+
+            for r in [0usize, 5] {
+                assert_eq!(s[r].to_bits(), cs[r].to_bits(), "{label}: sum of clean row {r}");
+                assert_eq!(m[r].to_bits(), cm[r].to_bits(), "{label}: max of clean row {r}");
+                assert_eq!(
+                    bits(&row(&sm, r)),
+                    bits(&row(&csm, r)),
+                    "{label}: softmax of clean row {r}"
+                );
+            }
+
+            // Sum: IEEE, row by row.
+            assert!(s[1].is_nan(), "{label}: NaN + finite = NaN, got {}", s[1]);
+            assert_eq!(s[2], f32::INFINITY, "{label}: sum of a +inf row");
+            assert_eq!(s[3], f32::NEG_INFINITY, "{label}: sum of a -inf row");
+            assert!(s[4].is_nan(), "{label}: +inf + -inf = NaN, got {}", s[4]);
+
+            // Max: +inf wins; a planted -inf never is the maximum of a row that has finite
+            // entries (compared to the row's own finite maximum); a NaN gives NaN or the
+            // finite maximum.
+            assert_eq!(m[2], f32::INFINITY, "{label}: max of a +inf row");
+            assert_eq!(m[4], f32::INFINITY, "{label}: max of a +inf and -inf row");
+            let finite_max_3 = row(&x, 3)
+                .iter()
+                .cloned()
+                .filter(|v| v.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(m[3], finite_max_3, "{label}: a planted -inf cannot be a row's maximum");
+            let finite_max_1 = row(&x, 1)
+                .iter()
+                .cloned()
+                .filter(|v| v.is_finite())
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                m[1].is_nan() || m[1] == finite_max_1,
+                "{label}: max of a NaN row is NaN or the finite maximum {finite_max_1}, got {}",
+                m[1]
+            );
+
+            // Softmax: a row holding a NaN or a +inf is NaN in every entry (torch's answer),
+            // never a valid-looking distribution. Before the kernel fix these three rows came
+            // back as the uniform 1/cols with no NaN at all (observed on the device, cols 33,
+            // 1000 and 5000): the all--inf fallback caught any non-positive denominator,
+            // NaN included.
+            for (r, what) in [(1usize, "a NaN"), (2, "a +inf"), (4, "a +inf and a -inf")] {
+                let out = row(&sm, r);
+                assert!(
+                    out.iter().all(|p| p.is_nan()),
+                    "{label}: softmax of a row holding {what} must be NaN throughout, got {} NaN of {cols}, first {:?}",
+                    out.iter().filter(|p| p.is_nan()).count(),
+                    &out[..4.min(cols)]
+                );
+            }
+            // A -inf next to finite entries is an ordinary masked row: a distribution over the
+            // finite entries with exactly zero mass at the -inf position.
+            let out3 = row(&sm, 3);
+            assert!(
+                out3.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                    && (out3.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() < 1e-4,
+                "{label}: softmax of a masked row is not a distribution"
+            );
+            assert_eq!(sm[at(3, c_ninf)], 0.0, "{label}: softmax at a planted -inf");
+        }
+    });
+}
+
+/// Subnormal inputs. Fast math may flush them to zero, so the result is either the f32
+/// reference or the flushed one; what it must never be is a magnitude the input does not
+/// have. Budget: `reduction_bound(n, scale)` with scale = sum of |terms|.
+///
+/// Observed on the device (Apple GPU, fast math): `row_sum_f32` flushes subnormal inputs to
+/// zero (the row of 1000 x 1e-40 sums to 0), while `row_max_f32` keeps a subnormal (max of
+/// that row is 1e-40). The assertions accept both branches, so the test records and does not
+/// change this behaviour.
+#[test]
+fn subnormal_inputs_are_summed_or_flushed_never_invented() {
+    with_gpu(|rt| {
+        let cols = 1000usize;
+        let sub = 1.0e-40f32;
+        assert!(sub > 0.0 && sub < f32::MIN_POSITIVE, "1e-40 must be subnormal in f32");
+        let rows = 3usize;
+        let mut x = vec![0.0f32; rows * cols];
+        x[..cols].fill(sub); // row 0: all subnormal
+        x[cols..2 * cols].fill(1.0); // row 1: normal, with one subnormal that must not matter
+        x[cols + 7] = sub;
+        x[2 * cols + 11] = -sub; // row 2: one negative subnormal in zeros
+        let (s, m, _) = run_reductions(rt, &x, rows, cols);
+
+        let ref0 = f64::from(sub) * cols as f64;
+        let b0 = reduction_bound(cols, ref0);
+        let branch = |got: f32, want: f64, b: f64| {
+            if got == 0.0 {
+                "flushed-to-zero"
+            } else if (f64::from(got) - want).abs() <= b {
+                "reference"
+            } else {
+                "neither"
+            }
+        };
+        eprintln!(
+            "OBSERVED subnormal sum row0 = {:e} ({}), row2 = {:e}, max row0 = {:e} ({})",
+            s[0],
+            branch(s[0], ref0, b0),
+            s[2],
+            m[0],
+            if m[0] == 0.0 { "flushed-to-zero" } else { "kept" }
+        );
+        assert!(
+            s[0] == 0.0 || (f64::from(s[0]) - ref0).abs() <= b0,
+            "sum of {cols} x {sub:e} = {:e}: want {ref0:e} +- {b0:e} or flushed 0",
+            s[0]
+        );
+        let ref1 = (cols - 1) as f64 + f64::from(sub);
+        let b1 = reduction_bound(cols, ref1);
+        assert!(
+            (f64::from(s[1]) - ref1).abs() <= b1,
+            "normal row with a subnormal: {} want {ref1} +- {b1}",
+            s[1]
+        );
+        assert!(
+            s[2] == 0.0 || (f64::from(s[2]) + f64::from(sub)).abs() <= reduction_bound(cols, f64::from(sub)),
+            "sum of zeros and one -{sub:e} = {:e}",
+            s[2]
+        );
+        assert!(
+            m[0] == sub || m[0] == 0.0,
+            "max of a subnormal row is itself or flushed, got {:e}",
+            m[0]
+        );
+        assert_eq!(m[1], 1.0, "max of the normal row");
+        assert!(
+            m[2] == 0.0,
+            "max of zeros and one negative subnormal is 0, got {:e}",
+            m[2]
+        );
+    });
+}
+
+/// What an fp16 running sum does with `terms`: every partial sum rounded to f16.
+fn f16_running_sum(terms: &[f32]) -> f32 {
+    terms
+        .iter()
+        .fold(0.0f32, |acc, t| f16_bits_to_f32(f32_to_f16_bits(acc + t)))
+}
+
+/// A K-long dot product of f16 operands accumulates in f32 (the contract: f16/bf16 operands
+/// "accumulate in f32", `tests/f16.rs`). Two inputs on which an f16 accumulator fails
+/// visibly, each first checked on the host to *discriminate* (an f16 running sum is off by
+/// far more than the budget), so a vacuous input cannot pass:
+///
+/// * K = 8192 products of 1.0: f16's running sum stalls at 2048 (ulp 2 absorbs +1).
+/// * K = 4096 products of 256.0: the true 2^20 exceeds f16's 65504, so an f16 sum is +inf.
+///
+/// Reference: f64 over the same f16-rounded operands; budget `reduction_bound(K, sum |terms|)`.
+#[test]
+fn f16_operands_accumulate_in_f32() {
+    with_gpu(|rt| {
+        for &(k, a_val, b_val) in &[(8192usize, 1.0f32, 1.0f32), (4096, 16.0, 16.0)] {
+            let (m, n) = (128usize, 64usize);
+            let terms: Vec<f32> = vec![a_val * b_val; k];
+            let abs_sum: f64 = terms.iter().map(|t| f64::from(t.abs())).sum();
+            let want = terms.iter().map(|t| f64::from(*t)).sum::<f64>();
+            let bound = reduction_bound(k, abs_sum);
+            let f16_sum = f64::from(f16_running_sum(&terms));
+            assert!(
+                !f16_sum.is_finite() || (f16_sum - want).abs() > 100.0 * bound,
+                "k={k}: input does not discriminate (f16 sum {f16_sum}, f32 {want}, bound {bound})"
+            );
+
+            let a = rt.alloc_tensor_f16(&[m, k]).unwrap();
+            a.buffer.write_f16_bits(&f32_slice_to_f16(&vec![a_val; m * k]));
+            let b = rt.alloc_tensor_f16(&[k, n]).unwrap();
+            b.buffer.write_f16_bits(&f32_slice_to_f16(&vec![b_val; k * n]));
+            let c = tensor_f32(rt, &[m, n], &vec![0.0; m * n]);
+            gemm(&a, &b, &c, GemmBackend::TensorOps).expect("f16 gemm");
+            rt.synchronize().unwrap();
+            for (i, got) in c.buffer.read_f32().iter().enumerate() {
+                assert!(
+                    (f64::from(*got) - want).abs() <= bound,
+                    "k={k}: c[{i}] = {got}, f32-accumulated reference {want} +- {bound} (an f16 accumulator gives {f16_sum})"
+                );
+            }
+        }
     });
 }

@@ -14,6 +14,10 @@
 #include "reduce_tree.h"
 using namespace metal;
 
+/// The bit pattern of -INFINITY, tested as bits because fast math may assume
+/// no value is infinite and fold a float compare against it away.
+constant uint NEG_INF_BITS = 0xFF800000u;
+
 /// The starting value of lane `lid`'s running max over a row of `cols >= 1`:
 /// the lane's first element, or the row's first for a lane with none. Max is
 /// idempotent, so a duplicate changes nothing; an identity would have to be
@@ -39,7 +43,16 @@ inline float max_seed(device const float* xr, uint lid, uint cols) {
 ///
 /// A row of all -INFINITY sums to zero. Dividing would give NaN; the
 /// convention here is a uniform distribution, which is what a caller
-/// masking every position of an attention row expects to see.
+/// masking every position of an attention row expects to see. That is the
+/// only row the uniform fallback is for: a row holding a NaN or a +INFINITY
+/// (torch: NaN) has a NaN denominator and every output is NaN. A -INFINITY
+/// term is therefore recognised by its bits and contributes exactly 0, so the
+/// all--inf row's denominator is 0 rather than the NaN of `-inf - -inf`, and
+/// a NaN denominator can no longer be mistaken for it (it was: `!(denom > 0)`
+/// took both, silently turning poisoned rows into valid-looking uniform ones).
+/// The NaN case is never tested for (an `isnan` is what fast math may fold
+/// away): a NaN denominator fails `denom == 0` and flows through the ordinary
+/// formula to NaN outputs.
 kernel void softmax_rows_f32(
     device const float* x    [[buffer(0)]],
     device float*       out  [[buffer(1)]],
@@ -59,10 +72,15 @@ kernel void softmax_rows_f32(
     const float row_max = reduce_row_max(m, scratch, sgid, lane, tptg);
 
     float s = 0.0f;
-    for (ulong c = lid; c < (ulong)cols; c += tptg) { s += exp(xr[c] - row_max); }
+    for (ulong c = lid; c < (ulong)cols; c += tptg) {
+        const float v = xr[c];
+        s += as_type<uint>(v) == NEG_INF_BITS ? 0.0f : exp(v - row_max);
+    }
     const float denom = reduce_row_add(s, scratch + REDUCE_MAX_SIMDGROUPS, sgid, lane, tptg);
-    const float inv = denom > 0.0f ? 1.0f / denom : 1.0f / (float)cols;
-    const bool degenerate = !(denom > 0.0f);
+    // Zero only for a row of all -inf (the row's maximum contributes exp(0) = 1 to any other),
+    // never for a NaN, which compares false here and takes the ordinary path to NaN outputs.
+    const bool degenerate = denom == 0.0f;
+    const float inv = degenerate ? 1.0f / (float)cols : 1.0f / denom;
 
     for (ulong c = lid; c < (ulong)cols; c += tptg) {
         outr[c] = degenerate ? inv : exp(xr[c] - row_max) * inv;

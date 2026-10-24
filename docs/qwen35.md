@@ -1527,8 +1527,14 @@ kernel with no register accumulator, and this one is cooperative. Whether
 
 The 1k and 2k forwards do not show the stage saving. In that run the GEMM
 stages also came out 10–20% slower than in the control run straight after,
-and the GPU read 85% busy at the start from something else. They are
-unresolved until re-run. For comparison, on the same machine MLX measured
+and the GPU read 85% busy at the start from something else. That run was on
+a busy GPU and is not evidence; the paired prefill+score run below replaces
+it, and shows the 1k and 2k forwards behind mlx-lm (0.887x and 0.896x of
+tessl's time). Where that gap goes is measured by `bench_qwen35_layers
+--stage-profile` against `bench/qwen35_prefill_mlx_profile.py` (merged by
+`bench/qwen35_stage_profile_report.py`); that profile is NOT RUN yet (no quiet
+GPU in the session that wrote the tooling), so the stage cause is
+unmeasured. For comparison, on the same machine MLX measured
 7,606 / 7,528 / 5,285 tok/s at 1k / 2k / 8k, and torch MPS about 2.8k at 1k
 (both by the Lappi project).
 

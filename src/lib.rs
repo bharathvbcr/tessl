@@ -79,6 +79,7 @@
 //! | [`qwen35_bwd`] | Backward of the Qwen3.5 row-local ops: RMSNorm, gated RMSNorm, SwiGLU, output gate, causal conv + SiLU, GDN gates, Q/K norm + RoPE, embedding |
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
+//! | [`attn_prefill_bf16`] | Qwen3.5 prefill attention with bf16 Q/K/V tiles (opt-in; the f32 path stays the default) |
 //! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
 //! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
 //! | [`embedgemma2_tok`] | EmbeddingGemma 2's tokenizer in Rust: the snapshot's BPE `tokenizer.json`, the ids sentence-transformers feeds the model, decode |
@@ -107,7 +108,7 @@
 //!
 //! # Kernels
 //!
-//! 39 Metal sources compile to 303 kernel entry points: RMSNorm, gated MLP
+//! 39 Metal sources compile to 308 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
@@ -234,6 +235,7 @@
 //! the second class: write the comment.
 
 pub mod ab_flags;
+pub mod attn_prefill_bf16;
 pub mod attn_train;
 pub mod bert;
 pub mod capi;

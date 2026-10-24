@@ -12,6 +12,7 @@
 //! cargo run --release --bin bench_qwen35_layers -- --model-forward 1024 2048  # METRIC lines only
 //! cargo run --release --bin bench_qwen35_layers -- --paired-attn 200 8192
 //! cargo run --release --bin bench_qwen35_layers -- --attn-tiles 2048  # METRIC per tile
+//! cargo run --release --bin bench_qwen35_layers -- --paired-attn-bf16 1024 2048 8192
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gdn-recurrent 1 4
 //! cargo run --release --bin bench_qwen35_layers -- --paired-gate-up 512 2048
 //! cargo run --release --bin bench_qwen35_layers -- --prefill-score --weights=DIR \
@@ -90,6 +91,15 @@
 //! The lane has its own fixed rounds, so `--iters` is refused with it; a GPU
 //! failure after the run began ends stdout with `METRIC_INCOMPLETE reason`.
 //!
+//! `--paired-attn-bf16 [T...]` times the f32 `qwen35::attn_prefill` against the
+//! bf16-tile kernels (`attn_prefill_bf16::attn_prefill_bf16_with_tile`: all four
+//! tiles with a bf16 P, and f32 P at the default tile) on the same Q/K/V values,
+//! the contender order rotating each round (default T = 1024, 2048 and 8192). It
+//! prints one `METRIC attn_prefill_{f32|bf16|bf16pf32}_{tile}_ms_t{T}` per
+//! contender, and refuses an output that strays from the f32 kernel's by more
+//! than bf16 rounding could explain. Like `--attn-tiles` it has fixed rounds, so
+//! `--iters` is refused with it.
+//!
 //! `--model-forward [T...]` runs the tower lane alone and prints its METRIC
 //! lines. Default T is 1024 and 2048.
 //!
@@ -125,6 +135,7 @@ mod prefill_ids;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tessl::attn_prefill_bf16::{attn_prefill_bf16_with_tile, AttnProbTile};
 use tessl::qwen35::{self, Cols, GdnDims, GdnParams, GdnProjLayout, StateIn};
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer};
 use tessl::{gemm, nn, DType, GemmBackend, GpuRuntime, Tensor};
@@ -443,6 +454,159 @@ fn run_attn_tiles(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
                 tile.label()
             );
             println!("METRIC attn_prefill_{}_ms_t{t} {med:.4}", tile.label());
+        }
+    }
+    Ok(())
+}
+
+/// One contender of `--paired-attn-bf16`: the f32 default, or a bf16-tile
+/// kernel at a geometry and probability tile.
+#[derive(Clone, Copy)]
+enum Bf16Variant {
+    F32Default,
+    Bf16(qwen35::AttnTile, AttnProbTile),
+}
+
+impl Bf16Variant {
+    /// The metric name stem: `f32_q32_k32_sg4`, `bf16_{label}` or
+    /// `bf16pf32_{label}`.
+    fn label(self) -> String {
+        match self {
+            Bf16Variant::F32Default => format!("f32_{}", qwen35::ATTN_PREFILL_TILE.label()),
+            Bf16Variant::Bf16(tile, AttnProbTile::Bf16) => format!("bf16_{}", tile.label()),
+            Bf16Variant::Bf16(tile, AttnProbTile::F32) => format!("bf16pf32_{}", tile.label()),
+        }
+    }
+}
+
+/// `--paired-attn-bf16`: the f32 `attn_prefill` against every bf16-tile kernel
+/// on the same Q/K/V values (the bf16 kernels read a bf16 copy made before any
+/// timing, so the lane times the attention, not the cast), at the 2B's head
+/// geometry. One process, ABBA-style: the contender order rotates each round,
+/// so every kernel meets every position in the round. Per T it first runs each
+/// kernel once and refuses a non-finite or all-zero output, and one whose
+/// output strays from the f32 kernel's by more than bf16 rounding could
+/// explain; then prints the median per launch per kernel as `METRIC
+/// attn_prefill_{stem}_ms_t{T}` and the ratio to the f32 kernel.
+fn run_paired_attn_bf16(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
+    const WARMUP_ROUNDS: usize = 3;
+    const ROUNDS: usize = 9;
+    // The largest |bf16 - f32| over the f32 output's largest magnitude. A wrong
+    // kernel misses by O(1) of the output scale; bf16 operands move it ~1e-2.
+    const MAX_REL_DEVIATION: f32 = 0.1;
+    let mut contenders = vec![Bf16Variant::F32Default];
+    contenders.extend(qwen35::AttnTile::ALL.map(|tile| Bf16Variant::Bf16(tile, AttnProbTile::Bf16)));
+    contenders.push(Bf16Variant::Bf16(qwen35::AttnTile::Q32K32Sg4, AttnProbTile::F32));
+    println!(
+        "paired prefill attention, f32 attn_prefill vs bf16-tile kernels: batch 1, heads {Q_HEADS}q/{KV_HEADS}kv x \
+         {HEAD_DIM}, causal from 0, same Q/K/V values (bf16 copies made before timing); contender order rotates \
+         each round; {WARMUP_ROUNDS} warmup + {ROUNDS} timed rounds"
+    );
+    for &t in ts {
+        if t > u32::MAX as usize {
+            return Err(format!("T={t} does not fit the kernel's u32 length"));
+        }
+        let reps = paired_reps(t);
+        let qd = t * (Q_HEADS * HEAD_DIM) as usize;
+        let kv = t * (KV_HEADS * HEAD_DIM) as usize;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let (qh, kh, vh) = (
+            common::fill_affine(qd, 11, scale, 0.0),
+            common::fill_affine(kv, 12, scale, 0.0),
+            common::fill_affine(kv, 13, scale, 0.0),
+        );
+        let (q, k, v) = (buf(rt, &qh)?, buf(rt, &kh)?, buf(rt, &vh)?);
+        let bf16 = |data: &[f32]| -> Res<GpuBuffer> {
+            let b = rt.alloc_buffer(data.len().max(1) * 2)?;
+            b.write_bf16_bits(&f32_slice_to_bf16(data));
+            Ok(b)
+        };
+        let (qb, kb, vb) = (bf16(&qh)?, bf16(&kh)?, bf16(&vh)?);
+        let o = rt.alloc_buffer(qd * 4)?;
+        let tkv = buf_u32(rt, &[t as u32])?;
+        let pos = buf_u32(rt, &[0])?;
+        let dims = nn::AttnDims {
+            batch: 1,
+            tq: t as u32,
+            heads: Q_HEADS,
+            heads_kv: KV_HEADS,
+            window: 0,
+            scale,
+        };
+        let launch = |variant: Bf16Variant| -> Res<()> {
+            match variant {
+                Bf16Variant::F32Default => qwen35::attn_prefill(rt, &q, &k, &v, &o, &tkv, &pos, &pos, dims, false),
+                Bf16Variant::Bf16(tile, p) => {
+                    attn_prefill_bf16_with_tile(rt, &qb, &kb, &vb, &o, &tkv, &pos, &pos, dims, false, tile, p)
+                }
+            }
+        };
+
+        let mut reference: Vec<f32> = Vec::new();
+        for &variant in &contenders {
+            o.write_f32(&vec![f32::NAN; qd]);
+            launch(variant)?;
+            rt.synchronize()?;
+            let out = o.read_f32()[..qd].to_vec();
+            if let Some(i) = out.iter().position(|x| !x.is_finite()) {
+                return Err(format!("T={t} {}: element {i} of {qd} is non-finite", variant.label()));
+            }
+            if out.iter().all(|&x| x == 0.0) {
+                return Err(format!("T={t} {}: output is all zeros", variant.label()));
+            }
+            if reference.is_empty() {
+                reference = out;
+                continue;
+            }
+            let span = reference.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let dev = reference
+                .iter()
+                .zip(&out)
+                .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            println!(
+                "T={t} {}: max |bf16 - f32| / max |f32 output| = {:.3e}",
+                variant.label(),
+                dev / span
+            );
+            if dev > MAX_REL_DEVIATION * span {
+                return Err(format!(
+                    "T={t} {}: deviates from the f32 kernel by {:.3e} of the output scale, above {MAX_REL_DEVIATION}",
+                    variant.label(),
+                    dev / span
+                ));
+            }
+        }
+
+        let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(ROUNDS); contenders.len()];
+        for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+            for step in 0..contenders.len() {
+                let i = (round + step) % contenders.len();
+                rt.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..reps {
+                    launch(contenders[i])?;
+                }
+                rt.synchronize()?;
+                if round >= WARMUP_ROUNDS {
+                    samples[i].push(t0.elapsed().as_secs_f64() * 1e3 / reps as f64);
+                }
+            }
+        }
+        let mut f32_median = f64::NAN;
+        for (variant, s) in contenders.iter().zip(samples) {
+            let lo = s.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let med = common::median(s)?;
+            if matches!(variant, Bf16Variant::F32Default) {
+                f32_median = med;
+            }
+            println!(
+                "attn_prefill {} T={t}: median {med:.4} ms, min {lo:.4}, max {hi:.4} ({reps} launches per buffer), \
+                 ratio to f32 {:.4}",
+                variant.label(),
+                med / f32_median
+            );
+            println!("METRIC attn_prefill_{}_ms_t{t} {med:.4}", variant.label());
         }
     }
     Ok(())
@@ -2071,6 +2235,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut check_only = false;
     let mut paired_attn = false;
     let mut attn_tiles = false;
+    let mut attn_bf16 = false;
     let mut decode: Option<usize> = None;
     let mut paired_rec = false;
     let mut paired_gate_up = false;
@@ -2114,6 +2279,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             paired_attn = true;
         } else if arg == "--attn-tiles" {
             attn_tiles = true;
+        } else if arg == "--paired-attn-bf16" {
+            attn_bf16 = true;
         } else if arg == "--gdn-scan32" {
             opts.scan = qwen35::GdnScanSlice::Cols32;
         } else if let Some(n) = arg.strip_prefix("--iters=") {
@@ -2131,7 +2298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
-                    "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-gdn-recurrent, --paired-gate-up, \
+                    "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-attn-bf16, --paired-gdn-recurrent, --paired-gate-up, \
                      --model-forward, --prefill-score, --ids=FILE, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
                 )
             })?;
@@ -2141,7 +2308,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ts.push(bounded_tokens(t, "T")?);
         }
     }
-    if attn_tiles && (check_only || paired_attn || paired_rec || paired_gate_up || model_forward || decode.is_some()) {
+    if attn_bf16
+        && (attn_tiles
+            || check_only
+            || paired_attn
+            || paired_rec
+            || paired_gate_up
+            || model_forward
+            || decode.is_some())
+    {
+        return Err("--paired-attn-bf16 takes token counts only".into());
+    }
+    if attn_bf16 && iters_given {
+        return Err("--paired-attn-bf16 runs its own fixed rounds (3 warmup + 9 timed); --iters does not apply".into());
+    }
+    if attn_tiles
+        && (attn_bf16 || check_only || paired_attn || paired_rec || paired_gate_up || model_forward || decode.is_some())
+    {
         return Err("--attn-tiles takes token counts only".into());
     }
     if attn_tiles && iters_given {
@@ -2163,7 +2346,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--paired-gate-up and --model-forward each take token counts only".into());
     }
     if prefill_score {
-        if check_only || paired_attn || paired_rec || paired_gate_up || model_forward || attn_tiles || decode.is_some()
+        if check_only
+            || paired_attn
+            || paired_rec
+            || paired_gate_up
+            || model_forward
+            || attn_tiles
+            || attn_bf16
+            || decode.is_some()
         {
             return Err("--prefill-score takes token counts, --weights, --ids and --iters only".into());
         }
@@ -2176,7 +2366,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else if opts.ids.is_some() {
         return Err("--ids applies to --prefill-score only".into());
     }
-    let paired = paired_attn || attn_tiles || paired_rec || paired_gate_up;
+    let paired = paired_attn || attn_tiles || attn_bf16 || paired_rec || paired_gate_up;
     if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
         return Err("--weights and --gdn-scan32 apply to the model lanes, not --paired-*".into());
     }
@@ -2205,6 +2395,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return common::mark_incomplete_on_error((|| -> Result<(), Box<dyn std::error::Error>> {
             rt.set_async_encode(true)?;
             run_attn_tiles(&rt, if ts.is_empty() { &[2048] } else { &ts })?;
+            rt.set_async_encode(false)?;
+            Ok(())
+        })());
+    }
+    if attn_bf16 {
+        return common::mark_incomplete_on_error((|| -> Result<(), Box<dyn std::error::Error>> {
+            rt.set_async_encode(true)?;
+            run_paired_attn_bf16(&rt, if ts.is_empty() { &[1024, 2048, 8192] } else { &ts })?;
             rt.set_async_encode(false)?;
             Ok(())
         })());

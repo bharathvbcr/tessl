@@ -50,7 +50,7 @@ that fusion for Metal.
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
-| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles) | `attn_prefill`, `attn_prefill_by_length`, `attn_prefill_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
+| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles); opt-in bf16-tile variants `qwen35_attn_tiled_bf16{,pf32}_h256_*` (5 entries, not wired into the prefill) | `attn_prefill`, `attn_prefill_by_length`, `attn_prefill_with_tile`; `attn_prefill_bf16::attn_prefill_bf16_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 6e. MLP activation | `qwen35_swiglu_{f32,bf16}` | `swiglu` | `act_fn(gate_proj(x)) * up_proj(x)` in `Qwen3_5MLP`, stored as bf16 for `down_proj` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_{bf16,f32}` | `embed_rows` | `embed_tokens(ids)` from the bf16 (or, in the f32 model, f32) table, on the device, so a forward needs no host gather |
@@ -1698,10 +1698,27 @@ span ±8% on this machine under load.
   worth doing yet.
 - **Prefill attention, remaining gaps.** `attn_prefill` is exact f32
   TensorOps. The measured exact-f32 GEMM on this machine reaches 6.4 TFLOP/s,
-  against 26.6 for bf16. A variant that casts the Q/K/V tiles to bf16 on load, with
-  f32 accumulation and softmax, is the next step. It would move the
-  attention output by bf16 rounding, which has to be measured at the model's
-  logits first. Each of a KV head's 4 query heads reads that head's K/V
+  against 26.6 for bf16. The bf16-tile variant exists as kernels
+  (`qwen35_attn_tiled_bf16_h256_*` with P rounded to bf16, four tiles, and
+  `qwen35_attn_tiled_bf16pf32_h256_q32_k32_sg4` with P kept f32; host entry
+  `attn_prefill_bf16::attn_prefill_bf16_with_tile`) and is checked at the
+  kernel (`tests/attn_prefill_bf16_tiles.rs`, an f64 oracle with a bound
+  derived from bf16's unit roundoff), but it is **not wired into the prefill
+  and nothing is measured yet**: its speed (`bench_qwen35_layers
+  --paired-attn-bf16`) and its effect on the model's logits are the open
+  measurements, and it moves the attention output by bf16 rounding, so the f32
+  path stays the default until the logits say otherwise. The kernel reads bf16
+  Q/K/V from device memory instead of casting on load: a cast in the kernel
+  would be a hand-staged device-to-threadgroup copy of every K and V tile for
+  every query block, which the strided tensor views exist to avoid. The
+  producer writes bf16 (the q/k-norm-RoPE store type, as the encoder's
+  `vision_qkv_norm_rope_bf16` does), or `qwen35_deliver_f32_to_bf16` casts the
+  f32 tensors once per layer. At the 2B's shapes and T = 8192 that halves the
+  operand bytes, Q/K/V 96 MiB to 48 MiB, and the K/V bytes each threadgroup
+  streams (upper bound, before cache reuse: 8 heads x 256 query blocks x T/2
+  keys x 2 x 256 elements = 4.3 G elements per layer) from 17.2 GB to 8.6 GB;
+  a separate cast pass would move 144 MiB per layer (read 96, write 48).
+  Each of a KV head's 4 query heads reads that head's K/V
   separately, and head_dim 256 is the only size compiled.
 - **mRoPE with image positions.** Text positions only. For text, the three mRoPE
   streams are equal and the rotation reduces to plain RoPE.

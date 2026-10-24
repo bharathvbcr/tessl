@@ -305,8 +305,11 @@ fn logit_deviation_rows(label: &str, dir: &Path, q4_sub: &str, variants: &[Preci
         // mlx-lm's own forward on the same 4-bit weights and ids (make_mlx_q4.py): bf16
         // activations and float32 activations. Host files only.
         let mlx_dir = q4.join("ref").join(q4_sub);
-        let (mlx_ids, _) = load_ref_in(&mlx_dir, "ids");
-        assert_eq!(mlx_ids.len(), ids.len(), "{label}: mlx-lm ids length differs");
+        assert_eq!(
+            ids_in(&mlx_dir),
+            ids,
+            "{label}: mlx-lm ids differ from the reference ids"
+        );
         let mut mlx_f32_mean = None;
         for (file, name) in [
             ("logits_mlx", "mlx-lm Q4 (bf16 acts)"),

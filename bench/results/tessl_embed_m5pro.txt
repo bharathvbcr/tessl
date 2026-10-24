@@ -1,0 +1,13 @@
+arm           workload  batch tokens     min ms  median ms   texts/s   tokens/s vs tessl
+tessl-embed   query         1     13       4.60       5.26       217       2824     1.00
+ollama-eg2    query         1     13      13.42      22.76        75        969     2.92
+ollama-nomic  query         1     17       8.38      20.83       119       2029     1.82
+tessl-embed   chunks8       8   1019      59.56      61.41       134      17108     1.00
+ollama-eg2    chunks8       8   1019     351.18     421.68        23       2902     5.90
+ollama-nomic  chunks8       8   1172      85.81     174.93        93      13658     1.44
+tessl-embed   chunks64     64   8184     441.56     452.60       145      18534     1.00
+ollama-eg2    chunks64     64   8184    3241.79    3487.59        20       2525     7.34
+ollama-nomic  chunks64     64   9589     713.92    1288.87        90      13432     1.62
+tessl vs ollama-eg2 (query): min cosine 0.988627, mean 0.988627 over 1 rows
+tessl vs ollama-eg2 (chunks8): min cosine 0.982532, mean 0.98498 over 8 rows
+loadavg before { 42.58 36.25 39.95 }, after { 60.88 44.59 42.58 }

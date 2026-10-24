@@ -304,6 +304,29 @@ min-of-N, with the load average recorded and gated (`MAX_LOAD`), and writes
 `bench/results/tessl_embed_m5pro.{json,txt}`; it then stops the server by its
 pid.
 
+Recorded 2026-10-24 on the M5 Pro, snapshot `914f7f89`, Ollama 0.40.6, 9 rounds
+(180, 72 and 18 calls per arm), **on a busy machine**: the load gate was off
+(`MAX_LOAD=0`) and the 1-minute load average was 42.6 before and 60.9 after, from
+other sessions' builds. Wall time per request over HTTP, minimum (median of round
+medians):
+
+| workload | tessl-embed (f32) | Ollama embeddinggemma-2:270m (nvfp4, MLX) | Ollama nomic-embed-text (F16) |
+|---|---|---|---|
+| 1 query, 13 tokens | 4.60 ms (5.26) | 13.42 ms (22.76) | 8.38 ms (20.83) |
+| 8 chunks, 1019 tokens | 59.6 ms (61.4) | 351.2 ms (421.7) | 85.8 ms (174.9) |
+| 64 chunks, 8184 tokens | 441.6 ms (452.6) | 3241.8 ms (3487.6) | 713.9 ms (1288.9) |
+
+Against the same model under Ollama, tessl-embed is 2.9x faster on a query and
+5.9x to 7.3x faster on batches by minimum. Against nomic-embed-text, a different
+model with 137M parameters and its own tokenizer (more tokens for the same texts),
+it is 1.8x faster on a query and 1.4x to 1.6x on batches. Its medians sit within
+15% of its minima, while Ollama's are 1.2x to 2.5x theirs, so the median ratios are
+larger. Both EmbeddingGemma 2 servers count the same tokens (13, 1019, 8184), so
+they were given the same ids. Their rows agree at cosine 0.9825 to 0.9886 (f32
+against nvfp4), which is why the two must not share a vector store. Taken under
+load, these are ratios of minima, not predictions; rerun with the gate on
+(`MAX_LOAD=12`) on a quiet machine to replace them.
+
 ## Not done
 
 - Linux and Windows: tessl is Metal.

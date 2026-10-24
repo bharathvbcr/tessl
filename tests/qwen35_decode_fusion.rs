@@ -583,6 +583,14 @@ fn fused_decode_saves_exactly_the_dispatches_it_replaces() {
             let ids = prompt(8);
             let feed = greedy_feed(&model, &ids, 4);
             let count = |fusion: DecodeFusion| {
+                // Async encode, as `bench_qwen35_layers --decode` and a real decode
+                // loop run: one command buffer, one wait per step. The runtime's
+                // default (sync) mode commits and waits after every dispatch that
+                // is not already inside a batching scope, so there commits and
+                // waits follow the dispatch count (measured: 57 -> 49 on this
+                // model's f32 add_norm when 8 plain dispatches went) and say
+                // nothing about the fusion.
+                rt.set_async_encode(true).unwrap();
                 let (mut dec, _) = model.prefill(&ids, 4).unwrap();
                 dec.set_fusion(fusion);
                 dec.step(feed[0]).unwrap();
@@ -591,6 +599,7 @@ fn fused_decode_saves_exactly_the_dispatches_it_replaces() {
                 dec.step(feed[1]).unwrap();
                 let s = infer_trace::snapshot().since(&before);
                 infer_trace::set_enabled(false);
+                rt.set_async_encode(false).unwrap();
                 s
             };
             let none = count(DecodeFusion::NONE);
@@ -626,6 +635,11 @@ fn fused_decode_saves_exactly_the_dispatches_it_replaces() {
                     (got.commits, got.sync_waits, got.cold_allocs),
                     (none.commits, none.sync_waits, none.cold_allocs),
                     "{precision:?} {name}: commits, waits and cold allocations"
+                );
+                assert_eq!(
+                    (got.commits, got.sync_waits, got.cold_allocs),
+                    (1, 1, 3),
+                    "{precision:?} {name}: an async step is one commit, one wait, three cold allocations"
                 );
             }
             eprintln!(

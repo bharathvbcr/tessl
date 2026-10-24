@@ -433,6 +433,18 @@ fn f32_staged_and_decode_match_forward_on_the_real_2b() {
             let want = forward_last(&model, &ids[..PROMPT + k]);
             check_row(&format!("prefill {PROMPT} + {k} decoded"), row, &want, 1e-5);
         }
+        // The same steps on the fused decode kernels (add + norm, gate/up + SiLU),
+        // against the separate-kernel rows: add+norm is bit-identical and the
+        // dense gate/up differs by f32 rounding of its two sums, inside 1e-5.
+        let (mut dec, first) = model.prefill(&ids[..PROMPT], STEPS as u32).unwrap();
+        dec.set_fusion(tessl::qwen35_model::DecodeFusion::ALL);
+        let mut fused = vec![first];
+        for k in 0..STEPS {
+            fused.push(dec.step(ids[PROMPT + k]).unwrap());
+        }
+        for (k, (f, u)) in fused.iter().zip(&got).enumerate() {
+            check_row(&format!("fused vs unfused, prefill {PROMPT} + {k} decoded"), f, u, 1e-5);
+        }
         let traced = model.forward(&ids[..PROMPT], true).unwrap();
         traced.trace[n_layers].clone()
     };
@@ -448,6 +460,54 @@ fn f32_staged_and_decode_match_forward_on_the_real_2b() {
     rt.synchronize().unwrap();
     let r = rel32(&out.buffer.read_f32(), &want_norm);
     assert!(r <= 1e-5, "staged final norm vs forward's: rel err {r:.3e} > 1e-5");
+}
+
+/// The production bf16 forward on the real 2B: `GREEDY` greedy tokens from a
+/// 12-token prompt, each session choosing its own next token, fused
+/// (`DecodeFusion::ALL`) against separate kernels. The tokens must be identical
+/// and every step's logits within 2e-2 of the peak (the bf16 decode bound; the
+/// dense gate/up sums in another order than the GEMM, which can flip a bf16
+/// rounding of the MLP's middle activation). Prints the worst step. A token
+/// mismatch is reported with its logit gap, since a tie may break either way.
+#[test]
+#[ignore]
+fn bf16_fused_decode_greedy_tokens_match_unfused_on_the_real_2b() {
+    const GREEDY: usize = 32;
+    const PROMPT: usize = 12;
+    let rt = GpuRuntime::new().unwrap();
+    let st = checkpoint();
+    let cfg = Qwen35Config::qwen35_2b().unwrap();
+    let vocab = cfg.vocab;
+    let model = Qwen35Model::load(&rt, &st, PREFIX, cfg, Precision::Bf16).unwrap();
+    let ids: Vec<u32> = (0..PROMPT as u32).map(|i| (i * 7919 + 101) % vocab).collect();
+    let run = |fusion: tessl::qwen35_model::DecodeFusion| {
+        let (mut dec, first) = model.prefill(&ids, GREEDY as u32).unwrap();
+        dec.set_fusion(fusion);
+        let (mut toks, mut rows) = (vec![], vec![first.clone()]);
+        let mut next = argmax32(&first) as u32;
+        for _ in 0..GREEDY {
+            toks.push(next);
+            let row = dec.step(next).unwrap();
+            next = argmax32(&row) as u32;
+            rows.push(row);
+        }
+        (toks, rows)
+    };
+    let (t0, r0) = run(tessl::qwen35_model::DecodeFusion::NONE);
+    let (t1, r1) = run(tessl::qwen35_model::DecodeFusion::ALL);
+    let mut worst = 0.0f64;
+    for (k, (a, b)) in r1.iter().zip(&r0).enumerate() {
+        worst = worst.max(rel32(a, b));
+        assert!(
+            rel32(a, b) <= 2e-2,
+            "step {k}: fused logits differ by {:.3e}",
+            rel32(a, b)
+        );
+    }
+    let first_diff = t0.iter().zip(&t1).position(|(a, b)| a != b);
+    eprintln!("real 2B bf16: {GREEDY} greedy tokens, first mismatch {first_diff:?}, worst logit rel err {worst:.3e}");
+    eprintln!("unfused tokens {t0:?}\nfused   tokens {t1:?}");
+    assert_eq!(first_diff, None, "greedy tokens diverged");
 }
 
 // ------------------------------------------------- decode, rows and answers ---

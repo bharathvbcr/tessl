@@ -1880,8 +1880,8 @@ impl Qwen35Model {
         self.project_residual(&a.m_mid, &layer.down, a, Self::defers_add(step))
     }
 
-    /// The one-token MLP front half in one dispatch (`a.m_mid = silu(x @ gate)
-    /// * (x @ up)`), over whichever weights the layer has: dense f32 or bf16
+    /// The one-token MLP front half in one dispatch (`a.m_mid` is `silu(x @ gate)`
+    /// times `x @ up`), over whichever weights the layer has: dense f32 or bf16
     /// (`qwen35::gate_up_silu`) or MLX Q4 (`Q4Weight::gate_up_silu`). Returns
     /// whether it ran: false for a layer it does not cover (a gate and up of
     /// different kinds, a dense weight that is a view, more than one row),

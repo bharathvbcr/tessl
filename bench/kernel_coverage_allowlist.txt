@@ -11,3 +11,4 @@
 # Empty until the uncovered kernels are triaged (ft-6d88defb).
 mtl_tensor_fill_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)
 mtl_tensor_read_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)
+gemv_q4_mlx_simd_gate_up_silu: test-only: tests/qwen35_decode_fusion.rs (the Q4 decode MLP; no bench loads a Q4 model, the tiny Q4 checkpoint in tests/qwen35_mlx_q4.rs runs it end to end)

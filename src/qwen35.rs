@@ -2504,6 +2504,7 @@ const GATE_UP_TPTG: usize = 256;
 /// equals the GEMM pair's `swiglu` to f32 rounding of the two sums, not bit
 /// for bit (the bf16 `out` can differ by one rounding step where a sum lands
 /// near a rounding boundary).
+#[allow(clippy::too_many_arguments)]
 pub fn gate_up_silu(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,

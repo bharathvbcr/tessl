@@ -56,12 +56,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::logit_dev::{argmax, kl_rows, load_ref, load_ref_in, log_softmax, logit_dev, ref_dir, LogitDev};
+use common::logit_dev::{
+    argmax, ear, kl_rows, load_ref, load_ref_in, log_softmax, logit_dev, ref_dir, LogitDev, EAR_TOP_K,
+};
 use common::with_gpu;
 use tessl::npy::read_npy;
 use tessl::qwen35::{self, AttnProjLayout, GdnProjLayout, GdnScanSlice};
 use tessl::qwen35_model::{LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
-use tessl::safetensors::SafeTensors;
+use tessl::safetensors::{CheckpointView, SafeTensors};
 use tessl::GpuRuntime;
 
 const PREFIX: &str = "model.language_model.";
@@ -209,6 +211,26 @@ fn real_2b_logits(ids: &[u32], precision: Precision) -> Vec<f32> {
     logits
 }
 
+/// One forward of the MLX affine 4-bit 2B in `dir` (`tools/qwen35_ref/make_mlx_q4.py`'s
+/// output, built from the same bf16 weights as the reference), the logits only.
+fn q4_2b_logits(dir: &Path, ids: &[u32]) -> Vec<f32> {
+    let rt = GpuRuntime::new().unwrap();
+    let cfg_text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let cfg = Qwen35Config::from_config_json(&cfg_text).unwrap();
+    let st = CheckpointView::open(dir).unwrap();
+    let (model, _) = Qwen35Model::load_mlx_q4(&rt, &st, cfg, &cfg_text).unwrap();
+    let logits = model.forward(ids, false).unwrap().logits;
+    assert!(logits.iter().all(|x| x.is_finite()), "Q4: non-finite logits");
+    logits
+}
+
+/// The Q4 checkpoint directory: `QWEN35_2B_MLX_Q4_DIR`, else `target/qwen35_2b_mlx_q4`.
+fn q4_dir() -> PathBuf {
+    std::env::var_os("QWEN35_2B_MLX_Q4_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_2b_mlx_q4"))
+}
+
 fn to_f32(v: &[f64]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
@@ -231,10 +253,15 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
 
     let tessl_f32 = real_2b_logits(&ids, Precision::F32);
     let tessl_f32_64: Vec<f64> = tessl_f32.iter().map(|&x| f64::from(x)).collect();
+    let hf_bf16_ref = to_f32(&hf_bf16);
     let mut failures = Vec::new();
+    // EAR (SLQ's Expected Acceptance Rate, top-10) against the bf16 model: transformers'
+    // bf16 forward, `logits_bf16`. Reported, not gated.
+    let mut ear_rows = Vec::new();
     for &variant in variants {
         let fresh = (variant != Precision::F32).then(|| real_2b_logits(&ids, variant));
         let got: &[f32] = fresh.as_deref().unwrap_or(&tessl_f32);
+        ear_rows.push(ear(got, &hf_bf16, vocab, EAR_TOP_K).row(&format!("{variant:?} vs transformers bf16")));
         let vs_tessl = logit_dev(got, &tessl_f32_64, vocab);
         let vs_hf = logit_dev(got, &hf_f32, vocab);
         eprintln!("{}", vs_tessl.row(&format!("{variant:?} vs tessl F32")));
@@ -254,8 +281,20 @@ fn logit_deviation_rows(label: &str, dir: &Path, variants: &[Precision]) -> Vec<
             }
         }
     }
-    let floor = logit_dev(&to_f32(&hf_bf16), &hf_f32, vocab);
+    let floor = logit_dev(&hf_bf16_ref, &hf_f32, vocab);
     eprintln!("{}", floor.row("transformers bf16 vs fp32 (floor)"));
+    ear_rows.push(ear(&to_f32(&hf_f32), &hf_bf16, vocab, EAR_TOP_K).row("transformers fp32 vs bf16 (floor)"));
+    let q4 = q4_dir();
+    if q4.join("config.json").is_file() {
+        let got = q4_2b_logits(&q4, &ids);
+        eprintln!("{}", logit_dev(&got, &hf_f32, vocab).row("MLX Q4 vs transformers fp32"));
+        ear_rows.push(ear(&got, &hf_bf16, vocab, EAR_TOP_K).row("MLX Q4 vs transformers bf16"));
+    } else {
+        eprintln!("MLX Q4: NOT RUN ({} has no config.json)", q4.display());
+    }
+    for r in &ear_rows {
+        eprintln!("{r}");
+    }
     failures
 }
 
@@ -392,6 +431,45 @@ fn logit_dev_shape_mismatch_panics() {
 #[should_panic(expected = "does not divide")]
 fn logit_dev_vocab_not_dividing_len_panics() {
     logit_dev(&[0.0; 10], &[0.0; 10], 4);
+}
+
+/// SLQ's EAR, hand-computed. Reference row 0 is `[ln 3, -5, 0, -9]`: its top-2 are
+/// indices 0 and 2, so `p = softmax(ln 3, 0) = (3/4, 1/4)`. The candidate's row 0 is
+/// `[0, 7, 0, 7]`; gathered at 0 and 2 it is `(0, 0)`, `q = (1/2, 1/2)`, and
+/// `EAR = min(3/4, 1/2) + min(1/4, 1/2) = 3/4`. The 7s sit outside the reference's
+/// top-2 and must not matter. Row 1 is identical on both sides, EAR 1.
+#[test]
+fn ear_matches_a_hand_computed_two_row_case() {
+    let ln3 = 3f64.ln();
+    let want = vec![ln3, -5.0, 0.0, -9.0, 1.0, 0.0, -2.0, 4.0];
+    let mut got = to_f32(&want);
+    got[..4].copy_from_slice(&[0.0, 7.0, 0.0, 7.0]);
+    let e = ear(&got, &want, 4, 2);
+    assert_eq!((e.positions, e.k, e.nonfinite), (2, 2, 0));
+    assert!((e.per_position[0] - 0.75).abs() < 1e-12, "{:?}", e.per_position);
+    assert!((e.per_position[1] - 1.0).abs() < 1e-6, "{:?}", e.per_position);
+    assert!((e.mean - 0.875).abs() < 1e-6 && (e.min - 0.75).abs() < 1e-12, "{e:?}");
+    assert!(!e.clears(0.99) && e.clears(0.87));
+    // Top-1 is the identity on the argmax: a one-entry softmax is 1 on both sides.
+    assert_eq!(ear(&got, &want, 4, 1).mean, 1.0);
+}
+
+#[test]
+fn ear_of_identical_logits_is_one_and_nonfinite_never_clears() {
+    let want = dev_rows();
+    let e = ear(&to_f32(&want), &want, 4, 4);
+    assert!(e.clears(0.99) && (e.mean - 1.0).abs() < 1e-6 && e.min > 0.999999);
+    let mut got = to_f32(&want);
+    got[11] = f32::NAN;
+    let bad = ear(&got, &want, 4, 4);
+    assert_eq!(bad.nonfinite, 1);
+    assert!(bad.mean.is_nan() && !bad.clears(0.0) && !bad.clears(f64::NEG_INFINITY));
+}
+
+#[test]
+#[should_panic(expected = "outside 1..=4")]
+fn ear_k_beyond_the_vocab_panics() {
+    ear(&[0.0; 4], &[0.0; 4], 4, 5);
 }
 
 #[test]

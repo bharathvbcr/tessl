@@ -1,0 +1,55 @@
+{
+  "card": "ft-7af0512eeb8261e0ad8235e79ef542b7",
+  "metric": {
+    "name": "EAR",
+    "source": "IST-DASLab/SLQ eval/run_ear.py, src/metrics/evaluation.py (read 2026-10-23 via WebFetch, paraphrased)",
+    "top_k": 10,
+    "formula": "per position: p=softmax(reference top-k logits), q=softmax(candidate logits gathered at the reference top-k indices), EAR=sum(min(p,q)); mean over positions; unmasked (weight 1)",
+    "lossless_bar": 0.99,
+    "implementation": "tests/common/logit_dev.rs ear()"
+  },
+  "provenance": {
+    "tessl_revision": "e519ca899b7243f7d15d26591bf4e5aef3a93daa",
+    "base_main": "f00244e",
+    "checkpoint": "Qwen/Qwen3.5-2B-Base",
+    "snapshot": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+    "q4_checkpoint": {
+      "mlx_lm": "0.32.0",
+      "mlx": "0.32.3",
+      "quantization": {"mode": "affine", "bits": 4, "group_size": 64},
+      "model_safetensors_sha256": "cdafd8bae44b62e95217e5003e11fb17f84c8a288a16b21f61697a14737ed004"
+    },
+    "references": {"transformers": "5.19.0", "torch": "2.14.1"},
+    "prompts": {
+      "default": {"positions": 155, "ids_npy_sha256": "10d55495b8ea5c753fd3a84e12fa1dd288fe151c292a3949499829bbb10d07fa", "ids_int64_le_sha256": "bbadbbf1ce83c680cbe95d07434c9f52f1319f5a373f59946a6fc8a8f90620d0"},
+      "text": {"positions": 512, "file": "tests/fixtures/qwen35_text_ids.npy", "ids_npy_sha256": "3ea859387894d2f056a7fef0a63ea4a70df164533adc875a90e0e742ceacd85d", "ids_int64_le_sha256": "51faa8e4c0db0bff6b046bcd0e10b9d807adf4da0ba7c42af026bbd646e45b65"}
+    },
+    "generator_commands": [
+      "tools/qwen35_ref/make_reference.py --model-dir $SNAP",
+      "tools/qwen35_ref/make_reference.py --model-dir $SNAP --ids tests/fixtures/qwen35_text_ids.npy --out target/qwen35_ref_text",
+      "tools/qwen35_ref/make_mlx_q4.py --model-dir $SNAP",
+      "cargo test --release --test qwen35_model -- --ignored --exact logit_deviation_report --nocapture --test-threads=1"
+    ],
+    "run": {"machine": "Apple M5 Pro", "start_utc": "2026-10-24T08:29:33Z", "end_utc": "2026-10-24T08:31:29Z", "load_average": 16.75, "peak_footprint_gib": 12.19, "lock": "mac_heavy", "timing_reported": false}
+  },
+  "results": [
+    {"candidate": "tessl F32", "reference": "transformers fp32", "default": {"mean": 0.999997, "min": 0.999990}, "text": {"mean": 0.999998, "min": 0.999984}},
+    {"candidate": "tessl Bf16", "reference": "transformers fp32", "default": {"mean": 0.997648, "min": 0.989935}, "text": {"mean": 0.998021, "min": 0.986902}},
+    {"candidate": "transformers bf16", "reference": "transformers fp32", "default": {"mean": 0.988105, "min": 0.936518}, "text": {"mean": 0.991597, "min": 0.952472}},
+    {"candidate": "tessl F32", "reference": "transformers bf16", "default": {"mean": 0.988111, "min": 0.941073}, "text": {"mean": 0.991600, "min": 0.952472}},
+    {"candidate": "tessl Bf16", "reference": "transformers bf16", "default": {"mean": 0.987706, "min": 0.950375}, "text": {"mean": 0.991380, "min": 0.943232}},
+    {"candidate": "tessl MLX Q4", "reference": "transformers fp32", "default": {"mean": 0.847976, "min": 0.474716}, "text": {"mean": 0.865793, "min": 0.310431}},
+    {"candidate": "tessl MLX Q4", "reference": "transformers bf16", "default": {"mean": 0.846856, "min": 0.472425}, "text": {"mean": 0.865543, "min": 0.310095}},
+    {"candidate": "mlx-lm Q4 (f32 acts)", "reference": "transformers fp32", "default": {"mean": 0.848180, "min": 0.473750}, "text": {"mean": 0.865812, "min": 0.312542}},
+    {"candidate": "mlx-lm Q4 (f32 acts)", "reference": "transformers bf16", "default": {"mean": 0.847124, "min": 0.471458}, "text": {"mean": 0.865578, "min": 0.312206}},
+    {"candidate": "mlx-lm Q4 (bf16 acts)", "reference": "transformers fp32", "default": {"mean": 0.847858, "min": 0.470740}, "text": {"mean": 0.865996, "min": 0.338975}},
+    {"candidate": "mlx-lm Q4 (bf16 acts)", "reference": "transformers bf16", "default": {"mean": 0.846952, "min": 0.468448}, "text": {"mean": 0.865733, "min": 0.338638}},
+    {"candidate": "tessl MLX Q4", "reference": "mlx-lm Q4 (f32 acts)", "default": {"mean": 0.997335, "min": 0.992176}, "text": {"mean": 0.997911, "min": 0.987516}}
+  ],
+  "q8": {"measured": false, "reason": "no Qwen3.5 model path runs Q8 weights; gemv_q8 (src/nn.rs:716) is a standalone int8 group-affine GEMV used only by tests and bench_nn_kernels; no Q8 loader or quantizer for model weights exists"},
+  "findings": [
+    "a bf16 reference cannot anchor the 0.99 bar: exact fp32 vs transformers bf16 is 0.988111 (default) and 0.991600 (text); tessl F32 and Bf16 clear 0.99 against fp32 on both prompts",
+    "MLX affine 4-bit group-64 is lossy at about 0.85 / 0.87 EAR; tessl reproduces mlx-lm's Q4 to 2.0e-4 (default) and 1.9e-5 (text) in mean EAR against fp32",
+    "Q8 not measured: no Qwen3.5 Q8 loader"
+  ]
+}

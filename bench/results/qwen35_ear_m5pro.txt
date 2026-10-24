@@ -1,0 +1,81 @@
+Qwen3.5-2B Expected Acceptance Rate (EAR), bf16 / fp32 / MLX affine Q4 / Q8 -- M5 Pro, 2026-10-24
+=================================================================================================
+
+Question (card ft-7af0512eeb8261e0ad8235e79ef542b7, AC3): is a quantized Qwen3.5-2B "effectively
+lossless" by SLQ's measure, EAR >= 0.99, on the existing affine Q4 path and the existing affine Q8 path?
+
+Metric (SLQ, IST-DASLab/SLQ, eval/run_ear.py -> compute_baseline_topk / compute_kl_and_ear in
+src/metrics/evaluation.py, read 2026-10-23 through WebFetch, which paraphrases rather than quotes):
+at each position take the REFERENCE's top-10 logits and indices; gather the candidate's logits at the
+same indices; p = softmax(reference top-10), q = softmax(gathered candidate), both over the 10 entries
+only; EAR = sum_i min(p_i, q_i); mean over positions. SLQ weights positions by a calibration mask; with
+no mask each weight is 1, which is what is computed. Ties in the reference break to the lower index.
+Implementation: tests/common/logit_dev.rs `ear()`, pinned by three device-free tests in
+tests/qwen35_model.rs (hand-computed: 0.75 on one row, 0.875 mean over two). Printed by
+`logit_deviation_report` (tests/qwen35_model.rs).
+
+Provenance
+  tessl revision      e519ca899b7243f7d15d26591bf4e5aef3a93daa (branch gp/w25-ear, base main f00244e)
+  checkpoint          Qwen/Qwen3.5-2B-Base, HF snapshot b1485b2fa6dfa1287294f269f5fb618e03d52d7c (bf16)
+  Q4 checkpoint       mlx_lm 0.32.0 / mlx 0.32.3 convert -q --q-bits 4 --q-group-size 64 (affine) of that snapshot,
+                      by tools/qwen35_ref/make_mlx_q4.py; model.safetensors sha256
+                      cdafd8bae44b62e95217e5003e11fb17f84c8a288a16b21f61697a14737ed004
+  references          transformers 5.19.0, torch 2.14.1 (tools/qwen35_ref/make_reference.py): logits_f32 (fp32
+                      forward) and logits_bf16 (bf16 forward); mlx-lm logits_mlx (bf16 acts) and
+                      logits_mlx_f32 (f32 acts) from make_mlx_q4.py
+  prompts             default: the 155-token prompt of make_reference.py; ids.npy sha256
+                      10d55495b8ea5c753fd3a84e12fa1dd288fe151c292a3949499829bbb10d07fa, int64 LE ids sha256
+                      bbadbbf1ce83c680cbe95d07434c9f52f1319f5a373f59946a6fc8a8f90620d0
+                      text: tests/fixtures/qwen35_text_ids.npy, 512 tokens, sha256
+                      3ea859387894d2f056a7fef0a63ea4a70df164533adc875a90e0e742ceacd85d, int64 LE ids sha256
+                      51faa8e4c0db0bff6b046bcd0e10b9d807adf4da0ba7c42af026bbd646e45b65
+                      (mlx-lm's ids are asserted identical to the reference ids by value)
+  generator commands  SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c
+                      PY=~/.venvs/ml-2026-10/bin/python
+                      $PY tools/qwen35_ref/make_reference.py --model-dir $SNAP
+                      $PY tools/qwen35_ref/make_reference.py --model-dir $SNAP --ids tests/fixtures/qwen35_text_ids.npy --out target/qwen35_ref_text
+                      $PY tools/qwen35_ref/make_mlx_q4.py --model-dir $SNAP
+                      QWEN35_2B_SAFETENSORS=$SNAP/model.safetensors-00001-of-00001.safetensors QWEN35_REF_DIR=target/qwen35_ref
+                      QWEN35_REF_TEXT_DIR=target/qwen35_ref_text cargo test --release --test qwen35_model -- --ignored
+                      --exact logit_deviation_report --nocapture --test-threads=1
+  run conditions      Apple M5 Pro, under the mac_heavy lock, 2026-10-24 08:29:33Z-08:31:29Z, load average 16.75;
+                      one process; peak footprint 12.19 GiB (memguard cap 32 GiB); test ok in 113.46 s. No timing
+                      is reported. Full log: target-gp/ear3 run (w25_ear3.log).
+
+EAR, top-10, mean / min over positions (n = 155 default, 512 text)
+
+  candidate                                reference                  default (155)       text (512)
+  tessl F32                                transformers fp32          0.999997 / 0.99999  0.999998 / 0.99998   clears 0.99
+  tessl Bf16                               transformers fp32          0.997648 / 0.98994  0.998021 / 0.98690   clears 0.99
+  transformers bf16 forward                transformers fp32          0.988105 / 0.9365   0.991597 / 0.9525    default FAILS, text clears
+  tessl F32                                transformers bf16          0.988111 / 0.94107  0.991600 / 0.95247   default FAILS, text clears
+  tessl Bf16                               transformers bf16          0.987706 / 0.95038  0.991380 / 0.94323   default FAILS, text clears
+  tessl MLX Q4                             transformers fp32          0.847976 / 0.4747   0.865793 / 0.3104    FAILS
+  tessl MLX Q4                             transformers bf16          0.846856 / 0.47243  0.865543 / 0.31010   FAILS
+  mlx-lm Q4 (f32 acts)                     transformers fp32          0.848180 / 0.4738   0.865812 / 0.3125    FAILS
+  mlx-lm Q4 (f32 acts)                     transformers bf16          0.847124 / 0.47146  0.865578 / 0.31221   FAILS
+  mlx-lm Q4 (bf16 acts)                    transformers fp32          0.847858 / 0.4707   0.865996 / 0.3390    FAILS
+  mlx-lm Q4 (bf16 acts)                    transformers bf16          0.846952 / 0.46845  0.865733 / 0.33864   FAILS
+  tessl MLX Q4                             mlx-lm Q4 (f32 acts)       0.997335 / 0.99218  0.997911 / 0.98752   clears 0.99 (same weights)
+  Q4 vs transformers fp32, context: top-1 126/155 and 414/512, KL mean 0.133 and 0.138.
+
+Findings
+  (a) A bf16 reference cannot anchor the 0.99 bar. Exact fp32 scored against transformers' bf16 forward
+      gets only 0.988111 (default) and 0.991600 (text); the transformers bf16 forward against fp32 gets
+      0.988105 and 0.991597. Against transformers fp32, tessl F32 (0.999997 / 0.999998) and tessl Bf16
+      (0.997648 / 0.998021) clear 0.99 on both prompts. The card's bf16-reference rows are kept above and
+      are the ones to quote only with this caveat.
+  (b) MLX affine 4-bit, group size 64 round-to-nearest, is lossy by this measure: EAR about 0.85 (default)
+      and 0.87 (text) against fp32, minimum 0.47 and 0.31. tessl's Q4 forward reproduces mlx-lm's own Q4
+      forward on the same weights and ids: mean EAR against fp32 differs by 2.0e-4 (default) and 1.9e-5
+      (text), and tessl's Q4 against mlx-lm's f32-activation Q4 is 0.997335 / 0.997911. The loss is the
+      4-bit format, not the tessl path. The test asserts that parity (EAR_Q4_PARITY_DELTA = 5e-3, fixed
+      before the first run); it asserts no 0.99 bar, which Q4 does not reach.
+  (c) Q8: NOT MEASURED. No Qwen3.5 model path runs with Q8 weights. `gemv_q8` (src/nn.rs:716) is a
+      standalone group-affine int8 GEMV (i8 packed, f32 scales and zeros) that only tests and
+      bench_nn_kernels call; the model's weight variants are dense and MLX Q4 only, and there is neither
+      a Q8 loader nor a quantizer for model weights. Measuring a Q8 model needs a new loader, which was
+      out of scope; no second grid format was added.
+
+Scope and limits: one 2B model, two prompts (155 and 512 positions, no calibration mask), top-10, mean
+and min only. Weights are the Base release. EAR against a reference is only as good as the reference.

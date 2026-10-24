@@ -14,7 +14,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::with_gpu;
+use common::{buf, empty, random_f32, reduction_bound, with_gpu};
 use objc2_metal::MTLComputePipelineState;
 use tessl::nn::{
     self, AttnDims, AttnHeadDim, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvRopeDims,
@@ -463,5 +463,65 @@ fn oversize_threadgroup_names_the_kernel_the_request_and_the_limit() {
             assert!(e.contains(want), "{want} missing from: {e}");
         }
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// RMSNorm of rows carrying planted NaN, +inf and a subnormal row, against clean neighbours.
+///
+/// `out = x * rsqrt(mean(x^2) + eps) * w`, so by the arithmetic: a NaN anywhere makes the sum of
+/// squares NaN and every element of that row NaN; a +inf makes it +inf, `rsqrt` 0, every other
+/// element `x * 0 * w = 0` and the planted one `inf * 0 = NaN`. The clean rows around them are
+/// compared bit for bit with a run of the same data without the plants. A row of subnormals
+/// squares to zero (flushed or not), so `inv = rsqrt(eps)` and `out = x * inv * w`; fast math
+/// may flush the input itself, so the result is that or exactly 0. Budget for the subnormal
+/// row: `reduction_bound(dim, |reference|)` (scale = the reference output).
+#[test]
+fn rms_norm_planted_non_finite_and_subnormal_rows() {
+    with_gpu(|rt| {
+        let (rows, dim, eps) = (5usize, 1000usize, 1e-6f32);
+        let clean = random_f32(rows * dim, 0x4A5);
+        let mut x = clean.clone();
+        let sub = 1.0e-40f32;
+        assert!(sub > 0.0 && sub < f32::MIN_POSITIVE);
+        let (c_nan, c_inf) = (dim / 3, dim - 1);
+        x[dim + c_nan] = f32::NAN; // row 1
+        x[2 * dim + c_inf] = f32::INFINITY; // row 2
+        x[3 * dim..4 * dim].fill(sub); // row 3
+        let weight = buf(rt, &vec![1.0f32; dim]);
+        let run = |data: &[f32]| {
+            let (xb, ob) = (buf(rt, data), empty(rt, rows * dim));
+            nn::rms_norm_f32(rt, &xb, &weight, &ob, rows as u32, dim as u32, eps).unwrap();
+            rt.synchronize().unwrap();
+            ob.read_f32()
+        };
+        let (want_clean, got) = (run(&clean), run(&x));
+        let row = |v: &[f32], r: usize| v[r * dim..(r + 1) * dim].to_vec();
+        let bits = |v: Vec<f32>| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+        for r in [0usize, 4] {
+            assert_eq!(bits(row(&got, r)), bits(row(&want_clean, r)), "clean row {r} changed");
+        }
+        assert!(
+            row(&got, 1).iter().all(|v| v.is_nan()),
+            "a NaN input must make its whole row NaN"
+        );
+        let r2 = row(&got, 2);
+        assert!(
+            r2[c_inf].is_nan(),
+            "inf * rsqrt(inf) = inf * 0 = NaN at the planted +inf"
+        );
+        assert!(
+            r2.iter().enumerate().all(|(c, v)| c == c_inf || *v == 0.0),
+            "every other element of a +inf row is x * 0 = 0"
+        );
+        let inv = 1.0 / f64::from(eps).sqrt();
+        let want = f64::from(sub) * inv;
+        let bound = reduction_bound(dim, want);
+        for (c, v) in row(&got, 3).iter().enumerate() {
+            assert!(
+                *v == 0.0 || (f64::from(*v) - want).abs() <= bound,
+                "subnormal row [{c}] = {v:e}, want {want:e} +- {bound:e} or flushed 0"
+            );
+        }
     });
 }

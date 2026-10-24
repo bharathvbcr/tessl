@@ -1,4 +1,73 @@
-# BUILD_REPORT — GitPulse backlog, waves 23–24 (2026-10-22/23)
+# BUILD_REPORT — GitPulse backlog, waves 25–26 (2026-10-24), wrap-up
+
+Written while the wrap-up gate is queued. Nothing from waves 25–26 is on `main` yet. Landing is
+fast-forward-only after a green `scripts/ci_local.sh` under the lock and an ojas-7a ack, as
+before. A gate result or merge reported after this section supersedes it.
+
+## Landing state
+- **Integration branch:** `gp/w25-integrate` @ `fec3656` (worktree `../tessl-int25`).
+  - Contents: lanes A, B and D, a doc fix (`b13af61`) and current `main` (`21ef26d`). All merged without conflicts.
+- **Gate:** `target-gp/gate_int25.sh` (full `ci_local.sh`) is queued under `mac_heavy`.
+  - At 20:06–20:17Z it was still waiting: host load 113–205 against a limit of 60, from other sessions.
+  - No gate result yet. The earlier wave-25 per-lane device runs are evidence for the lanes, not for the merge.
+- **`main` moved during the wave, from other sessions:**
+  - `98bbc3e` (gusset v0.0.3 pin);
+  - `aa71fab` (eg2/embed-server merge);
+  - `21ef26d`, the owner-authorised commit of the docs-accuracy edits that had been sitting uncommitted in main's tree: README, `docs/architecture.md`, `docs/verification.md`, the h2h task file.
+
+## Wave 25 (ft-7af0512e, ft-2bc8f1e9, ft-8fef5f4d)
+| lane | branch @ tip | result | Opus verification |
+|---|---|---|---|
+| A guard tests | `gp/w25-guard-tests` @ `eb7df79` | `softmax_rows_f32` fixed: a NaN or +inf row now stays NaN instead of becoming uniform. Only an all -inf row is uniform. Planted NaN, ±inf and subnormal tests for reductions and rms_norm. Exact zero query/key gradients for one key row. The -24 witness is derived from the values. Round 3: reductions 10/10, nn_adversarial 10/10; 14 break-it perturbations each exit 101. | pass with notes: exit 101 only proves a panic, not the expected assertion. The break-it script lived in the lane's `target/` and is gone. |
+| B Q4/Q8 EAR | `gp/w25-ear` @ `f1afff7` (measured at `e519ca8`) | EAR is SLQ's top-10 expected acceptance rate. Exact f32 vs fp32: 0.999997 / 0.999998. tessl Q4 vs fp32: 0.848 / 0.866. mlx-lm Q4: 0.848 / 0.866, so tessl matches mlx-lm to 2e-4, asserted within 5e-3. The loss comes from the 4-bit format, not tessl. Even transformers' bf16 forward scores only 0.988 / 0.992 against fp32. | pass with notes. All 24 numbers match `w25_ear3.log`. **Q8 not measured** (no Qwen3.5 Q8 load path), so card AC3 is only partly met. |
+| C decode fusion | `gp/w25-decode-fusion` @ `8e1ca8e` + uncommitted | Fused add+RMSNorm and gate/up GEMV+SiLU (f32, bf16, Q4 epilogue) behind `Decode::set_fusion` / `TESSL_QWEN35_DECODE_FUSION=1`, default off. Instruct-weights run: bf16 greedy 32/32 tokens match, worst logit rel 3.9e-3. Trace 273→225 dispatches, still 1 commit / 1 wait / 3 cold allocations. Q4 49→41 dispatches, bit-identical. F32 saves 4 per layer, not 2, because an exact-f32 NN GEMM is zero+matmul (`src/gemm.rs:1230-1261`). | **not landed**: lane still finishing hosted runs (a `runtime` wake-latency timing test failed once under load). Needs its clean-commit Base run, a merge and a re-gate. No tok/s claim: the paired A/B has not been run. |
+| D MLX prefill profile | `gp/w25-mlx-profile` @ `4c56cb4` | Quiet-GPU stage profile at 8k, tessl vs mlx-lm (ms/layer): sdpa 42.41 vs 13.07 (f32 Q/K/V vs bf16 SDPA), which is 176 of the 231 ms gap; GDN core 7.80 vs 5.55; swiglu 1.7× (bytes); GEMMs at parity. | pass with notes: a single non-paired diagnostic run. At 1k the largest share is the GDN core, not sdpa. 2k not profiled. |
+
+## Wave 26 (Fable: two lanes, no third, because both candidates collide with lane B)
+- **A, ft-52a09bd6, Softmax Collapse in the training cross-entropy** (`gp/w26-ce-collapse-main` @ `977168e`).
+  - The fix excludes the target from the log-sum-exp; the loss becomes softplus of the negated margin.
+  - A failing-first test (`5046c60`) pins the p−1 collapse past the fp32 cliff.
+  - Still running: verification, the device run and the gate. Not merged.
+- **B, ft-f3e14014 item 1, bf16 Q/K/V tiles for prefill attention, phase 1 kernel only** (`gp/w26-attn-bf16-tiles-main` @ `43ede64`).
+  - The adoption bar was fixed before any kernel was written: EAR vs fp32 ≥ 0.9966 / 0.9970, within 1e-3 of transformers' bf16, and 32-token greedy unchanged; otherwise opt-in. f32 stays selectable either way.
+  - Phase 2 (wiring into `src/qwen35.rs`, the EAR measurement, the paired bench) is not started this session.
+- **Wrong base:** both lanes' worktrees were created from `a8fc965` (10-19, about 100 commits behind `main`), not `main`. Both re-based by cherry-picking onto `main` (`-main` branches); the old branches are kept until cleanup.
+
+## Cards
+- **Moved:** ft-2bc8f1e9 → review. ft-52a09bd6 → in_progress.
+- **Pending the landing:**
+  - ft-7af0512e → review, with the Q8 part split out;
+  - ft-8fef5f4d: AC1 noted, stays in progress.
+- **Filed this wave:**
+  - ft-1e84d0d6: GDN prefill core gap, after lane B. Someone else's session is already on it: `gp/w26-gdn-core` @ `fea7d9b`, not this session.
+  - ft-64d6f0dd: guard-test hardening, covering a durable break-it script with message checks, the f16 tiled-accumulator witness, rms_norm -inf and pinned FTZ.
+  - ft-e501914a: Q8 EAR, plus a report that fails or flags NOT RUN distinctly when the Q4 checkpoint is missing.
+  - ft-a66643eb: stage-profile follow-ups (T=2048, per-length attribution, an enforced replica cross-check, paired n≥3).
+- **To file at wrap-up:** wave 26 lane B phase 2, from the lane's own list.
+
+## Fable's decisions (wave 26)
+1. Lane B kernel-side work starts now; the wiring in `src/qwen35.rs` waits for wave 25 on `main`, because it shares files with lane C.
+2. No third lane: GDN core and ft-805b6ea4 both share `src/qwen35.rs` or the norm/gate-up kernels with lane B.
+3. Lane B's EAR go/no-go is stated before the kernel exists.
+
+## Owner decisions still pending (unchanged)
+- the 27B weights download;
+- sigmoid vs swish `output_gate_type`;
+- tokenizer bench method;
+- torch 2.15;
+- ft-a96618 one-sided curve bound;
+- ft-bf6bc26b licence provenance;
+- a C ABI for the fused AdamW step.
+
+Outward-facing, owner only: ft-921d4808 (push main), ft-c89dd818 (publish 0.3.0), ft-ed68689d (leaderboard).
+
+## Cleanup plan (after landing)
+1. Bundle each wave-25/26 lane branch into `tessl-backups/`.
+2. Then delete the merged lane branches, `gp/w25-integrate`, the stale `worktree-agent-*` refs (all at `a8fc965`) and their worktrees.
+3. Not touched: `eg2/*`, `gp/w26-gdn-core` and `../tessl-eg2`, which belong to other sessions.
+4. **Disk:** 40 GiB free (96% used). Agent worktree `target/` dirs need the owner's `rm`.
+
+# Earlier: waves 23–24 (2026-10-22/23)
 
 ## Landed: `main` = `fc778a2`
 - **Method:** fast-forward from `e636223`.

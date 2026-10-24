@@ -1535,8 +1535,41 @@ kernel with no register accumulator, and this one is cooperative. Whether
 
 The 1k and 2k forwards do not show the stage saving. In that run the GEMM
 stages also came out 10–20% slower than in the control run straight after,
-and the GPU read 85% busy at the start from something else. They are
-unresolved until re-run. For comparison, on the same machine MLX measured
+and the GPU read 85% busy at the start from something else. That run was on
+a busy GPU and is not evidence; the paired prefill+score run below replaces
+it, and shows the 1k and 2k forwards behind mlx-lm (0.887x and 0.896x of
+tessl's time). Where that gap goes was profiled on a quiet GPU
+(`bench_qwen35_layers --stage-profile` against
+`bench/qwen35_prefill_mlx_profile.py`, merged by
+`bench/qwen35_stage_profile_report.py`; one non-paired run per lane, a
+diagnostic and not a speed claim;
+`bench/results/qwen35_prefill_stage_profile_m5pro.txt`). At 8k the forward is
+1262.6 ms against mlx's 1031.4; the gap is 54 ms in the 18 GDN layers and
+174 ms in the 6 attention layers (real layers, norm to MLP). At 1k it is 134.6
+against 117.2 ms. Three causes, none of them a sync or an extra dtype cast:
+
+| Stage (ms per layer) | tessl 1k | mlx 1k | tessl 8k | mlx 8k |
+|---|---|---|---|---|
+| prefill attention (sdpa) | 0.804 | 0.258 | 42.41 | 13.07 |
+| GDN core (chunk prep + scan; mlx: l2norm + gates + recurrence) | 1.070 | 0.741 | 7.80 | 5.55 |
+| swiglu | 0.266 | 0.158 | 1.92 | 1.14 |
+| GDN in-projection GEMM | 1.128 | 1.165 | 8.71 | 8.93 |
+| MLP gate + up GEMMs | 1.690 | 1.679 | 12.95 | 12.99 |
+| gated norm | 0.096 | 0.172 | 0.745 | 1.429 |
+
+1. **Prefill attention**, 3.2x slower: 254 against 78 ms per 8k forward, 176
+   of the 231 ms gap. tessl's `attn_prefill` runs on f32 Q/K/V/O buffers; mlx's
+   SDPA is bf16. The fix is the bf16 Q/K/V tile item of ft-f3e14014; reaching
+   mlx's 13 ms would put the 8k forward near 1087 ms.
+2. **GDN core**, 1.4x: 140 against 100 ms per 8k forward. tessl's chunked scan
+   alone (5.86 ms) is slower than mlx's whole sequential recurrence kernel
+   (3.97), and prep adds 1.98.
+3. **swiglu**, 1.7x, 19 ms per 8k forward. Both sides run it as one pass; the
+   difference is bytes: tessl reads two f32 `[T, 6144]` GEMM outputs (503 MB
+   moved), mlx two bf16 ones (302 MB), the same ~265 GB/s on both.
+
+The GEMMs are at parity (the "10-20% slower" reading does not reproduce on a
+quiet GPU), and tessl is faster at gated norm. For comparison, on the same machine MLX measured
 7,606 / 7,528 / 5,285 tok/s at 1k / 2k / 8k, and torch MPS about 2.8k at 1k
 (both by the Lappi project).
 

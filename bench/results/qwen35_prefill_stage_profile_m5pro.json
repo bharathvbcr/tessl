@@ -1,0 +1,1434 @@
+{
+ "tessl": [
+  {
+   "backend": "tessl",
+   "tokens": 1024,
+   "iters": 9,
+   "reps": 8,
+   "stages": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "ms": 0.070802,
+     "min_ms": 0.069974,
+     "count": 1,
+     "dispatches": 1,
+     "enc_us": 0.99475
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "ms": 0.064359,
+     "min_ms": 0.056766,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 1.599
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "ms": 1.127969,
+     "min_ms": 1.125,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 3.515625
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "ms": 0.320599,
+     "min_ms": 0.313807,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 3.046875
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_prep",
+     "ms": 0.363073,
+     "min_ms": 0.360161,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 2.885375
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_scan",
+     "ms": 0.725547,
+     "min_ms": 0.719969,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 3.286375
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "ms": 1.069677,
+     "min_ms": 1.068375,
+     "count": 18,
+     "dispatches": 2,
+     "enc_us": 3.5625
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "ms": 0.096411,
+     "min_ms": 0.095609,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 0.885375
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "ms": 0.355776,
+     "min_ms": 0.348719,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 1.95825
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "ms": 0.05924,
+     "min_ms": 0.057349,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 0.666625
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "ms": 0.716198,
+     "min_ms": 0.708818,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 2.6875
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "ms": 0.095661,
+     "min_ms": 0.093516,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 0.984375
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "ms": 0.804141,
+     "min_ms": 0.798448,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 2.765625
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "ms": 0.073979,
+     "min_ms": 0.071448,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 0.760375
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "ms": 0.354771,
+     "min_ms": 0.347073,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 2.296875
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "ms": 0.059557,
+     "min_ms": 0.056229,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 0.65625
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "ms": 1.689896,
+     "min_ms": 1.680401,
+     "count": 24,
+     "dispatches": 2,
+     "enc_us": 3.046875
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "ms": 0.265469,
+     "min_ms": 0.257651,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 1.109375
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "ms": 0.958547,
+     "min_ms": 0.956287,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 2.20825
+    }
+   ],
+   "parts_ms": {
+    "gdn_layer": 2.940901,
+    "attn_layer": 2.079276,
+    "mlp": 2.941563
+   },
+   "timeline_ms": {
+    "begin": 0.042834,
+    "advance_return": 0.102708,
+    "score_wait": 134.492833,
+    "total": 134.638375,
+    "total_median": 135.057334
+   },
+   "submit_floor_ms": 4.2e-05
+  },
+  {
+   "backend": "tessl",
+   "tokens": 8192,
+   "iters": 9,
+   "reps": 8,
+   "stages": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "ms": 0.458911,
+     "min_ms": 0.446734,
+     "count": 1,
+     "dispatches": 1,
+     "enc_us": 3.791625
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "ms": 0.423437,
+     "min_ms": 0.416917,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 2.599
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "ms": 8.714354,
+     "min_ms": 8.692969,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 4.375
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "ms": 2.367286,
+     "min_ms": 2.36162,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 3.859375
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_prep",
+     "ms": 1.977323,
+     "min_ms": 1.97563,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 4.234375
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_scan",
+     "ms": 5.85962,
+     "min_ms": 5.777479,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 4.56775
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "ms": 7.802062,
+     "min_ms": 7.783552,
+     "count": 18,
+     "dispatches": 2,
+     "enc_us": 5.099
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "ms": 0.744958,
+     "min_ms": 0.73876,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 3.177125
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "ms": 2.479365,
+     "min_ms": 2.455786,
+     "count": 18,
+     "dispatches": 1,
+     "enc_us": 4.349
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "ms": 0.420995,
+     "min_ms": 0.418917,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 2.880125
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "ms": 5.41399,
+     "min_ms": 5.402068,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 4.046875
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "ms": 0.803563,
+     "min_ms": 0.791828,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 4.125
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "ms": 42.40862,
+     "min_ms": 42.250698,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 4.572875
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "ms": 0.676391,
+     "min_ms": 0.659625,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 3.224
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "ms": 2.405969,
+     "min_ms": 2.383984,
+     "count": 6,
+     "dispatches": 1,
+     "enc_us": 3.86975
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "ms": 0.424276,
+     "min_ms": 0.412203,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 2.390625
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "ms": 12.949104,
+     "min_ms": 12.928432,
+     "count": 24,
+     "dispatches": 2,
+     "enc_us": 4.552125
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "ms": 1.924229,
+     "min_ms": 1.899073,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 2.18225
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "ms": 6.783141,
+     "min_ms": 6.752787,
+     "count": 24,
+     "dispatches": 1,
+     "enc_us": 4.078125
+    }
+   ],
+   "parts_ms": {
+    "gdn_layer": 22.39763,
+    "attn_layer": 52.046891,
+    "mlp": 22.101589
+   },
+   "timeline_ms": {
+    "begin": 0.133,
+    "advance_return": 0.136,
+    "score_wait": 1262.375958,
+    "total": 1262.644958,
+    "total_median": 1274.238458
+   },
+   "submit_floor_ms": 4.2e-05
+  }
+ ],
+ "mlx": [
+  {
+   "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16",
+   "tokens": 1024,
+   "iters": 9,
+   "reps": 8,
+   "stages": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "ms": 0.09435937681701034,
+     "min_ms": 0.08823437383398414,
+     "count": 1,
+     "build_us": 0.8072529453784227
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "ms": 0.0770937476772815,
+     "min_ms": 0.06889587530167773,
+     "count": 18,
+     "build_us": 0.32812386052682996
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "ms": 1.1649114967440255,
+     "min_ms": 1.1539999977685511,
+     "count": 18,
+     "build_us": 3.953129635192454
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "ms": 0.27495837275637314,
+     "min_ms": 0.27131249953527004,
+     "count": 18,
+     "build_us": 2.4791224859654903
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "ms": 0.7411510014208034,
+     "min_ms": 0.7317343697650358,
+     "count": 18,
+     "build_us": 12.859374692197889
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "ms": 0.1723437526379712,
+     "min_ms": 0.16992712335195392,
+     "count": 18,
+     "build_us": 1.9479994080029428
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "ms": 0.3383177536306903,
+     "min_ms": 0.324411375913769,
+     "count": 18,
+     "build_us": 4.015622835140675
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "ms": 0.042395877244416624,
+     "min_ms": 0.04093749885214493,
+     "count": 6,
+     "build_us": 0.47399953473359346
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "ms": 0.7078802518662997,
+     "min_ms": 0.6992551279836334,
+     "count": 6,
+     "build_us": 3.9687511161901057
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "ms": 0.18013537192018703,
+     "min_ms": 0.1730156218400225,
+     "count": 6,
+     "build_us": 13.526005204766989
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "ms": 0.2580520012998022,
+     "min_ms": 0.24903124722186476,
+     "count": 6,
+     "build_us": 1.65625533554703
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "ms": 0.07744274626020342,
+     "min_ms": 0.0743541240808554,
+     "count": 6,
+     "build_us": 1.7603742890059948
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "ms": 0.3365105003467761,
+     "min_ms": 0.3302343757241033,
+     "count": 6,
+     "build_us": 5.979251000098884
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "ms": 0.04169275052845478,
+     "min_ms": 0.038557249354198575,
+     "count": 24,
+     "build_us": 0.572872522752732
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "ms": 1.6789791261544451,
+     "min_ms": 1.6742812513257377,
+     "count": 24,
+     "build_us": 3.833374648820609
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "ms": 0.15755212371004745,
+     "min_ms": 0.1477238765801303,
+     "count": 24,
+     "build_us": 2.3541288101114333
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "ms": 1.0590051242616028,
+     "min_ms": 1.0355885024182498,
+     "count": 24,
+     "build_us": 3.822875441983342
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_qk_l2norm",
+     "ms": 0.19689062173711136,
+     "min_ms": 0.18977600120706484,
+     "count": 18,
+     "build_us": 9.73962596617639
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_gate_prep",
+     "ms": 0.027177004085388035,
+     "min_ms": 0.024255125026684254,
+     "count": 18,
+     "build_us": 2.3958782549016178
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_recurrence_kernel",
+     "ms": 0.6146874948171899,
+     "min_ms": 0.606338624493219,
+     "count": 18,
+     "build_us": 10.781244782265276
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_qkv",
+     "ms": 0.841333378048148,
+     "min_ms": 0.8361458749277517,
+     "count": 18,
+     "build_us": 2.6874986360780895
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_z",
+     "ms": 0.30322387465275824,
+     "min_ms": 0.2969166307593696,
+     "count": 18,
+     "build_us": 2.9478760552592576
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_ba",
+     "ms": 0.0448437494924292,
+     "min_ms": 0.03837500116787851,
+     "count": 18,
+     "build_us": 2.2708773030899465
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_out_proj_gemm_only",
+     "ms": 0.30501037690555677,
+     "min_ms": 0.30173949926393107,
+     "count": 18,
+     "build_us": 3.177126927766949
+    },
+    {
+     "group": "detail",
+     "stage": "resid_add_only",
+     "ms": 0.052505245548672974,
+     "min_ms": 0.0480728704133071,
+     "count": 48,
+     "build_us": 1.0520016076043248
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_gate_gemm",
+     "ms": 0.844744878122583,
+     "min_ms": 0.838984371512197,
+     "count": 24,
+     "build_us": 3.364628355484456
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_up_gemm",
+     "ms": 0.8452082474832423,
+     "min_ms": 0.8415417541982606,
+     "count": 24,
+     "build_us": 3.072877007070929
+    }
+   ],
+   "layers_ms": {
+    "gdn_layer": 5.238984369498212,
+    "attn_layer": 4.294203121389728
+   },
+   "forward_ms": {
+    "build": 0.6213339511305094,
+    "eval": 116.27979099284858,
+    "tolist": 0.2596670528873801,
+    "total": 117.16079199686646,
+    "total_median": 117.25641699740663
+   },
+   "insitu_ms": {
+    "gdn_input_norm": 2.920167928095907,
+    "gdn_mixer": 47.197126026730984,
+    "resid_add_1": 5.234291078522801,
+    "post_norm": 3.9499980048276484,
+    "mlp": 68.41729307780042,
+    "resid_add_2": 5.145624163560569,
+    "attn_input_norm": 1.0170420282520354,
+    "attn_mixer": 9.726750082336366
+   }
+  },
+  {
+   "backend": "mlx-lm-0.32.0-mlx-0.32.3-gpu-bf16",
+   "tokens": 8192,
+   "iters": 9,
+   "reps": 8,
+   "stages": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "ms": 0.22587500279769301,
+     "min_ms": 0.18021350115304813,
+     "count": 1,
+     "build_us": 2.2603708202950656
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "ms": 0.25363024906255305,
+     "min_ms": 0.24382812262047082,
+     "count": 18,
+     "build_us": 1.7031270544975996
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "ms": 8.928765622840729,
+     "min_ms": 8.909869749913923,
+     "count": 18,
+     "build_us": 4.807377990800887
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "ms": 2.401052122877445,
+     "min_ms": 2.364218744332902,
+     "count": 18,
+     "build_us": 5.390626029111445
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "ms": 5.545328123844229,
+     "min_ms": 5.481333253555931,
+     "count": 18,
+     "build_us": 16.791746020317078
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "ms": 1.4291613770183176,
+     "min_ms": 1.3975365000078455,
+     "count": 18,
+     "build_us": 3.6406272556632757
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "ms": 2.5862083784886636,
+     "min_ms": 2.5743072474142537,
+     "count": 18,
+     "build_us": 3.765620931517333
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "ms": 0.2294166260981001,
+     "min_ms": 0.22395837731892243,
+     "count": 6,
+     "build_us": 0.6145055522210896
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "ms": 5.452057368529495,
+     "min_ms": 5.438703119580168,
+     "count": 6,
+     "build_us": 3.6354977055452764
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "ms": 1.270942622795701,
+     "min_ms": 1.2217499970574863,
+     "count": 6,
+     "build_us": 11.94262586068362
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "ms": 13.071484376268927,
+     "min_ms": 13.033343748247717,
+     "count": 6,
+     "build_us": 2.0103761926293373
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "ms": 0.6273437538766302,
+     "min_ms": 0.6175417511258274,
+     "count": 6,
+     "build_us": 1.8697464838624
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "ms": 2.5522916184854694,
+     "min_ms": 2.5334947495139204,
+     "count": 6,
+     "build_us": 1.8802456906996667
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "ms": 0.23281249741557986,
+     "min_ms": 0.22157812782097608,
+     "count": 24,
+     "build_us": 0.5312540451996028
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "ms": 12.990552124392707,
+     "min_ms": 12.961046872078441,
+     "count": 24,
+     "build_us": 3.5884950193576515
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "ms": 1.141150998591911,
+     "min_ms": 1.1143490046379156,
+     "count": 24,
+     "build_us": 1.5468758647330105
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "ms": 8.53946875577094,
+     "min_ms": 8.138140619848855,
+     "count": 24,
+     "build_us": 3.0990049708634615
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_qk_l2norm",
+     "ms": 1.506302120105829,
+     "min_ms": 1.484479129430838,
+     "count": 18,
+     "build_us": 3.6874989746138453
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_gate_prep",
+     "ms": 0.025171873858198524,
+     "min_ms": 0.023213498934637755,
+     "count": 18,
+     "build_us": 1.088505086954683
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_recurrence_kernel",
+     "ms": 3.970234378357418,
+     "min_ms": 3.941447997931391,
+     "count": 18,
+     "build_us": 6.552123522851616
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_qkv",
+     "ms": 6.5180000019609,
+     "min_ms": 6.504848999611568,
+     "count": 18,
+     "build_us": 2.47386924456805
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_z",
+     "ms": 2.191713501815684,
+     "min_ms": 2.1805572469020262,
+     "count": 18,
+     "build_us": 1.536500349175185
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_ba",
+     "ms": 0.26383850490674376,
+     "min_ms": 0.2597605052869767,
+     "count": 18,
+     "build_us": 1.364627678412944
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_out_proj_gemm_only",
+     "ms": 2.1990937530063093,
+     "min_ms": 2.193020744016394,
+     "count": 18,
+     "build_us": 2.7031201170757413
+    },
+    {
+     "group": "detail",
+     "stage": "resid_add_only",
+     "ms": 0.29513550543924794,
+     "min_ms": 0.2884427522076294,
+     "count": 48,
+     "build_us": 0.37500285543501377
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_gate_gemm",
+     "ms": 6.51617711992003,
+     "min_ms": 6.507656253234018,
+     "count": 24,
+     "build_us": 2.4427499738521874
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_up_gemm",
+     "ms": 6.515067747386638,
+     "min_ms": 6.503291748231277,
+     "count": 24,
+     "build_us": 2.609376679174602
+    }
+   ],
+   "layers_ms": {
+    "gdn_layer": 41.49671362392837,
+    "attn_layer": 45.11277088022325
+   },
+   "forward_ms": {
+    "build": 0.6404999876394868,
+    "eval": 1030.5560840060934,
+    "tolist": 0.23054098710417747,
+    "total": 1031.427124980837,
+    "total_median": 1035.5791249894537
+   },
+   "insitu_ms": {
+    "gdn_input_norm": 7.5792899006046355,
+    "gdn_mixer": 382.89787410758436,
+    "resid_add_1": 12.942332890816033,
+    "post_norm": 10.081417160108685,
+    "mlp": 503.7136248429306,
+    "resid_add_2": 12.999582046177238,
+    "attn_input_norm": 2.5372489471919835,
+    "attn_mixer": 135.91116695897654
+   }
+  }
+ ],
+ "comparison": [
+  {
+   "tokens": 1024,
+   "rows": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "count": 1,
+     "tessl_ms": 0.070802,
+     "mlx_ms": 0.09435937681701034,
+     "tessl_total_ms": 0.070802,
+     "mlx_total_ms": 0.09435937681701034
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "count": 18,
+     "tessl_ms": 0.064359,
+     "mlx_ms": 0.0770937476772815,
+     "tessl_total_ms": 1.158462,
+     "mlx_total_ms": 1.387687458191067
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "count": 18,
+     "tessl_ms": 1.127969,
+     "mlx_ms": 1.1649114967440255,
+     "tessl_total_ms": 20.303442,
+     "mlx_total_ms": 20.96840694139246
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "count": 18,
+     "tessl_ms": 0.320599,
+     "mlx_ms": 0.27495837275637314,
+     "tessl_total_ms": 5.7707820000000005,
+     "mlx_total_ms": 4.9492507096147165
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_prep",
+     "count": 18,
+     "tessl_ms": 0.363073,
+     "mlx_ms": null,
+     "tessl_total_ms": 6.535314,
+     "mlx_total_ms": null
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_scan",
+     "count": 18,
+     "tessl_ms": 0.725547,
+     "mlx_ms": null,
+     "tessl_total_ms": 13.059846,
+     "mlx_total_ms": null
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "count": 18,
+     "tessl_ms": 1.069677,
+     "mlx_ms": 0.7411510014208034,
+     "tessl_total_ms": 19.254186,
+     "mlx_total_ms": 13.34071802557446
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "count": 18,
+     "tessl_ms": 0.096411,
+     "mlx_ms": 0.1723437526379712,
+     "tessl_total_ms": 1.735398,
+     "mlx_total_ms": 3.1021875474834815
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "count": 18,
+     "tessl_ms": 0.355776,
+     "mlx_ms": 0.3383177536306903,
+     "tessl_total_ms": 6.403968,
+     "mlx_total_ms": 6.089719565352425
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "count": 6,
+     "tessl_ms": 0.05924,
+     "mlx_ms": 0.042395877244416624,
+     "tessl_total_ms": 0.35544,
+     "mlx_total_ms": 0.25437526346649975
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "count": 6,
+     "tessl_ms": 0.716198,
+     "mlx_ms": 0.7078802518662997,
+     "tessl_total_ms": 4.297188,
+     "mlx_total_ms": 4.247281511197798
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "count": 6,
+     "tessl_ms": 0.095661,
+     "mlx_ms": 0.18013537192018703,
+     "tessl_total_ms": 0.573966,
+     "mlx_total_ms": 1.0808122315211222
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "count": 6,
+     "tessl_ms": 0.804141,
+     "mlx_ms": 0.2580520012998022,
+     "tessl_total_ms": 4.824846,
+     "mlx_total_ms": 1.5483120077988133
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "count": 6,
+     "tessl_ms": 0.073979,
+     "mlx_ms": 0.07744274626020342,
+     "tessl_total_ms": 0.443874,
+     "mlx_total_ms": 0.4646564775612205
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "count": 6,
+     "tessl_ms": 0.354771,
+     "mlx_ms": 0.3365105003467761,
+     "tessl_total_ms": 2.128626,
+     "mlx_total_ms": 2.0190630020806566
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "count": 24,
+     "tessl_ms": 0.059557,
+     "mlx_ms": 0.04169275052845478,
+     "tessl_total_ms": 1.429368,
+     "mlx_total_ms": 1.0006260126829147
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "count": 24,
+     "tessl_ms": 1.689896,
+     "mlx_ms": 1.6789791261544451,
+     "tessl_total_ms": 40.557504,
+     "mlx_total_ms": 40.29549902770668
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "count": 24,
+     "tessl_ms": 0.265469,
+     "mlx_ms": 0.15755212371004745,
+     "tessl_total_ms": 6.371256000000001,
+     "mlx_total_ms": 3.781250969041139
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "count": 24,
+     "tessl_ms": 0.958547,
+     "mlx_ms": 1.0590051242616028,
+     "tessl_total_ms": 23.005128,
+     "mlx_total_ms": 25.416122982278466
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_qk_l2norm",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.19689062173711136,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 3.5440311912680045
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_gate_prep",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.027177004085388035,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 0.4891860735369846
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_recurrence_kernel",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.6146874948171899,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 11.064374906709418
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_qkv",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.841333378048148,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 15.144000804866664
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_z",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.30322387465275824,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 5.458029743749648
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_ba",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.0448437494924292,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 0.8071874908637255
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_out_proj_gemm_only",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.30501037690555677,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 5.490186784300022
+    },
+    {
+     "group": "detail",
+     "stage": "resid_add_only",
+     "count": 48,
+     "tessl_ms": null,
+     "mlx_ms": 0.052505245548672974,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 2.5202517863363028
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_gate_gemm",
+     "count": 24,
+     "tessl_ms": null,
+     "mlx_ms": 0.844744878122583,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 20.273877074941993
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_up_gemm",
+     "count": 24,
+     "tessl_ms": null,
+     "mlx_ms": 0.8452082474832423,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 20.284997939597815
+    }
+   ],
+   "sum_tessl_ms": 138.684236,
+   "sum_mlx_ms": 130.04032910976093,
+   "tessl_total_ms": 134.638375,
+   "mlx_total_ms": 117.16079199686646
+  },
+  {
+   "tokens": 8192,
+   "rows": [
+    {
+     "group": "embed",
+     "stage": "gather",
+     "count": 1,
+     "tessl_ms": 0.458911,
+     "mlx_ms": 0.22587500279769301,
+     "tessl_total_ms": 0.458911,
+     "mlx_total_ms": 0.22587500279769301
+    },
+    {
+     "group": "gdn",
+     "stage": "input_norm",
+     "count": 18,
+     "tessl_ms": 0.423437,
+     "mlx_ms": 0.25363024906255305,
+     "tessl_total_ms": 7.621866,
+     "mlx_total_ms": 4.565344483125955
+    },
+    {
+     "group": "gdn",
+     "stage": "in_proj_gemm",
+     "count": 18,
+     "tessl_ms": 8.714354,
+     "mlx_ms": 8.928765622840729,
+     "tessl_total_ms": 156.858372,
+     "mlx_total_ms": 160.71778121113311
+    },
+    {
+     "group": "gdn",
+     "stage": "conv1d_silu",
+     "count": 18,
+     "tessl_ms": 2.367286,
+     "mlx_ms": 2.401052122877445,
+     "tessl_total_ms": 42.611148,
+     "mlx_total_ms": 43.21893821179401
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_prep",
+     "count": 18,
+     "tessl_ms": 1.977323,
+     "mlx_ms": null,
+     "tessl_total_ms": 35.591814,
+     "mlx_total_ms": null
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core_scan",
+     "count": 18,
+     "tessl_ms": 5.85962,
+     "mlx_ms": null,
+     "tessl_total_ms": 105.47316,
+     "mlx_total_ms": null
+    },
+    {
+     "group": "gdn",
+     "stage": "gdn_core",
+     "count": 18,
+     "tessl_ms": 7.802062,
+     "mlx_ms": 5.545328123844229,
+     "tessl_total_ms": 140.437116,
+     "mlx_total_ms": 99.81590622919612
+    },
+    {
+     "group": "gdn",
+     "stage": "gated_norm",
+     "count": 18,
+     "tessl_ms": 0.744958,
+     "mlx_ms": 1.4291613770183176,
+     "tessl_total_ms": 13.409244000000001,
+     "mlx_total_ms": 25.724904786329716
+    },
+    {
+     "group": "gdn",
+     "stage": "out_proj_resid",
+     "count": 18,
+     "tessl_ms": 2.479365,
+     "mlx_ms": 2.5862083784886636,
+     "tessl_total_ms": 44.62857,
+     "mlx_total_ms": 46.551750812795945
+    },
+    {
+     "group": "attn",
+     "stage": "input_norm",
+     "count": 6,
+     "tessl_ms": 0.420995,
+     "mlx_ms": 0.2294166260981001,
+     "tessl_total_ms": 2.52597,
+     "mlx_total_ms": 1.3764997565886006
+    },
+    {
+     "group": "attn",
+     "stage": "in_proj_gemm",
+     "count": 6,
+     "tessl_ms": 5.41399,
+     "mlx_ms": 5.452057368529495,
+     "tessl_total_ms": 32.483940000000004,
+     "mlx_total_ms": 32.71234421117697
+    },
+    {
+     "group": "attn",
+     "stage": "qk_norm_rope",
+     "count": 6,
+     "tessl_ms": 0.803563,
+     "mlx_ms": 1.270942622795701,
+     "tessl_total_ms": 4.821378,
+     "mlx_total_ms": 7.625655736774206
+    },
+    {
+     "group": "attn",
+     "stage": "sdpa",
+     "count": 6,
+     "tessl_ms": 42.40862,
+     "mlx_ms": 13.071484376268927,
+     "tessl_total_ms": 254.45172,
+     "mlx_total_ms": 78.42890625761356
+    },
+    {
+     "group": "attn",
+     "stage": "out_gate",
+     "count": 6,
+     "tessl_ms": 0.676391,
+     "mlx_ms": 0.6273437538766302,
+     "tessl_total_ms": 4.058346,
+     "mlx_total_ms": 3.7640625232597813
+    },
+    {
+     "group": "attn",
+     "stage": "out_proj_resid",
+     "count": 6,
+     "tessl_ms": 2.405969,
+     "mlx_ms": 2.5522916184854694,
+     "tessl_total_ms": 14.435813999999999,
+     "mlx_total_ms": 15.313749710912816
+    },
+    {
+     "group": "mlp",
+     "stage": "post_norm",
+     "count": 24,
+     "tessl_ms": 0.424276,
+     "mlx_ms": 0.23281249741557986,
+     "tessl_total_ms": 10.182624,
+     "mlx_total_ms": 5.5874999379739165
+    },
+    {
+     "group": "mlp",
+     "stage": "gate_up_gemm",
+     "count": 24,
+     "tessl_ms": 12.949104,
+     "mlx_ms": 12.990552124392707,
+     "tessl_total_ms": 310.778496,
+     "mlx_total_ms": 311.77325098542497
+    },
+    {
+     "group": "mlp",
+     "stage": "swiglu",
+     "count": 24,
+     "tessl_ms": 1.924229,
+     "mlx_ms": 1.141150998591911,
+     "tessl_total_ms": 46.181495999999996,
+     "mlx_total_ms": 27.387623966205865
+    },
+    {
+     "group": "mlp",
+     "stage": "down_proj_resid",
+     "count": 24,
+     "tessl_ms": 6.783141,
+     "mlx_ms": 8.53946875577094,
+     "tessl_total_ms": 162.79538399999998,
+     "mlx_total_ms": 204.94725013850257
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_qk_l2norm",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 1.506302120105829,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 27.113438161904924
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_gate_prep",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.025171873858198524,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 0.4530937294475734
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_recurrence_kernel",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 3.970234378357418,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 71.46421881043352
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_qkv",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 6.5180000019609,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 117.3240000352962
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_z",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 2.191713501815684,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 39.450843032682315
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_in_proj_ba",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 0.26383850490674376,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 4.749093088321388
+    },
+    {
+     "group": "detail",
+     "stage": "gdn_out_proj_gemm_only",
+     "count": 18,
+     "tessl_ms": null,
+     "mlx_ms": 2.1990937530063093,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 39.58368755411357
+    },
+    {
+     "group": "detail",
+     "stage": "resid_add_only",
+     "count": 48,
+     "tessl_ms": null,
+     "mlx_ms": 0.29513550543924794,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 14.166504261083901
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_gate_gemm",
+     "count": 24,
+     "tessl_ms": null,
+     "mlx_ms": 6.51617711992003,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 156.38825087808073
+    },
+    {
+     "group": "detail",
+     "stage": "mlp_up_gemm",
+     "count": 24,
+     "tessl_ms": null,
+     "mlx_ms": 6.515067747386638,
+     "tessl_total_ms": null,
+     "mlx_total_ms": 156.3616259372793
+    }
+   ],
+   "sum_tessl_ms": 1248.740395,
+   "sum_mlx_ms": 1069.7373439616058,
+   "tessl_total_ms": 1262.644958,
+   "mlx_total_ms": 1031.427124980837
+  }
+ ],
+ "provenance": {
+  "card": "ft-2bc8f1e951d0f5afff0f72303155f940",
+  "kind": "diagnostic stage profile, single non-paired runs per lane; NOT a speed claim",
+  "revision": "34e84ec26fa754d6bb8e43ded4a2ba0a4b40cf03 (clean tree), base f00244e",
+  "machine": "Apple M5 Pro, AC power, powermode 2",
+  "snapshot": "Qwen3.5-2B-Base b1485b2fa6dfa1287294f269f5fb618e03d52d7c, bf16",
+  "ids": "tests/fixtures/qwen35_prefill_ids.json; fnv1a32 1800809562 (T=1024), 2900155900 (T=8192)",
+  "lanes": "tessl bench_qwen35_layers --stage-profile; mlx-lm 0.32.0 / mlx 0.32.3 bench/qwen35_prefill_mlx_profile.py --insitu",
+  "iters": "3 warmup + 9 timed, 8 calls per command buffer / mx.eval, median per stage",
+  "conditions": "GPU-idle wait passed 2026-10-24T07:30:54Z, mac_heavy lock from 07:32:35Z, each lane alone in the lock; load 7.8 -> 4.1; GPU 0-1% at lane start; the 90%/92% readings at the start of T=8192 are each lane's own T=1024 work just finished",
+  "logs": "target-gp/w25_stage_profile.log (lead), worktree target/stage_profile_{tessl,mlx}.log"
+ }
+}

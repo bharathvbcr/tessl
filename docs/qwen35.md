@@ -849,6 +849,14 @@ cargo test --release --test qwen35_mlx_q4 -- --ignored --exact mlx_q4_2b_attribu
 prompt and `tests/fixtures/qwen35_text_ids.npy` (`QWEN35_2B_MLX_Q4_DIR` points the tests at
 another output directory).
 
+**EAR (SLQ's top-10 Expected Acceptance Rate, bar 0.99).** `logit_deviation_report` also prints
+EAR rows. The Q4 path scores about 0.85 (default prompt) and 0.87 (text) against transformers fp32,
+far under 0.99, and tessl reproduces mlx-lm's own Q4 forward on the same weights to 2e-4 in mean
+EAR (asserted within 5e-3), so the loss is the 4-bit group-64 format and not the tessl path. A bf16
+reference cannot anchor the bar: exact fp32 scores only 0.988 against transformers' bf16 forward.
+Q8 is not measured, since no Qwen3.5 path loads Q8 weights (`gemv_q8` is a standalone kernel).
+Numbers, formula and provenance: `bench/results/qwen35_ear_m5pro.txt`.
+
 **Toward Qwen3.8-27B (AC2), what this stage leaves.** Config parse: done and tested on the real
 config. Quantized loader and Q4 kernels: shapes of the 27B (packed windows of 16480 GDN and 14336 attention rows,
 cols 5120 / 6144 / 17408, vocab 248320 rows) are inside every kernel's domain by inspection

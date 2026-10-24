@@ -217,3 +217,111 @@ pub fn logit_dev(got: &[f32], want: &[f64], vocab: usize) -> LogitDev {
         nonfinite_want,
     }
 }
+
+/// The bar SLQ calls "effectively lossless" for the Expected Acceptance Rate.
+pub const EAR_LOSSLESS_BAR: f64 = 0.99;
+
+/// SLQ's top-K width for EAR (`eval/run_ear.py --top-k`, default 10).
+pub const EAR_TOP_K: usize = 10;
+
+/// Expected Acceptance Rate of `got` against the reference `want`, per
+/// position and aggregated.
+///
+/// The definition is SLQ's (IST-DASLab/SLQ, `eval/run_ear.py` calling
+/// `compute_baseline_topk` / `compute_kl_and_ear` in `src/metrics/evaluation.py`,
+/// read 2026-10-23): at each position take the reference's top-`k` logits and
+/// their indices; gather the candidate's logits at those same indices;
+/// `p = softmax(reference top-k logits)` and `q = softmax(gathered candidate
+/// logits)`, both over the `k` entries only; `EAR = sum_i min(p_i, q_i)`,
+/// averaged over positions. SLQ weights positions by a calibration mask; with no
+/// mask every position has weight 1, which is what is computed here. Ties in
+/// the reference break to the lower index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ear {
+    pub per_position: Vec<f64>,
+    pub mean: f64,
+    pub min: f64,
+    pub positions: usize,
+    pub k: usize,
+    /// NaN or infinite values in `got` / `want`: any makes `mean` and `min` NaN.
+    pub nonfinite: usize,
+}
+
+impl Ear {
+    /// True only for finite input whose mean reaches `bar`.
+    pub fn clears(&self, bar: f64) -> bool {
+        self.nonfinite == 0 && self.mean.is_finite() && bar.is_finite() && self.mean >= bar
+    }
+
+    pub fn row(&self, label: &str) -> String {
+        let mut s = format!(
+            "{label:<34} EAR top-{} mean {:.6} min {:.6} over {} positions  clears {EAR_LOSSLESS_BAR}: {}",
+            self.k,
+            self.mean,
+            self.min,
+            self.positions,
+            self.clears(EAR_LOSSLESS_BAR),
+        );
+        if self.nonfinite > 0 {
+            s.push_str(&format!("  NON-FINITE: {}", self.nonfinite));
+        }
+        s
+    }
+}
+
+fn softmax_f64(xs: &[f64]) -> Vec<f64> {
+    let m = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let e: Vec<f64> = xs.iter().map(|x| (x - m).exp()).collect();
+    let s: f64 = e.iter().sum();
+    e.iter().map(|x| x / s).collect()
+}
+
+/// EAR of `got` against `want`, both `[positions, vocab]` row-major, with `k`
+/// candidates per position. Panics on a shape that cannot be compared or `k`
+/// outside `1..=vocab`.
+pub fn ear(got: &[f32], want: &[f64], vocab: usize, k: usize) -> Ear {
+    assert!(vocab > 0, "ear: vocab is 0");
+    assert!((1..=vocab).contains(&k), "ear: k {k} outside 1..={vocab}");
+    assert_eq!(got.len(), want.len(), "ear: got and want differ in length");
+    assert!(!got.is_empty(), "ear: no logits to compare");
+    assert_eq!(
+        got.len() % vocab,
+        0,
+        "ear: vocab {vocab} does not divide the {} logits",
+        got.len()
+    );
+    let positions = got.len() / vocab;
+    let nonfinite = got.iter().filter(|x| !x.is_finite()).count() + want.iter().filter(|x| !x.is_finite()).count();
+    if nonfinite > 0 {
+        return Ear {
+            per_position: vec![f64::NAN; positions],
+            mean: f64::NAN,
+            min: f64::NAN,
+            positions,
+            k,
+            nonfinite,
+        };
+    }
+    let per_position: Vec<f64> = got
+        .chunks(vocab)
+        .zip(want.chunks(vocab))
+        .map(|(g, w)| {
+            let mut idx: Vec<usize> = (0..vocab).collect();
+            idx.sort_by(|&a, &b| w[b].total_cmp(&w[a]).then(a.cmp(&b)));
+            idx.truncate(k);
+            let p = softmax_f64(&idx.iter().map(|&i| w[i]).collect::<Vec<_>>());
+            let q = softmax_f64(&idx.iter().map(|&i| f64::from(g[i])).collect::<Vec<_>>());
+            p.iter().zip(&q).map(|(a, b)| a.min(*b)).sum()
+        })
+        .collect();
+    let mean = per_position.iter().sum::<f64>() / positions as f64;
+    let min = per_position.iter().cloned().fold(f64::INFINITY, f64::min);
+    Ear {
+        per_position,
+        mean,
+        min,
+        positions,
+        k,
+        nonfinite: 0,
+    }
+}

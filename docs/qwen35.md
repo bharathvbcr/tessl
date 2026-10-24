@@ -853,7 +853,8 @@ another output directory).
 EAR rows. The Q4 path scores about 0.85 (default prompt) and 0.87 (text) against transformers fp32,
 far under 0.99, and tessl reproduces mlx-lm's own Q4 forward on the same weights to 2e-4 in mean
 EAR (asserted within 5e-3), so the loss is the 4-bit group-64 format and not the tessl path. A bf16
-reference cannot anchor the bar: exact fp32 scores only 0.988 against transformers' bf16 forward.
+reference cannot anchor the bar: exact fp32 scores only 0.988 (default prompt) and 0.992 (text)
+against transformers' bf16 forward, so the bf16 forward itself sits at the bar.
 Q8 is not measured, since no Qwen3.5 path loads Q8 weights (`gemv_q8` is a standalone kernel).
 Numbers, formula and provenance: `bench/results/qwen35_ear_m5pro.txt`.
 

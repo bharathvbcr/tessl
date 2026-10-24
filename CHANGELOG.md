@@ -76,6 +76,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Softmax collapse in the logit cross-entropy** (card ft-52a09bd67033db0bd25ba2db68bdfa12;
+  Barron, "A Fix for Softmax and Cross-Entropy", arXiv:2610.31642). The max-shifted
+  softmax lost the target's gradient past the f32 precision cliff: at a margin near
+  16.6, `1 + exp(-margin)` rounds to 1, `softmax_t - 1` is exactly 0, the other
+  classes keep their positive gradients, and the row stops summing to 0 (the paper's
+  `[9, -9, -9]`, target 0, gave a loss and target gradient of 0 against 3.0e-8).
+  `ce_lse_update` now folds every class except the target into the running
+  log-sum-exp `L`, across vocabulary chunks, and with `margin = z_t - L` the loss is
+  `softplus(-margin)`. `ce_softmax_grad` writes `exp(z_j - L) * sigmoid(-margin)` for
+  the other classes and `-sigmoid(-margin)` for the target (the exact negation of what
+  the others sum to), times `scale`. A row whose other classes are all `-inf` has
+  loss 0 and zero gradient. Same objective, same f32 arithmetic, no GEMM operand
+  change; no `tessl_*` signature or ABI version changes. `tests/cross_entropy.rs`
+  and `tests/ce_collapse_host.rs` pin the paper's row, margins from -100 to 100, a
+  multi-chunk walk, `-inf` and NaN logits against an f64 oracle.
 - **`grad_sq_norm` no longer overflows or underflows on extreme gradients.**
   `qwen35_sq_sum_pieces` squared raw values, so a gradient above about 1.8e19
   made the norm +inf and gradients near 1e-25 made it 0. Each 4096-element

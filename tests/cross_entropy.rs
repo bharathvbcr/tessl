@@ -1194,7 +1194,7 @@ fn a_nan_logit_is_an_error() {
             for chunk in [4, 2] {
                 let r = run_logit_rows(
                     rt,
-                    &[z.clone()],
+                    std::slice::from_ref(&z),
                     &[t],
                     chunk,
                     Reduction::Sum,

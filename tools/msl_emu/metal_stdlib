@@ -87,6 +87,15 @@ struct alignas(16) float4 {
 };
 inline float4 operator*(float s, const float4 &v) { return v * s; }
 
+/// `uint4` as a 16-byte load of packed bf16 pairs (`qwen35_gate_up_silu_bf16`):
+/// four words, indexed, 16-byte aligned like `float4`.
+struct alignas(16) uint4 {
+    uint w[4];
+    uint4() = default;
+    uint operator[](uint i) const { return w[i]; }
+    uint &operator[](uint i) { return w[i]; }
+};
+
 using uint2 = vec2<uint>;
 using uint3 = vec3<uint>;
 using ulong2 = vec2<ulong>;

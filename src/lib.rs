@@ -107,11 +107,11 @@
 //!
 //! # Kernels
 //!
-//! 39 Metal sources compile to 303 kernel entry points: RMSNorm, gated MLP
+//! 39 Metal sources compile to 308 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
 //! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
-//! sampling. [`nn`] exposes them through 89 shape-checked functions. The
+//! sampling. [`nn`] exposes them through 90 shape-checked functions. The
 //! Qwen3.5 layer kernels — the gated delta net (chunked prefill and
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole
@@ -132,8 +132,8 @@
 //! [`embedgemma2_pre`], and the tokenizer that turns a text into the encoder's
 //! ids (no Python) is [`embedgemma2_tok`].
 //!
-//! 44 of these were promoted out of `gemma-metal`, where they were reachable
-//! only as raw pipeline-name strings through an overlay metallib. All 44 now
+//! 45 of these were promoted out of `gemma-metal`, where they were reachable
+//! only as raw pipeline-name strings through an overlay metallib. All 45 now
 //! carry a numeric test against an independent reference rather than a name
 //! check; see the crate's `tests/` directory and `docs/verification.md`.
 //!

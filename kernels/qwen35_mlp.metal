@@ -227,7 +227,7 @@ kernel void NAME(                                                               
     uint lane [[thread_index_in_simdgroup]],                                      \
     uint lid [[thread_position_in_threadgroup]])                                  \
 {                                                                                 \
-    threadgroup float red[8][2][QG_COLS];                                         \
+    threadgroup float red[16u * QG_COLS];                                         \
     const uint cg = lane & 7u;                                                    \
     const uint kl = lane >> 3;                                                    \
     const ulong col0 = (ulong)tg * QG_COLS + (ulong)cg * QG_VEC;                  \
@@ -264,8 +264,8 @@ kernel void NAME(                                                               
     }                                                                             \
     if (kl == 0u) {                                                               \
         for (uint j = 0u; j < QG_VEC; ++j) {                                      \
-            red[sgid][0][cg * QG_VEC + j] = ag[j];                                \
-            red[sgid][1][cg * QG_VEC + j] = au[j];                                \
+            red[(sgid * 2u) * QG_COLS + cg * QG_VEC + j] = ag[j];                                \
+            red[(sgid * 2u + 1u) * QG_COLS + cg * QG_VEC + j] = au[j];                                \
         }                                                                         \
     }                                                                             \
     threadgroup_barrier(mem_flags::mem_threadgroup);                              \
@@ -274,7 +274,7 @@ kernel void NAME(                                                               
         if (col < (ulong)n) {                                                     \
             float g = 0.0f;                                                       \
             float u = 0.0f;                                                       \
-            for (uint s = 0u; s < 8u; ++s) { g += red[s][0][lid]; u += red[s][1][lid]; } \
+            for (uint s = 0u; s < 8u; ++s) { g += red[(s * 2u) * QG_COLS + lid]; u += red[(s * 2u + 1u) * QG_COLS + lid]; } \
             out[col] = (T)(tessl_silu(g) * u);                                    \
         }                                                                         \
     }                                                                             \

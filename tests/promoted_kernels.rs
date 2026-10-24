@@ -62,6 +62,7 @@ const PROMOTED: &[&str] = &[
     "gemv_q4_mlx_simd",
     "gemv_q4_mlx_simd_add",
     "gemv_q4_mlx_simd_gate_up_gelu",
+    "gemv_q4_mlx_simd_gate_up_silu",
     "gemv_q4_mlx_simd_kv",
     "gemv_q4_mlx_simd_i4",
     "gemv_q4_mlx_simd_add_i4",

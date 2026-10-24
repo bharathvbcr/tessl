@@ -1,6 +1,6 @@
 //! Numeric tests for promoted kernels that had only a name check.
 //!
-//! `promoted_kernels.rs` asserts each of the 44 promoted entry points resolves
+//! `promoted_kernels.rs` asserts each of the 45 promoted entry points resolves
 //! out of tessl's own metallib. That is a real gate on the move, and it is not
 //! a correctness test: a kernel can resolve, dispatch, and return wrong numbers.
 //!

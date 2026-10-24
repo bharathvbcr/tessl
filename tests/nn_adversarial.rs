@@ -517,6 +517,14 @@ fn rms_norm_planted_non_finite_and_subnormal_rows() {
         let inv = 1.0 / f64::from(eps).sqrt();
         let want = f64::from(sub) * inv;
         let bound = reduction_bound(dim, want);
+        let flushed = row(&got, 3).iter().filter(|v| **v == 0.0).count();
+        eprintln!(
+            "OBSERVED rms_norm subnormal row: {flushed}/{dim} outputs flushed to 0, first = {:e} (reference {want:e}); \
+             NaN row nan_count={}, +inf row nan_count={}",
+            row(&got, 3)[0],
+            row(&got, 1).iter().filter(|v| v.is_nan()).count(),
+            r2.iter().filter(|v| v.is_nan()).count()
+        );
         for (c, v) in row(&got, 3).iter().enumerate() {
             assert!(
                 *v == 0.0 || (f64::from(*v) - want).abs() <= bound,

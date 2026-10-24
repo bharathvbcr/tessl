@@ -334,6 +334,10 @@ fn planted_non_finite_inputs_poison_exactly_their_rows() {
                 let any_nan = out.iter().any(|p| p.is_nan());
                 let finite_valid = out.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p))
                     && (out.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() < 1e-4;
+                eprintln!(
+                    "OBSERVED softmax {label} row {r}: nan_count={} all_uniform={all_uniform} finite_valid={finite_valid}",
+                    out.iter().filter(|p| p.is_nan()).count()
+                );
                 assert!(
                     any_nan || all_uniform || finite_valid,
                     "{label}: softmax of poisoned row {r} is neither NaN, uniform nor a distribution: {:?}",
@@ -365,6 +369,23 @@ fn subnormal_inputs_are_summed_or_flushed_never_invented() {
 
         let ref0 = f64::from(sub) * cols as f64;
         let b0 = reduction_bound(cols, ref0);
+        let branch = |got: f32, want: f64, b: f64| {
+            if got == 0.0 {
+                "flushed-to-zero"
+            } else if (f64::from(got) - want).abs() <= b {
+                "reference"
+            } else {
+                "neither"
+            }
+        };
+        eprintln!(
+            "OBSERVED subnormal sum row0 = {:e} ({}), row2 = {:e}, max row0 = {:e} ({})",
+            s[0],
+            branch(s[0], ref0, b0),
+            s[2],
+            m[0],
+            if m[0] == 0.0 { "flushed-to-zero" } else { "kept" }
+        );
         assert!(
             s[0] == 0.0 || (f64::from(s[0]) - ref0).abs() <= b0,
             "sum of {cols} x {sub:e} = {:e}: want {ref0:e} +- {b0:e} or flushed 0",

@@ -642,6 +642,12 @@ fn one_key_row_gives_output_v_and_zero_query_and_key_gradients() {
                     let key = vec![1.0f32; t * D];
                     let (o, dq, dk, dv) = fwd_bwd(rt, &dm, &q, &key, &v, &d_o);
                     let label = format!("t={t} c={c} k={k}");
+                    let peak = |g: &[f32]| g.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                    eprintln!(
+                        "OBSERVED one-key {label}: max|dQ[0]|={:e} max|dK[0]|={:e}",
+                        peak(&dq[..D]),
+                        peak(&dk[..D])
+                    );
                     assert!(
                         o[..D].iter().zip(&v[..D]).all(|(a, b)| a.to_bits() == b.to_bits()),
                         "{label}: o[0] != V[0]"
@@ -729,6 +735,12 @@ fn the_minus_24_witness_leaves_no_query_gradient_in_the_first_coordinate() {
         let (want_dq, want_dk, want_dv) = attn_bwd(&s, &q64, &k64, &v64, &do64);
         assert_eq!(want_dq[3 * D], 0.0, "reference: the first coordinate is exactly 0");
 
+        eprintln!(
+            "OBSERVED witness dQ[3][0]={:e} dQ[3][1]={:e} (reference {:e})",
+            dq[3 * D],
+            dq[3 * D + 1],
+            want_dq[3 * D + 1]
+        );
         let term_scale: f64 = g
             .iter()
             .map(|x| (f64::from(alpha) * f64::from(*x) * 65536.0).abs())

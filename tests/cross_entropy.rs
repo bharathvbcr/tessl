@@ -17,6 +17,7 @@ mod common;
 
 use std::sync::Arc;
 
+use common::ce::{ce_oracle, other_classes_lse};
 use common::{buf, buf_bf16, random_f32, round_trip_bf16, with_gpu};
 use tessl::cross_entropy::{
     cross_entropy_rows, cross_entropy_rows_accumulating, CeGrads, CeHidden, CeOutput, CeWorkspace, Reduction,
@@ -138,12 +139,10 @@ fn reference(c: &Case, h: &[f32], w: &[f32]) -> Reference {
                 hr.iter().zip(wr).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum()
             })
             .collect();
-        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let lse = m + logits.iter().map(|l| (l - m).exp()).sum::<f64>().ln();
-        let t = c.targets[i] as usize;
-        per_row.push(lse - logits[t]);
-        for (j, &l) in logits.iter().enumerate() {
-            let g = ((l - lse).exp() - f64::from(u8::from(j == t))) * scale;
+        let (loss, grad) = ce_oracle(&logits, c.targets[i] as usize);
+        per_row.push(loss);
+        for (j, &gj) in grad.iter().enumerate() {
+            let g = gj * scale;
             let wr = &w[j * hs..][..hs];
             for k in 0..hs {
                 dh[i * hs + k] += g * f64::from(wr[k]);
@@ -836,6 +835,377 @@ fn the_accumulating_call_adds_dw_into_what_it_holds() {
                     err <= 8.0 * u * scale,
                     "{op:?}: dW[{k}] = {got}, want {want} (err {err:.3e})"
                 );
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Softmax collapse (Barron, "A Fix for Softmax and Cross-Entropy").
+//
+// The logits are chosen directly: hidden width `LW`, hidden row `r` is the unit
+// vector `e_r`, and weight row `j` holds `z[r][j]` in column `r`, so the exact
+// f32 GEMM returns exactly `z` (one product of 1.0 and `z`, the rest 0 * 0).
+// With `h = e_r`, `dW[j][r]` is the gradient of the loss with respect to
+// `z[r][j]`, so the whole `[rows, vocab]` gradient is read back from `dW`.
+// ---------------------------------------------------------------------------
+
+/// Hidden width of the logit-row cases: at least the number of rows in one.
+const LW: usize = 16;
+
+/// Run `cross_entropy_rows` on the rows of logits `z` (every row the same
+/// length), returning the output and the gradient of the loss with respect
+/// to each logit, `[row][class]`.
+#[allow(clippy::too_many_arguments)]
+fn run_logit_rows(
+    rt: &Arc<GpuRuntime>,
+    z: &[Vec<f32>],
+    targets: &[u32],
+    chunk: usize,
+    reduction: Reduction,
+    scale: f32,
+    h_dtype: DType,
+    operands: GemmOperands,
+) -> Result<(CeOutput, Vec<Vec<f32>>), String> {
+    let (n, vocab) = (z.len(), z[0].len());
+    assert!(n <= LW);
+    let mut h = vec![0.0f32; n * LW];
+    for r in 0..n {
+        h[r * LW + r] = 1.0;
+    }
+    let mut w = vec![0.0f32; vocab * LW];
+    for (r, zr) in z.iter().enumerate() {
+        for (j, &l) in zr.iter().enumerate() {
+            w[j * LW + r] = l;
+        }
+    }
+    let ht = upload_at(rt, &h, h_dtype, &[n, LW], 0);
+    let wt = upload_at(rt, &w, DType::F32, &[vocab, LW], 0);
+    let rows: Vec<u32> = (0..n as u32).collect();
+    let ws = CeWorkspace::new(rt, n as u32, LW as u32, chunk as u32, DType::F32, operands)?;
+    let dh = sentinel_tensor(rt, &[n, LW]);
+    let dw = sentinel_tensor(rt, &[vocab, LW]);
+    let out = cross_entropy_rows(
+        rt,
+        CeHidden { rows: &ht, off: 0 },
+        &wt,
+        &rows,
+        targets,
+        reduction,
+        operands,
+        &ws,
+        Some(CeGrads {
+            dh: &dh,
+            dw: &dw,
+            scale,
+        }),
+    )?;
+    let dwv = dw.read_f32()?;
+    let grads = (0..n).map(|r| (0..vocab).map(|j| dwv[j * LW + r]).collect()).collect();
+    Ok((out, grads))
+}
+
+/// Run the rows and compare loss, mean/sum reduction and every gradient with
+/// the f64 oracle on the operands the GPU reads. Gradients are held to
+/// `3e-5` of the row's peak (`2^-7` under bf16 operands, which round the
+/// gradient before `dW`), and, on exact f32, the row must sum to zero within
+/// `4 * eps * (1 + |L|)` of its peak: `L`, the log-sum-exp of the other
+/// classes, is formed in f32, and its rounding moves every `exp(z_j - L)` by
+/// that relative amount. A target gradient the oracle puts above the f32
+/// normal range must be nonzero and negative: that is the collapse.
+#[allow(clippy::too_many_arguments)]
+fn check_logit_rows(
+    rt: &Arc<GpuRuntime>,
+    label: &str,
+    z: &[Vec<f32>],
+    targets: &[u32],
+    chunk: usize,
+    reduction: Reduction,
+    scale: f32,
+    h_dtype: DType,
+    operands: GemmOperands,
+) -> Vec<Vec<f32>> {
+    let label = format!("{label} chunk={chunk} {reduction:?} scale={scale} h={h_dtype:?} {operands:?}");
+    let (out, grads) = run_logit_rows(rt, z, targets, chunk, reduction, scale, h_dtype, operands)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    let n = z.len();
+    let eff = f64::from(scale)
+        / match reduction {
+            Reduction::Mean => n as f64,
+            Reduction::Sum => 1.0,
+        };
+    let (grad_rel, check_sum) = match operands {
+        GemmOperands::ExactF32 => (3e-5, true),
+        GemmOperands::Bf16 => (2f64.powi(-7), false),
+    };
+    let mut total = 0.0;
+    for r in 0..n {
+        let zr: Vec<f64> = match operands {
+            GemmOperands::ExactF32 => z[r].iter().map(|&x| f64::from(x)).collect(),
+            GemmOperands::Bf16 => round_trip_bf16(&z[r]).into_iter().map(f64::from).collect(),
+        };
+        let t = targets[r] as usize;
+        let (loss, g) = ce_oracle(&zr, t);
+        total += loss;
+        let got_loss = out.per_row[r];
+        assert!(
+            (got_loss - loss).abs() <= 1e-4 * loss.abs() + 1e-60,
+            "{label}: row {r} loss {got_loss:e} want {loss:e}"
+        );
+        let peak = g.iter().fold(0.0f64, |m, x| m.max(x.abs())) * eff.abs();
+        let mut sum = 0.0f64;
+        for (j, (&got, &gj)) in grads[r].iter().zip(&g).enumerate() {
+            let want = gj * eff;
+            assert!(got != SENTINEL && got.is_finite(), "{label}: row {r} class {j}: {got}");
+            assert!(
+                (f64::from(got) - want).abs() <= grad_rel * peak + 1e-36,
+                "{label}: row {r} class {j}: grad {got:e} want {want:e} (peak {peak:e})"
+            );
+            sum += f64::from(got);
+        }
+        let want_t = g[t] * eff;
+        if want_t.abs() > 1e-30 {
+            let got_t = grads[r][t];
+            assert!(
+                got_t != 0.0 && (got_t < 0.0) == (want_t < 0.0),
+                "{label}: row {r}: the target gradient collapsed to {got_t:e}, want {want_t:e}"
+            );
+        }
+        if check_sum && peak > 0.0 {
+            let lo = other_classes_lse(&zr, t);
+            let tol = 4.0 * f64::from(f32::EPSILON) * (1.0 + lo.abs()) * peak;
+            assert!(
+                sum.abs() <= tol,
+                "{label}: row {r} sums to {sum:e}, want 0 within {tol:e} (peak {peak:e})"
+            );
+        }
+    }
+    let want_loss = match reduction {
+        Reduction::Mean => total / n as f64,
+        Reduction::Sum => total,
+    };
+    assert!(
+        (out.loss - want_loss).abs() <= 1e-4 * want_loss.abs() + 1e-60,
+        "{label}: reduced loss {:e} want {want_loss:e}",
+        out.loss
+    );
+    grads
+}
+
+/// The paper's `[9, -9, -9]` with the target on class 0, and its rotations so
+/// the target is also the middle and last class. `1 + exp(-17.3)` is 1 in
+/// f32, so `softmax_t - 1` is 0 while the other two gradients are 1.5e-8: the
+/// row must instead carry `g_t = -3.0e-8` and sum to 0.
+#[test]
+fn a_target_past_the_f32_cliff_keeps_its_gradient() {
+    with_gpu(|rt| {
+        let z = vec![vec![9.0f32, -9.0, -9.0], vec![-9.0, 9.0, -9.0], vec![-9.0, -9.0, 9.0]];
+        let targets = [0u32, 1, 2];
+        for (h_dtype, operands) in [
+            (DType::F32, GemmOperands::ExactF32),
+            (DType::BF16, GemmOperands::ExactF32),
+            (DType::F32, GemmOperands::Bf16),
+            (DType::BF16, GemmOperands::Bf16),
+        ] {
+            for chunk in [3, 1] {
+                let g = check_logit_rows(rt, "paper", &z, &targets, chunk, Reduction::Sum, 1.0, h_dtype, operands);
+                // The numbers the paper's row has: q = sigmoid(-(9 - (-9 + ln 2))).
+                let q = 1.0 / (1.0 + (9.0f64 - (-9.0 + 2f64.ln())).exp());
+                let rel = if operands == GemmOperands::Bf16 {
+                    2f64.powi(-7)
+                } else {
+                    3e-5
+                };
+                assert!(
+                    (f64::from(g[0][0]) + q).abs() <= rel * q,
+                    "target gradient {:e}, want {:e}",
+                    g[0][0],
+                    -q
+                );
+                if operands == GemmOperands::ExactF32 {
+                    let sum: f32 = g[0].iter().sum();
+                    assert!(sum.abs() <= 1e-6 * q as f32, "row sum {sum:e}");
+                }
+            }
+        }
+    });
+}
+
+/// Margins on both sides of the cliff (0, 16, 17, 20, 40, 100 and their
+/// negatives), a row of ties, the target in the first, a middle and the last
+/// class, chunks that split the row and one that does not; mean reduction and
+/// the sum over rows.
+#[test]
+fn the_margin_sweep_matches_the_oracle_across_the_cliff() {
+    with_gpu(|rt| {
+        let others = [0.0f32, -1.0, -2.5, 0.5, 3.0, -0.25];
+        let lo = other_classes_lse(&others.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(), usize::MAX);
+        let margins = [
+            0.0f64, 16.0, -16.0, 17.0, -17.0, 20.0, -20.0, 40.0, -40.0, 100.0, -100.0,
+        ];
+        for t in [0usize, 3, 6] {
+            let mut z: Vec<Vec<f32>> = margins
+                .iter()
+                .map(|&m| {
+                    let mut row = others.to_vec();
+                    row.insert(t, (lo + m) as f32);
+                    row
+                })
+                .collect();
+            z.push(vec![3.0f32; 7]);
+            let targets = vec![t as u32; z.len()];
+            for chunk in [2, 7] {
+                for (reduction, scale) in [(Reduction::Sum, 1.0), (Reduction::Mean, 2.5)] {
+                    check_logit_rows(
+                        rt,
+                        &format!("margins target={t}"),
+                        &z,
+                        &targets,
+                        chunk,
+                        reduction,
+                        scale,
+                        DType::F32,
+                        GemmOperands::ExactF32,
+                    );
+                }
+            }
+            check_logit_rows(
+                rt,
+                &format!("margins target={t}"),
+                &z,
+                &targets,
+                2,
+                Reduction::Sum,
+                1.0,
+                DType::BF16,
+                GemmOperands::Bf16,
+            );
+        }
+    });
+}
+
+/// A vocabulary of several chunks (the last partial), the target in the first
+/// chunk, the middle, the last and on a chunk edge, collapsed margins either
+/// way, chunk sizes that do and do not divide the vocabulary.
+#[test]
+fn collapsed_margins_survive_a_multi_chunk_walk() {
+    with_gpu(|rt| {
+        let vocab = 300usize;
+        let targets = [0u32, 150, 299, 64];
+        let margins = [20.0f64, 20.0, -20.0, 30.0];
+        let z: Vec<Vec<f32>> = targets
+            .iter()
+            .zip(margins)
+            .enumerate()
+            .map(|(r, (&t, m))| {
+                let mut row: Vec<f32> = random_f32(vocab, 0xc011 + r as u64)
+                    .into_iter()
+                    .map(|x| x * 5.0)
+                    .collect();
+                let zr: Vec<f64> = row.iter().map(|&x| f64::from(x)).collect();
+                row[t as usize] = (other_classes_lse(&zr, t as usize) + m) as f32;
+                row
+            })
+            .collect();
+        for chunk in [64, 7, 300] {
+            for (reduction, scale) in [(Reduction::Mean, 2.5), (Reduction::Sum, 1.0)] {
+                check_logit_rows(
+                    rt,
+                    "multi-chunk",
+                    &z,
+                    &targets,
+                    chunk,
+                    reduction,
+                    scale,
+                    DType::F32,
+                    GemmOperands::ExactF32,
+                );
+            }
+        }
+        check_logit_rows(
+            rt,
+            "multi-chunk",
+            &z,
+            &targets,
+            64,
+            Reduction::Mean,
+            1.0,
+            DType::BF16,
+            GemmOperands::Bf16,
+        );
+    });
+}
+
+/// `-inf` logits. Some non-targets `-inf` is an ordinary row; a row whose
+/// other classes are all `-inf` has `L = -inf`, margin `+inf`: loss 0 and
+/// every gradient 0 (not NaN from `exp(-inf - -inf)`).
+#[test]
+fn minus_infinite_logits_and_a_row_of_only_the_target() {
+    with_gpu(|rt| {
+        let ninf = f32::NEG_INFINITY;
+        let z = vec![
+            vec![ninf, 2.0, ninf, ninf, ninf],
+            vec![1.0, ninf, 2.0, ninf, 0.0],
+            vec![0.5, ninf, ninf, ninf, ninf],
+            vec![1.0, 2.0, 3.0, ninf, ninf],
+        ];
+        let targets = [1u32, 2, 0, 0];
+        for chunk in [5, 2, 1] {
+            let g = check_logit_rows(
+                rt,
+                "inf",
+                &z,
+                &targets,
+                chunk,
+                Reduction::Sum,
+                1.0,
+                DType::F32,
+                GemmOperands::ExactF32,
+            );
+            for r in [0usize, 2] {
+                assert!(g[r].iter().all(|&x| x == 0.0), "chunk {chunk} row {r}: {:?}", g[r]);
+            }
+            let (out, _) = run_logit_rows(
+                rt,
+                &z,
+                &targets,
+                chunk,
+                Reduction::Sum,
+                1.0,
+                DType::F32,
+                GemmOperands::ExactF32,
+            )
+            .unwrap();
+            assert!(out.per_row[0] == 0.0 && out.per_row[2] == 0.0, "{:?}", out.per_row);
+        }
+    });
+}
+
+/// A NaN logit, in a non-target or in the target, is an error, never a clean
+/// loss (a max that drops NaN must not hide it).
+#[test]
+fn a_nan_logit_is_an_error() {
+    with_gpu(|rt| {
+        for (z, t) in [
+            (vec![1.0f32, f32::NAN, 2.0, 0.0], 2u32),
+            (vec![1.0f32, 3.0, f32::NAN, 0.0], 2u32),
+            (vec![f32::NAN, 3.0, 1.0, 0.0], 0u32),
+        ] {
+            for chunk in [4, 2] {
+                let r = run_logit_rows(
+                    rt,
+                    &[z.clone()],
+                    &[t],
+                    chunk,
+                    Reduction::Sum,
+                    1.0,
+                    DType::F32,
+                    GemmOperands::ExactF32,
+                );
+                let e = r
+                    .err()
+                    .unwrap_or_else(|| panic!("{z:?} target {t} chunk {chunk}: a NaN logit gave a number"));
+                assert!(e.contains("not finite"), "{e}");
             }
         }
     });

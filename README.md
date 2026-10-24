@@ -118,7 +118,7 @@ flowchart TD
     subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
         TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
         SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
-        NnKernels["39 Kernel Sources (303 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW · BERT"]
+        NnKernels["39 Kernel Sources (308 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW · BERT"]
     end
 
     Downstream -->|Typed API Calls| TesslAPI

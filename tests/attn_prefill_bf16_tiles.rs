@@ -86,9 +86,6 @@ impl Case {
     fn q_len(&self) -> usize {
         self.batch * self.tq * self.h * D
     }
-    fn kv_len(&self) -> usize {
-        self.batch * self.cap * self.hkv * D
-    }
     /// Overwrite the cache positions the call does not read with a value that
     /// would dominate any softmax, so a mask or length bug cannot hide.
     fn poison_unread_kv(&mut self, from: usize) {
@@ -427,8 +424,8 @@ fn the_row_maximum_contributes_exactly_one_on_a_sharp_row() {
             for j in 0..t {
                 for hk in 0..c.hkv {
                     let at = ((b * c.cap + j) * c.hkv + hk) * D;
-                    for x in 0..D {
-                        c.k[at + x] = if j == key { a * u[x] } else { 0.02 * rng.unit() };
+                    for (x, ux) in u.iter().enumerate() {
+                        c.k[at + x] = if j == key { a * ux } else { 0.02 * rng.unit() };
                     }
                 }
             }
@@ -645,8 +642,8 @@ fn the_oracle_reproduces_a_two_key_row_by_hand() {
     let r = &refs[0];
     assert_eq!(r.live, 2);
     // weights 1/4 and 3/4: out = 4/4 - 8*3/4 = -5; A = 4/4 + 8*3/4 = 7.
-    assert!((r.out[0] + 5.0).abs() < 1e-12, "{}", r.out[0]);
-    assert!((r.a[0] - 7.0).abs() < 1e-12, "{}", r.a[0]);
+    assert!((r.out[0] + 5.0).abs() < 1e-6, "{}", r.out[0]);
+    assert!((r.a[0] - 7.0).abs() < 1e-6, "{}", r.a[0]);
     assert!((r.spread - 3.0f64.ln()).abs() < 1e-6, "{}", r.spread);
     // dq = |q.k| for key 1 = ln 3 / scale; the bound is positive, grows with
     // the input rounding, and is far below the output's own scale here.

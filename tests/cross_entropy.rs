@@ -1139,44 +1139,56 @@ fn collapsed_margins_survive_a_multi_chunk_walk() {
 /// `-inf` logits. Some non-targets `-inf` is an ordinary row; a row whose
 /// other classes are all `-inf` has `L = -inf`, margin `+inf`: loss 0 and
 /// every gradient 0 (not NaN from `exp(-inf - -inf)`).
+///
+/// Each row is its own call. The logits here come from the identity GEMM of
+/// `run_logit_rows` (hidden row `r` is the unit vector `e_r`, weight row `j`
+/// holds row `r`'s logit in column `r`), so a logit is `sum_k h[r,k] * W[j,k]`
+/// and includes `0 * W[j, r']` for every other batched row `r'`. Any `-inf` in
+/// another row's column makes that product `0 * -inf = NaN`, and the GEMM
+/// itself emits NaN logits: a batch cannot carry a `-inf` logit next to another
+/// row. With one row every other weight column is 0, so `z = -inf + 0 = -inf`
+/// exactly. (The NaN tests are single-row for the same reason: the NaN there
+/// is the logit under test, not a product.)
 #[test]
 fn minus_infinite_logits_and_a_row_of_only_the_target() {
     with_gpu(|rt| {
         let ninf = f32::NEG_INFINITY;
-        let z = vec![
-            vec![ninf, 2.0, ninf, ninf, ninf],
-            vec![1.0, ninf, 2.0, ninf, 0.0],
-            vec![0.5, ninf, ninf, ninf, ninf],
-            vec![1.0, 2.0, 3.0, ninf, ninf],
+        // (logits, target, whether every other class is -inf)
+        let rows: [(Vec<f32>, u32, bool); 4] = [
+            (vec![ninf, 2.0, ninf, ninf, ninf], 1, true),
+            (vec![1.0, ninf, 2.0, ninf, 0.0], 2, false),
+            (vec![0.5, ninf, ninf, ninf, ninf], 0, true),
+            (vec![1.0, 2.0, 3.0, ninf, ninf], 0, false),
         ];
-        let targets = [1u32, 2, 0, 0];
         for chunk in [5, 2, 1] {
-            let g = check_logit_rows(
-                rt,
-                "inf",
-                &z,
-                &targets,
-                chunk,
-                Reduction::Sum,
-                1.0,
-                DType::F32,
-                GemmOperands::ExactF32,
-            );
-            for r in [0usize, 2] {
-                assert!(g[r].iter().all(|&x| x == 0.0), "chunk {chunk} row {r}: {:?}", g[r]);
+            for (z, t, only_target) in &rows {
+                let g = check_logit_rows(
+                    rt,
+                    "inf",
+                    std::slice::from_ref(z),
+                    &[*t],
+                    chunk,
+                    Reduction::Sum,
+                    1.0,
+                    DType::F32,
+                    GemmOperands::ExactF32,
+                );
+                if *only_target {
+                    assert!(g[0].iter().all(|&x| x == 0.0), "chunk {chunk} {z:?}: {:?}", g[0]);
+                    let (out, _) = run_logit_rows(
+                        rt,
+                        std::slice::from_ref(z),
+                        &[*t],
+                        chunk,
+                        Reduction::Sum,
+                        1.0,
+                        DType::F32,
+                        GemmOperands::ExactF32,
+                    )
+                    .unwrap();
+                    assert!(out.per_row[0] == 0.0, "chunk {chunk} {z:?}: loss {}", out.per_row[0]);
+                }
             }
-            let (out, _) = run_logit_rows(
-                rt,
-                &z,
-                &targets,
-                chunk,
-                Reduction::Sum,
-                1.0,
-                DType::F32,
-                GemmOperands::ExactF32,
-            )
-            .unwrap();
-            assert!(out.per_row[0] == 0.0 && out.per_row[2] == 0.0, "{:?}", out.per_row);
         }
     });
 }

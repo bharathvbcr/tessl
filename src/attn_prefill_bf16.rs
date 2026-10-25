@@ -94,6 +94,12 @@ pub fn attn_prefill_bf16_with_tile(
     }
     let entry = attn_prefill_bf16_entry(tile, p)?;
     let overflow = || format!("{WHAT}: a dimension product overflows");
+    let grid_y = (dims.batch as usize)
+        .checked_mul(dims.heads as usize)
+        .ok_or_else(overflow)?;
+    if grid_y > u32::MAX as usize {
+        return Err(format!("{WHAT}: B*H grid extent {grid_y} exceeds Metal uint indexing"));
+    }
     let q_elems = [dims.batch, dims.tq, dims.heads, D]
         .iter()
         .try_fold(1usize, |acc, &x| acc.checked_mul(x as usize))
@@ -142,14 +148,11 @@ pub fn attn_prefill_bf16_with_tile(
     let (bq, _, sg) = tile.geometry();
     let threads = sg as usize * THREADS_PER_SIMDGROUP;
     let pipeline = rt.pipeline(entry)?;
-    let groups_y = (dims.batch as usize)
-        .checked_mul(dims.heads as usize)
-        .ok_or_else(overflow)?;
     dispatch_2d_tg(
         rt,
         &pipeline,
         (dims.tq as usize).div_ceil(bq as usize),
-        groups_y,
+        grid_y,
         threads,
         |bnd| {
             set_gpu_buf(bnd, q, 0);

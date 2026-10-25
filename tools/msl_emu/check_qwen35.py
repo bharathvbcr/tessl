@@ -1115,8 +1115,9 @@ def _expand_macros(src):
     """The source with every top-level macro instantiation expanded: function-
     like macros (possibly calling each other) with their arguments substituted,
     then object-like macros, as the preprocessor would for the kernel
-    signatures. Only what the kernel sources use: one instantiation per line,
-    no nested parentheses in arguments."""
+    signatures. Only what the kernel sources use: one instantiation per line;
+    arguments may hold balanced parentheses (`P[(BQ) * (BK)]`) but no commas
+    outside them."""
     import re
     text = src.replace("\\\n", " ")
     fn, obj = {}, {}
@@ -1126,28 +1127,58 @@ def _expand_macros(src):
         if m.group(1) not in fn:
             obj[m.group(1)] = (m.group(2) or "").strip()
 
+    def split_call(body, start):
+        """(args, end) of the call whose '(' is at `start`: top-level commas
+        split the arguments, parentheses and brackets nest."""
+        depth, args, cur = 0, [], []
+        for i in range(start, len(body)):
+            c = body[i]
+            if c in "([{":
+                depth += 1
+                if depth == 1:
+                    continue
+            elif c in ")]}":
+                depth -= 1
+                if depth == 0:
+                    args.append("".join(cur).strip())
+                    return args, i + 1
+            elif c == "," and depth == 1:
+                args.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(c)
+        raise AssertionError(f"unbalanced macro call in {body[start - 40:start + 40]!r}")
+
+    def expand_calls(body):
+        out, i = [], 0
+        for m in re.finditer(r"\b(\w+)\(", body):
+            if m.start() < i or m.group(1) not in fn:
+                continue
+            params, text_ = fn[m.group(1)]
+            args, end = split_call(body, m.end() - 1)
+            if len(args) != len(params):
+                continue
+            # All parameters at once, so an argument that happens to spell
+            # another parameter is not substituted again.
+            by_name = dict(zip(params, args))
+            rep = re.sub(r"\b(\w+)\b", lambda w: by_name.get(w.group(1), w.group(1)), text_)
+            out.append(body[i:m.start()])
+            out.append(rep)
+            i = end
+        out.append(body[i:])
+        return "".join(out)
+
     def subst(body):
         for _ in range(8):
             # Arguments are substituted before object-like macros expand, as
             # in the preprocessor: an argument naming a macro that expands
             # to a parameter declaration must not split the call first.
-            new = re.sub(r"\b(\w+)\(([^()]*)\)", call, body)
+            new = expand_calls(body)
             new = re.sub(r"\b(\w+)\b", lambda w: obj.get(w.group(1), w.group(1)), new)
             if new == body:
                 return body
             body = new
         raise AssertionError("macro expansion did not settle")
-
-    def call(m):
-        if m.group(1) not in fn:
-            return m.group(0)
-        params, body = fn[m.group(1)]
-        args = [a.strip() for a in m.group(2).split(",")]
-        if len(args) != len(params):
-            return m.group(0)
-        for p, a in zip(params, args):
-            body = re.sub(rf"\b{p}\b", a, body)
-        return body
 
     out = []
     for line in text.splitlines():
@@ -1207,6 +1238,15 @@ def _name_defs(rs):
         kernels = [k for b in re.findall(_OUT_KERNEL, body) for k in _out_kernel_variants(b)]
         kernels += re.findall(r'"(qwen35_\w+)"', re.sub(_OUT_KERNEL, "", body))
         defs.append((m.start(), m.group(1), kernels))
+    # `let name = entry_fn(..)?;` where `entry_fn` is a `fn .. -> Result<&'static
+    # str, String>` in the same sources whose arms name the kernels literally
+    # (src/attn_prefill_bf16.rs): the dispatch serves every kernel the function
+    # can return.
+    funcs = {m.group(1): re.findall(r'"(qwen35_\w+)"', m.group(2))
+             for m in re.finditer(r"fn (\w+)\([^)]*\) -> Result<&'static str, String> \{(.*?)\n\}", rs, re.S)}
+    for m in re.finditer(r"let (\w+) = (\w+)\(", rs):
+        if funcs.get(m.group(2)):
+            defs.append((m.start(), m.group(1), funcs[m.group(2)]))
     defs.sort()
     return defs
 
@@ -1231,6 +1271,12 @@ def case_host_contract_parser():
         ('let name = match act { A => out_kernel!("qwen35_base", out.dtype, what)?, '
          'B => out_kernel!("qwen35_other", out.dtype, what)? };',
          ["qwen35_base_f32", "qwen35_base_bf16", "qwen35_other_f32", "qwen35_other_bf16"]),
+        # src/attn_prefill_bf16.rs: the dispatch takes its name from a function
+        # whose arms spell the kernels literally.
+        ("pub fn entry(t: T, p: P) -> Result<&'static str, String> {\n    match (p, t) {\n"
+         '        (A, X) => Ok("qwen35_a"),\n        (B, X) => Ok("qwen35_b"),\n        (_, o) => Err(format!("no {o}")),\n    }\n}\n'
+         "fn run() {\n    let entry = entry(tile, p)?;\n}\n",
+         ["qwen35_a", "qwen35_b"]),
     ]
     for src, want in shapes:
         got = [k for _, _, ks in _name_defs(src) for k in ks]
@@ -1243,11 +1289,14 @@ def case_host_contract_parser():
 
 def _host_binds():
     """{kernel name: [(index, kind)]} from the dispatch closures of the host
-    files that bind these kernels (src/qwen35.rs, and src/attn_train.rs for
-    the training attention)."""
+    files that bind these kernels (src/qwen35.rs, src/attn_train.rs for the
+    training attention and src/attn_prefill_bf16.rs for the bf16-tile
+    prefill attention)."""
     import re
     qwen35_rs = open(os.path.join(ROOT, "src", "qwen35.rs")).read()
-    rs = qwen35_rs + "\n" + open(os.path.join(ROOT, "src", "attn_train.rs")).read()
+    rs = qwen35_rs
+    for extra in ("attn_train.rs", "attn_prefill_bf16.rs"):
+        rs += "\n" + open(os.path.join(ROOT, "src", extra)).read()
     name_defs = _name_defs(rs)
     # (position, variable, kernels): a dispatch resolves its pipeline variable
     # to the nearest `let` before it, since most functions reuse the name `p`.
@@ -1343,7 +1392,17 @@ def case_host_contract():
     # host builds its grid from, and must match the arguments it passes.
     import re
     tiled = open(os.path.join(ROOT, "kernels", "qwen35_attn_tiled.metal")).read()
-    insts = re.findall(r"^TILED_ATTN_KERNEL(?:_IMPL)?\((\w+), (\d+), (\d+), (\d+)[,)]", tiled, re.M)
+    insts = re.findall(r"^TILED_ATTN(?:_BF16(?:_PF32)?)?_KERNEL(?:_IMPL)?\((\w+), (\d+), (\d+), (\d+)[,)]", tiled, re.M)
+    # A top-level kernel instantiation whose signature the macro expansion did
+    # not produce is a kernel nothing below checks: that must fail, never read
+    # as a pass.
+    for f in ("qwen35_gdn", "qwen35_attn", "qwen35_attn_tiled", "qwen35_attn_bwd", "qwen35_mlp", "qwen35_score"):
+        text = open(os.path.join(ROOT, "kernels", f + ".metal")).read()
+        for name in re.findall(r"^[A-Z][A-Z0-9_]*\((qwen35_\w+),", text, re.M):
+            ok = name in sigs
+            print(f"  [{'ok  ' if ok else 'FAIL'}] {name} instantiation produced a checked signature")
+            if not ok:
+                FAILURES.append(f"skipped kernel {name}")
     bwd = open(os.path.join(ROOT, "kernels", "qwen35_attn_bwd.metal")).read()
     insts += re.findall(r"^ATTN_BWD_D(?:Q|KV)_KERNEL\((\w+), (\d+), (\d+), (\d+)[,)]", bwd, re.M)
     if not insts:

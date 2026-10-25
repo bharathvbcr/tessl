@@ -219,7 +219,8 @@ fn oracle(c: &Case, q: &[f32], k: &[f32], v: &[f32]) -> Vec<RowRef> {
 fn bound(r: &RowRef, scale: f64, tier1: bool, x: usize) -> f64 {
     let d_in = if tier1 { (2.0 * U + U * U) * scale * r.dq } else { 0.0 };
     let d_acc = D as f64 * F32_EPS * scale * r.dq;
-    let d_exp = (4.0 + 2.0 * r.spread) * F32_EPS;
+    // One f32 ulp is up to 2^-23 relative, twice the unit roundoff F32_EPS.
+    let d_exp = (4.0 + 2.0 * r.spread) * 2.0 * F32_EPS;
     let a = d_in + U + d_acc + d_exp;
     let u_v = if tier1 { U } else { 0.0 };
     let g = (r.live + D) as f64 * F32_EPS;

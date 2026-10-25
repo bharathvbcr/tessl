@@ -116,6 +116,36 @@ fn attn_tiles_refuses_iters_it_would_not_honour() {
     assert_refused_before_gpu(&["--attn-tiles", "--iters=0"], "--iters");
 }
 
+#[test]
+fn paired_attn_bf16_refuses_every_other_lane_and_iters() {
+    for lane in [
+        "--attn-tiles",
+        "--check-only",
+        "--paired-attn",
+        "--model-forward",
+        "--decode",
+        "--decode=16",
+        "--paired-gdn-recurrent",
+        "--paired-gate-up",
+    ] {
+        assert_refused_before_gpu(
+            &["--paired-attn-bf16", lane],
+            "--paired-attn-bf16 takes token counts only",
+        );
+        assert_refused_before_gpu(
+            &[lane, "--paired-attn-bf16"],
+            "--paired-attn-bf16 takes token counts only",
+        );
+    }
+    for args in [["--paired-attn-bf16", "--iters=3"], ["--iters=3", "--paired-attn-bf16"]] {
+        assert_refused_before_gpu(&args, "--iters does not apply");
+    }
+    assert_refused_before_gpu(
+        &["--paired-attn-bf16", "--gdn-scan32"],
+        "--weights and --gdn-scan32 apply to the model lanes",
+    );
+}
+
 /// GPU: the per-layer table's header reports the sample count that ran.
 #[test]
 fn iters_flag_reaches_the_layer_table_label() {

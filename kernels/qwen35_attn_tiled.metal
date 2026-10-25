@@ -100,3 +100,73 @@ TILED_ATTN_KERNEL(qwen35_attn_tiled_h256_q64_k64_sg8, 64, 64, 8)
 
 // The training forward: the default geometry, also writing the log-sum-exp.
 TILED_ATTN_KERNEL_IMPL(qwen35_attn_tiled_lse_h256_q32_k32_sg4, 32, 32, 4, TILED_ATTN_LSE_DECL, lse)
+
+// ------------------------------------------------------------ bf16 tiles ---
+//
+// The same body with the operand tiles in bf16: Q, K and V are bf16 in device
+// memory (`IN = bfloat`), so both `Q.K^T` and `P.V` run on the matrix units'
+// bf16 path, which this machine runs at 26.6 TFLOP/s against 6.4 for exact f32
+// (docs/qwen35.md, "Prefill attention, remaining gaps"). Everything else is the
+// f32 kernels': scores S, the online-softmax state (m, l, alpha) and the O
+// accumulator are f32, the scale is applied to the f32 scores before the row
+// maximum is subtracted, so the maximum's weight is exactly exp(0) = 1, and the
+// masking, the buffer slots (Q, K, V are the only bf16 operands; O stays f32,
+// or bf16 under `out_bf16`) and the grid are `qwen35_attn_tiled_h256_*`'s.
+//
+// Where the cast happens: not in this kernel. The matrix-unit tensor views read
+// device memory directly, so a cast on load would be a hand-staged
+// device -> threadgroup copy of every K and V tile for every query block (the
+// re-read this design avoids); the producer writes bf16 instead (the q/k-norm-
+// RoPE kernel's store type, as `vision_qkv_norm_rope_bf16` does for the
+// encoder), or one `qwen35_deliver_f32_to_bf16` pass casts the f32 tensors once.
+//
+// `PT` is the type of the probability tile: bfloat for the `bf16` entries (a
+// tile of its own, rounded to nearest even as it is stored; the row sum counts
+// the rounded weights, so a row stays a convex combination of V's rows), float
+// for the `bf16pf32` entry (P is S in place, f32 P times bf16 V, the same mixed
+// operands the encoder's `ENCODER_TILED_BF16_PF32_KERNEL` runs).
+#define TILED_ATTN_BF16_KERNEL_IMPL(NAME, BQ, BK, NSG, PT, P_DECL, P_PTR)       \
+kernel void NAME(                                                             \
+    device const bfloat *Q [[buffer(0)]],                                     \
+    device const bfloat *K [[buffer(1)]],                                     \
+    device const bfloat *V [[buffer(2)]],                                     \
+    device float *O [[buffer(3)]],                                            \
+    constant uint &B [[buffer(4)]],                                           \
+    constant uint &Tq [[buffer(5)]],                                          \
+    device const uint *Tkv_ptr [[buffer(6)]],                                 \
+    constant uint &H [[buffer(7)]],                                           \
+    constant uint &Hkv [[buffer(8)]],                                         \
+    constant uint &window [[buffer(9)]],                                      \
+    constant float &scale [[buffer(10)]],                                     \
+    device const uint *q_pos_offset_ptr [[buffer(11)]],                       \
+    device const uint *kv_pos_offset_ptr [[buffer(12)]],                      \
+    constant uint &out_bf16 [[buffer(13)]],                                   \
+    constant uint &kv_capacity [[buffer(14)]],                                \
+    uint2 tgpig [[threadgroup_position_in_grid]],                             \
+    uint tid [[thread_index_in_threadgroup]])                                 \
+{                                                                             \
+    threadgroup float S[(BQ) * (BK)];                                         \
+    P_DECL                                                                    \
+    threadgroup float m_row[BQ];                                              \
+    threadgroup float l_row[BQ];                                              \
+    threadgroup float a_row[BQ];                                              \
+    const uint Tkv = min(*Tkv_ptr, kv_capacity);                              \
+    attn_tiled_core<TILED_ATTN_D, BQ, BK, NSG, false, bfloat, PT>(            \
+        const_cast<device bfloat *>(Q), const_cast<device bfloat *>(K),       \
+        const_cast<device bfloat *>(V), O, nullptr, Tq, Tkv, H, Hkv, scale,   \
+        (ulong)(*q_pos_offset_ptr), (ulong)(*kv_pos_offset_ptr), out_bf16,    \
+        kv_capacity, 0u, tgpig, tid, S, P_PTR, m_row, l_row, a_row);          \
+    (void)B;                                                                  \
+    (void)window;                                                             \
+}
+#define TILED_ATTN_BF16_KERNEL(NAME, BQ, BK, NSG)                              \
+    TILED_ATTN_BF16_KERNEL_IMPL(NAME, BQ, BK, NSG, bfloat,                     \
+        threadgroup bfloat P[(BQ) * (BK)];, P)
+#define TILED_ATTN_BF16_PF32_KERNEL(NAME, BQ, BK, NSG)                         \
+    TILED_ATTN_BF16_KERNEL_IMPL(NAME, BQ, BK, NSG, float, , S)
+
+TILED_ATTN_BF16_KERNEL(qwen35_attn_tiled_bf16_h256_q32_k32_sg4, 32, 32, 4)
+TILED_ATTN_BF16_KERNEL(qwen35_attn_tiled_bf16_h256_q32_k64_sg4, 32, 64, 4)
+TILED_ATTN_BF16_KERNEL(qwen35_attn_tiled_bf16_h256_q64_k32_sg8, 64, 32, 8)
+TILED_ATTN_BF16_KERNEL(qwen35_attn_tiled_bf16_h256_q64_k64_sg8, 64, 64, 8)
+TILED_ATTN_BF16_PF32_KERNEL(qwen35_attn_tiled_bf16pf32_h256_q32_k32_sg4, 32, 32, 4)

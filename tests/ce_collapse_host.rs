@@ -54,16 +54,48 @@ fn kexp(x: f32) -> f32 {
     }
 }
 
+/// How `ce_lse_update` keeps `-inf` away from `exp`. Three versions of the
+/// kernel, each modelled as the device runs it:
+/// - `None`: the first version fed every logit to `exp`.
+/// - `Compare`: the second skipped `l > -FLT_MAX`. Under fast math (`ninf`,
+///   `nnan`) the compare is false for NaN, so a NaN logit is silently dropped
+///   instead of poisoning the sum (the device run's `a_nan_logit_is_an_error`
+///   and `rejects_what_it_cannot_compute` failures). The mirror models that
+///   NaN behaviour; the device also lost finite logits in row 1 of the `-inf`
+///   test, which the mirror cannot reproduce (a compare folded by the
+///   optimiser has no host model).
+/// - `Bits`: the kernel's: skip exactly the bit pattern `0xff800000`, let NaN
+///   through to `exp`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Guard {
+    None,
+    Compare,
+    Bits,
+}
+
+const NEG_INF_BITS: u32 = 0xff80_0000;
+
+/// `ce_is_zero`: the bits of `x`, sign dropped, are 0.
+fn bits_is_zero(x: f32) -> bool {
+    x.to_bits() << 1 == 0
+}
+
 /// `ce_lse_update` over `chunk`-wide pieces of the row, in f32: the running
 /// maximum `m` (identity `f32::MIN`, never an infinity) and `s` over the
-/// non-target classes. `guarded` is the kernel's shape: a `-inf` logit is
-/// skipped by a compare against the identity, and a zero `s` is not rescaled.
-/// Unguarded is the first version, which fed `-inf` to `exp`.
-fn lse_walk(z: &[f32], t: usize, chunk: usize, guarded: bool) -> (f32, f32) {
+/// non-target classes, with the given [`Guard`]. A zero `s` is not rescaled
+/// under `Compare` and `Bits`.
+fn lse_walk(z: &[f32], t: usize, chunk: usize, guard: Guard) -> (f32, f32) {
     let (mut m, mut s) = (f32::MIN, 0.0f32);
     for (k, piece) in z.chunks(chunk).enumerate() {
         let v0 = k * chunk;
-        let live = |c: usize, l: f32| v0 + c != t && (!guarded || l > f32::MIN);
+        let live = |c: usize, l: f32| {
+            v0 + c != t
+                && match guard {
+                    Guard::None => true,
+                    Guard::Compare => l > f32::MIN,
+                    Guard::Bits => l.to_bits() != NEG_INF_BITS,
+                }
+        };
         let mx = piece
             .iter()
             .enumerate()
@@ -78,7 +110,7 @@ fn lse_walk(z: &[f32], t: usize, chunk: usize, guarded: bool) -> (f32, f32) {
             .map(|(_, &l)| kexp(l - m_new))
             .sum();
         let s_old = if k == 0 { 0.0 } else { s };
-        let carried = if guarded && s_old == 0.0 {
+        let carried = if guard != Guard::None && bits_is_zero(s_old) {
             0.0
         } else {
             s_old * kexp(m_old - m_new)
@@ -93,8 +125,8 @@ fn lse_walk(z: &[f32], t: usize, chunk: usize, guarded: bool) -> (f32, f32) {
 /// chunking changes only the order of the sum). A row with no finite
 /// non-target class has `s == 0` and a zero gradient.
 fn excluded_target_grad(z: &[f32], t: usize) -> Vec<f32> {
-    let (m, s) = lse_walk(z, t, z.len(), true);
-    if s == 0.0 {
+    let (m, s) = lse_walk(z, t, z.len(), Guard::Bits);
+    if bits_is_zero(s) {
         return vec![0.0; z.len()];
     }
     let lo = m + s.ln();
@@ -106,10 +138,10 @@ fn excluded_target_grad(z: &[f32], t: usize) -> Vec<f32> {
         .map(|(j, &l)| {
             if j == t {
                 -q
-            } else if l > f32::MIN {
-                kexp(l - lo) * q
-            } else {
+            } else if l.to_bits() == NEG_INF_BITS {
                 0.0
+            } else {
+                kexp(l - lo) * q
             }
         })
         .collect()
@@ -220,9 +252,10 @@ fn minus_infinite_logits_never_reach_exp_in_any_chunking() {
     for (z, t) in rows {
         let zd = as_f64(z);
         let (loss, want) = ce_oracle(&zd, t);
-        let finite_others = z.iter().enumerate().any(|(j, &l)| j != t && l > f32::MIN);
+        let finite_others = z.iter().enumerate().any(|(j, &l)| j != t && l.is_finite());
+        let neg_inf_other = z.iter().enumerate().any(|(j, &l)| j != t && l == ninf);
         for chunk in [5, 3, 2, 1] {
-            let (m, s) = lse_walk(z, t, chunk, true);
+            let (m, s) = lse_walk(z, t, chunk, Guard::Bits);
             assert!(s.is_finite(), "{z:?} t={t} chunk={chunk}: s = {s}");
             if finite_others {
                 let lo = f64::from(m) + f64::from(s).ln();
@@ -234,11 +267,16 @@ fn minus_infinite_logits_never_reach_exp_in_any_chunking() {
                 assert_eq!(s, 0.0, "{z:?} t={t} chunk={chunk}: nothing finite to sum");
                 assert_eq!(loss, 0.0);
             }
-            let unguarded = lse_walk(z, t, chunk, false).1;
-            assert!(
-                unguarded.is_nan() || unguarded.is_finite() && !z.iter().enumerate().any(|(j, &l)| j != t && l == ninf),
-                "{z:?} t={t} chunk={chunk}: unguarded s = {unguarded}"
-            );
+            // The guard is what keeps `s` finite: without it a `-inf` other
+            // class makes `s` NaN, exactly when there is one.
+            for guard in [Guard::None, Guard::Compare] {
+                let s = lse_walk(z, t, chunk, guard).1;
+                assert_eq!(
+                    s.is_nan(),
+                    neg_inf_other && guard == Guard::None,
+                    "{z:?} t={t} chunk={chunk} {guard:?}: s = {s}"
+                );
+            }
         }
         let got = excluded_target_grad(z, t);
         let peak = want.iter().fold(0.0f64, |a, x| a.max(x.abs()));
@@ -250,6 +288,61 @@ fn minus_infinite_logits_never_reach_exp_in_any_chunking() {
             );
         }
     }
+}
+
+/// A NaN logit must reach the sum and poison it, in every chunking and in
+/// every position (non-target, in a chunk of its own, next to `-inf`), so the
+/// host reports the row as not finite. A float compare as the `-inf` guard
+/// (`Compare`) drops it and `s` comes out a clean number: the mirror of the
+/// device failures "a NaN logit gave a number" and "got loss 0".
+#[test]
+fn a_nan_logit_poisons_the_sum_and_a_compare_guard_would_drop_it() {
+    let (nan, ninf) = (f32::NAN, f32::NEG_INFINITY);
+    let rows: [(&[f32], usize); 4] = [
+        (&[1.0, nan, 2.0, 0.0], 2),
+        (&[nan, 3.0, 1.0, 0.0], 1),
+        (&[1.0, ninf, nan, ninf], 0),
+        (&[ninf, nan, ninf, ninf], 0),
+    ];
+    for (z, t) in rows {
+        for chunk in [4, 2, 1] {
+            let s = lse_walk(z, t, chunk, Guard::Bits).1;
+            assert!(s.is_nan(), "{z:?} t={t} chunk={chunk}: s = {s}, the NaN was dropped");
+            let dropped = lse_walk(z, t, chunk, Guard::Compare).1;
+            assert!(
+                !dropped.is_nan(),
+                "{z:?} t={t} chunk={chunk}: the compare guard model should drop NaN"
+            );
+        }
+        assert!(excluded_target_grad(z, t).iter().any(|g| g.is_nan()) || z[t].is_nan());
+    }
+}
+
+/// Ties the mirror to the kernel: the guards the mirror models are the ones
+/// `kernels/cross_entropy.metal` spells, and the float compare they replaced
+/// is gone. Removing a guard from the kernel fails here, on any host.
+#[test]
+fn the_kernel_spells_the_guards_the_mirror_models() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/cross_entropy.metal");
+    let src = std::fs::read_to_string(&path).expect("kernel source");
+    let code: String = src
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "as_type<uint>(x) == 0xff800000u",
+        "(as_type<uint>(x) << 1) == 0u",
+        "v0 + c != t && !ce_is_neg_inf(row[c])",
+        "ce_is_zero(s_old) ? 0.0f",
+        "if (ce_is_zero(sn))",
+        "ce_is_neg_inf(z) ? 0.0f : precise::exp(z - lo) * q",
+        "if (v0 + c != t)",
+    ] {
+        assert!(code.contains(needle), "kernel no longer spells `{needle}`");
+    }
+    assert!(!code.contains("> -FLT_MAX"), "a float compare with -FLT_MAX is back");
+    assert!(!code.contains("== 0.0f"), "a float compare of s with 0 is back");
 }
 
 /// The oracle itself, against the textbook `softmax - onehot` where that is

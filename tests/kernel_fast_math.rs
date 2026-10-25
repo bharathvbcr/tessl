@@ -550,6 +550,106 @@ fn no_kernel_compares_a_value_with_itself() {
     );
 }
 
+/// Lines of `code` that compare a value with `-FLT_MAX`: `x > -FLT_MAX`,
+/// `-FLT_MAX < x`, `==`, `!=`, `<=`, `>=`, over collapsed text. `-FLT_MAX` is
+/// the finite identity a running max is seeded with; compared against, it is a
+/// stand-in for `-inf` (`x > -FLT_MAX` as "x is finite"), and under fast math
+/// (`ninf`, `nnan`) that compare may be folded, and is false for NaN, which it
+/// then silently drops. Classify infinities and NaN by bit pattern
+/// (`as_type<uint>(x) == 0xff800000u`) or with `isfinite` / `isnan` / `isinf`.
+/// An assignment (`m = -FLT_MAX`) and a `+FLT_MAX` sentinel are not hits.
+fn neg_flt_max_compare_lines(code: &str) -> Vec<usize> {
+    let (t, lines) = collapse(code);
+    let needle: Vec<char> = "-FLT_MAX".chars().collect();
+    let is_cmp = |a: char, b: Option<char>| match (a, b) {
+        ('=' | '!' | '<' | '>', Some('=')) => true,
+        ('<' | '>', _) => true,
+        _ => false,
+    };
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= t.len() {
+        if t[i..i + needle.len()] != needle[..] || (i > 0 && is_ident(t[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let j = i + needle.len();
+        if t.get(j).is_some_and(|&c| is_ident(c)) {
+            i += 1;
+            continue;
+        }
+        // Before: `<`, `>`, `<=`, `>=`, `==`, `!=` (not `->`, `<<`, `>>`, a lone `=`).
+        let before = match (i.checked_sub(2).map(|k| t[k]), i.checked_sub(1).map(|k| t[k])) {
+            (_, Some('=')) => matches!(i.checked_sub(2).map(|k| t[k]), Some('=' | '!' | '<' | '>')),
+            (p, Some(c @ ('<' | '>'))) => p != Some('-') && p != Some(c),
+            _ => false,
+        };
+        let after = match (t.get(j).copied(), t.get(j + 1).copied()) {
+            (Some(a), b) if is_cmp(a, b) => !(matches!(a, '<' | '>') && b == Some(a)) && !(a == '=' && b != Some('=')),
+            _ => false,
+        };
+        if before || after {
+            hits.push(lines[i]);
+        }
+        i = j;
+    }
+    hits.dedup();
+    hits
+}
+
+#[test]
+fn the_neg_flt_max_compare_matcher_finds_compares_and_not_seeds() {
+    let hit = |src: &str| neg_flt_max_compare_lines(&strip_comments(src));
+    for src in [
+        "if (x > -FLT_MAX) {}",
+        "if (x >= -FLT_MAX) {}",
+        "if (x < -FLT_MAX) {}",
+        "if (x <= -FLT_MAX) {}",
+        "if (x == -FLT_MAX) {}",
+        "if (x != -FLT_MAX) {}",
+        "if (-FLT_MAX < x) {}",
+        "if (-FLT_MAX == x) {}",
+        "g = z > -FLT_MAX ? a : b;",
+        "if (x\n  > -FLT_MAX) {}",
+    ] {
+        assert_eq!(hit(src).len(), 1, "{src}");
+    }
+    for src in [
+        "float m = -FLT_MAX;",
+        "m = -FLT_MAX;",
+        "partials[i] = -FLT_MAX;",
+        "float v = max(v, -FLT_MAX);",
+        "x = a < b ? -FLT_MAX : b;",
+        "if (r < FLT_MAX) {}",
+        "// if (x > -FLT_MAX) {}",
+        "y = x << 1; z = -FLT_MAX_ISH;",
+    ] {
+        assert!(hit(src).is_empty(), "{src}");
+    }
+}
+
+#[test]
+fn no_kernel_compares_a_value_with_neg_flt_max() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
+    let mut hits = Vec::new();
+    for path in kernel_sources(&root) {
+        let src = std::fs::read_to_string(&path).expect("kernel source is readable UTF-8");
+        for line in neg_flt_max_compare_lines(&strip_comments(&src)) {
+            hits.push(format!(
+                "{}:{line}",
+                path.strip_prefix(&root).unwrap_or(&path).display()
+            ));
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "{} compare(s) with -FLT_MAX in kernel code; as a stand-in for -inf it is a float compare \
+         fast math may fold, and it drops NaN. Test the bits (as_type<uint>(x) == 0xff800000u) or \
+         use isfinite / isinf: {hits:#?}",
+        hits.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Adversarial regressions: spellings a kernel can use that a line-by-line,
 // path-only self-compare scan missed.

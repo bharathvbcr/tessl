@@ -43,6 +43,15 @@ kernel void NAME(                                                               
 CE_GATHER_KERNEL(ce_gather_rows_f32, float)
 CE_GATHER_KERNEL(ce_gather_rows_bf16, bfloat)
 
+/// Classification by bit pattern. The kernels are compiled with
+/// `-fmetal-math-mode=fast`, whose `ninf` / `nnan` flags let the compiler
+/// assume no operand is infinite or NaN, so a float compare against an
+/// infinity, `-FLT_MAX` standing in for one, or NaN may be folded, reordered or
+/// answered wrongly. An integer test of the bits cannot be assumed away.
+/// `-inf` is exactly `0xff800000`; `s` is zero when its bits, sign dropped, are 0.
+inline bool ce_is_neg_inf(float x) { return as_type<uint>(x) == 0xff800000u; }
+inline bool ce_is_zero(float x) { return (as_type<uint>(x) << 1) == 0u; }
+
 /// Fold one chunk of logits into each row's running log-sum-exp over the
 /// non-target classes.
 ///
@@ -101,13 +110,16 @@ kernel void ce_lse_update(
 
     float acc = 0.0f;
     for (uint c = lid; c < width; c += tptg) {
-        // A `-inf` logit contributes exactly 0. It is skipped by a compare
-        // against the finite identity, not fed to `exp`: with m_new at the
-        // identity (a row, or chunk, with no finite non-target logit)
-        // `-inf - m_new` is `-inf`, or `-inf - -inf` = NaN if `m_new` is
-        // itself `-inf`, and `precise::exp` is compiled under fast math,
-        // where an infinite or NaN argument is not something it must handle.
-        if (v0 + c != t && row[c] > -FLT_MAX) {
+        // A `-inf` logit contributes exactly 0. It is skipped, by its bit
+        // pattern, instead of being fed to `exp`: with m_new at the identity
+        // (a row, or chunk, with no finite non-target logit) `-inf - m_new`
+        // is `-inf`, or `-inf - -inf` = NaN if `m_new` is itself `-inf`, and
+        // `precise::exp` is compiled under fast math, where an infinite
+        // argument is not something it must handle. NaN is not skipped: it
+        // reaches `exp`, poisons `s`, and the host reports the row as not
+        // finite. A float compare (`row[c] > -FLT_MAX`) cannot do this job:
+        // fast math may fold it, and it is false for NaN, dropping the NaN.
+        if (v0 + c != t && !ce_is_neg_inf(row[c])) {
             acc += precise::exp(row[c] - m_new);
         }
     }
@@ -120,7 +132,7 @@ kernel void ce_lse_update(
         // multiplying it by `exp(m_old - m_new)` would be 0 * NaN if both
         // maxima sit at the identity.
         const float s_old = first != 0u ? 0.0f : s[n];
-        const float carried = s_old == 0.0f ? 0.0f : s_old * precise::exp(m_old - m_new);
+        const float carried = ce_is_zero(s_old) ? 0.0f : s_old * precise::exp(m_old - m_new);
         s[n] = carried + acc;
         m[n] = m_new;
         if (t >= v0 && t - v0 < width) {
@@ -163,7 +175,7 @@ kernel void ce_softmax_grad(
     if (c >= width || n >= n_rows) return;
     const ulong i = (ulong)n * ld + c;
     const float sn = s[n];
-    if (sn == 0.0f) {
+    if (ce_is_zero(sn)) {
         logits[i] = 0.0f;
         return;
     }
@@ -174,6 +186,6 @@ kernel void ce_softmax_grad(
     // A `-inf` non-target logit has gradient 0; `exp` is not handed `-inf`
     // (see ce_lse_update).
     const float z = logits[i];
-    const float g = (v0 + c == targets[n]) ? -q : (z > -FLT_MAX ? precise::exp(z - lo) * q : 0.0f);
+    const float g = (v0 + c == targets[n]) ? -q : (ce_is_neg_inf(z) ? 0.0f : precise::exp(z - lo) * q);
     logits[i] = g * scale;
 }

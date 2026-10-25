@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+/// The f64 oracle for one cross-entropy row, in the target-excluded form.
+pub mod ce;
+
 /// The gated delta rule as an f64 sequential reference — the CPU oracle for the
 /// GDN kernels. Pure arithmetic, no GPU, so it runs on any host.
 pub mod gdn;

@@ -11,10 +11,12 @@
 //! 1. gathers the `n` supervised rows into f32 `[n, hidden]` (bf16 widened
 //!    exactly);
 //! 2. walks the vocabulary in chunks: `logits = h @ W[v0..v0+w]ᵀ` (the
-//!    caller's [`GemmOperands`]), folded into a running log-sum-exp per row,
-//!    the target's logit picked up on the way;
+//!    caller's [`GemmOperands`]), folded into a running log-sum-exp per row
+//!    over the classes other than the target, the target's logit picked up on
+//!    the way;
 //! 3. with gradients requested, walks it again: the recomputed chunk becomes
-//!    `dlogits = (softmax - onehot) * scale`, then `dh += dlogits @ W_c` (the
+//!    `dlogits = (softmax - onehot) * scale`, written without the cancellation
+//!    (see below), then `dh += dlogits @ W_c` (the
 //!    first chunk writes `dh`, the rest accumulate into it in the GEMM) and
 //!    `dW[v0..v0+w] = dlogitsᵀ @ h` (or `+=`, with
 //!    [`cross_entropy_rows_accumulating`], into a gradient bank).
@@ -35,6 +37,18 @@
 //! `torch.nn.functional.cross_entropy` over those rows. With gradients, `scale`
 //! is the upstream gradient of the loss (1 for a plain `backward()`); `dh` and
 //! `dW` are the gradients of `scale * loss`.
+//!
+//! The target is left out of the log-sum-exp (Barron, "A Fix for Softmax and
+//! Cross-Entropy", arXiv:2610.31642). Let `L` be the log-sum-exp of the classes
+//! `j != t` and `margin = z_t - L`. The row's loss is the same number,
+//! `softplus(-margin)`, and its gradient is `exp(z_j - L) * sigmoid(-margin)`
+//! for `j != t` and `-sigmoid(-margin)` at the target (the non-target terms sum
+//! to exactly `sigmoid(-margin)`, so the row sums to 0). The textbook
+//! `softmax - onehot` rounds `1 + exp(-margin)` to 1 once the margin passes
+//! about 16.6 in f32: the target's gradient is then exactly 0 while the others
+//! stay positive. A row whose other classes are all `-inf` has loss 0 and zero
+//! gradient. Logits stay f32 even after bf16 GEMM operand rounding, so the f32
+//! cliff is the one that applies on both lanes.
 //!
 //! The four GEMMs (two logit walks, `dh`, `dW`) run on the caller's
 //! [`GemmOperands`]: exact f32, or operands rounded to bf16 with f32
@@ -86,7 +100,8 @@ pub struct CeGrads<'a> {
 pub struct CeOutput {
     /// The reduced loss.
     pub loss: f64,
-    /// `logsumexp - target logit` for each supplied row.
+    /// `logsumexp - target logit` for each supplied row, evaluated as
+    /// `softplus(-margin)` (see the module docs).
     pub per_row: Vec<f64>,
 }
 
@@ -612,6 +627,7 @@ fn ce_rows(
                 set_u32(bnd, w as u32, 6);
                 set_u32(bnd, v0 as u32, 7);
                 set_f32(bnd, scale, 8);
+                set_gpu_buf(bnd, &ws.tlogit, 9);
             })?;
             // The two GEMMs below share one bf16 rounding of dlogits.
             let dlogits = match &ws.logits16 {
@@ -644,9 +660,7 @@ fn ce_rows(
 
     rt.synchronize()?;
     let (m, s, t) = (ws.m.try_read_f32()?, ws.s.try_read_f32()?, ws.tlogit.try_read_f32()?);
-    let per_row: Vec<f64> = (0..n)
-        .map(|i| f64::from(m[i]) + f64::from(s[i]).ln() - f64::from(t[i]))
-        .collect();
+    let per_row: Vec<f64> = (0..n).map(|i| row_loss(m[i], s[i], t[i])).collect();
     if let Some(i) = per_row.iter().position(|l| !l.is_finite()) {
         return Err(format!(
             "{what}: row {i}'s loss is not finite (non-finite hidden states or weights?)"
@@ -658,6 +672,26 @@ fn ce_rows(
         Reduction::Sum => total,
     };
     Ok(CeOutput { loss, per_row })
+}
+
+/// One row's loss from the first walk's state: `m` and `s` are the running
+/// maximum and `sum(exp(z - m))` over the classes other than the target, `t`
+/// the target's logit. With `L = m + ln(s)` and `margin = t - L` it is
+/// `softplus(-margin) = max(-margin, 0) + ln_1p(exp(-|margin|))`, which stays
+/// accurate where `ln(1 + exp(-margin))` would round to 0 (margin past about
+/// 16.6 in f32). `s == 0` means every other class is `-inf`: the row has
+/// nothing to lose to, loss 0. A NaN anywhere stays NaN (the caller refuses
+/// non-finite rows), and an infinite target logit below the rest is an
+/// infinite loss.
+fn row_loss(m: f32, s: f32, t: f32) -> f64 {
+    if s == 0.0 {
+        return 0.0;
+    }
+    let neg_margin = f64::from(m) + f64::from(s).ln() - f64::from(t);
+    if neg_margin.is_nan() {
+        return f64::NAN;
+    }
+    neg_margin.max(0.0) + (-neg_margin.abs()).exp().ln_1p()
 }
 
 /// `v` padded with zeros to `len` (the workspace buffers' full mapping).

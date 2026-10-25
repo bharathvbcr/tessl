@@ -755,6 +755,14 @@ def cross_entropy(
     gradient is accumulated in f32 and cast to the weight's dtype once.
     ``operands`` is the GEMMs': ``"f32"`` (exact) or ``"bf16"`` (operands
     rounded to bf16, f32 accumulation).
+
+    The loss is the same function as ``F.cross_entropy``, evaluated with the
+    target left out of the log-sum-exp: with ``L = logsumexp(z[j != t])`` and
+    ``margin = z[t] - L`` it is ``softplus(-margin)``, and the gradient is
+    ``exp(z[j] - L) * sigmoid(-margin)`` for ``j != t`` and ``-sigmoid(-margin)``
+    at the target. ``softmax - onehot`` computed directly rounds the target's
+    gradient to 0 once the margin passes about 16.6 in f32 (Barron, "A Fix for
+    Softmax and Cross-Entropy"); this form keeps it, and each row sums to 0.
     """
     chunk = _check_uint("chunk", chunk, 32)
     if mask is None:

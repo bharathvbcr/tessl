@@ -55,7 +55,11 @@ Provenance
   (flat threadgroup array in kernels/qwen35_mlp.metal, emulator uint4, doc counts); full log
   /Users/bharath/Code/research/tessl/target-gp/w25_fusion_round2.log. Weights for the real-2B
   rows in that run: the instruct Qwen3.5-2B snapshot 15852e8c...; the trace rows are random
-  weights. The clean-commit rerun (Base snapshot b1485b2f...) supersedes the real-2B rows; its
-  log is named in the lead's report. Binary: release, target/release/bench_qwen35_layers.
+  weights. The round-2 tree was dirty, so it is superseded by the clean-commit rerun:
+  2026-10-25 02:05-02:07Z, load ~7.6, under the mac_heavy lock, tessl commit b33dc57 with 0
+  dirty files, real-2B rows on the Base snapshot b1485b2f...; every step exited 0 and the
+  trace reproduced 273 -> 225 dispatches per token. Log (local, untracked):
+  /Users/bharath/Code/research/tessl/target-gp/w25_fusion_final.log.
+  Binary: release, target/release/bench_qwen35_layers.
   Power/GPU state: not recorded by this trace script (no pmset sample); the counts are
   deterministic and load-independent.

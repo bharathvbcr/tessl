@@ -561,11 +561,7 @@ fn no_kernel_compares_a_value_with_itself() {
 fn neg_flt_max_compare_lines(code: &str) -> Vec<usize> {
     let (t, lines) = collapse(code);
     let needle: Vec<char> = "-FLT_MAX".chars().collect();
-    let is_cmp = |a: char, b: Option<char>| match (a, b) {
-        ('=' | '!' | '<' | '>', Some('=')) => true,
-        ('<' | '>', _) => true,
-        _ => false,
-    };
+    let is_cmp = |a: char, b: Option<char>| matches!((a, b), ('=' | '!' | '<' | '>', Some('=')) | ('<' | '>', _));
     let mut hits = Vec::new();
     let mut i = 0;
     while i + needle.len() <= t.len() {

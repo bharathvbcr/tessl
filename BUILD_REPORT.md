@@ -1,57 +1,44 @@
-# BUILD_REPORT — GitPulse backlog, waves 25–26 (2026-10-24), wrap-up
+# BUILD_REPORT — GitPulse backlog, waves 25–26 (2026-10-24/25), final
 
-Written while the wrap-up gate is queued. Nothing from waves 25–26 is on `main` yet. Landing is
-fast-forward-only after a green `scripts/ci_local.sh` under the lock and an ojas-7a ack, as
-before. A gate result or merge reported after this section supersedes it.
+Wrap-up is complete: every wave 25–26 lane that passed verification is on `main`, and the lane branches are bundled and deleted. No new lanes were started after the wrap-up order. Nothing is pushed.
 
-## Landing state
-- **Integration branch:** `gp/w25-integrate` @ `fec3656` (worktree `../tessl-int25`).
-  - Contents: lanes A, B and D, a doc fix (`b13af61`) and current `main` (`21ef26d`). All merged without conflicts.
-- **Gate:** `target-gp/gate_int25.sh` (full `ci_local.sh`) is queued under `mac_heavy`.
-  - At 20:06–20:17Z it was still waiting: host load 113–205 against a limit of 60, from other sessions.
-  - No gate result yet. The earlier wave-25 per-lane device runs are evidence for the lanes, not for the merge.
-- **`main` moved during the wave, from other sessions:**
-  - `98bbc3e` (gusset v0.0.3 pin);
-  - `aa71fab` (eg2/embed-server merge);
-  - `21ef26d`, the owner-authorised commit of the docs-accuracy edits that had been sitting uncommitted in main's tree: README, `docs/architecture.md`, `docs/verification.md`, the h2h task file.
+## Landed on `main` (fast-forward from `gp/w25-integrate`, each after a green `scripts/ci_local.sh` under the lock)
+| main | contents | gate |
+|---|---|---|
+| `8bc0468` | wave 25 lanes A (guard tests), B (Q4 EAR), D (MLX prefill profile), plus the docs fix and the other sessions' `main` commits | green |
+| `5d6f786` | wave 25 lane C (decode fusion, default off) and wave 26 lane B (bf16 prefill attention tiles, phase 1, kernel only) | green, 03:56–06:16Z |
+| `64efd56` | wave 26 lane A (cross-entropy softmax-collapse fix) and the `qwen35_train_ragged` re-pin | green, rev `64efd56` dirty 0, 14:38:57–16:44:21Z: `ci:local OK`, 3657 passed / 0 failed / 77 ignored, no skipped steps |
 
-## Wave 25 (ft-7af0512e, ft-2bc8f1e9, ft-8fef5f4d)
-| lane | branch @ tip | result | Opus verification |
+- **ojas:** the owner chose to fast-forward without the ojas-7a rerun, which had closed out and was starved of cargo slots. The last ojas pass is ojas `42d5a9f` against tessl `fc778a2`. Card draft: `target-gp/card_ojas_rerun.json`.
+- **Re-pin (owner approved 2026-10-25):** the CE fix moves the train step's low bits. `tests/qwen35_train_ragged.rs` goldens went from causal `0x06504ffc2068a5b0` / rows `0x3aef36370924cc39` to `0xe676ec632041b59a` / `0x907e0d9ba49de71c`. The oracle-tolerance train tests (qwen35_train, capi, torch CE) passed on the device unchanged.
+- **Failed gates on the way, none on the landed code's correctness:**
+  - `435f835` and the first run on `64efd56` failed `make device` on the Go thread-growth flake (below).
+  - `435f835` also failed the `qwen35_train_ragged` pins, which led to the re-pin.
+  - The lane B merge needed hand conflict resolution (README, bench usage), and the hosted manifest count (`kernel_fast_math` 13 → 15).
+
+## Lane results and Opus verdicts
+| lane | card | result | Opus verdict |
 |---|---|---|---|
-| A guard tests | `gp/w25-guard-tests` @ `eb7df79` | `softmax_rows_f32` fixed: a NaN or +inf row now stays NaN instead of becoming uniform. Only an all -inf row is uniform. Planted NaN, ±inf and subnormal tests for reductions and rms_norm. Exact zero query/key gradients for one key row. The -24 witness is derived from the values. Round 3: reductions 10/10, nn_adversarial 10/10; 14 break-it perturbations each exit 101. | pass with notes: exit 101 only proves a panic, not the expected assertion. The break-it script lived in the lane's `target/` and is gone. |
-| B Q4/Q8 EAR | `gp/w25-ear` @ `f1afff7` (measured at `e519ca8`) | EAR is SLQ's top-10 expected acceptance rate. Exact f32 vs fp32: 0.999997 / 0.999998. tessl Q4 vs fp32: 0.848 / 0.866. mlx-lm Q4: 0.848 / 0.866, so tessl matches mlx-lm to 2e-4, asserted within 5e-3. The loss comes from the 4-bit format, not tessl. Even transformers' bf16 forward scores only 0.988 / 0.992 against fp32. | pass with notes. All 24 numbers match `w25_ear3.log`. **Q8 not measured** (no Qwen3.5 Q8 load path), so card AC3 is only partly met. |
-| C decode fusion | `gp/w25-decode-fusion` @ `8e1ca8e` + uncommitted | Fused add+RMSNorm and gate/up GEMV+SiLU (f32, bf16, Q4 epilogue) behind `Decode::set_fusion` / `TESSL_QWEN35_DECODE_FUSION=1`, default off. Instruct-weights run: bf16 greedy 32/32 tokens match, worst logit rel 3.9e-3. Trace 273→225 dispatches, still 1 commit / 1 wait / 3 cold allocations. Q4 49→41 dispatches, bit-identical. F32 saves 4 per layer, not 2, because an exact-f32 NN GEMM is zero+matmul (`src/gemm.rs:1230-1261`). | **not landed**: lane still finishing hosted runs (a `runtime` wake-latency timing test failed once under load). Needs its clean-commit Base run, a merge and a re-gate. No tok/s claim: the paired A/B has not been run. |
-| D MLX prefill profile | `gp/w25-mlx-profile` @ `4c56cb4` | Quiet-GPU stage profile at 8k, tessl vs mlx-lm (ms/layer): sdpa 42.41 vs 13.07 (f32 Q/K/V vs bf16 SDPA), which is 176 of the 231 ms gap; GDN core 7.80 vs 5.55; swiglu 1.7× (bytes); GEMMs at parity. | pass with notes: a single non-paired diagnostic run. At 1k the largest share is the GDN core, not sdpa. 2k not profiled. |
+| W25-A guard tests | ft-7af0512e | `softmax_rows_f32` keeps a NaN/+inf row NaN; planted NaN/±inf/subnormal tests for reductions and rms_norm | pass with notes (exit 101 proves a panic, not the assertion; break-it script not kept) |
+| W25-B Q4/Q8 EAR | ft-2bc8f1e9 | tessl Q4 EAR matches mlx-lm Q4 to 2e-4 (0.848 / 0.866) | pass with notes; **Q8 not measured** (split to ft-e501914a) |
+| W25-C decode fusion | ft-8fef5f4d | fused add+RMSNorm and gate/up GEMV+SiLU behind `TESSL_QWEN35_DECODE_FUSION=1`, default off; bf16 greedy 32/32 tokens match; 273→225 dispatches on the clean rerun of `b33dc57` (provenance in `bench/results/qwen35_decode_fusion_dispatches_m5pro.txt`) | pass; **no tok/s claim**, the paired A/B has not been run |
+| W25-D MLX prefill profile | — | at 8k, sdpa is 176 of the 231 ms/layer gap to mlx-lm | pass with notes (one unpaired run, 2k not profiled) |
+| W26-A CE softmax collapse | ft-52a09bd6 | target left out of the log-sum-exp, softplus loss, gradient `exp(z−L)·sigmoid(−margin)`; −inf/0 guards classify by bit pattern because fast-math float compares against ±inf/−FLT_MAX are unsafe; a lint now refuses −FLT_MAX compares in kernels. 13/13 device tests pass | pass. Single min-of-15 timing 11.72/44.68 ms before vs 11.41/42.68 ms after: a sample, not a speedup claim |
+| W26-B bf16 attention tiles phase 1 | ft-f3e14014 item 1 | kernel and host wrapper, opt-in flag `--paired-attn-bf16`; 8/8 device tests; emulator host-contract checker fixed to scan `src/attn_prefill_bf16.rs` | pass for phase 1. Phase 2 (wiring, EAR against the pre-stated bar, paired bench) not started |
 
-## Wave 26 (Fable: two lanes, no third, because both candidates collide with lane B)
-- **A, ft-52a09bd6, Softmax Collapse in the training cross-entropy** (`gp/w26-ce-collapse-main` @ `977168e`).
-  - The fix excludes the target from the log-sum-exp; the loss becomes softplus of the negated margin.
-  - A failing-first test (`5046c60`) pins the p−1 collapse past the fp32 cliff.
-  - Still running: verification, the device run and the gate. Not merged.
-- **B, ft-f3e14014 item 1, bf16 Q/K/V tiles for prefill attention, phase 1 kernel only** (`gp/w26-attn-bf16-tiles-main` @ `43ede64`).
-  - The adoption bar was fixed before any kernel was written: EAR vs fp32 ≥ 0.9966 / 0.9970, within 1e-3 of transformers' bf16, and 32-token greedy unchanged; otherwise opt-in. f32 stays selectable either way.
-  - Phase 2 (wiring into `src/qwen35.rs`, the EAR measurement, the paired bench) is not started this session.
-- **Wrong base:** both lanes' worktrees were created from `a8fc965` (10-19, about 100 commits behind `main`), not `main`. Both re-based by cherry-picking onto `main` (`-main` branches); the old branches are kept until cleanup.
+## Gaps and pending work (card drafts — GitPulse could not file them)
+GitPulse's installed `gitpulse-mcp` reads store schema 9 while the store is at 10, so no card could be filed or moved this session. Drafts are JSON in `target-gp/` (local, gitignored). After `bun run check:schema-parity` passes in the GitPulse checkout, `zsh target-gp/file_pending_cards.sh` files them.
+- `card_go_thread_flake.json`: `go/embedgemma2/concurrency_test.go:153` relative thread-growth check fails about 1 run in 8 standalone and in 2 of the last 3 gates. The test was not loosened. The card asks for a measured control distribution.
+- `card_ojas_rerun.json`: rerun ojas against tessl `64efd56`.
+- `card_ce_followups.json`: fast-math max reduction, the identity-GEMM fixture (0·−inf = NaN), a paired timing A/B, a Python ignore-row test.
+- `card_attn_bf16_phase2.json`: wave 26 lane B phase 2, plus the checker's hand-listed files and arg-count skip.
+- `card_lanec_gaps.json`: decode fusion follow-ups: prove fusion ran in the real-2B tests, assert default-off, the paired tok/s A/B, `DecodeFusion` `non_exhaustive`, wording and doc-count checks.
+- `card_ojas_cuda_ce.json`: the same softmax collapse in ojas-cuda's `ce_rows_cuda.rs`.
+- `card_bonsai.json`: Ternary Bonsai 2 27B (Hadamard-rotated ternary g128) as a Qwen3.8-27B format.
 
-## Cards
-- **Moved:** ft-2bc8f1e9 → review. ft-52a09bd6 → in_progress.
-- **Pending the landing:**
-  - ft-7af0512e → review, with the Q8 part split out;
-  - ft-8fef5f4d: AC1 noted, stays in progress.
-- **Filed this wave:**
-  - ft-1e84d0d6: GDN prefill core gap, after lane B. Someone else's session is already on it: `gp/w26-gdn-core` @ `fea7d9b`, not this session.
-  - ft-64d6f0dd: guard-test hardening, covering a durable break-it script with message checks, the f16 tiled-accumulator witness, rms_norm -inf and pinned FTZ.
-  - ft-e501914a: Q8 EAR, plus a report that fails or flags NOT RUN distinctly when the Q4 checkpoint is missing.
-  - ft-a66643eb: stage-profile follow-ups (T=2048, per-length attribution, an enforced replica cross-check, paired n≥3).
-- **To file at wrap-up:** wave 26 lane B phase 2, from the lane's own list.
+**Card moves pending** for the same reason: ft-7af0512e → review (Q8 split to ft-e501914a); ft-8fef5f4d AC1 note; ft-52a09bd6 → review; ft-f3e14014 phase 1 note.
 
-## Fable's decisions (wave 26)
-1. Lane B kernel-side work starts now; the wiring in `src/qwen35.rs` waits for wave 25 on `main`, because it shares files with lane C.
-2. No third lane: GDN core and ft-805b6ea4 both share `src/qwen35.rs` or the norm/gate-up kernels with lane B.
-3. Lane B's EAR go/no-go is stated before the kernel exists.
-
-## Owner decisions still pending (unchanged)
-- the 27B weights download;
+## Owner decisions still pending
 - sigmoid vs swish `output_gate_type`;
 - tokenizer bench method;
 - torch 2.15;
@@ -59,13 +46,12 @@ before. A gate result or merge reported after this section supersedes it.
 - ft-bf6bc26b licence provenance;
 - a C ABI for the fused AdamW step.
 
-Outward-facing, owner only: ft-921d4808 (push main), ft-c89dd818 (publish 0.3.0), ft-ed68689d (leaderboard).
+The 27B weights download is done. Outward-facing, owner only: ft-921d4808 (push main), ft-c89dd818 (publish 0.3.0), ft-ed68689d (leaderboard).
 
-## Cleanup plan (after landing)
-1. Bundle each wave-25/26 lane branch into `tessl-backups/`.
-2. Then delete the merged lane branches, `gp/w25-integrate`, the stale `worktree-agent-*` refs (all at `a8fc965`) and their worktrees.
-3. Not touched: `eg2/*`, `gp/w26-gdn-core` and `../tessl-eg2`, which belong to other sessions.
-4. **Disk:** 40 GiB free (96% used). Agent worktree `target/` dirs need the owner's `rm`.
+## Cleanup
+- **Bundled to `../tessl-backups/` and deleted:** every wave 25–26 lane branch, `gp/w25-integrate` (`64efd56`), `gp/w26-ce-collapse` (`32e3d63`, the old-base branch superseded by the cherry-picked `-main` one), and the stale `worktree-agent-*` refs. The `../tessl-int25` worktree and the agent worktrees were removed. They held only build output and caches.
+- **Not touched, other sessions' work:** `eg2/*`, `../tessl-eg2`, `../tessl-embed`, `gp/w26-gdn-core`, `gp/w26-gdn-core-land`, `.claude/worktrees/gdn-core`.
+- **Disk:** 211 GiB free.
 
 # Earlier: waves 23–24 (2026-10-22/23)
 

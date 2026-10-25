@@ -118,8 +118,15 @@ fn seq_a() -> Vec<u32> {
 /// 0xd962357482c76de8. The norm rewrite in 4632d2e alone gave causal
 /// 0x465a2c57c290769e, rows 0x3aef36370924cc39; the qk-norm kernels in 201bc61
 /// moved only the causal digest. Pinned in `--release`.
-const GOLDEN_CAUSAL: u64 = 0x06504ffc2068a5b0;
-const GOLDEN_ROWS: u64 = 0x3aef36370924cc39;
+///
+/// Re-pinned (the cross-entropy softmax-collapse fix, owner decision
+/// 2026-10-25, card ft-52a09bd6): the target is left out of the log-sum-exp and
+/// the gradient is `exp(z - L) * sigmoid(-margin)` / `-sigmoid(-margin)` instead
+/// of `exp(z - lse) - onehot`, which moves the low bits of every gradient. Old
+/// values: causal 0x06504ffc2068a5b0, rows 0x3aef36370924cc39 (main 5d6f786
+/// passed them; the integration of that fix alone moved both).
+const GOLDEN_CAUSAL: u64 = 0xe676ec632041b59a;
+const GOLDEN_ROWS: u64 = 0x907e0d9ba49de71c;
 
 fn causal_digest(model: &Qwen35Model) -> u64 {
     let a = seq_a();

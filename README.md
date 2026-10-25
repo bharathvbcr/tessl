@@ -42,7 +42,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 | **Status** | [`0.2.0`](https://crates.io/crates/tessl) — Metal 4 / MPP TensorOps verified on M5 Pro |
 | **API docs** | [docs.rs/tessl](https://docs.rs/tessl) — built on `aarch64-apple-darwin` with all features |
 | **Tests** | 2,081 `#[test]` attributes by source count on 2026-10-23: 1,727 across 168 integration test files and 354 in `src/` (299 in the library, 55 in bench and profile binaries and their shared helpers), plus doc tests; `ignore` is not subtracted. The last full GPU run on record (2026-10-15, `60a6240`, [docs/verification.md](docs/verification.md)) passed 1,255 with 0 failed and 16 ignored. Run it with `cargo test --release -- --test-threads=1`; the GPU suite needs an M-series Mac. |
-| **Kernel coverage** | All 44 promoted kernels have a numeric test, not only a name check |
+| **Kernel coverage** | All 45 promoted kernels have a numeric test, not only a name check |
 | **Platform** | Apple silicon, macOS 26+, Xcode 26 Metal Toolchain |
 | **License** | MIT OR Apache-2.0 |
 
@@ -55,7 +55,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling bounding operand rereads (once $B$ holds $\ge 2^{23}$ elements, one `tile_walk` policy for every GEMM family), combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step, except to rewind the constant arena once per ~12 MiB of constants in a run that never synchronizes.
-- **Neural-Network Kernel Library:** 39 Metal source files providing 303 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 89 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
+- **Neural-Network Kernel Library:** 39 Metal source files providing 308 kernel entry points — RMSNorm, gated MLP activations (SiLU / GELU-tanh), flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, row-wise softmax/sum/max, and softcap sampling. All reachable through 90 shape-checked entry points in `tessl::nn`, not as raw pipeline-name strings.
 - **Qwen3.5 Layer Kernels (`tessl::qwen35`):** the gated delta net as two fused dispatches (a parallel per-chunk prep with the 64×64 triangular solve in threadgroup memory, then a sequential `simdgroup_matrix` scan), a snapshot-reading recurrent decode, shared-prefix attention (one KV prefix at batch stride 0 for many questions), causal conv+SiLU, gated RMSNorm, Qwen's partial RoPE and output gate, and scoring of only the answer rows — see [docs/qwen35.md](docs/qwen35.md). Checked against transformers' own Qwen3.5 code on a CPU emulator of the kernels and compiled by Apple's Metal compiler in CI (`-std=metal4.0 -Werror`), and tested on the M5 Pro GPU (`tests/qwen35_kernels.rs`); per-kernel, forward and `train_step` timings on the M5 Pro are in the same document.
 - **Qwen3.5 Training on the GPU (`tessl::qwen35_train`, `qwen35_bwd`, `gdn_train`, `attn_train`, `cross_entropy`):** one full training step of the Qwen3.5 text model — forward with per-layer recompute, causal-LM loss, and every parameter's gradient — without leaving Metal. The gated delta rule saves one state per 64 tokens (32 MiB/layer at the 2B's shapes, T = 2048, versus 435 MiB in torch); the LM-head cross-entropy runs in vocabulary chunks and never forms `[rows, vocab]` logits; every weight gradient is a per-block partial summed in order, so a step is deterministic with no atomics. A step can also be split in two halves for a loss computed outside tessl, accumulated into a gradient bank, and scored only at chosen positions. Measured against transformers' own f32 reference in [docs/qwen35.md](docs/qwen35.md).
 - **EmbeddingGemma 2, multimodal (`tessl::embedgemma2`, `embedgemma2_vision`, `embedgemma2_audio`, `embedgemma2_mm`, `embedgemma2_tok`, `embedgemma2_pre`, `media`):** the `google/embeddinggemma-2` text encoder, vision tower and audio tower from the checkpoint, so text, images, audio clips, videos (with or without timestamps) and mixed items embed in one call with one GPU wait — exact f32 or bf16 operands, Matryoshka prefixes normalized on the GPU. Its own tokenizer, image/audio/video preprocessing and file decoding (ImageIO, AudioToolbox, AVFoundation) are in Rust, so no Python stands between a file and its embedding. Held to sentence-transformers' output in [EmbeddingGemma 2](docs/embedgemma2.md).
@@ -92,7 +92,7 @@ flowchart TD
     subgraph TesslAPI["tessl Public API Surface"]
         GpuRt["GpuRuntime<br/>(Device, Allocator, Encoder Lease)"]
         GemmAPI["GEMM Suite<br/>gemm() · gemm_epilogue() · gemm_batched()"]
-        NnAPI["tessl::nn (89 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
+        NnAPI["tessl::nn (90 Typed Entry Points)<br/>RMSNorm · FlashAttn · Softmax · Q4/Q8 GEMV"]
         BertAPI["tessl::bert (Sparse Encoders)<br/>BERT · DistilBERT · OpenSearch"]
         TensorTypes["Tensor &lt;T&gt; / GpuBuffer<br/>(DType: F32, BF16, F16, I8, I32)"]
         IcbAPI["DecodeIcb &amp; PingPongCbReplay<br/>(ICB Capture &amp; Dual-Slot Replay)"]
@@ -118,7 +118,7 @@ flowchart TD
     subgraph MetallibShaders["Compiled Metallib Shader Kernels"]
         TensorOps["matmul_tensorops.metal<br/>(MPP TensorOps matmul2d · Register Accumulation)"]
         SimdFallback["matmul_simdgroup.metal<br/>(Portable SIMDgroup Matrix Fallback)"]
-        NnKernels["39 Kernel Sources (303 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW · BERT"]
+        NnKernels["39 Kernel Sources (308 Entry Points)<br/>RMSNorm · FlashAttn SWA/Global · MLX Q4/Q8 · RoPE · Qwen3.5 fwd/bwd · AdamW · BERT"]
     end
 
     Downstream -->|Typed API Calls| TesslAPI

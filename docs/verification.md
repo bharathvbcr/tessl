@@ -13,7 +13,7 @@ flowchart TD
         T2["Tier 2: Adversarial Shape Sweeps<br/>(1e30 Sentinel-seeded buffers · 1x1, primes, tile edge boundaries)"]
         T3["Tier 3: Seeded Randomized Shape Fuzzing<br/>(gemm_fuzz_quick [160 cases] · gemm_fuzz_deep [2500 soak])"]
         T4["Tier 4: Hostile NN Input Boundary Suite<br/>(nn_adversarial.rs · overflow dims, capacity check, zero-dispatch)"]
-        T5["Tier 5: Promoted Kernel Numeric Goldens<br/>(44 promoted kernels checked for exact values vs CPU references)"]
+        T5["Tier 5: Promoted Kernel Numeric Goldens<br/>(45 promoted kernels checked for exact values vs CPU references)"]
         T6["Tier 6: GDN Mathematical Oracles<br/>(f64 sequential reference · error damping &amp; saturation bounds)"]
 
         T1 --> T2 --> T3 --> T4 --> T5 --> T6
@@ -219,7 +219,7 @@ hangs the GPU past a 120-second timeout, against 0.06 s with them in place.
 
 ## 5. Numeric coverage of the promoted kernels
 
-`promoted_kernels.rs` asserts each of the 44 promoted entry points resolves out
+`promoted_kernels.rs` asserts each of the 45 promoted entry points resolves out
 of tessl's own metallib. That is a gate on the *move*, not on correctness: a
 kernel can resolve, dispatch, and return wrong numbers.
 
@@ -230,8 +230,8 @@ grid mismatches, one undocumented weight layout, uninitialised threadgroup
 scratch across half of every attention query block, a NaN in the online softmax,
 and an output-width validation that made `out_bf16` unusable.
 
-All 44 now have one, in `nn_kernels.rs`, `reductions.rs`, `nn_wiring.rs`,
-`promoted_numeric.rs`, `attention.rs`, `qkv_rope.rs` and `q4_interleaved.rs`.
+All 45 now have one, in `nn_kernels.rs`, `reductions.rs`, `nn_wiring.rs`,
+`promoted_numeric.rs`, `attention.rs`, `qkv_rope.rs`, `q4_interleaved.rs` and `qwen35_decode_fusion.rs`.
 Where a family is selected by an enum or a bool, every arm is exercised: the
 three Q4 MLX row variants share one reference, and both `Q4MlxLayout` packings
 are checked against each other as well as against the dense reference.

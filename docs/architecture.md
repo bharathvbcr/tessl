@@ -178,14 +178,14 @@ Qwen3.5 kernels in `tessl::qwen35` add three sources and eleven more — see
 [qwen35.md](qwen35.md)). Counted over the whole crate on 2026-10-02 there are
 30 Metal sources and 205 entry points: the difference is the Qwen3.5 forward,
 backward and AdamW kernels. That count is a dated snapshot; the README's
-current figures (39 sources, 303 entry points) are the ones the build's own
+current figures (39 sources, 308 entry points) are the ones the build's own
 test checks. The `nn` ones arrived here by
 promotion out of `gemma-metal`, where they were reachable only as raw pipeline
 name strings through an overlay metallib — meaning a typo in a name was a
 runtime failure, and nothing checked that a buffer was large enough for the grid
 being dispatched over it.
 
-`src/nn.rs` is the boundary that ended that. It has 89 public free functions
+`src/nn.rs` is the boundary that ended that. It has 90 public free functions
 (the count `tests/docs_name_real_tools.rs` checks the README against; it
 includes the `validate_*` helpers and the unsafe `_with_scalars` variants),
 and each entry point resolves the pipeline by a name fixed at the call site and

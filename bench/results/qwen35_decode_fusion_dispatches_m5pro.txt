@@ -1,0 +1,61 @@
+Qwen3.5 decode fusion (AC1): dispatches per token, before and after (M5 Pro)
+
+What this records
+  Decode::step per token with the separate kernels ("before") and with the fused
+  add + RMSNorm and gate/up GEMV + SiLU*mul kernels ("after"), counted the way
+  bench/results/qwen35_model_prefill_decode_m5pro.txt counted its 273: `bench_qwen35_layers
+  --decode=64 --iters=1`, whose "Decode::step per token" line is infer_trace
+  (tessl::infer_trace::snapshot) over 4 separate traced steps, async encode on, on
+  Qwen35Model::random(qwen35_2b, Bf16). The count does not depend on the prefix length P
+  (64 here, 4096 there). Same binary for both arms; the arm is chosen by the environment,
+  TESSL_QWEN35_DECODE_FUSION=1 (src/ab_flags.rs qwen35_decode_fusion) for "after", unset for
+  "before". The wait_us the bench prints is NOT a timing result (loaded host, one iteration,
+  not paired); the paired tok/s A/B is a separate run on an idle GPU.
+
+Result (random qwen35_2b weights, bf16, async encode, min..max of 4 traced steps)
+                               before (unfused)   after (fused)
+  dispatches per token ............ 273                225
+  command buffer commits per token .. 1                  1
+  host waits per token .............. 1                  1
+  cold allocations per token ........ 3                  3
+  -48 dispatches = 2 per layer x 24 layers: the gate GEMM, the up GEMM and the SwiGLU
+  become one qwen35_gate_up_silu_bf16 dispatch.
+
+What the add + RMSNorm fusion does and does not change
+  Nothing in this table. The bf16 forward (and the Q4 GEMV) adds the residual inside the
+  output projection's own dispatch (GEMM epilogue, beta = 1), so the norm after it was
+  already the only extra dispatch: there is no separate add to fold. The fused
+  qwen35_add_rms_norm_* applies to the exact-f32 forward only, where the residual add is its
+  own dispatch: it removes 2 per layer (a mixer's output into the post norm, the down
+  projection's into the next input norm or the final one), 48 per token at 24 layers.
+
+Other paths (device tests, small models; tests/qwen35_decode_fusion.rs, tests/qwen35_mlx_q4.rs)
+  Q4 tiny model (4 layers): 49 -> 41 dispatches per token, 2 per layer, logits bit-identical.
+  F32, 4-layer random model: gate/up fusion saves 4 per layer, not 2, because an exact-f32 NN
+  GEMM is two dispatches (zero_f32 on C, then the matmul: src/gemm.rs dispatch_tensorops_nn);
+  add + norm saves 2 per layer. 78 -> 62 with gate/up alone, as measured.
+  Under the runtime's default sync encode, commits and waits follow the dispatch count (every
+  dispatch outside a batching scope commits and waits); the table above is async, which is how
+  the bench and a decode loop run.
+
+Parity evidence for the same fused kernels (same device log)
+  add_rms_norm vs residual_add + rms_norm: bit-identical (f32 and bf16 out).
+  Q4 gate/up SiLU vs two gemv_q4_mlx_simd + swiglu: bit-identical.
+  Dense gate/up vs the GEMM pair: F32 worst 1.24e-6 of peak (k 2048, n 6144); bf16 2.31e-4 of
+  peak with 3 of 6144 bf16 rounding flips (sum order differs from the GEMM's, so equal to f32
+  rounding of the two sums, not bit for bit).
+  Whole step, random models: add_norm alone bit-identical; F32 gate/up worst rel err 5.41e-7
+  (bound 1e-5); bf16 0.0.
+  Real Qwen3.5-2B bf16, 12-token prompt, 32 greedy tokens each session choosing its own: tokens
+  identical (first mismatch None), worst logit rel err 3.898e-3 (bound 2e-2).
+
+Provenance
+  Round-2 device run (07:13-07:21Z, load ~9, under the machine mac_heavy lock) of tessl
+  commit 8e1ca8e (branch gp/w25-decode-fusion, from main f00244e) plus 8 uncommitted files
+  (flat threadgroup array in kernels/qwen35_mlp.metal, emulator uint4, doc counts); full log
+  /Users/bharath/Code/research/tessl/target-gp/w25_fusion_round2.log. Weights for the real-2B
+  rows in that run: the instruct Qwen3.5-2B snapshot 15852e8c...; the trace rows are random
+  weights. The clean-commit rerun (Base snapshot b1485b2f...) supersedes the real-2B rows; its
+  log is named in the lead's report. Binary: release, target/release/bench_qwen35_layers.
+  Power/GPU state: not recorded by this trace script (no pmset sample); the counts are
+  deterministic and load-independent.

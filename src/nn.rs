@@ -4139,6 +4139,79 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
         },
         GateUpDispatch::Blocked => "gemv_q4_mlx_blocked_gate_up_gelu",
     };
+    gate_up_gemv(
+        rt,
+        entry,
+        "gemv_q4_mlx_gate_up_gelu",
+        gate,
+        up,
+        x,
+        mid,
+        shape,
+        dispatch,
+        mid_as_bf16,
+        scalars,
+    )
+}
+
+/// `mid = silu(W_gate @ x) * (W_up @ x)` in one dispatch: Qwen3.5's MLP front
+/// half at one row, [`gemv_q4_mlx_gate_up_gelu`] with SiLU, over the row-major
+/// simdgroup kernel (the layout its banks have). `x` is bf16 `[cols]`;
+/// `mid_as_bf16` writes bf16 for the down projection, else f32. Gate and up
+/// each run `gemv_q4_mlx_simd`'s accumulation, then `silu(gate) * up`, so the
+/// result is bit-identical to two `gemv_q4_mlx_simd` dispatches into f32
+/// followed by `qwen35::swiglu`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_mlx_gate_up_silu(
+    rt: &Arc<GpuRuntime>,
+    gate: Q4MlxBank<'_>,
+    up: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    mid: &GpuBuffer,
+    shape: QuantShape,
+    mid_as_bf16: bool,
+) -> Result<(), String> {
+    unsafe {
+        gate_up_gemv(
+            rt,
+            "gemv_q4_mlx_simd_gate_up_silu",
+            "gemv_q4_mlx_gate_up_silu",
+            gate,
+            up,
+            x,
+            mid,
+            shape,
+            GateUpDispatch::Simd(Q4MlxLayout::RowMajor),
+            mid_as_bf16,
+            |bnd| {
+                set_u32(bnd, shape.rows, 8);
+                set_u32(bnd, shape.cols, 9);
+                set_u32(bnd, shape.group_size, 10);
+                set_u32(bnd, u32::from(mid_as_bf16), 11);
+            },
+        )
+    }
+}
+
+/// The body of the gate/up GEMVs: validate, then dispatch `entry`. `what` names
+/// the public function in the aliasing refusal.
+///
+/// # Safety
+/// As [`gemv_q4_mlx_gate_up_gelu_with_scalars`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn gate_up_gemv(
+    rt: &Arc<GpuRuntime>,
+    entry: &'static str,
+    what: &'static str,
+    gate: Q4MlxBank<'_>,
+    up: Q4MlxBank<'_>,
+    x: &GpuBuffer,
+    mid: &GpuBuffer,
+    shape: QuantShape,
+    dispatch: GateUpDispatch,
+    mid_as_bf16: bool,
+    scalars: impl FnOnce(&mut Binder<'_>),
+) -> Result<(), String> {
     if dispatch == GateUpDispatch::Blocked && shape.cols as usize > GEMV_X_TILE {
         return Err(format!(
             "{entry}: cols {} exceeds the blocked kernel x-cache capacity {GEMV_X_TILE}",
@@ -4165,7 +4238,7 @@ pub unsafe fn gemv_q4_mlx_gate_up_gelu_with_scalars(
     }
 
     require_disjoint_writes(
-        "gemv_q4_mlx_gate_up_gelu",
+        what,
         &[("mid", mid)],
         &[
             ("gate_packed", gate.packed),

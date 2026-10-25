@@ -558,6 +558,56 @@ impl Q4Weight {
         }
     }
 
+    /// `mid[1, rows] = silu(x @ self.Wᵀ) * (x @ up.Wᵀ)` for one row, in one
+    /// dispatch ([`nn::gemv_q4_mlx_gate_up_silu`]): `self` is the gate and `up`
+    /// the up projection, both `[rows, cols]`. `x` is bf16 `[1, cols]`; `mid` is
+    /// bf16 or f32 `[1, rows]`, both whole tensors. The same bits as
+    /// [`Self::matmul`] twice into f32 and `qwen35::swiglu` into `mid`'s dtype.
+    pub(crate) fn gate_up_silu(
+        &self,
+        up: &Q4Weight,
+        rt: &Arc<GpuRuntime>,
+        x: &Tensor,
+        mid: &Tensor,
+    ) -> Result<(), String> {
+        const WHAT: &str = "Q4Weight::gate_up_silu";
+        if (self.rows, self.cols) != (up.rows, up.cols) {
+            return Err(format!(
+                "{WHAT}: gate is [{}, {}] but up is [{}, {}]",
+                self.rows, self.cols, up.rows, up.cols
+            ));
+        }
+        let mid_bf16 = match mid.dtype {
+            DType::BF16 => true,
+            DType::F32 => false,
+            other => return Err(format!("{WHAT}: mid must be bf16 or f32, got {other:?}")),
+        };
+        if x.dtype != DType::BF16 {
+            return Err(format!("{WHAT}: x must be bf16, got {:?}", x.dtype));
+        }
+        if x.byte_offset() != 0 || mid.byte_offset() != 0 {
+            return Err(format!("{WHAT}: x and mid must be whole tensors, not views"));
+        }
+        if x.shape() != [1, self.cols as usize] || mid.shape() != [1, self.rows as usize] {
+            return Err(format!(
+                "{WHAT}: x {:?} and mid {:?} do not fit a [{}, {}] weight at one row",
+                x.shape(),
+                mid.shape(),
+                self.rows,
+                self.cols
+            ));
+        }
+        nn::gemv_q4_mlx_gate_up_silu(
+            rt,
+            self.bank(),
+            up.bank(),
+            &x.buffer,
+            &mid.buffer,
+            self.shape(),
+            mid_bf16,
+        )
+    }
+
     /// `out[n, cols] = W[ids[i], :]` in f32 (the embedding gather).
     pub(crate) fn gather(&self, rt: &Arc<GpuRuntime>, ids: &GpuBuffer, n: u32, out: &GpuBuffer) -> Result<(), String> {
         nn::embed_lookup_q4_mlx(rt, self.bank(), ids, out, self.rows, self.cols, MLX_Q4_GROUP, n)

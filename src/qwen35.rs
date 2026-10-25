@@ -2439,6 +2439,111 @@ pub fn rms_norm(
     })
 }
 
+/// `resid += y`, then `out = rms_norm(resid) * (1 + w)` ([`rms_norm`]), in one
+/// dispatch: the exact-f32 forward's residual add ([`residual_add`]) and the
+/// norm after it. Bit-identical to the two calls: the add is the same f32 add,
+/// and the sum of squares is reduced in the same order (`qwen35_add_rms_norm_*`
+/// documents how). `y`, `resid` (f32 `[rows, dim]`) and `w` are distinct
+/// buffers, and `out` (f32 or bf16 `[rows, dim]`) overlaps none of them.
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm(
+    rt: &Arc<GpuRuntime>,
+    y: &GpuBuffer,
+    resid: &GpuBuffer,
+    w: &GpuBuffer,
+    out: &GpuBuffer,
+    out_dtype: DType,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::add_rms_norm";
+    let name = out_kernel!("qwen35_add_rms_norm", out_dtype, WHAT)?;
+    validate_rms_scalars(dim, eps, WHAT)?;
+    let n = (rows as usize)
+        .checked_mul(dim as usize)
+        .ok_or_else(|| format!("{WHAT}: rows x dim overflows usize"))?;
+    require::<f32>(rt, y, n, "add_rms_norm y")?;
+    require::<f32>(rt, resid, n, "add_rms_norm resid")?;
+    require::<f32>(rt, w, dim as usize, "add_rms_norm w")?;
+    if out_dtype == DType::BF16 {
+        require::<u16>(rt, out, n, "add_rms_norm out")?;
+    } else {
+        require::<f32>(rt, out, n, "add_rms_norm out")?;
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(WHAT, &[("resid", resid), ("out", out)], &[("y", y), ("w", w)])?;
+    let p = rt.pipeline(name)?;
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
+        set_gpu_buf(bnd, y, 0);
+        set_gpu_buf(bnd, resid, 1);
+        set_gpu_buf(bnd, w, 2);
+        set_gpu_buf(bnd, out, 3);
+        set_u32(bnd, rows, 4);
+        set_u32(bnd, dim, 5);
+        set_f32(bnd, eps, 6);
+    })
+}
+
+/// Columns of both weights one threadgroup of `qwen35_gate_up_silu_*` owns, and
+/// the threads it runs (the kernel's `QG_COLS` and `QG_TPTG`).
+const GATE_UP_COLS: usize = 64;
+const GATE_UP_TPTG: usize = 256;
+
+/// `out = silu(x @ w_gate) * (x @ w_up)` for one token in one dispatch: the
+/// decode MLP's two GEMVs and [`swiglu`] between them, the `[1, n]` gate and
+/// up vectors never written out. `x` is `[k]`, `w_gate` and `w_up` are the
+/// model's `[k, n]` row-major (`x @ w`), `out` is `[n]`, all of `dtype` (F32 or
+/// BF16, one for every operand, as the GEMMs it replaces take them). The sums
+/// are f32 and the product is rounded once to `dtype`.
+///
+/// The sums run in the kernel's own fixed order, not the GEMM's, so a result
+/// equals the GEMM pair's `swiglu` to f32 rounding of the two sums, not bit
+/// for bit (the bf16 `out` can differ by one rounding step where a sum lands
+/// near a rounding boundary).
+#[allow(clippy::too_many_arguments)]
+pub fn gate_up_silu(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    w_gate: &GpuBuffer,
+    w_up: &GpuBuffer,
+    out: &GpuBuffer,
+    dtype: DType,
+    k: u32,
+    n: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::gate_up_silu";
+    let name = out_kernel!("qwen35_gate_up_silu", dtype, WHAT)?;
+    let (ku, nu) = (k as usize, n as usize);
+    let wn = ku
+        .checked_mul(nu)
+        .ok_or_else(|| format!("{WHAT}: k x n overflows usize"))?;
+    let check = |buf: &GpuBuffer, need: usize, what: &str| match dtype {
+        DType::BF16 => require::<u16>(rt, buf, need, what),
+        _ => require::<f32>(rt, buf, need, what),
+    };
+    check(x, ku, "gate_up_silu x")?;
+    check(w_gate, wn, "gate_up_silu w_gate")?;
+    check(w_up, wn, "gate_up_silu w_up")?;
+    check(out, nu, "gate_up_silu out")?;
+    if k == 0 || n == 0 {
+        return Ok(());
+    }
+    require_disjoint_writes(WHAT, &[("out", out)], &[("x", x), ("w_gate", w_gate), ("w_up", w_up)])?;
+    let p = rt.pipeline(name)?;
+    dispatch_tg_1d(rt, &p, nu.div_ceil(GATE_UP_COLS), GATE_UP_TPTG, None, |bnd| {
+        set_gpu_buf(bnd, x, 0);
+        set_gpu_buf(bnd, w_gate, 1);
+        set_gpu_buf(bnd, w_up, 2);
+        set_gpu_buf(bnd, out, 3);
+        set_u32(bnd, k, 4);
+        set_u32(bnd, n, 5);
+    })
+}
+
 // ------------------------------------------------ matrix-unit prefill attention ---
 
 /// Block geometry of [`attn_prefill_with_tile`]: queries per threadgroup (BQ)

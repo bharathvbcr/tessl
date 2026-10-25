@@ -805,6 +805,13 @@ pub fn suites() -> Vec<Suite> {
         suite("bench_qwen35_layers", &["256", "--iters=1"], &[]),
         suite("bench_qwen35_layers", &["--gdn-scan32", "256", "--iters=1"], &[]),
         suite("bench_qwen35_layers", &["--decode=64", "--iters=1"], &[]),
+        // The same decode with the fused add + RMSNorm and gate/up + SiLU kernels on
+        // (`TESSL_QWEN35_DECODE_FUSION`), which the default decode does not dispatch.
+        suite(
+            "bench_qwen35_layers",
+            &["--decode=64", "--iters=1"],
+            &[("TESSL_QWEN35_DECODE_FUSION", "1")],
+        ),
         suite("bench_qwen35_layers", &["--attn-tiles", "256"], &[]),
         suite("bench_qwen35_layers", &["--paired-attn", "256"], &[]),
         suite("bench_qwen35_layers", &["--paired-gdn-recurrent", "1"], &[]),

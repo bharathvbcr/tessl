@@ -445,6 +445,61 @@ fn mlx_q4_tiny_prefill_then_decode_matches_forward_at_the_last_row() {
     });
 }
 
+/// The fused Q4 decode step (`DecodeFusion::ALL`: the gate/up GEMVs and SiLU·mul
+/// in one dispatch) is bit-identical to the separate kernels, logits compared as
+/// bits over every step, and saves exactly two dispatches per layer under async
+/// encode (one commit, one wait either way). Add+norm changes nothing on Q4: the
+/// GEMV already adds the residual in its own dispatch.
+#[test]
+fn mlx_q4_tiny_fused_decode_is_bit_identical_and_saves_two_dispatches_per_layer() {
+    use tessl::infer_trace;
+    use tessl::qwen35_model::DecodeFusion;
+    const STEPS: usize = 4;
+    with_gpu(|rt| {
+        let model = load_q4(rt, &Net::new(13).mlx_entries()).unwrap();
+        let layers = config().layers.len() as u64;
+        for n in [1usize, 5, 70] {
+            let ids = seq(n + STEPS);
+            let run = |fusion: DecodeFusion| {
+                rt.set_async_encode(true).unwrap();
+                let (mut dec, first) = model.prefill(&ids[..n], STEPS as u32).unwrap();
+                dec.set_fusion(fusion);
+                let mut rows = vec![first];
+                let mut counts = None;
+                for k in 0..STEPS {
+                    infer_trace::set_enabled(k == STEPS - 1);
+                    let before = infer_trace::snapshot();
+                    rows.push(dec.step(ids[n + k]).unwrap());
+                    if k == STEPS - 1 {
+                        counts = Some(infer_trace::snapshot().since(&before));
+                    }
+                }
+                infer_trace::set_enabled(false);
+                rt.set_async_encode(false).unwrap();
+                (rows, counts.unwrap())
+            };
+            let (base, c0) = run(DecodeFusion::NONE);
+            let (fused, c1) = run(DecodeFusion::ALL);
+            for (k, (a, b)) in fused.iter().zip(&base).enumerate() {
+                let (a, b): (Vec<u32>, Vec<u32>) = (
+                    a.iter().map(|x| x.to_bits()).collect(),
+                    b.iter().map(|x| x.to_bits()).collect(),
+                );
+                assert_eq!(
+                    a, b,
+                    "prefill {n} + {k}: fused Q4 step differs from the separate kernels"
+                );
+            }
+            assert_eq!(c1.dispatches, c0.dispatches - 2 * layers, "prefill {n}");
+            assert_eq!((c0.commits, c0.sync_waits, c1.commits, c1.sync_waits), (1, 1, 1, 1));
+            eprintln!(
+                "Q4 prefill {n}: {} dispatches per token unfused, {} fused",
+                c0.dispatches, c1.dispatches
+            );
+        }
+    });
+}
+
 /// Every unsupported layout is refused before a wrong model could run, and the
 /// refusals name what they refused.
 #[test]

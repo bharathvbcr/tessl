@@ -1,5 +1,7 @@
 // The simdgroup-cooperative MLX affine Q4 GEMV (M=1) body shared by the ten
-// `gemv_q4_mlx_simd*` entry points in `gemv_q4_mlx.metal`:
+// `gemv_q4_mlx_simd*` entry points in `gemv_q4_mlx.metal` (and an
+// eleventh, `gemv_q4_mlx_simd_gate_up_silu`, Qwen3.5's gate/up with SiLU,
+// row-major only):
 //
 //     layout        Store          AddResid            GateUpGelu                    (+ bank routing)
 //     row-major     _simd          _simd_add           _simd_gate_up_gelu            _simd_kv, _simd_qkv
@@ -42,6 +44,8 @@ enum class Q4Epi : uint {
     /// Two banks over one x: `gelu_pytorch_tanh(gate) * up`, written as f32 or
     /// (`mid_as_bf16`) bf16 into `out`.
     GateUpGelu = 2u,
+    /// [`GateUpGelu`] with SiLU: `silu(gate) * up`, Qwen3.5's MLP.
+    GateUpSilu = 3u,
 };
 
 /// First output row of this simdgroup within the bank its threadgroup owns.
@@ -122,7 +126,7 @@ inline void q4_simd_gemv(
     uint lane)
 {
     constexpr bool ROW_MAJOR = (L == Q4Layout::RowMajor);
-    constexpr uint NB = (E == Q4Epi::GateUpGelu) ? 2u : 1u;
+    constexpr uint NB = (E == Q4Epi::GateUpGelu || E == Q4Epi::GateUpSilu) ? 2u : 1u;
 
     if (row0 >= rows) return;
     const Q4Bank banks[2] = {bank0, bank1};
@@ -196,7 +200,8 @@ inline void q4_simd_gemv(
             } else if (E == Q4Epi::AddResid) {
                 out[row] = sum[0] + resid[row];
             } else {
-                const float v = tessl_gelu_pytorch_tanh(sum[0]) * sum[NB - 1u];
+                const float act = (E == Q4Epi::GateUpSilu) ? tessl_silu(sum[0]) : tessl_gelu_pytorch_tanh(sum[0]);
+                const float v = act * sum[NB - 1u];
                 if (mid_as_bf16 != 0u) {
                     ((device bfloat *)out)[row] = bfloat(v);
                 } else {

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicI8, Ordering};
 // once.
 const ENV_HAZARD_BARRIERS: &[&str] = &["TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS"];
 const ENV_COARSE_BARRIERS: &[&str] = &["TESSL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS"];
+const ENV_QWEN35_DECODE_FUSION: &[&str] = &["TESSL_QWEN35_DECODE_FUSION"];
 
 /// The recognised spellings, exact and case-sensitive. `None` means "this value
 /// does not decide the flag" — for an unset name *and* for a set-but-unrecognised
@@ -144,6 +145,18 @@ pub fn coarse_barriers() -> bool {
     // `get` is latching and its default runs once: coarse inherits the hazard
     // flag as of this first read (see `need_barrier_from`).
     COARSE_BARRIERS.get(ENV_COARSE_BARRIERS, || coarse_default(None, hazard_barriers()))
+}
+
+/// Unset (read env), off = Qwen3.5 decode runs its separate kernels, on = fused.
+static QWEN35_DECODE_FUSION: TriFlag = TriFlag::new();
+
+/// Whether a new `Qwen35Model` decode session ([`crate::qwen35_model::Decode`])
+/// starts with the fused decode kernels (add + RMSNorm, gate/up GEMV + SiLU·mul)
+/// on. Default off; `TESSL_QWEN35_DECODE_FUSION=1` turns it on, which is how a
+/// paired bench runs the two arms as separate lanes of one binary. A session
+/// can still be switched either way with `Decode::set_fusion`.
+pub fn qwen35_decode_fusion() -> bool {
+    QWEN35_DECODE_FUSION.get(ENV_QWEN35_DECODE_FUSION, || false)
 }
 
 /// Pure core of [`need_barrier`], split out so the truth table can be pinned by
@@ -311,6 +324,7 @@ mod tests {
         let lists: &[(&str, &[&str])] = &[
             ("hazard_barriers", ENV_HAZARD_BARRIERS),
             ("coarse_barriers", ENV_COARSE_BARRIERS),
+            ("qwen35_decode_fusion", ENV_QWEN35_DECODE_FUSION),
         ];
         for (flag, names) in lists {
             assert!(!names.is_empty(), "{flag} has no env names");

@@ -86,7 +86,7 @@
 //! ([`crate::qwen35::score_answer_rows`]), on a model with or without the
 //! packed head.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::config_json::{self, field, float};
@@ -1344,6 +1344,7 @@ impl Qwen35Model {
             decoded: 0,
             broken: false,
             param_generation: s.param_generation,
+            fusion: DecodeFusion::from_env(),
         };
         Ok((decode, logits))
     }
@@ -1536,14 +1537,35 @@ impl Qwen35Model {
     /// written, and [`Self::layer`] runs them in [`LayerPart::ORDER`].
     fn layer_part(&self, l: &Layer, a: &Acts, step: Step<'_>, part: LayerPart) -> Result<(), String> {
         match part {
-            LayerPart::InputNorm => self.norm(&a.resid, &l.input_norm, &a.x),
+            LayerPart::InputNorm => self.norm_resid(a, &l.input_norm),
             LayerPart::Mixer => match &l.mixer {
                 Mixer::Gdn(w) => self.gdn(w, a, step),
                 Mixer::Attn(w) => self.attention(w, a, step),
             },
-            LayerPart::PostNorm => self.norm(&a.resid, &l.post_norm, &a.x),
-            LayerPart::Mlp => self.mlp(l, a),
+            LayerPart::PostNorm => self.norm_resid(a, &l.post_norm),
+            LayerPart::Mlp => self.mlp(l, a, step),
         }
+    }
+
+    /// `a.x = rms_norm(a.resid) * (1 + w)`: [`Self::norm`], preceded by the
+    /// residual add the last projection deferred (`a.add_pending`), in the same
+    /// dispatch.
+    fn norm_resid(&self, a: &Acts, w: &GpuBuffer) -> Result<(), String> {
+        if !a.add_pending.swap(false, Ordering::Relaxed) {
+            return self.norm(&a.resid, w, &a.x);
+        }
+        let (rows, dim) = (a.t, self.cfg.hidden);
+        qwen35::add_rms_norm(
+            &self.rt,
+            &a.proj_out.buffer,
+            &a.resid.buffer,
+            w,
+            &a.x.buffer,
+            self.precision.dtype(),
+            rows,
+            dim,
+            self.cfg.rms_norm_eps,
+        )
     }
 
     /// `out = (rms_norm(resid) * (1 + norm.w)) @ headᵀ` for every row of
@@ -1552,6 +1574,11 @@ impl Qwen35Model {
     /// `[rows, vocab]`. Encoded, not waited for.
     fn head(&self, resid: &Tensor, x: &Tensor, out: &Tensor) -> Result<(), String> {
         self.norm(resid, &self.final_norm, x)?;
+        self.head_matmul(x, out)
+    }
+
+    /// [`Self::head`] after its norm: `out = x @ headᵀ`.
+    fn head_matmul(&self, x: &Tensor, out: &Tensor) -> Result<(), String> {
         match (&self.lm_head_bf16, self.head_table()) {
             (_, Weight::Q4(q)) => q.matmul(&self.rt, x, out, None),
             (Some(head), _) => gemm(x, head, out, BACKEND),
@@ -1589,8 +1616,26 @@ impl Qwen35Model {
         )
     }
 
-    /// `resid += y @ w_out`.
-    fn project_residual(&self, y: &Tensor, w_out: &Weight, a: &Acts) -> Result<(), String> {
+    /// `resid += y @ w_out`. With `defer` (a fused decode step), a projection
+    /// whose add is a separate dispatch (the exact-f32 forward's, and the Q4
+    /// TensorOps GEMM's) stops at `proj_out` and leaves the add to the next
+    /// [`Self::norm_resid`], which does it with the norm; one whose add is
+    /// already inside the projection's dispatch is unchanged.
+    fn project_residual(&self, y: &Tensor, w_out: &Weight, a: &Acts, defer: bool) -> Result<(), String> {
+        let add = || {
+            let width = self.cfg.hidden;
+            if defer {
+                a.add_pending.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            qwen35::residual_add(
+                &self.rt,
+                Cols::dense(&a.proj_out.buffer, width),
+                Cols::dense(&a.resid.buffer, width),
+                a.t,
+                width,
+            )
+        };
         let w_out = match w_out {
             Weight::Dense(t) => t,
             // The Q4 kernels add the residual in the same dispatch for up to
@@ -1602,30 +1647,21 @@ impl Qwen35Model {
             }
             Weight::Q4(q) => {
                 q.matmul(&self.rt, y, &a.proj_out, None)?;
-                let width = self.cfg.hidden;
-                return qwen35::residual_add(
-                    &self.rt,
-                    Cols::dense(&a.proj_out.buffer, width),
-                    Cols::dense(&a.resid.buffer, width),
-                    a.t,
-                    width,
-                );
+                return add();
             }
         };
         match self.precision {
             Precision::Bf16 => qwen35::project_residual(y, w_out, &a.resid, BACKEND),
             Precision::F32 => {
                 gemm(y, w_out, &a.proj_out, BACKEND)?;
-                let width = self.cfg.hidden;
-                qwen35::residual_add(
-                    &self.rt,
-                    Cols::dense(&a.proj_out.buffer, width),
-                    Cols::dense(&a.resid.buffer, width),
-                    a.t,
-                    width,
-                )
+                add()
             }
         }
+    }
+
+    /// Whether `step` is a decode step that asked for [`DecodeFusion::add_norm`].
+    fn defers_add(step: Step<'_>) -> bool {
+        matches!(step, Step::Decode(_, io) if io.fusion.add_norm)
     }
 
     fn gdn(&self, w: &GdnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
@@ -1716,7 +1752,7 @@ impl Qwen35Model {
             g.v_dim(),
             self.cfg.rms_norm_eps,
         )?;
-        self.project_residual(&a.g_y, &w.w_out, a)
+        self.project_residual(&a.g_y, &w.w_out, a, Self::defers_add(step))
     }
 
     fn attention(&self, w: &AttnWeights, a: &Acts, step: Step<'_>) -> Result<(), String> {
@@ -1820,25 +1856,60 @@ impl Qwen35Model {
             l.q_heads(),
             l.head_dim(),
         )?;
-        self.project_residual(&a.a_y, &w.w_out, a)
+        self.project_residual(&a.a_y, &w.w_out, a, Self::defers_add(step))
     }
 
-    fn mlp(&self, layer: &Layer, a: &Acts) -> Result<(), String> {
+    fn mlp(&self, layer: &Layer, a: &Acts, step: Step<'_>) -> Result<(), String> {
         let inter = self.cfg.intermediate;
-        self.project(&a.x, &layer.gate, &a.m_gate)?;
-        self.project(&a.x, &layer.up, &a.m_up)?;
-        qwen35::swiglu(
-            &self.rt,
-            Cols::dense(&a.m_gate.buffer, inter),
-            Cols::dense(&a.m_up.buffer, inter),
-            OutCols {
-                cols: Cols::dense(&a.m_mid.buffer, inter),
-                dtype: self.precision.dtype(),
-            },
-            a.t,
-            inter,
-        )?;
-        self.project_residual(&a.m_mid, &layer.down, a)
+        let fused = matches!(step, Step::Decode(_, io) if io.fusion.gate_up) && self.gate_up_silu(layer, a)?;
+        if !fused {
+            self.project(&a.x, &layer.gate, &a.m_gate)?;
+            self.project(&a.x, &layer.up, &a.m_up)?;
+            qwen35::swiglu(
+                &self.rt,
+                Cols::dense(&a.m_gate.buffer, inter),
+                Cols::dense(&a.m_up.buffer, inter),
+                OutCols {
+                    cols: Cols::dense(&a.m_mid.buffer, inter),
+                    dtype: self.precision.dtype(),
+                },
+                a.t,
+                inter,
+            )?;
+        }
+        self.project_residual(&a.m_mid, &layer.down, a, Self::defers_add(step))
+    }
+
+    /// The one-token MLP front half in one dispatch (`a.m_mid` is `silu(x @ gate)`
+    /// times `x @ up`), over whichever weights the layer has: dense f32 or bf16
+    /// (`qwen35::gate_up_silu`) or MLX Q4 (`Q4Weight::gate_up_silu`). Returns
+    /// whether it ran: false for a layer it does not cover (a gate and up of
+    /// different kinds, a dense weight that is a view, more than one row),
+    /// which the caller runs as the separate GEMMs.
+    fn gate_up_silu(&self, layer: &Layer, a: &Acts) -> Result<bool, String> {
+        if a.t != 1 {
+            return Ok(false);
+        }
+        match (&layer.gate, &layer.up) {
+            (Weight::Dense(g), Weight::Dense(u)) if g.byte_offset() == 0 && u.byte_offset() == 0 => {
+                qwen35::gate_up_silu(
+                    &self.rt,
+                    &a.x.buffer,
+                    &g.buffer,
+                    &u.buffer,
+                    &a.m_mid.buffer,
+                    self.precision.dtype(),
+                    self.cfg.hidden,
+                    self.cfg.intermediate,
+                )?;
+                Ok(true)
+            }
+            (Weight::Q4(g), Weight::Q4(u)) => {
+                g.gate_up_silu(u, &self.rt, &a.x, &a.m_mid)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -1859,6 +1930,51 @@ pub enum LayerPart {
 impl LayerPart {
     /// The order a layer runs its parts in.
     pub const ORDER: [LayerPart; 4] = [Self::InputNorm, Self::Mixer, Self::PostNorm, Self::Mlp];
+}
+
+/// Which decode kernels a [`Decode`] session fuses; `NONE` is the separate
+/// kernels the prefill runs, so `NONE` against [`Self::ALL`] is an A/B of the
+/// same step, one dispatch count against another.
+///
+/// - `add_norm`: a residual add and the norm after it in one dispatch
+///   (`qwen35::add_rms_norm`), where the add is a dispatch of its own. That is
+///   the exact-f32 forward's, after every projection that feeds a norm: the
+///   mixer's output and the MLP's down projection (into the next layer's input
+///   norm, or the final one). The bf16 forward and the Q4 GEMV add the
+///   residual inside the projection's own dispatch already, so this changes
+///   nothing there. Bit-identical to the pair.
+/// - `gate_up`: the MLP's gate and up GEMVs and `silu(gate) * up` in one
+///   dispatch (`qwen35::gate_up_silu` for dense f32 and bf16 weights,
+///   `gemv_q4_mlx_simd_gate_up_silu` for Q4). Bit-identical to the three
+///   dispatches on Q4; on dense weights the sums run in another order than the
+///   GEMM's, so equal to f32 rounding of the two sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeFusion {
+    pub add_norm: bool,
+    pub gate_up: bool,
+}
+
+impl DecodeFusion {
+    /// Every kernel separate.
+    pub const NONE: DecodeFusion = DecodeFusion {
+        add_norm: false,
+        gate_up: false,
+    };
+    /// Every fusion on.
+    pub const ALL: DecodeFusion = DecodeFusion {
+        add_norm: true,
+        gate_up: true,
+    };
+
+    /// A new session's setting: `ALL` under `TESSL_QWEN35_DECODE_FUSION=1`
+    /// ([`crate::ab_flags::qwen35_decode_fusion`]), else `NONE`.
+    pub fn from_env() -> Self {
+        if crate::ab_flags::qwen35_decode_fusion() {
+            Self::ALL
+        } else {
+            Self::NONE
+        }
+    }
 }
 
 /// How one layer's mixer runs, and where its state starts and goes.
@@ -1928,6 +2044,7 @@ struct DecodeIo<'s> {
     suffix_len: GpuBuffer,
     q_pos: GpuBuffer,
     scratch: &'s DecodeScratch,
+    fusion: DecodeFusion,
 }
 
 /// A prefill stopped between layers, from [`Qwen35Model::begin`].
@@ -2194,9 +2311,22 @@ pub struct Decode<'m> {
     broken: bool,
     /// The model's parameter generation when the prefill began.
     param_generation: u64,
+    fusion: DecodeFusion,
 }
 
 impl Decode<'_> {
+    /// The fused kernels this session's steps run.
+    pub fn fusion(&self) -> DecodeFusion {
+        self.fusion
+    }
+
+    /// Choose which kernels the following steps fuse ([`DecodeFusion`]); any
+    /// step may use either setting, since fusion changes no state a step
+    /// carries.
+    pub fn set_fusion(&mut self, fusion: DecodeFusion) {
+        self.fusion = fusion;
+    }
+
     /// The position the next token takes: the prefill's tokens plus those
     /// decoded since.
     pub fn position(&self) -> u32 {
@@ -2240,14 +2370,18 @@ impl Decode<'_> {
             suffix_len: rt.alloc_buffer_from_u32(&[slot + 1])?,
             q_pos: rt.alloc_buffer_from_u32(&[self.prefix_len + slot])?,
             scratch: &self.scratch,
+            fusion: self.fusion,
         };
         m.embed_ids(&[id], &self.a.resid)?;
+        self.a.add_pending.store(false, Ordering::Relaxed);
         // From the first layer on, a failure leaves the state part advanced.
         self.broken = true;
         for (l, c) in m.layers.iter().zip(&self.carry) {
             m.layer(l, &self.a, Step::Decode(c, &io))?;
         }
-        m.head(&self.a.resid, &self.a.x, &self.logits)?;
+        // The last MLP's add may still be pending: the final norm takes it.
+        m.norm_resid(&self.a, &m.final_norm)?;
+        m.head_matmul(&self.a.x, &self.logits)?;
         rt.synchronize()?;
         // Read before advancing: a failed read leaves `position()` where it was,
         // and the session poisoned, since the layers' state has moved past it.
@@ -2335,6 +2469,11 @@ struct Acts {
     m_gate: Tensor,
     m_up: Tensor,
     m_mid: Tensor,
+    /// A decode step with [`DecodeFusion::add_norm`] on skipped the residual
+    /// add of the last projection (`proj_out` holds it): the next norm of the
+    /// residual does the add too (`qwen35::add_rms_norm`). Only the exact-f32
+    /// forward has a separate add to skip; false everywhere else.
+    add_pending: AtomicBool,
 }
 
 /// The allocated size of an `n`-element f32 buffer, as [`Acts`] and the
@@ -2432,6 +2571,7 @@ impl Acts {
             m_gate: f32t(plan.intermediate)?,
             m_up: f32t(plan.intermediate)?,
             m_mid: act(plan.intermediate)?,
+            add_pending: AtomicBool::new(false),
         })
     }
 

@@ -474,7 +474,8 @@ fn an_all_equal_row_returns_the_mean_of_v() {
         let t = 97usize;
         let mut c = random_case("all-equal scores", 1, t, 0, t, t, 1.0 / 16.0, 1.0, 0xD000);
         let u = random_f32(D, 0xD100);
-        let w: Vec<f32> = random_f32(D, 0xD200).iter().map(|x| 0.5 * x).collect();
+        // dot(u, w) = 0.5 |u|^2 (about 42): far from zero by construction, not by seed.
+        let w: Vec<f32> = u.iter().map(|x| 0.5 * x).collect();
         for tq in 0..t {
             for hd in 0..c.h {
                 let at = (tq * c.h + hd) * D;

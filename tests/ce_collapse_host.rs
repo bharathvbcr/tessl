@@ -42,13 +42,58 @@ fn shifted_softmax_grad(z: &[f32], t: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `exp` as the kernels may not rely on it: they compile under fast math
+/// (`-fmetal-math-mode=fast`), where an infinite or NaN argument is outside
+/// what `precise::exp` must handle. The mirror makes that hostile case
+/// explicit (NaN), so it passes only where no infinity ever reaches `exp`.
+fn kexp(x: f32) -> f32 {
+    if x.is_finite() {
+        x.exp()
+    } else {
+        f32::NAN
+    }
+}
+
+/// `ce_lse_update` over `chunk`-wide pieces of the row, in f32: the running
+/// maximum `m` (identity `f32::MIN`, never an infinity) and `s` over the
+/// non-target classes. `guarded` is the kernel's shape: a `-inf` logit is
+/// skipped by a compare against the identity, and a zero `s` is not rescaled.
+/// Unguarded is the first version, which fed `-inf` to `exp`.
+fn lse_walk(z: &[f32], t: usize, chunk: usize, guarded: bool) -> (f32, f32) {
+    let (mut m, mut s) = (f32::MIN, 0.0f32);
+    for (k, piece) in z.chunks(chunk).enumerate() {
+        let v0 = k * chunk;
+        let live = |c: usize, l: f32| v0 + c != t && (!guarded || l > f32::MIN);
+        let mx = piece
+            .iter()
+            .enumerate()
+            .filter(|&(c, _)| v0 + c != t)
+            .fold(f32::MIN, |a, (_, &l)| a.max(l));
+        let m_old = if k == 0 { mx } else { m };
+        let m_new = m_old.max(mx);
+        let acc: f32 = piece
+            .iter()
+            .enumerate()
+            .filter(|&(c, &l)| live(c, l))
+            .map(|(_, &l)| kexp(l - m_new))
+            .sum();
+        let s_old = if k == 0 { 0.0 } else { s };
+        let carried = if guarded && s_old == 0.0 {
+            0.0
+        } else {
+            s_old * kexp(m_old - m_new)
+        };
+        s = carried + acc;
+        m = m_new;
+    }
+    (m, s)
+}
+
 /// The new kernels' arithmetic for one row, in f32 (the vocabulary walk's
 /// chunking changes only the order of the sum). A row with no finite
 /// non-target class has `s == 0` and a zero gradient.
 fn excluded_target_grad(z: &[f32], t: usize) -> Vec<f32> {
-    let others = || z.iter().enumerate().filter(|&(j, _)| j != t).map(|(_, &l)| l);
-    let m = others().fold(f32::MIN, f32::max);
-    let s: f32 = others().map(|l| (l - m).exp()).sum();
+    let (m, s) = lse_walk(z, t, z.len(), true);
     if s == 0.0 {
         return vec![0.0; z.len()];
     }
@@ -58,7 +103,15 @@ fn excluded_target_grad(z: &[f32], t: usize) -> Vec<f32> {
     let q = if margin >= 0.0 { e / (1.0 + e) } else { 1.0 / (1.0 + e) };
     z.iter()
         .enumerate()
-        .map(|(j, &l)| if j == t { -q } else { (l - lo).exp() * q })
+        .map(|(j, &l)| {
+            if j == t {
+                -q
+            } else if l > f32::MIN {
+                kexp(l - lo) * q
+            } else {
+                0.0
+            }
+        })
         .collect()
 }
 
@@ -146,6 +199,57 @@ fn a_row_of_only_the_target_has_no_loss_and_no_gradient() {
     assert_eq!(loss, 0.0);
     assert!(want.iter().all(|&g| g == 0.0));
     assert!(excluded_target_grad(&z, 1).iter().all(|&g| g == 0.0));
+}
+
+/// `-inf` logits across a chunked walk: no infinity may reach `exp`, whatever
+/// the chunk boundaries (a chunk of only `-inf`, of only the target, a row
+/// whose other classes are all `-inf`). The unguarded first version, which fed
+/// `-inf` to `exp`, ends with `s = NaN` on every such row under the hostile
+/// `kexp`: the failure `minus_infinite_logits_and_a_row_of_only_the_target`
+/// reported on the device ("row 0's loss is not finite").
+#[test]
+fn minus_infinite_logits_never_reach_exp_in_any_chunking() {
+    let ninf = f32::NEG_INFINITY;
+    let rows: [(&[f32], usize); 5] = [
+        (&[ninf, 2.0, ninf, ninf, ninf], 1),
+        (&[1.0, ninf, 2.0, ninf, 0.0], 2),
+        (&[0.5, ninf, ninf, ninf, ninf], 0),
+        (&[1.0, 2.0, 3.0, ninf, ninf], 0),
+        (&[ninf, ninf, 4.0, 1.0, ninf], 3),
+    ];
+    for (z, t) in rows {
+        let zd = as_f64(z);
+        let (loss, want) = ce_oracle(&zd, t);
+        let finite_others = z.iter().enumerate().any(|(j, &l)| j != t && l > f32::MIN);
+        for chunk in [5, 3, 2, 1] {
+            let (m, s) = lse_walk(z, t, chunk, true);
+            assert!(s.is_finite(), "{z:?} t={t} chunk={chunk}: s = {s}");
+            if finite_others {
+                let lo = f64::from(m) + f64::from(s).ln();
+                assert!(
+                    (lo - common::ce::other_classes_lse(&zd, t)).abs() < 1e-5,
+                    "{z:?} t={t} chunk={chunk}"
+                );
+            } else {
+                assert_eq!(s, 0.0, "{z:?} t={t} chunk={chunk}: nothing finite to sum");
+                assert_eq!(loss, 0.0);
+            }
+            let unguarded = lse_walk(z, t, chunk, false).1;
+            assert!(
+                unguarded.is_nan() || unguarded.is_finite() && !z.iter().enumerate().any(|(j, &l)| j != t && l == ninf),
+                "{z:?} t={t} chunk={chunk}: unguarded s = {unguarded}"
+            );
+        }
+        let got = excluded_target_grad(z, t);
+        let peak = want.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+        for (j, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(g.is_finite(), "{z:?} t={t} class {j}: {g}");
+            assert!(
+                (f64::from(g) - w).abs() <= 3e-5 * peak + 1e-36,
+                "{z:?} t={t} class {j}: {g} want {w}"
+            );
+        }
+    }
 }
 
 /// The oracle itself, against the textbook `softmax - onehot` where that is

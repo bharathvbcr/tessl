@@ -101,7 +101,13 @@ kernel void ce_lse_update(
 
     float acc = 0.0f;
     for (uint c = lid; c < width; c += tptg) {
-        if (v0 + c != t) {
+        // A `-inf` logit contributes exactly 0. It is skipped by a compare
+        // against the finite identity, not fed to `exp`: with m_new at the
+        // identity (a row, or chunk, with no finite non-target logit)
+        // `-inf - m_new` is `-inf`, or `-inf - -inf` = NaN if `m_new` is
+        // itself `-inf`, and `precise::exp` is compiled under fast math,
+        // where an infinite or NaN argument is not something it must handle.
+        if (v0 + c != t && row[c] > -FLT_MAX) {
             acc += precise::exp(row[c] - m_new);
         }
     }
@@ -110,7 +116,11 @@ kernel void ce_lse_update(
     acc = reduce_row_add(acc, scratch + REDUCE_MAX_SIMDGROUPS, sgid, lane, tptg);
 
     if (lid == 0u) {
-        const float carried = first != 0u ? 0.0f : s[n] * precise::exp(m_old - m_new);
+        // `s == 0` (no finite non-target logit yet) has nothing to rescale;
+        // multiplying it by `exp(m_old - m_new)` would be 0 * NaN if both
+        // maxima sit at the identity.
+        const float s_old = first != 0u ? 0.0f : s[n];
+        const float carried = s_old == 0.0f ? 0.0f : s_old * precise::exp(m_old - m_new);
         s[n] = carried + acc;
         m[n] = m_new;
         if (t >= v0 && t - v0 < width) {
@@ -161,6 +171,9 @@ kernel void ce_softmax_grad(
     const float margin = tlogit[n] - lo;
     const float e = precise::exp(-fabs(margin));
     const float q = margin >= 0.0f ? e / (1.0f + e) : 1.0f / (1.0f + e);
-    const float g = (v0 + c == targets[n]) ? -q : precise::exp(logits[i] - lo) * q;
+    // A `-inf` non-target logit has gradient 0; `exp` is not handed `-inf`
+    // (see ce_lse_update).
+    const float z = logits[i];
+    const float g = (v0 + c == targets[n]) ? -q : (z > -FLT_MAX ? precise::exp(z - lo) * q : 0.0f);
     logits[i] = g * scale;
 }

@@ -963,8 +963,8 @@ qwen35_train::tests::real_2b_gradients_are_those_of_tessls_forward
   recording machine only (`target-gp/` is gitignored, so a clone does not
   have it): `target-gp/gpurun14/test_f64.log` (result line 310, loss line 5,
   worst line 155), `meta_f64.txt`, `header.txt`, driver
-  `target-gp/gpurun14.sh`. The same figures are in BUILD_REPORT.md under
-  "Late results (wave 22b)". This is one run on one fixture, not a repeated
+  `target-gp/gpurun14.sh`. The same figures are in the local, untracked
+  BUILD_REPORT.md under "Late results (wave 22b)". This is one run on one fixture, not a repeated
   measurement.
 
 `real_2b_step_matches_transformers` (loss: train 3.81033944, inference 3.81033982,

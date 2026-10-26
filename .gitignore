@@ -99,3 +99,12 @@ DerivedData/
 .devcouncil/*
 !/.devcouncil/
 !.devcouncil/config.yaml
+
+# Local-only notes: session and branch reports, GitPulse task cards, the
+# history-scrub SHA map and the EmbeddingGemma 2 gap audit. Kept on the
+# working machine, not published.
+/BRANCH_REPORT.md
+/BUILD_REPORT.md
+/tasks/
+/docs/history/
+/docs/embedgemma2_audit.md

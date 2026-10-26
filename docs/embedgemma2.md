@@ -2054,7 +2054,7 @@ which differs from sentence-transformers for a text starting with `<bos>`.
 ## Text-encoder fusion (G7)
 
 The text encoder's elementwise passes between its GEMMs are fused where the arithmetic
-can be kept bit for bit (`docs/embedgemma2_audit.md`, G7; the audio tower's version of the
+can be kept bit for bit (gap G7 of the 2026-10-15 gap audit; the audio tower's version of the
 same work is "Kernels" and "Speed" under "Audio tower"). `ExactF32` embeddings are
 unchanged to the bit on the tiny and the real checkpoint (hashes below), `Bf16` ones too,
 so every bound of "Bounds and observed errors" and "Precision" holds as it was. What

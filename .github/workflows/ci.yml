@@ -195,13 +195,17 @@ jobs:
       - name: Comparator lanes, host-only tests
         # The MLX/torch comparison lanes are the only parity tooling still in
         # Python (the scorer, the ladder, the kernel census and the attention
-        # tuner are Rust bins with cargo tests). These tests need numpy only,
-        # never MLX or torch: they check the lanes' masking rule and the
-        # external-lane files they write. The pin is the one
-        # tools/msl_emu/requirements.txt already carries for the oracle, so
-        # there is a single place to bump it. A non-zero exit fails the job.
+        # tuner are Rust bins with cargo tests). The file checks the masking
+        # rule and the external-lane files (numpy) and the CPU contracts of the
+        # torch lanes (torch and transformers: a tiny Qwen3.5, no MLX, no GPU).
+        # Installing only numpy used to fail at `import embedgemma2_torch`.
+        # The pin is tools/msl_emu/requirements.txt, the same file the
+        # kernel-emulator job installs, so there is one place to bump it.
+        # No `--extra-index-url` here: that CPU index is for the Linux job.
+        # On macOS the PyPI wheel is the one that runs these CPU tests.
+        # A non-zero exit fails the job.
         run: |
-          python3 -m pip install "$(grep -E '^numpy==' tools/msl_emu/requirements.txt)"
+          python3 -m pip install -r tools/msl_emu/requirements.txt
           python3 -I bench/test_comparator_lanes.py
 
       - name: Kernel IR fast-math scan (tune rigs included)

@@ -158,8 +158,9 @@ cargo run --release --bin gemm_parity -- score /tmp/parity
 # CLI contract of the dumper. Both run in the hosted CI job.
 cargo test --release --test gemm_parity --test bench_gemm_sweep_cli
 
-# The Python comparison lanes (attention masking rule, external-lane writer);
-# needs numpy only.
+# The Python comparison lanes (attention masking rule, external-lane writer,
+# CPU contracts of the torch lanes). Needs numpy, torch and transformers
+# (tools/msl_emu/requirements.txt); no GPU.
 python3 -I bench/test_comparator_lanes.py
 ```
 

@@ -74,8 +74,9 @@ else
   MSL_EMU_OUT="$EMU_OUT/fast" "$ORACLE_PY" tools/msl_emu/check_qwen35.py --fast-math
 fi
 
-echo "==> comparator lanes, host-only (masking rule and external-lane files; the scorer, ladder, census and tuner are cargo tests)"
-# Needs numpy, which the oracle environment carries. A non-zero exit stops the script.
+echo "==> comparator lanes, host-only (masking rule, external-lane files, CPU torch-lane contracts; the scorer, ladder, census and tuner are cargo tests)"
+# Needs numpy, torch and transformers, which the oracle environment carries
+# (CI installs tools/msl_emu/requirements.txt). A non-zero exit stops the script.
 "$ORACLE_PY" -I bench/test_comparator_lanes.py
 
 echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, needs the torch oracle)"

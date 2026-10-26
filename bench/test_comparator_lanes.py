@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Host-only tests of the Python comparison lanes (numpy only, no GPU, no MLX/torch).
+"""Host-only tests of the Python comparison lanes (no GPU, no MLX).
+
+Needs numpy, plus torch and transformers for the CPU contracts of the torch
+lanes (a tiny Qwen3.5, no device). The pins are
+`tools/msl_emu/requirements.txt`, which CI installs before this file.
 
 The numeric-parity scorer, the ladder and their contracts are Rust now
 (`tests/gemm_parity.rs`). What stays here is what only Python can check: that
 `flash_attn_torch_mlx.py` transcribes the kernels' masking rule and FLOP
-accounting correctly, and that `gemm_sweep_mlx.py --external-lanes` writes the
-files the Rust scorer reads.
+accounting correctly, that `gemm_sweep_mlx.py --external-lanes` writes the
+files the Rust scorer reads, and that the torch lane scripts keep the
+argument, metric and CPU-step contracts `bench_paired` reads.
 
   python3 -I bench/test_comparator_lanes.py
 """

@@ -424,7 +424,10 @@ fn every_figure_is_a_well_formed_svg_with_a_background_a_title_and_a_dark_theme(
 fn the_same_data_is_the_same_bytes_from_the_library_and_from_the_binary() {
     let out_a = fresh("determinism_a");
     let out_b = fresh("determinism_b");
-    for (name, stem) in ALL {
+    // `&` so `name` is `&str`. ALL is a slice; Rust 1.82 will not coerce a
+    // `&&str` element inside the array passed to `run`, and the MSRV job
+    // fails to compile this test.
+    for &(name, stem) in ALL {
         let first = render(name);
         let second = render(name);
         assert_eq!(first.svg, second.svg, "{name}: two renders differ");

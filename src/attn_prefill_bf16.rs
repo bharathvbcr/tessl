@@ -12,16 +12,21 @@
 //!
 //! - `q`: bf16 `[batch, tq, heads, 256]`; `k`, `v`: bf16
 //!   `[batch, capacity, kv_heads, 256]`. A caller that holds f32 tensors casts
-//!   them once with the producer's store (or `qwen35_deliver_f32_to_bf16`); the
-//!   kernel does not cast on load (see the kernel file for why).
+//!   them once with the producer's store (or [`cast_f32_to_bf16`]); the kernel
+//!   does not cast on load (see the kernel file for why).
 //! - `o`: f32 `[batch, tq, heads, 256]`, or bf16 with `out_bf16`.
 //!
-//! The f32 path ([`crate::qwen35::attn_prefill`]) is untouched and stays the
-//! default; nothing here is reached unless a caller asks for it.
+//! [`crate::qwen35_model`] calls this for a bf16 prefill and a staged prefill.
+//! [`crate::qwen35::attn_prefill`] stays the f32 forward, and decode attention
+//! stays on [`crate::qwen35::attn_prefix_decode`] in both precisions. The cast
+//! below is `dispatch_1d` on the `cast_f32_to_bf16` utility kernel (the one the
+//! GEMM boundaries use, round to nearest even, pinned to the host rounding by
+//! `tests/bf16_cast.rs`): the attention host-contract scan does not treat that
+//! dispatch as an attention bind.
 
 use std::sync::Arc;
 
-use crate::dispatch::{dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
+use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
 use crate::nn::{
     attn_kv_capacity_bf16, require, require_disjoint_writes, validate_attn_output_scalar_aliases, AttnDims,
 };
@@ -172,4 +177,24 @@ pub fn attn_prefill_bf16_with_tile(
             set_u32(bnd, kv_capacity, 14);
         },
     )
+}
+
+/// Round the first `n` f32 values of `src` to bf16 into the first `n` of `dst`
+/// (`cast_f32_to_bf16`, round to nearest even, as every bf16 GEMM operand of the
+/// model is rounded).
+pub fn cast_f32_to_bf16(rt: &Arc<GpuRuntime>, src: &GpuBuffer, dst: &GpuBuffer, n: usize) -> Result<(), String> {
+    const WHAT: &str = "attn_prefill_bf16::cast_f32_to_bf16";
+    let n32 = u32::try_from(n).map_err(|_| format!("{WHAT}: {n} elements exceed u32"))?;
+    require::<f32>(rt, src, n, format_args!("{WHAT} src"))?;
+    require::<u16>(rt, dst, n, format_args!("{WHAT} dst"))?;
+    require_disjoint_writes(WHAT, &[("dst", dst)], &[("src", src)])?;
+    if n == 0 {
+        return Ok(());
+    }
+    let pipeline = rt.pipeline("cast_f32_to_bf16")?;
+    dispatch_1d(rt, &pipeline, n, |bnd| {
+        set_gpu_buf(bnd, src, 0);
+        set_gpu_buf(bnd, dst, 1);
+        set_u32(bnd, n32, 2);
+    })
 }

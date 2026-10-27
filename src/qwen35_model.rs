@@ -45,12 +45,16 @@
 //!
 //! [`Precision::Bf16`] is the production forward: bf16 weights, and every GEMM
 //! input rounded to bf16 (the norms, gated norm, output gate and SwiGLU write
-//! bf16 directly); accumulation, the residual stream, the GDN state and all
-//! attention arithmetic stay f32. [`Precision::F32`] widens the weights to f32
-//! (exactly) and keeps every activation f32 with exact-f32 GEMMs: the same
-//! computation as transformers in fp32, up to operation order, which makes it
-//! the tight oracle for the composition. It needs the runtime's relaxed-f32
-//! GEMM switched off (the default), and checks that it is.
+//! bf16 directly). Accumulation, the residual stream and the GDN state stay
+//! f32. Prefill and staged prefill cast Q, K and V to bf16 and run
+//! [`crate::attn_prefill_bf16`] (bf16 matrix products, f32 scores, softmax and
+//! output); the K/V caches stay f32 and decode attention stays f32
+//! ([`crate::qwen35::attn_prefix_decode`]). [`Precision::F32`] widens
+//! the weights to f32 (exactly) and keeps every activation f32, including
+//! [`crate::qwen35::attn_prefill`]: the same computation as transformers in
+//! fp32, up to operation order, which makes it the tight oracle for the
+//! composition. It needs the runtime's relaxed-f32 GEMM switched off (the
+//! default), and checks that it is.
 //!
 //! # Prefill and decode
 //!
@@ -72,9 +76,10 @@
 //! place, the token's K/V written to a suffix cache of `max_new` slots with
 //! `attn_qk_norm_rope_suffix`) and returns its logits. The decode kernels sum
 //! in a different order from the prefill ones (the recurrent rule against the
-//! chunked one, split-KV attention against tiled), so a decoded token's
-//! logits equal the prefill's at that position to f32 rounding, not bit for
-//! bit; `tests/qwen35_model.rs` holds them to a bound.
+//! chunked one, split-KV attention against tiled; on [`Precision::Bf16`] also
+//! f32 decode attention against the prefill's bf16 Q/K/V tile), so a decoded
+//! token's logits equal the prefill's at that position to a bound, not bit for
+//! bit; `tests/qwen35_model.rs` holds them to it.
 //!
 //! # Logits
 //!
@@ -89,6 +94,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::attn_prefill_bf16::{self, AttnProbTile};
 use crate::config_json::{self, field, float};
 use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
@@ -1802,7 +1808,7 @@ impl Qwen35Model {
                     theta,
                     eps,
                 )?;
-                qwen35::attn_prefill(rt, &a.a_q, k, v, &a.a_o, &a.tkv, &a.zero, &a.zero, dims, false)?;
+                self.prefill_attention(a, k, v, dims)?;
             }
             // One token at position prefix_len + slot: cached at its suffix
             // slot, attending to the prefix and the suffix so far.
@@ -1857,6 +1863,42 @@ impl Qwen35Model {
             l.head_dim(),
         )?;
         self.project_residual(&a.a_y, &w.w_out, a, Self::defers_add(step))
+    }
+
+    /// Prefill attention. Bf16 rounds Q, K and V once and runs the bf16 tile;
+    /// f32 stays on [`qwen35::attn_prefill`]. `O` is f32 either way, which is
+    /// what [`qwen35::attn_output_gate`] reads.
+    fn prefill_attention(&self, a: &Acts, k: &GpuBuffer, v: &GpuBuffer, dims: AttnDims) -> Result<(), String> {
+        let l = self.cfg.attn;
+        if self.precision == Precision::Bf16 && l.head_dim() == qwen35::PREFIX_ATTN_HEAD_DIM {
+            let (qb, kb, vb) = a.attn_bf16_bufs()?;
+            let nq = attn_elems(a.t, l.q_heads(), l.head_dim())?;
+            let nkv = attn_elems(a.t, l.kv_heads(), l.head_dim())?;
+            attn_prefill_bf16::cast_f32_to_bf16(&self.rt, &a.a_q, qb, nq)?;
+            attn_prefill_bf16::cast_f32_to_bf16(&self.rt, k, kb, nkv)?;
+            attn_prefill_bf16::cast_f32_to_bf16(&self.rt, v, vb, nkv)?;
+            attn_prefill_bf16::attn_prefill_bf16_with_tile(
+                &self.rt,
+                qb,
+                kb,
+                vb,
+                &a.a_o,
+                &a.tkv,
+                &a.zero,
+                &a.zero,
+                dims,
+                false,
+                // Quiet M5 Pro tile run, 2026-10-27 (`--paired-attn-bf16`).
+                // Q32K64 medians 0.2484 / 0.8330 / 12.5595 ms at T = 1024 / 2048 / 8192,
+                // ahead of Q32K32 (0.2754 / 0.9236 / 14.6640). Max relative deviation
+                // 2.436e-3 on both. Kernel only: the f32-to-bf16 cast is outside the
+                // timer. Decode stays on `ATTN_PREFILL_TILE`; that run did not time tq = 1.
+                qwen35::AttnTile::Q32K64Sg4,
+                AttnProbTile::Bf16,
+            )
+        } else {
+            qwen35::attn_prefill(&self.rt, &a.a_q, k, v, &a.a_o, &a.tkv, &a.zero, &a.zero, dims, false)
+        }
     }
 
     fn mlp(&self, layer: &Layer, a: &Acts, step: Step<'_>) -> Result<(), String> {
@@ -2462,6 +2504,9 @@ struct Acts {
     /// attention layer overwrites; none when each layer keeps its own
     /// ([`Carry`]).
     kv: Option<(GpuBuffer, GpuBuffer)>,
+    /// bf16 Q and live K/V for the bf16 prefill tile. None on the f32 forward,
+    /// and none when the head dim is not the compiled 256.
+    attn_bf16: Option<AttnBf16Scratch>,
     a_o: GpuBuffer,
     a_y: Tensor,
     tkv: GpuBuffer,
@@ -2476,6 +2521,40 @@ struct Acts {
     add_pending: AtomicBool,
 }
 
+/// bf16 copies of one prefill's Q and of its live K and V. The f32 caches
+/// stay: decode still reads them.
+struct AttnBf16Scratch {
+    q: GpuBuffer,
+    k: GpuBuffer,
+    v: GpuBuffer,
+}
+
+/// Elements of a `[t, heads, dim]` attention tensor, or an overflow.
+fn attn_elems(t: u32, heads: u32, dim: u32) -> Result<usize, String> {
+    (t as usize)
+        .checked_mul(heads as usize)
+        .and_then(|n| n.checked_mul(dim as usize))
+        .ok_or_else(|| format!("Qwen35Model: attention length {t}x{heads}x{dim} overflows"))
+}
+
+/// Live Q and K/V lengths for the bf16 prefill tile, or none when this head
+/// dim has no compiled bf16 kernel.
+fn bf16_attn_counts(cfg: &Qwen35Config, t: u32) -> Result<Option<(usize, usize)>, String> {
+    if cfg.attn.head_dim() != qwen35::PREFIX_ATTN_HEAD_DIM {
+        return Ok(None);
+    }
+    Ok(Some((
+        attn_elems(t, cfg.attn.q_heads(), cfg.attn.head_dim())?,
+        attn_elems(t, cfg.attn.kv_heads(), cfg.attn.head_dim())?,
+    )))
+}
+
+/// Allocated bytes of an `n`-element bf16 buffer, the same `n.max(1)` rule as
+/// [`Acts::new`].
+fn bf16_buf_bytes(n: usize) -> u64 {
+    GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(2), BufferKind::Cold)
+}
+
 /// The allocated size of an `n`-element f32 buffer, as [`Acts`] and the
 /// session's other buffers make it (never empty).
 fn f32_bytes(n: usize) -> u64 {
@@ -2484,6 +2563,7 @@ fn f32_bytes(n: usize) -> u64 {
 
 /// What [`Acts`] allocates at `t` tokens: the one place its sizes are
 /// decided, which [`Acts::new`] allocates from and [`Acts::bytes`] sums.
+/// The bf16 attention scratch is the exception; both call [`bf16_attn_counts`].
 struct ActsPlan {
     t: usize,
     p: Precision,
@@ -2546,8 +2626,21 @@ impl Acts {
         let f32t = |cols: usize| rt.alloc_tensor_unzeroed(&[tu, cols], DType::F32);
         let act = |cols: usize| activation(rt, p, tu, cols);
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);
+        let bf16s = |n: usize| rt.alloc_buffer(n.max(1) * 2);
         // Fresh buffers, written without a GPU wait.
         let u32_buf = |v: u32| rt.alloc_buffer_from_u32(&[v]);
+        let attn_bf16 = if p == Precision::Bf16 {
+            match bf16_attn_counts(cfg, t)? {
+                Some((nq, nkv)) => Some(AttnBf16Scratch {
+                    q: bf16s(nq)?,
+                    k: bf16s(nkv)?,
+                    v: bf16s(nkv)?,
+                }),
+                None => None,
+            }
+        } else {
+            None
+        };
         Ok(Self {
             t,
             resid: f32t(plan.hidden)?,
@@ -2564,6 +2657,7 @@ impl Acts {
                 Some(n) => Some((f32s(n)?, f32s(n)?)),
                 None => None,
             },
+            attn_bf16,
             a_o: f32s(tu * plan.qd)?,
             a_y: act(plan.qd)?,
             tkv: u32_buf(t)?,
@@ -2584,6 +2678,15 @@ impl Acts {
         let ws = GdnWorkspace::bytes_for(&plan.gdn)? as u64;
         let scalar = f32_bytes(1);
         let kv = plan.kv.map_or(0, |n| f32_bytes(n).saturating_mul(2));
+        let attn_bf16 = match p {
+            Precision::Bf16 => match bf16_attn_counts(cfg, t)? {
+                Some((nq, nkv)) => bf16_buf_bytes(nq)
+                    .saturating_add(bf16_buf_bytes(nkv))
+                    .saturating_add(bf16_buf_bytes(nkv)),
+                None => 0,
+            },
+            Precision::F32 => 0,
+        };
         Ok([
             plan.f32_rows(plan.hidden),
             plan.act_rows(plan.hidden),
@@ -2596,6 +2699,7 @@ impl Acts {
             plan.f32_rows(plan.a_width),
             plan.f32_rows(plan.qd),
             kv,
+            attn_bf16,
             plan.f32_rows(plan.qd),
             plan.act_rows(plan.qd),
             scalar,
@@ -2606,6 +2710,14 @@ impl Acts {
         ]
         .into_iter()
         .fold(0, u64::saturating_add))
+    }
+
+    /// The bf16 Q, K and V of a bf16 prefill.
+    fn attn_bf16_bufs(&self) -> Result<(&GpuBuffer, &GpuBuffer, &GpuBuffer), String> {
+        self.attn_bf16
+            .as_ref()
+            .map(|s| (&s.q, &s.k, &s.v))
+            .ok_or_else(|| "Qwen35Model: bf16 prefill attention has no Q/K/V scratch".to_string())
     }
 
     /// The shared K/V of a prefill that keeps nothing.
@@ -2645,6 +2757,10 @@ mod tests {
                         .map(alloc)
                         .sum::<u64>();
                     got += a.kv.as_ref().map_or(0, |(k, v)| alloc(k) + alloc(v));
+                    got += a
+                        .attn_bf16
+                        .as_ref()
+                        .map_or(0, |s| alloc(&s.q) + alloc(&s.k) + alloc(&s.v));
                     got += GdnWorkspace::bytes_for(&cfg.gdn.dims(1, t)).unwrap() as u64;
                     let want = Acts::bytes(&cfg, p, t, shared).unwrap();
                     assert_eq!(want, got, "{p:?} t={t} shared_kv={shared}");

@@ -235,6 +235,16 @@ fn q4_dir() -> PathBuf {
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qwen35_2b_mlx_q4"))
 }
 
+/// A missing Q4 checkpoint is a failed check, not a measured pass.
+/// `config_present` is whether that directory's `config.json` is a file.
+fn q4_checkpoint_gate(config_present: bool) -> Result<(), String> {
+    if config_present {
+        Ok(())
+    } else {
+        Err("COULD NOT RUN: MLX Q4 checkpoint is missing (config.json is missing)".to_string())
+    }
+}
+
 fn to_f32(v: &[f64]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
@@ -298,44 +308,48 @@ fn logit_deviation_rows(label: &str, dir: &Path, q4_sub: &str, variants: &[Preci
     eprintln!("{}", floor.row("transformers bf16 vs fp32 (floor)"));
     ear_both(&mut ear_rows, "transformers bf16 (floor)", &hf_bf16_ref);
     let q4 = q4_dir();
-    if q4.join("config.json").is_file() {
-        let got = q4_2b_logits(&q4, &ids);
-        eprintln!("{}", logit_dev(&got, &hf_f32, vocab).row("MLX Q4 vs transformers fp32"));
-        let tessl_q4 = ear_both(&mut ear_rows, "tessl MLX Q4", &got);
-        // mlx-lm's own forward on the same 4-bit weights and ids (make_mlx_q4.py): bf16
-        // activations and float32 activations. Host files only.
-        let mlx_dir = q4.join("ref").join(q4_sub);
-        assert_eq!(
-            ids_in(&mlx_dir),
-            ids,
-            "{label}: mlx-lm ids differ from the reference ids"
-        );
-        let mut mlx_f32_mean = None;
-        for (file, name) in [
-            ("logits_mlx", "mlx-lm Q4 (bf16 acts)"),
-            ("logits_mlx_f32", "mlx-lm Q4 (f32 acts)"),
-        ] {
-            let (mshape, mlx) = load_ref_in(&mlx_dir, file);
-            assert_eq!(mshape, shape, "{label}: {file} shape differs from the reference");
-            let mlx32 = to_f32(&mlx);
-            let m = ear_both(&mut ear_rows, name, &mlx32);
-            if file == "logits_mlx_f32" {
-                mlx_f32_mean = Some(m);
-                ear_rows.push(ear(&got, &mlx, vocab, EAR_TOP_K).row("tessl MLX Q4 vs mlx-lm Q4 (f32 acts)"));
-            }
+    match q4_checkpoint_gate(q4.join("config.json").is_file()) {
+        Err(msg) => {
+            failures.push(msg.clone());
+            eprintln!("{msg} ({})", q4.display());
         }
-        // Pinned before the first run: tessl's Q4 forward is the same format as mlx-lm's, so
-        // its EAR against fp32 is within 5e-3 of mlx-lm's float32-activation forward. A
-        // faithful kernel moves the mean far less than the 4-bit format itself moves it.
-        let m = mlx_f32_mean.unwrap();
-        let gap = (tessl_q4 - m).abs();
-        if !gap.is_finite() || gap > EAR_Q4_PARITY_DELTA {
-            failures.push(format!(
+        Ok(()) => {
+            let got = q4_2b_logits(&q4, &ids);
+            eprintln!("{}", logit_dev(&got, &hf_f32, vocab).row("MLX Q4 vs transformers fp32"));
+            let tessl_q4 = ear_both(&mut ear_rows, "tessl MLX Q4", &got);
+            // mlx-lm's own forward on the same 4-bit weights and ids (make_mlx_q4.py): bf16
+            // activations and float32 activations. Host files only.
+            let mlx_dir = q4.join("ref").join(q4_sub);
+            assert_eq!(
+                ids_in(&mlx_dir),
+                ids,
+                "{label}: mlx-lm ids differ from the reference ids"
+            );
+            let mut mlx_f32_mean = None;
+            for (file, name) in [
+                ("logits_mlx", "mlx-lm Q4 (bf16 acts)"),
+                ("logits_mlx_f32", "mlx-lm Q4 (f32 acts)"),
+            ] {
+                let (mshape, mlx) = load_ref_in(&mlx_dir, file);
+                assert_eq!(mshape, shape, "{label}: {file} shape differs from the reference");
+                let mlx32 = to_f32(&mlx);
+                let m = ear_both(&mut ear_rows, name, &mlx32);
+                if file == "logits_mlx_f32" {
+                    mlx_f32_mean = Some(m);
+                    ear_rows.push(ear(&got, &mlx, vocab, EAR_TOP_K).row("tessl MLX Q4 vs mlx-lm Q4 (f32 acts)"));
+                }
+            }
+            // Pinned before the first run: tessl's Q4 forward is the same format as mlx-lm's, so
+            // its EAR against fp32 is within 5e-3 of mlx-lm's float32-activation forward. A
+            // faithful kernel moves the mean far less than the 4-bit format itself moves it.
+            let m = mlx_f32_mean.unwrap();
+            let gap = (tessl_q4 - m).abs();
+            if !gap.is_finite() || gap > EAR_Q4_PARITY_DELTA {
+                failures.push(format!(
                 "{label}: tessl Q4 EAR vs fp32 {tessl_q4:.6} differs from mlx-lm Q4 {m:.6} by more than {EAR_Q4_PARITY_DELTA}"
             ));
+            }
         }
-    } else {
-        eprintln!("MLX Q4: NOT RUN ({} has no config.json)", q4.display());
     }
     for r in &ear_rows {
         eprintln!("{r}");
@@ -350,7 +364,9 @@ fn logit_deviation_rows(label: &str, dir: &Path, q4_sub: &str, variants: &[Preci
 /// directory of `QWEN35_REF_DIR` (`target/qwen35_ref`); with
 /// `QWEN35_REF_TEXT_DIR` set it repeats on that directory's prompt (the 512
 /// natural-text ids of `make_reference.py --ids tests/fixtures/qwen35_text_ids.npy`),
-/// and prints NOT RUN for it when unset. Add a variant by extending `variants`.
+/// and prints NOT RUN for it when unset. A missing Q4 checkpoint (`config.json`
+/// not a file) fails this report: a check that could not run is not a pass.
+/// Add a variant by extending `variants`.
 #[test]
 #[ignore]
 fn logit_deviation_report() {
@@ -375,6 +391,20 @@ fn logit_deviation_report() {
 
 fn dev_rows() -> Vec<f64> {
     vec![0.5, 2.0, -1.0, 0.0, 3.0, 1.0, -2.0, 0.5, 0.25, 1.5, -0.5, 0.0]
+}
+
+#[test]
+fn q4_checkpoint_gate_fails_closed_when_the_checkpoint_is_missing() {
+    assert!(q4_checkpoint_gate(true).is_ok());
+    let err = q4_checkpoint_gate(false).expect_err("a missing checkpoint is an error");
+    assert!(err.contains("COULD NOT RUN"), "{err}");
+    assert!(err.contains("MLX Q4"), "{err}");
+    assert!(err.contains("config.json"), "{err}");
+    assert!(err.contains("missing"), "{err}");
+    assert!(
+        !err.contains("MLX Q4: NOT RUN"),
+        "the old passing line must not be the failure: {err}"
+    );
 }
 
 #[test]

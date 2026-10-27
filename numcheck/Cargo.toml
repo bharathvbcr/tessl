@@ -1,0 +1,10 @@
+[package]
+name = "numcheck"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Shared float checks: non-finite planting, a 4ε√N tolerance, an fp64 oracle comparison, and bitwise equality that rejects NaN and Inf."
+
+[dependencies]

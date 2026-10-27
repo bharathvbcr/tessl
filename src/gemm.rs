@@ -121,6 +121,64 @@ fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
     k >= 2048 && m <= 384 && n <= 384 && m.min(n) <= 128
 }
 
+/// Whether a remaining GEMM route decision changes products or their sum.
+///
+/// The accumulate-kernel environment flags are not decisions. They were
+/// removed; a comment may still name them, and no string literal reads them.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteArithmetic {
+    /// Different products, or the same products added in a different order.
+    Changing,
+    /// One kernel: the same products in the same order.
+    Preserving,
+}
+
+/// Route decisions that remain after the accumulate-kernel flags were removed.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteDecision {
+    /// [`prefer_tn_splitk`] sends tall-K, small-MN shapes to a split-K kernel.
+    PreferTnSplitk,
+    /// K partitions versus one dispatch over all of K.
+    SplitKVersusOneLaunch,
+    /// 64×64 versus 128×64 ([`coop_narrow`], [`epi_tile_auto`]).
+    EpiTileWidth,
+    /// bf16, f16, relaxed f32, or exact f32.
+    Dtype,
+    /// [`gemm`] with no tile override, on the cooperative-destination path.
+    AutoCoopTile,
+    /// [`gemm_tiled`] forced to the tile [`nn_coop_kernel`] already returns.
+    ForcedMatchingCoopTile,
+}
+
+/// Classification of [`RouteDecision`].
+///
+/// [`RouteDecision::PreferTnSplitk`] and
+/// [`RouteDecision::SplitKVersusOneLaunch`] change association: a split-K
+/// kernel sums K in partitions, and [`gemm_tn_splitk_par_f32`] records that
+/// this rounding differs from one dispatch over all of K.
+/// [`RouteDecision::EpiTileWidth`] instantiates `matmul2d_descriptor(SM, SN, ...)`
+/// at 64×64 or 128×64 (`kernels/gemm_coop.h` `mm_coop`). Those two geometries
+/// were not measured bit-equal, so a width change is not a preserving route.
+/// [`RouteDecision::Dtype`] changes the products (the element type, and
+/// `RELAXED` on the f32 descriptor) and is left out of the bitwise sweep.
+/// [`RouteDecision::AutoCoopTile`] and
+/// [`RouteDecision::ForcedMatchingCoopTile`] preserve arithmetic when they
+/// name the same kernel: [`gemm_dispatch`] then runs one
+/// [`dispatch_tensorops_nn_coop`]. Forcing the other width is
+/// [`RouteDecision::EpiTileWidth`], not this pair.
+#[cfg(test)]
+pub(crate) fn route_arithmetic(decision: RouteDecision) -> RouteArithmetic {
+    match decision {
+        RouteDecision::PreferTnSplitk
+        | RouteDecision::SplitKVersusOneLaunch
+        | RouteDecision::EpiTileWidth
+        | RouteDecision::Dtype => RouteArithmetic::Changing,
+        RouteDecision::AutoCoopTile | RouteDecision::ForcedMatchingCoopTile => RouteArithmetic::Preserving,
+    }
+}
+
 /// Tile sizes for TensorOps kernels (must match matmul_tensorops.metal).
 ///
 /// `tests/audit_gemm_tiles.rs` checks each `TILE_*` against the kernel it is
@@ -3903,6 +3961,89 @@ mod stress_tests {
         rt.set_precision(PrecisionMode::F32);
     }
 
+    /// [`route_arithmetic`] marks the auto cooperative tile and the same tile
+    /// forced through [`gemm_tiled`] as preserving, because both name one
+    /// kernel. This is the output check on one bf16 shape. Split-K, a real
+    /// tile-width change, and the dtype routes are classified changing and
+    /// are not launched here.
+    #[test]
+    fn preserving_coop_routes_match_bit_for_bit() {
+        assert_eq!(route_arithmetic(RouteDecision::Dtype), RouteArithmetic::Changing);
+        assert_eq!(
+            route_arithmetic(RouteDecision::PreferTnSplitk),
+            RouteArithmetic::Changing
+        );
+        assert_eq!(
+            route_arithmetic(RouteDecision::SplitKVersusOneLaunch),
+            RouteArithmetic::Changing
+        );
+        assert_eq!(route_arithmetic(RouteDecision::EpiTileWidth), RouteArithmetic::Changing);
+        assert_eq!(
+            route_arithmetic(RouteDecision::AutoCoopTile),
+            RouteArithmetic::Preserving
+        );
+        assert_eq!(
+            route_arithmetic(RouteDecision::ForcedMatchingCoopTile),
+            RouteArithmetic::Preserving
+        );
+
+        let (m, n, k) = (32usize, 64usize, 48usize);
+        assert!(!prefer_tn_splitk(m, n, k), "sweep shape takes split-K");
+        let tile = epi_tile_auto(m, n, CoopElem::Bf16);
+        let (auto_name, auto_geom) = nn_coop_kernel(m, n, k, CoopElem::Bf16);
+        let (forced_name, forced_geom) = nn_coop_kernel_for(CoopElem::Bf16, tile);
+        assert_eq!(auto_name, forced_name, "preserving pair must name one kernel");
+        assert_eq!((forced_geom.sm, forced_geom.sn), (auto_geom.sm, auto_geom.sn));
+        let other = match tile {
+            EpiTile::Narrow => EpiTile::Wide,
+            EpiTile::Wide => EpiTile::Narrow,
+        };
+        assert_ne!(
+            nn_coop_kernel_for(CoopElem::Bf16, other).0,
+            auto_name,
+            "the other tile width is a different kernel and is not launched"
+        );
+
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        assert!(rt.has_tensorops(), "requires TensorOps metallib");
+        rt.set_precision(PrecisionMode::F32);
+        let a_host: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32) - 2.0).collect();
+        let b_host: Vec<f32> = (0..k * n).map(|i| ((i % 3) as f32) - 1.0).collect();
+        let a = bf16_operand(&rt, &[m, k], &a_host);
+        let b = bf16_operand(&rt, &[k, n], &b_host);
+        assert_eq!(a.dtype, DType::BF16, "dtype routes stay out of the sweep");
+        assert_eq!(b.dtype, DType::BF16, "dtype routes stay out of the sweep");
+        let c_auto = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        let c_forced = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        c_auto.buffer.write_f32(&vec![f32::NAN; m * n]);
+        c_forced.buffer.write_f32(&vec![f32::NAN; m * n]);
+        gemm(&a, &b, &c_auto, GemmBackend::TensorOps).unwrap();
+        gemm_tiled(&a, &b, &c_forced, GemmBackend::TensorOps, tile).unwrap();
+        rt.synchronize().unwrap();
+        let auto_out = c_auto.buffer.read_f32();
+        let forced_out = c_forced.buffer.read_f32();
+        assert_eq!(auto_out.len(), m * n);
+        assert_eq!(forced_out.len(), m * n);
+        let mut mismatches = 0usize;
+        let mut first = None;
+        for (i, (got, want)) in auto_out.iter().zip(&forced_out).enumerate() {
+            if !got.is_finite() || !want.is_finite() || got.to_bits() != want.to_bits() {
+                mismatches += 1;
+                first.get_or_insert((i, *got, *want));
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{auto_name} {m}x{n}x{k}: {mismatches} outputs differ, first {first:?}"
+        );
+    }
+
+    fn bf16_operand(rt: &std::sync::Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
+        let t = rt.alloc_tensor_bf16(shape).expect("alloc bf16");
+        t.buffer.write_bf16_bits(&crate::tensor::f32_slice_to_bf16(data));
+        t
+    }
+
     /// Separate runtimes on separate threads must not corrupt each other
     /// (buffer pools, dispatch counters, pipeline caches are per-runtime).
     #[test]
@@ -3971,6 +4112,43 @@ mod coop_tile_select {
                 assert_eq!(epi_tile_auto(m, n, elem), EpiTile::Wide, "{elem:?} {m}x{n}");
             }
         }
+        // The four route decisions change arithmetic. The preserving pair is
+        // the auto tile and the same tile forced: one kernel name. The other
+        // width is a different kernel and is not that pair. Dtype stays out.
+        assert_eq!(
+            route_arithmetic(RouteDecision::PreferTnSplitk),
+            RouteArithmetic::Changing
+        );
+        assert_eq!(
+            route_arithmetic(RouteDecision::SplitKVersusOneLaunch),
+            RouteArithmetic::Changing
+        );
+        assert_eq!(route_arithmetic(RouteDecision::EpiTileWidth), RouteArithmetic::Changing);
+        assert_eq!(route_arithmetic(RouteDecision::Dtype), RouteArithmetic::Changing);
+        assert_eq!(
+            route_arithmetic(RouteDecision::AutoCoopTile),
+            RouteArithmetic::Preserving
+        );
+        assert_eq!(
+            route_arithmetic(RouteDecision::ForcedMatchingCoopTile),
+            RouteArithmetic::Preserving
+        );
+        let (m, n, k) = (32usize, 64usize, 48usize);
+        assert!(!prefer_tn_splitk(m, n, k), "the bitwise sweep's shape takes split-K");
+        let tile = epi_tile_auto(m, n, CoopElem::Bf16);
+        let (auto_name, auto_geom) = nn_coop_kernel(m, n, k, CoopElem::Bf16);
+        let (forced_name, forced_geom) = nn_coop_kernel_for(CoopElem::Bf16, tile);
+        assert_eq!(auto_name, forced_name, "preserving pair must name one kernel");
+        assert_eq!((forced_geom.sm, forced_geom.sn), (auto_geom.sm, auto_geom.sn));
+        let other = match tile {
+            EpiTile::Narrow => EpiTile::Wide,
+            EpiTile::Wide => EpiTile::Narrow,
+        };
+        assert_ne!(
+            nn_coop_kernel_for(CoopElem::Bf16, other).0,
+            auto_name,
+            "64x64 and 128x64 are different kernels"
+        );
     }
 
     /// Short M and N <= 512, which grid fill extends rather than replaces.

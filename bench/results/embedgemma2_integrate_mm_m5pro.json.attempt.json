@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "attempt_id": "146a4-18dfc7ce631c6f28",
+  "status": "published",
+  "started_at_utc": "2026-10-19T00:47:45Z",
+  "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 8 --evidence --max-spread 1.25 --clean-env --out bench/results/embedgemma2_integrate_mm_m5pro.json before:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm after:BENCH_ITERS=8,BENCH_WARMUP=2=target/release/bench_embedgemma2_mm control:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm_control",
+  "invocation_argv": [
+    "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+    "--rounds",
+    "8",
+    "--evidence",
+    "--max-spread",
+    "1.25",
+    "--clean-env",
+    "--out",
+    "bench/results/embedgemma2_integrate_mm_m5pro.json",
+    "before:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm",
+    "after:BENCH_ITERS=8,BENCH_WARMUP=2=target/release/bench_embedgemma2_mm",
+    "control:BENCH_ITERS=8,BENCH_WARMUP=2=target/wt_base/target/release/bench_embedgemma2_mm_control"
+  ],
+  "output_path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_integrate_mm_m5pro.json",
+  "prior_output": null,
+  "interpretation": "Unless status is published, output_path does not represent this attempt.",
+  "finished_at_utc": "2026-10-19T00:57:58Z",
+  "published_output": {
+    "path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_integrate_mm_m5pro.json",
+    "size_bytes": 33183,
+    "mtime_ns": 1792371478733145784,
+    "sha256": "a1b4379bf6ba64f8dee171cbd52dfc16a0c5567d87b7579a145ca8f8dcd00c70"
+  }
+}

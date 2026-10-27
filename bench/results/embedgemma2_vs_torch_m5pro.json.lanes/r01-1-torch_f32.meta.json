@@ -1,0 +1,24 @@
+{
+  "round": 1,
+  "lane": "torch_f32",
+  "argv": [
+    "$HOME/.venvs/ml-2026-10/bin/python",
+    "bench/embedgemma2_torch.py",
+    "--dtype",
+    "f32"
+  ],
+  "started_at_utc": "2026-10-19T09:57:17Z",
+  "finished_at_utc": "2026-10-19T09:59:10Z",
+  "load_at_start": {
+    "loadavg_1m": 5.10400390625,
+    "loadavg_5m": 9.15185546875,
+    "loadavg_15m": 19.22509765625,
+    "cpu_count_normalizer": 18,
+    "normalized_loadavg_1m": 0.2835557725694444,
+    "normalized_loadavg_5m": 0.5084364149305556,
+    "normalized_loadavg_15m": 1.0680609809027777
+  },
+  "exit_code": 0,
+  "signal": null,
+  "error": null
+}

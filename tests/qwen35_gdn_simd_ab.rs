@@ -1,7 +1,7 @@
 //! Interleaved A/B of the GDN core at the Qwen3.5-2B shape: the chunked prefill
 //! path (`gdn_chunk_forward`), the token-by-token `gdn_recurrent`, and
-//! `gdn_recurrent_simd`, with `gdn_recurrent` timed a second time as the noise
-//! floor.
+//! the four kernels of `gdn_recurrent_simd`'s family, with `gdn_recurrent`
+//! timed a second time as the noise floor.
 //!
 //! This is a measurement, not a gate: it is `#[ignore]`d, and run under the
 //! machine lock by `target-gp/` scripts (see `bench/results/
@@ -13,7 +13,7 @@
 //! chunked arm's prep dispatch is inside its time). A sample is `N` launches
 //! between two `synchronize`s, divided by `N`; every arm gets `WARMUP`
 //! untimed launches before its first sample. Rounds rotate the arm order (round
-//! r starts at arm r mod 4), so no arm is always first or always after the same
+//! r starts at arm r mod the number of arms), so no arm is always first or always after the same
 //! neighbour. Per arm: min and median over rounds. Noise floor: the ratio of
 //! the two `gdn_recurrent` arms, per round, then its median and range, which is
 //! the resolution at which any other ratio below can be read.
@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use common::{buf, empty, random_f32, with_gpu};
 use tessl::qwen35::{
-    gdn_chunk_forward, gdn_recurrent, gdn_recurrent_simd, Cols, GdnDims, GdnGateLogits, GdnParams, GdnQkv,
-    GdnWorkspace, StateIn,
+    gdn_chunk_forward, gdn_recurrent, gdn_recurrent_simd_with, Cols, GdnDims, GdnGateLogits, GdnParams, GdnQkv,
+    GdnSimdScalars, GdnSimdVariant, GdnWorkspace, StateIn,
 };
 use tessl::tensor::GpuBuffer;
 use tessl::GpuRuntime;
@@ -83,7 +83,10 @@ fn ops(rt: &Arc<GpuRuntime>, t: usize, seed: u64) -> Ops {
         }
     }
     let a_log: Vec<f32> = random_f32(HV, seed + 5).into_iter().map(|x| -0.5 + 1.5 * x).collect();
-    let state0: Vec<f32> = random_f32(HV * DK * DV, seed + 7).into_iter().map(|x| x * 0.1).collect();
+    let state0: Vec<f32> = random_f32(HV * DK * DV, seed + 7)
+        .into_iter()
+        .map(|x| x * 0.1)
+        .collect();
     Ops {
         qkv: buf(rt, &qkv),
         ld_qkv: ld_qkv as u32,
@@ -102,11 +105,23 @@ fn ops(rt: &Arc<GpuRuntime>, t: usize, seed: u64) -> Ops {
 enum Arm {
     Chunked,
     Recurrent,
-    Simd,
+    Simd(GdnSimdVariant),
     RecurrentAgain,
 }
 
-const ARMS: [Arm; 4] = [Arm::Chunked, Arm::Recurrent, Arm::Simd, Arm::RecurrentAgain];
+const ARMS: [Arm; 7] = [
+    Arm::Chunked,
+    Arm::Recurrent,
+    Arm::Simd(GdnSimdVariant::Fused),
+    Arm::Simd(GdnSimdVariant::FusedSg8),
+    Arm::Simd(GdnSimdVariant::Prepped),
+    Arm::Simd(GdnSimdVariant::PreppedSg8),
+    Arm::RecurrentAgain,
+];
+const CHUNKED: usize = 0;
+const RECURRENT: usize = 1;
+const SIMD: usize = 2;
+const RECURRENT_AGAIN: usize = 6;
 
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
@@ -130,7 +145,7 @@ fn max(v: &[f64]) -> f64 {
 #[test]
 #[ignore = "timing run; execute under the machine lock (target-gp scripts)"]
 fn gdn_simd_recurrent_ab_at_the_2b_shape() {
-    let rounds = env_usize("GDN_AB_ROUNDS", 11);
+    let rounds = env_usize("GDN_AB_ROUNDS", 14);
     let warmup = env_usize("GDN_AB_WARMUP", 3);
     let lengths: Vec<usize> = std::env::var("GDN_AB_T")
         .unwrap_or_else(|_| "1,200,1024,8192".into())
@@ -148,6 +163,7 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
             v_dim: DV as u32,
         };
         let ws = GdnWorkspace::new(rt, &big).unwrap();
+        let scalars = GdnSimdScalars::new(rt, &big).unwrap();
         for &t in &lengths {
             let o = ops(rt, t, 3 + t as u64);
             let d = GdnDims { seq: t as u32, ..big };
@@ -179,7 +195,9 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 let r = match arm {
                     Arm::Chunked => gdn_chunk_forward(rt, &d, &q, &g, &p, st, &ws, cols, Some(&sts[i])),
                     Arm::Recurrent | Arm::RecurrentAgain => gdn_recurrent(rt, &d, &q, &g, &p, st, cols, Some(&sts[i])),
-                    Arm::Simd => gdn_recurrent_simd(rt, &d, &q, &g, &p, st, cols, Some(&sts[i])),
+                    Arm::Simd(v) => {
+                        gdn_recurrent_simd_with(rt, &d, &q, &g, &p, st, cols, Some(&sts[i]), v, Some(&scalars))
+                    }
                 };
                 r.expect("launch");
             };
@@ -188,29 +206,33 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 launch(arm);
             }
             rt.synchronize().unwrap();
-            let read = |arm: Arm, b: &[GpuBuffer], n: usize| {
-                let i = ARMS.iter().position(|&a| a == arm).unwrap();
-                b[i].read_f32()[..n].to_vec()
-            };
+            let read = |i: usize, b: &[GpuBuffer], n: usize| b[i].read_f32()[..n].to_vec();
             let n_out = t * width as usize;
-            let (y_r, y_s, y_c) = (
-                read(Arm::Recurrent, &outs, n_out),
-                read(Arm::Simd, &outs, n_out),
-                read(Arm::Chunked, &outs, n_out),
-            );
-            let (s_r, s_s) = (read(Arm::Recurrent, &sts, state_n), read(Arm::Simd, &sts, state_n));
+            let (y_r, s_r) = (read(RECURRENT, &outs, n_out), read(RECURRENT, &sts, state_n));
             let scale = y_r.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-3);
             let sscale = s_r.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-3);
             let dev = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
-            let (dy, ds, dc) = (dev(&y_r, &y_s), dev(&s_r, &s_s), dev(&y_r, &y_c));
+            let dc = dev(&y_r, &read(CHUNKED, &outs, n_out));
             println!(
-                "GDN_AB_CHECK t={t}: simd vs recurrent max|dy|/scale {:.3e} max|dstate|/scale {:.3e}; chunked vs recurrent max|dy|/scale {:.3e}",
-                dy / scale,
-                ds / sscale,
+                "GDN_AB_CHECK t={t}: chunked vs recurrent max|dy|/scale {:.3e}",
                 dc / scale
             );
-            assert!(dy <= 1e-4 * scale && ds <= 1e-4 * sscale, "simd kernel disagrees with gdn_recurrent at t={t}");
-            assert!(y_s.iter().any(|&x| x != 0.0), "simd output is all zeros");
+            for i in SIMD..RECURRENT_AGAIN {
+                let (y_s, s_s) = (read(i, &outs, n_out), read(i, &sts, state_n));
+                let (dy, ds) = (dev(&y_r, &y_s), dev(&s_r, &s_s));
+                println!(
+                    "GDN_AB_CHECK t={t} {:?}: vs recurrent max|dy|/scale {:.3e} max|dstate|/scale {:.3e}",
+                    ARMS[i],
+                    dy / scale,
+                    ds / sscale
+                );
+                assert!(
+                    dy <= 1e-4 * scale && ds <= 1e-4 * sscale,
+                    "{:?} disagrees with gdn_recurrent at t={t}",
+                    ARMS[i]
+                );
+                assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", ARMS[i]);
+            }
 
             // Launches per sample: enough that a sample is well above the host
             // submit-and-wait floor (about 0.25 ms) at every length.
@@ -252,13 +274,19 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                     max(&samples[i])
                 );
             }
-            // Indices: 0 chunked, 1 recurrent, 2 simd, 3 recurrent again.
-            for (name, num, den) in [
-                ("noise recurrent/recurrent_again", 1, 3),
-                ("simd/recurrent", 2, 1),
-                ("simd/chunked", 2, 0),
-                ("recurrent/chunked", 1, 0),
-            ] {
+            let mut pairs = vec![
+                (
+                    "noise recurrent/recurrent_again".to_string(),
+                    RECURRENT,
+                    RECURRENT_AGAIN,
+                ),
+                ("recurrent/chunked".to_string(), RECURRENT, CHUNKED),
+            ];
+            for i in SIMD..RECURRENT_AGAIN {
+                pairs.push((format!("{:?}/recurrent", ARMS[i]), i, RECURRENT));
+                pairs.push((format!("{:?}/chunked", ARMS[i]), i, CHUNKED));
+            }
+            for (name, num, den) in pairs {
                 let r = ratio(num, den);
                 println!(
                     "GDN_AB_RATIO t={t} {name}: median {:.3} min {:.3} max {:.3}",

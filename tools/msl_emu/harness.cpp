@@ -99,10 +99,10 @@ int main(int argc, char **argv) {
         std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
                     "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_SCAN16_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
                     "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n"
-                    "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\nGDN_SIMD_COLS %u\n",
+                    "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\nGDN_SIMD_COLS %u\nGDN_SIMD_PREP_SG %u\n",
                     GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
                     GDN_SCAN_TG_FLOATS, GDN_SCAN16_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
-                    PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R, GDN_SIMD_COLS);
+                    PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R, GDN_SIMD_COLS, GDN_SIMD_PREP_SG);
         return 0;
     }
     emu::start_watchdog();
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
             outputs.push_back("ws_w");
             outputs.push_back("ws_aq");
         }
-    } else if (kname == "qwen35_gdn_recurrent" || kname == "qwen35_gdn_recurrent_simd") {
+    } else if (kname == "qwen35_gdn_recurrent" || kname.rfind("qwen35_gdn_recurrent_simd", 0) == 0) {
         const uint B = P("B"), T = P("T"), Hk = P("Hk"), Hv = P("Hv"), Dv = P("Dv"), ld_qkv = P("ld_qkv"),
                    q_off = P("q_off"), k_off = P("k_off"), v_off = P("v_off"), ld_ab = P("ld_ab"),
                    a_off = P("a_off"), b_off = P("b_off"), ld_out = P("ld_out"), out_off = P("out_off"),
@@ -185,13 +185,27 @@ int main(int argc, char **argv) {
         // `rec_bv16`: the 16-column-slice recurrent (qwen35_gdn_recurrent_bv16),
         // 64 threads a group.
         const bool bv16 = params.count("rec_bv16") != 0;
-        if (kname == "qwen35_gdn_recurrent_simd") {
-            // One simdgroup a column, no threadgroup memory: GDN_SIMD_COLS columns a group.
-            launch(uint3(Dv / GDN_SIMD_COLS, Hv, B), uint3(32u * GDN_SIMD_COLS, 1, 1), 0,
-                   [&](const Ids &id, float *) {
-                qwen35_gdn_recurrent_simd(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off,
-                                          v_off, ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, id.tg,
-                                          id.sg, id.lane);
+        if (kname.rfind("qwen35_gdn_recurrent_simd", 0) == 0) {
+            // One simdgroup a column, no threadgroup memory: `cols` columns a group.
+            // The `_pre` kernels read what `qwen35_gdn_simd_prep` writes, as the host runs it first.
+            const bool pre = kname.find("_pre") != std::string::npos;
+            const uint cols = kname.find("_sg8") != std::string::npos ? 2u * GDN_SIMD_COLS : GDN_SIMD_COLS;
+            const uint rows = B * T;
+            std::vector<float4> sc(size_t(rows) * Hv + 1);
+            if (pre && rows > 0) {
+                launch(uint3(cdiv(rows * Hv, GDN_SIMD_PREP_SG), 1, 1), uint3(32u * GDN_SIMD_PREP_SG, 1, 1), 0,
+                       [&](const Ids &id, float *) {
+                    qwen35_gdn_simd_prep(qkv, ab, alog, dtb, sc.data(), rows, Hk, Hv, ld_qkv, q_off, k_off, ld_ab,
+                                         a_off, b_off, id.tg.x, id.sg, id.lane);
+                });
+            }
+            launch(uint3(Dv / cols, Hv, B), uint3(32u * cols, 1, 1), 0, [&](const Ids &id, float *) {
+                auto *run = kname == "qwen35_gdn_recurrent_simd"          ? gdn_simd_body<GDN_SIMD_COLS, false>
+                            : kname == "qwen35_gdn_recurrent_simd_sg8"    ? gdn_simd_body<2u * GDN_SIMD_COLS, false>
+                            : kname == "qwen35_gdn_recurrent_simd_pre"    ? gdn_simd_body<GDN_SIMD_COLS, true>
+                                                                          : gdn_simd_body<2u * GDN_SIMD_COLS, true>;
+                run(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off, ld_ab, a_off,
+                    b_off, ld_out, out_off, sb, flags, lens, sc.data(), id.tg, id.sg, id.lane);
             });
         } else {
             launch(uint3(Dv / (bv16 ? 16u : GDN_BV), Hv, B), uint3(bv16 ? 64u : GDN_SCAN_THREADS, 1, 1),

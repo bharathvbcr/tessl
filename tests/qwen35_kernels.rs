@@ -30,7 +30,7 @@ use common::qwen35::*;
 use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams, GdnProjLayout, GdnQkv,
-    GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
+    GdnScanSlice, GdnSimdScalars, GdnSimdVariant, GdnWorkspace, LmHead, OutCols, StateIn,
 };
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, DType, GpuBuffer};
 use tessl::{GemmBackend, GpuRuntime};
@@ -307,6 +307,9 @@ enum Path {
     /// `qwen35_gdn_recurrent_simd`: the recurrence with mlx-lm's decomposition.
     /// Same contract as [`Path::Recurrent`], other summation order.
     RecurrentSimd,
+    /// The other kernels of the simd family ([`GdnSimdVariant`]); `Fused` is
+    /// [`Path::RecurrentSimd`] through its own entry point.
+    SimdVariant(GdnSimdVariant),
 }
 
 /// Where a GDN call puts its final state.
@@ -428,9 +431,25 @@ fn run_gdn_slice(
         (Path::RecurrentSimd, None) => {
             qwen35::gdn_recurrent_simd(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
         }
+        (Path::SimdVariant(v), None) => {
+            let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
+            qwen35::gdn_recurrent_simd_with(
+                rt,
+                &dims,
+                &qkv,
+                &gates,
+                &params,
+                state,
+                out_cols,
+                state_out,
+                v,
+                Some(&scalars),
+            )
+            .unwrap()
+        }
+        (Path::SimdVariant(_), Some(_)) => unreachable!("the variants have no ragged entry point"),
         (Path::RecurrentSimd, Some(l)) => {
-            qwen35::gdn_recurrent_simd_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l)
-                .unwrap()
+            qwen35::gdn_recurrent_simd_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
         }
     }
     rt.synchronize().unwrap();
@@ -926,6 +945,30 @@ fn check_simd_vs_recurrent(
         errs.3,
         errs.2
     );
+    // The other kernels of the family run the same arithmetic (the prepped
+    // ones with the scalars computed in a pass of their own, the sg8 ones in
+    // wider threadgroups): each is held to the same two conditions.
+    for v in [
+        GdnSimdVariant::FusedSg8,
+        GdnSimdVariant::Prepped,
+        GdnSimdVariant::PreppedSg8,
+    ] {
+        let (vy, vs) = run_gdn(rt, d, Path::SimdVariant(v));
+        assert_close(&format!("{label} {v:?} y"), &vy, &want_y, by);
+        assert_close(&format!("{label} {v:?} state"), &vs, &want_s, bs);
+        assert!(
+            max_abs_err(&vy, &want_y) <= 4.0 * errs.0 + ulp64 * max_abs(&want_y),
+            "{label}: {v:?} y error {:.3e} against the recurrent's {:.3e}",
+            max_abs_err(&vy, &want_y),
+            errs.0
+        );
+        assert!(
+            max_abs_err(&vs, &want_s) <= 4.0 * errs.2 + ulp64 * max_abs(&want_s),
+            "{label}: {v:?} state error {:.3e} against the recurrent's {:.3e}",
+            max_abs_err(&vs, &want_s),
+            errs.2
+        );
+    }
     println!(
         "GDN_SIMD_ERR {label}: |y|max {:.3e} recurrent_y {:.3e} simd_y {:.3e} | |s|max {:.3e} recurrent_s {:.3e} simd_s {:.3e}",
         max_abs(&want_y),
@@ -989,14 +1032,20 @@ fn gdn_recurrent_simd_matches_f64_across_shapes_and_lengths() {
             for &t in ts {
                 seed += 10;
                 let d = GdnData::random(GdnShape { t, ..shape }, state, seed);
-                let label = format!("b{} t{t} hk{} hv{} dv{} state={state}", shape.b, shape.hk, shape.hv, shape.dv);
+                let label = format!(
+                    "b{} t{t} hk{} hv{} dv{} state={state}",
+                    shape.b, shape.hk, shape.hv, shape.dv
+                );
                 let (_, sy, ry) = check_simd_vs_recurrent(&label, rt, &d);
                 differing += sy.iter().zip(&ry).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             }
         }
         // Different summation orders cannot agree to every bit over this many
         // outputs: if they did, the "new" kernel was the old one.
-        assert!(differing > 0, "simd output is bit-identical to gdn_recurrent's everywhere");
+        assert!(
+            differing > 0,
+            "simd output is bit-identical to gdn_recurrent's everywhere"
+        );
     });
 }
 
@@ -1066,13 +1115,21 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
         type Poison = Box<dyn Fn(&mut GdnData)>;
         let cases: Vec<(&str, Poison, bool)> = vec![
             ("NaN in v", Box::new(move |d| d.v[v_at(row, 1, 5)] = f32::NAN), true),
-            ("+inf in v", Box::new(move |d| d.v[v_at(row, 2, 9)] = f32::INFINITY), true),
+            (
+                "+inf in v",
+                Box::new(move |d| d.v[v_at(row, 2, 9)] = f32::INFINITY),
+                true,
+            ),
             ("NaN in q", Box::new(move |d| d.q[qk_at(row, 0)] = f32::NAN), true),
             ("NaN in k", Box::new(move |d| d.k[qk_at(row, 1)] = f32::NAN), true),
             ("NaN in b", Box::new(move |d| d.b[g_at(row, 3)] = f32::NAN), true),
             ("NaN in a", Box::new(move |d| d.a[g_at(row, 0)] = f32::NAN), true),
             ("+inf in a", Box::new(move |d| d.a[g_at(row, 2)] = f32::INFINITY), false),
-            ("-inf in a", Box::new(move |d| d.a[g_at(row, 2)] = f32::NEG_INFINITY), false),
+            (
+                "-inf in a",
+                Box::new(move |d| d.a[g_at(row, 2)] = f32::NEG_INFINITY),
+                false,
+            ),
             (
                 "q, k of 1e30 (norm overflows)",
                 Box::new(move |d| {
@@ -1089,27 +1146,46 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
             let mut d = GdnData::random(s, "batch", 9700 + i as u64);
             poison(&mut d);
             let (ry, rs) = run_gdn(rt, &d, Path::Recurrent);
-            let (sy, ss) = run_gdn(rt, &d, Path::RecurrentSimd);
-            let (my, ms) = (bad_mask(&ry), bad_mask(&sy));
-            let (mrs, mss) = (bad_mask(&rs), bad_mask(&ss));
-            let bad = my.iter().filter(|&&b| b).count() + mrs.iter().filter(|&&b| b).count();
+            let my_bad = bad_mask(&ry);
+            let mrs = bad_mask(&rs);
+            let bad = my_bad.iter().filter(|&&b| b).count() + mrs.iter().filter(|&&b| b).count();
             // A poison that poisoned nothing in the incumbent would make the
             // equality below vacuous: say which ones are expected to bite.
-            assert_eq!(bad > 0, *must_poison, "{name}: gdn_recurrent produced {bad} non-finite elements");
-            assert_eq!(my, ms, "{name}: non-finite pattern of y differs from gdn_recurrent's");
-            assert_eq!(mrs, mss, "{name}: non-finite pattern of the state differs from gdn_recurrent's");
-            println!("GDN_SIMD_NONFINITE {name}: {bad} non-finite elements in both kernels, patterns equal");
-            for (what, a, b) in [("y", &ry, &sy), ("state", &rs, &ss)] {
-                let scale = a.iter().filter(|x| x.is_finite()).fold(0.0f32, |m, x| m.max(x.abs()));
-                for (j, (x, z)) in a.iter().zip(b.iter()).enumerate() {
-                    if x.is_finite() && z.is_finite() {
-                        assert!(
-                            (x - z).abs() <= 1e-3 * scale.max(1e-3),
-                            "{name} {what}[{j}]: recurrent {x} simd {z}"
-                        );
+            assert_eq!(
+                bad > 0,
+                *must_poison,
+                "{name}: gdn_recurrent produced {bad} non-finite elements"
+            );
+            for path in [
+                Path::RecurrentSimd,
+                Path::SimdVariant(GdnSimdVariant::FusedSg8),
+                Path::SimdVariant(GdnSimdVariant::Prepped),
+                Path::SimdVariant(GdnSimdVariant::PreppedSg8),
+            ] {
+                let (sy, ss) = run_gdn(rt, &d, path);
+                assert_eq!(
+                    my_bad,
+                    bad_mask(&sy),
+                    "{name} {path:?}: non-finite pattern of y differs from gdn_recurrent's"
+                );
+                assert_eq!(
+                    mrs,
+                    bad_mask(&ss),
+                    "{name} {path:?}: non-finite pattern of the state differs from gdn_recurrent's"
+                );
+                for (what, a, b) in [("y", &ry, &sy), ("state", &rs, &ss)] {
+                    let scale = a.iter().filter(|x| x.is_finite()).fold(0.0f32, |m, x| m.max(x.abs()));
+                    for (j, (x, z)) in a.iter().zip(b.iter()).enumerate() {
+                        if x.is_finite() && z.is_finite() {
+                            assert!(
+                                (x - z).abs() <= 1e-3 * scale.max(1e-3),
+                                "{name} {path:?} {what}[{j}]: recurrent {x} simd {z}"
+                            );
+                        }
                     }
                 }
             }
+            println!("GDN_SIMD_NONFINITE {name}: {bad} non-finite elements in gdn_recurrent and in all four simd kernels, patterns equal");
         }
     });
 }
@@ -1137,13 +1213,59 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
                 count("qwen35_gdn_recurrent"),
                 count("qwen35_gdn_recurrent_bv16"),
             );
-            run_gdn_slice(rt, &d, Path::RecurrentSimd, StateOut::Separate, None, GdnScanSlice::Cols32);
-            assert_eq!(count("qwen35_gdn_recurrent_simd") - simd0, 1, "one simd pipeline request");
-            assert_eq!(count("qwen35_gdn_recurrent") - rec0, 0, "the simd path must not request gdn_recurrent");
+            run_gdn_slice(
+                rt,
+                &d,
+                Path::RecurrentSimd,
+                StateOut::Separate,
+                None,
+                GdnScanSlice::Cols32,
+            );
+            assert_eq!(
+                count("qwen35_gdn_recurrent_simd") - simd0,
+                1,
+                "one simd pipeline request"
+            );
+            assert_eq!(
+                count("qwen35_gdn_recurrent") - rec0,
+                0,
+                "the simd path must not request gdn_recurrent"
+            );
             assert_eq!(count("qwen35_gdn_recurrent_bv16") - rec16_0, 0);
             run_gdn_slice(rt, &d, Path::Recurrent, StateOut::Separate, None, GdnScanSlice::Cols32);
-            assert_eq!(count("qwen35_gdn_recurrent_simd") - simd0, 1, "gdn_recurrent must not request the simd kernel");
+            assert_eq!(
+                count("qwen35_gdn_recurrent_simd") - simd0,
+                1,
+                "gdn_recurrent must not request the simd kernel"
+            );
             assert_eq!(count("qwen35_gdn_recurrent") - rec0, 1);
+            // Each variant asks for its own pipeline (the prepped ones also the prep pass), and no other's.
+            for (v, name, prep) in [
+                (GdnSimdVariant::FusedSg8, "qwen35_gdn_recurrent_simd_sg8", 0),
+                (GdnSimdVariant::Prepped, "qwen35_gdn_recurrent_simd_pre", 1),
+                (GdnSimdVariant::PreppedSg8, "qwen35_gdn_recurrent_simd_pre_sg8", 1),
+            ] {
+                let (n0, p0, s0) = (
+                    count(name),
+                    count("qwen35_gdn_simd_prep"),
+                    count("qwen35_gdn_recurrent_simd"),
+                );
+                run_gdn_slice(
+                    rt,
+                    &d,
+                    Path::SimdVariant(v),
+                    StateOut::Separate,
+                    None,
+                    GdnScanSlice::Cols32,
+                );
+                assert_eq!(count(name) - n0, 1, "{v:?}: its own pipeline");
+                assert_eq!(count("qwen35_gdn_simd_prep") - p0, prep, "{v:?}: prep passes");
+                assert_eq!(
+                    count("qwen35_gdn_recurrent_simd") - s0,
+                    0,
+                    "{v:?}: must not run the fused kernel"
+                );
+            }
         });
     });
 }
@@ -1173,8 +1295,14 @@ fn the_simd_bound_can_fail() {
         let (mut y2, mut s2) = (y.clone(), st.clone());
         y2[y.len() / 2] += 1e-3 * max_abs(&want_y) as f32 * 2.0;
         s2[st.len() / 3] += 1e-3 * max_abs(&want_s) as f32 * 2.0;
-        assert!(rejects(y2, &want_y), "a 2e-3 relative error in one y element passed the bound");
-        assert!(rejects(s2, &want_s), "a 2e-3 relative error in one state element passed the bound");
+        assert!(
+            rejects(y2, &want_y),
+            "a 2e-3 relative error in one y element passed the bound"
+        );
+        assert!(
+            rejects(s2, &want_s),
+            "a 2e-3 relative error in one state element passed the bound"
+        );
         // And a kernel doing the wrong thing fails the comparison against the
         // reference: the same problem with the start state dropped.
         let mut no_state = GdnData::random(s, "batch", 9950);
@@ -2362,6 +2490,10 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_recurrent",
             "qwen35_gdn_recurrent_bv16",
             "qwen35_gdn_recurrent_simd",
+            "qwen35_gdn_recurrent_simd_sg8",
+            "qwen35_gdn_recurrent_simd_pre",
+            "qwen35_gdn_recurrent_simd_pre_sg8",
+            "qwen35_gdn_simd_prep",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
             "qwen35_attn_qk_norm_rope",

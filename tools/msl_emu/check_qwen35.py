@@ -266,7 +266,7 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
     # So does the 16-column recurrent.
     # The simd recurrent has no 16-column form, and sums in another order than the
     # recurrent: it is held to the f64 reference below, not to a bit pattern.
-    if T <= 1000 and kernel != "qwen35_gdn_recurrent_simd":
+    if T <= 1000 and not kernel.startswith("qwen35_gdn_recurrent_simd"):
         flag = "scan_bv16" if kernel == "qwen35_gdn_chunk" else "rec_bv16"
         out16 = run(kernel, dict(params, **{flag: 1}), inputs, outs)
         for name in outs:
@@ -1380,6 +1380,7 @@ def case_host_contract():
                                 ("SCAN16_TG_BYTES", "GDN_SCAN16_TG_FLOATS", 4),
                                 ("REC_TG_BYTES", "GDN_REC_TG_FLOATS", 4),
                                 ("REC_SIMD_COLS", "GDN_SIMD_COLS", 1),
+                                ("SIMD_PREP_SG", "GDN_SIMD_PREP_SG", 1),
                                 ("REDUCE_MAX_SIMDGROUPS", "REDUCE_MAX_SIMDGROUPS", 1),
                                 ("PREFIX_ATTN_HEAD_DIM", "PREFIX_ATTN_D", 1),
                                 ("PREFIX_ATTN_LANES", "PREFIX_ATTN_R", 1),
@@ -1422,6 +1423,10 @@ def case_host_contract():
         if not ok:
             FAILURES.append(f"constant {const}")
 
+
+# The one-simdgroup-per-column recurrence: fused gates and norms, or from the prep pass; 4 or 8 columns a group.
+SIMD_KERNELS = ["qwen35_gdn_recurrent_simd", "qwen35_gdn_recurrent_simd_sg8",
+                "qwen35_gdn_recurrent_simd_pre", "qwen35_gdn_recurrent_simd_pre_sg8"]
 
 CASES = [
     ("host_contract_parser", case_host_contract_parser),
@@ -1468,18 +1473,20 @@ CASES = [
     ("recurrent_in_place", lambda: case_recurrent_in_place(14)),
     # qwen35_gdn_recurrent_simd (one simdgroup a value column): the recurrent's
     # cases, held to the same transformers function and f64 reference.
-    ("simd_recurrent_T0_passthrough", lambda: case_gdn("qwen35_gdn_recurrent_simd", 2, 0, 1, 2, 32, 123,
-                                                       state_mode="snapshot")),
-    ("simd_recurrent_T1_snapshot", lambda: case_gdn("qwen35_gdn_recurrent_simd", 4, 1, 2, 4, 64, 111,
-                                                    state_mode="snapshot")),
-    ("simd_recurrent_T7_state", lambda: case_gdn("qwen35_gdn_recurrent_simd", 2, 7, 1, 2, 128, 112,
-                                                 state_mode="batch")),
-    ("simd_recurrent_T20", lambda: case_gdn("qwen35_gdn_recurrent_simd", 1, 20, 1, 1, 32, 113)),
-    ("simd_recurrent_softplus_series", lambda: case_gdn("qwen35_gdn_recurrent_simd", 1, 9, 1, 2, 32, 120,
-                                                        dt_shift=-10.0)),
-    ("config_2b_simd_recurrent", lambda: case_gdn("qwen35_gdn_recurrent_simd", 2, 2, 16, 16, 128, 135,
-                                                  state_mode="snapshot")),
-    ("simd_recurrent_in_place", lambda: case_recurrent_in_place(114, "qwen35_gdn_recurrent_simd")),
+    ("simd_recurrent_T0_passthrough", lambda: [case_gdn(k, 2, 0, 1, 2, 32, 123, state_mode="snapshot")
+                                               for k in SIMD_KERNELS]),
+    ("simd_recurrent_T1_snapshot", lambda: [case_gdn(k, 4, 1, 2, 4, 64, 111, state_mode="snapshot")
+                                            for k in SIMD_KERNELS]),
+    ("simd_recurrent_T7_state", lambda: [case_gdn(k, 2, 7, 1, 2, 128, 112, state_mode="batch")
+                                         for k in SIMD_KERNELS]),
+    ("simd_recurrent_T20", lambda: [case_gdn(k, 1, 20, 1, 1, 32, 113) for k in SIMD_KERNELS]),
+    ("simd_recurrent_softplus_series", lambda: [case_gdn(k, 1, 9, 1, 2, 32, 120, dt_shift=-10.0)
+                                                for k in SIMD_KERNELS]),
+    # Grouped value heads (hv = 2 hk): the prep pass recomputes a key head's norms per value head.
+    ("simd_recurrent_gqa", lambda: [case_gdn(k, 2, 5, 2, 4, 64, 121, state_mode="batch") for k in SIMD_KERNELS]),
+    ("config_2b_simd_recurrent", lambda: [case_gdn(k, 2, 2, 16, 16, 128, 135, state_mode="snapshot")
+                                          for k in SIMD_KERNELS]),
+    ("simd_recurrent_in_place", lambda: [case_recurrent_in_place(114, k) for k in SIMD_KERNELS]),
     ("gated_norm", lambda: [case_gated_norm(bf, 15) for bf in (False, True)]),
     ("qk_norm_rope", lambda: case_qk_norm_rope(16)),
     ("qk_rope_posbuf", lambda: case_qk_rope_posbuf(29)),

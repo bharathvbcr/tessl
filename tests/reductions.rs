@@ -50,9 +50,10 @@ fn softmax_matches_a_f64_reference() {
                     );
                     sum += g as f64;
                 }
+                let sum_bound = reduction_bound(cols, 1.0);
                 assert!(
-                    (sum - 1.0).abs() < 1e-4,
-                    "row {r} of {rows}x{cols} sums to {sum}, not 1"
+                    (sum - 1.0).abs() <= sum_bound,
+                    "row {r} of {rows}x{cols} sums to {sum}, not 1 (bound {sum_bound})"
                 );
             }
         }
@@ -341,24 +342,26 @@ fn planted_non_finite_inputs_poison_exactly_their_rows() {
             // A -inf next to finite entries is an ordinary masked row: a distribution over the
             // finite entries with exactly zero mass at the -inf position.
             let out3 = row(&sm, 3);
+            let sum_bound = reduction_bound(cols, 1.0);
             assert!(
                 out3.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p))
-                    && (out3.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() < 1e-4,
-                "{label}: softmax of a masked row is not a distribution"
+                    && (out3.iter().map(|p| f64::from(*p)).sum::<f64>() - 1.0).abs() <= sum_bound,
+                "{label}: softmax of a masked row is not a distribution (bound {sum_bound})"
             );
             assert_eq!(sm[at(3, c_ninf)], 0.0, "{label}: softmax at a planted -inf");
         }
     });
 }
 
-/// Subnormal inputs. Fast math may flush them to zero, so the result is either the f32
-/// reference or the flushed one; what it must never be is a magnitude the input does not
-/// have. Budget: `reduction_bound(n, scale)` with scale = sum of |terms|.
+/// Subnormal inputs. Budget for the normal row: `reduction_bound(n, scale)` with scale = sum of
+/// |terms|.
 ///
-/// Observed on the device (Apple GPU, fast math): `row_sum_f32` flushes subnormal inputs to
-/// zero (the row of 1000 x 1e-40 sums to 0), while `row_max_f32` keeps a subnormal (max of
-/// that row is 1e-40). The assertions accept both branches, so the test records and does not
-/// change this behaviour.
+/// Pinned to what this Apple GPU's fast math was observed to do, not to either outcome. A kernel
+/// that takes the other branch fails:
+///
+/// * `row_sum_f32` flushes. A row of 1000 x 1e-40 sums to 0, and one negative subnormal among
+///   zeros sums to 0.
+/// * `row_max_f32` keeps the subnormal. The max of that row is 1e-40, not 0.
 #[test]
 fn subnormal_inputs_are_summed_or_flushed_never_invented() {
     with_gpu(|rt| {
@@ -372,29 +375,14 @@ fn subnormal_inputs_are_summed_or_flushed_never_invented() {
         x[cols + 7] = sub;
         x[2 * cols + 11] = -sub; // row 2: one negative subnormal in zeros
         let (s, m, _) = run_reductions(rt, &x, rows, cols);
-
-        let ref0 = f64::from(sub) * cols as f64;
-        let b0 = reduction_bound(cols, ref0);
-        let branch = |got: f32, want: f64, b: f64| {
-            if got == 0.0 {
-                "flushed-to-zero"
-            } else if (f64::from(got) - want).abs() <= b {
-                "reference"
-            } else {
-                "neither"
-            }
-        };
         eprintln!(
-            "OBSERVED subnormal sum row0 = {:e} ({}), row2 = {:e}, max row0 = {:e} ({})",
-            s[0],
-            branch(s[0], ref0, b0),
-            s[2],
-            m[0],
-            if m[0] == 0.0 { "flushed-to-zero" } else { "kept" }
+            "OBSERVED subnormal sum row0 = {:e}, row2 = {:e}, max row0 = {:e}",
+            s[0], s[2], m[0]
         );
-        assert!(
-            s[0] == 0.0 || (f64::from(s[0]) - ref0).abs() <= b0,
-            "sum of {cols} x {sub:e} = {:e}: want {ref0:e} +- {b0:e} or flushed 0",
+
+        assert_eq!(
+            s[0], 0.0,
+            "row_sum_f32 flushes a subnormal row: sum of {cols} x {sub:e} got {:e}",
             s[0]
         );
         let ref1 = (cols - 1) as f64 + f64::from(sub);
@@ -404,19 +392,19 @@ fn subnormal_inputs_are_summed_or_flushed_never_invented() {
             "normal row with a subnormal: {} want {ref1} +- {b1}",
             s[1]
         );
-        assert!(
-            s[2] == 0.0 || (f64::from(s[2]) + f64::from(sub)).abs() <= reduction_bound(cols, f64::from(sub)),
-            "sum of zeros and one -{sub:e} = {:e}",
+        assert_eq!(
+            s[2], 0.0,
+            "row_sum_f32 flushes one negative subnormal among zeros, got {:e}",
             s[2]
         );
-        assert!(
-            m[0] == sub || m[0] == 0.0,
-            "max of a subnormal row is itself or flushed, got {:e}",
+        assert_eq!(
+            m[0], sub,
+            "row_max_f32 keeps a subnormal: max got {:e}, want {sub:e}",
             m[0]
         );
         assert_eq!(m[1], 1.0, "max of the normal row");
-        assert!(
-            m[2] == 0.0,
+        assert_eq!(
+            m[2], 0.0,
             "max of zeros and one negative subnormal is 0, got {:e}",
             m[2]
         );
@@ -430,42 +418,148 @@ fn f16_running_sum(terms: &[f32]) -> f32 {
         .fold(0.0f32, |acc, t| f16_bits_to_f32(f32_to_f16_bits(acc + t)))
 }
 
+/// f16 within each tile of `tile` products, then those tile sums added in f32.
+/// A tile of 1 is the contract (f32 accumulation of f16 products). Width 2 and up is the
+/// tiled f16 accumulator the all-ones input does not catch.
+fn f16_tiled_sum(terms: &[f32], tile: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for chunk in terms.chunks(tile) {
+        acc += f16_running_sum(chunk);
+    }
+    acc
+}
+
+fn f16_roundtrip(v: f32) -> f32 {
+    f16_bits_to_f32(f32_to_f16_bits(v))
+}
+
+/// One row of A. `b_val` is every element of B, so each product is `a * b_val`.
+struct F16Case {
+    k: usize,
+    m: usize,
+    n: usize,
+    b_val: f32,
+    /// When set, every tile width in 2, 4, 8, 16, 32 must miss the f32 budget.
+    tiled: bool,
+    row: fn(usize) -> Vec<f32>,
+}
+
+fn f16_row_ones(k: usize) -> Vec<f32> {
+    vec![1.0; k]
+}
+
+fn f16_row_sixteens(k: usize) -> Vec<f32> {
+    vec![16.0; k]
+}
+
+/// Pairs of +65504, +65504, -65504, -65504. The f32 sum is 0. Any f16 tile of
+/// two or more products overflows before the cancellation (65504 + 65504 is
+/// past f16's finite range). All ones do not: a tile of ones is exact in f16.
+fn f16_row_cancel(k: usize) -> Vec<f32> {
+    let h = 65504.0f32;
+    (0..k).map(|i| if i % 4 < 2 { h } else { -h }).collect()
+}
+
 /// A K-long dot product of f16 operands accumulates in f32 (the contract: f16/bf16 operands
-/// "accumulate in f32", `tests/f16.rs`). Two inputs on which an f16 accumulator fails
-/// visibly, each first checked on the host to *discriminate* (an f16 running sum is off by
-/// far more than the budget), so a vacuous input cannot pass:
+/// "accumulate in f32", `tests/f16.rs`). Each input is checked on the host first, so a
+/// vacuous input cannot pass:
 ///
-/// * K = 8192 products of 1.0: f16's running sum stalls at 2048 (ulp 2 absorbs +1).
-/// * K = 4096 products of 256.0: the true 2^20 exceeds f16's 65504, so an f16 sum is +inf.
+/// * K = 8192 products of 1.0: a running f16 sum stalls at 2048. A tiled f16 sum of ones
+///   stays exact, so this case does not claim to catch a tile.
+/// * K = 4096 products of 256.0: the true 2^20 exceeds f16's 65504, so a running f16 sum
+///   is +inf. A tile of 64 * 256 still fits in f16.
+/// * K = 128 of the cancelling ±65504 pattern: every tile width from 2 to 32 is non-finite
+///   or far from the f32 sum 0.
 ///
-/// Reference: f64 over the same f16-rounded operands; budget `reduction_bound(K, sum |terms|)`.
+/// `GemmBackend::Simdgroup` has no f16 kernel and must refuse. A backend that accepts the
+/// call is held to the same f32 reference. Reference: f64 over the products; budget
+/// `reduction_bound(K, sum |terms|)`.
 #[test]
 fn f16_operands_accumulate_in_f32() {
+    let cases = [
+        F16Case {
+            k: 8192,
+            m: 128,
+            n: 64,
+            b_val: 1.0,
+            tiled: false,
+            row: f16_row_ones,
+        },
+        F16Case {
+            k: 4096,
+            m: 128,
+            n: 64,
+            b_val: 16.0,
+            tiled: false,
+            row: f16_row_sixteens,
+        },
+        F16Case {
+            k: 128,
+            m: 64,
+            n: 64,
+            b_val: 1.0,
+            tiled: true,
+            row: f16_row_cancel,
+        },
+    ];
     with_gpu(|rt| {
-        for &(k, a_val, b_val) in &[(8192usize, 1.0f32, 1.0f32), (4096, 16.0, 16.0)] {
-            let (m, n) = (128usize, 64usize);
-            let terms: Vec<f32> = vec![a_val * b_val; k];
+        for case in cases {
+            let a_row = (case.row)(case.k);
+            assert_eq!(a_row.len(), case.k);
+            let terms: Vec<f32> = a_row.iter().map(|a| a * case.b_val).collect();
+            for (i, t) in terms.iter().enumerate() {
+                assert_eq!(f16_roundtrip(*t), *t, "k={}: product {i} is not f16-exact", case.k);
+            }
             let abs_sum: f64 = terms.iter().map(|t| f64::from(t.abs())).sum();
             let want = terms.iter().map(|t| f64::from(*t)).sum::<f64>();
-            let bound = reduction_bound(k, abs_sum);
+            let bound = reduction_bound(case.k, abs_sum);
             let f16_sum = f64::from(f16_running_sum(&terms));
             assert!(
                 !f16_sum.is_finite() || (f16_sum - want).abs() > 100.0 * bound,
-                "k={k}: input does not discriminate (f16 sum {f16_sum}, f32 {want}, bound {bound})"
+                "k={}: input does not discriminate (f16 sum {f16_sum}, f32 {want}, bound {bound})",
+                case.k
             );
+            if case.tiled {
+                for tile in [2usize, 4, 8, 16, 32] {
+                    assert_eq!(case.k % tile, 0, "k {} not divisible by tile {tile}", case.k);
+                    let got = f64::from(f16_tiled_sum(&terms, tile));
+                    assert!(
+                        !got.is_finite() || (got - want).abs() > 100.0 * bound,
+                        "tile {tile}: tiled f16 accumulator is not off the f32 result ({got} vs {want} +- {bound})"
+                    );
+                }
+            }
 
-            let a = rt.alloc_tensor_f16(&[m, k]).unwrap();
-            a.buffer.write_f16_bits(&f32_slice_to_f16(&vec![a_val; m * k]));
-            let b = rt.alloc_tensor_f16(&[k, n]).unwrap();
-            b.buffer.write_f16_bits(&f32_slice_to_f16(&vec![b_val; k * n]));
-            let c = tensor_f32(rt, &[m, n], &vec![0.0; m * n]);
-            gemm(&a, &b, &c, GemmBackend::TensorOps).expect("f16 gemm");
-            rt.synchronize().unwrap();
-            for (i, got) in c.buffer.read_f32().iter().enumerate() {
-                assert!(
-                    (f64::from(*got) - want).abs() <= bound,
-                    "k={k}: c[{i}] = {got}, f32-accumulated reference {want} +- {bound} (an f16 accumulator gives {f16_sum})"
-                );
+            let mut a_host = vec![0.0f32; case.m * case.k];
+            for row in 0..case.m {
+                a_host[row * case.k..(row + 1) * case.k].copy_from_slice(&a_row);
+            }
+            let a = rt.alloc_tensor_f16(&[case.m, case.k]).unwrap();
+            a.buffer.write_f16_bits(&f32_slice_to_f16(&a_host));
+            let b = rt.alloc_tensor_f16(&[case.k, case.n]).unwrap();
+            b.buffer
+                .write_f16_bits(&f32_slice_to_f16(&vec![case.b_val; case.k * case.n]));
+            for backend in [GemmBackend::TensorOps, GemmBackend::Simdgroup] {
+                let c = tensor_f32(rt, &[case.m, case.n], &vec![0.0; case.m * case.n]);
+                match gemm(&a, &b, &c, backend) {
+                    Ok(()) => {
+                        rt.synchronize().unwrap();
+                        for (i, got) in c.buffer.read_f32().iter().enumerate() {
+                            assert!(
+                                (f64::from(*got) - want).abs() <= bound,
+                                "k={} {backend:?}: c[{i}] = {got}, f32-accumulated reference {want} +- {bound} (an f16 accumulator gives {f16_sum})",
+                                case.k
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        assert!(
+                            backend == GemmBackend::Simdgroup && e.contains("f16 require TensorOps"),
+                            "k={} {backend:?} f16 refusal: {e}",
+                            case.k
+                        );
+                    }
+                }
             }
         }
     });

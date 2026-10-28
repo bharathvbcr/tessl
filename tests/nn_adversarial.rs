@@ -14,7 +14,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{buf, empty, random_f32, reduction_bound, with_gpu};
+use common::{buf, empty, random_f32, with_gpu};
 use objc2_metal::MTLComputePipelineState;
 use tessl::nn::{
     self, AttnDims, AttnHeadDim, Q4Bank, Q4MlxBank, Q4MlxLayout, Q4MlxRowVariant, QkvBuffers, QkvRopeDims,
@@ -466,23 +466,19 @@ fn oversize_threadgroup_names_the_kernel_the_request_and_the_limit() {
     });
 }
 
-/// RMSNorm of rows carrying planted NaN, +inf and a subnormal row, against clean neighbours.
+/// RMSNorm of rows carrying planted NaN, +inf, -inf and a subnormal row, against clean neighbours.
 ///
-/// `out = x * rsqrt(mean(x^2) + eps) * w`, so by the arithmetic: a NaN anywhere makes the sum of
-/// squares NaN and every element of that row NaN; a +inf makes it +inf, `rsqrt` 0, every other
+/// `out = x * rsqrt(mean(x^2) + eps) * w`. A NaN anywhere makes the sum of squares NaN and every
+/// element of that row NaN. A +inf or a -inf makes the sum of squares +inf, `rsqrt` 0, every other
 /// element `x * 0 * w = 0` and the planted one `inf * 0 = NaN`. The clean rows around them are
-/// compared bit for bit with a run of the same data without the plants. A row of subnormals
-/// squares to zero (flushed or not), so `inv = rsqrt(eps)` and `out = x * inv * w`; fast math
-/// may flush the input itself, so the result is that or exactly 0. Budget for the subnormal
-/// row: `reduction_bound(dim, |reference|)` (scale = the reference output).
+/// compared bit for bit with a run of the same data without the plants.
 ///
-/// Observed on the device (fast math): the subnormal row is flushed completely, 1000 of 1000
-/// outputs are exactly 0 and none equals the reference. The assertion accepts either branch;
-/// the test records that behaviour and does not change it.
+/// Pinned to the device: `rms_norm` flushes a subnormal row. All `dim` outputs are exactly 0.
+/// The unflushed reference would be `x * rsqrt(eps)`; a kernel that returns it fails.
 #[test]
 fn rms_norm_planted_non_finite_and_subnormal_rows() {
     with_gpu(|rt| {
-        let (rows, dim, eps) = (5usize, 1000usize, 1e-6f32);
+        let (rows, dim, eps) = (6usize, 1000usize, 1e-6f32);
         let clean = random_f32(rows * dim, 0x4A5);
         let mut x = clean.clone();
         let sub = 1.0e-40f32;
@@ -491,6 +487,7 @@ fn rms_norm_planted_non_finite_and_subnormal_rows() {
         x[dim + c_nan] = f32::NAN; // row 1
         x[2 * dim + c_inf] = f32::INFINITY; // row 2
         x[3 * dim..4 * dim].fill(sub); // row 3
+        x[4 * dim + c_inf] = f32::NEG_INFINITY; // row 4
         let weight = buf(rt, &vec![1.0f32; dim]);
         let run = |data: &[f32]| {
             let (xb, ob) = (buf(rt, data), empty(rt, rows * dim));
@@ -502,7 +499,7 @@ fn rms_norm_planted_non_finite_and_subnormal_rows() {
         let row = |v: &[f32], r: usize| v[r * dim..(r + 1) * dim].to_vec();
         let bits = |v: Vec<f32>| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
 
-        for r in [0usize, 4] {
+        for r in [0usize, 5] {
             assert_eq!(bits(row(&got, r)), bits(row(&want_clean, r)), "clean row {r} changed");
         }
         assert!(
@@ -518,22 +515,22 @@ fn rms_norm_planted_non_finite_and_subnormal_rows() {
             r2.iter().enumerate().all(|(c, v)| c == c_inf || *v == 0.0),
             "every other element of a +inf row is x * 0 = 0"
         );
-        let inv = 1.0 / f64::from(eps).sqrt();
-        let want = f64::from(sub) * inv;
-        let bound = reduction_bound(dim, want);
+        let r4 = row(&got, 4);
+        assert!(
+            r4[c_inf].is_nan(),
+            "inf * rsqrt(inf) = inf * 0 = NaN at the planted -inf"
+        );
+        assert!(
+            r4.iter().enumerate().all(|(c, v)| c == c_inf || *v == 0.0),
+            "every other element of a -inf row is x * 0 = 0"
+        );
         let flushed = row(&got, 3).iter().filter(|v| **v == 0.0).count();
         eprintln!(
-            "OBSERVED rms_norm subnormal row: {flushed}/{dim} outputs flushed to 0, first = {:e} (reference {want:e}); \
-             NaN row nan_count={}, +inf row nan_count={}",
-            row(&got, 3)[0],
-            row(&got, 1).iter().filter(|v| v.is_nan()).count(),
-            r2.iter().filter(|v| v.is_nan()).count()
+            "OBSERVED rms_norm subnormal row: {flushed}/{dim} outputs flushed to 0, first = {:e}",
+            row(&got, 3)[0]
         );
         for (c, v) in row(&got, 3).iter().enumerate() {
-            assert!(
-                *v == 0.0 || (f64::from(*v) - want).abs() <= bound,
-                "subnormal row [{c}] = {v:e}, want {want:e} +- {bound:e} or flushed 0"
-            );
+            assert_eq!(*v, 0.0, "rms_norm flushes a subnormal row: [{c}] = {v:e}, want 0");
         }
     });
 }

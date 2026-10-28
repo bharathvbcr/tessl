@@ -82,21 +82,21 @@ fn parsing_weights_dir(name: &str) -> Scratch {
 
 #[test]
 fn attn_tiles_refuses_every_other_lane_and_the_model_options() {
-    // The `--weights`, `--gdn-chunked` and `--gdn-scan32` cases must get past the checkpoint
+    // The `--weights`, `--gdn-simd` and `--gdn-scan32` cases must get past the checkpoint
     // parse to the `--paired-*` guard, so the directory is one that parses.
     let d = parsing_weights_dir("bq35_tiles_weights");
     let p = d.0.to_str().unwrap();
     assert_refused_before_gpu(
         &["--attn-tiles", &format!("--weights={p}")],
-        "--weights, --gdn-chunked and --gdn-scan32 apply to the model lanes",
+        "--weights, --gdn-simd and --gdn-scan32 apply to the model lanes",
     );
     assert_refused_before_gpu(
         &["--attn-tiles", "--gdn-scan32"],
-        "--weights, --gdn-chunked and --gdn-scan32 apply to the model lanes",
+        "--weights, --gdn-simd and --gdn-scan32 apply to the model lanes",
     );
     assert_refused_before_gpu(
-        &["--attn-tiles", "--gdn-chunked"],
-        "--weights, --gdn-chunked and --gdn-scan32 apply to the model lanes",
+        &["--attn-tiles", "--gdn-simd"],
+        "--weights, --gdn-simd and --gdn-scan32 apply to the model lanes",
     );
     for lane in [
         "--check-only",
@@ -146,7 +146,7 @@ fn paired_attn_bf16_refuses_every_other_lane_and_iters() {
     }
     assert_refused_before_gpu(
         &["--paired-attn-bf16", "--gdn-scan32"],
-        "--weights, --gdn-chunked and --gdn-scan32 apply to the model lanes",
+        "--weights, --gdn-simd and --gdn-scan32 apply to the model lanes",
     );
 }
 
@@ -162,19 +162,19 @@ fn iters_flag_reaches_the_layer_table_label() {
     assert!(!stdout.contains("median of 7"), "stale default in output:\n{stdout}");
     // The bench times the library's default prefill GDN, not an override of it.
     assert!(
-        stdout.contains("gdn prefill: Simd"),
+        stdout.contains("gdn prefill: Chunked(Cols16)"),
         "bench overrode the default GDN prefill:\n{stdout}"
     );
 }
 
-/// GPU: `--gdn-chunked` reaches the model, which then runs the chunked rule.
+/// GPU: `--gdn-simd` reaches the model, which then runs the simd recurrence.
 #[test]
-fn gdn_chunked_flag_reaches_the_model() {
-    let (ok, stdout, stderr) = run(&["--gdn-chunked", "--iters=1", "16"]);
+fn gdn_simd_flag_reaches_the_model() {
+    let (ok, stdout, stderr) = run(&["--gdn-simd", "--iters=1", "16"]);
     assert!(ok, "bench failed:\n{stdout}\n{stderr}");
     assert!(
-        stdout.contains("gdn prefill: Chunked(Cols16)"),
-        "model did not get --gdn-chunked:\n{stdout}"
+        stdout.contains("gdn prefill: Simd"),
+        "model did not get --gdn-simd:\n{stdout}"
     );
 }
 

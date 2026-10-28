@@ -69,8 +69,8 @@ All notable changes to `tessl` are recorded here. The format follows
   kernels (`qwen35_gdn_recurrent_simd`, `_l8_vec`, `_pre_l8_vec` with its
   `qwen35_gdn_simd_prep` pass) taking `gdn_recurrent`'s inputs and agreeing with it to
   rounding (about 2e-7 of the output scale; summation order differs, so not bitwise).
-  `Qwen35Model`'s prefill runs `_pre_l8_vec` (`GdnSimdVariant::Prepped8`) by default (see
-  Changed). Measured in
+  `Qwen35Model`'s prefill runs `_pre_l8_vec` (`GdnSimdVariant::Prepped8`) when given
+  `GdnPrefillKernel::Simd` (opt-in; see Changed). Measured in
   `bench/results/qwen35_gdn_simd_ab_m5pro.txt`: mlx's 32-lanes-a-column mapping as it is
   is slower than `gdn_recurrent` at every length; the 8-lane, `float4`-load kernel with
   the gates and norms computed once per (token, value head) takes 0.63x / 0.76x / 0.83x
@@ -190,24 +190,36 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
-- **`Qwen35Model` prefill: bf16 attention tile and the simd GDN recurrence by default**
+- **`Qwen35Model` prefill: the bf16 attention tile by default; the simd GDN recurrence opt-in**
   (`src/qwen35_model.rs`). `Precision::Bf16` prefill (and staged prefill) casts Q, K and V
   to bf16 once (`attn_prefill_bf16::cast_f32_to_bf16`) and runs
   `attn_prefill_bf16_with_tile` at Q32K64 with a bf16 probability tile. O, the K/V caches
-  and decode attention stay f32, and `Precision::F32` keeps `attn_prefill`. Prefill GDN, in
-  both precisions, runs `gdn_recurrent_simd_with` (`GdnSimdVariant::Prepped8`) instead of
-  `gdn_chunk_forward`. `GdnPrefillKernel { Chunked(GdnScanSlice), Simd }` (default
-  `Simd`) is set with `with_gdn_prefill`, and `with_gdn_scan_slice` selects `Chunked`. Acts
-  allocates only the chosen kernel's scratch. Decode is unchanged (`gdn_recurrent`).
-  Gated on the real 2B (`bench/results/w33_prefill_gate_m5pro.txt`):
+  and decode attention stay f32, and `Precision::F32` keeps `attn_prefill`. With the
+  default chunked GDN, the real-2B bf16 gate
+  (`bench/results/w31_attn_bf16_gate_m5pro.txt`) gives mean KL against fp32 of 3.43e-5 /
+  3.13e-5, with 0 / 2 top-1 misses on the prompt and text references. transformers bf16
+  gives 5.74e-4 / 3.79e-4, with 3 / 17 misses.
+  `GdnPrefillKernel { Chunked(GdnScanSlice), Simd }` is set with `with_gdn_prefill`, and
+  `with_gdn_scan_slice` selects `Chunked` at a slice. The default stays
+  `Chunked(GdnScanSlice::default())`, the owner's rule: it changes only if the simd prefill
+  is faster. `Simd` runs `gdn_recurrent_simd_with` (`GdnSimdVariant::Prepped8`) in both
+  precisions; Acts allocates only the chosen kernel's scratch. Decode is unchanged
+  (`gdn_recurrent`). `Simd` is gated on the real 2B
+  (`bench/results/w33_prefill_gate_m5pro.txt`):
   - f32 layer by layer against transformers fp32: logits rel err 1.97e-6, top-1
     mismatches 0/155.
-  - bf16 against fp32: mean KL 3.09e-5 / 3.05e-5 with 0 / 1 top-1 misses on the prompt
-    and text references. transformers bf16 gives 5.74e-4 / 3.79e-4 with 3 / 17 misses.
+  - bf16 against fp32: mean KL 3.09e-5 / 3.05e-5, with 0 / 1 top-1 misses.
 
   Kernel-level timings are in `qwen35_attn_bf16_tiles_m5pro.txt` and
-  `qwen35_gdn_simd_ab_m5pro.txt`. The model-level prefill+score head-to-head against
-  mlx-lm has not been run on these defaults yet.
+  `qwen35_gdn_simd_ab_m5pro.txt`. The model-level A/B, chunked vs simd on the real 2B
+  (`bench_qwen35_layers --prefill-score`, one binary, 6 paired rounds), is in
+  `bench/results/qwen35_gdn_prefill_model_ab_m5pro.{txt,json}`. It is inconclusive:
+  every length is within ±5%, with simd/chunked medians 0.968 / 0.988 / 0.986 / 1.021 at
+  T = 200 / 1024 / 2048 / 8192. GPU utilization was 29-98% from other work during the
+  run, and GDN is about 13% of the forward at T = 8192, so the kernel's 0.63-0.85x saving
+  is below that run's resolution. Simd was not shown to be faster, so the default stays
+  chunked. A quiet-GPU rerun and the prefill+score head-to-head against mlx-lm are still
+  open.
 
 - **`kernel_coverage` is Rust and takes an allowlist.** `bench/kernel_coverage.py`
   and its tests moved to `src/bin/kernel_coverage.rs` (`src/bin/common/kcov.rs`,

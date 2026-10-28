@@ -1,0 +1,556 @@
+{
+  "rounds": 6,
+  "format": "Workloads",
+  "lanes": [
+    {
+      "name": "chunked",
+      "argv": [
+        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+        "--prefill-score",
+        "--gdn-chunked",
+        "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+        "--ids=tests/fixtures/qwen35_prefill_ids.json",
+        "200",
+        "1024",
+        "2048",
+        "8192"
+      ],
+      "env": {
+        "BENCH_ITERS": "21",
+        "BENCH_WARMUP": "3"
+      }
+    },
+    {
+      "name": "simd",
+      "argv": [
+        "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+        "--prefill-score",
+        "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+        "--ids=tests/fixtures/qwen35_prefill_ids.json",
+        "200",
+        "1024",
+        "2048",
+        "8192"
+      ],
+      "env": {
+        "BENCH_ITERS": "21",
+        "BENCH_WARMUP": "3"
+      }
+    }
+  ],
+  "env": {},
+  "max_ratio_spread": 1.25,
+  "methodology": {
+    "ratio_pairing": "same outer round",
+    "execution_order": "lanes forward on even rounds, reversed on odd rounds",
+    "central_estimate": "median of paired per-round ratios",
+    "canonical_aggregate": "none; per workload",
+    "recorded_round_value": "one child-process aggregate per lane per round; inner iteration timings are not emitted",
+    "drift_gate": "max/min paired ratio spread per series and aggregate",
+    "environment_probe_policy": "thermal/power/load are provenance-only: pmset is macOS-specific and may emit non-numeric state, while normalized host load is workload- and CPU-count-dependent; paired ratio spread is the portable enforced stability gate"
+  },
+  "summary": [
+    {
+      "workload": "prefill_score_t200",
+      "chunked": {
+        "ms_min_median": 37.215604,
+        "ms_min_min": 35.726375,
+        "ms_min_max": 39.774667,
+        "ms_min_all": [
+          35.726375,
+          39.774667,
+          37.943583,
+          38.324041,
+          36.487625,
+          36.406291
+        ]
+      },
+      "simd": {
+        "ms_min_median": 36.358938,
+        "ms_min_min": 34.571583,
+        "ms_min_max": 37.994875,
+        "ms_min_all": [
+          36.966292,
+          37.994875,
+          34.571583,
+          35.5285,
+          35.751584,
+          37.361708
+        ],
+        "vs_base": {
+          "median": 0.9675403901070848,
+          "lo": 0.9111312181561768,
+          "hi": 1.0347059280433575
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t200_median",
+      "chunked": {
+        "ms_min_median": 39.3272915,
+        "ms_min_min": 37.587084,
+        "ms_min_max": 42.618208,
+        "ms_min_all": [
+          37.587084,
+          42.618208,
+          40.452916,
+          39.554458,
+          38.629708,
+          39.100125
+        ]
+      },
+      "simd": {
+        "ms_min_median": 39.425604,
+        "ms_min_min": 37.459875,
+        "ms_min_max": 41.62275,
+        "ms_min_all": [
+          39.87475,
+          41.62275,
+          38.181833,
+          37.459875,
+          41.046375,
+          38.976458
+        ],
+        "vs_base": {
+          "median": 0.9867397979977924,
+          "lo": 0.9438586083633623,
+          "hi": 1.062559805008104
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t1024",
+      "chunked": {
+        "ms_min_median": 138.31381249999998,
+        "ms_min_min": 136.243875,
+        "ms_min_max": 147.338959,
+        "ms_min_all": [
+          136.243875,
+          147.338959,
+          141.783292,
+          139.988708,
+          136.638917,
+          136.27925
+        ]
+      },
+      "simd": {
+        "ms_min_median": 138.3139165,
+        "ms_min_min": 132.659458,
+        "ms_min_max": 145.454083,
+        "ms_min_all": [
+          140.373625,
+          145.454083,
+          132.659458,
+          136.254208,
+          135.054917,
+          142.415709
+        ],
+        "vs_base": {
+          "median": 0.9878073073576047,
+          "lo": 0.9356494416845675,
+          "hi": 1.0450285645100044
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t1024_median",
+      "chunked": {
+        "ms_min_median": 148.4814585,
+        "ms_min_min": 144.005208,
+        "ms_min_max": 158.338709,
+        "ms_min_all": [
+          144.005208,
+          158.338709,
+          152.113125,
+          147.762583,
+          144.897167,
+          149.200334
+        ]
+      },
+      "simd": {
+        "ms_min_median": 150.433437,
+        "ms_min_min": 143.098,
+        "ms_min_max": 159.904958,
+        "ms_min_all": [
+          152.967666,
+          159.904958,
+          145.124792,
+          143.098,
+          156.947792,
+          147.899208
+        ],
+        "vs_base": {
+          "median": 1.000585549491205,
+          "lo": 0.9540583167954771,
+          "hi": 1.0831667398990623
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t2048",
+      "chunked": {
+        "ms_min_median": 272.1250625,
+        "ms_min_min": 266.487125,
+        "ms_min_max": 290.847959,
+        "ms_min_all": [
+          266.487125,
+          290.847959,
+          278.045583,
+          275.131875,
+          269.11825,
+          267.982042
+        ]
+      },
+      "simd": {
+        "ms_min_median": 273.4045,
+        "ms_min_min": 263.370459,
+        "ms_min_max": 287.570625,
+        "ms_min_all": [
+          277.429292,
+          287.570625,
+          263.370459,
+          269.379708,
+          264.7835,
+          281.801625
+        ],
+        "vs_base": {
+          "median": 0.9863122823959113,
+          "lo": 0.9472204383120877,
+          "hi": 1.0515690637210684
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t2048_median",
+      "chunked": {
+        "ms_min_median": 294.99054149999995,
+        "ms_min_min": 286.194333,
+        "ms_min_max": 314.129416,
+        "ms_min_all": [
+          286.194333,
+          314.129416,
+          298.468459,
+          293.713083,
+          288.264625,
+          296.268
+        ]
+      },
+      "simd": {
+        "ms_min_median": 299.280479,
+        "ms_min_min": 284.110583,
+        "ms_min_max": 322.396334,
+        "ms_min_all": [
+          303.890416,
+          322.396334,
+          292.659292,
+          284.110583,
+          314.533583,
+          294.670542
+        ],
+        "vs_base": {
+          "median": 1.0104624910291382,
+          "lo": 0.9673065295494516,
+          "hi": 1.091127928027936
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t8192",
+      "chunked": {
+        "ms_min_median": 1120.0010419999999,
+        "ms_min_min": 1115.714708,
+        "ms_min_max": 1203.16325,
+        "ms_min_all": [
+          1119.870917,
+          1203.16325,
+          1169.477458,
+          1120.131167,
+          1115.736208,
+          1115.714708
+        ]
+      },
+      "simd": {
+        "ms_min_median": 1148.089438,
+        "ms_min_min": 1094.665708,
+        "ms_min_max": 1244.252792,
+        "ms_min_all": [
+          1171.353167,
+          1244.252792,
+          1094.665708,
+          1113.918459,
+          1124.825709,
+          1184.987958
+        ],
+        "vs_base": {
+          "median": 1.0211489503274302,
+          "lo": 0.9360297631320397,
+          "hi": 1.0620886768842344
+        }
+      }
+    },
+    {
+      "workload": "prefill_score_t8192_median",
+      "chunked": {
+        "ms_min_median": 1222.5320000000002,
+        "ms_min_min": 1166.824583,
+        "ms_min_max": 1290.276666,
+        "ms_min_all": [
+          1203.382,
+          1290.276666,
+          1246.321,
+          1214.65525,
+          1166.824583,
+          1230.40875
+        ]
+      },
+      "simd": {
+        "ms_min_median": 1244.5320004999999,
+        "ms_min_min": 1182.940417,
+        "ms_min_max": 1331.968459,
+        "ms_min_all": [
+          1268.972084,
+          1331.968459,
+          1200.797291,
+          1182.940417,
+          1295.979084,
+          1220.091917
+        ],
+        "vs_base": {
+          "median": 1.0119637033523166,
+          "lo": 0.9634735280878683,
+          "hi": 1.1106888755016915
+        }
+      }
+    }
+  ],
+  "raw": [
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.726375,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":37.587084,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":136.243875,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":144.005208,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":266.487125,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":286.194333,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1119.870917,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1203.382000,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.966292,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":39.874750,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":140.373625,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":152.967666,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":277.429292,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":303.890416,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1171.353167,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1268.972084,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    },
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":39.774667,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":42.618208,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":147.338959,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":158.338709,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":290.847959,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":314.129416,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1203.163250,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1290.276666,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":37.994875,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":41.622750,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":145.454083,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":159.904958,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":287.570625,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":322.396334,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1244.252792,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1331.968459,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    },
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":37.943583,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":40.452916,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":141.783292,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":152.113125,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":278.045583,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":298.468459,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1169.477458,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1246.321000,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":34.571583,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":38.181833,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":132.659458,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":145.124792,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":263.370459,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":292.659292,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1094.665708,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1200.797291,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    },
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":38.324041,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":39.554458,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":139.988708,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":147.762583,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":275.131875,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":293.713083,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1120.131167,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1214.655250,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.528500,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":37.459875,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":136.254208,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":143.098000,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":269.379708,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":284.110583,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1113.918459,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1182.940417,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    },
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.487625,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":38.629708,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":136.638917,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":144.897167,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":269.118250,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":288.264625,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1115.736208,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1166.824583,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":35.751584,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":41.046375,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":135.054917,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":156.947792,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":264.783500,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":314.533583,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1124.825709,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1295.979084,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    },
+    {
+      "chunked": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":36.406291,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":39.100125,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":136.279250,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":149.200334,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":267.982042,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":296.268000,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1115.714708,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1230.408750,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}],
+      "simd": [{"workload":"prefill_score_t200","backend":"tessl","ms_min":37.361708,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t200_median","backend":"tessl","ms_min":38.976458,"iters":21,"tokens":200,"answers":17,"ids_fnv1a32":1757866882},{"workload":"prefill_score_t1024","backend":"tessl","ms_min":142.415709,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t1024_median","backend":"tessl","ms_min":147.899208,"iters":21,"tokens":1024,"answers":17,"ids_fnv1a32":1800809562},{"workload":"prefill_score_t2048","backend":"tessl","ms_min":281.801625,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t2048_median","backend":"tessl","ms_min":294.670542,"iters":21,"tokens":2048,"answers":17,"ids_fnv1a32":2655569077},{"workload":"prefill_score_t8192","backend":"tessl","ms_min":1184.987958,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900},{"workload":"prefill_score_t8192_median","backend":"tessl","ms_min":1220.091917,"iters":21,"tokens":8192,"answers":17,"ids_fnv1a32":2900155900}]
+    }
+  ],
+  "lane_archive": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/qwen35_gdn_prefill_model_ab_m5pro.json.lanes",
+  "provenance": {
+    "schema_version": 1,
+    "started_at_utc": "2026-10-28T12:41:48Z",
+    "invocation_shell": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_paired.land --evidence --max-spread 1.25 --rounds 6 --clean-env --out /private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/qwen35_gdn_prefill_model_ab_m5pro.json 'chunked:BENCH_ITERS=21,BENCH_WARMUP=3=/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land --prefill-score --gdn-chunked --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192' 'simd:BENCH_ITERS=21,BENCH_WARMUP=3=/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land --prefill-score --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192'",
+    "invocation_argv": [
+      "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_paired.land",
+      "--evidence",
+      "--max-spread",
+      "1.25",
+      "--rounds",
+      "6",
+      "--clean-env",
+      "--out",
+      "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/qwen35_gdn_prefill_model_ab_m5pro.json",
+      "chunked:BENCH_ITERS=21,BENCH_WARMUP=3=/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land --prefill-score --gdn-chunked --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192",
+      "simd:BENCH_ITERS=21,BENCH_WARMUP=3=/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land --prefill-score --weights=$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c --ids=tests/fixtures/qwen35_prefill_ids.json 200 1024 2048 8192"
+    ],
+    "cwd": "$HOME/Code/research/tessl-land-w33",
+    "path_policy": "paths beneath the invoking user's home are recorded as $HOME-relative; hashes are computed from the real files",
+    "environment_policy": "full process environment not captured; with --clean-env the inherited benchmark/tuning prefixes [\"BENCH_\", \"TESSL_\", \"METAL_\", \"MTL_\", \"MLX_\", \"PYTORCH_\", \"OMP_\", \"MKL_\", \"VECLIB_\", \"ACCELERATE_\"] are cleared and benchmark_config records only the explicit lane overrides",
+    "benchmark_config": {
+      "rounds": 6,
+      "max_spread": 1.25,
+      "lane_timeout_secs": 3600,
+      "clean_env": true,
+      "format": "Workloads",
+      "lanes": [
+        {
+          "name": "chunked",
+          "argv": [
+            "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+            "--prefill-score",
+            "--gdn-chunked",
+            "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+            "--ids=tests/fixtures/qwen35_prefill_ids.json",
+            "200",
+            "1024",
+            "2048",
+            "8192"
+          ],
+          "env": {
+            "BENCH_ITERS": "21",
+            "BENCH_WARMUP": "3"
+          }
+        },
+        {
+          "name": "simd",
+          "argv": [
+            "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+            "--prefill-score",
+            "--weights=/Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c",
+            "--ids=tests/fixtures/qwen35_prefill_ids.json",
+            "200",
+            "1024",
+            "2048",
+            "8192"
+          ],
+          "env": {
+            "BENCH_ITERS": "21",
+            "BENCH_WARMUP": "3"
+          }
+        }
+      ],
+      "compare": []
+    },
+    "git": {
+      "available": true,
+      "root": "$HOME/Code/research/tessl-land-w33",
+      "scope": ".",
+      "revision": "e80c464ef7c6f4702ccb61c081fb7135c835d9ab",
+      "dirty": false,
+      "status_porcelain": [],
+      "status_line_count": 0,
+      "status_truncated": false,
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_diff_bytes": 0
+    },
+    "host": {
+      "machine": "aarch64",
+      "cpu_count": 18,
+      "hardware_model": "Mac17,8",
+      "memory_bytes": 68719476736
+    },
+    "os": {
+      "system": "macos",
+      "release": "27.0.0",
+      "version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:06:40 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+      "sw_vers": {
+        "argv": [
+          "sw_vers"
+        ],
+        "returncode": 0,
+        "stdout": "ProductName:\u0009\u0009macOS\nProductVersion:\u0009\u000927.0.1\nBuildVersion:\u0009\u000926A434"
+      }
+    },
+    "runtime": {
+      "rustc": {
+        "argv": [
+          "rustc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stdout": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    },
+    "power": {
+      "thermal_pressure": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      },
+      "thermal_pressure_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "therm"
+        ],
+        "returncode": 0,
+        "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+      },
+      "power_source_finish": {
+        "argv": [
+          "pmset",
+          "-g",
+          "batt"
+        ],
+        "returncode": 0,
+        "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0\u000985%; AC attached; not charging present: true"
+      }
+    },
+    "load": {
+      "start": {
+        "loadavg_1m": 7.13037109375,
+        "loadavg_5m": 6.00390625,
+        "loadavg_15m": 7.94970703125,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.3961317274305556,
+        "normalized_loadavg_5m": 0.3335503472222222,
+        "normalized_loadavg_15m": 0.441650390625
+      },
+      "finish": {
+        "loadavg_1m": 8.98876953125,
+        "loadavg_5m": 7.7578125,
+        "loadavg_15m": 7.81884765625,
+        "cpu_count_normalizer": 18,
+        "normalized_loadavg_1m": 0.4993760850694444,
+        "normalized_loadavg_5m": 0.4309895833333333,
+        "normalized_loadavg_15m": 0.4343804253472222
+      }
+    },
+    "inputs": {
+      "driver": {
+        "path": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_paired.land",
+        "size_bytes": 890096,
+        "mtime_ns": 1793191308116469505,
+        "sha256": "e32ed27eeaac7877f9d31905d8931a3efe063d96244c1899457e35c45a73f00a"
+      },
+      "lane:chunked:bench_qwen35_layers.land": {
+        "path": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+        "size_bytes": 4458048,
+        "mtime_ns": 1793191308113452870,
+        "sha256": "542db5687700d6bfbbd1d4f44979d157863f14966ce757057eb48caa9c2b32a4"
+      },
+      "lane:simd:bench_qwen35_layers.land": {
+        "path": "/private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/bin/bench_qwen35_layers.land",
+        "size_bytes": 4458048,
+        "mtime_ns": 1793191308113452870,
+        "sha256": "542db5687700d6bfbbd1d4f44979d157863f14966ce757057eb48caa9c2b32a4"
+      }
+    },
+    "device": {
+      "probe_argv": [
+        "system_profiler",
+        "SPDisplaysDataType",
+        "-json"
+      ],
+      "gpus": [
+        {
+          "_name": "Apple M5 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+          "spdisplays_vendor": "sppci_vendor_Apple",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "20",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M5 Pro"
+        }
+      ]
+    },
+    "finished_at_utc": "2026-10-28T12:50:47Z"
+  }
+}

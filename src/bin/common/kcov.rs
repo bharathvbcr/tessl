@@ -798,13 +798,13 @@ pub fn suites() -> Vec<Suite> {
             ],
         ),
         // Qwen3.5 inference at the 2B's shapes on random weights (no checkpoint):
-        // prefill (the simd GDN recurrence, both attention routes), the chunked
-        // GDN rule at both scan slices, per-token decode, the attention tile variants, the paired
+        // prefill (the chunked GDN rule, both attention routes), the other GDN
+        // scan slice, the opt-in simd GDN prefill, per-token decode, the attention tile variants, the paired
         // attention and recurrent-rule lanes. T = 256 is past the short-prefix
         // route, so the tiled prefill attention runs.
         suite("bench_qwen35_layers", &["256", "--iters=1"], &[]),
         suite("bench_qwen35_layers", &["--gdn-scan32", "256", "--iters=1"], &[]),
-        suite("bench_qwen35_layers", &["--gdn-chunked", "256", "--iters=1"], &[]),
+        suite("bench_qwen35_layers", &["--gdn-simd", "256", "--iters=1"], &[]),
         suite("bench_qwen35_layers", &["--decode=64", "--iters=1"], &[]),
         // The same decode with the fused add + RMSNorm and gate/up + SiLU kernels on
         // (`TESSL_QWEN35_DECODE_FUSION`), which the default decode does not dispatch.

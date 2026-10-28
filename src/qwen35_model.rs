@@ -2594,10 +2594,10 @@ fn f32_bytes(n: usize) -> u64 {
 }
 
 /// The GDN kernel a prefill runs. Decode always runs [`qwen35::gdn_recurrent`] (one token).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GdnPrefillKernel {
     /// [`qwen35::gdn_chunk_forward`]: the chunked rule (`torch_chunk_gated_delta_rule`'s
-    /// arithmetic), its scan in the given column slices.
+    /// arithmetic), its scan in the given column slices. The default, at the default slice.
     Chunked(GdnScanSlice),
     /// [`qwen35::gdn_recurrent_simd_with`] with [`GdnSimdVariant::Prepped8`]: the recurrent rule
     /// over the whole sequence (8 lanes a value column, `float4` q/k loads, gates and norms
@@ -2605,9 +2605,18 @@ pub enum GdnPrefillKernel {
     /// the chunked kernel's time at T = 200 / 1024 / 4096 / 8192 on the 2B's shape
     /// (`bench/results/qwen35_gdn_simd_ab_m5pro.txt`, 22 paired rounds), with 16 B of scratch a
     /// token and value head instead of the chunked workspace. It sums in the recurrent order, as
-    /// decode does, so prefill logits move by f32 rounding against the chunked rule.
-    #[default]
+    /// decode does, so prefill logits move by f32 rounding against the chunked rule. Opt-in: on
+    /// the whole 2B prefill it was not shown faster than the chunked rule (simd/chunked 0.97-1.02,
+    /// inside the noise, `bench/results/qwen35_gdn_prefill_model_ab_m5pro.txt`).
     Simd,
+}
+
+/// The chunked rule at the default slice. It becomes [`GdnPrefillKernel::Simd`] only when a clean
+/// model-level A/B shows the simd prefill faster beyond noise.
+impl Default for GdnPrefillKernel {
+    fn default() -> Self {
+        Self::Chunked(GdnScanSlice::default())
+    }
 }
 
 /// The scratch of the chosen [`GdnPrefillKernel`], sized for the forward's `GdnDims`.

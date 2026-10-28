@@ -667,8 +667,8 @@ fn the_suite_list_reaches_the_breadth_it_claims() {
     let s = kcov::suites();
     // 2 sweep runs, 1 base + 9 decode (R x chunk) + 9 rows (R x SGT) + 1 tiled
     // attention runs, nn kernels, variants, routes, the encoder attention, 3 EmbedGemma 2 kernel
-    // lanes (text, audio, vision), 8 Qwen3.5 inference (one with the fused decode kernels on, two on
-    // the chunked GDN prefill rule) and 5 Qwen3.5 training runs.
+    // lanes (text, audio, vision), 8 Qwen3.5 inference (one with the fused decode kernels on, one on
+    // the other GDN scan slice, one on the simd GDN prefill) and 5 Qwen3.5 training runs.
     assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3 + 4 + 8 + 5);
     // Every suite is a probe, not a measurement: bounded by its environment or,
     // for the Qwen3.5 benches, by its arguments.

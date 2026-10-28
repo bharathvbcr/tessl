@@ -1,0 +1,16 @@
+round 1/6 done
+round 2/6 done
+round 3/6 done
+round 4/6 done
+round 5/6 done
+round 6/6 done
+                workload             chunked ms                simd ms       vs base [lo, hi]
+      prefill_score_t200                 37.216                 36.359  0.968x [0.911, 1.035]
+prefill_score_t200_median                 39.327                 39.426  0.987x [0.944, 1.063]
+     prefill_score_t1024                138.314                138.314  0.988x [0.936, 1.045]
+prefill_score_t1024_median                148.481                150.433  1.001x [0.954, 1.083]
+     prefill_score_t2048                272.125                273.404  0.986x [0.947, 1.052]
+prefill_score_t2048_median                294.991                299.280  1.010x [0.967, 1.091]
+     prefill_score_t8192               1120.001               1148.089  1.021x [0.936, 1.062]
+prefill_score_t8192_median               1222.532               1244.532  1.012x [0.963, 1.111]
+wrote /private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/qwen35_gdn_prefill_model_ab_m5pro.json (attempt marker /private/tmp/claude-501/-Users-bharath-Code-research-tessl/9d40c168-6abf-4804-ae5a-f4d6d42e9ece/scratchpad/qwen35_gdn_prefill_model_ab_m5pro.json.attempt.json)

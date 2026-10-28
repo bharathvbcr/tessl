@@ -281,7 +281,7 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
             };
             for (i, arm) in arms.iter().enumerate() {
                 println!(
-                    "GDN_AB t={t} arm={arm:?} min_ms={:.4} median_ms={:.4} max_ms={:.4} rounds={rounds} launches_per_sample={} async={asynchronous}",,
+                    "GDN_AB t={t} arm={arm:?} min_ms={:.4} median_ms={:.4} max_ms={:.4} rounds={rounds} launches_per_sample={} async={asynchronous}",
                     min(&samples[i]),
                     median(&samples[i]),
                     max(&samples[i]),

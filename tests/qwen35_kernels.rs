@@ -2562,25 +2562,33 @@ fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
         let d = GdnData::random(s, "none", 9990);
         let dims = dims_of(s);
         let width = s.hv * s.dv;
-        let out = seeded(rt, s.t * width, SENTINEL);
         let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
+        // A refused call must leave its output untouched; an accepted one must write it.
+        let call = |p: &Packed, v: GdnSimdVariant| {
+            let out = seeded(rt, s.t * width, SENTINEL);
+            let r = qwen35::gdn_recurrent_simd_with(
+                rt,
+                &dims,
+                &p.qkv(),
+                &p.gates(dims.v_heads),
+                &p.params(),
+                StateIn::Zero,
+                Cols::dense(&out, width as u32),
+                None,
+                v,
+                Some(&scalars),
+            );
+            rt.synchronize().unwrap();
+            let written = out.read_f32().iter().any(|&x| x != SENTINEL);
+            (r, written)
+        };
         for lead in [1usize, 0] {
             let p = Packed::with_lead(rt, &d, lead);
             for v in GdnSimdVariant::ALL {
-                let r = qwen35::gdn_recurrent_simd_with(
-                    rt,
-                    &dims,
-                    &p.qkv(),
-                    &p.gates(dims.v_heads),
-                    &p.params(),
-                    StateIn::Zero,
-                    Cols::dense(&out, width as u32),
-                    None,
-                    v,
-                    Some(&scalars),
-                );
+                let (r, written) = call(&p, v);
                 let refused = v.vec && lead == 1;
                 assert_eq!(r.is_err(), refused, "{v:?} lead {lead}: {r:?}");
+                assert_eq!(written, !refused, "{v:?} lead {lead}: output written = {written}");
                 if let Err(e) = r {
                     assert!(e.contains("multiples of 4"), "{e}");
                 }
@@ -2591,25 +2599,9 @@ fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
             lanes: 4,
             ..GdnSimdVariant::FUSED
         };
-        let p = Packed::new(rt, &d);
-        let r = qwen35::gdn_recurrent_simd_with(
-            rt,
-            &dims,
-            &p.qkv(),
-            &p.gates(dims.v_heads),
-            &p.params(),
-            StateIn::Zero,
-            Cols::dense(&out, width as u32),
-            None,
-            none,
-            None,
-        );
+        let (r, written) = call(&Packed::new(rt, &d), none);
         assert!(r.is_err_and(|e| e.contains("no kernel")), "lanes = 4 must be refused");
-        rt.synchronize().unwrap();
-        assert!(
-            out.read_f32().iter().all(|&x| x == SENTINEL),
-            "a refused call wrote its output"
-        );
+        assert!(!written, "a refused call wrote its output");
     });
 }
 

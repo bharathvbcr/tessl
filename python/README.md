@@ -20,6 +20,14 @@ by the supervised rows, not by `T * V`. The weight gradient is accumulated in
 f32 and cast to the weight's dtype once. Slices along the leading dimensions
 (such as `hidden[:, :-1]`) and tensors at a storage offset are read in place;
 other strided layouts are copied contiguous first. An empty mask is an error.
+The loss is evaluated with the target excluded from the log-sum-exp: with
+`L = logsumexp(z[j != t])` and `margin = z[t] - L`, the loss is `softplus(-margin)`
+and the gradient is `exp(z[j] - L) * sigmoid(-margin)` for `j != t` and
+`-sigmoid(-margin)` at the target (Barron, "A Fix for Softmax and Cross-Entropy",
+arXiv:2610.31642). This prevents the target's gradient from rounding to 0 once
+the margin exceeds ~16.6 in f32, ensuring every row sums to 0. Classification
+of `-inf` and zero uses raw bit patterns to prevent fast-math compiler
+optimizations from mishandling `-FLT_MAX` comparisons.
 
 ## Training a whole Qwen3.5 model
 

@@ -55,6 +55,7 @@ that fusion for Metal.
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_{bf16,f32}` | `embed_rows` | `embed_tokens(ids)` from the bf16 (or, in the f32 model, f32) table, on the device, so a forward needs no host gather |
 | 8. Fused projections | tessl's GEMM | `pack_linear_weights_*`, `fused_projection`, `project_residual` | `in_proj_qkv/z/b/a`, `q/k/v_proj`, `out_proj` + residual |
+| 8b. Fused decode kernels | `qwen35_add_rms_norm_{f32,bf16}`, `qwen35_gemv_gate_up_silu_{f32,bf16}`, `gemv_q4_mlx_simd_gate_up_silu` | `add_rms_norm`, `gate_up_silu`, `Decode::set_fusion` | fused residual add + RMSNorm, and fused gate/up GEMV + SiLU for decode steps |
 
 ### Layout: everything reads the fused projection in place
 
@@ -709,6 +710,28 @@ and `forward(ids, true)` already returns every layer's un-normed residual
 consumer wants the normed state, and a second read path would be one more
 buffer contract (f32 `[tokens, hidden]` aliasing live state) to keep honest.
 Revisit if a caller needs the raw residual without tracing every layer.
+
+### Decode fusion: fused add + RMSNorm and gate/up GEMV + SiLU
+
+`Decode::set_fusion(bool)` on the `Decode` session (and the `TESSL_QWEN35_DECODE_FUSION=1`
+environment flag) enables fused decode kernels that reduce per-token dispatch overhead:
+
+- **Fused add + RMSNorm (`qwen35_add_rms_norm_{f32,bf16}`, `add_rms_norm`):** In exact f32,
+  folds the residual add into the RMSNorm kernel, eliminating 2 dispatches per layer (48
+  per token across 24 layers). In bf16, the residual add is already folded into the output
+  projection GEMM epilogue (`beta = 1`), so the norm was already a single dispatch.
+- **Fused gate/up GEMV + SiLU (`qwen35_gemv_gate_up_silu_{f32,bf16}`, `gemv_q4_mlx_simd_gate_up_silu`):**
+  Combines the gate projection, up projection, and SwiGLU elementwise product into one kernel.
+  In bf16, this replaces two GEMVs and a SwiGLU with one dispatch (saving 2 dispatches per layer).
+  In exact f32, where each NN GEMM involves `zero_f32` and matmul dispatches, this saves 4
+  dispatches per layer.
+
+On Qwen3.5-2B in bf16, fused decode drops dispatches from 273 to 225 per token (a saving of 48
+dispatches per token; `bench/results/qwen35_decode_fusion_dispatches_m5pro.txt`). On a 4-layer
+Q4 MLX model, it drops dispatches from 49 to 41 per token. Add+RMSNorm and Q4 gate/up SiLU
+are bit-identical to their unfused counterparts; on the real 2B in bf16, 32 greedy decoded tokens
+match bit for bit (first mismatch None, worst logit relative error 3.9e-3). Default is off
+(`DecodeFusion::NONE`).
 
 ### MLX 4-bit weights: `Qwen35Model::load_mlx_q4`
 
@@ -1704,11 +1727,15 @@ span ±8% on this machine under load.
   exist (`tessl::cross_entropy`, over the supervised rows only, in vocabulary
   chunks), and every layer has a backward, so `train_step` runs the whole
   forward and backward on the GPU (torch sees it through
-  `tessl_torch.Qwen35`). A batch runs one sequence at a time: each row
-  trimmed to its length (exact for right padding, which a causal model never
-  attends), its gradients accumulated in a bank, so a batch of `B` rows costs
-  `B` steps rather than one padded one (throughput not measured). What it
-  does not do yet: several sequences in one step.
+  `tessl_torch.Qwen35`). Cross-entropy evaluates loss as `softplus(-margin)`
+  with the target excluded from the log-sum-exp (Barron arXiv:2610.31642),
+  preventing target gradient collapse past margin 16.6 in f32, with raw bit-pattern
+  classification for `-inf` and 0 to avoid fast-math `-FLT_MAX` compare issues.
+  Multiple sequences in one step are supported via ragged training
+  (`Qwen35Model::train_step_ragged_into`, C ABI 13 `tessl_qwen35_train_step_ragged`,
+  Python `Qwen35.train_step_ragged`), accepting packed token ids and `cu_seqlens`
+  and returning token-mean loss and per-sequence loss without padding waste.
+  Single sequences can also run row by row with gradients accumulated into a bank.
 - **Exact f32 at the MLP up/gate shape: the split-K route.** The 4.1 vs
   5.7 TFLOP/s gap at 2048 x 6144 x 2048 (`bench/results/f32_exact_coop_m5pro.txt`)
   was the row-major tile walk re-reading B (50 MB of f32) once per tile
@@ -1729,11 +1756,11 @@ span ±8% on this machine under load.
   token, so it is not a GPU-resident loop, and its speed has not been
   measured.
 - **bf16 inputs, remaining gaps.** Every kernel reads its GEMM's output as
-  f32. A bf16-input MLP and a fused gate/up/SwiGLU GEMM both measured slower
+  f32. A bf16-input MLP and a fused gate/up/SwiGLU GEMM during prefill forward both measured slower
   and were removed (see "bf16 activation inputs"). GDN and attention were
-  not tried. A gate/up fusion that wins would need to keep one accumulator
-  per thread, for example by staging gate through threadgroup memory; that
-  is untested.
+  not tried. For decode, gate/up GEMV + SiLU fusion is implemented and verified
+  (`qwen35_gemv_gate_up_silu_{f32,bf16}` and `gemv_q4_mlx_simd_gate_up_silu`),
+  enabled via `Decode::set_fusion` or `TESSL_QWEN35_DECODE_FUSION=1`.
 - **Shared-prefix attention, remaining gaps.** Only head_dim 256 is compiled. The rows of
   a batch read the shared prefix independently: rows that share a head could
   share its K/V lines in one threadgroup, but no measurement says that is

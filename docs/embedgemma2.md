@@ -1926,7 +1926,7 @@ a media extension, a `data:image/` URI, or the path of an existing media file
 | --- | --- |
 | `Tokenizer::from_snapshot(dir)`, `from_file(path)`, `from_json(text)` | a tokenizer; `with_tokenizer_config(text)` and `with_prompts(text)` add the sidecars |
 | `encode(text)`, `encode_with_prompt(Some(name), text)` | the ids the model receives (one text, as above); `Err` for a refused placeholder or an unknown prompt name |
-| `encode_batch(texts)`, `encode_batch_with_prompt(name, texts)` | each text as `encode` has it; an `Err` names the text's position |
+| `encode_batch(texts)`, `encode_batch_with_prompt(name, texts)`, `encode_batch_with_threads(name, texts, threads)` | each text as `encode` has it; an `Err` names the text's position. Multithreaded across scoped worker threads (`par_batch`) balanced by byte length; thread count configured by `TESSL_TOK_THREADS` (1..=64, default system cores up to 32) or explicitly via `encode_batch_with_threads` |
 | `encode_raw(text, add_special_tokens)` | `Tokenizer.encode(text, add_special_tokens).ids` of the library, no sentence-transformers rule. A text (with its prompt) of `MAX_TEXT_BYTES` (256 MiB) or more is an `Err` from `encode`/`encode_with_prompt` and a panic here: the merge list's positions are 32-bit |
 | `decode(ids)`, `decode_with(ids, skip_special_tokens)` | `Tokenizer.decode`: special tokens skipped by default, as that method does (transformers' `decode` defaults to keeping them); an id with no token is skipped, as the library does |
 | `prompt(name)`, `prompt_names()`, `token_to_id`, `id_to_token`, `vocab_size` | lookups |
@@ -2033,7 +2033,8 @@ on short queries, documents, multilingual text and a 100k-character text, agains
 workloads and behind on the documents (0.3x), and loads in 0.48 s against 0.65
 to 0.68 s. The spread between rounds is a factor of two to five, so these are
 ratios of minima, not predictions. The hash of all ids is equal in both lanes
-on every workload.
+on every workload. `bench_embedgemma2_tok` also supports `BENCH_TOK_MODE=batch` to
+time `Tokenizer::encode_batch` across cores against `bench/tok_hf_native`'s batch lanes.
 
 ### Regenerating, and what is not covered
 

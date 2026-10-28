@@ -8,6 +8,61 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`tessl-embed`: EmbeddingGemma 2 behind Ollama's `/api/embed` on 127.0.0.1**
+  (`go/cmd/tessl-embed`, `go/Makefile`, `go/README.md`). An in-process HTTP server
+  serving the text encoder over Ollama's embedding protocol (`/api/embed`,
+  `/api/embeddings`, `/api/tags`, `/api/show`, `/api/version`) via [gusset](https://github.com/bharathvbcr/gusset)
+  (pinned to `v0.0.3`). Text is tokenized in Rust with the snapshot's own
+  `tokenizer.json` and served under model aliases (`embeddinggemma-2-tessl:query`,
+  `:document`, `:latest`) matching `SentenceTransformer.encode` in float32 on the
+  real checkpoint (`914f7f89`) to max abs 5.4e-7 and cosine 1.000000000. Gusset boundary
+  overhead measures 9-13 µs per call. Includes the `go/cmd/embed_bench` comparator tool
+  and paired benchmark results (`bench/results/tessl_embed_m5pro.{json,txt}`).
+- **Qwen3.5 decode fusion** (`src/qwen35.rs`, `src/qwen35_model.rs`, `src/qwen35_q4.rs`,
+  `kernels/qwen35_mlp.metal`, `kernels/gemv_q4_mlx.metal`): `Decode::set_fusion` and
+  the `TESSL_QWEN35_DECODE_FUSION=1` environment flag enable fused add + RMSNorm
+  (`qwen35_add_rms_norm_{f32,bf16}`) and fused gate/up GEMV + SiLU
+  (`qwen35_gemv_gate_up_silu_{f32,bf16}`, plus the Q4 MLX variant
+  `gemv_q4_mlx_simd_gate_up_silu`). Fused decode removes 48 dispatches per token on
+  the 2B in bf16 (273 -> 225 dispatches per token, 2 per layer across 24 layers;
+  `bench/results/qwen35_decode_fusion_dispatches_m5pro.txt`); in exact f32 forward it
+  removes 4 per layer for gate/up (saving `zero_f32` and matmul dispatches) and 2 per
+  layer for add+norm. Default is off (`DecodeFusion::NONE`). Verified bit-identical for
+  add+norm and Q4 gate/up SiLU; greedy 32 tokens match on the real 2B with worst logit
+  relative error 3.9e-3. Promoted kernels: 44 -> 45.
+- **Prefill attention: bf16 Q/K/V tile variants** (`kernels/qwen35_attn_tiled.metal`,
+  `src/attn_prefill_bf16.rs`, `src/bin/bench_qwen35_layers.rs`). 5 Metal kernel variants
+  (`qwen35_attn_tiled_bf16_h256_q32_k32_sg4`, `_q16_k64_sg4`, `_q32_k64_sg4`,
+  `_q64_k64_sg4`, and `qwen35_attn_tiled_bf16_pf32_h256_q32_k32_sg4`) and host wrapper
+  `attn_prefill_bf16_with_tile` for causal SDPA with bf16 Q/K/V tiles. Bounded by an
+  f64 oracle derived from unit roundoff in `tests/attn_prefill_bf16_tiles.rs` and verified
+  in the MSL emulator (`tools/msl_emu/check_qwen35.py`). Includes the paired benchmark lane
+  `--paired-attn-bf16`. Kernel entry points: 308 -> 313.
+- **Direct loading of MLX affine 4-bit weights** (`Qwen35Model::load_mlx_q4`,
+  `src/qwen35_q4.rs`, `docs/qwen35.md`). Loads `mlx_lm.convert -q --q-bits 4` safetensors
+  directly into Q4 model banks without dequantization or intermediate host copies.
+  Features strict validate-before-allocate verification: header checks, finite checks on
+  scales/biases/norms, and convention enforcement before allocating GPU buffers. Verified
+  against mlx-lm float32 on the real 2B (default prompt 155/155 top-1 match, KL 3.7e-5;
+  text prompt 509/512 top-1, KL 3.0e-5).
+- **EmbeddingGemma 2 tokenizer: multi-threaded `encode_batch` across cores**
+  (`src/embedgemma2_tok.rs`, `src/par_batch.rs`). `Tokenizer::encode_batch` cuts batches
+  into contiguous chunks balanced by byte length across scoped worker threads (`par_batch`).
+  Controlled by `TESSL_TOK_THREADS` (1-64, default machine cores up to 32) or
+  `Tokenizer::encode_batch_with_threads`. Preserves exact output ordering, error semantics,
+  and bit-identical hashes against single-threaded execution. `bench_embedgemma2_tok`
+  gains `BENCH_TOK_MODE=batch`.
+- **Qwen3.5 prefill+score head-to-head and stage profile benchmarks**
+  (`bench_qwen35_layers`, `bench/results/qwen35_prefill_score_h2h_m5pro.txt`,
+  `bench/results/qwen35_prefill_profile_m5pro.txt`). Paired head-to-head (`--prefill-score`,
+  shared token ids file) demonstrates tessl is 4.47–5.35× faster than PyTorch 2.14.1 MPS
+  across T = 200 to 8192, and within 0.836–0.896× of mlx-lm 0.32. Quiet-host stage profile
+  (`--stage-profile`) attributes 176 ms of the 231 ms/layer deficit vs mlx-lm at 8k to
+  prefill attention (sdpa).
+- **Qwen3.5 EAR (Expected Acceptance Rate) report** (`bench/results/qwen35_ear_m5pro.txt`).
+  Measures SLQ top-10 acceptance overlap for speculative decoding on the real 2B:
+  F32 vs Bf16 achieves 0.988 (default prompt) and 0.992 (text prompt); tessl Q4 matches
+  mlx-lm Q4 to 2e-4 (0.848 / 0.866).
 - **`Qwen35Model::train_step_fused_adamw`** (card ft-dafde7719192ece85330e1df5db96e05):
   `train_step_into` then `adamw_step` without the gradient bank. The backward
   updates each layer from a gradient scratch the pool reuses from layer to layer,
@@ -76,6 +131,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`-inf` and zero bit-pattern classification in cross-entropy and `-FLT_MAX` compare lint**
+  (`kernels/cross_entropy.metal`, `tests/ce_collapse_host.rs`, `tests/kernel_fast_math.rs`).
+  Fast-math compiler optimizations treat floating-point comparisons against `±inf` or
+  `-FLT_MAX` unsafely, causing `-inf` logits to be evaluated incorrectly or NaN values to be
+  masked. `cross_entropy.metal` now classifies `-inf` and zero by raw IEEE 754 bit pattern
+  (`as_type<uint>(x) == 0xff800000u`), never hands `exp()` a `-inf` logit, never rescales an
+  empty sum, and lets NaNs propagate. Added an automated kernel lint (`tests/kernel_fast_math.rs`)
+  refusing comparisons with `-FLT_MAX` across all Metal shader sources.
+- **Guard tests strengthened for non-finite and subnormal inputs**
+  (`tests/reductions.rs`, `tests/nn_adversarial.rs`, `tests/ce_collapse_host.rs`).
+  Verified `softmax_rows_f32` maps NaN and +inf rows to NaN rather than uniform
+  probabilities. Planted non-finite (NaN, ±inf) and subnormal tests for reductions, RMS norm,
+  and GProj ensuring correct propagation and failure detection across boundary conditions.
 - **Softmax collapse in the logit cross-entropy** (card ft-52a09bd67033db0bd25ba2db68bdfa12;
   Barron, "A Fix for Softmax and Cross-Entropy", arXiv:2610.31642). The max-shifted
   softmax lost the target's gradient past the f32 precision cliff: at a margin near

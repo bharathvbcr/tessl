@@ -22,6 +22,7 @@ Comprehensive architectural references, kernel documentation, benchmarks, and pl
 | [**EmbeddingGemma 2**](embedgemma2.md) | Full text encoder execution from SafeTensors: symmetric sliding-window attention, per-layer inputs, mean pooling, and Matryoshka dimension truncation. |
 | [**BERT & DistilBERT**](bert.md) | Learned sparse document encoders (`BertForMaskedLM` / `DistilBertForMaskedLM`): fused LayerNorms, exact erf GELU, and segment sparse max reduction. |
 | [**PyTorch Interop**](../python/README.md) | `tessl_torch` C ABI bindings: drop-in cross-entropy, GDN seam patching, and full model `train_step` integration. |
+| [**Go Interop & Ollama Server**](../go/README.md) | In-process Go binding for EmbeddingGemma 2 via `gusset` and `tessl-embed` HTTP server implementing Ollama's `/api/embed`. |
 
 ---
 

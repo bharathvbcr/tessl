@@ -1,24 +1,29 @@
 //! Interleaved A/B of the GDN core at the Qwen3.5-2B shape: the chunked prefill
-//! path (`gdn_chunk_forward`), the token-by-token `gdn_recurrent`, and
-//! the four kernels of `gdn_recurrent_simd`'s family, with `gdn_recurrent`
-//! timed a second time as the noise floor.
+//! path (`gdn_chunk_forward`), the token-by-token `gdn_recurrent`, and every
+//! kernel of `gdn_recurrent_simd`'s family, with `gdn_recurrent` timed a second
+//! time as the noise floor.
 //!
 //! This is a measurement, not a gate: it is `#[ignore]`d, and run under the
-//! machine lock by `target-gp/` scripts (see `bench/results/
-//! qwen35_gdn_simd_ab_m5pro.txt` for the protocol and the numbers).
+//! machine lock (`bench/results/qwen35_gdn_simd_ab_m5pro.txt` has the protocol
+//! as run and the numbers).
 //!
 //! Protocol. Same inputs to every arm (batch 1, 16 key heads, 16 value heads,
 //! Dk = Dv = 128, a non-zero per-batch start state, `state_out` written), the
-//! gates, norms and q scale folded into each kernel's loads (equal work: the
-//! chunked arm's prep dispatch is inside its time). A sample is `N` launches
-//! between two `synchronize`s, divided by `N`; every arm gets `WARMUP`
-//! untimed launches before its first sample. Rounds rotate the arm order (round
-//! r starts at arm r mod the number of arms), so no arm is always first or always after the same
-//! neighbour. Per arm: min and median over rounds. Noise floor: the ratio of
-//! the two `gdn_recurrent` arms, per round, then its median and range, which is
-//! the resolution at which any other ratio below can be read.
+//! gates, norms and q scale computed by every arm (equal work: the chunked
+//! arm's prep dispatch and the prepped simd arm's prep dispatch are inside their
+//! time). A sample is `N` launches between two `synchronize`s, divided by `N`,
+//! `N` sized per arm to about `GDN_AB_TARGET_MS` of work; every arm gets
+//! `GDN_AB_WARMUP` untimed launches before its first sample. Each round rotates
+//! the arm order by one, so no arm is always first or always after the same
+//! neighbour. Per arm: min, median and max over `GDN_AB_ROUNDS` (at least 9)
+//! rounds. Noise floor: the ratio of the two `gdn_recurrent` arms, per round,
+//! then its median and range, which is the resolution at which any other ratio
+//! below can be read. Launches are timed with async encode on
+//! (`GDN_AB_ASYNC=0` for the library default, every launch its own
+//! submit-and-wait), because at decode lengths the default sits every arm on the
+//! host floor.
 //!
-//! Correctness runs first: the simd kernel's output and state are compared
+//! Correctness runs first: each simd kernel's output and state are compared
 //! with `gdn_recurrent`'s on the same inputs, and the run aborts if they are
 //! not within 1e-4 of the output scale. A fast wrong kernel is not a result.
 
@@ -196,7 +201,7 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                     Arm::Chunked => gdn_chunk_forward(rt, &d, &q, &g, &p, st, &ws, cols, Some(&sts[i])),
                     Arm::Recurrent | Arm::RecurrentAgain => gdn_recurrent(rt, &d, &q, &g, &p, st, cols, Some(&sts[i])),
                     Arm::Simd(v) => {
-                        gdn_recurrent_simd_with(rt, &d, &q, &g, &p, st, cols, Some(&sts[i]), v, Some(&scalars))
+                        gdn_recurrent_simd_with(rt, &d, &q, &g, &p, st, cols, Some(&sts[i]), None, v, Some(&scalars))
                     }
                 };
                 r.expect("launch");

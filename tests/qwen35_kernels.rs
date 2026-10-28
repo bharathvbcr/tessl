@@ -383,7 +383,7 @@ fn run_gdn_slice(
     let s = d.s;
     let dims = dims_of(s);
     let p = match path {
-        Path::SimdVariant(v) if v.vec => Packed::aligned(rt, d),
+        Path::SimdVariant(v) if v.vec() => Packed::aligned(rt, d),
         _ => Packed::new(rt, d),
     };
     let width = s.hv * s.dv;
@@ -448,7 +448,7 @@ fn run_gdn_slice(
         (Path::RecurrentSimd, None) => {
             qwen35::gdn_recurrent_simd(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
         }
-        (Path::SimdVariant(v), None) => {
+        (Path::SimdVariant(v), lens) => {
             let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
             qwen35::gdn_recurrent_simd_with(
                 rt,
@@ -459,15 +459,26 @@ fn run_gdn_slice(
                 state,
                 out_cols,
                 state_out,
+                lens.as_ref(),
                 v,
                 Some(&scalars),
             )
             .unwrap()
         }
-        (Path::SimdVariant(_), Some(_)) => unreachable!("the variants have no ragged entry point"),
-        (Path::RecurrentSimd, Some(l)) => {
-            qwen35::gdn_recurrent_simd_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
-        }
+        (Path::RecurrentSimd, Some(l)) => qwen35::gdn_recurrent_simd_with(
+            rt,
+            &dims,
+            &qkv,
+            &gates,
+            &params,
+            state,
+            out_cols,
+            state_out,
+            Some(l),
+            GdnSimdVariant::Mlx,
+            None,
+        )
+        .unwrap(),
     }
     rt.synchronize().unwrap();
 
@@ -888,6 +899,9 @@ fn gdn_varlen_rows_equal_each_row_alone_bit_for_bit() {
             let d = GdnData::random(short, state, 8250 + 10 * i as u64);
             gdn_varlen_case(rt, &d, Path::Recurrent, &lens);
             gdn_varlen_case(rt, &d, Path::RecurrentSimd, &lens);
+            for v in other_simd_variants() {
+                gdn_varlen_case(rt, &d, Path::SimdVariant(v), &lens);
+            }
         }
     });
 }
@@ -910,24 +924,16 @@ fn max_abs_err(got: &[f32], want: &[f64]) -> f64 {
 
 /// The kernels of the simd family other than `qwen35_gdn_recurrent_simd` itself.
 fn other_simd_variants() -> impl Iterator<Item = GdnSimdVariant> {
-    GdnSimdVariant::ALL.into_iter().filter(|v| *v != GdnSimdVariant::FUSED)
+    GdnSimdVariant::ALL.into_iter().filter(|v| *v != GdnSimdVariant::Mlx)
 }
 
-/// The entry point a variant names: `qwen35_gdn_recurrent_simd` plus `_pre`,
-/// `_l16`/`_l8`, `_vec`, `_pf` for what it turns on.
-fn simd_entry_name(v: GdnSimdVariant) -> String {
-    format!(
-        "qwen35_gdn_recurrent_simd{}{}{}{}{}",
-        if v.prepped { "_pre" } else { "" },
-        if v.lanes == 32 {
-            String::new()
-        } else {
-            format!("_l{}", v.lanes)
-        },
-        if v.vec { "_vec" } else { "" },
-        if v.prefetch { "_pf" } else { "" },
-        if v.reassoc { "_rr" } else { "" },
-    )
+/// The entry point of a variant.
+fn simd_entry_name(v: GdnSimdVariant) -> &'static str {
+    match v {
+        GdnSimdVariant::Mlx => "qwen35_gdn_recurrent_simd",
+        GdnSimdVariant::Fused8 => "qwen35_gdn_recurrent_simd_l8_vec",
+        GdnSimdVariant::Prepped8 => "qwen35_gdn_recurrent_simd_pre_l8_vec",
+    }
 }
 
 /// `qwen35_gdn_recurrent_simd` and `qwen35_gdn_recurrent` on one problem, each
@@ -1271,7 +1277,7 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
             assert_eq!(count("qwen35_gdn_recurrent") - rec0, 1);
             // Each variant asks for its own pipeline (the prepped ones also the prep pass), and no other's.
             for v in other_simd_variants() {
-                let name = simd_entry_name(v);
+                let name = simd_entry_name(v).to_string();
                 let (n0, p0, s0) = (
                     count(&name),
                     count("qwen35_gdn_simd_prep"),
@@ -1288,7 +1294,7 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
                 assert_eq!(count(&name) - n0, 1, "{v:?}: its own pipeline {name}");
                 assert_eq!(
                     count("qwen35_gdn_simd_prep") - p0,
-                    u64::from(v.prepped),
+                    u64::from(v == GdnSimdVariant::Prepped8),
                     "{v:?}: prep passes"
                 );
                 assert_eq!(
@@ -2542,7 +2548,7 @@ fn every_qwen35_kernel_is_in_the_metallib() {
         }
         for v in GdnSimdVariant::ALL {
             let name = simd_entry_name(v);
-            rt.pipeline(&name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            rt.pipeline(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     });
 }
@@ -2587,7 +2593,7 @@ fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
             let p = Packed::with_lead(rt, &d, lead);
             for v in GdnSimdVariant::ALL {
                 let (r, written) = call(&p, v);
-                let refused = v.vec && lead == 1;
+                let refused = v.vec() && lead == 1;
                 assert_eq!(r.is_err(), refused, "{v:?} lead {lead}: {r:?}");
                 assert_eq!(written, !refused, "{v:?} lead {lead}: output written = {written}");
                 if let Err(e) = r {
@@ -2595,14 +2601,6 @@ fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
                 }
             }
         }
-        // And a combination no kernel exists for is an error, not a silent other kernel.
-        let none = GdnSimdVariant {
-            lanes: 4,
-            ..GdnSimdVariant::FUSED
-        };
-        let (r, written) = call(&Packed::new(rt, &d), none);
-        assert!(r.is_err_and(|e| e.contains("no kernel")), "lanes = 4 must be refused");
-        assert!(!written, "a refused call wrote its output");
     });
 }
 

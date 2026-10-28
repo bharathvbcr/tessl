@@ -1496,79 +1496,54 @@ fn gdn_recurrent_impl(
 // ------------------------------------------------------ simd recurrence ---
 
 /// Which kernel of the one-simdgroup-per-column recurrence [`gdn_recurrent_simd_with`]
-/// runs: how its lanes are spent, where the gates and norms are computed, and
-/// how it loads and sums. Only the combinations in [`GdnSimdVariant::ALL`] exist.
+/// runs. All take [`gdn_recurrent`]'s inputs and agree with it to rounding.
+///
+/// Measured in `bench/results/qwen35_gdn_simd_ab_m5pro.txt`: [`Self::Mlx`] is
+/// slower than [`gdn_recurrent`] at every length; [`Self::Prepped8`] is faster
+/// than [`gdn_chunk_forward`] from T = 200 to 8192; [`Self::Fused8`] is a
+/// single dispatch and the one to compare against [`gdn_recurrent`] at T = 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GdnSimdVariant {
-    /// Lanes that share a value column: 32 (mlx's mapping), 16, 8 or 4. A
-    /// simdgroup then carries `32 / lanes` columns, each lane `128 / lanes` rows.
-    pub lanes: u32,
-    /// Read the gates and norms from a [`GdnSimdScalars`] a `qwen35_gdn_simd_prep`
-    /// pass has filled, rather than computing them in the loop as
-    /// [`gdn_recurrent`] does.
-    pub prepped: bool,
-    /// Load q and k as `float4`s (each lane a contiguous run of rows). Needs
-    /// `ld`, `q_off` and `k_off` of the qkv window to be multiples of 4.
-    pub vec: bool,
-    /// Issue step `t + 1`'s loads before step `t`'s arithmetic.
-    pub prefetch: bool,
-    /// Reassociate the step: both reductions read the old state and run side
-    /// by side, and q and k are never scaled per element (needs `prepped`).
-    pub reassoc: bool,
-}
-
-const fn variant(lanes: u32, prepped: bool, vec: bool, prefetch: bool, reassoc: bool) -> GdnSimdVariant {
-    GdnSimdVariant {
-        lanes,
-        prepped,
-        vec,
-        prefetch,
-        reassoc,
-    }
+pub enum GdnSimdVariant {
+    /// `qwen35_gdn_recurrent_simd`: mlx-lm's mapping as it is. A simdgroup a
+    /// value column, 4 state rows a lane, `simd_sum`; the gates and norms are
+    /// computed in the loop.
+    Mlx,
+    /// `qwen35_gdn_recurrent_simd_l8_vec`: 8 lanes a column (4 columns a
+    /// simdgroup, 16 rows a lane, shuffle butterfly), q and k read as `float4`s.
+    /// Gates and norms in the loop. Needs `ld`, `q_off` and `k_off` of the qkv
+    /// window to be multiples of 4.
+    Fused8,
+    /// `qwen35_gdn_recurrent_simd_pre_l8_vec`: [`Self::Fused8`] with the gates,
+    /// norms and q scale computed once per (token, value head) by
+    /// `qwen35_gdn_simd_prep` into a [`GdnSimdScalars`]; two dispatches.
+    Prepped8,
 }
 
 impl GdnSimdVariant {
-    /// `qwen35_gdn_recurrent_simd`: mlx's mapping, everything computed in the loop.
-    pub const FUSED: Self = variant(32, false, false, false, false);
     /// Every kernel of the family.
-    pub const ALL: [Self; 12] = [
-        variant(32, false, false, false, false),
-        variant(32, true, false, false, false),
-        variant(8, true, false, false, false),
-        variant(8, false, true, false, false),
-        variant(8, true, true, false, false),
-        variant(8, true, true, true, false),
-        variant(16, true, true, false, false),
-        variant(32, true, true, false, false),
-        variant(8, true, true, false, true),
-        variant(16, true, true, false, true),
-        variant(32, true, true, false, true),
-        variant(4, true, true, false, true),
-    ];
-}
+    pub const ALL: [Self; 3] = [Self::Mlx, Self::Fused8, Self::Prepped8];
 
-/// The entry point of `v`. A free function of literal arms, so the emulator's
-/// host-contract check sees every kernel the simd dispatch site binds.
-fn simd_kernel_name(v: GdnSimdVariant) -> Result<&'static str, String> {
-    match (v.lanes, v.prepped, v.vec, v.prefetch, v.reassoc) {
-        (32, false, false, false, false) => Ok("qwen35_gdn_recurrent_simd"),
-        (32, true, false, false, false) => Ok("qwen35_gdn_recurrent_simd_pre"),
-        (8, true, false, false, false) => Ok("qwen35_gdn_recurrent_simd_pre_l8"),
-        (8, false, true, false, false) => Ok("qwen35_gdn_recurrent_simd_l8_vec"),
-        (8, true, true, false, false) => Ok("qwen35_gdn_recurrent_simd_pre_l8_vec"),
-        (8, true, true, true, false) => Ok("qwen35_gdn_recurrent_simd_pre_l8_vec_pf"),
-        (16, true, true, false, false) => Ok("qwen35_gdn_recurrent_simd_pre_l16_vec"),
-        (32, true, true, false, false) => Ok("qwen35_gdn_recurrent_simd_pre_vec"),
-        (8, true, true, false, true) => Ok("qwen35_gdn_recurrent_simd_pre_l8_vec_rr"),
-        (16, true, true, false, true) => Ok("qwen35_gdn_recurrent_simd_pre_l16_vec_rr"),
-        (32, true, true, false, true) => Ok("qwen35_gdn_recurrent_simd_pre_vec_rr"),
-        (4, true, true, false, true) => Ok("qwen35_gdn_recurrent_simd_pre_l4_vec_rr"),
-        _ => Err(format!("qwen35::gdn_recurrent_simd: no kernel for {v:?}")),
+    fn prepped(self) -> bool {
+        self == Self::Prepped8
+    }
+
+    /// Whether it loads q and k as `float4`s.
+    pub fn vec(self) -> bool {
+        self != Self::Mlx
+    }
+
+    /// Lanes that share a value column.
+    fn lanes(self) -> usize {
+        if self == Self::Mlx {
+            32
+        } else {
+            8
+        }
     }
 }
 
-/// Scratch for the prepped variants: per (token row, value head) two `float4`s,
-/// `{decay, beta, rq, rk}` and `{q_n . k_n, 0, 0, 0}`. Allocate once for the largest call.
+/// Scratch for [`GdnSimdVariant::Prepped8`]: one `float4` `{decay, beta, rq, rk}`
+/// per (token row, value head). Allocate once for the largest call.
 pub struct GdnSimdScalars {
     buf: GpuBuffer,
 }
@@ -1577,7 +1552,7 @@ impl GdnSimdScalars {
     /// Bytes a call of `dims` needs.
     pub fn bytes_for(dims: &GdnDims) -> Result<usize, String> {
         usize_product(
-            &[dims.batch as usize, dims.seq as usize, dims.v_heads as usize, 32],
+            &[dims.batch as usize, dims.seq as usize, dims.v_heads as usize, 16],
             "GdnSimdScalars",
         )
     }
@@ -1618,41 +1593,14 @@ pub fn gdn_recurrent_simd(
         out,
         state_out,
         None,
-        GdnSimdVariant::FUSED,
+        GdnSimdVariant::Mlx,
         None,
     )
 }
 
-/// [`gdn_recurrent_simd`] with a length per row, as [`gdn_recurrent_varlen`].
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_recurrent_simd_varlen(
-    rt: &Arc<GpuRuntime>,
-    dims: &GdnDims,
-    qkv: &GdnQkv<'_>,
-    gates: &GdnGateLogits<'_>,
-    params: &GdnParams<'_>,
-    state: StateIn<'_>,
-    out: Cols<'_>,
-    state_out: Option<&GpuBuffer>,
-    seq_lens: &GpuBuffer,
-) -> Result<(), String> {
-    gdn_recurrent_simd_impl(
-        rt,
-        dims,
-        qkv,
-        gates,
-        params,
-        state,
-        out,
-        state_out,
-        Some(seq_lens),
-        GdnSimdVariant::FUSED,
-        None,
-    )
-}
-
-/// [`gdn_recurrent_simd`] on a chosen [`GdnSimdVariant`]. The prepped variants
-/// need `scalars`, which this fills (one extra dispatch); the others ignore it.
+/// [`gdn_recurrent_simd`] on a chosen [`GdnSimdVariant`], optionally with a
+/// length per row as [`gdn_recurrent_varlen`]. [`GdnSimdVariant::Prepped8`]
+/// needs `scalars`, which this fills (one extra dispatch); the others ignore it.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_recurrent_simd_with(
     rt: &Arc<GpuRuntime>,
@@ -1663,11 +1611,12 @@ pub fn gdn_recurrent_simd_with(
     state: StateIn<'_>,
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
+    seq_lens: Option<&GpuBuffer>,
     variant: GdnSimdVariant,
     scalars: Option<&GdnSimdScalars>,
 ) -> Result<(), String> {
     gdn_recurrent_simd_impl(
-        rt, dims, qkv, gates, params, state, out, state_out, None, variant, scalars,
+        rt, dims, qkv, gates, params, state, out, state_out, seq_lens, variant, scalars,
     )
 }
 
@@ -1689,8 +1638,7 @@ fn gdn_recurrent_simd_impl(
     let (flags, bstride) = validate_gdn(
         rt, WHAT, dims, qkv, gates, params, state, out, state_out, None, seq_lens,
     )?;
-    let rec_name = simd_kernel_name(variant)?;
-    let sc = match (variant.prepped, scalars) {
+    let sc = match (variant.prepped(), scalars) {
         (true, Some(s)) => {
             require::<u8>(rt, &s.buf, GdnSimdScalars::bytes_for(dims)?, "gdn simd scalars")?;
             // The prep pass writes it, so it may be none of what either pass reads or writes.
@@ -1710,7 +1658,7 @@ fn gdn_recurrent_simd_impl(
         (true, None) => return Err(format!("{WHAT}: {variant:?} needs a GdnSimdScalars")),
         (false, _) => None,
     };
-    if variant.vec && [qkv.ld, qkv.q_off, qkv.k_off].iter().any(|x| x % 4 != 0) {
+    if variant.vec() && [qkv.ld, qkv.q_off, qkv.k_off].iter().any(|x| x % 4 != 0) {
         return Err(format!(
             "{WHAT}: {variant:?} loads q and k as float4s; ld ({}), q_off ({}) and k_off ({}) must be multiples of 4",
             qkv.ld, qkv.q_off, qkv.k_off
@@ -1749,8 +1697,15 @@ fn gdn_recurrent_simd_impl(
             },
         )?;
     }
+    // Literal names, so the emulator's host-contract check sees every kernel
+    // this site binds.
+    let rec_name = match variant {
+        GdnSimdVariant::Mlx => "qwen35_gdn_recurrent_simd",
+        GdnSimdVariant::Fused8 => "qwen35_gdn_recurrent_simd_l8_vec",
+        GdnSimdVariant::Prepped8 => "qwen35_gdn_recurrent_simd_pre_l8_vec",
+    };
     // Columns a threadgroup: `REC_SIMD_COLS` simdgroups of `32 / lanes` columns.
-    let cols = REC_SIMD_COLS * (32 / variant.lanes as usize);
+    let cols = REC_SIMD_COLS * (32 / variant.lanes());
     let threads = REC_SIMD_COLS * 32;
     let p = pipeline_for(rt, rec_name, threads, 0)?;
     dispatch_groups(

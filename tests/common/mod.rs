@@ -213,8 +213,10 @@ pub fn round_trip_bf16(data: &[f32]) -> Vec<f32> {
 /// Rounding errors of a reassociated sum add as a random walk, `sqrt(n)`, not linearly;
 /// the factor 4 covers the tree's two stages. A test names its `scale` instead of
 /// picking a number, and never widens this to make a case pass.
+///
+/// The body is `numcheck::reduction_tolerance`. This function does not keep a second copy.
 pub fn reduction_bound(n: usize, scale: f64) -> f64 {
-    4.0 * f64::from(f32::EPSILON) * (n as f64).sqrt() * scale
+    numcheck::reduction_tolerance(n, scale)
 }
 
 pub fn tensor_f32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {

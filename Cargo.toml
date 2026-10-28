@@ -29,6 +29,9 @@ exclude = [
     # The Go binding (go/) is its own module and its own Rust crate (go/engine); a
     # consumer of this crate gets neither from crates.io.
     "go/**",
+    # numcheck is its own unpublished crate. Tests path-depend on it; it is not
+    # part of the tessl package.
+    "numcheck/**",
 ]
 
 # tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and
@@ -106,6 +109,10 @@ dispatch2 = "0.3"
 # Already the block crate objc2-metal uses for MTL4CommitFeedbackHandler.
 block2 = "0.6"
 libc = "0.2"
+
+[dev-dependencies]
+# Card ft-29323ca4. One std-only home. reduction_bound delegates to it.
+numcheck = { path = "numcheck" }
 
 [profile.release]
 opt-level = 3

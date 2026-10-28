@@ -923,6 +923,311 @@ GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent, 32u)
 /// 32-column grid is `Dv / 32 x Hv` groups. Bit-identical to the 32-column one.
 GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent_bv16, 16u)
 
+// ------------------------------------------------- recurrent, one simdgroup a column ---
+
+/// Simdgroups of `qwen35_gdn_simd_prep` a threadgroup.
+constant uint GDN_SIMD_PREP_SG = 8u;
+/// Simdgroups a `qwen35_gdn_recurrent_simd*` threadgroup runs.
+constant uint GDN_SIMD_COLS = 4u;
+
+/// Sum over the `LANES` lanes of a simdgroup that share a column (an aligned
+/// run of `LANES`), delivered to each of them: `simd_sum` at 32, a butterfly of
+/// `simd_shuffle_xor` at 8.
+template <uint LANES>
+inline float gdn_simd_group_sum(float x)
+{
+    static_assert(LANES == 32u || LANES == 8u, "whole columns per simdgroup");
+    if (LANES == 32u) {
+        return simd_sum(x);
+    }
+    for (uint off = LANES / 2u; off > 0u; off >>= 1u) {
+        x += simd_shuffle_xor(x, off);
+    }
+    return x;
+}
+
+/// A lane's `GDN_DK / LANES` rows of a key-dim vector (q or k) at `p`, which
+/// is offset to the lane's first row. `VEC` gives a lane a contiguous run, read as
+/// `float4`s (16-byte aligned: the host checks the strides and offsets), else
+/// it holds rows `sub + LANES * i`, one coalesced scalar load each.
+template <uint LANES, bool VEC>
+inline void gdn_simd_load_rows(device const float *p, thread float *out)
+{
+    constexpr uint ROWS = GDN_DK / LANES;
+    if (VEC) {
+        static_assert(ROWS % 4u == 0u, "float4 rows");
+        device const float4 *p4 = (device const float4 *)p;
+        for (uint j = 0u; j < ROWS / 4u; ++j) {
+            const float4 x = p4[j];
+            out[4u * j] = x.x;
+            out[4u * j + 1u] = x.y;
+            out[4u * j + 2u] = x.z;
+            out[4u * j + 3u] = x.w;
+        }
+    } else {
+        for (uint i = 0u; i < ROWS; ++i) {
+            out[i] = p[LANES * i];
+        }
+    }
+}
+
+/// The per-(token, value head) scalars the recurrence needs and that do not
+/// depend on the state: `{decay, beta, rq, rk}`, with `rq`/`rk` the q and k
+/// l2norm scales (q's folding in `Dk^-0.5`) of the head's key head. Computed
+/// exactly as `qwen35_gdn_recurrent` computes them in its loop, from a lane's
+/// rows `q`, `k` and the raw gate logits `a`, `b`. Every lane of a `LANES`-lane
+/// column group returns the same values.
+template <uint LANES>
+inline float4 gdn_simd_scalars(
+    thread const float *q,
+    thread const float *k,
+    float a,
+    float b,
+    float a_log,
+    float dt_bias)
+{
+    float ssq = 0.0f;
+    float ssk = 0.0f;
+    for (uint i = 0u; i < GDN_DK / LANES; ++i) {
+        ssq += q[i] * q[i];
+        ssk += k[i] * k[i];
+    }
+    const float rq = rsqrt(gdn_simd_group_sum<LANES>(ssq) + GDN_L2_EPS) * rsqrt((float)GDN_DK);
+    const float rk = rsqrt(gdn_simd_group_sum<LANES>(ssk) + GDN_L2_EPS);
+    const float decay = exp(qwen35_log_decay(a, a_log, dt_bias));
+    const float beta = tessl_sigmoid(b);
+    return float4(decay, beta, rq, rk);
+}
+
+/// The scalars of `gdn_simd_scalars` for every (row, value head), once each,
+/// for `qwen35_gdn_recurrent_simd_pre_l8_vec` to read, one `float4` a pair. One
+/// simdgroup a pair. A head group's value heads recompute their shared key
+/// head's norms; that is `Hv / Hk` times a 128-element dot per row, nothing
+/// next to what the recurrence would redo per column.
+///
+/// Grid: x = ceil(rows * Hv / GDN_SIMD_PREP_SG) threadgroups of
+/// `32 * GDN_SIMD_PREP_SG` threads, `rows = B * T`.
+kernel void qwen35_gdn_simd_prep(
+    device const float *qkv [[buffer(0)]],
+    device const float *ab [[buffer(1)]],
+    device const float *a_log [[buffer(2)]],
+    device const float *dt_bias [[buffer(3)]],
+    device float4 *sc [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &Hk [[buffer(6)]],
+    constant uint &Hv [[buffer(7)]],
+    constant uint &ld_qkv [[buffer(8)]],
+    constant uint &q_off [[buffer(9)]],
+    constant uint &k_off [[buffer(10)]],
+    constant uint &ld_ab [[buffer(11)]],
+    constant uint &a_off [[buffer(12)]],
+    constant uint &b_off [[buffer(13)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const ulong unit = (ulong)tg * GDN_SIMD_PREP_SG + sg;
+    // Uniform per simdgroup, and this kernel has no barrier.
+    if (unit >= (ulong)rows * Hv) return;
+    const ulong row = unit / Hv;
+    const uint hv = (uint)(unit % Hv);
+    const uint hk = hv / max(Hv / Hk, 1u);
+    float q[GDN_DK / 32u];
+    float k[GDN_DK / 32u];
+    gdn_simd_load_rows<32u, false>(qkv + row * (ulong)ld_qkv + q_off + hk * GDN_DK + lane, q);
+    gdn_simd_load_rows<32u, false>(qkv + row * (ulong)ld_qkv + k_off + hk * GDN_DK + lane, k);
+    device const float *gr = ab + row * (ulong)ld_ab;
+    const float4 c = gdn_simd_scalars<32u>(q, k, gr[a_off + hv], gr[b_off + hv], a_log[hv], dt_bias[hv]);
+    if (lane == 0u) {
+        sc[unit] = c;
+    }
+}
+
+/// `qwen35_gdn_recurrent` with mlx-lm's decomposition (`gated_delta.py`,
+/// `_make_gated_delta_kernel`): a simdgroup per group of value columns, state
+/// in registers for the whole sequence, both per-token reductions over the key
+/// dim a shuffle sum, no threadgroup memory and no barrier, so simdgroups never
+/// wait on one another (`gdn_recurrent` runs a head as 4 threadgroups whose 4
+/// key blocks meet at two barriers a token).
+///
+/// Same inputs, layouts, flags and outputs as `qwen35_gdn_recurrent`. State is
+/// `[DK, Dv]` as in `gdn_recurrent`, not mlx's `[Dv, DK]`, so the start and
+/// end transfers are strided by `Dv`. The sums run in a different order, so
+/// the two agree to rounding, not bit for bit.
+///
+/// `LANES` is how many lanes share a column. 32 is mlx's mapping (one column a
+/// simdgroup, 4 rows a lane, `simd_sum`). At 8 a simdgroup carries 4 columns,
+/// each lane 16 rows, the reductions are a 3-step butterfly, and a lane's q and
+/// k loads serve all of its 4 columns' groups.
+///
+/// `PRE` chooses where the state-independent scalars come from. Without it the
+/// gates, both l2norms and the q scale are folded into the loads, each column
+/// group computing them for itself, as `gdn_recurrent` does. With it
+/// `qwen35_gdn_simd_prep` has computed them once per (token, value head) and
+/// the loop reads one `float4`.
+///
+/// `VEC` gives each lane a contiguous run of rows, loaded as `float4`s (the
+/// host requires 16-byte aligned q and k windows). Every step addresses its
+/// operands by pointers advanced a row at a time rather than by a 64-bit row
+/// product.
+///
+/// Grid: x = Dv / (GDN_SIMD_COLS * 32 / LANES), y = value head, z = batch;
+/// 32 * GDN_SIMD_COLS threads.
+template <uint LANES, bool PRE, bool VEC>
+inline void gdn_simd_body(
+    device const float *qkv,
+    device const float *ab,
+    device const float *a_log,
+    device const float *dt_bias,
+    device const float *state_in,
+    device float *out,
+    device float *state_out,
+    uint T,
+    uint Hk,
+    uint Hv,
+    uint Dv,
+    uint ld_qkv,
+    uint q_off,
+    uint k_off,
+    uint v_off,
+    uint ld_ab,
+    uint a_off,
+    uint b_off,
+    uint ld_out,
+    uint out_off,
+    uint state_bstride,
+    uint flags,
+    device const uint *seq_lens,
+    device const float4 *sc,
+    uint3 tg,
+    uint sg,
+    uint lane)
+{
+    constexpr uint ROWS = GDN_DK / LANES;
+    constexpr uint CPS = 32u / LANES;
+    // Rows a lane holds: `r0 + RS * i`.
+    constexpr uint RS = VEC ? 1u : LANES;
+    const uint hv = tg.y;
+    const uint b = tg.z;
+    const uint hk = hv / max(Hv / Hk, 1u);
+    const uint sub = lane % LANES;
+    const uint v = tg.x * (GDN_SIMD_COLS * CPS) + sg * CPS + lane / LANES;
+    const uint r0 = VEC ? sub * ROWS : sub;
+
+    float s[ROWS];
+    const ulong state_head = (ulong)hv * GDN_DK * Dv;
+    for (uint i = 0u; i < ROWS; ++i) {
+        s[i] = (flags & 1u) != 0u
+            ? state_in[(ulong)b * state_bstride + state_head + (ulong)(r0 + RS * i) * Dv + v]
+            : 0.0f;
+    }
+
+    // Row b's live length (`flags & 4`: ragged rows); the row stride stays T.
+    const uint Tb = (flags & 4u) != 0u ? min(seq_lens[b], T) : T;
+
+    // This step's operands, by pointers advanced a row a step.
+    const ulong row0 = (ulong)b * T;
+    device const float *qp = qkv + row0 * ld_qkv + q_off + hk * GDN_DK + r0;
+    device const float *kp = qkv + row0 * ld_qkv + k_off + hk * GDN_DK + r0;
+    device const float *vp = qkv + row0 * ld_qkv + v_off + (ulong)hv * Dv + v;
+    device const float4 *scp = sc + row0 * Hv + hv;
+    device const float *gp = ab + row0 * ld_ab;
+    device float *op = out + row0 * ld_out + out_off + (ulong)hv * Dv + v;
+    const float al = a_log[hv];
+    const float dtb = dt_bias[hv];
+
+    for (uint t = 0u; t < Tb; ++t) {
+        float qc[ROWS];
+        float kc[ROWS];
+        gdn_simd_load_rows<LANES, VEC>(qp, qc);
+        gdn_simd_load_rows<LANES, VEC>(kp, kc);
+        const float vc = *vp;
+        const float4 c = PRE ? *scp : gdn_simd_scalars<LANES>(qc, kc, gp[a_off + hv], gp[b_off + hv], al, dtb);
+        const float decay = c.x;
+        const float beta = c.y;
+        const float rq = c.z;
+        const float rk = c.w;
+
+        // kv_mem = (decay * S)^T k
+        float kn[ROWS];
+        float kv = 0.0f;
+        for (uint i = 0u; i < ROWS; ++i) {
+            kn[i] = kc[i] * rk;
+            s[i] *= decay;
+            kv += s[i] * kn[i];
+        }
+        const float delta = beta * (vc - gdn_simd_group_sum<LANES>(kv));
+
+        // S += k delta^T; y = S^T q
+        float y = 0.0f;
+        for (uint i = 0u; i < ROWS; ++i) {
+            s[i] += kn[i] * delta;
+            y += s[i] * (qc[i] * rq);
+        }
+        y = gdn_simd_group_sum<LANES>(y);
+        if (sub == 0u) {
+            *op = y;
+        }
+
+        qp += ld_qkv;
+        kp += ld_qkv;
+        vp += ld_qkv;
+        scp += Hv;
+        gp += ld_ab;
+        op += ld_out;
+    }
+
+    if ((flags & 2u) != 0u) {
+        const ulong head = (ulong)b * Hv + hv;
+        for (uint i = 0u; i < ROWS; ++i) {
+            state_out[head * GDN_DK * Dv + (ulong)(r0 + RS * i) * Dv + v] = s[i];
+        }
+    }
+}
+
+#define GDN_SIMD_KERNEL(NAME, LANES, PRE, VEC)                                     \
+kernel void NAME(                                                                  \
+    device const float *qkv [[buffer(0)]],                                         \
+    device const float *ab [[buffer(1)]],                                          \
+    device const float *a_log [[buffer(2)]],                                       \
+    device const float *dt_bias [[buffer(3)]],                                     \
+    device const float *state_in [[buffer(4)]],                                    \
+    device float *out [[buffer(5)]],                                               \
+    device float *state_out [[buffer(6)]],                                         \
+    constant uint &T [[buffer(7)]],                                                \
+    constant uint &Hk [[buffer(8)]],                                               \
+    constant uint &Hv [[buffer(9)]],                                               \
+    constant uint &Dv [[buffer(10)]],                                              \
+    constant uint &ld_qkv [[buffer(11)]],                                          \
+    constant uint &q_off [[buffer(12)]],                                           \
+    constant uint &k_off [[buffer(13)]],                                           \
+    constant uint &v_off [[buffer(14)]],                                           \
+    constant uint &ld_ab [[buffer(15)]],                                           \
+    constant uint &a_off [[buffer(16)]],                                           \
+    constant uint &b_off [[buffer(17)]],                                           \
+    constant uint &ld_out [[buffer(18)]],                                          \
+    constant uint &out_off [[buffer(19)]],                                         \
+    constant uint &state_bstride [[buffer(20)]],                                   \
+    constant uint &flags [[buffer(21)]],                                           \
+    device const uint *seq_lens [[buffer(22)]],                                    \
+    device const float4 *sc [[buffer(23)]],                                        \
+    uint3 tg [[threadgroup_position_in_grid]],                                     \
+    uint sg [[simdgroup_index_in_threadgroup]],                                    \
+    uint lane [[thread_index_in_simdgroup]])                                       \
+{                                                                                  \
+    gdn_simd_body<LANES, PRE, VEC>(                                                \
+        qkv, ab, a_log, dt_bias, state_in, out, state_out, T, Hk, Hv, Dv, ld_qkv,  \
+        q_off, k_off, v_off, ld_ab, a_off, b_off, ld_out, out_off, state_bstride,  \
+        flags, seq_lens, sc, tg, sg, lane);                                        \
+}
+
+/// mlx-lm's mapping as it is: 32 lanes a column, scalar loads, gates in the loop.
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd, 32u, false, false)
+/// 8 lanes a column, `float4` loads, gates in the loop: one dispatch, for decode.
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_l8_vec, 8u, false, true)
+/// 8 lanes a column, `float4` loads, gates and norms from `qwen35_gdn_simd_prep`: for prefill.
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_pre_l8_vec, 8u, true, true)
+
 // --------------------------------------------------------- gated RMSNorm ---
 
 /// `out = rms_norm(x) * w * silu(z)` per head: transformers'

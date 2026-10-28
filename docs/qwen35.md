@@ -47,10 +47,11 @@ that fusion for Metal.
 | 3. Causal conv + SiLU | `qwen35_conv1d_silu` | `conv1d_silu` | `causal_conv1d_fn` / `causal_conv1d_update` |
 | 4. Gated RMSNorm | `qwen35_gated_rms_norm_{f32,bf16}` | `gated_rms_norm` | `Qwen3_5RMSNormGated` |
 | 5. Read-only GDN decode | `qwen35_gdn_recurrent`, `qwen35_gdn_recurrent_bv16` | `gdn_recurrent`, `gdn_recurrent_with_slice` | `torch_recurrent_gated_delta_rule` |
+| 5b. GDN recurrence, one simdgroup per group of value columns (mlx-lm's decomposition; `Qwen35Model`'s default prefill GDN, as `Prepped8`) | `qwen35_gdn_recurrent_simd`, `qwen35_gdn_recurrent_simd_l8_vec`, `qwen35_gdn_recurrent_simd_pre_l8_vec` (+ `qwen35_gdn_simd_prep`) | `gdn_recurrent_simd`, `gdn_recurrent_simd_with` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |
-| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles); opt-in bf16-tile variants `qwen35_attn_tiled_bf16{,pf32}_h256_*` (5 entries, not wired into the prefill) | `attn_prefill`, `attn_prefill_by_length`, `attn_prefill_with_tile`; `attn_prefill_bf16::attn_prefill_bf16_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
+| 6d. Prefill attention on the matrix units | `qwen35_attn_tiled_h256_*` (4 tiles); bf16-tile variants `qwen35_attn_tiled_bf16{,pf32}_h256_*` (5 entries; `Precision::Bf16` prefill runs `_q32_k64_sg4`) | `attn_prefill`, `attn_prefill_by_length`, `attn_prefill_with_tile`; `attn_prefill_bf16::attn_prefill_bf16_with_tile` | causal `sdpa` over the layer's own K/V; `nn::flash_attn_rows` with both products on TensorOps |
 | 6e. MLP activation | `qwen35_swiglu_{f32,bf16}` | `swiglu` | `act_fn(gate_proj(x)) * up_proj(x)` in `Qwen3_5MLP`, stored as bf16 for `down_proj` |
 | 7. Score only the answer rows | `qwen35_score_rows_{f32,bf16}` | `score_answer_rows` | final norm + `lm_head`, restricted to the answer tokens |
 | 7b. Embedding gather | `qwen35_embed_rows_{bf16,f32}` | `embed_rows` | `embed_tokens(ids)` from the bf16 (or, in the f32 model, f32) table, on the device, so a forward needs no host gather |
@@ -84,7 +85,8 @@ for the windows. A layout and a separately stated shape that disagree on
 ```text
 proj   = fused_projection(x, W_in)                         GEMM
 qkv    = conv1d_silu(proj[:, :conv_dim], conv_w, state)    kernel 3 (writes the next conv state)
-o      = gdn_chunk_forward(qkv, gates(proj), ...)          kernels 1+2 (prefill; writes the final state)
+o      = gdn_recurrent_simd_with(qkv, gates(proj), ...)    kernel 5b (prefill default, Prepped8; writes the final state)
+       | gdn_chunk_forward(qkv, gates(proj), ...)          kernels 1+2 (prefill, GdnPrefillKernel::Chunked)
        | gdn_recurrent(qkv, gates(proj), ...)              kernel 5 (decode)
 y      = gated_rms_norm(o, z(proj), norm_w) -> bf16       kernel 4
 resid += y @ W_out                                         project_residual (GEMM, beta = 1 epilogue)
@@ -1772,11 +1774,13 @@ span ±8% on this machine under load.
   `qwen35_attn_tiled_bf16pf32_h256_q32_k32_sg4` with P kept f32; host entry
   `attn_prefill_bf16::attn_prefill_bf16_with_tile`) and is checked at the
   kernel (`tests/attn_prefill_bf16_tiles.rs`, an f64 oracle with a bound
-  derived from bf16's unit roundoff), but it is **not wired into the prefill
-  and nothing is measured yet**: its speed (`bench_qwen35_layers
-  --paired-attn-bf16`) and its effect on the model's logits are the open
-  measurements, and it moves the attention output by bf16 rounding, so the f32
-  path stays the default until the logits say otherwise. The kernel reads bf16
+  derived from bf16's unit roundoff). `Precision::Bf16` prefill uses it at
+  Q32K64 with a bf16 P tile. Q, K and V are cast once by
+  `attn_prefill_bf16::cast_f32_to_bf16`. The real-2B bf16 logit gate passes
+  (`bench/results/w33_prefill_gate_m5pro.txt`: mean KL against fp32 3.09e-5 /
+  3.05e-5, below transformers bf16's 5.74e-4 / 3.79e-4). `Precision::F32` stays
+  on `attn_prefill`. The open measurement is the model-level prefill+score
+  timing against mlx-lm. The kernel reads bf16
   Q/K/V from device memory instead of casting on load: a cast in the kernel
   would be a hand-staged device-to-threadgroup copy of every K and V tile for
   every query block, which the strided tensor views exist to avoid. The

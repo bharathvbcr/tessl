@@ -30,7 +30,7 @@ use common::qwen35::*;
 use common::{buf, buf_u32, random_f32, seeded, with_gpu};
 use tessl::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnGateLogits, GdnParams, GdnProjLayout, GdnQkv,
-    GdnScanSlice, GdnWorkspace, LmHead, OutCols, StateIn,
+    GdnScanSlice, GdnSimdScalars, GdnSimdVariant, GdnWorkspace, LmHead, OutCols, StateIn,
 };
 use tessl::tensor::{bf16_bits_to_f32, f32_slice_to_bf16, DType, GpuBuffer};
 use tessl::{GemmBackend, GpuRuntime};
@@ -231,19 +231,32 @@ struct Packed {
     a_log: GpuBuffer,
     dt_bias: GpuBuffer,
     key_w: u32,
+    /// Column of q's first element: 1 (so no window starts on a 4-float boundary),
+    /// or 0 for the layout the `float4` kernels take.
+    lead: usize,
 }
 
 impl Packed {
     fn new(rt: &Arc<GpuRuntime>, d: &GdnData) -> Self {
+        Self::with_lead(rt, d, 1)
+    }
+
+    /// q at column 0 and a row stride that is a multiple of 4: what the
+    /// `float4`-loading kernels accept.
+    fn aligned(rt: &Arc<GpuRuntime>, d: &GdnData) -> Self {
+        Self::with_lead(rt, d, 0)
+    }
+
+    fn with_lead(rt: &Arc<GpuRuntime>, d: &GdnData, lead: usize) -> Self {
         let GdnShape { b, t, hk, hv, dv } = d.s;
         let key_w = hk * DK;
-        let ld = 1 + 2 * key_w + hv * dv + 4;
+        let ld = lead + 2 * key_w + hv * dv + if lead == 0 { 0 } else { 4 };
         let mut qkv = vec![SENTINEL; b * t * ld];
         for r in 0..b * t {
             let row = &mut qkv[r * ld..(r + 1) * ld];
-            row[1..1 + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
-            row[1 + key_w..1 + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
-            row[1 + 2 * key_w..1 + 2 * key_w + hv * dv].copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
+            row[lead..lead + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
+            row[lead + key_w..lead + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
+            row[lead + 2 * key_w..lead + 2 * key_w + hv * dv].copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
         }
         let g_ld = 1 + 2 * hv + 2;
         let mut gates = vec![SENTINEL; b * t * g_ld];
@@ -260,6 +273,7 @@ impl Packed {
             a_log: buf(rt, &d.a_log),
             dt_bias: buf(rt, &d.dt_bias),
             key_w: key_w as u32,
+            lead,
         }
     }
 
@@ -267,9 +281,9 @@ impl Packed {
         GdnQkv {
             buf: &self.qkv,
             ld: self.ld,
-            q_off: 1,
-            k_off: 1 + self.key_w,
-            v_off: 1 + 2 * self.key_w,
+            q_off: self.lead as u32,
+            k_off: self.lead as u32 + self.key_w,
+            v_off: self.lead as u32 + 2 * self.key_w,
         }
     }
 
@@ -304,6 +318,12 @@ fn dims_of(s: GdnShape) -> GdnDims {
 enum Path {
     Chunk,
     Recurrent,
+    /// `qwen35_gdn_recurrent_simd`: the recurrence with mlx-lm's decomposition.
+    /// Same contract as [`Path::Recurrent`], other summation order.
+    RecurrentSimd,
+    /// The other kernels of the simd family ([`GdnSimdVariant`]); `Fused` is
+    /// [`Path::RecurrentSimd`] through its own entry point.
+    SimdVariant(GdnSimdVariant),
 }
 
 /// Where a GDN call puts its final state.
@@ -338,7 +358,8 @@ fn run_gdn_lens(
     lens: Option<&[u32]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let base = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols32);
-    if path == Path::Chunk || lens.is_none() {
+    // The simd recurrence has no 16-column form to agree with.
+    if path == Path::Chunk || (path == Path::Recurrent && lens.is_none()) {
         let narrow = run_gdn_slice(rt, d, path, mode, lens, GdnScanSlice::Cols16);
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(
@@ -361,7 +382,10 @@ fn run_gdn_slice(
 ) -> (Vec<f32>, Vec<f32>) {
     let s = d.s;
     let dims = dims_of(s);
-    let p = Packed::new(rt, d);
+    let p = match path {
+        Path::SimdVariant(v) if v.vec() => Packed::aligned(rt, d),
+        _ => Packed::new(rt, d),
+    };
     let width = s.hv * s.dv;
     let (out_ld, out_off) = (width + 3, 2usize);
     let out = seeded(rt, s.b * s.t * out_ld, SENTINEL);
@@ -421,6 +445,40 @@ fn run_gdn_slice(
         (Path::Recurrent, Some(l)) => {
             qwen35::gdn_recurrent_varlen(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out, l).unwrap()
         }
+        (Path::RecurrentSimd, None) => {
+            qwen35::gdn_recurrent_simd(rt, &dims, &qkv, &gates, &params, state, out_cols, state_out).unwrap()
+        }
+        (Path::SimdVariant(v), lens) => {
+            let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
+            qwen35::gdn_recurrent_simd_with(
+                rt,
+                &dims,
+                &qkv,
+                &gates,
+                &params,
+                state,
+                out_cols,
+                state_out,
+                lens.as_ref(),
+                v,
+                Some(&scalars),
+            )
+            .unwrap()
+        }
+        (Path::RecurrentSimd, Some(l)) => qwen35::gdn_recurrent_simd_with(
+            rt,
+            &dims,
+            &qkv,
+            &gates,
+            &params,
+            state,
+            out_cols,
+            state_out,
+            Some(l),
+            GdnSimdVariant::Mlx,
+            None,
+        )
+        .unwrap(),
     }
     rt.synchronize().unwrap();
 
@@ -487,14 +545,21 @@ fn gdn_chunk_matches_transformers_golden() {
 fn gdn_recurrent_matches_transformers_golden() {
     with_gpu(|rt| {
         let d = GdnData::fixture();
-        let (y, st) = run_gdn(rt, &d, Path::Recurrent);
-        assert_close("rec y", &y, &load("gdn_y_f64").1, rel_bound(&load("gdn_y_f64").1));
-        assert_close(
-            "rec state",
-            &st,
-            &load("gdn_state_f64").1,
-            rel_bound(&load("gdn_state_f64").1),
-        );
+        for path in [Path::Recurrent, Path::RecurrentSimd] {
+            let (y, st) = run_gdn(rt, &d, path);
+            assert_close(
+                &format!("{path:?} y"),
+                &y,
+                &load("gdn_y_f64").1,
+                rel_bound(&load("gdn_y_f64").1),
+            );
+            assert_close(
+                &format!("{path:?} state"),
+                &st,
+                &load("gdn_state_f64").1,
+                rel_bound(&load("gdn_state_f64").1),
+            );
+        }
     });
 }
 
@@ -688,6 +753,7 @@ fn gdn_recurrent_decode_shapes() {
         for (i, (s, state)) in cases.into_iter().enumerate() {
             let d = GdnData::random(s, state, 200 + i as u64);
             check_gdn(&format!("recurrent {s:?} {state}"), rt, &d, Path::Recurrent);
+            check_gdn(&format!("recurrent simd {s:?} {state}"), rt, &d, Path::RecurrentSimd);
         }
     });
 }
@@ -710,6 +776,7 @@ fn gdn_strong_decay_stays_finite_and_exact() {
         d.a = d.a.iter().map(|x| x * 2.0).collect();
         check_gdn("chunk strong decay", rt, &d, Path::Chunk);
         check_gdn("recurrent strong decay", rt, &d, Path::Recurrent);
+        check_gdn("recurrent simd strong decay", rt, &d, Path::RecurrentSimd);
     });
 }
 
@@ -831,7 +898,457 @@ fn gdn_varlen_rows_equal_each_row_alone_bit_for_bit() {
         for (i, state) in ["batch", "snapshot"].iter().enumerate() {
             let d = GdnData::random(short, state, 8250 + 10 * i as u64);
             gdn_varlen_case(rt, &d, Path::Recurrent, &lens);
+            gdn_varlen_case(rt, &d, Path::RecurrentSimd, &lens);
+            for v in other_simd_variants() {
+                gdn_varlen_case(rt, &d, Path::SimdVariant(v), &lens);
+            }
         }
+    });
+}
+
+// ------------------------------------- the simd recurrence against f64 and the recurrence ---
+
+/// Largest absolute error of `got` against the f64 `want`; a never-written or
+/// non-finite element is an error of infinity, so it cannot slip under a bound.
+fn max_abs_err(got: &[f32], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len(), "length");
+    got.iter().zip(want).fold(0.0, |m, (&g, &w)| {
+        let e = if g == SENTINEL || !g.is_finite() {
+            f64::INFINITY
+        } else {
+            (f64::from(g) - w).abs()
+        };
+        m.max(e)
+    })
+}
+
+/// The kernels of the simd family other than `qwen35_gdn_recurrent_simd` itself.
+fn other_simd_variants() -> impl Iterator<Item = GdnSimdVariant> {
+    GdnSimdVariant::ALL.into_iter().filter(|v| *v != GdnSimdVariant::Mlx)
+}
+
+/// The entry point of a variant.
+fn simd_entry_name(v: GdnSimdVariant) -> &'static str {
+    match v {
+        GdnSimdVariant::Mlx => "qwen35_gdn_recurrent_simd",
+        GdnSimdVariant::Fused8 => "qwen35_gdn_recurrent_simd_l8_vec",
+        GdnSimdVariant::Prepped8 => "qwen35_gdn_recurrent_simd_pre_l8_vec",
+    }
+}
+
+/// `qwen35_gdn_recurrent_simd` and `qwen35_gdn_recurrent` on one problem, each
+/// held to the f64 reference, and to each other.
+///
+/// **The bound, stated before the run.** Two conditions, both on max absolute
+/// error over the whole output (and, separately, the final state):
+///
+/// 1. *Absolute*: each kernel within `1e-4 * max|want|` of f64. This is the
+///    bound this file holds every GDN kernel to (`rel_bound`); the kernels
+///    measure about 1e-6 relative to the output scale, and every defect the
+///    emulator mutation run injected moved the output by more than 1e-2.
+/// 2. *Relative to the incumbent*: the simd kernel's error is at most
+///    `4 * recurrent's + 64 * 2^-24 * max|want|`. The two kernels sum the same 128
+///    products in different orders: `gdn_recurrent` folds 32 rows left to right
+///    per thread and adds four partials; the simd kernel folds 4 rows per lane
+///    and then runs a 5-level shuffle tree. A depth-9 tree has an error bound
+///    below a depth-34 chain's, so the simd error should not exceed the
+///    incumbent's by more than the luck of which element is worst; 4x and a
+///    64-ulp floor (for cases where the incumbent is exact) leave room for
+///    that, and a wrong kernel is orders of magnitude off, not 4x.
+///
+/// Returns (recurrent y err, simd y err, recurrent state err, simd state err,
+/// the simd output, the recurrent output).
+fn check_simd_vs_recurrent(
+    label: &str,
+    rt: &Arc<GpuRuntime>,
+    d: &GdnData,
+) -> ((f64, f64, f64, f64), Vec<f32>, Vec<f32>) {
+    let (want_y, want_s) = gdn_f64(&d.problem());
+    let (ry, rs) = run_gdn(rt, d, Path::Recurrent);
+    let (sy, ss) = run_gdn(rt, d, Path::RecurrentSimd);
+    let (by, bs) = (rel_bound(&want_y), rel_bound(&want_s));
+    assert_close(&format!("{label} recurrent y"), &ry, &want_y, by);
+    assert_close(&format!("{label} simd y"), &sy, &want_y, by);
+    assert_close(&format!("{label} recurrent state"), &rs, &want_s, bs);
+    assert_close(&format!("{label} simd state"), &ss, &want_s, bs);
+    let ulp64 = 64.0 * 2f64.powi(-24);
+    let errs = (
+        max_abs_err(&ry, &want_y),
+        max_abs_err(&sy, &want_y),
+        max_abs_err(&rs, &want_s),
+        max_abs_err(&ss, &want_s),
+    );
+    assert!(
+        errs.1 <= 4.0 * errs.0 + ulp64 * max_abs(&want_y),
+        "{label}: simd y error {:.3e} against the recurrent's {:.3e}",
+        errs.1,
+        errs.0
+    );
+    assert!(
+        errs.3 <= 4.0 * errs.2 + ulp64 * max_abs(&want_s),
+        "{label}: simd state error {:.3e} against the recurrent's {:.3e}",
+        errs.3,
+        errs.2
+    );
+    // The other kernels of the family run the same arithmetic (the prepped
+    // ones with the scalars computed in a pass of their own, the sg8 ones in
+    // wider threadgroups): each is held to the same two conditions.
+    for v in other_simd_variants() {
+        let (vy, vs) = run_gdn(rt, d, Path::SimdVariant(v));
+        assert_close(&format!("{label} {v:?} y"), &vy, &want_y, by);
+        assert_close(&format!("{label} {v:?} state"), &vs, &want_s, bs);
+        assert!(
+            max_abs_err(&vy, &want_y) <= 4.0 * errs.0 + ulp64 * max_abs(&want_y),
+            "{label}: {v:?} y error {:.3e} against the recurrent's {:.3e}",
+            max_abs_err(&vy, &want_y),
+            errs.0
+        );
+        assert!(
+            max_abs_err(&vs, &want_s) <= 4.0 * errs.2 + ulp64 * max_abs(&want_s),
+            "{label}: {v:?} state error {:.3e} against the recurrent's {:.3e}",
+            max_abs_err(&vs, &want_s),
+            errs.2
+        );
+    }
+    println!(
+        "GDN_SIMD_ERR {label}: |y|max {:.3e} recurrent_y {:.3e} simd_y {:.3e} | |s|max {:.3e} recurrent_s {:.3e} simd_s {:.3e}",
+        max_abs(&want_y),
+        errs.0,
+        errs.1,
+        max_abs(&want_s),
+        errs.2,
+        errs.3
+    );
+    (errs, sy, ry)
+}
+
+#[test]
+fn gdn_recurrent_simd_matches_f64_across_shapes_and_lengths() {
+    // The real 2B shape (16 key heads, 16 value heads, Dk = Dv = 128) at every
+    // length, plus odd shapes `GdnDims` accepts: grouped value heads (hv = 3 hk),
+    // Dv = 96 (a multiple of 32, not of 64 or 128), batch > 1 with per-batch
+    // state, and a shared snapshot. T crosses the 32-lane and 64-row edges.
+    with_gpu(|rt| {
+        let two_b = GdnShape {
+            b: 1,
+            t: 0,
+            hk: 16,
+            hv: 16,
+            dv: 128,
+        };
+        let grouped = GdnShape {
+            b: 3,
+            t: 0,
+            hk: 2,
+            hv: 6,
+            dv: 32,
+        };
+        let dv96 = GdnShape {
+            b: 2,
+            t: 0,
+            hk: 1,
+            hv: 1,
+            dv: 96,
+        };
+        let small = GdnShape {
+            b: 1,
+            t: 0,
+            hk: 1,
+            hv: 2,
+            dv: 32,
+        };
+        let plan: [(GdnShape, &str, &[usize]); 8] = [
+            (two_b, "none", &[0, 1, 2, 31, 32, 33, 200, 1024]),
+            (two_b, "batch", &[1, 2, 33, 200]),
+            (grouped, "none", &[0, 1, 2, 31, 32, 33, 200]),
+            (grouped, "batch", &[0, 1, 33, 200]),
+            (grouped, "snapshot", &[1, 2, 32, 200]),
+            (dv96, "batch", &[1, 32, 33]),
+            (dv96, "snapshot", &[2, 33]),
+            (small, "batch", &[1, 1024]),
+        ];
+        let mut differing = 0usize;
+        let mut seed = 9100u64;
+        for (shape, state, ts) in plan {
+            for &t in ts {
+                seed += 10;
+                let d = GdnData::random(GdnShape { t, ..shape }, state, seed);
+                let label = format!(
+                    "b{} t{t} hk{} hv{} dv{} state={state}",
+                    shape.b, shape.hk, shape.hv, shape.dv
+                );
+                let (_, sy, ry) = check_simd_vs_recurrent(&label, rt, &d);
+                differing += sy.iter().zip(&ry).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            }
+        }
+        // Different summation orders cannot agree to every bit over this many
+        // outputs: if they did, the "new" kernel was the old one.
+        assert!(
+            differing > 0,
+            "simd output is bit-identical to gdn_recurrent's everywhere"
+        );
+    });
+}
+
+#[test]
+fn gdn_recurrent_simd_gain_extremes() {
+    // Decay and operand scale at the ends of their range, T long enough for the
+    // state to carry them: decay indistinguishable from 1 (A_log = -9: the state is
+    // never forgotten, error accumulates over 1024 steps), decay of zero in f32
+    // (A_log = 2.5 with |a| up to 8: exp(g) underflows), and q/k scaled to
+    // 1e-3 (the l2norm epsilon dominates the norm) and 1e3.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 1024,
+            hk: 2,
+            hv: 4,
+            dv: 128,
+        };
+        let base = || GdnData::random(s, "batch", 9500);
+        let mut slow = base();
+        slow.a_log = vec![-9.0; s.hv];
+        slow.dt_bias = vec![-6.0; s.hv];
+        check_simd_vs_recurrent("decay~1", rt, &slow);
+        let mut fast = base();
+        fast.a_log = vec![2.5; s.hv];
+        fast.a = fast.a.iter().map(|x| x * 4.0).collect();
+        check_simd_vs_recurrent("decay~0", rt, &fast);
+        for (name, k) in [("qk 1e-3", 1e-3f32), ("qk 1e3", 1e3)] {
+            let mut d = base();
+            d.q.iter_mut().for_each(|x| *x *= k);
+            d.k.iter_mut().for_each(|x| *x *= k);
+            check_simd_vs_recurrent(name, rt, &d);
+        }
+        // Large values and a large v: only the finite-ness and the bound.
+        let mut big = base();
+        big.v.iter_mut().for_each(|x| *x *= 1e4);
+        check_simd_vs_recurrent("v 1e4", rt, &big);
+    });
+}
+
+/// Non-finite pattern of `v`: which elements are NaN or infinite.
+fn bad_mask(v: &[f32]) -> Vec<bool> {
+    v.iter().map(|x| !x.is_finite()).collect()
+}
+
+#[test]
+fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
+    // `gdn_recurrent` has no NaN or infinity policy: it clamps nothing and
+    // checks nothing, so a non-finite operand flows wherever the arithmetic
+    // carries it. The simd kernel's policy is the same one, tested as the same
+    // *pattern*: for each poison, the elements that are non-finite out of
+    // `gdn_recurrent` are exactly the ones non-finite out of the simd kernel
+    // (and the finite ones agree to a loose bound), in the output and the state.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 2,
+            t: 12,
+            hk: 2,
+            hv: 4,
+            dv: 64,
+        };
+        let (bt, hk, hv, dv) = (s.b * s.t, s.hk, s.hv, s.dv);
+        let qk_at = move |row: usize, kh: usize| (row * hk + kh) * DK + 17;
+        let v_at = move |row: usize, h: usize, col: usize| (row * hv + h) * dv + col;
+        let g_at = move |row: usize, h: usize| row * hv + h;
+        let row = 3usize; // batch 0, token 3
+        type Poison = Box<dyn Fn(&mut GdnData)>;
+        let cases: Vec<(&str, Poison, bool)> = vec![
+            ("NaN in v", Box::new(move |d| d.v[v_at(row, 1, 5)] = f32::NAN), true),
+            (
+                "+inf in v",
+                Box::new(move |d| d.v[v_at(row, 2, 9)] = f32::INFINITY),
+                true,
+            ),
+            ("NaN in q", Box::new(move |d| d.q[qk_at(row, 0)] = f32::NAN), true),
+            ("NaN in k", Box::new(move |d| d.k[qk_at(row, 1)] = f32::NAN), true),
+            ("NaN in b", Box::new(move |d| d.b[g_at(row, 3)] = f32::NAN), true),
+            ("NaN in a", Box::new(move |d| d.a[g_at(row, 0)] = f32::NAN), true),
+            ("+inf in a", Box::new(move |d| d.a[g_at(row, 2)] = f32::INFINITY), false),
+            (
+                "-inf in a",
+                Box::new(move |d| d.a[g_at(row, 2)] = f32::NEG_INFINITY),
+                false,
+            ),
+            (
+                "q, k of 1e30 (norm overflows)",
+                Box::new(move |d| {
+                    for e in 0..DK {
+                        d.q[(row * hk) * DK + e] = 1e30;
+                        d.k[(row * hk) * DK + e] = -1e30;
+                    }
+                }),
+                false,
+            ),
+        ];
+        assert!(bt > row);
+        for (i, (name, poison, must_poison)) in cases.iter().enumerate() {
+            let mut d = GdnData::random(s, "batch", 9700 + i as u64);
+            poison(&mut d);
+            let (ry, rs) = run_gdn(rt, &d, Path::Recurrent);
+            let my_bad = bad_mask(&ry);
+            let mrs = bad_mask(&rs);
+            let bad = my_bad.iter().filter(|&&b| b).count() + mrs.iter().filter(|&&b| b).count();
+            // A poison that poisoned nothing in the incumbent would make the
+            // equality below vacuous: say which ones are expected to bite.
+            assert_eq!(
+                bad > 0,
+                *must_poison,
+                "{name}: gdn_recurrent produced {bad} non-finite elements"
+            );
+            for path in std::iter::once(Path::RecurrentSimd).chain(other_simd_variants().map(Path::SimdVariant)) {
+                let (sy, ss) = run_gdn(rt, &d, path);
+                assert_eq!(
+                    my_bad,
+                    bad_mask(&sy),
+                    "{name} {path:?}: non-finite pattern of y differs from gdn_recurrent's"
+                );
+                assert_eq!(
+                    mrs,
+                    bad_mask(&ss),
+                    "{name} {path:?}: non-finite pattern of the state differs from gdn_recurrent's"
+                );
+                for (what, a, b) in [("y", &ry, &sy), ("state", &rs, &ss)] {
+                    let scale = a.iter().filter(|x| x.is_finite()).fold(0.0f32, |m, x| m.max(x.abs()));
+                    for (j, (x, z)) in a.iter().zip(b.iter()).enumerate() {
+                        if x.is_finite() && z.is_finite() {
+                            assert!(
+                                (x - z).abs() <= 1e-3 * scale.max(1e-3),
+                                "{name} {path:?} {what}[{j}]: recurrent {x} simd {z}"
+                            );
+                        }
+                    }
+                }
+            }
+            println!("GDN_SIMD_NONFINITE {name}: {bad} non-finite elements in gdn_recurrent and in every simd kernel, patterns equal");
+        }
+    });
+}
+
+#[test]
+fn gdn_recurrent_simd_runs_its_own_pipeline() {
+    // Guards the way a kernel test goes vacuous: a host path that quietly runs
+    // the old kernel would pass every comparison above. The trace counts
+    // pipeline requests by name, in a child process (the trace is read from the
+    // environment once).
+    common::in_traced_child("gdn_recurrent_simd_runs_its_own_pipeline", || {
+        let count = tessl::runtime::traced_kernel_count;
+        assert!(tessl::runtime::kernel_trace_enabled(), "the child must trace");
+        with_gpu(|rt| {
+            let s = GdnShape {
+                b: 1,
+                t: 5,
+                hk: 2,
+                hv: 2,
+                dv: 32,
+            };
+            let d = GdnData::random(s, "none", 9900);
+            let (simd0, rec0, rec16_0) = (
+                count("qwen35_gdn_recurrent_simd"),
+                count("qwen35_gdn_recurrent"),
+                count("qwen35_gdn_recurrent_bv16"),
+            );
+            run_gdn_slice(
+                rt,
+                &d,
+                Path::RecurrentSimd,
+                StateOut::Separate,
+                None,
+                GdnScanSlice::Cols32,
+            );
+            assert_eq!(
+                count("qwen35_gdn_recurrent_simd") - simd0,
+                1,
+                "one simd pipeline request"
+            );
+            assert_eq!(
+                count("qwen35_gdn_recurrent") - rec0,
+                0,
+                "the simd path must not request gdn_recurrent"
+            );
+            assert_eq!(count("qwen35_gdn_recurrent_bv16") - rec16_0, 0);
+            run_gdn_slice(rt, &d, Path::Recurrent, StateOut::Separate, None, GdnScanSlice::Cols32);
+            assert_eq!(
+                count("qwen35_gdn_recurrent_simd") - simd0,
+                1,
+                "gdn_recurrent must not request the simd kernel"
+            );
+            assert_eq!(count("qwen35_gdn_recurrent") - rec0, 1);
+            // Each variant asks for its own pipeline (the prepped ones also the prep pass), and no other's.
+            for v in other_simd_variants() {
+                let name = simd_entry_name(v).to_string();
+                let (n0, p0, s0) = (
+                    count(&name),
+                    count("qwen35_gdn_simd_prep"),
+                    count("qwen35_gdn_recurrent_simd"),
+                );
+                run_gdn_slice(
+                    rt,
+                    &d,
+                    Path::SimdVariant(v),
+                    StateOut::Separate,
+                    None,
+                    GdnScanSlice::Cols32,
+                );
+                assert_eq!(count(&name) - n0, 1, "{v:?}: its own pipeline {name}");
+                assert_eq!(
+                    count("qwen35_gdn_simd_prep") - p0,
+                    u64::from(v == GdnSimdVariant::Prepped8),
+                    "{v:?}: prep passes"
+                );
+                assert_eq!(
+                    count("qwen35_gdn_recurrent_simd") - s0,
+                    0,
+                    "{v:?}: must not run the fused kernel"
+                );
+            }
+        });
+    });
+}
+
+#[test]
+fn the_simd_bound_can_fail() {
+    // The tolerance is only evidence if a wrong answer breaks it. Perturb a
+    // correct simd output by 1e-3 of its scale in one element (a mis-summed
+    // lane, a dropped decay, a wrong q scale all do far more than this) and
+    // require the file's bound to reject it, for y and for the state.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 33,
+            hk: 2,
+            hv: 2,
+            dv: 64,
+        };
+        let d = GdnData::random(s, "batch", 9950);
+        let (want_y, want_s) = gdn_f64(&d.problem());
+        let (y, st) = run_gdn(rt, &d, Path::RecurrentSimd);
+        assert_close("unperturbed y", &y, &want_y, rel_bound(&want_y));
+        let rejects = |got: Vec<f32>, want: &[f64]| {
+            let bound = rel_bound(want);
+            std::panic::catch_unwind(|| assert_close("perturbed", &got, want, bound)).is_err()
+        };
+        let (mut y2, mut s2) = (y.clone(), st.clone());
+        y2[y.len() / 2] += 1e-3 * max_abs(&want_y) as f32 * 2.0;
+        s2[st.len() / 3] += 1e-3 * max_abs(&want_s) as f32 * 2.0;
+        assert!(
+            rejects(y2, &want_y),
+            "a 2e-3 relative error in one y element passed the bound"
+        );
+        assert!(
+            rejects(s2, &want_s),
+            "a 2e-3 relative error in one state element passed the bound"
+        );
+        // And a kernel doing the wrong thing fails the comparison against the
+        // reference: the same problem with the start state dropped.
+        let mut no_state = GdnData::random(s, "batch", 9950);
+        no_state.state0 = None;
+        let (y3, _) = run_gdn(rt, &no_state, Path::RecurrentSimd);
+        assert!(
+            rejects(y3, &want_y),
+            "dropping the start state did not move the output past the bound"
+        );
     });
 }
 
@@ -2009,6 +2526,8 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_chunk_scan_bv16",
             "qwen35_gdn_recurrent",
             "qwen35_gdn_recurrent_bv16",
+            "qwen35_gdn_recurrent_simd",
+            "qwen35_gdn_simd_prep",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
             "qwen35_attn_qk_norm_rope",
@@ -2027,6 +2546,62 @@ fn every_qwen35_kernel_is_in_the_metallib() {
         ] {
             rt.pipeline(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+        for v in GdnSimdVariant::ALL {
+            let name = simd_entry_name(v);
+            rt.pipeline(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    });
+}
+
+#[test]
+fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
+    // The `vec` kernels load q and k as `float4`s. A window whose offset or
+    // stride is not a multiple of 4 floats would read the wrong columns or fault
+    // on a real GPU; the host says no instead, before any dispatch.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 3,
+            hk: 1,
+            hv: 1,
+            dv: 32,
+        };
+        let d = GdnData::random(s, "none", 9990);
+        let dims = dims_of(s);
+        let width = s.hv * s.dv;
+        let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
+        // A refused call must leave its output untouched; an accepted one must write it.
+        let call = |p: &Packed, v: GdnSimdVariant| {
+            let out = seeded(rt, s.t * width, SENTINEL);
+            let r = qwen35::gdn_recurrent_simd_with(
+                rt,
+                &dims,
+                &p.qkv(),
+                &p.gates(dims.v_heads),
+                &p.params(),
+                StateIn::Zero,
+                Cols::dense(&out, width as u32),
+                None,
+                None,
+                v,
+                Some(&scalars),
+            );
+            rt.synchronize().unwrap();
+            let written = out.read_f32().iter().any(|&x| x != SENTINEL);
+            (r, written)
+        };
+        for lead in [1usize, 0] {
+            let p = Packed::with_lead(rt, &d, lead);
+            for v in GdnSimdVariant::ALL {
+                let (r, written) = call(&p, v);
+                let refused = v.vec() && lead == 1;
+                assert_eq!(r.is_err(), refused, "{v:?} lead {lead}: {r:?}");
+                assert_eq!(written, !refused, "{v:?} lead {lead}: output written = {written}");
+                if let Err(e) = r {
+                    assert!(e.contains("multiples of 4"), "{e}");
+                }
+            }
+        }
     });
 }
 
@@ -2042,7 +2617,7 @@ fn gdn_state_out_discarded_and_in_place_on_both_paths() {
         };
         let d = GdnData::random(s, "batch", 1200);
         let (want_y, want_s) = gdn_f64(&d.problem());
-        for path in [Path::Chunk, Path::Recurrent] {
+        for path in [Path::Chunk, Path::Recurrent, Path::RecurrentSimd] {
             let (y, _) = run_gdn_with(rt, &d, path, StateOut::Discard);
             assert_close(&format!("{path:?} discard y"), &y, &want_y, rel_bound(&want_y));
             let (y, st) = run_gdn_with(rt, &d, path, StateOut::InPlace);
@@ -2068,7 +2643,7 @@ fn empty_sequence_copies_the_state_through() {
         d.s = s;
         (d.q, d.k, d.v, d.a, d.b) = (vec![], vec![], vec![], vec![], vec![]);
         let want: Vec<f64> = d.state0.as_ref().unwrap().iter().map(|&x| f64::from(x)).collect();
-        for path in [Path::Chunk, Path::Recurrent] {
+        for path in [Path::Chunk, Path::Recurrent, Path::RecurrentSimd] {
             let (y, st) = run_gdn_with(rt, &d, path, StateOut::Separate);
             assert!(y.is_empty());
             assert_close(&format!("{path:?} T=0 state"), &st, &want, 0.0);

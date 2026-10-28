@@ -37,7 +37,8 @@ All notable changes to `tessl` are recorded here. The format follows
   `attn_prefill_bf16_with_tile` for causal SDPA with bf16 Q/K/V tiles. Bounded by an
   f64 oracle derived from unit roundoff in `tests/attn_prefill_bf16_tiles.rs` and verified
   in the MSL emulator (`tools/msl_emu/check_qwen35.py`). Includes the paired benchmark lane
-  `--paired-attn-bf16`. Kernel entry points: 308 -> 313.
+  `--paired-attn-bf16`. Kernel entry points: 308 -> 313. `Precision::Bf16` prefill runs
+  the `_q32_k64_sg4` tile (see Changed).
 - **Direct loading of MLX affine 4-bit weights** (`Qwen35Model::load_mlx_q4`,
   `src/qwen35_q4.rs`, `docs/qwen35.md`). Loads `mlx_lm.convert -q --q-bits 4` safetensors
   directly into Q4 model banks without dequantization or intermediate host copies.
@@ -63,6 +64,21 @@ All notable changes to `tessl` are recorded here. The format follows
   Measures SLQ top-10 acceptance overlap for speculative decoding on the real 2B:
   F32 vs Bf16 achieves 0.988 (default prompt) and 0.992 (text prompt); tessl Q4 matches
   mlx-lm Q4 to 2e-4 (0.848 / 0.866).
+- **`gdn_recurrent_simd` / `gdn_recurrent_simd_with`: the GDN recurrence with mlx-lm's
+  decomposition** (one simdgroup per group of value columns, no barrier), three
+  kernels (`qwen35_gdn_recurrent_simd`, `_l8_vec`, `_pre_l8_vec` with its
+  `qwen35_gdn_simd_prep` pass) taking `gdn_recurrent`'s inputs and agreeing with it to
+  rounding (about 2e-7 of the output scale; summation order differs, so not bitwise).
+  `Qwen35Model`'s prefill runs `_pre_l8_vec` (`GdnSimdVariant::Prepped8`) by default (see
+  Changed). Measured in
+  `bench/results/qwen35_gdn_simd_ab_m5pro.txt`: mlx's 32-lanes-a-column mapping as it is
+  is slower than `gdn_recurrent` at every length; the 8-lane, `float4`-load kernel with
+  the gates and norms computed once per (token, value head) takes 0.63x / 0.76x / 0.83x
+  / 0.85x of `gdn_chunk_forward`'s time at T = 200 / 1024 / 4096 / 8192 on the 2B's GDN
+  shape (f32, batch 1, async timing, GPU near idle). Tests: `tests/qwen35_kernels.rs` (f64 reference across shapes and
+  lengths, gain extremes, NaN/inf pattern equal to `gdn_recurrent`'s, pipeline-ran
+  trace, a bound that can fail, float4-alignment refusal), emulator cases in
+  `tools/msl_emu/check_qwen35.py`, rig `tests/qwen35_gdn_simd_ab.rs`.
 - **`Qwen35Model::train_step_fused_adamw`** (card ft-dafde7719192ece85330e1df5db96e05):
   `train_step_into` then `adamw_step` without the gradient bank. The backward
   updates each layer from a gradient scratch the pool reuses from layer to layer,
@@ -173,6 +189,25 @@ All notable changes to `tessl` are recorded here. The format follows
   finish.
 
 ### Changed
+
+- **`Qwen35Model` prefill: bf16 attention tile and the simd GDN recurrence by default**
+  (`src/qwen35_model.rs`). `Precision::Bf16` prefill (and staged prefill) casts Q, K and V
+  to bf16 once (`attn_prefill_bf16::cast_f32_to_bf16`) and runs
+  `attn_prefill_bf16_with_tile` at Q32K64 with a bf16 probability tile. O, the K/V caches
+  and decode attention stay f32, and `Precision::F32` keeps `attn_prefill`. Prefill GDN, in
+  both precisions, runs `gdn_recurrent_simd_with` (`GdnSimdVariant::Prepped8`) instead of
+  `gdn_chunk_forward`. `GdnPrefillKernel { Chunked(GdnScanSlice), Simd }` (default
+  `Simd`) is set with `with_gdn_prefill`, and `with_gdn_scan_slice` selects `Chunked`. Acts
+  allocates only the chosen kernel's scratch. Decode is unchanged (`gdn_recurrent`).
+  Gated on the real 2B (`bench/results/w33_prefill_gate_m5pro.txt`):
+  - f32 layer by layer against transformers fp32: logits rel err 1.97e-6, top-1
+    mismatches 0/155.
+  - bf16 against fp32: mean KL 3.09e-5 / 3.05e-5 with 0 / 1 top-1 misses on the prompt
+    and text references. transformers bf16 gives 5.74e-4 / 3.79e-4 with 3 / 17 misses.
+
+  Kernel-level timings are in `qwen35_attn_bf16_tiles_m5pro.txt` and
+  `qwen35_gdn_simd_ab_m5pro.txt`. The model-level prefill+score head-to-head against
+  mlx-lm has not been run on these defaults yet.
 
 - **`kernel_coverage` is Rust and takes an allowlist.** `bench/kernel_coverage.py`
   and its tests moved to `src/bin/kernel_coverage.rs` (`src/bin/common/kcov.rs`,

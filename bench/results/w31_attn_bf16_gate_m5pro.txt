@@ -1,0 +1,95 @@
+# w31 bf16 prefill attention gate, 2026-10-28T00:53:12Z, d099e91 qwen35_model: bf16 prefill attention on the bf16 Q/K/V tile (Q32K64, bf16 P); decode unchanged
+# checkpoint /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c/model.safetensors-00001-of-00001.safetensors
+19:53  up 1 day, 12:08, 1 user, load averages: 13.78 17.25 19.81
+
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+
+wrote target/qwen35_ref: T=155, fp32 next token ' Q'
+
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+
+wrote target/qwen35_ref_text: T=512, fp32 next token '"'
+# ref: model_dir /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c/
+# ref: T 155
+# ref: torch 2.12.1
+# ref: transformers 5.19.0
+# ref: prompt 'The gated delta rule updates a fast-weight memory with a learned decay and a delta correction. Each token writes its value under its key, after first erasing whatever the memory already returned for that key, and the whole memory fades by a per-head factor between tokens. Linear attention layers of this kind are cheap at long context because their state has a fixed size, while full attention layers keep every past key and value. Hybrid models interleave the two so that most layers are cheap and a few can still look up exact tokens from far back in the context. In a model with twenty-four layers where every fourth one is full attention, eighteen layers are linear and six are full. Question: which layer types does Qwen3.5 mix, and in what ratio? Answer:'
+# ref: fp32 next token ' Q'
+== always-run tests
+test an_all_equal_row_returns_the_mean_of_v ... ok
+test bf16_tiles_match_the_f64_oracle_across_prefill_shapes ... ok
+test bf16_tiles_match_the_oracle_when_scores_are_sharp_across_blocks ... ok
+test entry_names_spell_the_instantiated_geometry ... ok
+test out_bf16_is_the_rounded_f32_output_and_runs_repeat_bit_for_bit ... ok
+test the_host_entry_refuses_what_the_kernels_cannot_do ... ok
+test the_oracle_reproduces_a_two_key_row_by_hand ... ok
+test the_row_maximum_contributes_exactly_one_on_a_sharp_row ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+test bf16_widening_into_a_view_is_exact_and_checks_its_destination ... ok
+test device_bf16_cast_rounds_to_nearest_even_like_the_host ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test a_head_in_another_shard_than_the_embedding_loads ... ok
+test a_head_inside_the_tower_prefix_is_refused_as_unread ... ok
+test a_prefill_counts_its_own_activations_against_the_working_set ... ok
+test a_prefill_over_the_working_set_is_refused_before_it_runs ... ok
+test an_untied_head_in_the_wrong_dtype_is_refused ... ok
+test answer_scores_are_forwards_logits_at_the_answers ... ok
+test argument_refusals_encode_nothing ... ok
+test bf16_forward_is_no_worse_than_transformers_bf16 ... ignored
+test bf16_fused_decode_greedy_tokens_match_unfused_on_the_real_2b ... ignored
+test chosen_logit_rows_are_forwards_rows ... ok
+test conv_widths_the_kernel_lacks_are_refused_at_the_config ... ok
+test decode_and_row_refusals ... ok
+test decode_step_failing_part_way_poisons_the_session ... ok
+test decode_step_failing_to_read_its_logits_does_not_advance ... ok
+test ear_k_beyond_the_vocab_panics - should panic ... ok
+test ear_matches_a_hand_computed_two_row_case ... ok
+test ear_of_identical_logits_is_one_and_nonfinite_never_clears ... ok
+test encode_part_in_order_is_advance_to ... ok
+test encode_part_refuses_extreme_layers_and_a_broken_session ... ok
+test f32_forward_matches_transformers_fp32_layer_by_layer ... ignored
+test f32_staged_and_decode_match_forward_on_the_real_2b ... ignored
+test gdn_scan_slice_is_bit_identical_on_the_model ... ok
+test gdn_scan_slice_reaches_prefill_and_staged ... ok
+test head_and_config_must_agree ... ok
+test logit_dev_empty_panics - should panic ... ok
+test logit_dev_identical_rows_are_exact ... ok
+test logit_dev_nan_and_inf_never_pass_a_bound ... ok
+test logit_dev_nan_in_the_last_element_is_not_skipped_by_max ... ok
+test logit_dev_one_flipped_argmax_is_one_miss_with_positive_kl ... ok
+test logit_dev_shape_mismatch_panics - should panic ... ok
+test logit_dev_vocab_not_dividing_len_panics - should panic ... ok
+test logit_dev_within_rel_is_false_for_nan_and_inf_operands ... ok
+test logit_dev_zero_reference_scale_only_matches_exactly ... ok
+test logit_deviation_report ... ignored
+test mamba_ssm_dtype_other_than_float32_is_refused_at_the_config ... ok
+test nonzero_attention_dropout_is_refused_at_the_config ... ok
+test prefill_then_decode_matches_forward_at_the_last_row ... ok
+test random_bf16_model_runs_forward_and_prefill ... ok
+test random_is_seeded_and_f32_matches_the_tower ... ok
+test random_untied_model_has_its_own_head ... ok
+test sessions_refuse_to_continue_across_a_per_entry_host_write ... ok
+test sessions_refuse_to_continue_across_a_weight_write ... ok
+test stress_decode_matches_forward_on_random_shapes ... ok
+test stress_hostile_rows_and_answers ... ok
+test stress_interleaved_sessions_keep_their_own_state ... ok
+test stress_long_decode_stays_on_the_forward ... ok
+test stress_relaxed_precision_mid_session_is_refused_not_fatal ... ok
+test tensors_the_model_never_reads_are_refused_by_name ... ok
+test the_real_2b_config_shape_still_loads ... ok
+test ungrouped_attention_heads_are_refused_at_the_config ... ok
+test untied_decode_rows_and_answers_use_the_own_head ... ok
+test untied_forward_matches_transformers_logits ... ok
+test result: ok. 47 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 9.77s
+== real 2B bf16 gate, QWEN35_REF_DIR=target/qwen35_ref
+test bf16_forward_is_no_worse_than_transformers_bf16 ... vs fp32 over 155 positions: transformers bf16 mean KL 5.736e-4 (max 6.073e-3), top-1 misses 3
+vs fp32: tessl bf16 mean KL 3.430e-5 (max 3.762e-4), top-1 misses 0, logits rel err 2.819e-3
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 4.50s
+== real 2B bf16 gate, QWEN35_REF_DIR=target/qwen35_ref_text
+test bf16_forward_is_no_worse_than_transformers_bf16 ... vs fp32 over 512 positions: transformers bf16 mean KL 3.791e-4 (max 4.596e-3), top-1 misses 17
+vs fp32: tessl bf16 mean KL 3.132e-5 (max 6.918e-4), top-1 misses 2, logits rel err 3.341e-3
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.14s
+19:59  up 1 day, 12:14, 1 user, load averages: 10.17 12.16 16.39
+GATE_EXIT 0

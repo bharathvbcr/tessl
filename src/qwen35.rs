@@ -78,6 +78,11 @@ const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
 /// Threads of `qwen35_gdn_recurrent_bv16`: 4 key blocks x 16 columns.
 const REC16_THREADS: usize = 64;
+/// Simdgroups a `qwen35_gdn_recurrent_simd*` threadgroup runs (`GDN_SIMD_COLS`
+/// in kernels/qwen35_gdn.metal).
+const REC_SIMD_COLS: usize = 4;
+/// Simdgroups a `qwen35_gdn_simd_prep` threadgroup runs (`GDN_SIMD_PREP_SG`).
+const SIMD_PREP_SG: usize = 8;
 /// Simdgroups per threadgroup for the one-simdgroup-per-row kernels.
 const ROWS_PER_TG: usize = 8;
 /// `REDUCE_MAX_SIMDGROUPS` in kernels/reduce_tree.h.
@@ -1484,6 +1489,256 @@ fn gdn_recurrent_impl(
             set_u32(bnd, bstride, 20);
             set_u32(bnd, flags, 21);
             set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 22);
+        },
+    )
+}
+
+// ------------------------------------------------------ simd recurrence ---
+
+/// Which kernel of the one-simdgroup-per-column recurrence [`gdn_recurrent_simd_with`]
+/// runs. All take [`gdn_recurrent`]'s inputs and agree with it to rounding.
+///
+/// Measured in `bench/results/qwen35_gdn_simd_ab_m5pro.txt`: [`Self::Mlx`] is
+/// slower than [`gdn_recurrent`] at every length; [`Self::Prepped8`] is faster
+/// than [`gdn_chunk_forward`] from T = 200 to 8192; [`Self::Fused8`] is a
+/// single dispatch and the one to compare against [`gdn_recurrent`] at T = 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnSimdVariant {
+    /// `qwen35_gdn_recurrent_simd`: mlx-lm's mapping as it is. A simdgroup a
+    /// value column, 4 state rows a lane, `simd_sum`; the gates and norms are
+    /// computed in the loop.
+    Mlx,
+    /// `qwen35_gdn_recurrent_simd_l8_vec`: 8 lanes a column (4 columns a
+    /// simdgroup, 16 rows a lane, shuffle butterfly), q and k read as `float4`s.
+    /// Gates and norms in the loop. Needs `ld`, `q_off` and `k_off` of the qkv
+    /// window to be multiples of 4.
+    Fused8,
+    /// `qwen35_gdn_recurrent_simd_pre_l8_vec`: [`Self::Fused8`] with the gates,
+    /// norms and q scale computed once per (token, value head) by
+    /// `qwen35_gdn_simd_prep` into a [`GdnSimdScalars`]; two dispatches.
+    Prepped8,
+}
+
+impl GdnSimdVariant {
+    /// Every kernel of the family.
+    pub const ALL: [Self; 3] = [Self::Mlx, Self::Fused8, Self::Prepped8];
+
+    fn prepped(self) -> bool {
+        self == Self::Prepped8
+    }
+
+    /// Whether it loads q and k as `float4`s.
+    pub fn vec(self) -> bool {
+        self != Self::Mlx
+    }
+
+    /// Lanes that share a value column.
+    fn lanes(self) -> usize {
+        if self == Self::Mlx {
+            32
+        } else {
+            8
+        }
+    }
+}
+
+/// Scratch for [`GdnSimdVariant::Prepped8`]: one `float4` `{decay, beta, rq, rk}`
+/// per (token row, value head). Allocate once for the largest call.
+pub struct GdnSimdScalars {
+    buf: GpuBuffer,
+}
+
+impl GdnSimdScalars {
+    /// Bytes a call of `dims` needs.
+    pub fn bytes_for(dims: &GdnDims) -> Result<usize, String> {
+        usize_product(
+            &[dims.batch as usize, dims.seq as usize, dims.v_heads as usize, 16],
+            "GdnSimdScalars",
+        )
+    }
+
+    /// Scratch for calls up to `max`.
+    pub fn new(rt: &GpuRuntime, max: &GdnDims) -> Result<Self, String> {
+        // A zero-length Metal buffer is not a buffer.
+        Ok(Self {
+            buf: rt.alloc_buffer(Self::bytes_for(max)?.max(16))?,
+        })
+    }
+}
+
+/// [`gdn_recurrent`] on `qwen35_gdn_recurrent_simd`: mlx-lm's decomposition,
+/// one simdgroup per (value head, value column) holding four state rows a
+/// lane, with no threadgroup memory and no barrier. Same arguments, layouts and
+/// outputs; the sums run in another order, so the result agrees with
+/// [`gdn_recurrent`]'s to rounding rather than bit for bit. Not called by
+/// `Qwen35Model`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_simd(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+) -> Result<(), String> {
+    gdn_recurrent_simd_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        None,
+        GdnSimdVariant::Mlx,
+        None,
+    )
+}
+
+/// [`gdn_recurrent_simd`] on a chosen [`GdnSimdVariant`], optionally with a
+/// length per row as [`gdn_recurrent_varlen`]. [`GdnSimdVariant::Prepped8`]
+/// needs `scalars`, which this fills (one extra dispatch); the others ignore it.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_simd_with(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: Option<&GpuBuffer>,
+    variant: GdnSimdVariant,
+    scalars: Option<&GdnSimdScalars>,
+) -> Result<(), String> {
+    gdn_recurrent_simd_impl(
+        rt, dims, qkv, gates, params, state, out, state_out, seq_lens, variant, scalars,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_recurrent_simd_impl(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: Option<&GpuBuffer>,
+    variant: GdnSimdVariant,
+    scalars: Option<&GdnSimdScalars>,
+) -> Result<(), String> {
+    const WHAT: &str = "qwen35::gdn_recurrent_simd";
+    let (flags, bstride) = validate_gdn(
+        rt, WHAT, dims, qkv, gates, params, state, out, state_out, None, seq_lens,
+    )?;
+    let sc = match (variant.prepped(), scalars) {
+        (true, Some(s)) => {
+            require::<u8>(rt, &s.buf, GdnSimdScalars::bytes_for(dims)?, "gdn simd scalars")?;
+            // The prep pass writes it, so it may be none of what either pass reads or writes.
+            let reads = [
+                Some(("qkv", qkv.buf)),
+                Some(("gate logits", gates.buf)),
+                Some(("A_log", params.a_log)),
+                Some(("dt_bias", params.dt_bias)),
+                Some(("out", out.buf)),
+                state.buffer().map(|b| ("state_in", b)),
+                state_out.map(|b| ("state_out", b)),
+                seq_lens.map(|b| ("seq_lens", b)),
+            ];
+            require_disjoint_writes_opt(WHAT, &[Some(("scalars", &s.buf))], &reads)?;
+            Some(&s.buf)
+        }
+        (true, None) => return Err(format!("{WHAT}: {variant:?} needs a GdnSimdScalars")),
+        (false, _) => None,
+    };
+    if variant.vec() && [qkv.ld, qkv.q_off, qkv.k_off].iter().any(|x| x % 4 != 0) {
+        return Err(format!(
+            "{WHAT}: {variant:?} loads q and k as float4s; ld ({}), q_off ({}) and k_off ({}) must be multiples of 4",
+            qkv.ld, qkv.q_off, qkv.k_off
+        ));
+    }
+    // seq == 0 with a state_out still dispatches: it copies the start state
+    // through, so a caller alternating state buffers never reads a stale one.
+    if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
+        return Ok(());
+    }
+    if let Some(sc) = sc {
+        let rows = u32_product(&[dims.batch, dims.seq], WHAT)?;
+        let units = usize_product(&[rows as usize, dims.v_heads as usize], WHAT)?;
+        let prep = pipeline_for(rt, "qwen35_gdn_simd_prep", SIMD_PREP_SG * 32, 0)?;
+        dispatch_groups(
+            rt,
+            &prep,
+            (units.div_ceil(SIMD_PREP_SG), 1, 1),
+            SIMD_PREP_SG * 32,
+            0,
+            |bnd| {
+                set_gpu_buf(bnd, qkv.buf, 0);
+                set_gpu_buf(bnd, gates.buf, 1);
+                set_gpu_buf(bnd, params.a_log, 2);
+                set_gpu_buf(bnd, params.dt_bias, 3);
+                set_gpu_buf(bnd, sc, 4);
+                set_u32(bnd, rows, 5);
+                set_u32(bnd, dims.k_heads, 6);
+                set_u32(bnd, dims.v_heads, 7);
+                set_u32(bnd, qkv.ld, 8);
+                set_u32(bnd, qkv.q_off, 9);
+                set_u32(bnd, qkv.k_off, 10);
+                set_u32(bnd, gates.ld, 11);
+                set_u32(bnd, gates.a_off, 12);
+                set_u32(bnd, gates.b_off, 13);
+            },
+        )?;
+    }
+    // Literal names, so the emulator's host-contract check sees every kernel
+    // this site binds.
+    let rec_name = match variant {
+        GdnSimdVariant::Mlx => "qwen35_gdn_recurrent_simd",
+        GdnSimdVariant::Fused8 => "qwen35_gdn_recurrent_simd_l8_vec",
+        GdnSimdVariant::Prepped8 => "qwen35_gdn_recurrent_simd_pre_l8_vec",
+    };
+    // Columns a threadgroup: `REC_SIMD_COLS` simdgroups of `32 / lanes` columns.
+    let cols = REC_SIMD_COLS * (32 / variant.lanes());
+    let threads = REC_SIMD_COLS * 32;
+    let p = pipeline_for(rt, rec_name, threads, 0)?;
+    dispatch_groups(
+        rt,
+        &p,
+        (dims.v_dim as usize / cols, dims.v_heads as usize, dims.batch as usize),
+        threads,
+        0,
+        |bnd| {
+            set_gpu_buf(bnd, qkv.buf, 0);
+            set_gpu_buf(bnd, gates.buf, 1);
+            set_gpu_buf(bnd, params.a_log, 2);
+            set_gpu_buf(bnd, params.dt_bias, 3);
+            set_gpu_buf(bnd, state.buffer().unwrap_or(qkv.buf), 4);
+            set_gpu_buf(bnd, out.buf, 5);
+            set_gpu_buf(bnd, state_out.unwrap_or(out.buf), 6);
+            set_u32(bnd, dims.seq, 7);
+            set_u32(bnd, dims.k_heads, 8);
+            set_u32(bnd, dims.v_heads, 9);
+            set_u32(bnd, dims.v_dim, 10);
+            set_u32(bnd, qkv.ld, 11);
+            set_u32(bnd, qkv.q_off, 12);
+            set_u32(bnd, qkv.k_off, 13);
+            set_u32(bnd, qkv.v_off, 14);
+            set_u32(bnd, gates.ld, 15);
+            set_u32(bnd, gates.a_off, 16);
+            set_u32(bnd, gates.b_off, 17);
+            set_u32(bnd, out.ld, 18);
+            set_u32(bnd, out.off, 19);
+            set_u32(bnd, bstride, 20);
+            set_u32(bnd, flags, 21);
+            set_gpu_buf(bnd, seq_lens.unwrap_or(qkv.buf), 22);
+            set_gpu_buf(bnd, sc.unwrap_or(qkv.buf), 23);
         },
     )
 }

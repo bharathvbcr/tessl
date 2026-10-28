@@ -1509,11 +1509,22 @@ pub enum GdnSimdVariant {
     Prepped,
     /// `qwen35_gdn_recurrent_simd_pre_sg8`: 8 columns, scalars from the prep pass.
     PreppedSg8,
+    /// `qwen35_gdn_recurrent_simd_l16`: 16 lanes a column (two columns a simdgroup, 8 a threadgroup).
+    FusedL16,
+    /// `qwen35_gdn_recurrent_simd_l8`: 8 lanes a column (four columns a simdgroup, 16 a threadgroup).
+    FusedL8,
+    /// `qwen35_gdn_recurrent_simd_pre_l16`: [`Self::FusedL16`] with the scalars from the prep pass.
+    PreppedL16,
+    /// `qwen35_gdn_recurrent_simd_pre_l8`: [`Self::FusedL8`] with the scalars from the prep pass.
+    PreppedL8,
 }
 
 impl GdnSimdVariant {
     fn prepped(self) -> bool {
-        matches!(self, Self::Prepped | Self::PreppedSg8)
+        matches!(
+            self,
+            Self::Prepped | Self::PreppedSg8 | Self::PreppedL16 | Self::PreppedL8
+        )
     }
 }
 
@@ -1699,12 +1710,20 @@ fn gdn_recurrent_simd_impl(
         GdnSimdVariant::FusedSg8 => "qwen35_gdn_recurrent_simd_sg8",
         GdnSimdVariant::Prepped => "qwen35_gdn_recurrent_simd_pre",
         GdnSimdVariant::PreppedSg8 => "qwen35_gdn_recurrent_simd_pre_sg8",
+        GdnSimdVariant::FusedL16 => "qwen35_gdn_recurrent_simd_l16",
+        GdnSimdVariant::FusedL8 => "qwen35_gdn_recurrent_simd_l8",
+        GdnSimdVariant::PreppedL16 => "qwen35_gdn_recurrent_simd_pre_l16",
+        GdnSimdVariant::PreppedL8 => "qwen35_gdn_recurrent_simd_pre_l8",
     };
-    let cols = match variant {
-        GdnSimdVariant::Fused | GdnSimdVariant::Prepped => REC_SIMD_COLS,
-        GdnSimdVariant::FusedSg8 | GdnSimdVariant::PreppedSg8 => 2 * REC_SIMD_COLS,
+    // Simdgroups a threadgroup, and columns a simdgroup carries (32 / lanes a column).
+    let (simdgroups, cols_per_sg) = match variant {
+        GdnSimdVariant::Fused | GdnSimdVariant::Prepped => (REC_SIMD_COLS, 1),
+        GdnSimdVariant::FusedSg8 | GdnSimdVariant::PreppedSg8 => (2 * REC_SIMD_COLS, 1),
+        GdnSimdVariant::FusedL16 | GdnSimdVariant::PreppedL16 => (REC_SIMD_COLS, 2),
+        GdnSimdVariant::FusedL8 | GdnSimdVariant::PreppedL8 => (REC_SIMD_COLS, 4),
     };
-    let threads = cols * 32;
+    let cols = simdgroups * cols_per_sg;
+    let threads = simdgroups * 32;
     let p = pipeline_for(rt, rec_name, threads, 0)?;
     dispatch_groups(
         rt,

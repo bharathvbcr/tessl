@@ -109,19 +109,23 @@ enum Arm {
     RecurrentAgain,
 }
 
-const ARMS: [Arm; 7] = [
+const ARMS: [Arm; 11] = [
     Arm::Chunked,
     Arm::Recurrent,
     Arm::Simd(GdnSimdVariant::Fused),
     Arm::Simd(GdnSimdVariant::FusedSg8),
     Arm::Simd(GdnSimdVariant::Prepped),
     Arm::Simd(GdnSimdVariant::PreppedSg8),
+    Arm::Simd(GdnSimdVariant::FusedL16),
+    Arm::Simd(GdnSimdVariant::FusedL8),
+    Arm::Simd(GdnSimdVariant::PreppedL16),
+    Arm::Simd(GdnSimdVariant::PreppedL8),
     Arm::RecurrentAgain,
 ];
 const CHUNKED: usize = 0;
 const RECURRENT: usize = 1;
 const SIMD: usize = 2;
-const RECURRENT_AGAIN: usize = 6;
+const RECURRENT_AGAIN: usize = 10;
 
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
@@ -145,7 +149,7 @@ fn max(v: &[f64]) -> f64 {
 #[test]
 #[ignore = "timing run; execute under the machine lock (target-gp scripts)"]
 fn gdn_simd_recurrent_ab_at_the_2b_shape() {
-    let rounds = env_usize("GDN_AB_ROUNDS", 14);
+    let rounds = env_usize("GDN_AB_ROUNDS", 22);
     let warmup = env_usize("GDN_AB_WARMUP", 3);
     let lengths: Vec<usize> = std::env::var("GDN_AB_T")
         .unwrap_or_else(|_| "1,200,1024,8192".into())

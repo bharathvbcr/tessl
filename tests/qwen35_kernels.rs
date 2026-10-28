@@ -891,6 +891,17 @@ fn max_abs_err(got: &[f32], want: &[f64]) -> f64 {
     })
 }
 
+/// The kernels of the simd family other than `qwen35_gdn_recurrent_simd` itself.
+const OTHER_SIMD_VARIANTS: [GdnSimdVariant; 7] = [
+    GdnSimdVariant::FusedSg8,
+    GdnSimdVariant::Prepped,
+    GdnSimdVariant::PreppedSg8,
+    GdnSimdVariant::FusedL16,
+    GdnSimdVariant::FusedL8,
+    GdnSimdVariant::PreppedL16,
+    GdnSimdVariant::PreppedL8,
+];
+
 /// `qwen35_gdn_recurrent_simd` and `qwen35_gdn_recurrent` on one problem, each
 /// held to the f64 reference, and to each other.
 ///
@@ -948,11 +959,7 @@ fn check_simd_vs_recurrent(
     // The other kernels of the family run the same arithmetic (the prepped
     // ones with the scalars computed in a pass of their own, the sg8 ones in
     // wider threadgroups): each is held to the same two conditions.
-    for v in [
-        GdnSimdVariant::FusedSg8,
-        GdnSimdVariant::Prepped,
-        GdnSimdVariant::PreppedSg8,
-    ] {
+    for v in OTHER_SIMD_VARIANTS {
         let (vy, vs) = run_gdn(rt, d, Path::SimdVariant(v));
         assert_close(&format!("{label} {v:?} y"), &vy, &want_y, by);
         assert_close(&format!("{label} {v:?} state"), &vs, &want_s, bs);
@@ -1156,12 +1163,7 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
                 *must_poison,
                 "{name}: gdn_recurrent produced {bad} non-finite elements"
             );
-            for path in [
-                Path::RecurrentSimd,
-                Path::SimdVariant(GdnSimdVariant::FusedSg8),
-                Path::SimdVariant(GdnSimdVariant::Prepped),
-                Path::SimdVariant(GdnSimdVariant::PreppedSg8),
-            ] {
+            for path in std::iter::once(Path::RecurrentSimd).chain(OTHER_SIMD_VARIANTS.map(Path::SimdVariant)) {
                 let (sy, ss) = run_gdn(rt, &d, path);
                 assert_eq!(
                     my_bad,
@@ -1244,6 +1246,10 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
                 (GdnSimdVariant::FusedSg8, "qwen35_gdn_recurrent_simd_sg8", 0),
                 (GdnSimdVariant::Prepped, "qwen35_gdn_recurrent_simd_pre", 1),
                 (GdnSimdVariant::PreppedSg8, "qwen35_gdn_recurrent_simd_pre_sg8", 1),
+                (GdnSimdVariant::FusedL16, "qwen35_gdn_recurrent_simd_l16", 0),
+                (GdnSimdVariant::FusedL8, "qwen35_gdn_recurrent_simd_l8", 0),
+                (GdnSimdVariant::PreppedL16, "qwen35_gdn_recurrent_simd_pre_l16", 1),
+                (GdnSimdVariant::PreppedL8, "qwen35_gdn_recurrent_simd_pre_l8", 1),
             ] {
                 let (n0, p0, s0) = (
                     count(name),
@@ -2493,6 +2499,10 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_recurrent_simd_sg8",
             "qwen35_gdn_recurrent_simd_pre",
             "qwen35_gdn_recurrent_simd_pre_sg8",
+            "qwen35_gdn_recurrent_simd_l16",
+            "qwen35_gdn_recurrent_simd_l8",
+            "qwen35_gdn_recurrent_simd_pre_l16",
+            "qwen35_gdn_recurrent_simd_pre_l8",
             "qwen35_gdn_simd_prep",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",

@@ -189,7 +189,11 @@ int main(int argc, char **argv) {
             // One simdgroup a column, no threadgroup memory: `cols` columns a group.
             // The `_pre` kernels read what `qwen35_gdn_simd_prep` writes, as the host runs it first.
             const bool pre = kname.find("_pre") != std::string::npos;
-            const uint cols = kname.find("_sg8") != std::string::npos ? 2u * GDN_SIMD_COLS : GDN_SIMD_COLS;
+            const bool sg8 = kname.find("_sg8") != std::string::npos;
+            const uint lanes = kname.find("_l16") != std::string::npos ? 16u
+                               : kname.find("_l8") != std::string::npos ? 8u : 32u;
+            const uint sgs = sg8 ? 2u * GDN_SIMD_COLS : GDN_SIMD_COLS;
+            const uint cols = sgs * (32u / lanes);
             const uint rows = B * T;
             std::vector<float4> sc(size_t(rows) * Hv + 1);
             if (pre && rows > 0) {
@@ -199,11 +203,16 @@ int main(int argc, char **argv) {
                                          a_off, b_off, id.tg.x, id.sg, id.lane);
                 });
             }
-            launch(uint3(Dv / cols, Hv, B), uint3(32u * cols, 1, 1), 0, [&](const Ids &id, float *) {
-                auto *run = kname == "qwen35_gdn_recurrent_simd"          ? gdn_simd_body<GDN_SIMD_COLS, false>
-                            : kname == "qwen35_gdn_recurrent_simd_sg8"    ? gdn_simd_body<2u * GDN_SIMD_COLS, false>
-                            : kname == "qwen35_gdn_recurrent_simd_pre"    ? gdn_simd_body<GDN_SIMD_COLS, true>
-                                                                          : gdn_simd_body<2u * GDN_SIMD_COLS, true>;
+            launch(uint3(Dv / cols, Hv, B), uint3(32u * sgs, 1, 1), 0, [&](const Ids &id, float *) {
+                auto *run = gdn_simd_body<32u, GDN_SIMD_COLS, false>;
+                if (lanes == 32u && !sg8 && !pre) run = gdn_simd_body<32u, GDN_SIMD_COLS, false>;
+                else if (lanes == 32u && sg8 && !pre) run = gdn_simd_body<32u, 2u * GDN_SIMD_COLS, false>;
+                else if (lanes == 32u && !sg8) run = gdn_simd_body<32u, GDN_SIMD_COLS, true>;
+                else if (lanes == 32u) run = gdn_simd_body<32u, 2u * GDN_SIMD_COLS, true>;
+                else if (lanes == 16u && !pre) run = gdn_simd_body<16u, GDN_SIMD_COLS, false>;
+                else if (lanes == 16u) run = gdn_simd_body<16u, GDN_SIMD_COLS, true>;
+                else if (!pre) run = gdn_simd_body<8u, GDN_SIMD_COLS, false>;
+                else run = gdn_simd_body<8u, GDN_SIMD_COLS, true>;
                 run(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off, ld_ab, a_off,
                     b_off, ld_out, out_off, sb, flags, lens, sc.data(), id.tg, id.sg, id.lane);
             });

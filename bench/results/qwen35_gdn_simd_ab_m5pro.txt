@@ -1,270 +1,538 @@
-# Qwen3.5 GDN recurrence, one simdgroup per value column (mlx-lm's decomposition) vs gdn_chunk_forward and
-# gdn_recurrent, Apple M5 Pro, 2026-10-27/28. INTERIM: runs 1, 2, 2b below; the final clean run is appended after them.
+# Qwen3.5 GDN recurrence with mlx-lm's decomposition (one simdgroup per value column), against gdn_chunk_forward and
+# gdn_recurrent, Apple M5 Pro, 2026-10-27/28
 #
-# Lane: branch gp/w32-gdn-simd-recurrent off main 789a132. Kernels in kernels/qwen35_gdn.metal, host in
-# src/qwen35.rs (gdn_recurrent_simd*), A/B rig tests/qwen35_gdn_simd_ab.rs, mlx comparator
-# bench/qwen35_gdn_mlx_kernel_probe.py. Nothing here is called by Qwen35Model.
+# VERDICT (details and caveats below)
+#   1. mlx-lm's mapping as it is (qwen35_gdn_recurrent_simd: 32 lanes a column, 2048 independent simdgroups, gates
+#      and norms recomputed in the loop) is SLOWER than tessl's gdn_recurrent at every length from T = 200 (1.15-1.65x at
+#      T = 200-8192) and at T = 1 (1.5x). The hypothesis that parallelism and the per-step barrier explain the gap to
+#      mlx is refuted for this shape: removing the barriers and going from 64 threadgroups to 2048 simdgroups made it worse.
+#   2. A reworked mapping beats gdn_chunk_forward at every prefill length tried. qwen35_gdn_recurrent_simd_pre_l8_vec
+#      (8 lanes a column, float4 loads of q and k, gates/norms/q scale computed once per (token, value head) by a prep
+#      dispatch) is 0.63x / 0.76x / 0.83x / 0.85x of chunked's time at T = 200 / 1024 / 4096 / 8192 (final run, GPU near idle,
+#      median of 22 per-round ratios; ranges 0.57-0.68 / 0.72-0.81 / 0.81-0.86 / 0.75-0.88, none reaching 1.0; noise
+#      floor 0.96-1.06 at T >= 200). Same rounds: 0.43x of gdn_recurrent at T = 1024-8192. Outputs agree with gdn_recurrent
+#      to ~2e-7 of the output scale (chunked differs from gdn_recurrent by 1e-6 to 2e-6).
+#   3. Decode (T = 1): under the library's default (each launch its own submit-and-wait) every arm sits on the ~0.1-0.15 ms
+#      floor and the protocol ranks nothing. Timed with async encode (launches back to back, about 8 us each),
+#      qwen35_gdn_recurrent_simd_l8_vec (one dispatch) is 0.78x of gdn_recurrent (range 0.62-0.88; 0.86 in run 4), but the noise floor at that size is 1.05-1.15 median with ranges up to 1.7-2.3, so this is
+#      suggestive, not resolved, and the saving is ~1.6 us a layer. Batch > 1 decode was not measured.
+#   4. Not wired into Qwen35Model. Wiring (section "Wiring") needs the owner's call and the model-level logit gate.
 #
-# Shape: batch 1, 16 key heads, 16 value heads, Dk = Dv = 128 (Qwen3.5-2B), non-zero per-batch start state,
-# state_out written, f32 operands, gates/l2norm/q scale computed by every arm (chunked arm's prep dispatch is inside
-# its time; the "pre" simd arms' prep dispatch is inside theirs). Inputs identical for every arm.
-# Protocol: one sample = N launches between two synchronize()s divided by N (N sized per arm to ~20 ms, <= 400);
-# 3 untimed warmup launches per arm; 22 rounds; arm order rotates by one each round; every arm's output and state is
-# compared with gdn_recurrent's before any timing and the run aborts above 1e-4 of scale (all arms agreed to ~1e-7).
-# Noise floor: gdn_recurrent timed twice (arms "Recurrent" and "RecurrentAgain"); the per-round ratio's median/range
-# is printed as "noise". Run 1 and run 2 time the library default (every launch its own submit-and-wait);
-# run 2b times with async encode on (launches queue back to back), which is the only protocol that resolves T = 1.
+# CLAIM LABELS. verified = a log or file cited below. inferred = reasoning from those. Every timing here is on one
+# machine, one shape, f32 operands, batch 1.
 #
-# CONDITIONS (stated honestly): none of these three runs had an idle GPU. Device utilization at the hold start was
-# 37% (run 1), 27% (run 2) and 40% (run 2b), and 34-41% just before the A/B; CPU load average 9 / 44 / 20 (2b rose to
-# 43 during the hold). The machine lock was held (other sessions run their GPU work under it, so the residue is work
-# outside the lock). Ratios inside one interleaved run share that contamination; absolute milliseconds do not
-# transfer. gdn_chunk_forward and gdn_recurrent land within ~7% of their 2026-10-27 one-shot values
-# (8.03 / 14.48 ms at T = 8192 in qwen35_gdn_packed_oneshot_m5pro.txt on branch gp/w27-attn-bf16-prefill), run 2b's min
-# (8.32 / 17.03) is 3% / 18% above them.
+# Lane: branch gp/w32-gdn-simd-recurrent off main 789a132. Kernels kernels/qwen35_gdn.metal, host src/qwen35.rs
+# (gdn_recurrent_simd, gdn_recurrent_simd_with), A/B rig tests/qwen35_gdn_simd_ab.rs, mlx comparator
+# bench/qwen35_gdn_mlx_kernel_probe.py, correctness tests in tests/qwen35_kernels.rs, emulator cases in tools/msl_emu.
 #
-# Naming: "simd L<n>" = n lanes share a value column (32 = mlx's mapping: 4 state rows a lane, simd_sum;
-# 16 / 8 = two / four columns a simdgroup, 8 / 16 rows a lane, shuffle-xor butterfly). "pre" = gates, norms, q scale
-# computed once per (token, value head) by qwen35_gdn_simd_prep into a float4 scratch, rather than recomputed by every
-# column in the loop; adds one dispatch. "vec" = q and k loaded as float4s (lane holds a contiguous run of rows;
-# host requires ld/q_off/k_off multiples of 4). "pf" = step t+1's operands loaded before step t's arithmetic.
-# "sg8" = 8 simdgroups a threadgroup instead of 4. All variants: 4 simdgroups a threadgroup except sg8.
+# SHAPE: batch 1, 16 key heads, 16 value heads, Dk = Dv = 128 (Qwen3.5-2B), non-zero per-batch start state, state_out
+# written, f32 operands. Every arm computes the gates, l2norm and q scale (chunked arm: its prep dispatch is inside its
+# time; the "pre" simd arms: their prep dispatch is inside theirs). Same inputs for every arm.
+#
+# PROTOCOL (tests/qwen35_gdn_simd_ab.rs): one sample = N launches between two synchronize()s divided by N, N sized per
+# arm to ~20 ms (<= 400); 3 untimed warmup launches per arm; 22 rounds; the arm order rotates by one each round; every
+# arm's output and state is compared with gdn_recurrent's before any timing and the run aborts above 1e-4 of scale.
+# Noise floor: gdn_recurrent timed twice ("Recurrent" and "RecurrentAgain"); the per-round ratio is printed as "noise".
+# Runs 1 and 2 time the library default (sync: every launch its own submit-and-wait); runs 2b, 4 and 6 time with async
+# encode on, the only protocol that resolves T = 1 (the README's dispatch floor: below ~0.25 ms of work the sync protocol
+# measures submit latency).
+#
+# NAMING: "simd L<n>": n lanes share a value column (32 = mlx's mapping, 4 state rows a lane, simd_sum; 16/8/4: two/four/
+# eight columns a simdgroup, 8/16/32 rows a lane, shuffle-xor butterfly). "pre": gates, norms and q scale computed once per
+# (token, value head) by qwen35_gdn_simd_prep into a float4 scratch instead of recomputed by every column. "vec": q and
+# k loaded as float4s (a lane holds a contiguous run of rows; the host requires ld, q_off, k_off multiples of 4). "pf":
+# step t+1's operands loaded before step t's arithmetic. "rr": the step reassociated so both reductions read the old
+# state and run side by side. "sg8": 8 simdgroups a threadgroup instead of 4. Shipped kernels: Mlx = "simd L32" fused,
+# Fused8 = "simd L8 vec", Prepped8 = "simd L8 pre vec". Everything else was pruned after this sweep (commit c2c0407);
+# its code is at commits 465f113 / 2dc051c (rr, L4, pf) and ce937b1 / 364cabc (sg8, L16, scalar-load variants).
 
-## Run 1 - 2026-10-28T01:00:15Z (2026-10-27 20:00 CDT), commit ce937b1 kernels (scalar strided loads, 64-bit row
-## products), library-default (sync) timing, GPU 37% at start, load 9.0. Source: target-gp/logs/w32_run1_v2_all.out
-## (not committed; the table below is its GDN_AB lines).
-  T=1   (ms per launch: min / median / max over rounds)
-    Chunked                       0.4736    0.5117    0.9066
-    Recurrent                     0.1450    0.1621    0.3898
-    simd L32                      0.1511    0.1700    0.2392
-    simd L32 sg8                  0.1349    0.1618    0.3651
-    simd L32 pre                  0.2788    0.3109    0.3945
-    simd L32 pre sg8              0.2768    0.3026    0.3861
-    simd L16                      0.1423    0.1565    0.2386
-    simd L8                       0.1368    0.1500    0.2175
-    simd L16 pre                  0.2679    0.2960    0.4600
-    simd L8 pre                   0.2696    0.2990    0.4328
-    RecurrentAgain                0.1443    0.1600    0.4179
-  T=200   (ms per launch: min / median / max over rounds)
-    Chunked                       0.5167    0.5247    0.5632
-    Recurrent                     0.4336    0.4429    0.4779
-    simd L32                      0.6199    0.6399    0.6712
-    simd L32 sg8                  0.6210    0.6373    0.6779
-    simd L32 pre                  0.5860    0.6123    0.6554
-    simd L32 pre sg8              0.5973    0.6223    0.7379
-    simd L16                      0.5063    0.5184    0.5533
-    simd L8                       0.4766    0.4963    0.5359
-    simd L16 pre                  0.5000    0.5206    0.5764
-    simd L8 pre                   0.4539    0.4729    0.5673
-    RecurrentAgain                0.4312    0.4523    0.4950
-  T=1024   (ms per launch: min / median / max over rounds)
-    Chunked                       1.3573    1.4280    2.7036
-    Recurrent                     2.0743    2.1429    2.2986
-    simd L32                      2.7988    2.8994    3.8906
-    simd L32 sg8                  3.0206    3.1310    3.3221
-    simd L32 pre                  2.0201    2.1136    2.2390
-    simd L32 pre sg8              2.0976    2.1940    2.3095
-    simd L16                      2.1675    2.3025    3.0155
-    simd L8                       2.2608    2.2970    2.4141
-    simd L16 pre                  1.6926    1.7722    2.9571
-    simd L8 pre                   1.4510    1.5197    1.6326
-    RecurrentAgain                2.0704    2.1309    2.2104
-  T=8192   (ms per launch: min / median / max over rounds)
-    Chunked                       7.7921    8.3091    9.3714
-    Recurrent                    15.4970   15.7162   15.9208
-    simd L32                     23.8352   24.6910   26.1731
-    simd L32 sg8                 30.1171   33.4926   38.3154
-    simd L32 pre                 21.0066   23.6694   25.6436
-    simd L32 pre sg8             26.5348   29.0450   32.4873
-    simd L16                     17.0363   18.4000   19.4720
-    simd L8                      17.9514   18.6295   19.5195
-    simd L16 pre                 15.2003   16.0273   17.6259
-    simd L8 pre                  12.3309   12.9740   14.1887
-    RecurrentAgain               15.5264   15.7695   16.0117
+## FINAL RUN (run 6) - 2026-10-28T07:32:28Z (02:32 CDT), source commit a1911a8; the binary is tests/qwen35_gdn_simd_ab.rs as of b951c1b (a1911a8 only rewords a message in tests/qwen35_kernels.rs);
+## async timing, shipped kernels only, T = 1, 200, 1024, 4096, 8192. Source: target-gp/logs/w32_run6_final_ab_b.out
+CONDITIONS: Device Utilization 13% at hold start, 0% after the 90 s idle wait the script allows, 13% in the reading taken
+immediately before the A/B (an unattributed blip; the readings are windowed averages), no bench_/qwen35_ process running,
+load average 6.95 (flat start to end). chunked 7.74 ms and gdn_recurrent 15.44 ms at T = 8192 (min) are +3.6% / +6.6% from the
+2026-10-27 one-shots (8.03 / 14.48 on a differently loaded machine). 22 rounds.
+  T=1   (ms per launch:        min     median        max)
+    Chunked                             0.1022     0.1025     0.3607
+    Recurrent                           0.0077     0.0079     0.0167
+    simd Mlx (L32, gates in loop)       0.0118     0.0119     0.0243
+    simd Fused8 (L8 vec)                0.0061     0.0061     0.0104
+    simd Prepped8 (L8 vec + prep)       0.0075     0.0076     0.0123
+    RecurrentAgain                      0.0068     0.0069     0.0098
+  T=200   (ms per launch:        min     median        max)
+    Chunked                             0.2465     0.2537     0.2722
+    Recurrent                           0.3043     0.3145     0.3212
+    simd Mlx (L32, gates in loop)       0.4014     0.4092     0.4264
+    simd Fused8 (L8 vec)                0.2253     0.2267     0.2453
+    simd Prepped8 (L8 vec + prep)       0.1552     0.1577     0.1672
+    RecurrentAgain                      0.3016     0.3093     0.3283
+  T=1024   (ms per launch:        min     median        max)
+    Chunked                             1.0655     1.0915     1.1377
+    Recurrent                           1.9246     1.9367     2.0223
+    simd Mlx (L32, gates in loop)       2.1871     2.2493     2.4028
+    simd Fused8 (L8 vec)                1.2053     1.2126     1.2414
+    simd Prepped8 (L8 vec + prep)       0.8132     0.8233     0.8600
+    RecurrentAgain                      1.9173     1.9379     1.9866
+  T=4096   (ms per launch:        min     median        max)
+    Chunked                             3.9473     4.0237     4.1418
+    Recurrent                           7.7672     7.8147     8.0607
+    simd Mlx (L32, gates in loop)       9.2365    10.8432    12.9259
+    simd Fused8 (L8 vec)                4.8230     4.8483     4.9438
+    simd Prepped8 (L8 vec + prep)       3.3212     3.3399     3.4376
+    RecurrentAgain                      7.7487     7.8450     8.0051
+  T=8192   (ms per launch:        min     median        max)
+    Chunked                             7.7424     7.9051     8.9010
+    Recurrent                          15.4420    15.5771    15.8046
+    simd Mlx (L32, gates in loop)      20.2858    25.7622    32.4560
+    simd Fused8 (L8 vec)                9.5477     9.7208     9.9793
+    simd Prepped8 (L8 vec + prep)       6.6333     6.7392     6.9391
+    RecurrentAgain                     15.4351    15.5179    15.9321
 
+  Ratios (median of the 22 per-round ratios; min and max in parentheses). "noise" is gdn_recurrent over itself.
+    T=   1  noise recurrent/recurrent_again              median 1.146  (min 0.920, max 1.705)
+    T=   1  recurrent/chunked                            median 0.076  (min 0.046, max 0.090)
+    T=   1  simd Mlx (L32, gates in loop)/recurrent      median 1.512  (min 1.381, max 1.799)
+    T=   1  simd Mlx (L32, gates in loop)/chunked        median 0.115  (min 0.067, max 0.137)
+    T=   1  simd Fused8 (L8 vec)/recurrent               median 0.779  (min 0.624, max 0.879)
+    T=   1  simd Fused8 (L8 vec)/chunked                 median 0.060  (min 0.029, max 0.066)
+    T=   1  simd Prepped8 (L8 vec + prep)/recurrent      median 0.965  (min 0.736, max 1.145)
+    T=   1  simd Prepped8 (L8 vec + prep)/chunked        median 0.073  (min 0.034, max 0.090)
+    T= 200  noise recurrent/recurrent_again              median 1.011  (min 0.962, max 1.058)
+    T= 200  recurrent/chunked                            median 1.237  (min 1.140, max 1.275)
+    T= 200  simd Mlx (L32, gates in loop)/recurrent      median 1.317  (min 1.274, max 1.353)
+    T= 200  simd Mlx (L32, gates in loop)/chunked        median 1.632  (min 1.503, max 1.725)
+    T= 200  simd Fused8 (L8 vec)/recurrent               median 0.726  (min 0.707, max 0.770)
+    T= 200  simd Fused8 (L8 vec)/chunked                 median 0.905  (min 0.831, max 0.967)
+    T= 200  simd Prepped8 (L8 vec + prep)/recurrent      median 0.505  (min 0.488, max 0.549)
+    T= 200  simd Prepped8 (L8 vec + prep)/chunked        median 0.629  (min 0.573, max 0.677)
+    T=1024  noise recurrent/recurrent_again              median 1.004  (min 0.973, max 1.032)
+    T=1024  recurrent/chunked                            median 1.796  (min 1.699, max 1.852)
+    T=1024  simd Mlx (L32, gates in loop)/recurrent      median 1.152  (min 1.131, max 1.227)
+    T=1024  simd Mlx (L32, gates in loop)/chunked        median 2.077  (min 1.922, max 2.223)
+    T=1024  simd Fused8 (L8 vec)/recurrent               median 0.626  (min 0.600, max 0.641)
+    T=1024  simd Fused8 (L8 vec)/chunked                 median 1.121  (min 1.070, max 1.155)
+    T=1024  simd Prepped8 (L8 vec + prep)/recurrent      median 0.424  (min 0.408, max 0.444)
+    T=1024  simd Prepped8 (L8 vec + prep)/chunked        median 0.760  (min 0.721, max 0.805)
+    T=4096  noise recurrent/recurrent_again              median 0.999  (min 0.972, max 1.040)
+    T=4096  recurrent/chunked                            median 1.940  (min 1.876, max 1.983)
+    T=4096  simd Mlx (L32, gates in loop)/recurrent      median 1.382  (min 1.182, max 1.657)
+    T=4096  simd Mlx (L32, gates in loop)/chunked        median 2.651  (min 2.316, max 3.210)
+    T=4096  simd Fused8 (L8 vec)/recurrent               median 0.621  (min 0.601, max 0.632)
+    T=4096  simd Fused8 (L8 vec)/chunked                 median 1.203  (min 1.169, max 1.237)
+    T=4096  simd Prepped8 (L8 vec + prep)/recurrent      median 0.429  (min 0.413, max 0.437)
+    T=4096  simd Prepped8 (L8 vec + prep)/chunked        median 0.832  (min 0.809, max 0.856)
+    T=8192  noise recurrent/recurrent_again              median 1.001  (min 0.973, max 1.019)
+    T=8192  recurrent/chunked                            median 1.971  (min 1.749, max 2.004)
+    T=8192  simd Mlx (L32, gates in loop)/recurrent      median 1.647  (min 1.305, max 2.090)
+    T=8192  simd Mlx (L32, gates in loop)/chunked        median 3.272  (min 2.577, max 4.169)
+    T=8192  simd Fused8 (L8 vec)/recurrent               median 0.620  (min 0.608, max 0.641)
+    T=8192  simd Fused8 (L8 vec)/chunked                 median 1.221  (min 1.121, max 1.251)
+    T=8192  simd Prepped8 (L8 vec + prep)/recurrent      median 0.431  (min 0.422, max 0.443)
+    T=8192  simd Prepped8 (L8 vec + prep)/chunked        median 0.846  (min 0.745, max 0.883)
 
-  Ratios (median of the 22 per-round ratios; range in parentheses):
-    T=   1 noise recurrent/recurrent_again          median 1.021  (min 0.385, max 2.135)
-    T=   1 recurrent/chunked                        median 0.310  (min 0.177, max 0.472)
-    T= 200 noise recurrent/recurrent_again          median 0.988  (min 0.885, max 1.078)
-    T= 200 recurrent/chunked                        median 0.842  (min 0.807, max 0.924)
-    T=1024 noise recurrent/recurrent_again          median 0.996  (min 0.959, max 1.086)
-    T=1024 recurrent/chunked                        median 1.486  (min 0.850, max 1.611)
-    T=8192 noise recurrent/recurrent_again          median 0.996  (min 0.974, max 1.017)
-    T=8192 recurrent/chunked                        median 1.893  (min 1.660, max 1.997)
+  mlx-lm's own kernel, same hold? NO: the mlx probe was not run in this hold. See the MLX section.
 
-## Run 2 - 2026-10-28T02:09:10Z (21:09 CDT), commit d7f5f96 kernels (adds pointer-advanced loads, vec, pf), sync
-## timing, GPU 27% at start (34% before the A/B), load 44.3 at start (CPU heavily contended).
-  T=1   (ms per launch: min / median / max over rounds)
-    Chunked                       0.5506    0.8533    1.9609
-    Recurrent                     0.1733    0.2203    0.3327
-    simd L32                      0.1813    0.2152    0.3192
-    simd L32 pre                  0.3502    0.4192    0.6115
-    simd L16                      0.1670    0.2143    0.5186
-    simd L8                       0.1510    0.2100    0.2976
-    simd L16 pre                  0.3160    0.4110    0.5567
-    simd L8 pre                   0.3078    0.4094    0.5236
-    simd L8 pre vec               0.3471    0.4025    0.9422
-    simd L8 pre pf                0.3589    0.4113    0.5103
-    simd L8 pre vec pf            0.3203    0.4113    0.6709
-    simd L8 vec pf                0.1605    0.2110    0.5477
-    simd L32 pre vec pf           0.3526    0.4371    1.2598
-    simd L16 pre vec pf           0.3196    0.4252    0.5765
-    RecurrentAgain                0.1843    0.2189    0.3021
-  T=200   (ms per launch: min / median / max over rounds)
-    Chunked                       0.6080    0.7598    0.9518
-    Recurrent                     0.5214    0.6562    0.9061
-    simd L32                      0.6441    0.8197    1.1573
-    simd L32 pre                  0.5854    0.7199    1.3787
-    simd L16                      0.5249    0.6338    0.8243
-    simd L8                       0.4532    0.5531    1.3986
-    simd L16 pre                  0.5617    0.6426    1.5673
-    simd L8 pre                   0.5373    0.6179    1.0853
-    simd L8 pre vec               0.5038    0.5588    0.6342
-    simd L8 pre pf                0.5530    0.6730    1.3801
-    simd L8 pre vec pf            0.5369    0.6263    0.8362
-    simd L8 vec pf                0.4240    0.5361    1.3067
-    simd L32 pre vec pf           0.6440    0.7807    1.0704
-    simd L16 pre vec pf           0.5679    0.6762    0.9569
-    RecurrentAgain                0.5277    0.6575    1.3682
-  T=1024   (ms per launch: min / median / max over rounds)
-    Chunked                       1.5108    1.7253    2.2385
-    Recurrent                     2.2313    2.4577    4.3939
-    simd L32                      2.7827    3.0724    3.3112
-    simd L32 pre                  1.9860    2.2715    6.5765
-    simd L16                      2.1690    2.4827    5.8995
-    simd L8                       1.7085    1.9117    2.3476
-    simd L16 pre                  1.6291    2.0178    5.2803
-    simd L8 pre                   1.5076    1.6912    2.7536
-    simd L8 pre vec               1.2345    1.4240    2.2040
-    simd L8 pre pf                1.5959    1.7895    2.4551
-    simd L8 pre vec pf            1.5225    1.6746    3.1371
-    simd L8 vec pf                1.4420    1.6145    1.9626
-    simd L32 pre vec pf           2.2509    2.6177    3.7655
-    simd L16 pre vec pf           1.6451    1.8757    2.5026
-    RecurrentAgain                2.2155    2.4623    2.5601
-  T=8192   (ms per launch: min / median / max over rounds)
-    Chunked                       8.9536    9.5696   11.0879
-    Recurrent                    16.7388   17.6518   21.7403
-    simd L32                     27.3897   32.9554   39.1982
-    simd L32 pre                 24.0578   25.7548   29.1980
-    simd L16                     17.6399   19.0555   20.1612
-    simd L8                      13.2482   13.9923   17.3575
-    simd L16 pre                 18.4064   20.4859   25.9693
-    simd L8 pre                  11.5639   12.2489   13.7698
-    simd L8 pre vec               7.6869    8.2988    9.2996
-    simd L8 pre pf               15.8192   17.3338   19.3274
-    simd L8 pre vec pf           10.0409   10.7306   13.2741
-    simd L8 vec pf               10.8039   11.5457   12.2321
-    simd L32 pre vec pf          29.6201   34.6904   45.4485
-    simd L16 pre vec pf          13.1342   15.2425   18.2625
-    RecurrentAgain               16.6843   17.5977   19.0327
+## RUN 4 - the full sweep, 2026-10-28T04:33:33Z (23:33 CDT), commit f39f8a9 kernels, async timing, 15 arms
+## GPU 35% at hold start, 16% after the idle wait, 44% before the A/B (the correctness tests ran just before it in
+## the same hold); load 16.7 -> 11.7. Source: target-gp/logs/w32_run4_v6_all.out
+  T=1   (ms per launch:        min     median        max)
+    Chunked                             0.1025     0.1047     0.3412
+    Recurrent                           0.0074     0.0076     0.0177
+    simd L32                            0.0120     0.0123     0.0257
+    simd L32 pre                        0.0133     0.0135     0.0226
+    simd L8 pre                         0.0082     0.0084     0.0121
+    simd L8 vec                         0.0064     0.0065     0.0093
+    simd L8 pre vec                     0.0079     0.0081     0.0112
+    simd L8 pre vec pf                  0.0084     0.0087     0.0117
+    simd L16 pre vec                    0.0099     0.0103     0.0132
+    simd L32 pre vec                    0.0132     0.0136     0.0172
+    simd L8 pre vec rr                  0.0080     0.0083     0.0103
+    simd L16 pre vec rr                 0.0099     0.0102     0.0119
+    simd L32 pre vec rr                 0.0129     0.0131     0.0151
+    simd L4 pre vec rr                  0.0095     0.0097     0.0118
+    RecurrentAgain                      0.0070     0.0072     0.0119
+  T=200   (ms per launch:        min     median        max)
+    Chunked                             0.2495     0.2512     0.4152
+    Recurrent                           0.3047     0.3065     0.3137
+    simd L32                            0.4030     0.4048     0.4717
+    simd L32 pre                        0.2320     0.2338     0.2410
+    simd L8 pre                         0.1720     0.1742     0.1778
+    simd L8 vec                         0.2263     0.2274     0.2309
+    simd L8 pre vec                     0.1562     0.1585     0.1648
+    simd L8 pre vec pf                  0.2064     0.2081     0.2168
+    simd L16 pre vec                    0.1667     0.1677     0.1774
+    simd L32 pre vec                    0.2302     0.2315     0.2456
+    simd L8 pre vec rr                  0.1538     0.1548     0.1604
+    simd L16 pre vec rr                 0.1754     0.1776     0.1857
+    simd L32 pre vec rr                 0.2484     0.2491     0.2874
+    simd L4 pre vec rr                  0.1503     0.1511     0.1572
+    RecurrentAgain                      0.3045     0.3061     0.5495
+  T=1024   (ms per launch:        min     median        max)
+    Chunked                             1.0927     1.1142     1.1279
+    Recurrent                           1.9510     1.9762     2.0001
+    simd L32                            2.2198     2.2846     2.3293
+    simd L32 pre                        1.5193     1.5679     1.6465
+    simd L8 pre                         1.0381     1.0774     1.1053
+    simd L8 vec                         1.2101     1.2176     1.2437
+    simd L8 pre vec                     0.8161     0.8199     0.8430
+    simd L8 pre vec pf                  1.0436     1.0547     1.0918
+    simd L16 pre vec                    1.0200     1.0542     1.0925
+    simd L32 pre vec                    1.2241     1.2612     1.3060
+    simd L8 pre vec rr                  0.7725     0.7763     0.7962
+    simd L16 pre vec rr                 1.0104     1.0214     1.0586
+    simd L32 pre vec rr                 1.3245     1.3505     1.3877
+    simd L4 pre vec rr                  0.7631     0.7693     0.7858
+    RecurrentAgain                      1.9437     1.9723     2.0070
+  T=8192   (ms per launch:        min     median        max)
+    Chunked                             7.7021     8.0649     8.2749
+    Recurrent                          15.5631    15.7100    15.9526
+    simd L32                           23.4908    26.8851    30.0933
+    simd L32 pre                       21.7730    24.5027    26.6321
+    simd L8 pre                        10.3577    10.8533    12.0740
+    simd L8 vec                         9.5846     9.6555     9.8079
+    simd L8 pre vec                     6.6853     6.7498     6.9114
+    simd L8 pre vec pf                  8.8085     8.9563     9.3720
+    simd L16 pre vec                   12.2170    13.1889    13.9001
+    simd L32 pre vec                   13.5774    15.5281    19.9201
+    simd L8 pre vec rr                  6.3609     6.4017     6.5169
+    simd L16 pre vec rr                12.2850    12.9642    14.7531
+    simd L32 pre vec rr                14.8365    16.9457    19.5236
+    simd L4 pre vec rr                  6.3697     6.4516     6.6014
+    RecurrentAgain                     15.6241    15.7250    16.0919
 
+  Ratios for the arms that matter (median; min, max):
+    T=   1  noise recurrent/recurrent_again              median 1.047  (min 0.811, max 2.308)
+    T=   1  simd L32/recurrent                           median 1.613  (min 1.225, max 1.877)
+    T=   1  simd L32/chunked                             median 0.117  (min 0.064, max 0.136)
+    T=   1  simd L32 pre/recurrent                       median 1.785  (min 1.276, max 2.095)
+    T=   1  simd L32 pre/chunked                         median 0.128  (min 0.066, max 0.154)
+    T=   1  simd L8 vec/recurrent                        median 0.858  (min 0.527, max 0.892)
+    T=   1  simd L8 vec/chunked                          median 0.062  (min 0.027, max 0.065)
+    T=   1  simd L8 pre vec/recurrent                    median 1.064  (min 0.631, max 1.108)
+    T=   1  simd L8 pre vec/chunked                      median 0.077  (min 0.033, max 0.083)
+    T=   1  simd L8 pre vec rr/recurrent                 median 1.074  (min 0.581, max 1.226)
+    T=   1  simd L8 pre vec rr/chunked                   median 0.079  (min 0.030, max 0.088)
+    T= 200  noise recurrent/recurrent_again              median 1.000  (min 0.556, max 1.030)
+    T= 200  simd L32/recurrent                           median 1.323  (min 1.293, max 1.525)
+    T= 200  simd L32/chunked                             median 1.613  (min 0.978, max 1.877)
+    T= 200  simd L32 pre/recurrent                       median 0.763  (min 0.744, max 0.784)
+    T= 200  simd L32 pre/chunked                         median 0.930  (min 0.561, max 0.961)
+    T= 200  simd L8 vec/recurrent                        median 0.742  (min 0.723, max 0.752)
+    T= 200  simd L8 vec/chunked                          median 0.905  (min 0.548, max 0.918)
+    T= 200  simd L8 pre vec/recurrent                    median 0.513  (min 0.502, max 0.540)
+    T= 200  simd L8 pre vec/chunked                      median 0.626  (min 0.377, max 0.661)
+    T= 200  simd L8 pre vec rr/recurrent                 median 0.507  (min 0.492, max 0.524)
+    T= 200  simd L8 pre vec rr/chunked                   median 0.616  (min 0.375, max 0.643)
+    T=1024  noise recurrent/recurrent_again              median 0.999  (min 0.982, max 1.012)
+    T=1024  simd L32/recurrent                           median 1.159  (min 1.119, max 1.182)
+    T=1024  simd L32/chunked                             median 2.058  (min 1.972, max 2.114)
+    T=1024  simd L32 pre/recurrent                       median 0.794  (min 0.767, max 0.831)
+    T=1024  simd L32 pre/chunked                         median 1.409  (min 1.357, max 1.480)
+    T=1024  simd L8 vec/recurrent                        median 0.618  (min 0.613, max 0.628)
+    T=1024  simd L8 vec/chunked                          median 1.095  (min 1.084, max 1.118)
+    T=1024  simd L8 pre vec/recurrent                    median 0.416  (min 0.410, max 0.425)
+    T=1024  simd L8 pre vec/chunked                      median 0.736  (min 0.726, max 0.760)
+    T=1024  simd L8 pre vec rr/recurrent                 median 0.394  (min 0.388, max 0.402)
+    T=1024  simd L8 pre vec rr/chunked                   median 0.697  (min 0.691, max 0.718)
+    T=8192  noise recurrent/recurrent_again              median 0.998  (min 0.971, max 1.015)
+    T=8192  simd L32/recurrent                           median 1.715  (min 1.491, max 1.916)
+    T=8192  simd L32/chunked                             median 3.357  (min 2.962, max 3.736)
+    T=8192  simd L32 pre/recurrent                       median 1.559  (min 1.387, max 1.669)
+    T=8192  simd L32 pre/chunked                         median 3.046  (min 2.649, max 3.353)
+    T=8192  simd L8 vec/recurrent                        median 0.615  (min 0.604, max 0.629)
+    T=8192  simd L8 vec/chunked                          median 1.199  (min 1.167, max 1.255)
+    T=8192  simd L8 pre vec/recurrent                    median 0.430  (min 0.421, max 0.442)
+    T=8192  simd L8 pre vec/chunked                      median 0.836  (min 0.813, max 0.882)
+    T=8192  simd L8 pre vec rr/recurrent                 median 0.409  (min 0.402, max 0.416)
+    T=8192  simd L8 pre vec rr/chunked                   median 0.794  (min 0.777, max 0.836)
 
-  Ratios:
-    T=   1 noise recurrent/recurrent_again          median 0.985  (min 0.742, max 1.354)
-    T=   1 recurrent/chunked                        median 0.318  (min 0.106, max 0.447)
-    T=   1 simd L8 pre vec/recurrent                median 1.834  (min 1.203, max 3.912)
-    T=   1 simd L8 pre vec/chunked                  median 0.529  (min 0.238, max 0.948)
-    T= 200 noise recurrent/recurrent_again          median 1.017  (min 0.538, max 1.355)
-    T= 200 recurrent/chunked                        median 0.865  (min 0.742, max 1.228)
-    T= 200 simd L8 pre vec/recurrent                median 0.836  (min 0.681, max 1.077)
-    T= 200 simd L8 pre vec/chunked                  median 0.741  (min 0.619, max 0.867)
-    T=1024 noise recurrent/recurrent_again          median 1.003  (min 0.935, max 1.842)
-    T=1024 recurrent/chunked                        median 1.417  (min 1.098, max 2.651)
-    T=1024 simd L8 pre vec/recurrent                median 0.571  (min 0.315, max 0.956)
-    T=1024 simd L8 pre vec/chunked                  median 0.832  (min 0.664, max 1.268)
-    T=8192 noise recurrent/recurrent_again          median 0.998  (min 0.912, max 1.243)
-    T=8192 recurrent/chunked                        median 1.840  (min 1.565, max 2.286)
-    T=8192 simd L8 pre vec/recurrent                median 0.469  (min 0.377, max 0.536)
-    T=8192 simd L8 pre vec/chunked                  median 0.861  (min 0.719, max 0.987)
+  SWEEP FINDINGS (T = 8192 min ms; gdn_recurrent 15.56, chunked 7.70 in the same run):
+    mlx mapping (L32 fused) 23.49 -> prep pass for gates/norms (L32 pre) 21.77 -> 8 lanes a column, scalar loads, fused 13.85
+    (run 2b; run 4 had no such arm) / pre 10.36 -> float4 loads: fused 9.58, pre 6.69.  Prefetch (pf) made the pre/vec arm
+    slower (8.81 vs 6.69). Lane count with vec+pre: L8 6.69, L16 12.22, L32 13.58. Reassociated step (rr): L8 6.36, L4 6.37,
+    L16 12.29, L32 14.84 (about 5% better than the plain step at L8; the min-max ranges do not overlap: 6.36-6.52 vs 6.69-6.91).
+    rr was NOT shipped. Its step sums raw q.S and k.S products and takes q_n.k_n from the prep pass, so a norm that
+    overflows (|q|, |k| above ~1e19) yields NaN where gdn_recurrent yields finite zeros: tests/qwen35_kernels.rs
+    gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons failed on it ("q, k of 1e30 (norm overflows)", run 3 log
+    w32_correct_kernels_v5.log, run 4 log w32_correct_kernels_v6.log: y non-finite at row 3, key head 0's value heads)
+    after a first fix (q_n.k_n from normalised elements) in commit 2dc051c did not close it; the cause was not found
+    (inferred: the unscaled sums, not the prep). Dropping it kept the policy equal to gdn_recurrent's and cost ~5%.
+    "Why L8 + float4 wins" is INFERRED, not measured (no GPU counters here): fewer simdgroups with 16 rows a lane
+    spend fewer reduction steps and fewer load instructions a column per token; prefetch doubles the live registers.
+    The 2048-simdgroup mapping is not latency-limited in the way the hypothesis assumed.
 
-## Run 2b - 2026-10-28T01:57:42Z (20:57 CDT), same kernels as run 2, ASYNC-encode timing, GPU 40% at start,
-## 46% after a 90 s idle wait, 35% before the A/B; load 20 -> 43.
-  T=1   (ms per launch: min / median / max over rounds)
-    Chunked                       0.1030    0.1049    0.3398
-    Recurrent                     0.0078    0.0087    0.0140
-    simd L32                      0.0121    0.0126    0.0175
-    simd L32 pre                  0.0132    0.0137    0.0166
-    simd L16                      0.0122    0.0131    0.0176
-    simd L8                       0.0065    0.0067    0.0096
-    simd L16 pre                  0.0101    0.0104    0.0129
-    simd L8 pre                   0.0083    0.0086    0.0114
-    simd L8 pre vec               0.0080    0.0086    0.0090
-    simd L8 pre pf                0.0084    0.0087    0.0101
-    simd L8 pre vec pf            0.0082    0.0084    0.0107
-    simd L8 vec pf                0.0067    0.0068    0.0079
-    simd L32 pre vec pf           0.0131    0.0135    0.0157
-    simd L16 pre vec pf           0.0108    0.0116    0.0162
-    RecurrentAgain                0.0074    0.0078    0.0089
-  T=200   (ms per launch: min / median / max over rounds)
-    Chunked                       0.2620    0.3332    0.4546
-    Recurrent                     0.3184    0.4048    0.4293
-    simd L32                      0.4088    0.5324    0.5753
-    simd L32 pre                  0.2391    0.3182    0.3552
-    simd L16                      0.2883    0.3788    0.4281
-    simd L8                       0.2443    0.3163    0.3554
-    simd L16 pre                  0.1966    0.2557    0.2943
-    simd L8 pre                   0.1757    0.2275    0.2540
-    simd L8 pre vec               0.1616    0.2061    0.2199
-    simd L8 pre pf                0.2253    0.2894    0.3157
-    simd L8 pre vec pf            0.2133    0.2767    0.3019
-    simd L8 vec pf                0.2490    0.3211    0.3801
-    simd L32 pre vec pf           0.2826    0.3639    0.4010
-    simd L16 pre vec pf           0.2377    0.3031    0.3226
-    RecurrentAgain                0.3289    0.4089    0.6398
-  T=1024   (ms per launch: min / median / max over rounds)
-    Chunked                       1.2907    1.3681    2.4072
-    Recurrent                     2.2354    2.3716    3.1721
-    simd L32                      2.6902    2.9099    3.4859
-    simd L32 pre                  1.8327    1.9574    2.9540
-    simd L16                      2.2140    2.3833    3.0400
-    simd L8                       1.6884    1.8243    2.2338
-    simd L16 pre                  1.4169    1.5393    2.0881
-    simd L8 pre                   1.2257    1.3227    1.9016
-    simd L8 pre vec               0.9957    1.0522    1.3077
-    simd L8 pre pf                1.3424    1.4245    3.3844
-    simd L8 pre vec pf            1.2340    1.3307    1.7024
-    simd L8 vec pf                1.4114    1.5302    2.2011
-    simd L32 pre vec pf           2.0568    2.2458    2.6603
-    simd L16 pre vec pf           1.4203    1.5730    2.8062
-    RecurrentAgain                2.2393    2.4148    4.7035
-  T=8192   (ms per launch: min / median / max over rounds)
-    Chunked                       8.3193    9.2358   10.7220
-    Recurrent                    17.0291   17.5344   20.0842
-    simd L32                     21.4203   28.3440   35.7933
-    simd L32 pre                 22.8084   28.2832   33.2566
-    simd L16                     17.6351   19.0500   21.8545
-    simd L8                      13.8504   14.4182   17.3876
-    simd L16 pre                 15.8606   19.7837   23.4061
-    simd L8 pre                  11.4388   12.5601   19.8556
-    simd L8 pre vec               7.3154    7.8680   10.6743
-    simd L8 pre pf               15.8783   17.5964   26.7384
-    simd L8 pre vec pf            9.9813   10.5813   12.8338
-    simd L8 vec pf               10.8957   11.6348   13.4547
-    simd L32 pre vec pf          28.5948   38.7469   41.9398
-    simd L16 pre vec pf          14.8293   17.2839   21.0900
-    RecurrentAgain               16.9170   17.6442   20.5395
+## RUN 2b - 2026-10-28T01:57:42Z (20:57 CDT), commit d7f5f96-era kernels (no rr), async timing, GPU 40% at start, 46% after the idle
+## wait, 35% before the A/B; load 20 -> 43 during the hold. Includes the sg8 and L16 scalar-load arms the later runs dropped.
+  T=1   (ms per launch:        min     median        max)
+    Chunked                             0.1030     0.1049     0.3398
+    Recurrent                           0.0078     0.0087     0.0140
+    simd L32                            0.0121     0.0126     0.0175
+    simd L32 pre                        0.0132     0.0137     0.0166
+    simd L16                            0.0122     0.0131     0.0176
+    simd L8                             0.0065     0.0067     0.0096
+    simd L16 pre                        0.0101     0.0104     0.0129
+    simd L8 pre                         0.0083     0.0086     0.0114
+    simd L8 pre vec                     0.0080     0.0086     0.0090
+    simd L8 pre pf                      0.0084     0.0087     0.0101
+    simd L8 pre vec pf                  0.0082     0.0084     0.0107
+    simd L8 vec pf                      0.0067     0.0068     0.0079
+    simd L32 pre vec pf                 0.0131     0.0135     0.0157
+    simd L16 pre vec pf                 0.0108     0.0116     0.0162
+    RecurrentAgain                      0.0074     0.0078     0.0089
+  T=200   (ms per launch:        min     median        max)
+    Chunked                             0.2620     0.3332     0.4546
+    Recurrent                           0.3184     0.4048     0.4293
+    simd L32                            0.4088     0.5324     0.5753
+    simd L32 pre                        0.2391     0.3182     0.3552
+    simd L16                            0.2883     0.3788     0.4281
+    simd L8                             0.2443     0.3163     0.3554
+    simd L16 pre                        0.1966     0.2557     0.2943
+    simd L8 pre                         0.1757     0.2275     0.2540
+    simd L8 pre vec                     0.1616     0.2061     0.2199
+    simd L8 pre pf                      0.2253     0.2894     0.3157
+    simd L8 pre vec pf                  0.2133     0.2767     0.3019
+    simd L8 vec pf                      0.2490     0.3211     0.3801
+    simd L32 pre vec pf                 0.2826     0.3639     0.4010
+    simd L16 pre vec pf                 0.2377     0.3031     0.3226
+    RecurrentAgain                      0.3289     0.4089     0.6398
+  T=1024   (ms per launch:        min     median        max)
+    Chunked                             1.2907     1.3681     2.4072
+    Recurrent                           2.2354     2.3716     3.1721
+    simd L32                            2.6902     2.9099     3.4859
+    simd L32 pre                        1.8327     1.9574     2.9540
+    simd L16                            2.2140     2.3833     3.0400
+    simd L8                             1.6884     1.8243     2.2338
+    simd L16 pre                        1.4169     1.5393     2.0881
+    simd L8 pre                         1.2257     1.3227     1.9016
+    simd L8 pre vec                     0.9957     1.0522     1.3077
+    simd L8 pre pf                      1.3424     1.4245     3.3844
+    simd L8 pre vec pf                  1.2340     1.3307     1.7024
+    simd L8 vec pf                      1.4114     1.5302     2.2011
+    simd L32 pre vec pf                 2.0568     2.2458     2.6603
+    simd L16 pre vec pf                 1.4203     1.5730     2.8062
+    RecurrentAgain                      2.2393     2.4148     4.7035
+  T=8192   (ms per launch:        min     median        max)
+    Chunked                             8.3193     9.2358    10.7220
+    Recurrent                          17.0291    17.5344    20.0842
+    simd L32                           21.4203    28.3440    35.7933
+    simd L32 pre                       22.8084    28.2832    33.2566
+    simd L16                           17.6351    19.0500    21.8545
+    simd L8                            13.8504    14.4182    17.3876
+    simd L16 pre                       15.8606    19.7837    23.4061
+    simd L8 pre                        11.4388    12.5601    19.8556
+    simd L8 pre vec                     7.3154     7.8680    10.6743
+    simd L8 pre pf                     15.8783    17.5964    26.7384
+    simd L8 pre vec pf                  9.9813    10.5813    12.8338
+    simd L8 vec pf                     10.8957    11.6348    13.4547
+    simd L32 pre vec pf                28.5948    38.7469    41.9398
+    simd L16 pre vec pf                14.8293    17.2839    21.0900
+    RecurrentAgain                     16.9170    17.6442    20.5395
+## RUN 1 - 2026-10-28T01:00:15Z (20:00 CDT), commit ce937b1 kernels (scalar loads, 64-bit row products), SYNC (library
+## default) timing, GPU 37% at start, 41% before the A/B, load 9.0. Under sync timing T = 1 is the host floor: the 0.14-0.15 ms
+## rows are submit-and-wait, not kernels (all arms but chunked's two dispatches).
+  T=1   (ms per launch:        min     median        max)
+    Chunked                             0.4736     0.5117     0.9066
+    Recurrent                           0.1450     0.1621     0.3898
+    simd L32                            0.1511     0.1700     0.2392
+    simd L32 sg8                        0.1349     0.1618     0.3651
+    simd L32 pre                        0.2788     0.3109     0.3945
+    simd L32 pre sg8                    0.2768     0.3026     0.3861
+    simd L16                            0.1423     0.1565     0.2386
+    simd L8                             0.1368     0.1500     0.2175
+    simd L16 pre                        0.2679     0.2960     0.4600
+    simd L8 pre                         0.2696     0.2990     0.4328
+    RecurrentAgain                      0.1443     0.1600     0.4179
+  T=200   (ms per launch:        min     median        max)
+    Chunked                             0.5167     0.5247     0.5632
+    Recurrent                           0.4336     0.4429     0.4779
+    simd L32                            0.6199     0.6399     0.6712
+    simd L32 sg8                        0.6210     0.6373     0.6779
+    simd L32 pre                        0.5860     0.6123     0.6554
+    simd L32 pre sg8                    0.5973     0.6223     0.7379
+    simd L16                            0.5063     0.5184     0.5533
+    simd L8                             0.4766     0.4963     0.5359
+    simd L16 pre                        0.5000     0.5206     0.5764
+    simd L8 pre                         0.4539     0.4729     0.5673
+    RecurrentAgain                      0.4312     0.4523     0.4950
+  T=1024   (ms per launch:        min     median        max)
+    Chunked                             1.3573     1.4280     2.7036
+    Recurrent                           2.0743     2.1429     2.2986
+    simd L32                            2.7988     2.8994     3.8906
+    simd L32 sg8                        3.0206     3.1310     3.3221
+    simd L32 pre                        2.0201     2.1136     2.2390
+    simd L32 pre sg8                    2.0976     2.1940     2.3095
+    simd L16                            2.1675     2.3025     3.0155
+    simd L8                             2.2608     2.2970     2.4141
+    simd L16 pre                        1.6926     1.7722     2.9571
+    simd L8 pre                         1.4510     1.5197     1.6326
+    RecurrentAgain                      2.0704     2.1309     2.2104
+  T=8192   (ms per launch:        min     median        max)
+    Chunked                             7.7921     8.3091     9.3714
+    Recurrent                          15.4970    15.7162    15.9208
+    simd L32                           23.8352    24.6910    26.1731
+    simd L32 sg8                       30.1171    33.4926    38.3154
+    simd L32 pre                       21.0066    23.6694    25.6436
+    simd L32 pre sg8                   26.5348    29.0450    32.4873
+    simd L16                           17.0363    18.4000    19.4720
+    simd L8                            17.9514    18.6295    19.5195
+    simd L16 pre                       15.2003    16.0273    17.6259
+    simd L8 pre                        12.3309    12.9740    14.1887
+    RecurrentAgain                     15.5264    15.7695    16.0117
 
+## RUN 2 - 2026-10-28T02:09:10Z (21:09 CDT), commit d7f5f96 kernels, SYNC timing, GPU 27% at start (34% before the A/B), load 44.3
+  T=1   (ms per launch:        min     median        max)
+    Chunked                             0.5506     0.8533     1.9609
+    Recurrent                           0.1733     0.2203     0.3327
+    simd L32                            0.1813     0.2152     0.3192
+    simd L32 pre                        0.3502     0.4192     0.6115
+    simd L16                            0.1670     0.2143     0.5186
+    simd L8                             0.1510     0.2100     0.2976
+    simd L16 pre                        0.3160     0.4110     0.5567
+    simd L8 pre                         0.3078     0.4094     0.5236
+    simd L8 pre vec                     0.3471     0.4025     0.9422
+    simd L8 pre pf                      0.3589     0.4113     0.5103
+    simd L8 pre vec pf                  0.3203     0.4113     0.6709
+    simd L8 vec pf                      0.1605     0.2110     0.5477
+    simd L32 pre vec pf                 0.3526     0.4371     1.2598
+    simd L16 pre vec pf                 0.3196     0.4252     0.5765
+    RecurrentAgain                      0.1843     0.2189     0.3021
+  T=200   (ms per launch:        min     median        max)
+    Chunked                             0.6080     0.7598     0.9518
+    Recurrent                           0.5214     0.6562     0.9061
+    simd L32                            0.6441     0.8197     1.1573
+    simd L32 pre                        0.5854     0.7199     1.3787
+    simd L16                            0.5249     0.6338     0.8243
+    simd L8                             0.4532     0.5531     1.3986
+    simd L16 pre                        0.5617     0.6426     1.5673
+    simd L8 pre                         0.5373     0.6179     1.0853
+    simd L8 pre vec                     0.5038     0.5588     0.6342
+    simd L8 pre pf                      0.5530     0.6730     1.3801
+    simd L8 pre vec pf                  0.5369     0.6263     0.8362
+    simd L8 vec pf                      0.4240     0.5361     1.3067
+    simd L32 pre vec pf                 0.6440     0.7807     1.0704
+    simd L16 pre vec pf                 0.5679     0.6762     0.9569
+    RecurrentAgain                      0.5277     0.6575     1.3682
+  T=1024   (ms per launch:        min     median        max)
+    Chunked                             1.5108     1.7253     2.2385
+    Recurrent                           2.2313     2.4577     4.3939
+    simd L32                            2.7827     3.0724     3.3112
+    simd L32 pre                        1.9860     2.2715     6.5765
+    simd L16                            2.1690     2.4827     5.8995
+    simd L8                             1.7085     1.9117     2.3476
+    simd L16 pre                        1.6291     2.0178     5.2803
+    simd L8 pre                         1.5076     1.6912     2.7536
+    simd L8 pre vec                     1.2345     1.4240     2.2040
+    simd L8 pre pf                      1.5959     1.7895     2.4551
+    simd L8 pre vec pf                  1.5225     1.6746     3.1371
+    simd L8 vec pf                      1.4420     1.6145     1.9626
+    simd L32 pre vec pf                 2.2509     2.6177     3.7655
+    simd L16 pre vec pf                 1.6451     1.8757     2.5026
+    RecurrentAgain                      2.2155     2.4623     2.5601
+  T=8192   (ms per launch:        min     median        max)
+    Chunked                             8.9536     9.5696    11.0879
+    Recurrent                          16.7388    17.6518    21.7403
+    simd L32                           27.3897    32.9554    39.1982
+    simd L32 pre                       24.0578    25.7548    29.1980
+    simd L16                           17.6399    19.0555    20.1612
+    simd L8                            13.2482    13.9923    17.3575
+    simd L16 pre                       18.4064    20.4859    25.9693
+    simd L8 pre                        11.5639    12.2489    13.7698
+    simd L8 pre vec                     7.6869     8.2988     9.2996
+    simd L8 pre pf                     15.8192    17.3338    19.3274
+    simd L8 pre vec pf                 10.0409    10.7306    13.2741
+    simd L8 vec pf                     10.8039    11.5457    12.2321
+    simd L32 pre vec pf                29.6201    34.6904    45.4485
+    simd L16 pre vec pf                13.1342    15.2425    18.2625
+    RecurrentAgain                     16.6843    17.5977    19.0327
 
-  Ratios:
-    T=   1 noise recurrent/recurrent_again          median 1.122  (min 0.881, max 1.791)
-    T=   1 recurrent/chunked                        median 0.082  (min 0.039, max 0.135)
-    T=   1 simd L8/recurrent                        median 0.763  (min 0.485, max 1.075)
-    T=   1 simd L8 pre vec/recurrent                median 0.971  (min 0.598, max 1.120)
-    T=   1 simd L8 pre vec/chunked                  median 0.081  (min 0.025, max 0.087)
-    T= 200 noise recurrent/recurrent_again          median 0.985  (min 0.640, max 1.065)
-    T= 200 recurrent/chunked                        median 1.216  (min 0.901, max 1.262)
-    T= 200 simd L8/recurrent                        median 0.780  (min 0.736, max 0.864)
-    T= 200 simd L8 pre vec/recurrent                median 0.512  (min 0.481, max 0.540)
-    T= 200 simd L8 pre vec/chunked                  median 0.618  (min 0.461, max 0.662)
-    T=1024 noise recurrent/recurrent_again          median 0.990  (min 0.513, max 1.379)
-    T=1024 recurrent/chunked                        median 1.727  (min 0.965, max 2.147)
-    T=1024 simd L8/recurrent                        median 0.781  (min 0.581, max 0.942)
-    T=1024 simd L8 pre vec/recurrent                median 0.445  (min 0.353, max 0.540)
-    T=1024 simd L8 pre vec/chunked                  median 0.768  (min 0.414, max 1.013)
-    T=8192 noise recurrent/recurrent_again          median 0.998  (min 0.890, max 1.135)
-    T=8192 recurrent/chunked                        median 1.927  (min 1.588, max 2.140)
-    T=8192 simd L8/recurrent                        median 0.822  (min 0.713, max 0.974)
-    T=8192 simd L8 pre vec/recurrent                median 0.449  (min 0.394, max 0.585)
-    T=8192 simd L8 pre vec/chunked                  median 0.866  (min 0.742, max 1.090)
+  Sync-vs-async at T = 200 (inversion worth noting): sync (run 1) has gdn_recurrent 0.434 ms < chunked 0.517 ms; async (run 6)
+  has gdn_recurrent 0.304 > chunked 0.247. Chunked's second dispatch costs about 0.1 ms of host time when every launch
+  waits; that is a statement about dispatch, not kernels. The async protocol is the one that measures kernels.
+
+## MLX-LM'S OWN KERNEL (bench/qwen35_gdn_mlx_kernel_probe.py, mlx 0.31.2, mlx-lm 0.31.3, mlx_lm.models.gated_delta.gated_delta_kernel,
+## bf16 and f32 inputs, same shape, kernel only, 15 rounds). NOT interleaved with the tessl arms: no ratio is claimed.
+  run 2 (21:11, GPU 95% before the probe):
+     t=1 dtype=bfloat16 min_ms=0.0282 median_ms=0.0378 max_ms=0.0839 rounds=15 launches_per_sample=33
+     t=1 dtype=float32 min_ms=0.0244 median_ms=0.0265 max_ms=0.0282 rounds=15 launches_per_sample=92
+     t=200 dtype=bfloat16 min_ms=0.2181 median_ms=0.2266 max_ms=0.2406 rounds=15 launches_per_sample=13
+     t=200 dtype=float32 min_ms=0.2069 median_ms=0.2100 max_ms=0.2483 rounds=15 launches_per_sample=44
+     t=1024 dtype=bfloat16 min_ms=0.9907 median_ms=1.0517 max_ms=1.2563 rounds=15 launches_per_sample=14
+     t=1024 dtype=float32 min_ms=1.1038 median_ms=1.1725 max_ms=1.5690 rounds=15 launches_per_sample=12
+     t=8192 dtype=bfloat16 min_ms=9.4711 median_ms=11.0627 max_ms=11.7229 rounds=15 launches_per_sample=2
+     t=8192 dtype=float32 min_ms=15.0936 median_ms=17.9328 max_ms=21.8826 rounds=15 launches_per_sample=2
+  run 3 (22:29, GPU 19% before the probe):
+     t=1 dtype=bfloat16 min_ms=0.0234 median_ms=0.0259 max_ms=0.0293 rounds=15 launches_per_sample=73
+     t=1 dtype=float32 min_ms=0.0225 median_ms=0.0236 max_ms=0.0367 rounds=15 launches_per_sample=88
+     t=200 dtype=bfloat16 min_ms=0.2108 median_ms=0.2162 max_ms=0.2432 rounds=15 launches_per_sample=17
+     t=200 dtype=float32 min_ms=0.2145 median_ms=0.2191 max_ms=0.2242 rounds=15 launches_per_sample=16
+     t=1024 dtype=bfloat16 min_ms=0.9676 median_ms=0.9758 max_ms=0.9988 rounds=15 launches_per_sample=15
+     t=1024 dtype=float32 min_ms=1.0546 median_ms=1.0699 max_ms=1.3404 rounds=15 launches_per_sample=6
+     t=8192 dtype=bfloat16 min_ms=8.2071 median_ms=8.3722 max_ms=9.4246 rounds=15 launches_per_sample=2
+     t=8192 dtype=float32 min_ms=10.7627 median_ms=15.2585 max_ms=22.7112 rounds=15 launches_per_sample=2
+  run 4 (23:35, GPU 99% before the probe, the A/B had just run):
+     t=1 dtype=bfloat16 min_ms=0.0272 median_ms=0.0369 max_ms=0.1439 rounds=15 launches_per_sample=32
+     t=1 dtype=float32 min_ms=0.0245 median_ms=0.0268 max_ms=0.0340 rounds=15 launches_per_sample=76
+     t=200 dtype=bfloat16 min_ms=0.2090 median_ms=0.2128 max_ms=0.2391 rounds=15 launches_per_sample=17
+     t=200 dtype=float32 min_ms=0.2051 median_ms=0.2062 max_ms=0.2093 rounds=15 launches_per_sample=46
+     t=1024 dtype=bfloat16 min_ms=0.9730 median_ms=0.9820 max_ms=1.0184 rounds=15 launches_per_sample=16
+     t=1024 dtype=float32 min_ms=1.0102 median_ms=1.1089 max_ms=1.1488 rounds=15 launches_per_sample=14
+     t=8192 dtype=bfloat16 min_ms=9.0777 median_ms=10.0290 max_ms=10.6559 rounds=15 launches_per_sample=2
+     t=8192 dtype=float32 min_ms=12.4062 median_ms=16.0155 max_ms=18.4590 rounds=15 launches_per_sample=2
+  DISCREPANCY, UNRESOLVED: bench/results/qwen35_prefill_stage_profile_m5pro.txt records mlx's recurrence kernel at 3.97 ms
+  (T = 8192, one GDN layer, mlx-lm "0.32", idle GPU). This probe measured 8.2-9.5 ms (bf16) and 10.8-15.1 ms (f32) at the
+  same T, min over rounds, and the lowest value came with a GPU at 19% beforehand. The versions differ (0.31.x here), the
+  inputs differ (random vs real), and the GPU was not idle at the probe's start in any run. I cannot reconcile these from
+  here and do not pick one. What follows from it: the "3.6x tessl's recurrent vs mlx's recurrence" premise (14.48 vs 3.97)
+  is not reproduced on this machine today; here mlx's kernel is the same order as gdn_recurrent (15.5) and as chunked
+  (7.7-8.0), and Prepped8 (6.6-6.7 ms, f32) is below the lowest mlx figure measured here (8.2, bf16 inputs).
+
+## CORRECTNESS (all verified from logs)
+  GPU: tests/qwen35_kernels.rs, the whole file, frozen binary, single thread, under the lock: 53 passed, 0 failed
+  (target-gp/logs/w32_correct_kernels_final_correct.log, hold 2026-10-28T05:39:56Z, "qwen35_kernels exit: 0"). New tests:
+    gdn_recurrent_simd_matches_f64_across_shapes_and_lengths  - 2B shape (16/16/128) T in {0,1,2,31,32,33,200,1024}, state zero
+        and per-batch; grouped heads (hk 2, hv 6, dv 32) b = 3 with zero/per-batch/snapshot state; dv = 96 b = 2; 1024 steps.
+        Both kernels vs an f64 reference (tests/common/qwen35.rs gdn_f64); every simd kernel's max abs error vs f64 within 1e-4
+        of the output scale (measured ~1e-8 abs on |y|max 3e-2, i.e. ~3e-7) AND within 4x gdn_recurrent's error + 64 ulp
+        of scale (bound stated in the test's doc comment before the first run; the two sum in different orders, so not bitwise).
+        Asserts the simd output is not bit-identical to gdn_recurrent's.
+    gdn_recurrent_simd_gain_extremes - decay ~1 (A_log -9, 1024 steps), decay 0, q/k scaled 1e-3 and 1e3, v scaled 1e4.
+    gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons - NaN in v/q/k/a/b, +-inf in a/v, q,k of 1e30: the set of non-finite
+        elements of y and of the state is identical to gdn_recurrent's, for every simd kernel (policy: no clamp, no check).
+    gdn_recurrent_simd_runs_its_own_pipeline - child process under TESSL_KERNEL_TRACE: each variant requests exactly its own
+        pipeline (and the prep pass only for Prepped8) and never the old kernel's.
+    the_simd_bound_can_fail - a 2e-3 relative error in one element, and a dropped start state, are rejected by the bound.
+    the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned - ld/q_off/k_off not multiples of 4: Err, nothing written.
+  Existing GDN tests extended to the simd kernels: transformers golden, decode shapes, strong decay, varlen (each ragged row
+  equals the row alone, bit for bit, for every variant), state_out discarded/in place, T = 0 state pass-through, kernel-in-metallib.
+  Emulator (CPU, real threads, three threadgroup orders, vs transformers modeling_qwen3_5 and an f64 reference):
+    ~/.venvs/ml/bin/python tools/msl_emu/check_qwen35.py -k simd,host_contract -> "all checks passed" (3 kernels + prep; host
+    slot/constant contract included).
+  Other gates (this tree): docs_name_real_tools 7 passed (metallib entry points 317, nn pub fns unchanged); kernel_fast_math 15
+  passed; dialect_lint_script 12 passed; cargo clippy --release --lib --test qwen35_kernels --test qwen35_gdn_simd_ab -- -D warnings
+  with TESSL_METAL_WERROR=1: clean.
+  KNOWN HISTORY: commit 465f113 has tests/qwen35_gdn_simd_ab.rs at 0 bytes (a truncating open in my edit script); commit 2dc051c
+  restores it. No rebase was allowed.
+
+## WIRING (not done; what it would take)
+  Layout (verified): the model reads the conv output dense: GdnProjLayout::conv_qkv gives ld = conv_dim (6144 at 2B), q_off 0,
+  k_off key_dim (2048), v_off 4096 (src/qwen35.rs, fn conv_qkv; call sites src/qwen35_model.rs:1700 gdn_chunk_forward, :1729
+  gdn_recurrent). All multiples of 4, so the float4 kernels' host check passes on the real layout. Buffer base alignment: the
+  gdn host functions take whole GpuBuffers (no byte offset); the runtime's bump sub-allocator aligns its cursor to 16
+  (src/runtime.rs:1923); that a bump buffer is bound at its own base offset was not checked (unverified).
+  Prefill: replace gdn_chunk_forward's call with gdn_recurrent_simd_with(.., None, GdnSimdVariant::Prepped8, Some(&scalars)),
+  with a GdnSimdScalars (16 B per token per value head: 2.1 MB at T = 8192) allocated beside the GdnWorkspace; the chunked
+  workspace (GdnWorkspace::bytes_for: about 200 MB at T = 8192 by its formula, not measured) would no longer be needed on that
+  path. Both entry points take the same state/out/state_out arguments (in place included). Decode: gdn_recurrent ->
+  Fused8 only if the batch-1 result above survives a proper decode measurement. Needed first: the model-level logit gate,
+  the owner's call; the kernels differ from gdn_recurrent at ~2e-7 of output scale, from chunked's output by about as much
+  as chunked differs from gdn_recurrent (1e-6..2e-6), so a gate comparing against chunked sees a different small shift.
+
+## NOT DONE / GAPS
+  - DevMap: no index (.devcouncil/codeintel absent in the tessl tree); navigation was ripgrep. GitPulse Insights: not loadable in
+    this session (ToolSearch found no gitpulse tool), so no collision check was run; the lane used its own worktree.
+  - No interleaved cross-runtime A/B against mlx; no GPU counter data (xctrace is limited on this machine); the explanation of why
+    L8 + float4 wins is inferred. Decode at batch > 1 and T between 2 and 31 unmeasured. bf16 operands not measured (the model's
+    GDN path is f32 here, as the kernels are).
+  - Runs 1-4 had a busy GPU (see each header). The final run's GPU readings are given above, not rounded.
+  - qwen35_gdn_recurrent_simd_pre_l8_vec reads q and k as float4s; a caller whose conv output is not 4-aligned gets an Err, not a
+    fallback.

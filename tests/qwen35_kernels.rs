@@ -1221,7 +1221,7 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
                     }
                 }
             }
-            println!("GDN_SIMD_NONFINITE {name}: {bad} non-finite elements in gdn_recurrent and in all four simd kernels, patterns equal");
+            println!("GDN_SIMD_NONFINITE {name}: {bad} non-finite elements in gdn_recurrent and in every simd kernel, patterns equal");
         }
     });
 }

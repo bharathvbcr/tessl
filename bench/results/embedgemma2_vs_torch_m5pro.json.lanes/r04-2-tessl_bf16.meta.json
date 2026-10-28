@@ -1,0 +1,21 @@
+{
+  "round": 4,
+  "lane": "tessl_bf16",
+  "argv": [
+    "target/release/bench_embedgemma2"
+  ],
+  "started_at_utc": "2026-10-19T10:10:35Z",
+  "finished_at_utc": "2026-10-19T10:10:54Z",
+  "load_at_start": {
+    "loadavg_1m": 7.85693359375,
+    "loadavg_5m": 9.90380859375,
+    "loadavg_15m": 13.625,
+    "cpu_count_normalizer": 18,
+    "normalized_loadavg_1m": 0.4364963107638889,
+    "normalized_loadavg_5m": 0.5502115885416666,
+    "normalized_loadavg_15m": 0.7569444444444444
+  },
+  "exit_code": 0,
+  "signal": null,
+  "error": null
+}

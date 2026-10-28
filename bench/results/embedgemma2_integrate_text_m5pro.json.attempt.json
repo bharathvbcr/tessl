@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "attempt_id": "cb35-18dfc69ce552e298",
+  "status": "published",
+  "started_at_utc": "2026-10-19T00:25:53Z",
+  "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 6 --evidence --max-spread 1.25 --clean-env --out bench/results/embedgemma2_integrate_text_m5pro.json before_async:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_ASYNC=1=target/wt_base/target/release/bench_embedgemma2 control:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_ASYNC=1=target/wt_base/target/release/bench_embedgemma2_control after_f32:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2 after_bf16:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2",
+  "invocation_argv": [
+    "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+    "--rounds",
+    "6",
+    "--evidence",
+    "--max-spread",
+    "1.25",
+    "--clean-env",
+    "--out",
+    "bench/results/embedgemma2_integrate_text_m5pro.json",
+    "before_async:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_ASYNC=1=target/wt_base/target/release/bench_embedgemma2",
+    "control:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_ASYNC=1=target/wt_base/target/release/bench_embedgemma2_control",
+    "after_f32:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2",
+    "after_bf16:BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2"
+  ],
+  "output_path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_integrate_text_m5pro.json",
+  "prior_output": null,
+  "interpretation": "Unless status is published, output_path does not represent this attempt.",
+  "finished_at_utc": "2026-10-19T00:47:45Z",
+  "published_output": {
+    "path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_integrate_text_m5pro.json",
+    "size_bytes": 75366,
+    "mtime_ns": 1792370865925371045,
+    "sha256": "9147108e90605745858a49de6ebaeb9ed470255e0d7bb6878d6f2e480cb57dcb"
+  }
+}

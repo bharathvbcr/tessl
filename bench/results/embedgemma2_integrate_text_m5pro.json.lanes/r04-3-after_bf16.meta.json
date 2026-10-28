@@ -1,0 +1,21 @@
+{
+  "round": 4,
+  "lane": "after_bf16",
+  "argv": [
+    "target/release/bench_embedgemma2"
+  ],
+  "started_at_utc": "2026-10-19T00:36:49Z",
+  "finished_at_utc": "2026-10-19T00:37:10Z",
+  "load_at_start": {
+    "loadavg_1m": 4.82373046875,
+    "loadavg_5m": 5.37109375,
+    "loadavg_15m": 8.6103515625,
+    "cpu_count_normalizer": 18,
+    "normalized_loadavg_1m": 0.2679850260416667,
+    "normalized_loadavg_5m": 0.2983940972222222,
+    "normalized_loadavg_15m": 0.4783528645833333
+  },
+  "exit_code": 0,
+  "signal": null,
+  "error": null
+}

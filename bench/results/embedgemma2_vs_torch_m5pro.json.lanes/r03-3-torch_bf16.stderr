@@ -1,0 +1,7 @@
+Loading weights:   0%|          | 0/1376 [00:00<?, ?it/s]Loading weights:  85%|████████▍ | 1166/1376 [00:00<00:00, 11638.67it/s]Loading weights: 100%|██████████| 1376/1376 [00:00<00:00, 11505.79it/s]
+1x16: MPS driver holds 1.4 GiB
+64x32: MPS driver holds 1.4 GiB
+32x256: MPS driver holds 1.4 GiB
+8x1024: MPS driver holds 1.5 GiB
+2x4096: MPS driver holds 1.6 GiB
+128x8-512: MPS driver holds 1.9 GiB

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "attempt_id": "c1bb-18dfe5bf6edac0f8",
+  "status": "published",
+  "started_at_utc": "2026-10-19T09:56:27Z",
+  "invocation_shell": "'$HOME/Code/research/tessl-eg2/target/release/bench_paired' --rounds 4 --evidence --max-spread 1.25 --clean-env --label 'EmbeddingGemma 2 text encode on Apple M5 Pro: tessl d8f9cc3 against sentence-transformers 6.1.0 on torch 2.14.1 MPS; the two workloads torch cannot fit in 32 GiB left out' --out bench/results/embedgemma2_vs_torch_m5pro.json 'tessl_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2' 'torch_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype f32' 'tessl_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2' 'torch_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype bf16'",
+  "invocation_argv": [
+    "$HOME/Code/research/tessl-eg2/target/release/bench_paired",
+    "--rounds",
+    "4",
+    "--evidence",
+    "--max-spread",
+    "1.25",
+    "--clean-env",
+    "--label",
+    "EmbeddingGemma 2 text encode on Apple M5 Pro: tessl d8f9cc3 against sentence-transformers 6.1.0 on torch 2.14.1 MPS; the two workloads torch cannot fit in 32 GiB left out",
+    "--out",
+    "bench/results/embedgemma2_vs_torch_m5pro.json",
+    "tessl_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=f32=target/release/bench_embedgemma2",
+    "torch_f32:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype f32",
+    "tessl_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3,BENCH_PRECISION=bf16=target/release/bench_embedgemma2",
+    "torch_bf16:BENCH_WORKLOADS=\"1x16,64x32,32x256,8x1024,2x4096,128x8-512\",BENCH_ITERS=10,BENCH_WARMUP=3=$HOME/.venvs/ml-2026-10/bin/python bench/embedgemma2_torch.py --dtype bf16"
+  ],
+  "output_path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_vs_torch_m5pro.json",
+  "prior_output": null,
+  "interpretation": "Unless status is published, output_path does not represent this attempt.",
+  "finished_at_utc": "2026-10-19T10:13:38Z",
+  "published_output": {
+    "path": "$HOME/Code/research/tessl-eg2/bench/results/embedgemma2_vs_torch_m5pro.json",
+    "size_bytes": 54532,
+    "mtime_ns": 1792404818115179380,
+    "sha256": "74b01bd55765ac672617234cb6d24df74bba5f2cbf76cfa7a40c51b342451fd0"
+  }
+}

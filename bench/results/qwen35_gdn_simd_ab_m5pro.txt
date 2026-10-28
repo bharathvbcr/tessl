@@ -510,6 +510,12 @@ load average 6.95 (flat start to end). chunked 7.74 ms and gdn_recurrent 15.44 m
   Other gates (this tree): docs_name_real_tools 7 passed (metallib entry points 317, nn pub fns unchanged); kernel_fast_math 15
   passed; dialect_lint_script 12 passed; cargo clippy --release --lib --test qwen35_kernels --test qwen35_gdn_simd_ab -- -D warnings
   with TESSL_METAL_WERROR=1: clean.
+  More gates run on the final tree (cargo test --release, each binary, all passed): kernel_coverage 55, hosted_selection 6 (+1
+  ignored), fixture_manifests 8, ci_workflow_gates 6, build_artifact_contract 2, embedded_metallib 1, promoted_kernels 5,
+  public_api_errors 11; `cargo test --release -j 2 --no-run` for the whole crate exits 0 (no other target lost compile).
+  DISCLOSURE: embedded_metallib, promoted_kernels and public_api_errors create a GpuRuntime (pipeline lookups, no kernel
+  dispatch, ~0.1-0.2 s each) and were run by me OUTSIDE the machine lock, in one cargo invocation at ~03:01 CDT. Nothing was timed then.
+  Emulator after the last harness change: check_qwen35.py -k recurrent,simd,host_contract -> "all checks passed".
   KNOWN HISTORY: commit 465f113 has tests/qwen35_gdn_simd_ab.rs at 0 bytes (a truncating open in my edit script); commit 2dc051c
   restores it. No rebase was allowed.
 

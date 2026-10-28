@@ -47,6 +47,7 @@ that fusion for Metal.
 | 3. Causal conv + SiLU | `qwen35_conv1d_silu` | `conv1d_silu` | `causal_conv1d_fn` / `causal_conv1d_update` |
 | 4. Gated RMSNorm | `qwen35_gated_rms_norm_{f32,bf16}` | `gated_rms_norm` | `Qwen3_5RMSNormGated` |
 | 5. Read-only GDN decode | `qwen35_gdn_recurrent`, `qwen35_gdn_recurrent_bv16` | `gdn_recurrent`, `gdn_recurrent_with_slice` | `torch_recurrent_gated_delta_rule` |
+| 5b. GDN recurrence, one simdgroup per value column (mlx-lm's decomposition; not called by `Qwen35Model`) | `qwen35_gdn_recurrent_simd` | `gdn_recurrent_simd`, `gdn_recurrent_simd_varlen` | `torch_recurrent_gated_delta_rule` |
 | 6. Attention extras | `qwen35_attn_qk_norm_rope`, `qwen35_attn_gate_{f32,bf16}` | `attn_qk_norm_rope`, `attn_output_gate` | `q_norm`/`k_norm` (`1 + w`), `apply_rotary_pos_emb` (partial), `* sigmoid(gate)` |
 | 6b. Decode loops replayed from an ICB | `qwen35_attn_qk_norm_rope_posbuf` | `attn_qk_norm_rope_posbuf` | the position comes from a device buffer, like `rms_qkv_rope_posbuf` |
 | 6c. Shared-prefix attention | `qwen35_attn_prefix_rows`, `qwen35_attn_prefix_decode_{partial,reduce}` (+ `slot_base` in 6/6b) | `attn_prefix_rows`, `attn_prefix_decode`, `attn_qk_norm_rope_suffix{,_posbuf}` | attention over a per-row copy of a shared KV prefix, without the copy |

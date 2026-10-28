@@ -2582,6 +2582,7 @@ fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
                 StateIn::Zero,
                 Cols::dense(&out, width as u32),
                 None,
+                None,
                 v,
                 Some(&scalars),
             );

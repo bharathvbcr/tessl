@@ -917,7 +917,7 @@ fn other_simd_variants() -> impl Iterator<Item = GdnSimdVariant> {
 /// `_l16`/`_l8`, `_vec`, `_pf` for what it turns on.
 fn simd_entry_name(v: GdnSimdVariant) -> String {
     format!(
-        "qwen35_gdn_recurrent_simd{}{}{}{}",
+        "qwen35_gdn_recurrent_simd{}{}{}{}{}",
         if v.prepped { "_pre" } else { "" },
         if v.lanes == 32 {
             String::new()
@@ -926,6 +926,7 @@ fn simd_entry_name(v: GdnSimdVariant) -> String {
         },
         if v.vec { "_vec" } else { "" },
         if v.prefetch { "_pf" } else { "" },
+        if v.reassoc { "_rr" } else { "" },
     )
 }
 

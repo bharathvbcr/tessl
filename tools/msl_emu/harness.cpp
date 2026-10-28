@@ -191,12 +191,14 @@ int main(int argc, char **argv) {
             const bool pre = kname.find("_pre") != std::string::npos;
             const bool vec = kname.find("_vec") != std::string::npos;
             const bool pf = kname.find("_pf") != std::string::npos;
+            const bool rr = kname.find("_rr") != std::string::npos;
             const uint lanes = kname.find("_l16") != std::string::npos ? 16u
-                               : kname.find("_l8") != std::string::npos ? 8u : 32u;
+                               : kname.find("_l8") != std::string::npos ? 8u
+                               : kname.find("_l4") != std::string::npos ? 4u : 32u;
             const uint sgs = GDN_SIMD_COLS;
             const uint cols = sgs * (32u / lanes);
             const uint rows = B * T;
-            std::vector<float4> sc(size_t(rows) * Hv + 1);
+            std::vector<float4> sc(2 * size_t(rows) * Hv + 2);
             if (pre && rows > 0) {
                 launch(uint3(cdiv(rows * Hv, GDN_SIMD_PREP_SG), 1, 1), uint3(32u * GDN_SIMD_PREP_SG, 1, 1), 0,
                        [&](const Ids &id, float *) {
@@ -210,14 +212,15 @@ int main(int argc, char **argv) {
                                   const float4 *, uint3, uint, uint);
             // The instantiations the kernel source makes, by (lanes, pre, vec, pf).
             Body run = nullptr;
-#define SIMD_CASE(L, P, V, F) \
-            if (lanes == L && pre == P && vec == V && pf == F) run = gdn_simd_body<L, GDN_SIMD_COLS, P, V, F>;
-            SIMD_CASE(32u, false, false, false) SIMD_CASE(32u, true, false, false)
-            SIMD_CASE(16u, false, false, false) SIMD_CASE(8u, false, false, false)
-            SIMD_CASE(16u, true, false, false) SIMD_CASE(8u, true, false, false)
-            SIMD_CASE(8u, true, true, false) SIMD_CASE(8u, true, false, true)
-            SIMD_CASE(8u, true, true, true) SIMD_CASE(8u, false, true, true)
-            SIMD_CASE(32u, true, true, true) SIMD_CASE(16u, true, true, true)
+#define SIMD_CASE(L, P, V, F, R) \
+            if (lanes == L && pre == P && vec == V && pf == F && rr == R) \
+                run = gdn_simd_body<L, GDN_SIMD_COLS, P, V, F, R>;
+            SIMD_CASE(32u, false, false, false, false) SIMD_CASE(32u, true, false, false, false)
+            SIMD_CASE(8u, true, false, false, false) SIMD_CASE(8u, false, true, false, false)
+            SIMD_CASE(8u, true, true, false, false) SIMD_CASE(8u, true, true, true, false)
+            SIMD_CASE(16u, true, true, false, false) SIMD_CASE(32u, true, true, false, false)
+            SIMD_CASE(8u, true, true, false, true) SIMD_CASE(16u, true, true, false, true)
+            SIMD_CASE(32u, true, true, false, true) SIMD_CASE(4u, true, true, false, true)
 #undef SIMD_CASE
             if (run == nullptr) {
                 std::fprintf(stderr, "harness: no simd instantiation for %s\n", kname.c_str());

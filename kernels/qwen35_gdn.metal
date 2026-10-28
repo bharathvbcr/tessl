@@ -991,9 +991,8 @@ inline void gdn_simd_load_rows(device const float *p, thread float *out)
 /// depend on the state: `{decay, beta, rq, rk}`, with `rq`/`rk` the q and k
 /// l2norm scales (q's folding in `Dk^-0.5`) of the head's key head. Computed
 /// exactly as `qwen35_gdn_recurrent` computes them in its loop, from a lane's
-/// rows `q`, `k` and the raw gate logits `a`, `b`; `*qk_raw` receives the dot of
-/// the raw (un-normalised) q and k, for the reassociated recurrence. Every lane
-/// of a `LANES`-lane column group returns the same values.
+/// rows `q`, `k` and the raw gate logits `a`, `b`. Every lane of a `LANES`-lane
+/// column group returns the same values.
 template <uint LANES>
 inline float4 gdn_simd_scalars(
     thread const float *q,
@@ -1001,23 +1000,32 @@ inline float4 gdn_simd_scalars(
     float a,
     float b,
     float a_log,
-    float dt_bias,
-    thread float *qk_raw)
+    float dt_bias)
 {
     float ssq = 0.0f;
     float ssk = 0.0f;
-    float sqk = 0.0f;
     for (uint i = 0u; i < GDN_DK / LANES; ++i) {
         ssq += q[i] * q[i];
         ssk += k[i] * k[i];
-        sqk += q[i] * k[i];
     }
     const float rq = rsqrt(gdn_simd_group_sum<LANES>(ssq) + GDN_L2_EPS) * rsqrt((float)GDN_DK);
     const float rk = rsqrt(gdn_simd_group_sum<LANES>(ssk) + GDN_L2_EPS);
-    *qk_raw = gdn_simd_group_sum<LANES>(sqk);
     const float decay = exp(qwen35_log_decay(a, a_log, dt_bias));
     const float beta = tessl_sigmoid(b);
     return float4(decay, beta, rq, rk);
+}
+
+/// `q_n . k_n`: the dot of the normalised, scaled q and k, from a `gdn_simd_scalars`
+/// result `c`. Summed from the normalised elements (not as `rq rk (q . k)`), so
+/// a norm that overflowed to a zero scale gives 0 rather than 0 times infinity.
+template <uint LANES>
+inline float gdn_simd_qk_normed(thread const float *q, thread const float *k, float4 c)
+{
+    float acc = 0.0f;
+    for (uint i = 0u; i < GDN_DK / LANES; ++i) {
+        acc += (q[i] * c.z) * (k[i] * c.w);
+    }
+    return gdn_simd_group_sum<LANES>(acc);
 }
 
 /// The scalars of `gdn_simd_scalars` for every (row, value head), once each,
@@ -1059,12 +1067,11 @@ kernel void qwen35_gdn_simd_prep(
     gdn_simd_load_rows<32u, false>(qkv + row * (ulong)ld_qkv + q_off + hk * GDN_DK + lane, q);
     gdn_simd_load_rows<32u, false>(qkv + row * (ulong)ld_qkv + k_off + hk * GDN_DK + lane, k);
     device const float *gr = ab + row * (ulong)ld_ab;
-    float qk_raw;
-    const float4 c = gdn_simd_scalars<32u>(q, k, gr[a_off + hv], gr[b_off + hv], a_log[hv], dt_bias[hv], &qk_raw);
+    const float4 c = gdn_simd_scalars<32u>(q, k, gr[a_off + hv], gr[b_off + hv], a_log[hv], dt_bias[hv]);
+    const float qk_n = gdn_simd_qk_normed<32u>(q, k, c);
     if (lane == 0u) {
         sc[2u * unit] = c;
-        // `rq * rk * (q . k)` of the raw vectors: q_n . k_n.
-        sc[2u * unit + 1u] = float4(c.z * c.w * qk_raw, 0.0f, 0.0f, 0.0f);
+        sc[2u * unit + 1u] = float4(qk_n, 0.0f, 0.0f, 0.0f);
     }
 }
 
@@ -1237,8 +1244,7 @@ inline void gdn_simd_body(
             }
         }
 
-        float qk_raw_unused;
-        const float4 c = PRE ? cc : gdn_simd_scalars<LANES>(qc, kc, ac, bc, al, dtb, &qk_raw_unused);
+        const float4 c = PRE ? cc : gdn_simd_scalars<LANES>(qc, kc, ac, bc, al, dtb);
         const float decay = c.x;
         const float beta = c.y;
         const float rq = c.z;

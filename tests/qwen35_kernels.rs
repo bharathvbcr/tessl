@@ -231,19 +231,32 @@ struct Packed {
     a_log: GpuBuffer,
     dt_bias: GpuBuffer,
     key_w: u32,
+    /// Column of q's first element: 1 (so no window starts on a 4-float boundary),
+    /// or 0 for the layout the `float4` kernels take.
+    lead: usize,
 }
 
 impl Packed {
     fn new(rt: &Arc<GpuRuntime>, d: &GdnData) -> Self {
+        Self::with_lead(rt, d, 1)
+    }
+
+    /// q at column 0 and a row stride that is a multiple of 4: what the
+    /// `float4`-loading kernels accept.
+    fn aligned(rt: &Arc<GpuRuntime>, d: &GdnData) -> Self {
+        Self::with_lead(rt, d, 0)
+    }
+
+    fn with_lead(rt: &Arc<GpuRuntime>, d: &GdnData, lead: usize) -> Self {
         let GdnShape { b, t, hk, hv, dv } = d.s;
         let key_w = hk * DK;
-        let ld = 1 + 2 * key_w + hv * dv + 4;
+        let ld = lead + 2 * key_w + hv * dv + if lead == 0 { 0 } else { 4 };
         let mut qkv = vec![SENTINEL; b * t * ld];
         for r in 0..b * t {
             let row = &mut qkv[r * ld..(r + 1) * ld];
-            row[1..1 + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
-            row[1 + key_w..1 + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
-            row[1 + 2 * key_w..1 + 2 * key_w + hv * dv].copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
+            row[lead..lead + key_w].copy_from_slice(&d.q[r * key_w..(r + 1) * key_w]);
+            row[lead + key_w..lead + 2 * key_w].copy_from_slice(&d.k[r * key_w..(r + 1) * key_w]);
+            row[lead + 2 * key_w..lead + 2 * key_w + hv * dv].copy_from_slice(&d.v[r * hv * dv..(r + 1) * hv * dv]);
         }
         let g_ld = 1 + 2 * hv + 2;
         let mut gates = vec![SENTINEL; b * t * g_ld];
@@ -260,6 +273,7 @@ impl Packed {
             a_log: buf(rt, &d.a_log),
             dt_bias: buf(rt, &d.dt_bias),
             key_w: key_w as u32,
+            lead,
         }
     }
 
@@ -267,9 +281,9 @@ impl Packed {
         GdnQkv {
             buf: &self.qkv,
             ld: self.ld,
-            q_off: 1,
-            k_off: 1 + self.key_w,
-            v_off: 1 + 2 * self.key_w,
+            q_off: self.lead as u32,
+            k_off: self.lead as u32 + self.key_w,
+            v_off: self.lead as u32 + 2 * self.key_w,
         }
     }
 
@@ -368,7 +382,10 @@ fn run_gdn_slice(
 ) -> (Vec<f32>, Vec<f32>) {
     let s = d.s;
     let dims = dims_of(s);
-    let p = Packed::new(rt, d);
+    let p = match path {
+        Path::SimdVariant(v) if v.vec => Packed::aligned(rt, d),
+        _ => Packed::new(rt, d),
+    };
     let width = s.hv * s.dv;
     let (out_ld, out_off) = (width + 3, 2usize);
     let out = seeded(rt, s.b * s.t * out_ld, SENTINEL);
@@ -892,15 +909,25 @@ fn max_abs_err(got: &[f32], want: &[f64]) -> f64 {
 }
 
 /// The kernels of the simd family other than `qwen35_gdn_recurrent_simd` itself.
-const OTHER_SIMD_VARIANTS: [GdnSimdVariant; 7] = [
-    GdnSimdVariant::FusedSg8,
-    GdnSimdVariant::Prepped,
-    GdnSimdVariant::PreppedSg8,
-    GdnSimdVariant::FusedL16,
-    GdnSimdVariant::FusedL8,
-    GdnSimdVariant::PreppedL16,
-    GdnSimdVariant::PreppedL8,
-];
+fn other_simd_variants() -> impl Iterator<Item = GdnSimdVariant> {
+    GdnSimdVariant::ALL.into_iter().filter(|v| *v != GdnSimdVariant::FUSED)
+}
+
+/// The entry point a variant names: `qwen35_gdn_recurrent_simd` plus `_pre`,
+/// `_l16`/`_l8`, `_vec`, `_pf` for what it turns on.
+fn simd_entry_name(v: GdnSimdVariant) -> String {
+    format!(
+        "qwen35_gdn_recurrent_simd{}{}{}{}",
+        if v.prepped { "_pre" } else { "" },
+        if v.lanes == 32 {
+            String::new()
+        } else {
+            format!("_l{}", v.lanes)
+        },
+        if v.vec { "_vec" } else { "" },
+        if v.prefetch { "_pf" } else { "" },
+    )
+}
 
 /// `qwen35_gdn_recurrent_simd` and `qwen35_gdn_recurrent` on one problem, each
 /// held to the f64 reference, and to each other.
@@ -959,7 +986,7 @@ fn check_simd_vs_recurrent(
     // The other kernels of the family run the same arithmetic (the prepped
     // ones with the scalars computed in a pass of their own, the sg8 ones in
     // wider threadgroups): each is held to the same two conditions.
-    for v in OTHER_SIMD_VARIANTS {
+    for v in other_simd_variants() {
         let (vy, vs) = run_gdn(rt, d, Path::SimdVariant(v));
         assert_close(&format!("{label} {v:?} y"), &vy, &want_y, by);
         assert_close(&format!("{label} {v:?} state"), &vs, &want_s, bs);
@@ -1163,7 +1190,7 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
                 *must_poison,
                 "{name}: gdn_recurrent produced {bad} non-finite elements"
             );
-            for path in std::iter::once(Path::RecurrentSimd).chain(OTHER_SIMD_VARIANTS.map(Path::SimdVariant)) {
+            for path in std::iter::once(Path::RecurrentSimd).chain(other_simd_variants().map(Path::SimdVariant)) {
                 let (sy, ss) = run_gdn(rt, &d, path);
                 assert_eq!(
                     my_bad,
@@ -1242,17 +1269,10 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
             );
             assert_eq!(count("qwen35_gdn_recurrent") - rec0, 1);
             // Each variant asks for its own pipeline (the prepped ones also the prep pass), and no other's.
-            for (v, name, prep) in [
-                (GdnSimdVariant::FusedSg8, "qwen35_gdn_recurrent_simd_sg8", 0),
-                (GdnSimdVariant::Prepped, "qwen35_gdn_recurrent_simd_pre", 1),
-                (GdnSimdVariant::PreppedSg8, "qwen35_gdn_recurrent_simd_pre_sg8", 1),
-                (GdnSimdVariant::FusedL16, "qwen35_gdn_recurrent_simd_l16", 0),
-                (GdnSimdVariant::FusedL8, "qwen35_gdn_recurrent_simd_l8", 0),
-                (GdnSimdVariant::PreppedL16, "qwen35_gdn_recurrent_simd_pre_l16", 1),
-                (GdnSimdVariant::PreppedL8, "qwen35_gdn_recurrent_simd_pre_l8", 1),
-            ] {
+            for v in other_simd_variants() {
+                let name = simd_entry_name(v);
                 let (n0, p0, s0) = (
-                    count(name),
+                    count(&name),
                     count("qwen35_gdn_simd_prep"),
                     count("qwen35_gdn_recurrent_simd"),
                 );
@@ -1264,8 +1284,12 @@ fn gdn_recurrent_simd_runs_its_own_pipeline() {
                     None,
                     GdnScanSlice::Cols32,
                 );
-                assert_eq!(count(name) - n0, 1, "{v:?}: its own pipeline");
-                assert_eq!(count("qwen35_gdn_simd_prep") - p0, prep, "{v:?}: prep passes");
+                assert_eq!(count(&name) - n0, 1, "{v:?}: its own pipeline {name}");
+                assert_eq!(
+                    count("qwen35_gdn_simd_prep") - p0,
+                    u64::from(v.prepped),
+                    "{v:?}: prep passes"
+                );
                 assert_eq!(
                     count("qwen35_gdn_recurrent_simd") - s0,
                     0,
@@ -2496,13 +2520,6 @@ fn every_qwen35_kernel_is_in_the_metallib() {
             "qwen35_gdn_recurrent",
             "qwen35_gdn_recurrent_bv16",
             "qwen35_gdn_recurrent_simd",
-            "qwen35_gdn_recurrent_simd_sg8",
-            "qwen35_gdn_recurrent_simd_pre",
-            "qwen35_gdn_recurrent_simd_pre_sg8",
-            "qwen35_gdn_recurrent_simd_l16",
-            "qwen35_gdn_recurrent_simd_l8",
-            "qwen35_gdn_recurrent_simd_pre_l16",
-            "qwen35_gdn_recurrent_simd_pre_l8",
             "qwen35_gdn_simd_prep",
             "qwen35_gated_rms_norm_f32",
             "qwen35_gated_rms_norm_bf16",
@@ -2522,6 +2539,77 @@ fn every_qwen35_kernel_is_in_the_metallib() {
         ] {
             rt.pipeline(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+        for v in GdnSimdVariant::ALL {
+            let name = simd_entry_name(v);
+            rt.pipeline(&name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    });
+}
+
+#[test]
+fn the_float4_simd_kernels_refuse_windows_that_are_not_16_byte_aligned() {
+    // The `vec` kernels load q and k as `float4`s. A window whose offset or
+    // stride is not a multiple of 4 floats would read the wrong columns or fault
+    // on a real GPU; the host says no instead, before any dispatch.
+    with_gpu(|rt| {
+        let s = GdnShape {
+            b: 1,
+            t: 3,
+            hk: 1,
+            hv: 1,
+            dv: 32,
+        };
+        let d = GdnData::random(s, "none", 9990);
+        let dims = dims_of(s);
+        let width = s.hv * s.dv;
+        let out = seeded(rt, s.t * width, SENTINEL);
+        let scalars = GdnSimdScalars::new(rt, &dims).unwrap();
+        for lead in [1usize, 0] {
+            let p = Packed::with_lead(rt, &d, lead);
+            for v in GdnSimdVariant::ALL {
+                let r = qwen35::gdn_recurrent_simd_with(
+                    rt,
+                    &dims,
+                    &p.qkv(),
+                    &p.gates(dims.v_heads),
+                    &p.params(),
+                    StateIn::Zero,
+                    Cols::dense(&out, width as u32),
+                    None,
+                    v,
+                    Some(&scalars),
+                );
+                let refused = v.vec && lead == 1;
+                assert_eq!(r.is_err(), refused, "{v:?} lead {lead}: {r:?}");
+                if let Err(e) = r {
+                    assert!(e.contains("multiples of 4"), "{e}");
+                }
+            }
+        }
+        // And a combination no kernel exists for is an error, not a silent other kernel.
+        let none = GdnSimdVariant {
+            lanes: 4,
+            ..GdnSimdVariant::FUSED
+        };
+        let p = Packed::new(rt, &d);
+        let r = qwen35::gdn_recurrent_simd_with(
+            rt,
+            &dims,
+            &p.qkv(),
+            &p.gates(dims.v_heads),
+            &p.params(),
+            StateIn::Zero,
+            Cols::dense(&out, width as u32),
+            None,
+            none,
+            None,
+        );
+        assert!(r.is_err_and(|e| e.contains("no kernel")), "lanes = 4 must be refused");
+        rt.synchronize().unwrap();
+        assert!(
+            out.read_f32().iter().all(|&x| x == SENTINEL),
+            "a refused call wrote its output"
+        );
     });
 }
 

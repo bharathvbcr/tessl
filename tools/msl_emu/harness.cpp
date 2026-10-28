@@ -189,10 +189,11 @@ int main(int argc, char **argv) {
             // One simdgroup a column, no threadgroup memory: `cols` columns a group.
             // The `_pre` kernels read what `qwen35_gdn_simd_prep` writes, as the host runs it first.
             const bool pre = kname.find("_pre") != std::string::npos;
-            const bool sg8 = kname.find("_sg8") != std::string::npos;
+            const bool vec = kname.find("_vec") != std::string::npos;
+            const bool pf = kname.find("_pf") != std::string::npos;
             const uint lanes = kname.find("_l16") != std::string::npos ? 16u
                                : kname.find("_l8") != std::string::npos ? 8u : 32u;
-            const uint sgs = sg8 ? 2u * GDN_SIMD_COLS : GDN_SIMD_COLS;
+            const uint sgs = GDN_SIMD_COLS;
             const uint cols = sgs * (32u / lanes);
             const uint rows = B * T;
             std::vector<float4> sc(size_t(rows) * Hv + 1);
@@ -203,16 +204,26 @@ int main(int argc, char **argv) {
                                          a_off, b_off, id.tg.x, id.sg, id.lane);
                 });
             }
+            using Body = void (*)(const float *, const float *, const float *, const float *, const float *,
+                                  float *, float *, /* T..flags: 15 uints */ uint, uint, uint, uint, uint, uint,
+                                  uint, uint, uint, uint, uint, uint, uint, uint, uint, const uint *,
+                                  const float4 *, uint3, uint, uint);
+            // The instantiations the kernel source makes, by (lanes, pre, vec, pf).
+            Body run = nullptr;
+#define SIMD_CASE(L, P, V, F) \
+            if (lanes == L && pre == P && vec == V && pf == F) run = gdn_simd_body<L, GDN_SIMD_COLS, P, V, F>;
+            SIMD_CASE(32u, false, false, false) SIMD_CASE(32u, true, false, false)
+            SIMD_CASE(16u, false, false, false) SIMD_CASE(8u, false, false, false)
+            SIMD_CASE(16u, true, false, false) SIMD_CASE(8u, true, false, false)
+            SIMD_CASE(8u, true, true, false) SIMD_CASE(8u, true, false, true)
+            SIMD_CASE(8u, true, true, true) SIMD_CASE(8u, false, true, true)
+            SIMD_CASE(32u, true, true, true) SIMD_CASE(16u, true, true, true)
+#undef SIMD_CASE
+            if (run == nullptr) {
+                std::fprintf(stderr, "harness: no simd instantiation for %s\n", kname.c_str());
+                return 2;
+            }
             launch(uint3(Dv / cols, Hv, B), uint3(32u * sgs, 1, 1), 0, [&](const Ids &id, float *) {
-                auto *run = gdn_simd_body<32u, GDN_SIMD_COLS, false>;
-                if (lanes == 32u && !sg8 && !pre) run = gdn_simd_body<32u, GDN_SIMD_COLS, false>;
-                else if (lanes == 32u && sg8 && !pre) run = gdn_simd_body<32u, 2u * GDN_SIMD_COLS, false>;
-                else if (lanes == 32u && !sg8) run = gdn_simd_body<32u, GDN_SIMD_COLS, true>;
-                else if (lanes == 32u) run = gdn_simd_body<32u, 2u * GDN_SIMD_COLS, true>;
-                else if (lanes == 16u && !pre) run = gdn_simd_body<16u, GDN_SIMD_COLS, false>;
-                else if (lanes == 16u) run = gdn_simd_body<16u, GDN_SIMD_COLS, true>;
-                else if (!pre) run = gdn_simd_body<8u, GDN_SIMD_COLS, false>;
-                else run = gdn_simd_body<8u, GDN_SIMD_COLS, true>;
                 run(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off, ld_ab, a_off,
                     b_off, ld_out, out_off, sb, flags, lens, sc.data(), id.tg, id.sg, id.lane);
             });

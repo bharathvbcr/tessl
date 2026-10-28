@@ -1425,10 +1425,9 @@ def case_host_contract():
 
 
 # The one-simdgroup-per-column recurrence: fused gates and norms, or from the prep pass; 4 or 8 columns a group.
-SIMD_KERNELS = ["qwen35_gdn_recurrent_simd", "qwen35_gdn_recurrent_simd_sg8",
-                "qwen35_gdn_recurrent_simd_pre", "qwen35_gdn_recurrent_simd_pre_sg8",
-                "qwen35_gdn_recurrent_simd_l16", "qwen35_gdn_recurrent_simd_l8",
-                "qwen35_gdn_recurrent_simd_pre_l16", "qwen35_gdn_recurrent_simd_pre_l8"]
+SIMD_KERNELS = ["qwen35_gdn_recurrent_simd" + sfx for sfx in
+                ("", "_pre", "_l16", "_l8", "_pre_l16", "_pre_l8", "_pre_l8_vec", "_pre_l8_pf",
+                 "_pre_l8_vec_pf", "_l8_vec_pf", "_pre_vec_pf", "_pre_l16_vec_pf")]
 
 CASES = [
     ("host_contract_parser", case_host_contract_parser),

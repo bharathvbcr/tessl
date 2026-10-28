@@ -109,23 +109,17 @@ enum Arm {
     RecurrentAgain,
 }
 
-const ARMS: [Arm; 11] = [
-    Arm::Chunked,
-    Arm::Recurrent,
-    Arm::Simd(GdnSimdVariant::Fused),
-    Arm::Simd(GdnSimdVariant::FusedSg8),
-    Arm::Simd(GdnSimdVariant::Prepped),
-    Arm::Simd(GdnSimdVariant::PreppedSg8),
-    Arm::Simd(GdnSimdVariant::FusedL16),
-    Arm::Simd(GdnSimdVariant::FusedL8),
-    Arm::Simd(GdnSimdVariant::PreppedL16),
-    Arm::Simd(GdnSimdVariant::PreppedL8),
-    Arm::RecurrentAgain,
-];
+/// Chunked, recurrent, every kernel of the simd family, recurrent again.
+fn arms() -> Vec<Arm> {
+    let mut v = vec![Arm::Chunked, Arm::Recurrent];
+    v.extend(GdnSimdVariant::ALL.map(Arm::Simd));
+    v.push(Arm::RecurrentAgain);
+    v
+}
+
 const CHUNKED: usize = 0;
 const RECURRENT: usize = 1;
 const SIMD: usize = 2;
-const RECURRENT_AGAIN: usize = 10;
 
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
@@ -166,6 +160,8 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
             v_heads: HV as u32,
             v_dim: DV as u32,
         };
+        let arms = arms();
+        let recurrent_again = arms.len() - 1;
         let ws = GdnWorkspace::new(rt, &big).unwrap();
         let scalars = GdnSimdScalars::new(rt, &big).unwrap();
         for &t in &lengths {
@@ -173,10 +169,10 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
             let d = GdnDims { seq: t as u32, ..big };
             let width = (HV * DV) as u32;
             let state_n = HV * DK * DV;
-            let outs: Vec<GpuBuffer> = ARMS.iter().map(|_| empty(rt, t * width as usize)).collect();
-            let sts: Vec<GpuBuffer> = ARMS.iter().map(|_| empty(rt, state_n)).collect();
+            let outs: Vec<GpuBuffer> = arms.iter().map(|_| empty(rt, t * width as usize)).collect();
+            let sts: Vec<GpuBuffer> = arms.iter().map(|_| empty(rt, state_n)).collect();
             let launch = |arm: Arm| {
-                let i = ARMS.iter().position(|&a| a == arm).unwrap();
+                let i = arms.iter().position(|&a| a == arm).unwrap();
                 let q = GdnQkv {
                     buf: &o.qkv,
                     ld: o.ld_qkv,
@@ -206,7 +202,7 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 r.expect("launch");
             };
             // Correctness before timing.
-            for arm in ARMS {
+            for &arm in &arms {
                 launch(arm);
             }
             rt.synchronize().unwrap();
@@ -221,21 +217,21 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 "GDN_AB_CHECK t={t}: chunked vs recurrent max|dy|/scale {:.3e}",
                 dc / scale
             );
-            for i in SIMD..RECURRENT_AGAIN {
+            for i in SIMD..recurrent_again {
                 let (y_s, s_s) = (read(i, &outs, n_out), read(i, &sts, state_n));
                 let (dy, ds) = (dev(&y_r, &y_s), dev(&s_r, &s_s));
                 println!(
                     "GDN_AB_CHECK t={t} {:?}: vs recurrent max|dy|/scale {:.3e} max|dstate|/scale {:.3e}",
-                    ARMS[i],
+                    arms[i],
                     dy / scale,
                     ds / sscale
                 );
                 assert!(
                     dy <= 1e-4 * scale && ds <= 1e-4 * sscale,
                     "{:?} disagrees with gdn_recurrent at t={t}",
-                    ARMS[i]
+                    arms[i]
                 );
-                assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", ARMS[i]);
+                assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", arms[i]);
             }
 
             // Launches per sample: enough that a sample is well above the host
@@ -248,17 +244,17 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 t0.elapsed().as_secs_f64() * 1e3
             };
             let per_sample = ((n / pilot.max(0.05)).ceil() as usize).clamp(1, 200);
-            for arm in ARMS {
+            for &arm in &arms {
                 for _ in 0..warmup {
                     launch(arm);
                 }
             }
             rt.synchronize().unwrap();
-            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); ARMS.len()];
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
             for round in 0..rounds {
-                for step in 0..ARMS.len() {
-                    let ai = (round + step) % ARMS.len();
-                    let arm = ARMS[ai];
+                for step in 0..arms.len() {
+                    let ai = (round + step) % arms.len();
+                    let arm = arms[ai];
                     let t0 = Instant::now();
                     for _ in 0..per_sample {
                         launch(arm);
@@ -270,7 +266,7 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
             let ratio = |num: usize, den: usize| -> Vec<f64> {
                 samples[num].iter().zip(&samples[den]).map(|(a, b)| a / b).collect()
             };
-            for (i, arm) in ARMS.iter().enumerate() {
+            for (i, arm) in arms.iter().enumerate() {
                 println!(
                     "GDN_AB t={t} arm={arm:?} min_ms={:.4} median_ms={:.4} max_ms={:.4} rounds={rounds} launches_per_sample={per_sample}",
                     min(&samples[i]),
@@ -282,13 +278,13 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 (
                     "noise recurrent/recurrent_again".to_string(),
                     RECURRENT,
-                    RECURRENT_AGAIN,
+                    recurrent_again,
                 ),
                 ("recurrent/chunked".to_string(), RECURRENT, CHUNKED),
             ];
-            for i in SIMD..RECURRENT_AGAIN {
-                pairs.push((format!("{:?}/recurrent", ARMS[i]), i, RECURRENT));
-                pairs.push((format!("{:?}/chunked", ARMS[i]), i, CHUNKED));
+            for i in SIMD..recurrent_again {
+                pairs.push((format!("{:?}/recurrent", arms[i]), i, RECURRENT));
+                pairs.push((format!("{:?}/chunked", arms[i]), i, CHUNKED));
             }
             for (name, num, den) in pairs {
                 let r = ratio(num, den);

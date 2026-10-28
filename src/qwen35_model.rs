@@ -102,7 +102,8 @@ use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch, GEMM_Q4_MLX_MAX_M};
 use crate::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice, GdnWorkspace,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice, GdnSimdScalars,
+    GdnSimdVariant, GdnWorkspace,
     LmHead, OutCols, SharedPrefix, StateIn,
 };
 use crate::qwen35_q4::{
@@ -527,9 +528,9 @@ pub struct Qwen35Model {
     pub(crate) lm_head_bf16: Option<Tensor>,
     pub(crate) final_norm: GpuBuffer,
     pub(crate) layers: Vec<Layer>,
-    /// The GDN chunk scan's column slice for every prefill this model runs
-    /// ([`Self::with_gdn_scan_slice`]); the library default unless chosen.
-    gdn_scan: GdnScanSlice,
+    /// The GDN kernel every prefill of this model runs ([`Self::with_gdn_prefill`],
+    /// [`Self::with_gdn_scan_slice`]); [`GdnPrefillKernel::default`] unless chosen.
+    gdn_prefill: GdnPrefillKernel,
     /// Bumped by every write to the weights after load
     /// ([`Self::bump_param_generation`]). A [`crate::qwen35_train::PendingStep`]
     /// records it at the forward, and the backward, which rebuilds each layer
@@ -945,7 +946,7 @@ impl Qwen35Model {
                 lm_head_bf16,
                 final_norm,
                 layers,
-                gdn_scan: GdnScanSlice::default(),
+                gdn_prefill: GdnPrefillKernel::default(),
                 param_generation: AtomicU64::new(0),
                 layer_fault: AtomicUsize::new(usize::MAX),
                 read_fault: AtomicUsize::new(usize::MAX),
@@ -1168,7 +1169,7 @@ impl Qwen35Model {
             lm_head_bf16,
             final_norm,
             layers,
-            gdn_scan: GdnScanSlice::default(),
+            gdn_prefill: GdnPrefillKernel::default(),
             param_generation: AtomicU64::new(0),
             layer_fault: AtomicUsize::new(usize::MAX),
             read_fault: AtomicUsize::new(usize::MAX),
@@ -1176,13 +1177,17 @@ impl Qwen35Model {
         })
     }
 
-    /// This model with the GDN chunk scan run in `slice`-column slices by
-    /// every prefill (`forward`, `begin`, `prefill`). The slices are
-    /// bit-identical, so this changes speed only; the default is the
-    /// library's ([`GdnScanSlice::default`]). Decode's recurrence has its own
-    /// width and is not affected.
-    pub fn with_gdn_scan_slice(mut self, slice: GdnScanSlice) -> Self {
-        self.gdn_scan = slice;
+    /// This model with every prefill (`forward`, `begin`, `prefill`) on the chunked GDN rule
+    /// ([`qwen35::gdn_chunk_forward`]), its scan run in `slice`-column slices. The slices are
+    /// bit-identical, so the slice changes speed only. Decode's recurrence has its own width and is
+    /// not affected.
+    pub fn with_gdn_scan_slice(self, slice: GdnScanSlice) -> Self {
+        self.with_gdn_prefill(GdnPrefillKernel::Chunked(slice))
+    }
+
+    /// This model with every prefill on `kernel` (see [`GdnPrefillKernel`]).
+    pub fn with_gdn_prefill(mut self, kernel: GdnPrefillKernel) -> Self {
+        self.gdn_prefill = kernel;
         self
     }
 
@@ -1317,9 +1322,9 @@ impl Qwen35Model {
         let need = self
             .carry_bytes(t, max_new)
             .saturating_add(DecodeScratch::bytes(1, q_heads, positions as usize, head_dim)? as u64)
-            .saturating_add(Acts::bytes(cfg, self.precision, 1, false)?)
+            .saturating_add(Acts::bytes(cfg, self.precision, 1, false, self.gdn_prefill)?)
             .saturating_add(logits_bytes.saturating_mul(2))
-            .saturating_add(Acts::bytes(cfg, self.precision, t, false)?);
+            .saturating_add(Acts::bytes(cfg, self.precision, t, false, self.gdn_prefill)?);
         self.check_working_set(
             WHAT,
             need,
@@ -1329,7 +1334,7 @@ impl Qwen35Model {
         // Everything the session holds is allocated before the prefill runs,
         // so a failed allocation never throws a finished prefill away.
         let carry = self.alloc_carry(t, max_new)?;
-        let a = Acts::new(rt, cfg, self.precision, 1, false)?;
+        let a = Acts::new(rt, cfg, self.precision, 1, false, self.gdn_prefill)?;
         let logits_t = rt.alloc_tensor_f32(&[1, cfg.vocab as usize])?;
         let scratch = DecodeScratch::new(rt, 1, q_heads, positions as usize, head_dim)?;
         let mut s = self.begin_impl(WHAT, ids, false, Some(carry), 0)?;
@@ -1369,15 +1374,14 @@ impl Qwen35Model {
         let t = self.check_ids(what, ids)?;
         // Counted against what is allocated now, so a prefill that has
         // already allocated its session's state is not charged for it twice.
-        let need = Acts::bytes(&self.cfg, self.precision, t, carry.is_none())?.saturating_add(extra_bytes);
+        let need = Acts::bytes(&self.cfg, self.precision, t, carry.is_none(), self.gdn_prefill)?.saturating_add(extra_bytes);
         self.check_working_set(
             what,
             need,
             &format!("a forward of {t} tokens needs"),
             "shorten the sequence, or free device memory",
         )?;
-        let mut a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none())?;
-        a.g_ws.set_scan_slice(self.gdn_scan);
+        let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none(), self.gdn_prefill)?;
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
             model: self,
@@ -1703,17 +1707,24 @@ impl Qwen35Model {
                     t,
                     g.conv_dim(),
                 )?;
-                qwen35::gdn_chunk_forward(
-                    rt,
-                    &dims,
-                    &qkv,
-                    &gates,
-                    &params,
-                    StateIn::Zero,
-                    &a.g_ws,
-                    out,
-                    keep.map(|c| &c.state),
-                )?;
+                match &a.g_prefill {
+                    GdnPrefillScratch::Chunked(ws) => {
+                        qwen35::gdn_chunk_forward(rt, &dims, &qkv, &gates, &params, StateIn::Zero, ws, out, keep.map(|c| &c.state))?
+                    }
+                    GdnPrefillScratch::Simd(scalars) => qwen35::gdn_recurrent_simd_with(
+                        rt,
+                        &dims,
+                        &qkv,
+                        &gates,
+                        &params,
+                        StateIn::Zero,
+                        out,
+                        keep.map(|c| &c.state),
+                        None,
+                        GdnSimdVariant::Prepped8,
+                        Some(scalars),
+                    )?,
+                }
             }
             // One token on the carried state: the conv reads one side and
             // writes the other (its output state may not be its input), and
@@ -2497,7 +2508,8 @@ struct Acts {
     g_qkv: GpuBuffer,
     g_o: GpuBuffer,
     g_y: Tensor,
-    g_ws: GdnWorkspace,
+    /// What the prefill's GDN kernel needs ([`GdnPrefillKernel`]).
+    g_prefill: GdnPrefillScratch,
     a_proj: Tensor,
     a_q: GpuBuffer,
     /// The attention layers' K/V, `[t, kv_heads, head_dim]` each, which every
@@ -2561,6 +2573,50 @@ fn f32_bytes(n: usize) -> u64 {
     GpuRuntime::allocated_bytes_for(n.max(1).saturating_mul(4), BufferKind::Cold)
 }
 
+/// The GDN kernel a prefill runs. Decode always runs [`qwen35::gdn_recurrent`] (one token).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GdnPrefillKernel {
+    /// [`qwen35::gdn_chunk_forward`]: the chunked rule (`torch_chunk_gated_delta_rule`'s
+    /// arithmetic), its scan in the given column slices.
+    Chunked(GdnScanSlice),
+    /// [`qwen35::gdn_recurrent_simd_with`] with [`GdnSimdVariant::Prepped8`]: the recurrent rule
+    /// over the whole sequence (8 lanes a value column, `float4` q/k loads, gates and norms
+    /// computed once per token and value head by a prep pass). 0.63x / 0.76x / 0.83x / 0.85x of
+    /// the chunked kernel's time at T = 200 / 1024 / 4096 / 8192 on the 2B's shape
+    /// (`bench/results/qwen35_gdn_simd_ab_m5pro.txt`, 22 paired rounds), with 16 B of scratch a
+    /// token and value head instead of the chunked workspace. It sums in the recurrent order, as
+    /// decode does, so prefill logits move by f32 rounding against the chunked rule.
+    #[default]
+    Simd,
+}
+
+/// The scratch of the chosen [`GdnPrefillKernel`], sized for the forward's `GdnDims`.
+enum GdnPrefillScratch {
+    Chunked(GdnWorkspace),
+    Simd(GdnSimdScalars),
+}
+
+impl GdnPrefillScratch {
+    fn new(rt: &GpuRuntime, dims: &GdnDims, kernel: GdnPrefillKernel) -> Result<Self, String> {
+        Ok(match kernel {
+            GdnPrefillKernel::Chunked(slice) => {
+                let mut ws = GdnWorkspace::new(rt, dims)?;
+                ws.set_scan_slice(slice);
+                Self::Chunked(ws)
+            }
+            GdnPrefillKernel::Simd => Self::Simd(GdnSimdScalars::new(rt, dims)?),
+        })
+    }
+
+    /// Bytes [`Self::new`] allocates, as `GdnWorkspace::bytes_for` and `GdnSimdScalars::bytes_for` count them.
+    fn bytes_for(dims: &GdnDims, kernel: GdnPrefillKernel) -> Result<usize, String> {
+        match kernel {
+            GdnPrefillKernel::Chunked(_) => GdnWorkspace::bytes_for(dims),
+            GdnPrefillKernel::Simd => GdnSimdScalars::bytes_for(dims),
+        }
+    }
+}
+
 /// What [`Acts`] allocates at `t` tokens: the one place its sizes are
 /// decided, which [`Acts::new`] allocates from and [`Acts::bytes`] sums.
 /// The bf16 attention scratch is the exception; both call [`bf16_attn_counts`].
@@ -2615,7 +2671,7 @@ impl ActsPlan {
 }
 
 impl Acts {
-    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<Self, String> {
+    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool, gdn: GdnPrefillKernel) -> Result<Self, String> {
         let plan = ActsPlan::new(cfg, p, t, shared_kv);
         let tu = plan.t;
         // Every activation is written in full before anything reads it — the
@@ -2650,7 +2706,7 @@ impl Acts {
             g_qkv: f32s(plan.g_qkv)?,
             g_o: f32s(tu * plan.g_value)?,
             g_y: act(plan.g_value)?,
-            g_ws: GdnWorkspace::new(rt, &plan.gdn)?,
+            g_prefill: GdnPrefillScratch::new(rt, &plan.gdn, gdn)?,
             a_proj: f32t(plan.a_width)?,
             a_q: f32s(tu * plan.qd)?,
             kv: match plan.kv {
@@ -2673,9 +2729,9 @@ impl Acts {
     /// (each buffer at its allocated size; the GDN workspace at
     /// [`GdnWorkspace::bytes_for`]'s). What a caller checks against the
     /// device's memory before allocating.
-    fn bytes(cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool) -> Result<u64, String> {
+    fn bytes(cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool, gdn: GdnPrefillKernel) -> Result<u64, String> {
         let plan = ActsPlan::new(cfg, p, t, shared_kv);
-        let ws = GdnWorkspace::bytes_for(&plan.gdn)? as u64;
+        let ws = GdnPrefillScratch::bytes_for(&plan.gdn, gdn)? as u64;
         let scalar = f32_bytes(1);
         let kv = plan.kv.map_or(0, |n| f32_bytes(n).saturating_mul(2));
         let attn_bf16 = match p {
@@ -2734,7 +2790,7 @@ mod tests {
     use super::*;
 
     /// `Acts::bytes` is what `Acts::new` allocates: every buffer's allocated
-    /// size summed, the GDN workspace at `GdnWorkspace::bytes_for`'s.
+    /// size summed, the GDN prefill scratch at its kernel's `bytes_for`.
     #[test]
     fn acts_bytes_is_what_acts_new_allocates() {
         let cfg = Qwen35Config::from_config_file(
@@ -2745,8 +2801,10 @@ mod tests {
         let alloc = |b: &GpuBuffer| GpuRuntime::allocated_bytes_for(b.nbytes(), BufferKind::Cold);
         for p in [Precision::F32, Precision::Bf16] {
             for t in [1u32, 5, 64, 65, 200] {
-                for shared in [false, true] {
-                    let a = Acts::new(&rt, &cfg, p, t, shared).unwrap();
+                for (shared, gdn) in [false, true].into_iter().flat_map(|s| {
+                    [GdnPrefillKernel::Simd, GdnPrefillKernel::Chunked(GdnScanSlice::default())].map(move |k| (s, k))
+                }) {
+                    let a = Acts::new(&rt, &cfg, p, t, shared, gdn).unwrap();
                     let mut got = [&a.resid, &a.x, &a.proj_out, &a.g_proj, &a.g_y, &a.a_proj, &a.a_y]
                         .iter()
                         .chain([&&a.m_gate, &&a.m_up, &&a.m_mid])
@@ -2761,9 +2819,9 @@ mod tests {
                         .attn_bf16
                         .as_ref()
                         .map_or(0, |s| alloc(&s.q) + alloc(&s.k) + alloc(&s.v));
-                    got += GdnWorkspace::bytes_for(&cfg.gdn.dims(1, t)).unwrap() as u64;
-                    let want = Acts::bytes(&cfg, p, t, shared).unwrap();
-                    assert_eq!(want, got, "{p:?} t={t} shared_kv={shared}");
+                    got += GdnPrefillScratch::bytes_for(&cfg.gdn.dims(1, t), gdn).unwrap() as u64;
+                    let want = Acts::bytes(&cfg, p, t, shared, gdn).unwrap();
+                    assert_eq!(want, got, "{p:?} t={t} shared_kv={shared} {gdn:?}");
                 }
             }
         }

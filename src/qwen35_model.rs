@@ -102,9 +102,8 @@ use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch, GEMM_Q4_MLX_MAX_M};
 use crate::qwen35::{
-    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice, GdnSimdScalars,
-    GdnSimdVariant, GdnWorkspace,
-    LmHead, OutCols, SharedPrefix, StateIn,
+    self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice,
+    GdnSimdScalars, GdnSimdVariant, GdnWorkspace, LmHead, OutCols, SharedPrefix, StateIn,
 };
 use crate::qwen35_q4::{
     classify_outside, peak_footprint_now, MlxNames, MlxQ4Error, MlxQ4LoadReport, MlxQuant, NormConvention, Q4Weight,
@@ -1374,14 +1373,22 @@ impl Qwen35Model {
         let t = self.check_ids(what, ids)?;
         // Counted against what is allocated now, so a prefill that has
         // already allocated its session's state is not charged for it twice.
-        let need = Acts::bytes(&self.cfg, self.precision, t, carry.is_none(), self.gdn_prefill)?.saturating_add(extra_bytes);
+        let need =
+            Acts::bytes(&self.cfg, self.precision, t, carry.is_none(), self.gdn_prefill)?.saturating_add(extra_bytes);
         self.check_working_set(
             what,
             need,
             &format!("a forward of {t} tokens needs"),
             "shorten the sequence, or free device memory",
         )?;
-        let a = Acts::new(&self.rt, &self.cfg, self.precision, t, carry.is_none(), self.gdn_prefill)?;
+        let a = Acts::new(
+            &self.rt,
+            &self.cfg,
+            self.precision,
+            t,
+            carry.is_none(),
+            self.gdn_prefill,
+        )?;
         self.embed_ids(ids, &a.resid)?;
         Ok(Staged {
             model: self,
@@ -1708,9 +1715,17 @@ impl Qwen35Model {
                     g.conv_dim(),
                 )?;
                 match &a.g_prefill {
-                    GdnPrefillScratch::Chunked(ws) => {
-                        qwen35::gdn_chunk_forward(rt, &dims, &qkv, &gates, &params, StateIn::Zero, ws, out, keep.map(|c| &c.state))?
-                    }
+                    GdnPrefillScratch::Chunked(ws) => qwen35::gdn_chunk_forward(
+                        rt,
+                        &dims,
+                        &qkv,
+                        &gates,
+                        &params,
+                        StateIn::Zero,
+                        ws,
+                        out,
+                        keep.map(|c| &c.state),
+                    )?,
                     GdnPrefillScratch::Simd(scalars) => qwen35::gdn_recurrent_simd_with(
                         rt,
                         &dims,
@@ -2671,7 +2686,14 @@ impl ActsPlan {
 }
 
 impl Acts {
-    fn new(rt: &Arc<GpuRuntime>, cfg: &Qwen35Config, p: Precision, t: u32, shared_kv: bool, gdn: GdnPrefillKernel) -> Result<Self, String> {
+    fn new(
+        rt: &Arc<GpuRuntime>,
+        cfg: &Qwen35Config,
+        p: Precision,
+        t: u32,
+        shared_kv: bool,
+        gdn: GdnPrefillKernel,
+    ) -> Result<Self, String> {
         let plan = ActsPlan::new(cfg, p, t, shared_kv);
         let tu = plan.t;
         // Every activation is written in full before anything reads it — the
@@ -2802,7 +2824,11 @@ mod tests {
         for p in [Precision::F32, Precision::Bf16] {
             for t in [1u32, 5, 64, 65, 200] {
                 for (shared, gdn) in [false, true].into_iter().flat_map(|s| {
-                    [GdnPrefillKernel::Simd, GdnPrefillKernel::Chunked(GdnScanSlice::default())].map(move |k| (s, k))
+                    [
+                        GdnPrefillKernel::Simd,
+                        GdnPrefillKernel::Chunked(GdnScanSlice::default()),
+                    ]
+                    .map(move |k| (s, k))
                 }) {
                     let a = Acts::new(&rt, &cfg, p, t, shared, gdn).unwrap();
                     let mut got = [&a.resid, &a.x, &a.proj_out, &a.g_proj, &a.g_y, &a.a_proj, &a.a_y]

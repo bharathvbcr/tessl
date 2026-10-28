@@ -222,21 +222,21 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 "GDN_AB_CHECK t={t}: chunked vs recurrent max|dy|/scale {:.3e}",
                 dc / scale
             );
-            for i in SIMD..recurrent_again {
+            for (i, arm) in arms.iter().enumerate().take(recurrent_again).skip(SIMD) {
                 let (y_s, s_s) = (read(i, &outs, n_out), read(i, &sts, state_n));
                 let (dy, ds) = (dev(&y_r, &y_s), dev(&s_r, &s_s));
                 println!(
                     "GDN_AB_CHECK t={t} {:?}: vs recurrent max|dy|/scale {:.3e} max|dstate|/scale {:.3e}",
-                    arms[i],
+                    arm,
                     dy / scale,
                     ds / sscale
                 );
                 assert!(
                     dy <= 1e-4 * scale && ds <= 1e-4 * sscale,
                     "{:?} disagrees with gdn_recurrent at t={t}",
-                    arms[i]
+                    arm
                 );
-                assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", arms[i]);
+                assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", arm);
             }
 
             // Timed with async encode on (`GDN_AB_ASYNC=0` for the library default):
@@ -301,9 +301,9 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 ),
                 ("recurrent/chunked".to_string(), RECURRENT, CHUNKED),
             ];
-            for i in SIMD..recurrent_again {
-                pairs.push((format!("{:?}/recurrent", arms[i]), i, RECURRENT));
-                pairs.push((format!("{:?}/chunked", arms[i]), i, CHUNKED));
+            for (i, arm) in arms.iter().enumerate().take(recurrent_again).skip(SIMD) {
+                pairs.push((format!("{arm:?}/recurrent"), i, RECURRENT));
+                pairs.push((format!("{arm:?}/chunked"), i, CHUNKED));
             }
             for (name, num, den) in pairs {
                 let r = ratio(num, den);

@@ -1,0 +1,28 @@
+# w33 prefill gate, 2026-10-28T08:44:37Z, 0e91451 qwen35_model: prefill GDN on the simd recurrence (Prepped8) by default; the chunked rule stays selectable
+# refs /Users/bharath/Code/research/tessl-w31-attn-bf16/target/qwen35_ref{,_text}
+# ref: model_dir /Users/bharath/.cache/huggingface/hub/models--Qwen--Qwen3.5-2B-Base/snapshots/b1485b2fa6dfa1287294f269f5fb618e03d52d7c/
+# ref: T 155
+# ref: torch 2.12.1
+# ref: transformers 5.19.0
+# ref: prompt 'The gated delta rule updates a fast-weight memory with a learned decay and a delta correction. Each token writes its value under its key, after first erasing whatever the memory already returned for that key, and the whole memory fades by a per-head factor between tokens. Linear attention layers of this kind are cheap at long context because their state has a fixed size, while full attention layers keep every past key and value. Hybrid models interleave the two so that most layers are cheap and a few can still look up exact tokens from far back in the context. In a model with twenty-four layers where every fourth one is full attention, eighteen layers are linear and six are full. Question: which layer types does Qwen3.5 mix, and in what ratio? Answer:'
+# ref: fp32 next token ' Q'
+ 3:44  up 1 day, 19:59, 1 user, load averages: 4.48 4.13 5.66
+== always-run tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+test result: ok. 47 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 8.35s
+== real 2B f32 layer by layer vs transformers fp32 (prompt)
+final norm: rel err 2.38e-6 (worst layer 4.02e-6)
+logits: rel err 1.97e-6, top-1 mismatches 0/155, max KL 1.45e-10
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 5.20s
+== real 2B bf16 gate, qwen35_ref
+test bf16_forward_is_no_worse_than_transformers_bf16 ... vs fp32 over 155 positions: transformers bf16 mean KL 5.736e-4 (max 6.073e-3), top-1 misses 3
+vs fp32: tessl bf16 mean KL 3.090e-5 (max 2.464e-4), top-1 misses 0, logits rel err 3.730e-3
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 3.68s
+== real 2B bf16 gate, qwen35_ref_text
+test bf16_forward_is_no_worse_than_transformers_bf16 ... vs fp32 over 512 positions: transformers bf16 mean KL 3.791e-4 (max 4.596e-3), top-1 misses 17
+vs fp32: tessl bf16 mean KL 3.053e-5 (max 2.664e-4), top-1 misses 1, logits rel err 3.694e-3
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 5.02s
+ 3:49  up 1 day, 20:04, 1 user, load averages: 4.57 4.50 5.41
+GATE_EXIT 0

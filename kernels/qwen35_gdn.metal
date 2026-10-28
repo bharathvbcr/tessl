@@ -1154,10 +1154,10 @@ kernel void NAME(                                                               
                              seq_lens, sc, tg, sg, lane);                          \
 }
 
-GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd, 4u, false)
-GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_sg8, 8u, false)
-GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_pre, 4u, true)
-GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_pre_sg8, 8u, true)
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd, GDN_SIMD_COLS, false)
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_sg8, 2u * GDN_SIMD_COLS, false)
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_pre, GDN_SIMD_COLS, true)
+GDN_SIMD_KERNEL(qwen35_gdn_recurrent_simd_pre_sg8, 2u * GDN_SIMD_COLS, true)
 
 // --------------------------------------------------------- gated RMSNorm ---
 

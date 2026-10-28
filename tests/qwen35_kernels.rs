@@ -1108,9 +1108,9 @@ fn gdn_recurrent_simd_poisons_what_gdn_recurrent_poisons() {
             dv: 64,
         };
         let (bt, hk, hv, dv) = (s.b * s.t, s.hk, s.hv, s.dv);
-        let qk_at = |row: usize, kh: usize| (row * hk + kh) * DK + 17;
-        let v_at = |row: usize, h: usize, col: usize| (row * hv + h) * dv + col;
-        let g_at = |row: usize, h: usize| row * hv + h;
+        let qk_at = move |row: usize, kh: usize| (row * hk + kh) * DK + 17;
+        let v_at = move |row: usize, h: usize, col: usize| (row * hv + h) * dv + col;
+        let g_at = move |row: usize, h: usize| row * hv + h;
         let row = 3usize; // batch 0, token 3
         type Poison = Box<dyn Fn(&mut GdnData)>;
         let cases: Vec<(&str, Poison, bool)> = vec![

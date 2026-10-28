@@ -234,44 +234,58 @@ fn gdn_simd_recurrent_ab_at_the_2b_shape() {
                 assert!(y_s.iter().any(|&x| x != 0.0), "{:?}: output is all zeros", arms[i]);
             }
 
-            // Launches per sample: enough that a sample is well above the host
-            // submit-and-wait floor (about 0.25 ms) at every length.
-            let n = (env_usize("GDN_AB_TARGET_MS", 20) as f64 / 1.0).max(1.0);
-            let pilot = {
-                let t0 = Instant::now();
-                launch(Arm::Chunked);
-                rt.synchronize().unwrap();
-                t0.elapsed().as_secs_f64() * 1e3
-            };
-            let per_sample = ((n / pilot.max(0.05)).ceil() as usize).clamp(1, 200);
+            // Timed with async encode on (`GDN_AB_ASYNC=0` for the library default):
+            // by default every launch is its own submit-and-wait, so at decode
+            // lengths each arm would sit on the ~0.15-0.25 ms host floor (README,
+            // "Dispatch floor") and the ratio would be a ratio of floors. Batched,
+            // launches queue back to back and the sample is the GPU's time.
+            let asynchronous = env_usize("GDN_AB_ASYNC", 1) != 0;
+            rt.set_async_encode(asynchronous).unwrap();
+            // Launches per sample, per arm: enough that a sample is about
+            // `GDN_AB_TARGET_MS` of that arm's work.
+            let target = env_usize("GDN_AB_TARGET_MS", 20) as f64;
             for &arm in &arms {
                 for _ in 0..warmup {
                     launch(arm);
                 }
             }
             rt.synchronize().unwrap();
+            let per_sample: Vec<usize> = arms
+                .iter()
+                .map(|&arm| {
+                    let t0 = Instant::now();
+                    for _ in 0..4 {
+                        launch(arm);
+                    }
+                    rt.synchronize().unwrap();
+                    let each = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
+                    ((target / each.max(0.01)).ceil() as usize).clamp(1, 400)
+                })
+                .collect();
             let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
             for round in 0..rounds {
                 for step in 0..arms.len() {
                     let ai = (round + step) % arms.len();
                     let arm = arms[ai];
                     let t0 = Instant::now();
-                    for _ in 0..per_sample {
+                    for _ in 0..per_sample[ai] {
                         launch(arm);
                     }
                     rt.synchronize().unwrap();
-                    samples[ai].push(t0.elapsed().as_secs_f64() * 1e3 / per_sample as f64);
+                    samples[ai].push(t0.elapsed().as_secs_f64() * 1e3 / per_sample[ai] as f64);
                 }
             }
+            rt.set_async_encode(false).unwrap();
             let ratio = |num: usize, den: usize| -> Vec<f64> {
                 samples[num].iter().zip(&samples[den]).map(|(a, b)| a / b).collect()
             };
             for (i, arm) in arms.iter().enumerate() {
                 println!(
-                    "GDN_AB t={t} arm={arm:?} min_ms={:.4} median_ms={:.4} max_ms={:.4} rounds={rounds} launches_per_sample={per_sample}",
+                    "GDN_AB t={t} arm={arm:?} min_ms={:.4} median_ms={:.4} max_ms={:.4} rounds={rounds} launches_per_sample={} async={asynchronous}",,
                     min(&samples[i]),
                     median(&samples[i]),
-                    max(&samples[i])
+                    max(&samples[i]),
+                    per_sample[i]
                 );
             }
             let mut pairs = vec![

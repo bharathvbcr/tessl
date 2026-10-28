@@ -99,10 +99,10 @@ int main(int argc, char **argv) {
         std::printf("GDN_DK %u\nGDN_C %u\nGDN_BV %u\nGDN_PREP_THREADS %u\nGDN_SCAN_THREADS %u\n"
                     "GDN_PREP_TG_FLOATS %u\nGDN_SCAN_TG_FLOATS %u\nGDN_SCAN16_TG_FLOATS %u\nGDN_REC_TG_FLOATS %u\n"
                     "REDUCE_MAX_SIMDGROUPS %u\nPREFIX_ATTN_D %u\nPREFIX_ATTN_R %u\nPREFIX_ATTN_SGT %u\n"
-                    "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\n",
+                    "PREFIX_DECODE_CHUNK %u\nPREFIX_DECODE_R %u\nGDN_SIMD_COLS %u\n",
                     GDN_DK, GDN_C, GDN_BV, GDN_PREP_THREADS, GDN_SCAN_THREADS, GDN_PREP_TG_FLOATS,
                     GDN_SCAN_TG_FLOATS, GDN_SCAN16_TG_FLOATS, GDN_REC_TG_FLOATS, REDUCE_MAX_SIMDGROUPS, PREFIX_ATTN_D, PREFIX_ATTN_R,
-                    PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R);
+                    PREFIX_ATTN_SGT, PREFIX_DECODE_CHUNK, PREFIX_DECODE_R, GDN_SIMD_COLS);
         return 0;
     }
     emu::start_watchdog();
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
             outputs.push_back("ws_w");
             outputs.push_back("ws_aq");
         }
-    } else if (kname == "qwen35_gdn_recurrent") {
+    } else if (kname == "qwen35_gdn_recurrent" || kname == "qwen35_gdn_recurrent_simd") {
         const uint B = P("B"), T = P("T"), Hk = P("Hk"), Hv = P("Hv"), Dv = P("Dv"), ld_qkv = P("ld_qkv"),
                    q_off = P("q_off"), k_off = P("k_off"), v_off = P("v_off"), ld_ab = P("ld_ab"),
                    a_off = P("a_off"), b_off = P("b_off"), ld_out = P("ld_out"), out_off = P("out_off"),
@@ -185,18 +185,28 @@ int main(int argc, char **argv) {
         // `rec_bv16`: the 16-column-slice recurrent (qwen35_gdn_recurrent_bv16),
         // 64 threads a group.
         const bool bv16 = params.count("rec_bv16") != 0;
-        launch(uint3(Dv / (bv16 ? 16u : GDN_BV), Hv, B), uint3(bv16 ? 64u : GDN_SCAN_THREADS, 1, 1),
-               GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
-            if (bv16) {
-                qwen35_gdn_recurrent_bv16(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off,
-                                          v_off, ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm,
-                                          id.tg, id.sg, id.lane);
-            } else {
-                qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
-                                     ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm, id.tg, id.sg,
-                                     id.lane);
-            }
-        });
+        if (kname == "qwen35_gdn_recurrent_simd") {
+            // One simdgroup a column, no threadgroup memory: GDN_SIMD_COLS columns a group.
+            launch(uint3(Dv / GDN_SIMD_COLS, Hv, B), uint3(32u * GDN_SIMD_COLS, 1, 1), 0,
+                   [&](const Ids &id, float *) {
+                qwen35_gdn_recurrent_simd(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off,
+                                          v_off, ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, id.tg,
+                                          id.sg, id.lane);
+            });
+        } else {
+            launch(uint3(Dv / (bv16 ? 16u : GDN_BV), Hv, B), uint3(bv16 ? 64u : GDN_SCAN_THREADS, 1, 1),
+                   GDN_REC_TG_FLOATS, [&](const Ids &id, float *tgm) {
+                if (bv16) {
+                    qwen35_gdn_recurrent_bv16(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off,
+                                              v_off, ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm,
+                                              id.tg, id.sg, id.lane);
+                } else {
+                    qwen35_gdn_recurrent(qkv, ab, alog, dtb, si, out, so, T, Hk, Hv, Dv, ld_qkv, q_off, k_off, v_off,
+                                         ld_ab, a_off, b_off, ld_out, out_off, sb, flags, lens, tgm, id.tg, id.sg,
+                                         id.lane);
+                }
+            });
+        }
     } else if (kname == "qwen35_gated_rms_norm_f32" || kname == "qwen35_gated_rms_norm_bf16") {
         const uint rows = P("rows"), H = P("H"), D = P("D"), ld_x = P("ld_x"), x_off = P("x_off"),
                    ld_z = P("ld_z"), z_off = P("z_off"), ld_out = P("ld_out"), out_off = P("out_off");

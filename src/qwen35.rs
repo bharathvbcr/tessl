@@ -78,6 +78,12 @@ const PREP_THREADS: usize = 256;
 const SCAN_THREADS: usize = 128;
 /// Threads of `qwen35_gdn_recurrent_bv16`: 4 key blocks x 16 columns.
 const REC16_THREADS: usize = 64;
+/// Value columns one `qwen35_gdn_recurrent_simd` threadgroup owns: `GDN_SIMD_COLS`
+/// in kernels/qwen35_gdn.metal.
+const REC_SIMD_COLS: usize = 4;
+/// Threads of `qwen35_gdn_recurrent_simd`: one simdgroup (32 threads) per column,
+/// so `32 * REC_SIMD_COLS`.
+const REC_SIMD_THREADS: usize = 128;
 /// Simdgroups per threadgroup for the one-simdgroup-per-row kernels.
 const ROWS_PER_TG: usize = 8;
 /// `REDUCE_MAX_SIMDGROUPS` in kernels/reduce_tree.h.
@@ -1355,7 +1361,7 @@ pub fn gdn_recurrent(
         out,
         state_out,
         None,
-        GDN_RECURRENT_SLICE,
+        RecurrentKernel::Slice(GDN_RECURRENT_SLICE),
     )
 }
 
@@ -1381,7 +1387,18 @@ pub fn gdn_recurrent_with_slice(
     state_out: Option<&GpuBuffer>,
     slice: GdnScanSlice,
 ) -> Result<(), String> {
-    gdn_recurrent_impl(rt, dims, qkv, gates, params, state, out, state_out, None, slice)
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        None,
+        RecurrentKernel::Slice(slice),
+    )
 }
 
 /// [`gdn_recurrent`] with a length per row.
@@ -1413,8 +1430,77 @@ pub fn gdn_recurrent_varlen(
         out,
         state_out,
         Some(seq_lens),
-        GDN_RECURRENT_SLICE,
+        RecurrentKernel::Slice(GDN_RECURRENT_SLICE),
     )
+}
+
+/// [`gdn_recurrent`] on `qwen35_gdn_recurrent_simd`: mlx-lm's decomposition,
+/// one simdgroup per (value head, value column) holding four state rows a
+/// lane, with no threadgroup memory and no barrier. Same arguments, layouts and
+/// outputs; the sums run in another order, so the result agrees with
+/// [`gdn_recurrent`]'s to rounding rather than bit for bit. Not called by
+/// `Qwen35Model`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_simd(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+) -> Result<(), String> {
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        None,
+        RecurrentKernel::Simd,
+    )
+}
+
+/// [`gdn_recurrent_simd`] with a length per row, as [`gdn_recurrent_varlen`].
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_simd_varlen(
+    rt: &Arc<GpuRuntime>,
+    dims: &GdnDims,
+    qkv: &GdnQkv<'_>,
+    gates: &GdnGateLogits<'_>,
+    params: &GdnParams<'_>,
+    state: StateIn<'_>,
+    out: Cols<'_>,
+    state_out: Option<&GpuBuffer>,
+    seq_lens: &GpuBuffer,
+) -> Result<(), String> {
+    gdn_recurrent_impl(
+        rt,
+        dims,
+        qkv,
+        gates,
+        params,
+        state,
+        out,
+        state_out,
+        Some(seq_lens),
+        RecurrentKernel::Simd,
+    )
+}
+
+/// Which recurrence kernel [`gdn_recurrent_impl`] launches. All of them take
+/// the same buffers in the same slots.
+#[derive(Clone, Copy)]
+enum RecurrentKernel {
+    /// `qwen35_gdn_recurrent` / `_bv16`: a threadgroup of key blocks per
+    /// column slice, meeting at barriers.
+    Slice(GdnScanSlice),
+    /// `qwen35_gdn_recurrent_simd`: one simdgroup per column, no barriers.
+    Simd,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1428,7 +1514,7 @@ fn gdn_recurrent_impl(
     out: Cols<'_>,
     state_out: Option<&GpuBuffer>,
     seq_lens: Option<&GpuBuffer>,
-    slice: GdnScanSlice,
+    kernel: RecurrentKernel,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35::gdn_recurrent";
     let (flags, bstride) = validate_gdn(
@@ -1439,27 +1525,29 @@ fn gdn_recurrent_impl(
     if dims.batch == 0 || (dims.seq == 0 && state_out.is_none()) {
         return Ok(());
     }
-    // Literal names, so the emulator's host-contract check sees both kernels
+    // Literal names, so the emulator's host-contract check sees every kernel
     // this site binds.
-    let rec_name = match slice {
-        GdnScanSlice::Cols32 => "qwen35_gdn_recurrent",
-        GdnScanSlice::Cols16 => "qwen35_gdn_recurrent_bv16",
+    let rec_name = match kernel {
+        RecurrentKernel::Slice(GdnScanSlice::Cols32) => "qwen35_gdn_recurrent",
+        RecurrentKernel::Slice(GdnScanSlice::Cols16) => "qwen35_gdn_recurrent_bv16",
+        RecurrentKernel::Simd => "qwen35_gdn_recurrent_simd",
     };
-    let (rec_cols, rec_threads) = match slice {
-        GdnScanSlice::Cols32 => (GDN_VALUE_BLOCK, SCAN_THREADS),
-        GdnScanSlice::Cols16 => (16, REC16_THREADS),
+    let (rec_cols, rec_threads, rec_tg_bytes) = match kernel {
+        RecurrentKernel::Slice(GdnScanSlice::Cols32) => (GDN_VALUE_BLOCK as usize, SCAN_THREADS, REC_TG_BYTES),
+        RecurrentKernel::Slice(GdnScanSlice::Cols16) => (16, REC16_THREADS, REC_TG_BYTES),
+        RecurrentKernel::Simd => (REC_SIMD_COLS, REC_SIMD_THREADS, 0),
     };
-    let p = pipeline_for(rt, rec_name, rec_threads, REC_TG_BYTES)?;
+    let p = pipeline_for(rt, rec_name, rec_threads, rec_tg_bytes)?;
     dispatch_groups(
         rt,
         &p,
         (
-            (dims.v_dim / rec_cols) as usize,
+            dims.v_dim as usize / rec_cols,
             dims.v_heads as usize,
             dims.batch as usize,
         ),
         rec_threads,
-        REC_TG_BYTES,
+        rec_tg_bytes,
         |bnd| {
             set_gpu_buf(bnd, qkv.buf, 0);
             set_gpu_buf(bnd, gates.buf, 1);

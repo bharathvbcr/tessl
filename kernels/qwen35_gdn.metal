@@ -923,6 +923,130 @@ GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent, 32u)
 /// 32-column grid is `Dv / 32 x Hv` groups. Bit-identical to the 32-column one.
 GDN_RECURRENT_KERNEL(qwen35_gdn_recurrent_bv16, 16u)
 
+// ------------------------------------------------- recurrent, one simdgroup a column ---
+
+/// Value columns (simdgroups) one `qwen35_gdn_recurrent_simd` threadgroup owns.
+constant uint GDN_SIMD_COLS = 4u;
+/// Key rows a lane holds: lane `l` owns rows `l + 32 i`.
+constant uint GDN_SIMD_ROWS = GDN_DK / 32u;
+static_assert(GDN_SIMD_ROWS * 32u == GDN_DK, "simd recurrent: whole key rows per lane");
+
+/// `qwen35_gdn_recurrent` with mlx-lm's decomposition (`gated_delta.py`,
+/// `_make_gated_delta_kernel`): one simdgroup per (batch, value head, value
+/// column), each lane holding `DK / 32` = 4 state rows in registers for the
+/// whole sequence. Both per-token reductions over the key dim are a
+/// `simd_sum`; there is no threadgroup memory and no barrier, so simdgroups
+/// never wait on one another and a head's 128 columns are 128 independent
+/// chains (`gdn_recurrent` runs a head as 4 threadgroups whose 4 key blocks
+/// meet at two barriers a token).
+///
+/// Same inputs, layouts, flags and outputs as `qwen35_gdn_recurrent`: the gates,
+/// both l2norms and the q scale are folded into the loads (each simdgroup
+/// computes them for itself: the norms cost two `simd_sum`s on rows the lane
+/// has already loaded, and nothing here depends on the state, so they sit off
+/// the state's dependency chain). State is `[DK, Dv]` as in `gdn_recurrent`,
+/// not mlx's `[Dv, DK]`, so the start and end transfers are strided by `Dv`.
+///
+/// The sums run in a different order from `gdn_recurrent`'s (4 rows a lane,
+/// then a tree across the 32 lanes), so the two agree to rounding, not bit for
+/// bit.
+///
+/// Grid: x = Dv / GDN_SIMD_COLS, y = value head, z = batch; 32 * GDN_SIMD_COLS
+/// threads, column `tg.x * GDN_SIMD_COLS + simdgroup`.
+kernel void qwen35_gdn_recurrent_simd(
+    device const float *qkv [[buffer(0)]],
+    device const float *ab [[buffer(1)]],
+    device const float *a_log [[buffer(2)]],
+    device const float *dt_bias [[buffer(3)]],
+    device const float *state_in [[buffer(4)]],
+    device float *out [[buffer(5)]],
+    device float *state_out [[buffer(6)]],
+    constant uint &T [[buffer(7)]],
+    constant uint &Hk [[buffer(8)]],
+    constant uint &Hv [[buffer(9)]],
+    constant uint &Dv [[buffer(10)]],
+    constant uint &ld_qkv [[buffer(11)]],
+    constant uint &q_off [[buffer(12)]],
+    constant uint &k_off [[buffer(13)]],
+    constant uint &v_off [[buffer(14)]],
+    constant uint &ld_ab [[buffer(15)]],
+    constant uint &a_off [[buffer(16)]],
+    constant uint &b_off [[buffer(17)]],
+    constant uint &ld_out [[buffer(18)]],
+    constant uint &out_off [[buffer(19)]],
+    constant uint &state_bstride [[buffer(20)]],
+    constant uint &flags [[buffer(21)]],
+    device const uint *seq_lens [[buffer(22)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint hv = tg.y;
+    const uint b = tg.z;
+    const uint hk = hv / max(Hv / Hk, 1u);
+    const uint v = tg.x * GDN_SIMD_COLS + sg;
+    const float q_scale = rsqrt((float)GDN_DK);
+
+    float s[GDN_SIMD_ROWS];
+    const ulong state_head = (ulong)hv * GDN_DK * Dv;
+    for (uint i = 0u; i < GDN_SIMD_ROWS; ++i) {
+        s[i] = (flags & 1u) != 0u
+            ? state_in[(ulong)b * state_bstride + state_head + (ulong)(lane + 32u * i) * Dv + v]
+            : 0.0f;
+    }
+
+    // Row b's live length (`flags & 4`: ragged rows); the row stride stays T.
+    const uint Tb = (flags & 4u) != 0u ? min(seq_lens[b], T) : T;
+    for (uint t = 0u; t < Tb; ++t) {
+        const ulong row = (ulong)b * T + t;
+        device const float *qp = qkv + row * (ulong)ld_qkv + q_off + hk * GDN_DK;
+        device const float *kp = qkv + row * (ulong)ld_qkv + k_off + hk * GDN_DK;
+        device const float *gr = ab + row * (ulong)ld_ab;
+
+        float qv[GDN_SIMD_ROWS];
+        float kn[GDN_SIMD_ROWS];
+        float ssq = 0.0f;
+        float ssk = 0.0f;
+        for (uint i = 0u; i < GDN_SIMD_ROWS; ++i) {
+            qv[i] = qp[lane + 32u * i];
+            kn[i] = kp[lane + 32u * i];
+            ssq += qv[i] * qv[i];
+            ssk += kn[i] * kn[i];
+        }
+        const float rq = rsqrt(simd_sum(ssq) + GDN_L2_EPS) * q_scale;
+        const float rk = rsqrt(simd_sum(ssk) + GDN_L2_EPS);
+        const float decay = exp(qwen35_log_decay(gr[a_off + hv], a_log[hv], dt_bias[hv]));
+        const float beta = tessl_sigmoid(gr[b_off + hv]);
+
+        // kv_mem = (decay * S)^T k
+        float kv = 0.0f;
+        for (uint i = 0u; i < GDN_SIMD_ROWS; ++i) {
+            kn[i] *= rk;
+            s[i] *= decay;
+            kv += s[i] * kn[i];
+        }
+        const float delta = beta * (qkv[row * (ulong)ld_qkv + v_off + (ulong)hv * Dv + v] - simd_sum(kv));
+
+        // S += k delta^T; y = S^T q
+        float y = 0.0f;
+        for (uint i = 0u; i < GDN_SIMD_ROWS; ++i) {
+            s[i] += kn[i] * delta;
+            y += s[i] * (qv[i] * rq);
+        }
+        y = simd_sum(y);
+        if (lane == 0u) {
+            out[row * (ulong)ld_out + out_off + (ulong)hv * Dv + v] = y;
+        }
+    }
+
+    if ((flags & 2u) != 0u) {
+        const ulong head = (ulong)b * Hv + hv;
+        for (uint i = 0u; i < GDN_SIMD_ROWS; ++i) {
+            state_out[head * GDN_DK * Dv + (ulong)(lane + 32u * i) * Dv + v] = s[i];
+        }
+    }
+}
+
 // --------------------------------------------------------- gated RMSNorm ---
 
 /// `out = rms_norm(x) * w * silu(z)` per head: transformers'

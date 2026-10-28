@@ -8,6 +8,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`gdn_recurrent_simd` / `gdn_recurrent_simd_with`: the GDN recurrence with mlx-lm's
+  decomposition** (one simdgroup per group of value columns, no barrier), three
+  kernels (`qwen35_gdn_recurrent_simd`, `_l8_vec`, `_pre_l8_vec` with its
+  `qwen35_gdn_simd_prep` pass) taking `gdn_recurrent`'s inputs and agreeing with it to
+  rounding (about 2e-7 of the output scale; summation order differs, so not bitwise).
+  Not called by `Qwen35Model`. Measured in
+  `bench/results/qwen35_gdn_simd_ab_m5pro.txt`: mlx's 32-lanes-a-column mapping as it is
+  is slower than `gdn_recurrent` at every length; the 8-lane, `float4`-load kernel with
+  the gates and norms computed once per (token, value head) takes 0.63x / 0.76x / 0.83x
+  / 0.85x of `gdn_chunk_forward`'s time at T = 200 / 1024 / 4096 / 8192 on the 2B's GDN
+  shape (f32, batch 1, async timing, GPU near idle). Wiring needs the model-level
+  logit gate. Tests: `tests/qwen35_kernels.rs` (f64 reference across shapes and
+  lengths, gain extremes, NaN/inf pattern equal to `gdn_recurrent`'s, pipeline-ran
+  trace, a bound that can fail, float4-alignment refusal), emulator cases in
+  `tools/msl_emu/check_qwen35.py`, rig `tests/qwen35_gdn_simd_ab.rs`.
 - **`Qwen35Model::train_step_fused_adamw`** (card ft-dafde7719192ece85330e1df5db96e05):
   `train_step_into` then `adamw_step` without the gradient bank. The backward
   updates each layer from a gradient scratch the pool reuses from layer to layer,

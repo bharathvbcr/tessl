@@ -1190,6 +1190,11 @@ impl Qwen35Model {
         self
     }
 
+    /// The GDN kernel this model's prefills run.
+    pub fn gdn_prefill(&self) -> GdnPrefillKernel {
+        self.gdn_prefill
+    }
+
     pub fn config(&self) -> &Qwen35Config {
         &self.cfg
     }

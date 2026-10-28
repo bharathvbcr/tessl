@@ -6,7 +6,8 @@
 //! cargo run --release --bin bench_qwen35_layers -- 1024 4096    # chosen T
 //! cargo run --release --bin bench_qwen35_layers -- --check-only # gate, no timing
 //! cargo run --release --bin bench_qwen35_layers -- --weights=DIR 8192   # real checkpoint
-//! cargo run --release --bin bench_qwen35_layers -- --gdn-scan32 # the other GDN scan slice
+//! cargo run --release --bin bench_qwen35_layers -- --gdn-chunked # prefill GDN on the chunked rule
+//! cargo run --release --bin bench_qwen35_layers -- --gdn-scan32 # chunked, the other scan slice
 //! cargo run --release --bin bench_qwen35_layers -- --iters=11   # samples per timing
 //! cargo run --release --bin bench_qwen35_layers -- --decode=4096  # prefill + per-token decode
 //! cargo run --release --bin bench_qwen35_layers -- --model-forward 1024 2048  # METRIC lines only
@@ -25,9 +26,11 @@
 //! own. Weights are `Qwen35Model::random` (seeded, bf16, with the packed LM head)
 //! unless `--weights=DIR` names a Qwen3.5 checkpoint directory (its
 //! `config.json` and the one `*.safetensors` file in it, tensors under
-//! `model.language_model.`), which is loaded at bf16 with the head. The GDN
-//! scan uses the library's default slice (`GdnScanSlice::default()`, Cols16);
-//! `--gdn-scan32` selects the other. Both are bit-identical.
+//! `model.language_model.`), which is loaded at bf16 with the head. The prefill
+//! GDN is the library's default (`GdnPrefillKernel::default()`, the simd
+//! recurrence); `--gdn-chunked` selects the chunked rule at the default scan
+//! slice (Cols16) and `--gdn-scan32` the chunked rule at the other slice
+//! (bit-identical to Cols16).
 //!
 //! What is timed, per T, with async encode (one command buffer per forward),
 //! `--iters` samples (default 7) after 2 warm-ups, as min and median:
@@ -932,7 +935,7 @@ fn run_paired_gate_up(rt: &Arc<GpuRuntime>, ts: &[usize]) -> Res<()> {
 use std::path::{Path, PathBuf};
 
 use tessl::infer_trace;
-use tessl::qwen35_model::{LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
+use tessl::qwen35_model::{GdnPrefillKernel, LayerKind, LayerPart, LogitRows, Precision, Qwen35Config, Qwen35Model};
 use tessl::safetensors::SafeTensors;
 
 /// Where the model's weights come from.
@@ -948,7 +951,7 @@ enum Weights {
 /// What the run was asked to time, from the command line.
 struct Opts {
     weights: Weights,
-    scan: qwen35::GdnScanSlice,
+    gdn: GdnPrefillKernel,
     /// Samples per timing (after `WARMUP` warm-ups).
     iters: usize,
     /// `--ids=FILE`, the `--prefill-score` ids file.
@@ -1008,7 +1011,9 @@ fn build_model(rt: &Arc<GpuRuntime>, o: &Opts) -> Res<Qwen35Model> {
         t0.elapsed().as_secs_f64(),
         model.describe()
     );
-    Ok(model.with_gdn_scan_slice(o.scan))
+    let model = model.with_gdn_prefill(o.gdn);
+    println!("gdn prefill: {:?}", model.gdn_prefill());
+    Ok(model)
 }
 
 /// Deterministic token ids below `vocab`.
@@ -2251,7 +2256,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_forward = false;
     let mut opts = Opts {
         weights: Weights::Random,
-        scan: qwen35::GdnScanSlice::default(),
+        gdn: GdnPrefillKernel::default(),
         iters: ITERS,
         ids: None,
     };
@@ -2293,8 +2298,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             attn_tiles = true;
         } else if arg == "--paired-attn-bf16" {
             attn_bf16 = true;
+        } else if arg == "--gdn-chunked" {
+            opts.gdn = GdnPrefillKernel::Chunked(qwen35::GdnScanSlice::default());
         } else if arg == "--gdn-scan32" {
-            opts.scan = qwen35::GdnScanSlice::Cols32;
+            opts.gdn = GdnPrefillKernel::Chunked(qwen35::GdnScanSlice::Cols32);
         } else if let Some(n) = arg.strip_prefix("--iters=") {
             iters_given = true;
             opts.iters = n
@@ -2311,7 +2318,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let t: usize = arg.parse().map_err(|_| {
                 format!(
                     "expected a token count, --check-only, --paired-attn, --attn-tiles, --paired-attn-bf16, --paired-gdn-recurrent, --paired-gate-up, \
-                     --model-forward, --prefill-score, --stage-profile, --ids=FILE, --weights=DIR, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
+                     --model-forward, --prefill-score, --stage-profile, --ids=FILE, --weights=DIR, --gdn-chunked, --gdn-scan32, --iters=N or --decode[=P], got {arg:?}"
                 )
             })?;
             if t == 0 {
@@ -2398,8 +2405,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--ids applies to --prefill-score and --stage-profile only".into());
     }
     let paired = paired_attn || attn_tiles || attn_bf16 || paired_rec || paired_gate_up;
-    if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.scan != qwen35::GdnScanSlice::default()) {
-        return Err("--weights and --gdn-scan32 apply to the model lanes, not --paired-*".into());
+    if paired && (matches!(opts.weights, Weights::Dir { .. }) || opts.gdn != GdnPrefillKernel::default()) {
+        return Err("--weights, --gdn-chunked and --gdn-scan32 apply to the model lanes, not --paired-*".into());
     }
     if paired_gate_up {
         let rt = GpuRuntime::new()?;
@@ -2445,7 +2452,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     print_power_state();
-    println!("gdn scan: {:?}", opts.scan);
     println!(
         "weights: {}",
         match &opts.weights {

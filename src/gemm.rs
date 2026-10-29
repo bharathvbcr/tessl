@@ -2242,6 +2242,77 @@ pub fn gemm_nt_bf16(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), Stri
     dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT)
 }
 
+/// `C[M,N] = round_opt(f32(A[M,K] @ B[N,K]^T) + bias[N])` in one dispatch: the
+/// bf16 NT GEMM of [`gemm_nt_bf16`] whose register epilogue adds the f32
+/// per-column `bias` and, with `round_bf16`, rounds each element to the
+/// nearest bf16 (ties to even) and widens it back, so C is f32 holding bf16
+/// values. The separate form is [`gemm_nt_bf16`], a bias-add pass and
+/// [`cast_f32_to_bf16_into`] then [`cast_bf16_to_f32_into`]: two more
+/// round-trips through C's memory that this does in registers.
+///
+/// Bit-identical to that sequence (`tests/gemm_nt_bf16_bias.rs`). The kernel
+/// (`matmul2d_tensorops_nt_bf16_f32_bias`) is `gemm_nt_bf16`'s own `mm_coop`
+/// instantiation (128x64 sg4, same descriptor, operand views and tile walk)
+/// with the epilogue on: the epilogue runs after the K reduction returns,
+/// reads no accumulator state `gemm_nt_bf16` does not also hold, and keeps
+/// the bias add a single f32 add (no fma contraction).
+///
+/// `bias` is f32 with exactly N elements. A and B follow [`gemm_nt_bf16`]:
+/// bf16 as they are, f32 rounded to bf16 first.
+pub fn gemm_nt_bf16_bias(
+    a_mk: &Tensor,
+    b_nk: &Tensor,
+    c: &Tensor,
+    bias: &Tensor,
+    round_bf16: bool,
+) -> Result<(), String> {
+    const ENTRY: &str = "gemm_nt_bf16_bias";
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, true, ENTRY)?;
+    let rt = a_mk.runtime();
+    check_bf16_lane(rt, c, ENTRY)?;
+    bias.validate()?;
+    if bias.dtype != DType::F32 {
+        return Err(format!("{ENTRY}: bias must be f32, got {:?}", bias.dtype));
+    }
+    if !std::sync::Arc::ptr_eq(rt, bias.runtime()) {
+        return Err(format!("{ENTRY}: bias belongs to a different runtime"));
+    }
+    if bias.numel() != n {
+        return Err(format!(
+            "{ENTRY}: bias is per-column and must hold exactly N = {n} elements, got {}",
+            bias.numel()
+        ));
+    }
+    require_view_alignment(bias, ENTRY, "bias")?;
+    // The bias is read while C is stored, by threadgroups that run apart.
+    if bias.overlaps(c) {
+        return Err(format!("{ENTRY}: bias must not overlap the output"));
+    }
+    let a_bf = ensure_bf16(a_mk)?;
+    let b_bf = ensure_bf16(b_nk)?;
+    let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32_bias")?;
+    let tile = TILE_COOP_TN_NT;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
+    let tg = morton_tg_count(tiles_n, tiles_m);
+    let tpt = threads_per_tg(&pipeline, tile);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&pipeline);
+        bnd.bind_tensor(&a_bf, 0);
+        bnd.bind_tensor(&b_bf, 1);
+        bnd.bind_tensor(c, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(tiles_n as u32, 6);
+        bnd.bind_u32(tiles_m as u32, 7);
+        bnd.bind_tensor(bias, 8);
+        bnd.bind_u32(u32::from(round_bf16), 9);
+        bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
+}
+
 /// `C += A[K,M]^T @ B[K,N]` on the accumulate kernels, C not zeroed: bf16
 /// operands (f32 ones rounded first) or exact f32. Validation is the
 /// caller's. Tall-K, small-MN shapes ([`prefer_tn_splitk`]) take a split-K

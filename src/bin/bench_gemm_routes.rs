@@ -60,9 +60,9 @@ use objc2_metal::MTLComputePipelineState;
 use std::sync::Arc;
 use tessl::bert::bias_add;
 use tessl::gemm::{
-    cast_bf16_to_f32_into, cast_f32_to_bf16, cast_f32_to_bf16_into, cast_f32_to_f16, gemm, gemm_batched,
-    gemm_epilogue, gemm_nn_splitk_par_f32, gemm_nt_bf16, gemm_nt_bf16_bias, gemm_nt_f32, gemm_small_m, gemm_tiled,
-    gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
+    cast_bf16_to_f32_into, cast_f32_to_bf16, cast_f32_to_bf16_into, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue,
+    gemm_nn_splitk_par_f32, gemm_nt_bf16, gemm_nt_bf16_bias, gemm_nt_f32, gemm_small_m, gemm_tiled, gemm_tn_bf16,
+    Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
 };
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;

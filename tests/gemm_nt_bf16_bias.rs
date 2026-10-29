@@ -55,20 +55,20 @@ fn case(rt: &Arc<GpuRuntime>, (m, n, k): (usize, usize, usize)) -> Case {
         }
     }
     let edge_biases: [f32; 14] = [
-        3.4e38,                          // rounds up to Inf as a bf16
-        3.39e38,                         // stays finite as a bf16
-        -3.4e38,                         // rounds to -Inf
-        f32::from_bits(0x0000_0001),     // smallest f32 subnormal
-        f32::from_bits(0x007f_ffff),     // largest f32 subnormal
-        f32::from_bits(0x8040_0000),     // a negative subnormal
-        f32::from_bits(0x0080_0000),     // smallest normal
-        -0.0,                            // a signed zero
-        f32::NAN,                        // a NaN bias
-        f32::from_bits(0x3f80_8000),     // 1 + 2^-8: a tie, rounds to even (1.0)
-        f32::from_bits(0x3f81_8000),     // 1 + 3 * 2^-8: a tie, rounds up to even
-        f32::from_bits(0x3f80_8001),     // just above a tie
-        f32::INFINITY,                   // an infinite bias
-        1.0e-30,                         // a small normal
+        3.4e38,                      // rounds up to Inf as a bf16
+        3.39e38,                     // stays finite as a bf16
+        -3.4e38,                     // rounds to -Inf
+        f32::from_bits(0x0000_0001), // smallest f32 subnormal
+        f32::from_bits(0x007f_ffff), // largest f32 subnormal
+        f32::from_bits(0x8040_0000), // a negative subnormal
+        f32::from_bits(0x0080_0000), // smallest normal
+        -0.0,                        // a signed zero
+        f32::NAN,                    // a NaN bias
+        f32::from_bits(0x3f80_8000), // 1 + 2^-8: a tie, rounds to even (1.0)
+        f32::from_bits(0x3f81_8000), // 1 + 3 * 2^-8: a tie, rounds up to even
+        f32::from_bits(0x3f80_8001), // just above a tie
+        f32::INFINITY,               // an infinite bias
+        1.0e-30,                     // a small normal
     ];
     for (j, &v) in edge_biases.iter().enumerate().take(n) {
         bias_h[j] = v;
@@ -103,7 +103,9 @@ fn fused(rt: &Arc<GpuRuntime>, c: &Case, (m, n): (usize, usize), round: bool) ->
 
 fn assert_bit_identical(tag: &str, n: usize, got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len(), "{tag}: lengths");
-    let bad: Vec<usize> = (0..got.len()).filter(|&i| got[i].to_bits() != want[i].to_bits()).collect();
+    let bad: Vec<usize> = (0..got.len())
+        .filter(|&i| got[i].to_bits() != want[i].to_bits())
+        .collect();
     if let Some(&i) = bad.first() {
         panic!(
             "{tag}: {} of {} elements differ; first at [{}, {}]: fused {} ({:#010x}) vs three-step {} ({:#010x})",
@@ -197,9 +199,8 @@ fn refuses_a_bias_that_is_not_f32_n_long_or_disjoint_from_c() {
         let (m, n, k) = (64, 64, 64);
         let c = case(rt, (m, n, k));
         let out = rt.alloc_tensor_f32(&[m, n]).expect("alloc");
-        let refused = |bias: &Tensor, out: &Tensor| {
-            gemm_nt_bf16_bias(&c.a, &c.b, out, bias, true).expect_err("must refuse")
-        };
+        let refused =
+            |bias: &Tensor, out: &Tensor| gemm_nt_bf16_bias(&c.a, &c.b, out, bias, true).expect_err("must refuse");
         let short = tensor_f32(rt, &[n - 1], &vec![0.0; n - 1]);
         assert!(refused(&short, &out).contains("exactly N = 64"), "short bias");
         let long = tensor_f32(rt, &[n + 1], &vec![0.0; n + 1]);

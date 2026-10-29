@@ -587,18 +587,18 @@ TN_NT_COOP_KERNEL(matmul2d_tensorops_nt_bf16_f32,       mm_nt_coop_bf16, 128, 64
 TN_NT_COOP_KERNEL(matmul2d_tensorops_tn_accum_bf16_f32, mm_tn_coop_bf16,  64, 64, 4, true)
 TN_NT_COOP_KERNEL(matmul2d_tensorops_nt_accum_bf16_f32, mm_nt_coop_bf16,  64, 64, 4, true)
 
-/// NT bf16 with a per-column f32 bias and an optional bf16 round, in the
-/// register epilogue: `C = round_opt(f32(A @ B^T) + bias[n])`, stored f32.
-/// The body is `matmul2d_tensorops_nt_bf16_f32`'s own instantiation of
-/// `mm_coop` (same descriptor, tile, views and walk, so the same K reduction)
-/// with EPILOGUE on and STRICT on: the bias add is its own f32 rounding, as
-/// the separate `bias_add` pass does it, and a nonzero `round_bf16` then
-/// rounds to the nearest bf16 (ties to even) and widens back, as
-/// `cast_f32_to_bf16` + `cast_bf16_to_f32` do. alpha = 1, beta = 0 and no
-/// activation, so the scale and accumulate steps do not run.
-#define NT_COOP_BIAS_KERNEL(NAME, SM, SN, NSG)                                 \
-    kernel void NAME(device bfloat *A [[buffer(0)]],                           \
-                     device bfloat *B [[buffer(1)]],                           \
+/// NT with a per-column f32 bias and an optional bf16 round, in the register
+/// epilogue: `C = round_opt(f32(A @ B^T) + bias[n])`, stored f32. The body is
+/// `matmul2d_tensorops_nt_bf16_f32`'s own instantiation of `mm_coop` (same
+/// descriptor, tile, views and walk, so the same K reduction) with EPILOGUE on;
+/// STRICT keeps the bias add its own f32 rounding, as the separate `bias_add`
+/// pass does it, and a nonzero `round_bf16` then rounds to the nearest bf16
+/// (ties to even) and widens back, as `cast_f32_to_bf16` +
+/// `cast_bf16_to_f32` do. alpha = 1, beta = 0 and no activation, so the scale
+/// and accumulate steps do not run.
+#define NT_COOP_EPI_KERNEL(NAME, ELEM, SM, SN, NSG, STRICT)                    \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
                      device float *C [[buffer(2)]],                            \
                      constant uint &M [[buffer(3)]],                           \
                      constant uint &N [[buffer(4)]],                           \
@@ -608,9 +608,10 @@ TN_NT_COOP_KERNEL(matmul2d_tensorops_nt_accum_bf16_f32, mm_nt_coop_bf16,  64, 64
                      device const float *bias [[buffer(8)]],                   \
                      constant uint &round_bf16 [[buffer(9)]],                  \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_coop<bfloat, SM, SN, NSG, false, true, false, false, true,          \
-                walk_by_b, true>(A, B, C, M, N, K, tiles_n, tiles_m, tgpig,    \
-                                 bias, 1.0f, 0.0f, GEMM_ACT_NONE, round_bf16); \
+        mm_coop<ELEM, SM, SN, NSG, false, true, false, false, true,            \
+                walk_by_b, STRICT>(A, B, C, M, N, K, tiles_n, tiles_m, tgpig, \
+                                   bias, 1.0f, 0.0f, GEMM_ACT_NONE,            \
+                                   round_bf16);                                \
     }
 
-NT_COOP_BIAS_KERNEL(matmul2d_tensorops_nt_bf16_f32_bias, 128, 64, 4)
+NT_COOP_EPI_KERNEL(matmul2d_tensorops_nt_bf16_f32_bias, bfloat, 128, 64, 4, true)

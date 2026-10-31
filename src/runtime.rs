@@ -36,10 +36,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
+/// Public so a client that budgets against the arena (ojas-metal's inline
+/// uploads) derives its share from this number instead of copying it.
 // 31B dense decode packs hundreds of binder consts across mid-commits within a
 // token before a waiting sync; 1 MiB exhausted mid-token. 16 MiB covers full
 // product shapes with headroom (still tiny vs Hot weight residency).
-const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
+pub const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
 
 /// Arena headroom a binder scope may still fill after it opens.
 ///

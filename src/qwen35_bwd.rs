@@ -32,9 +32,13 @@ const MAX_COLS: u32 = 16;
 /// Rows per threadgroup of the RMSNorm backward.
 const RMS_ROWS_PER_BLOCK: u32 = 32;
 /// (row, head) units per threadgroup of the gated-norm backward, and its
-/// fixed threadgroup size (`GATED_BWD_SG` simdgroups).
-const GATED_UNITS_PER_BLOCK: u32 = 64;
+/// fixed threadgroup size (`GATED_BWD_SG` simdgroups). Public because the
+/// scratch [`gated_rms_norm_bwd_part_len`] counts is one row of `dim` per
+/// block, which a caller sizing it without a runtime (ojas-metal) must agree on.
+pub const GATED_UNITS_PER_BLOCK: u32 = 64;
 const GATED_THREADS: usize = 128;
+/// Widest row [`gated_rms_norm_bwd`] takes: 32 lanes of [`MAX_COLS`] columns.
+pub const GATED_RMS_BWD_MAX_DIM: u32 = 32 * MAX_COLS;
 
 /// Whether two windows of `rows` rows can touch the same element. Windows of
 /// one buffer with the same row stride are disjoint exactly when their column
@@ -184,10 +188,9 @@ pub fn gated_rms_norm_bwd(
     eps: f32,
 ) -> Result<(), String> {
     const WHAT: &str = "qwen35_bwd::gated_rms_norm_bwd";
-    if heads == 0 || dim == 0 || dim > 32 * MAX_COLS {
+    if heads == 0 || dim == 0 || dim > GATED_RMS_BWD_MAX_DIM {
         return Err(format!(
-            "{WHAT}: heads must be non-zero and dim in 1..={}",
-            32 * MAX_COLS
+            "{WHAT}: heads must be non-zero and dim in 1..={GATED_RMS_BWD_MAX_DIM}"
         ));
     }
     if !(eps.is_finite() && eps > 0.0) {
@@ -351,9 +354,11 @@ pub fn attn_gate_bwd(
 }
 
 /// Flattened `batch * seq` rows per weight-gradient block of the conv backward.
-const CONV_ROWS_PER_BLOCK: u32 = 256;
+/// Public so a caller can size [`conv1d_silu_bwd_part_len`]'s scratch without
+/// a runtime (ojas-metal does, and refuses before any device call).
+pub const CONV_ROWS_PER_BLOCK: u32 = 256;
 /// Largest conv kernel width (`CONV_BWD_MAX_KW` in the kernel).
-const CONV_MAX_KW: u32 = 8;
+pub const CONV_MAX_KW: u32 = 8;
 // The backward runs every width the forward does, which the config checks.
 const _: () =
     assert!(*crate::qwen35::CONV_KERNEL_WIDTHS.start() == 2 && *crate::qwen35::CONV_KERNEL_WIDTHS.end() == CONV_MAX_KW);
@@ -985,4 +990,42 @@ pub fn copy_cols(rt: &Arc<GpuRuntime>, src: Cols<'_>, dst: Cols<'_>, rows: u32, 
         set_u32(bnd, dst.ld, 6);
         set_u32(bnd, dst.off, 7);
     })
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The constants this module exports are what the kernel was compiled
+    /// with: ojas-metal sizes scratch from them without a runtime, so a kernel
+    /// edit that moves one must fail here, not in a caller's budget.
+    #[test]
+    fn exported_layout_matches_the_kernel_source() {
+        let src = include_str!("../kernels/qwen35_bwd.metal");
+        for line in [
+            format!("constant uint CONV_BWD_MAX_KW = {CONV_MAX_KW};"),
+            format!("constant uint BWD_MAX_COLS = {MAX_COLS};"),
+        ] {
+            assert!(src.contains(&line), "kernel source no longer has `{line}`");
+        }
+        assert_eq!(GATED_RMS_BWD_MAX_DIM, 32 * MAX_COLS);
+    }
+
+    /// The scratch counts are whole blocks of the exported block sizes: one
+    /// row of `dim` (gated norm) or of `channels * width` (conv) per block.
+    #[test]
+    fn part_lens_are_whole_blocks_of_the_exported_sizes() {
+        for rows in [0u32, 1, 63, 64, 65, 1000] {
+            assert_eq!(
+                gated_rms_norm_bwd_part_len(rows, 1, 48),
+                rows.div_ceil(GATED_UNITS_PER_BLOCK) as usize * 48
+            );
+        }
+        for rows in [0u32, 1, 255, 256, 257, 4096] {
+            assert_eq!(
+                conv1d_silu_bwd_part_len(1, rows, 12, 4),
+                rows.div_ceil(CONV_ROWS_PER_BLOCK) as usize * 12 * 4
+            );
+        }
+    }
 }

@@ -25,12 +25,6 @@ All notable changes to `tessl` are recorded here. The format follows
   identity across preserving choices (`AutoCoopTile` vs `ForcedMatchingCoopTile`), while changing
   choices (`PreferTnSplitk`, `SplitKVersusOneLaunch`, `EpiTileWidth`, `Dtype`) are explicitly
   documented as arithmetic-altering.
-- **Residency set tracking and allocator lifecycle hardening** (`src/runtime.rs`, `tests/runtime_lifecycle.rs`).
-  Explicit buffer residency tracking via `alloc_buffer_hot` and `alloc_buffer_cold` using a single
-  `MTLResidencySet` (hot weights/grads/opt/EMA vs cold tape); allocator timeout streak resets on completed
-  wait; `set_wired_fraction` refuses poisoned memory-info locks and non-finite inputs; ICB replay
-  barrier ordering preserves barriers before later reads when intermediate immediate binds occur
-  (`tests/icb_replay_barriers.rs`).
 - **Qwen Q4 $M > 8$ TensorOps GEMM routing** (`src/qwen35_q4.rs`, `src/qwen35_model.rs`).
   Qwen Q4 with $M > 8$ routes to `nn::gemm_q4_mlx_tensorops` (`Q4Weight::matmul`, `project_residual`).
   $M = 1$ remains on `gemv_q4_mlx_simd` and $M \in 2..=8$ stays on `gemm_q4_mlx`.
@@ -175,6 +169,11 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **`synchronize` with no open batch consumes a queued commit fault** (`src/runtime.rs`).
+  A waiting commit with no batch returned before `observe_finished_feedback`, so a
+  `MTL4CommitFeedback` fault requeued after the batch was cleared stayed on its allocator
+  until some later encode. It now poisons at that `synchronize`.
+  `synchronize_with_no_open_batch_consumes_a_queued_commit_fault`.
 - **Q4 checkpoint gate fails closed when checkpoint is missing** (`tests/qwen35_model.rs`, card ft-e501914a31ee5eea0177488dd1e53cd7).
   `q4_checkpoint_gate` reports `COULD NOT RUN: MLX Q4 checkpoint is missing (config.json is missing)`
   and fails closed in `logit_deviation_report` when `config.json` is absent, preventing an
@@ -227,6 +226,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **The third consecutive SharedEvent wait-budget timeout poisons the runtime** (`src/runtime.rs`).
+  One or two consecutive budget timeouts still return the `is_event_wait_timeout` error and
+  leave the runtime usable. The third poisons it with a `Metal 4 DeviceLost` cause, which is
+  not that error, so a caller retrying on `is_event_wait_timeout` stops. A wait that reaches
+  its value clears the streak, and a poisoned runtime refuses a wait without spending another
+  budget. `three_consecutive_wait_timeouts_poison_the_runtime`,
+  `a_completed_wait_clears_the_timeout_streak`.
+- **`GpuRuntime::set_wired_fraction` returns `Result<(), String>`** (breaking; `src/runtime.rs`).
+  A non-finite fraction is refused and the stored budget is left as it was (`f64::clamp`
+  kept NaN, and `NaN as u64` stored 0); a poisoned `memory_info` lock is an error. A finite
+  fraction is still clamped to 0.5–0.95. `wired_budget` is printed by the arch02 train
+  banner and is not an admission cap. ojas arch02 `train` takes the `?` (ojas `3d709be`).
+  `tests/runtime_lifecycle.rs` asserts the exact 0.95 clamp and the three non-finite refusals.
 - **`Qwen35Model` prefill: the bf16 attention tile by default; the simd GDN recurrence opt-in**
   (`src/qwen35_model.rs`). `Precision::Bf16` prefill (and staged prefill) casts Q, K and V
   to bf16 once (`attn_prefill_bf16::cast_f32_to_bf16`) and runs

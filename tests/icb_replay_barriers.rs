@@ -134,9 +134,10 @@ fn the_last_unmarked_command_still_orders_the_next_scope() {
 /// `[A write (barrier_after=false), Immediate, B (barrier_after=true), A read]`
 /// keeps the barrier before the A read.
 ///
-/// `elide_non_interfering_barriers` used to clear its open span on an Immediate
-/// bind, so that barrier could be dropped across the earlier write to A. Replay
-/// emits the captured markers, and the one `true` is the barrier before the read.
+/// The Immediate bind gives the second command no known buffer set. Replay has
+/// emitted the captured markers as they are since the barrier-elision pass was
+/// removed (575923d); this pins that nothing between them drops the one `true`,
+/// which is the only barrier between the write to A and its read.
 #[test]
 fn an_immediate_bind_keeps_the_barrier_before_the_later_read() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());

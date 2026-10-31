@@ -500,17 +500,6 @@ fn fixture(name: &str) -> std::ffi::CString {
     std::ffi::CString::new(p.to_str().unwrap()).unwrap()
 }
 
-fn fixture_ids() -> Vec<u32> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train/ids.npy");
-    tessl::npy::read_npy(&p)
-        .unwrap()
-        .i64_slice()
-        .unwrap()
-        .iter()
-        .map(|&x| x as u32)
-        .collect()
-}
-
 fn load_model(rt: *mut TesslRuntime) -> *mut TesslQwen35 {
     load_model_as(rt, TESSL_F32)
 }
@@ -900,7 +889,6 @@ fn a_fresh_runtime_on_the_poisoned_thread_loads_and_runs_a_model() {
     let b = Handle::new();
     assert_eq!(poisoned(b.0), 0);
     let model = load_model(b.0);
-    let ids = fixture_ids();
     assert!(param_count(model) > 0, "the model on the fresh runtime has a parameter table");
     assert_eq!(poisoned(b.0), 0);
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
@@ -1351,7 +1339,7 @@ fn set_async_encode_validates_and_toggles_the_runtime() {
     assert!(rt.async_encode_enabled());
     assert_eq!(set_async(&handle, 0), TESSL_OK);
     assert!(!rt.async_encode_enabled());
-    assert_eq!(TESSL_ABI_VERSION, 13);
+    assert_eq!(TESSL_ABI_VERSION, 14);
 }
 
 /// Turning async encode off with work encoded and not yet waited for returns

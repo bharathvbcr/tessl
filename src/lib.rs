@@ -269,6 +269,7 @@ mod par_batch;
 #[cfg(test)]
 mod parser_mutation;
 mod plain;
+pub mod pool_ledger;
 pub mod qwen35;
 pub mod qwen35_adamw;
 pub mod qwen35_bwd;
@@ -301,6 +302,7 @@ pub use icb_smoke::{icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBin
 #[cfg(feature = "quant-prep")]
 pub use mtl_tensor::{nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED};
 pub use ops::softcap_f32;
+pub use pool_ledger::{LedgerClass, LedgerRefused, PoolLedger, PoolResident};
 pub use runtime::{
     is_allocation_failure, AllocFailure, BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode,
 };

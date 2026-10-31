@@ -73,11 +73,18 @@ pub(crate) struct PooledBuffer {
     /// address is fixed for the object's lifetime, so every bind reads this
     /// instead of sending `gpuAddress` again.
     pub(crate) gpu_addr: u64,
+    /// The pool's byte ledger when one was installed at allocation. It lets a
+    /// buffer that outlives its runtime hand its live charge back, since no
+    /// runtime is left to do it.
+    pub(crate) ledger: Option<Arc<dyn crate::pool_ledger::PoolLedger>>,
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         let Some(rt) = self.runtime.upgrade() else {
+            if let Some(ledger) = &self.ledger {
+                ledger.release(crate::pool_ledger::LedgerClass::Live, self.buffer.length() as u64);
+            }
             return;
         };
         // Keep the MTLBuffer alive until after CB completion via the runtime's
@@ -693,6 +700,7 @@ impl Tensor {
                 kind: BufferKind::External,
                 runtime: weak,
                 gpu_addr,
+                ledger: None,
             }),
         };
         Self::from_buffer(runtime, gpu_buf, shape, dtype, byte_offset)

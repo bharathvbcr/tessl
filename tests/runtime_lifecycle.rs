@@ -59,10 +59,17 @@ fn runtime_reports_a_usable_device_and_budget() {
         );
         assert!(info.pool_cache_cap > 0, "pool cache starts disabled");
 
-        // `set_wired_fraction` clamps to [0.5, 0.95]; an unclamped 2.0 would
-        // hand the caller a budget larger than the device reported.
-        rt.set_wired_fraction(2.0);
-        assert!(rt.memory_info().wired_budget <= info.recommended_working_set);
+        // 2.0 clamps to 0.95. `<= recommended` is not enough: the default 0.9×
+        // already satisfies it, so a setter that does nothing still passes.
+        let recommended = info.recommended_working_set;
+        let clamped = ((recommended as f64) * 0.95) as u64;
+        rt.set_wired_fraction(2.0).expect("2.0 clamps");
+        assert_eq!(rt.memory_info().wired_budget, clamped);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = rt.set_wired_fraction(bad).expect_err("non-finite fraction");
+            assert!(err.contains("finite"), "{err}");
+            assert_eq!(rt.memory_info().wired_budget, clamped, "{bad}");
+        }
     });
 }
 

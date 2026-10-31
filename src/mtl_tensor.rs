@@ -62,10 +62,11 @@ impl QuantDType {
 ///
 /// `MTLTensorDataType::Int4` is not bound in objc2-metal 0.3, which gates only the
 /// host-created `MTLTensor` descriptor path; TensorOps itself accepts
-/// `int4b_format`. verify(M) remains on hand simdgroup Q4 GEMM
-/// (`gemm_q4_mlx_simd*`) because no quantized TensorOps prefill GEMM is wired
-/// ([`QUANT_PREFILL_GEMM_WIRED`]). DDTree stays parked until verify(M) flattens (it will
-/// not with current simdgroup Q4 alone).
+/// `int4b_format`. Qwen Q4 with `M > 8` calls
+/// [`crate::nn::gemm_q4_mlx_tensorops`]. `M == 1` stays on `gemv_q4_mlx_simd`
+/// and `M` in `2..=8` stays on `gemm_q4_mlx`. [`QUANT_PREFILL_GEMM_WIRED`] stays
+/// false because this module's host descriptor path is not that GEMM and the
+/// kernel has not been timed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NaxVerifyReadiness {
     pub int8_tensorops_dtype: bool,
@@ -82,12 +83,13 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         int4_tensorops_dtype: QuantDType::Int4.to_mtl().is_ok(),
         fp8_e8m0_tensorops_dtype: QuantDType::Fp8E8M0.to_mtl().is_ok(),
         // Const, not a call into a stub that returns `Err` so this can read
-        // `.is_ok()` off it. There is one fact here — quantized TensorOps
-        // prefill GEMM does not exist — and it is stated once.
+        // `.is_ok()` off it. The host MTLTensor Int4 path is unwired. Qwen Q4
+        // with M>8 calls gemm_q4_mlx_tensorops; that kernel is not yet timed.
         quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
         note: "MTLTensorDataType::Int4 is not bound in objc2-metal 0.3, which gates only host-created MTLTensor \
-               descriptors (TensorOps itself accepts int4b_format); verify(M) = hand simdgroup Q4 because no \
-               quantized TensorOps prefill GEMM is wired",
+               descriptors (TensorOps itself accepts int4b_format). Qwen Q4 with M>8 calls nn::gemm_q4_mlx_tensorops; \
+               M==1 stays on gemv_q4_mlx_simd and M in 2..=8 stays on gemm_q4_mlx. QUANT_PREFILL_GEMM_WIRED stays false \
+               because that host descriptor path is unwired and the TensorOps Q4 GEMM is not yet timed.",
     }
 }
 
@@ -128,18 +130,19 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 /// int8 x int4b -> int32, uint8 x uint4b -> int32); a 4-bit LHS, or an unlisted
 /// pair such as half x uint4b -> int32, fails with "Unsupported type"
 /// (`MPPTensorOpsMatMul2dImpl.h:13811`). The nibble order inside a byte is not
-/// stated in any header and was not measured; tessl's own order (low nibble
-/// first, unsigned for MLX) must be confirmed on a GPU before any use. The
-/// per-group MLX scale and bias are not part of the operand, so a Q4 prefill
-/// GEMM needs a per-group `matmul2d` plus a register epilogue (the probe's
-/// `MLX_GROUP_LOOP` variant compiles that shape).
+/// stated in any header. It was measured on a GPU (`tests/int4b_tensorops.rs`:
+/// low nibble first, `int4b` two's complement). The per-group MLX scale and
+/// bias are not part of the operand, so the Q4 GEMM is one `matmul2d` per K
+/// group plus a register epilogue (the probe's `MLX_GROUP_LOOP` variant
+/// compiles that shape).
 ///
-/// Since measured on a GPU (`tests/int4b_tensorops.rs`: low nibble first,
-/// `int4b` two's complement, per-group parity with `nn::gemm_q4_mlx`), the
-/// shape is built as the opt-in [`crate::nn::gemm_q4_mlx_tensorops`]
-/// (`kernels/gemm_q4_mlx_tensorops.metal`, in-kernel `xsum`). This flag stays
-/// `false`: it records that no *routing* uses a quantized TensorOps GEMM, and
-/// nothing has been timed.
+/// That GEMM is [`crate::nn::gemm_q4_mlx_tensorops`]
+/// (`kernels/gemm_q4_mlx_tensorops.metal`, in-kernel `xsum`). Qwen Q4 with
+/// `M>8` calls it (`Q4Weight::matmul`, `project_residual`). `M==1` stays on
+/// `gemv_q4_mlx_simd` and `M` in `2..=8` stays on `gemm_q4_mlx`. This flag
+/// stays `false` because the host `MTLTensor` descriptor path still has no
+/// Int4 constructor, and because the routed kernel has not been timed. It
+/// does not mean the Qwen route is unwired.
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
@@ -641,7 +644,14 @@ mod tests {
         assert!(r.note.contains("Int4 is not bound"), "{}", r.note);
         assert!(r.note.contains("host-created MTLTensor"), "{}", r.note);
         assert!(r.note.contains("int4b_format"), "{}", r.note);
+        assert!(r.note.contains("gemm_q4_mlx_tensorops"), "{}", r.note);
+        assert!(r.note.contains("M>8"), "{}", r.note);
         assert!(!r.note.contains("TensorOps Q4 not shipped"), "{}", r.note);
+        assert!(
+            !r.note.contains("no quantized TensorOps prefill GEMM is wired"),
+            "{}",
+            r.note
+        );
     }
 
     /// The argument table has 31 buffer slots, so 30 is the last valid index

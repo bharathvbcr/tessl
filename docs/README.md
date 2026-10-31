@@ -32,10 +32,13 @@ The [`docs/apple-silicon/`](apple-silicon/README.md) directory contains speciali
 
 | Document | Focus |
 |---|---|
+| [`apple_ml_stack.md`](apple-silicon/apple_ml_stack.md) | 2026-10-30 survey of Metal tensors, unified memory, the M5/M6 chips, Core AI, Core ML, MLX, and what macOS 27.2 does not change. |
 | [`machine_profile_m5_pro.md`](apple-silicon/machine_profile_m5_pro.md) | Apple M5 Pro hardware characteristics, GPU core counts, bandwidth, and cache topology. |
 | [`gemm_architecture.md`](apple-silicon/gemm_architecture.md) | Low-level GEMM layout mechanics, $K$-partitioning, and cooperative tile selection. |
 | [`metal4_mpp.md`](apple-silicon/metal4_mpp.md) | Metal 4 modern encode pipeline, argument tables, residency sets, and MPP TensorOps. |
 | [`kernel_hardening.md`](apple-silicon/kernel_hardening.md) | Kernel robustness, bounds-checking guarantees, and memory hazard prevention. |
 | [`optimization_map.md`](apple-silicon/optimization_map.md) | Ongoing optimization milestones, audit tracking, and runtime budgets. |
 | [`mlx.md`](apple-silicon/mlx.md) | Architectural comparison with Apple's MLX framework. |
+| [`mlx_audit.md`](apple-silicon/mlx_audit.md) | 2026-10-30 MLX 0.32.4 versus `main`: which Metal paths are NAX, which quantized layouts tessl already loads, and what not to port. |
+| [`beta_nightly_gap.md`](apple-silicon/beta_nightly_gap.md) | 2026-10-30 check of Apple beta notes, nightlies, and the doc lines that contradicted the source. No seed after macOS 27.2. GPU cores 20. Wired budget is 0.9× the 48 GiB recommendation. |
 | [`coreml_metal_ml.md`](apple-silicon/coreml_metal_ml.md) | Trade-offs between Metal 4 compute, Core ML, and Apple Neural Engine (ANE). |

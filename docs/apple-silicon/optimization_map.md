@@ -468,7 +468,7 @@ f32 accum. Soft@3k quality remains Phase G; no further 128M default change.
 | Flip | Result |
 |------|--------|
 | P0 cold recycle + `removeAllocation` after sync | RSS plateaus (no +440 MB/step) |
-| P0b working-set probe + pool cache cap + banner | `recommended_ws=51.8 GiB`, wired_budget 0.9×, `--pool-cache-mb` / `--wired-fraction` |
+| P0b working-set probe + pool cache cap + banner | That day’s banner: `recommended_ws=51.8 GiB`, wired_budget 0.9×, `--pool-cache-mb` / `--wired-fraction`. This boot’s probe is 48 GiB (`machine_profile_m5_pro.md`) |
 | P1 packed compute encoder across `with_binder` | **80.5 → 58.4 ms** (−27%) |
 | P1 skip dead non-XSA `add_inplace(dv,dv_flash)` | 278 → 276 binders |
 | P1b persistent bf16 weight banks | enabled under `PrecisionMode::Bf16`; refresh after optim |
@@ -481,12 +481,12 @@ f32 accum. Soft@3k quality remains Phase G; no further 128M default change.
 | **B=32** (`--tok-mult 2`) | **105.2** | **77885** | Higher tok/s; RSS ~1.3 GB stable |
 | **B=64** (`--tok-mult 4`) | **197.7** | **82876** | Stable; RSS ~2.5 GB |
 
-B=32 improves **tokens/sec** despite higher ms/step. Prefer B=16 for step-time gate; consider B=32 for throughput runs.
+B=32 improves **tokens/sec** despite higher ms/step. Prefer B=16 for step-time gate; consider B=32 for throughput runs. These three rows are earlier runs, not a 2026-10-30 measurement. That rebench did not start; the blocker is on the OPEN row under Memory / residency.
 
 ### Machine
 
 See [`machine_profile_m5_pro.md`](machine_profile_m5_pro.md): M5 Pro, 20 GPU,
-64 GB, macOS 26.5.2. Apple M5 “3–4× TTFT” is cross-chip inference — not free
+64 GB, macOS 27.0.1 (26A434). Apple M5 “3–4× TTFT” is cross-chip inference — not free
 headroom below this gate.
 
 ---
@@ -601,8 +601,8 @@ binders. Residual = f32 grad casts into `ensure_bf16` + mlp_act/FA O still f32.
 |------|--------|
 | Cold recycle + `removeAllocation` after sync | **DONE** — RSS ~683 MB stable |
 | Wired / WS probe / pool cache CLI | **DONE** |
-| Hot vs cold residency sets | **DONE** (Audit 6 P0b+) — Hot weights/grads/opt/EMA; Cold tape |
-| B=32/64 FineWeb under wired policy | **OPEN** (synthetic B=32 already ~109.5 ms / 75k tok/s) |
+| Hot vs Cold buffer kinds, one `MTLResidencySet` | **DONE** (Audit 6 P0b+) — Hot weights/grads/opt/EMA; Cold tape |
+| B=32/64 FineWeb under wired policy | **OPEN** (2026-10-30 rebench not started; no new timings). Documented `fineweb10B_sp1024` is absent: `/Users/bharath/Code/research/parameter-golf` does not exist, and Spotlight has no file of that name. The GPU was also not idle (`ojas-verify` mac_heavy clippy pids 64743 and 64744; `tessl-embed` pid 12260). Synthetic B=32 ~109.5 ms / 75k tok/s stays a separate figure. Board: `gp-fineweb-b32-b64-rebench`, `ft-9a03a5d359aef49eaaf922f38badefe1` |
 
 Private heaps / ICB stay ruled out. Residency ≠ “bring back MTLHeap.”
 

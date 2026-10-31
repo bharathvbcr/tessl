@@ -130,3 +130,61 @@ fn the_last_unmarked_command_still_orders_the_next_scope() {
         "the tape's unbarriered last command must be ordered before the next dispatch"
     );
 }
+
+/// `[A write (barrier_after=false), Immediate, B (barrier_after=true), A read]`
+/// keeps the barrier before the A read.
+///
+/// `elide_non_interfering_barriers` used to clear its open span on an Immediate
+/// bind, so that barrier could be dropped across the earlier write to A. Replay
+/// emits the captured markers, and the one `true` is the barrier before the read.
+#[test]
+fn an_immediate_bind_keeps_the_barrier_before_the_later_read() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = GpuRuntime::new().expect("runtime");
+    let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+    let n_buf = rt.alloc_buffer_hot(4).unwrap();
+    n_buf.write_u32(&[N as u32]);
+    let (tg, tptg) = (mtl_size(N, 1, 1), mtl_size(1, 1, 1));
+    let bind = |index, buf: &tessl::tensor::GpuBuffer| DecodeIcbBind::Buf {
+        index,
+        buf: buf.clone(),
+        byte_offset: 0,
+        gpu_addr: 0,
+    };
+    let a = rt.alloc_buffer_hot(N * 4).unwrap();
+    let b = rt.alloc_buffer_hot(N * 4).unwrap();
+    let src = rt.alloc_buffer_hot(N * 4).unwrap();
+    let dst = rt.alloc_buffer_hot(N * 4).unwrap();
+    let cmd = |binds, barrier_after| DecodeIcbCommand {
+        pipeline: pipe.clone(),
+        threadgroups: tg,
+        threads_per_tg: tptg,
+        binds,
+        tg_mem: None,
+        barrier_after,
+        incomplete_binds: 0,
+    };
+    let cmds = vec![
+        cmd(vec![bind(0, &src), bind(1, &a), bind(2, &n_buf)], false),
+        cmd(
+            vec![
+                bind(0, &src),
+                bind(1, &dst),
+                bind(2, &n_buf),
+                DecodeIcbBind::Immediate {
+                    index: 3,
+                    bytes: 1u32.to_ne_bytes().to_vec(),
+                },
+            ],
+            false,
+        ),
+        cmd(vec![bind(0, &src), bind(1, &b), bind(2, &n_buf)], true),
+        cmd(vec![bind(0, &a), bind(1, &dst), bind(2, &n_buf)], false),
+    ];
+    let mut dec = DecodeIcb::from_commands(&rt, cmds).expect("tape");
+    let (res, snap) = traced(|| dec.execute(&rt));
+    res.expect("execute");
+    rt.synchronize().unwrap();
+    assert_eq!(snap.dispatches, 4, "one dispatch per tape command");
+    assert_eq!(snap.barriers, 1, "the captured barrier before the A read must be kept");
+}

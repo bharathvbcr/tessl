@@ -330,13 +330,17 @@ That exactness has a bound: a full-range dot product can wrap `int32` past
 sum.
 
 TensorOps itself accepts `int4b_format`, and the shader-side tensor constructor
-for it exists (compile-checked, not run: `device uchar *` handle, right operand
-only; see the `QUANT_PREFILL_GEMM_WIRED` doc in `src/mtl_tensor.rs` and
-`tools/probes/int4b/`). There is no Int4 GEMM here because none has been built
-and measured, not because of the host binding. An earlier version of this document and the README both blamed
-`MTLTensorDataType::Int4` being unbound in objc2-metal 0.3. That is true and
-irrelevant: it gates host-created `MTLTensor` descriptors, and every kernel here
-builds tensors from raw device pointers.
+for it exists (compile-checked: `device uchar *` handle, right operand only;
+see the `QUANT_PREFILL_GEMM_WIRED` doc in `src/mtl_tensor.rs` and
+`tools/probes/int4b/`). `nn::gemm_q4_mlx_tensorops` is that GEMM. Qwen Q4 with
+`M>8` calls it (`Q4Weight::matmul` and `project_residual`); `M==1` stays on
+`gemv_q4_mlx_simd` and `M` in `2..=8` stays on `gemm_q4_mlx`. It has not been
+timed, so no speedup is claimed. `QUANT_PREFILL_GEMM_WIRED` stays false because
+the host-created `MTLTensor` Int4 descriptor is still unbound. An earlier
+version of this document and the README blamed `MTLTensorDataType::Int4` being
+unbound in objc2-metal 0.3 for the missing GEMM. That binding is still unbound,
+and it gates host-created descriptors only. The kernel builds tensors from raw
+device pointers.
 
 ---
 

@@ -125,7 +125,7 @@ impl<'a> Loader<'a> {
     /// A tensor widened to f32, with its shape checked.
     pub(crate) fn f32(&self, rest: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let name = self.take(rest);
-        shape_checked(&name, shape, self.st.read_f32(&name))
+        shape_checked(&name, shape, TensorSource::read_f32(self.st, &name))
     }
 
     /// [`Self::f32`], refusing a non-finite element by index.
@@ -157,7 +157,7 @@ impl<'a> Loader<'a> {
     /// One finite value (a `[1]` or scalar tensor).
     pub(crate) fn scalar(&self, rest: &str) -> Result<f32, String> {
         let name = self.take(rest);
-        let (_, data) = self.st.read_f32(&name)?;
+        let (_, data) = TensorSource::read_f32(self.st, &name)?;
         match data.as_slice() {
             [s] if s.is_finite() => Ok(*s),
             other => Err(format!("{name}: expected one finite value, got {other:?}")),

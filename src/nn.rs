@@ -4655,8 +4655,10 @@ pub fn gemm_q4_mlx_tensorops_max_k(m: u32, n: u32, group_size: u32) -> u32 {
 }
 
 /// `Y[M, rows] = X[M, cols] @ W[rows, cols]^T` with MLX Q4 weights on the
-/// TensorOps matrix units: an opt-in companion to [`gemm_q4_mlx`] for larger `M`
-/// (no [`GEMM_Q4_MLX_MAX_M`] ceiling).
+/// TensorOps matrix units. Qwen Q4 calls this when `M` exceeds
+/// [`GEMM_Q4_MLX_MAX_M`] (`Q4Weight::matmul`, `project_residual`). `M == 1`
+/// stays on [`gemv_q4_mlx_simd`] and `M` in `2..=8` stays on [`gemm_q4_mlx`].
+/// There is no M ceiling on this kernel. It has not been timed.
 ///
 /// Same bank, activation (bf16), output (f32) and shape arguments as
 /// [`gemm_q4_mlx`], row-major bank only (no `layout`, no `resid`). The kernel
@@ -4871,10 +4873,12 @@ fn row_reduce(
 /// raw device pointers, so `MTLTensorDataType::Int8` being bound or not is
 /// irrelevant here — that binding is for descriptors this path never creates.
 /// The same is true of Int4: `metal::int4b_format` exists in the shading
-/// language and TensorOps accepts it, and what is actually missing is the
-/// shader-side tensor constructor does exist (it takes a `device uchar *`
-/// handle, right operand only); see `QUANT_PREFILL_GEMM_WIRED` in
-/// `mtl_tensor` for the compile-checked facts. What is not built is the GEMM.
+/// language and TensorOps accepts it. The shader-side constructor takes a
+/// `device uchar *` handle, right operand only. The GEMM is
+/// [`gemm_q4_mlx_tensorops`], and Qwen Q4 calls it when `M` exceeds
+/// [`GEMM_Q4_MLX_MAX_M`].
+/// `QUANT_PREFILL_GEMM_WIRED` in `mtl_tensor` stays false for the host
+/// `MTLTensor` Int4 descriptor path, and because that Q4 kernel is not yet timed.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_i8_dequant(
     rt: &Arc<GpuRuntime>,

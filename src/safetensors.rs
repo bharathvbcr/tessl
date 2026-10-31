@@ -693,7 +693,7 @@ impl TensorSource for CheckpointView {
     }
     fn read_f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         let st = self.shard(name)?;
-        st.read_f32(name)
+        SafeTensors::read_f32(st, name)
     }
     fn read_bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), String> {
         self.shard(name)?.read_bf16_bits(name)

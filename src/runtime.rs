@@ -32,7 +32,7 @@ use objc2_metal::{
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
@@ -105,11 +105,17 @@ pub enum BufferKind {
     External,
 }
 
-/// Probed device memory budget (logged in train banner).
+/// Probed device memory budget.
+///
+/// `wired_budget` is printed by the arch02 train banner. It is not an
+/// admission cap: Qwen `check_working_set` and the train preflight compare
+/// `recommended_working_set`.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceMemoryInfo {
     pub recommended_working_set: u64,
     pub memory_size: u64,
+    /// Fraction of `recommended_working_set` stored by [`GpuRuntime::set_wired_fraction`].
+    /// Default 0.9 at assemble. Printed by the arch02 banner. Not an admission cap.
     pub wired_budget: u64,
     pub pool_cache_cap: usize,
     /// `MTLDevice::hasUnifiedMemory`: the GPU has no dedicated local memory and
@@ -390,6 +396,9 @@ pub(crate) struct Metal4EncodePackage {
     pub handoff_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     /// Longest a runtime wait on `lifetime_event` blocks, in milliseconds.
     event_wait_ms: AtomicU64,
+    /// Budget timeouts since the last wait that reached its value. A success
+    /// stores 0. The third consecutive timeout poisons the runtime.
+    consecutive_wait_timeouts: AtomicU32,
     /// Scratch for scalar `[[buffer(N)]]` constants (M4 has no setBytes).
     /// 16 MiB bump arena; cursor advances per const pack and resets after a
     /// waiting commit -- `synchronize`, or the reclaim a scope triggers when
@@ -680,10 +689,11 @@ impl ParamsBuffer {
     }
 }
 
-/// The poison latch: set once an encode, submit, or GPU wait fails, after
-/// which the runtime refuses every call. It keeps the first cause, because
-/// only the call that poisoned the runtime returns it; every later refusal
-/// would otherwise say only "poisoned", far from the fault.
+/// The poison latch: set once an encode, a submit, a GPU fault, or the third
+/// consecutive wait-budget timeout fails, after which the runtime refuses
+/// every call. One or two budget timeouts do not set it. It keeps the first
+/// cause, because only the call that poisoned the runtime returns it; every
+/// later refusal would otherwise say only "poisoned", far from the fault.
 ///
 /// Metal's feedback thread sets it too, where a panic cannot be recovered, so
 /// the lock takes a poisoned guard as it is.
@@ -917,8 +927,12 @@ impl GpuRuntime {
         Ok(access)
     }
 
-    /// Apply the same poison latch, and cause, that a SharedEvent wait timeout
-    /// stores before returning. Subsequent encode and alloc refuse reuse.
+    /// Latch a test-only poison. Its cause is not a budget-timeout error:
+    /// [`Self::is_event_wait_timeout`] is false for it, and
+    /// [`Self::poison_on_failure`] stores it. A real SharedEvent wait that runs
+    /// out of budget does not call this. The first and second consecutive
+    /// budget timeouts leave the runtime usable; the third poisons it with a
+    /// DeviceLost cause of its own.
     ///
     /// This does not hang the GPU. Dependents use it when a real command-buffer
     /// fault cannot be produced, including ojas-metal's host-weight rebuild.
@@ -1106,11 +1120,13 @@ impl GpuRuntime {
         *self.memory_info.lock().unwrap()
     }
 
-    /// Whether an encode, submit, or GPU fault has latched this runtime permanently.
+    /// Whether an encode, submit, GPU fault, or third consecutive wait-budget
+    /// timeout has latched this runtime permanently.
     ///
     /// Callers read this instead of matching the poison string. The bit is the
     /// same one [`Self::poison_as_shared_event_timeout_for_test`] sets, and the
-    /// same one a `MTL4CommitFeedback` error sets.
+    /// same one a `MTL4CommitFeedback` error sets. A budget timeout does not set
+    /// it, and does not use that helper's string, until the third consecutive one.
     pub fn is_poisoned(&self) -> bool {
         self.poison.is_set()
     }
@@ -1183,13 +1199,27 @@ impl GpuRuntime {
         }
     }
 
-    /// Override wired budget fraction of `recommendedMaxWorkingSetSize` (logged only;
-    /// raising the system `iogpu.wired_limit_mb` still requires sysctl).
-    pub fn set_wired_fraction(&self, fraction: f64) {
-        let frac = fraction.clamp(0.5, 0.95);
-        if let Ok(mut info) = self.memory_info.lock() {
-            info.wired_budget = ((info.recommended_working_set as f64) * frac) as u64;
+    /// Store `wired_budget` as `fraction` times `recommendedMaxWorkingSetSize`.
+    ///
+    /// A finite fraction is clamped to 0.5–0.95. A non-finite fraction is
+    /// refused and the stored budget is left unchanged (`f64::clamp` would
+    /// keep NaN, and `NaN as u64` is 0). The arch02 train banner prints the
+    /// stored field. It is not an admission cap, this function does not log,
+    /// and raising `iogpu.wired_limit_mb` still requires sysctl.
+    ///
+    /// A poisoned `memory_info` lock is an error. [`Self::memory_info`] panics
+    /// on that same poison.
+    pub fn set_wired_fraction(&self, fraction: f64) -> Result<(), String> {
+        if !fraction.is_finite() {
+            return Err("set_wired_fraction: fraction must be finite".to_string());
         }
+        let frac = fraction.clamp(0.5, 0.95);
+        let mut info = self
+            .memory_info
+            .lock()
+            .map_err(|_| "set_wired_fraction: memory_info lock is poisoned".to_string())?;
+        info.wired_budget = ((info.recommended_working_set as f64) * frac) as u64;
+        Ok(())
     }
 
     /// Last CounterHeap (t0, t1) from the most recent Metal 4 synchronize, if any.
@@ -1304,13 +1334,16 @@ impl GpuRuntime {
     /// Whether `error` is the budget-exceeded error of a wait on the GPU
     /// timeline.
     ///
-    /// That error does **not** poison the runtime. A slow command buffer is not
-    /// a faulted one: the work is still queued and every allocator, arena
-    /// offset and pooled buffer stays exactly as it was, so nothing was reset or
-    /// recycled early. Retry [`Self::synchronize`] to keep waiting, raise the
-    /// budget with [`Self::set_event_wait_ms`] or `TESSL_EVENT_WAIT_MS`, or give
-    /// up and recreate the runtime. (A GPU fault, and a lifetime event that
-    /// runs ahead of what was submitted, still poison.)
+    /// One or two consecutive errors of this kind do **not** poison the runtime.
+    /// A slow command buffer is not a faulted one: the work is still queued and
+    /// every allocator, arena offset and pooled buffer stays exactly as it was,
+    /// so nothing was reset or recycled early. Retry [`Self::synchronize`] to
+    /// keep waiting, or raise the budget with [`Self::set_event_wait_ms`] or
+    /// `TESSL_EVENT_WAIT_MS`. A successful wait clears the streak. The third
+    /// consecutive timeout poisons the runtime (DeviceLost) and is not this
+    /// error, so a caller that retries on [`Self::is_event_wait_timeout`] stops.
+    /// (A GPU fault, and a lifetime event that runs ahead of what was submitted,
+    /// still poison on the first failure.)
     pub fn is_event_wait_timeout(error: &str) -> bool {
         error.starts_with(EVENT_WAIT_TIMEOUT_PREFIX)
     }
@@ -1420,17 +1453,32 @@ impl GpuRuntime {
     /// Block until the lifetime event reaches `value` (a value this runtime
     /// submitted), for at most [`Self::event_wait_ms`]. The one wait every
     /// lifetime decision goes through.
+    ///
+    /// A budget timeout leaves the runtime usable. The third consecutive one
+    /// poisons it (DeviceLost) and later calls return that poison without
+    /// waiting out another budget. A wait that reaches `value` clears the streak.
     fn wait_lifetime_event(&self, value: u64) -> Result<(), String> {
+        if self.poison.is_set() {
+            return Err(self.poison.error());
+        }
         let m4 = &self.metal4;
         let budget = m4.event_wait_ms.load(Ordering::Acquire);
         if !m4.lifetime_event.waitUntilSignaledValue_timeoutMS(value, budget) {
-            return Err(event_wait_timeout_error(
-                budget,
-                value,
-                m4.lifetime_event.signaledValue(),
-                m4.event_value.load(Ordering::Acquire),
-            ));
+            let streak = m4.consecutive_wait_timeouts.fetch_add(1, Ordering::AcqRel) + 1;
+            let signaled = m4.lifetime_event.signaledValue();
+            let submitted = m4.event_value.load(Ordering::Acquire);
+            if streak >= CONSECUTIVE_EVENT_WAIT_TIMEOUTS {
+                let error = format!(
+                    "Metal 4 DeviceLost: {streak} consecutive SharedEvent wait budgets exceeded \
+                     (last waited {budget} ms for lifetime event value {value}, reached {signaled}, \
+                     submitted {submitted}); the runtime is poisoned and will not keep retrying"
+                );
+                self.poison.set(error.as_str());
+                return Err(error);
+            }
+            return Err(event_wait_timeout_error(budget, value, signaled, submitted));
         }
+        m4.consecutive_wait_timeouts.store(0, Ordering::Release);
         self.checked_lifetime_value().map(|_| ())
     }
 
@@ -1931,17 +1979,11 @@ impl GpuRuntime {
         let off = cursor;
         state.cursor = cursor + nbytes;
         // Zero the logical window on the host (unified memory).
-        {
-            let ptr = state.buffer.metal().contents().as_ptr() as *mut u8;
-            // SAFETY: `off + nbytes == cursor` and the cursor was bounds-checked
-            // against the arena's capacity before it advanced, so this window
-            // lies inside `state.buffer`. `state` is held under the arena lock,
-            // so no other host thread is writing it, and the window is past the
-            // previous cursor — bytes no submitted command has been pointed at.
-            unsafe {
-                std::ptr::write_bytes(ptr.add(off), 0, nbytes);
-            }
-        }
+        // SAFETY: `off + nbytes` was bounds-checked against the arena capacity
+        // before the cursor advanced, so the window lies inside `state.buffer`.
+        // The arena lock is held, and the window is past the previous cursor —
+        // bytes no submitted command has been pointed at.
+        unsafe { state.buffer.zero_range_unsubmitted(off, nbytes) };
         Ok(crate::tensor::Tensor {
             buffer: state.buffer.clone(),
             shape: shape.to_vec(),
@@ -2371,6 +2413,10 @@ impl GpuRuntime {
             if wait {
                 self.checked_lifetime_value()?;
                 self.drain_cold_recycles(u64::MAX);
+                // A waiting commit clears the batch after it requeues a feedback
+                // watch whose callback has not landed. The next synchronize has
+                // no batch, and this is the only path that still sees that watch.
+                self.observe_finished_feedback()?;
             }
             return Ok(());
         };
@@ -2712,14 +2758,20 @@ pub const DEFAULT_EVENT_WAIT_MS: u64 = 30_000;
 pub const EVENT_WAIT_MS_RANGE: std::ops::RangeInclusive<u64> = 1..=3_600_000;
 
 /// Start of the error a wait that ran out of budget returns. See
-/// [`GpuRuntime::is_event_wait_timeout`].
+/// [`GpuRuntime::is_event_wait_timeout`]. The third consecutive error of this
+/// kind is a DeviceLost poison instead, and does not start with this prefix.
 const EVENT_WAIT_TIMEOUT_PREFIX: &str = "Metal 4 SharedEvent wait budget exceeded";
+
+/// Consecutive budget timeouts that poison the runtime. Fewer than this leave
+/// it usable, so one slow wait can be retried.
+const CONSECUTIVE_EVENT_WAIT_TIMEOUTS: u32 = 3;
 
 fn event_wait_timeout_error(budget_ms: u64, value: u64, signaled: u64, submitted: u64) -> String {
     format!(
         "{EVENT_WAIT_TIMEOUT_PREFIX} (timed out): waited {budget_ms} ms for lifetime event value {value} \
          (reached {signaled}, submitted {submitted}); the GPU work may only be slow, so the runtime is \
-         not poisoned: retry, or raise the budget with set_event_wait_ms or TESSL_EVENT_WAIT_MS"
+         not poisoned: retry, or raise the budget with set_event_wait_ms or TESSL_EVENT_WAIT_MS. \
+         The third consecutive timeout of this kind poisons the runtime"
     )
 }
 
@@ -2956,6 +3008,7 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         lifetime_event,
         handoff_event,
         event_wait_ms: AtomicU64::new(event_wait_ms_from_env()),
+        consecutive_wait_timeouts: AtomicU32::new(0),
         const_arena: crate::dispatch::ConstArena::new(&const_staging),
         const_staging,
         const_cursor: Mutex::new(0),
@@ -3487,6 +3540,37 @@ mod audit_tests {
         assert!(rt.is_poisoned(), "a reported fault did not set the poison latch");
     }
 
+    /// `synchronize` is `commit(true)`. With no open batch that path used to
+    /// return before `observe_finished_feedback`, so a fault requeued after the
+    /// batch was cleared stayed on the allocator until some later encode.
+    #[test]
+    fn synchronize_with_no_open_batch_consumes_a_queued_commit_fault() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(rt.active_m4.lock().unwrap().is_none());
+
+        let pending = Arc::new(FeedbackState::new());
+        rt.metal4.allocators.lock().unwrap()[1].feedback = Some(test_watch(&pending));
+        rt.synchronize().unwrap();
+        assert!(!rt.is_poisoned(), "a callback that has not run is silence, not a fault");
+        {
+            let mut slots = rt.metal4.allocators.lock().unwrap();
+            assert!(
+                slots.iter().any(|s| s.feedback.is_some()),
+                "synchronize dropped the pending watch"
+            );
+            for s in slots.iter_mut() {
+                s.feedback = None;
+            }
+        }
+
+        let failed = Arc::new(FeedbackState::new());
+        failed.fail("page fault".to_string());
+        rt.metal4.allocators.lock().unwrap()[0].feedback = Some(test_watch(&failed));
+        let err = rt.synchronize().unwrap_err();
+        assert!(err.contains("page fault"), "{err}");
+        assert!(rt.is_poisoned(), "synchronize left a reported fault unpoisoned");
+    }
+
     /// Hot buffers and large Cold ones are made at their size rounded to a
     /// 16 KiB page, and that is what Metal charges for them; small Cold
     /// temporaries keep power-of-two buckets. Before, every request took its
@@ -3684,6 +3768,87 @@ mod lifetime_event_tests {
         let t = rt.alloc_tensor_f32(&[4]).unwrap();
         drop(t);
         rt.synchronize().unwrap();
+        assert!(!rt.is_poisoned());
+    }
+
+    /// An allocator slot whose lifetime event has not reached `in_flight`, so
+    /// the next wait blocks until the budget.
+    fn arm_unsignaled_wait(rt: &GpuRuntime) -> u64 {
+        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
+        value
+    }
+
+    #[test]
+    fn three_consecutive_wait_timeouts_poison_the_runtime() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_event_wait_ms(1).unwrap();
+        let value = arm_unsignaled_wait(&rt);
+
+        for _ in 0..2 {
+            let error = rt.wait_all_allocators().unwrap_err();
+            assert!(GpuRuntime::is_event_wait_timeout(&error), "{error}");
+            assert!(!error.contains("DeviceLost"), "{error}");
+            assert!(!rt.is_poisoned(), "a single slow wait must stay usable");
+            rt.poison_on_failure(&error);
+            assert!(!rt.is_poisoned(), "poison_on_failure still skips a budget error");
+        }
+        assert_eq!(rt.metal4.allocators.lock().unwrap()[0].in_flight, value);
+
+        let started = std::time::Instant::now();
+        let error = rt.wait_all_allocators().unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the third 1 ms budget took {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("DeviceLost"), "{error}");
+        assert!(error.contains("3 consecutive"), "{error}");
+        assert!(!GpuRuntime::is_event_wait_timeout(&error), "{error}");
+        assert!(rt.is_poisoned());
+        assert_eq!(
+            rt.metal4.allocators.lock().unwrap()[0].in_flight,
+            value,
+            "the allocator was reset while its work was still outstanding"
+        );
+
+        // Sticky: a later wait does not spend another budget, and the first
+        // cause is what later refusals name.
+        let again = rt.wait_all_allocators().unwrap_err();
+        assert!(again.contains("DeviceLost"), "{again}");
+        assert!(rt.is_poisoned());
+        assert_eq!(rt.metal4.allocators.lock().unwrap()[0].in_flight, value);
+        let refused = rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err();
+        assert!(refused.contains("DeviceLost"), "the refusal lost the cause: {refused}");
+        // The wait was never a submitted command buffer. Signal the event so
+        // drop can release the allocator instead of leaking it.
+        rt.set_event_wait_ms(1_000).unwrap();
+        rt.metal4.lifetime_event.setSignaledValue(value);
+    }
+
+    #[test]
+    fn a_completed_wait_clears_the_timeout_streak() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_event_wait_ms(1).unwrap();
+        let value = arm_unsignaled_wait(&rt);
+        let error = rt.wait_all_allocators().unwrap_err();
+        assert!(GpuRuntime::is_event_wait_timeout(&error), "{error}");
+
+        rt.set_event_wait_ms(1_000).unwrap();
+        rt.metal4.lifetime_event.setSignaledValue(value);
+        rt.wait_all_allocators().unwrap();
+        assert!(!rt.is_poisoned());
+
+        rt.set_event_wait_ms(1).unwrap();
+        let value = arm_unsignaled_wait(&rt);
+        for _ in 0..2 {
+            let error = rt.wait_all_allocators().unwrap_err();
+            assert!(GpuRuntime::is_event_wait_timeout(&error), "{error}");
+            assert!(!rt.is_poisoned(), "the streak restarted after a completed wait");
+        }
+        rt.set_event_wait_ms(1_000).unwrap();
+        rt.metal4.lifetime_event.setSignaledValue(value);
+        rt.wait_all_allocators().unwrap();
         assert!(!rt.is_poisoned());
     }
 
@@ -3921,4 +4086,25 @@ mod deferred_release_poison_tests {
         rt.schedule_release(ProtocolObject::from_retained(buffer), false);
         assert_eq!(len(&rt.pending_release), 1, "allocation dropped instead of queued");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn set_wired_fraction_refuses_a_poisoned_memory_info_lock() {
+    let rt = GpuRuntime::new().expect("runtime");
+    let before = rt.memory_info().wired_budget;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = rt.memory_info.lock().unwrap();
+        panic!("poisoning memory_info on purpose");
+    }));
+    assert!(unwound.is_err());
+    let err = rt.set_wired_fraction(0.7).expect_err("poisoned lock must be an error");
+    assert!(err.contains("poisoned"), "{err}");
+    let budget = rt
+        .memory_info
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .wired_budget;
+    assert_eq!(budget, before);
+    assert_ne!(budget, 0);
 }

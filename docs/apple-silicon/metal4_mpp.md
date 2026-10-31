@@ -1,8 +1,10 @@
 # Metal 4 + MPP (agent guide)
 
-Training encode is **Metal 4 only**. Shader dialect may still use
-`-std=metal3.2` for non-TensorOps kernels — that is **not** classic M3
-command buffers.
+Training encode is **Metal 4 only**. `build.rs` AOT-compiles with
+`-std=metal4.0` and falls back to `-std=metal3.2` only when that compile
+fails and `TESSL_METAL_WERROR` is unset. TensorOps sources do not take the
+fallback. Either dialect is still a Metal 4 command buffer, not classic M3.
+There is no `-std=metal4.1` in that build.
 
 Related: [`machine_profile_m5_pro.md`](machine_profile_m5_pro.md) ·
 [`optimization_map.md`](optimization_map.md) · [`mlx.md`](mlx.md).
@@ -26,7 +28,7 @@ Ignore legacy README claims about dual Metal3/Metal4 encode paths.
 | Piece | File | Rule |
 |-------|------|------|
 | Init hard-fail | [`runtime.rs`](../../src/runtime.rs) `GpuRuntime::new` | If M4 package init fails → **error**, no classic CB fallback |
-| Binder | [`dispatch.rs`](../../src/dispatch.rs) | Argument table + ~1 MiB const arena only |
+| Binder | [`dispatch.rs`](../../src/dispatch.rs) | Argument table + 16 MiB const arena only (`METAL4_CONST_ARENA_BYTES` in `src/runtime.rs`) |
 | Train CLI | [`bin/train.rs`](../../../ojas/arch02/metal-native/src/bin/train.rs) | No `--metal3` / `--metal4`; always `encode=Metal4` |
 | Decision | [`DECISIONS.md`](../../../ojas/arch02/metal-native/DECISIONS.md) **M3** | Overturned to Metal 4 training encode only |
 | Historical M3 bench | `out/bench_m4_vs_m3/m3/` ~110.9 ms | **Frozen** — cannot re-run |
@@ -74,12 +76,13 @@ remains portable fallback — TensorOps is primary (DECISIONS **M2**).
 | Register every allocation + const arena | Assume unified memory ⇒ no residency set |
 | `useResidencySet` after `beginCommandBuffer` (queue-level) | Forget mid-step temps |
 | Batch `addAllocations`; **`removeAllocation` when CB complete** | Retain forever (Audit 4 **P0 leak**) |
-| Hot set (weights/opt) vs cold set (tape temps) | One unbounded set that grows +~0.4 GB/step |
+| One `MTLResidencySet`. `BufferKind::Hot` stays registered until its last handle drops; `Cold` is removed after the command buffer completes | One unbounded set that grows +~0.4 GB/step |
 | Recycle temps via `recycle_buffer` on Tensor drop | Assume bump slab alone is enough |
 
 **Heap note:** making an `MTLHeap` resident makes the **whole heap** resident.
-Private heaps / ICB stay ruled out. Fix the leak with remove/recycle + hot/cold
-sets — do not “bring back MTLHeap” as the residency fix.
+Private heaps / ICB stay ruled out. Fix the leak with remove/recycle and the
+Hot and Cold buffer kinds on the one residency set. Do not “bring back MTLHeap”
+as the residency fix.
 
 Host `GpuBuffer::zero` on bump views is unsafe (whole-slab memset). Mid-step
 zeros → GPU `zero_f32`.

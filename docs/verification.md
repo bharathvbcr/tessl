@@ -510,6 +510,61 @@ cargo test --release --lib parser_mutation:: -- --test-threads=1
 
 It builds no `GpuRuntime`, so the hosted CI `Host-only unit tests` step runs it.
 
+## 8. Guard-test perturbation suite (`scripts/guard_break_it.sh`) and `numcheck`
+
+A guard test that cannot fail is an unexamined pass. The guard test suite and the
+`numcheck` path crate (`numcheck/`, card ft-29323ca4) verify numeric error
+bounds, non-finite propagation, and subnormal handling under adversarial
+conditions.
+
+### `numcheck` path crate
+
+`numcheck` (`numcheck/src/lib.rs`) is a `#![forbid(unsafe_code)]` std-only path
+crate that serves as the single canonical owner of float validation tolerances:
+
+- **Derived reduction tolerance:**
+  $$\text{reduction\_tolerance}(N, \text{scale}) = 4 \cdot \epsilon_{\text{f32}} \cdot \sqrt{N} \cdot \text{scale}$$
+  Tessl's `tests/common/mod.rs` `reduction_bound` delegates directly to
+  `numcheck::reduction_tolerance`. Callers check `abs(error) <= tol` without
+  widening the bound.
+- **Planted values:** `Plant::{Nan, PosInf, NegInf, Subnormal}` provides
+  standardized bit patterns for non-finite and subnormal planting into buffers
+  via `plant_at` and `plant_f32`.
+- **FP64 oracle comparison:** `compare_oracle` compares f32 results against an
+  fp64 oracle under `reduction_tolerance`, failing closed on empty inputs, length
+  mismatches, non-finite values (NaN, +inf, -inf), or values outside the
+  $4\epsilon\sqrt{N}$ budget.
+- **Subnormal checking:** `check_subnormal` validates that a value is a finite
+  subnormal number (non-zero with an exponent field of zero).
+
+### `scripts/guard_break_it.sh`
+
+`scripts/guard_break_it.sh` (card ft-64d6f0ddd50c628ac5ab852f1c4c3b0b) is an
+automated driver that perturbs guard tests in `tests/reductions.rs` and
+`tests/nn_adversarial.rs` across 14 distinct rows. Each row mutates an assertion
+or condition to verify that the test fails with the expected failure message:
+
+| Perturbation ID | Test File | Target Invariant | Caught Needle |
+|---|---|---|---|
+| `nan-sum` | `tests/reductions.rs` | Planted NaN in sum reduction propagates as NaN | `NaN + finite = NaN` |
+| `pinf-sum` | `tests/reductions.rs` | Planted +inf in sum reduction propagates as +inf | `sum of a +inf row` |
+| `ninf-sum` | `tests/reductions.rs` | Planted -inf in sum reduction propagates as -inf | `sum of a -inf row` |
+| `softmax-nan` | `tests/reductions.rs` | Planted NaN in softmax row propagates as NaN | `softmax of a row holding` |
+| `masked-bound` | `tests/reductions.rs` | Fully masked softmax row yields valid distribution | `softmax of a masked row is not a distribution` |
+| `softmax-sum` | `tests/reductions.rs` | Softmax row sums to 1.0 within tolerance | `not 1 (bound` |
+| `sub-sum` | `tests/reductions.rs` | Subnormal values sum accurately or flush to zero | `row_sum_f32 flushes a subnormal row` |
+| `sub-max` | `tests/reductions.rs` | Subnormal row max detected correctly | `row_max_f32 keeps a subnormal` |
+| `f16-tiled` | `tests/reductions.rs` | Tiled f16 reductions maintain finite precision | `tiled f16 accumulator` |
+| `f16-gpu` | `tests/reductions.rs` | GPU f16 reduction matches host f32-accumulated reference | `f32-accumulated reference` |
+| `rms-nan` | `tests/nn_adversarial.rs` | Planted NaN in RMS norm input propagates as NaN | `a NaN input must make its whole row NaN` |
+| `rms-pinf` | `tests/nn_adversarial.rs` | Planted +inf in RMS norm input produces NaN | `planted +inf` |
+| `rms-ninf` | `tests/nn_adversarial.rs` | Planted -inf in RMS norm input produces NaN | `planted -inf` |
+| `rms-sub` | `tests/nn_adversarial.rs` | Subnormal inputs to RMS norm flush to zero | `rms_norm flushes a subnormal row` |
+
+The script provides `--check` to verify that each target string is unique in the
+source, and `--self-test` to verify driver traps, baseline preservation, and
+mutation rules without needing a GPU device.
+
 ## Fault injection
 
 The suite is only worth its green tick if it can go red. Nineteen faults are
@@ -1051,6 +1106,45 @@ The fault-test line is a measured count over tessl's own kernels (a different
 set from the mutation line above it, which targets the GDN references). Lines for
 checks that were not re-run say so, for the reason section 6 gives: a check that
 was not run must not be presented alongside checks that ran and passed.
+
+### Real-2B numerics gates (w31 and w33)
+
+Full-model numerics gates are run against the real Qwen3.5-2B-Base checkpoint
+(`b1485b2`) comparing tessl's output with PyTorch transformers references:
+
+- **Wave 31 (bf16 prefill attention gate, `bench/results/w31_attn_bf16_gate_m5pro.txt`):**
+  Prefill runs the bf16 Q/K/V tile (`attn_prefill_bf16_with_tile` at Q32K64 with a
+  bf16 P tile). Evaluated on M5 Pro against fp32 reference:
+  - *Prompt reference ($T=155$):* tessl bf16 mean KL 3.430e-5 (max 3.762e-4),
+    top-1 misses 0/155, logits rel err 2.819e-3. Transformers bf16 achieves mean
+    KL 5.736e-4 (max 6.073e-3) with 3 top-1 misses.
+  - *Text reference ($T=512$):* tessl bf16 mean KL 3.132e-5 (max 6.918e-4),
+    top-1 misses 2/512, logits rel err 3.341e-3. Transformers bf16 achieves mean
+    KL 3.791e-4 (max 4.596e-3) with 17 top-1 misses.
+- **Wave 33 (prefill gate, `bench/results/w33_prefill_gate_m5pro.txt`):**
+  Evaluated on M5 Pro with bf16 prefill attention and the SIMD GDN recurrence
+  (`qwen35_gdn_recurrent_simd_pre_l8_vec` / `Prepped8`):
+  - *f32 layer by layer vs transformers fp32 (prompt):* final norm rel err
+    2.38e-6 (worst layer 4.02e-6); logits rel err 1.97e-6, top-1 mismatches
+    0/155, max KL 1.45e-10.
+  - *bf16 prompt reference ($T=155$):* tessl bf16 mean KL 3.090e-5 (max
+    2.464e-4), 0 top-1 misses, logits rel err 3.730e-3.
+  - *bf16 text reference ($T=512$):* tessl bf16 mean KL 3.053e-5 (max
+    2.664e-4), 1 top-1 miss, logits rel err 3.694e-3.
+
+### Q4 checkpoint gate fail-closed verification
+
+A missing checkpoint must never report the same result as a check that ran and
+passed. In `tests/qwen35_model.rs`, `q4_checkpoint_gate` verifies that
+`config.json` is present in the target directory before attempting evaluation. If
+the checkpoint is absent, `logit_deviation_report` fails closed with:
+
+```
+COULD NOT RUN: MLX Q4 checkpoint is missing (config.json is missing)
+```
+
+The fail-closed behavior is tested explicitly in
+`q4_checkpoint_gate_fails_closed_when_the_checkpoint_is_missing`.
 
 ## Releasing
 

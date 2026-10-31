@@ -8,6 +8,34 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
+  A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
+  derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison
+  (`compare_oracle`), and non-finite value planting (`Plant::{Nan, PosInf, NegInf, Subnormal}`).
+  `tests/common/mod.rs::reduction_bound` delegates to it so the $4\epsilon\sqrt{N}$ reduction
+  tolerance has one canonical implementation.
+- **Guard test perturbation driver (`scripts/guard_break_it.sh`, card ft-64d6f0ddd50c628ac5ab852f1c4c3b0b)**.
+  Automated 14-row perturbation test driver validating failure assertions across reductions
+  (`tests/reductions.rs`), RMS norm, and GProj (`tests/nn_adversarial.rs`). All 14 perturbations
+  are caught by exact value assertions; self-test and `--check` modes verify that test error
+  messages match and that baselines pass.
+- **GEMM route classification and bitwise preservation** (`src/gemm.rs`, card ft-4311dd16b64edfe2ec1a59242ebd591d).
+  `RouteArithmetic` and `RouteDecision` types classifying GEMM route choices into arithmetic-preserving
+  vs arithmetic-changing. Test `preserving_coop_routes_match_bit_for_bit` verifies bit-for-bit
+  identity across preserving choices (`AutoCoopTile` vs `ForcedMatchingCoopTile`), while changing
+  choices (`PreferTnSplitk`, `SplitKVersusOneLaunch`, `EpiTileWidth`, `Dtype`) are explicitly
+  documented as arithmetic-altering.
+- **Residency set tracking and allocator lifecycle hardening** (`src/runtime.rs`, `tests/runtime_lifecycle.rs`).
+  Explicit buffer residency tracking via `alloc_buffer_hot` and `alloc_buffer_cold` using a single
+  `MTLResidencySet` (hot weights/grads/opt/EMA vs cold tape); allocator timeout streak resets on completed
+  wait; `set_wired_fraction` refuses poisoned memory-info locks and non-finite inputs; ICB replay
+  barrier ordering preserves barriers before later reads when intermediate immediate binds occur
+  (`tests/icb_replay_barriers.rs`).
+- **Qwen Q4 $M > 8$ TensorOps GEMM routing** (`src/qwen35_q4.rs`, `src/qwen35_model.rs`).
+  Qwen Q4 with $M > 8$ routes to `nn::gemm_q4_mlx_tensorops` (`Q4Weight::matmul`, `project_residual`).
+  $M = 1$ remains on `gemv_q4_mlx_simd` and $M \in 2..=8$ stays on `gemm_q4_mlx`.
+  `QUANT_PREFILL_GEMM_WIRED` in `src/mtl_tensor.rs` remains `false` because the host `MTLTensor`
+  descriptor path is unwired and the kernel is not yet timed.
 - **`tessl-embed`: EmbeddingGemma 2 behind Ollama's `/api/embed` on 127.0.0.1**
   (`go/cmd/tessl-embed`, `go/Makefile`, `go/README.md`). An in-process HTTP server
   serving the text encoder over Ollama's embedding protocol (`/api/embed`,
@@ -147,6 +175,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **Q4 checkpoint gate fails closed when checkpoint is missing** (`tests/qwen35_model.rs`, card ft-e501914a31ee5eea0177488dd1e53cd7).
+  `q4_checkpoint_gate` reports `COULD NOT RUN: MLX Q4 checkpoint is missing (config.json is missing)`
+  and fails closed in `logit_deviation_report` when `config.json` is absent, preventing an
+  unexamined pass from being masked as a successful verification. Tested in
+  `q4_checkpoint_gate_fails_closed_when_the_checkpoint_is_missing`.
+- **Text ban exemption eliminated via path-qualified safetensors reads** (`tests/host_access_ban.rs`, `src/loader.rs`).
+  `src/loader.rs` now calls `TensorSource::read_f32` and `SafeTensors::read_f32` by path,
+  clearing the `.read_f32(` text-ban exemption list and preventing accidental confusion with
+  panic-inducing `GpuBuffer::read_f32`.
 - **`-inf` and zero bit-pattern classification in cross-entropy and `-FLT_MAX` compare lint**
   (`kernels/cross_entropy.metal`, `tests/ce_collapse_host.rs`, `tests/kernel_fast_math.rs`).
   Fast-math compiler optimizations treat floating-point comparisons against `±inf` or

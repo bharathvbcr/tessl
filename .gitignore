@@ -91,21 +91,55 @@ htmlcov/
 xcuserdata/
 DerivedData/
 
-# Logs and scratch output.
+# Logs and scratch output, patch rejects, and backups.
 *.log
 *.tmp
+*.orig
+*.rej
+*.bak
+*.backup
+/scratch/
+scratch/
+/tmp/
+tmp/
 
 # DevCouncil local state
 .devcouncil/*
 !/.devcouncil/
 !.devcouncil/config.yaml
 
-# Local-only notes: session and branch reports, GitPulse task cards, the
-# history-scrub SHA map and the EmbeddingGemma 2 gap audit. Kept on the
-# working machine, not published.
+# Local-only notes: session, branch, build, and wave reports, GitPulse task cards,
+# the history-scrub SHA map, and audit notes. Kept on the working machine, not published.
 /BRANCH_REPORT.md
+/BRANCH_REPORT*.md
+BRANCH_REPORT*.md
+*BRANCH_REPORT*.md
 /BUILD_REPORT.md
+/BUILD_REPORT*.md
+BUILD_REPORT*.md
+*BUILD_REPORT*.md
+*build_report*.md
+/WAVE_REPORT.md
+/WAVE_REPORT*.md
+WAVE_REPORT*.md
+*WAVE_REPORT*.md
+*wave_report*.md
+/WAVE_*.md
+/wave_*.md
+/wave-*.md
+/AUDIT_REPORT.md
+/AUDIT_REPORT*.md
+AUDIT_REPORT*.md
+*AUDIT_REPORT*.md
+*audit_report*.md
 /tasks/
+tasks/
+.tasks/
+**/.tasks/
+gp-*.md
+**/gp-*.md
+gitpulse-tasks/
+.gitpulse-tasks/
 /docs/history/
 /docs/embedgemma2_audit.md
 

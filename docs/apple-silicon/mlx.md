@@ -50,6 +50,12 @@ Ignore stale pre–Audit 4 “Missing” narrative (residency leak, no wired pro
 
 ### Steal next (Audit 5 fusion + Audit 6 levers)
 
+Audit 6 in [`optimization_map.md`](optimization_map.md) is the status.
+P1a, P1a2, P1b, and P1c are **DONE** there (P1a/P1a2 then Soft-gated, default
+off). P1d is **REJECT as default**. P0b+ Hot is **DONE**. The estimates below
+are the original ones. Open rows are P1e, P2, P3, and the FineWeb B=32/64
+rebench.
+
 | Pri | Work | Est. | MLX / Apple analogy | Where |
 |-----|------|------|---------------------|-------|
 | **P1a** | Fuse bwd QKV | **−48 binders** | `mx.compile` graph fuse | [`model_bwd.rs`](../../../ojas/arch02/metal-native/src/model_bwd.rs) ~619–641 |
@@ -57,26 +63,29 @@ Ignore stale pre–Audit 4 “Missing” narrative (residency leak, no wired pro
 | **P1b** | Mirror resid/RMS bwd megakernels + skip_resid bf16 twin | **−16–20** | Same compile lesson on bwd | bwd ~279–363, ~644–676 |
 | **P1c** | Kill tape `deep_copy` | **−14–16** | `checkpoint` / recompute | [`model_fwd.rs`](../../../ojas/arch02/metal-native/src/model_fwd.rs) ~411–546 |
 | **P1d** | Hazard-aware Device barriers A/B | **0 or ~2–8 ms** | Stream deps without always-on serialize | [`dispatch.rs`](../../src/dispatch.rs) ~93–104 |
-| **P0b+** | Wire `BufferKind::Hot` residency | RSS at B≥32 | Hot weights/opt vs cold tape | [`runtime.rs`](../../src/runtime.rs) `alloc_buffer_hot` (dead today) |
+| **P0b+** | Wire `BufferKind::Hot` residency | RSS at B≥32 | Hot weights/opt vs cold tape | [`runtime.rs`](../../src/runtime.rs) `alloc_buffer_hot` is live (`runtime.rs:1842`, registers `BufferKind::Hot`). Audit 6 marks the wiring **DONE**. |
 | **P1e** | Cut bf16 activation / FA cast tax | ~5–15 ms (bf16 only) | Persistent acts path | banks refresh + per-GEMM casts |
 | **P2** | MLP coop postfix | Speculative | MPP coop destination | NAX util gate only |
 | **P3** | FA Soft EMA 2.038 → ~1.994 | Quality | Not step-time | FA numerics |
 
-**Top ROI order:** QKV fuse → dW accum-into-bank → resid/RMS bwd + deep_copy →
-barrier A/B → Hot residency + B=32/64 → bf16 casts (if training bf16) → coop/FA.
+**What is still open:** FineWeb B=32/64 rebench, then P1e residual casts if
+training bf16, then P2 only after a neural-accelerator utilization measurement,
+then P3 quality. QKV fuse, dW accum, resid/RMS bwd, and `deep_copy` are already
+DONE on the Audit 6 table.
 
 ---
 
 ## One-liners agents need
 
 1. **Unified memory ≠ skip residency** — register, `useResidencySet`, recycle +
-   `removeAllocation`. Hot/cold split still open (`alloc_buffer_hot` unused).
+   `removeAllocation`. `alloc_buffer_hot` (`runtime.rs:1842`) registers `BufferKind::Hot`. Audit 6 marks that wiring **DONE**.
 2. **`compile` ≈ megakernel + packed binder** — fwd packed; bwd still densest
-   (~38 ms of 58.4). Finish QKV / resid / dW fuse before “more NAX.”
+   (~38 ms of 58.4). QKV / resid / dW fuse is DONE on the Audit 6 table and
+   Soft-gated off. Do not start another fuse from this sheet.
 3. **Always-on Dispatch→Dispatch Device barrier** after every `Binder::dispatch`
-   may over-serialize independent work — A/B carefully (P1d).
-4. **dW today** = temp `dw` + `accum_bank` (`add_inplace`). TensorOps already
-   has `multiply_accumulate` into bank views — use it (P1a2).
+   stays the default. P1d’s hazard-aware alternative is **REJECT** (opt-in NaNs).
+4. **`multiply_accumulate` into bank views exists.** Audit 6 left that default
+   OFF after a Soft regression. Do not flip it from this sheet.
 5. **Wired/cache** unlock B=32/64 stability, not B=16 FLOPs.
 6. **Core ML / ANE / ML encoder** = inference only.
 

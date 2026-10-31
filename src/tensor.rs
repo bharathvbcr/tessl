@@ -421,7 +421,20 @@ impl GpuBuffer {
         // after GPU completion with no live views, so nothing else is reading
         // these bytes. The write is exactly `nbytes()` from the buffer's own
         // base, so it cannot overrun.
-        unsafe { std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>(), 0, self.nbytes()) };
+        unsafe { self.zero_range_unsubmitted(0, self.nbytes()) };
+    }
+
+    /// Zero `nbytes` at byte `off`.
+    ///
+    /// # Safety
+    /// As [`Self::zero_unsubmitted`], and `off + nbytes` must lie in this buffer.
+    pub(crate) unsafe fn zero_range_unsubmitted(&self, off: usize, nbytes: usize) {
+        debug_assert!(off.checked_add(nbytes).is_some_and(|end| end <= self.nbytes()));
+        // SAFETY: the caller bounds the window and guarantees no command is
+        // using these bytes. The write stays inside that window.
+        unsafe {
+            std::ptr::write_bytes(self.metal().contents().as_ptr().cast::<u8>().add(off), 0, nbytes);
+        }
     }
 
     /// Copy `data` to the start of the buffer on the host.

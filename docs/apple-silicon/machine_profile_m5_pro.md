@@ -13,9 +13,9 @@ Related: [`optimization_map.md`](optimization_map.md) · [`metal4_mpp.md`](metal
 | Item | Value |
 |------|-------|
 | Chip | **Apple M5 Pro** |
-| GPU cores | **20** |
+| GPU cores | **20**, measured 2026-10-30 (`system_profiler SPDisplaysDataType` “Total Number of Cores: 20”; `ioreg` `gpu-core-count` = 20) |
 | Unified memory | **64 GB** |
-| OS | **macOS 26.5.2** |
+| OS | **macOS 27.0.1** (`26A434`), measured 2026-10-30. macOS 27.2 is offered and not installed; its developer notes have no Metal or Core ML delta. See [`apple_ml_stack.md`](apple_ml_stack.md). |
 | Encode | Metal 4 only (hard-fail if M4 init fails) |
 | NAX | Present — TensorOps GEMM is the correct primary path |
 
@@ -46,9 +46,9 @@ MLX-style wired budgets map cleanly onto 64 GB unified memory:
 | Knob | Guidance |
 |------|----------|
 | `recommendedMaxWorkingSetSize` | Probe at `GpuRuntime` init; log in train banner |
-| Wired fraction | **~0.85–0.9 ×** recommended working set ≈ **~41–48 GB** on 64 GB |
+| Wired fraction | Default **0.9 ×** `recommendedMaxWorkingSetSize` (`src/runtime.rs` assemble). On this boot that is 46,385,646,796 bytes (43.2 GiB of the 48 GiB recommendation). `set_wired_fraction` stores a finite fraction clamped to 0.5–0.95. The arch02 banner prints that figure. It is not an admission cap, and it does not change `iogpu.wired_limit_mb` |
 | Pool cache cap | Cap recycled buffer pool; CLI override |
-| Storage | All pool allocs `StorageModeShared`; const arena ~1 MiB; bump slab ~64 MiB mostly idle |
+| Storage | All pool allocs `StorageModeShared`; const arena **16 MiB** (`METAL4_CONST_ARENA_BYTES` in `src/runtime.rs`; 1 MiB exhausted mid-token); bump slab ~64 MiB mostly idle |
 
 **Why this matters:** at B=16 the step is **binder / bwd-bound**, not
 “out of RAM.” Wired + cache caps are primarily **stability + room for B=32/64**,
@@ -59,7 +59,7 @@ not a free FLOPs win at B=16.
 | Batch | Role |
 |-------|------|
 | **B=16** | Live gate / default |
-| **B=32 / 64** | Throughput / RSS under wired policy; Hot residency still open |
+| **B=32 / 64** | Throughput / RSS under wired policy; Hot residency is wired (`alloc_buffer_hot`) |
 
 ---
 
@@ -95,19 +95,19 @@ Measure on Muon banks, top training GEMMs, and FA before rewriting. See
 | Row-wise FA bwd @ T=256 | Tiled FA gated off |
 | Soft EMA BPB ~2.038 f32 / ~2.037 bf16 | — |
 
-### Still open (Audit 6)
+### Still open
 
-| Gap | Impact |
-|-----|--------|
-| **P1a** bwd QKV fuse | **−48 binders** — top ROI |
-| **P1a2** dW accum-into-bank | **−24–32 binders** (MLP/out/stem) |
-| **P1b** resid/RMS bwd megakernels + skip_resid bf16 twin | **−16–20** |
-| **P1c** tape `deep_copy` | **−14–16** |
-| **P1d** hazard-aware Device barriers | 0 or ~2–8 ms (scheduling) |
-| **Hot residency** (`alloc_buffer_hot` unused) | RSS / churn at B≥32 |
-| **P0b** FineWeb B=32/64 rebench | Throughput docs |
-| **P1e** bf16 activation / FA cast tax | ~5–15 ms if training bf16 |
-| **P2** MLP coop postfix | Only after NAX util |
-| **P3** FA → CUDA BPB ~1.994 | Quality |
+The status table is Audit 6 in [`optimization_map.md`](optimization_map.md).
+These are the rows that table does not mark DONE:
+
+| Item | Map status |
+|------|------------|
+| **P0b** FineWeb B=32/64 rebench | Still open. Wired limit, working-set probe, and pool cache are DONE. Board: `gp-fineweb-b32-b64-rebench` |
+| **P1e** bf16 activation casts | **PARTIAL** |
+| **P2** MLP coop postfix | **DEFER** until a neural-accelerator utilization measurement |
+| **P3** FA quality | **PARTIAL** |
+
+P1a, P1a2, P1b, and P1c are **DONE** on that table. P1d is **REJECT as default**.
+Hot residency is **DONE**. Gate numbers stay on the map.
 
 Private heaps / ICB stay ruled out. Do not re-open Audit 4 P0/P0b/P1 as “missing.”

@@ -33,33 +33,15 @@ struct Site {
     count: usize,
 }
 
-/// Why this is a site list. `SafeTensors::read_f32` / `read_u32` and the
-/// `CheckpointSource` / `TensorSource` trait methods share names with the
-/// panicking `GpuBuffer` accessors but return `Result` (they read a file, not a
-/// mapping). Renaming them is a public API change the owner has not approved,
-/// and text scanning cannot infer a receiver's type soundly (aliases, wrapper
-/// types, shadowing, pattern bindings), so no heuristic is attempted: every
-/// exempt call is a reviewed site, counted exactly.
-///
-/// To add a site: confirm by reading the call that the receiver is a
-/// `SafeTensors` / `CheckpointSource` / `TensorSource` value, then add a row
-/// with the file, the receiver text as written (`self.st`, `st`) and the number
-/// of such calls. A new call beyond the count fails the test and names the
-/// call; a count above what the file holds (a stale row) fails and names the row.
-const ALLOWED_SITES: &[Site] = &[
-    Site {
-        file: "src/loader.rs",
-        receiver: "self.st",
-        method: ".read_f32(",
-        count: 2,
-    },
-    Site {
-        file: "src/safetensors.rs",
-        receiver: "st",
-        method: ".read_f32(",
-        count: 1,
-    },
-];
+/// Reviewed exemptions from the text ban. Empty: library code calls
+/// `TensorSource::read_f32` and `SafeTensors::read_f32` by path, so the source
+/// does not contain `.read_f32(`. Those methods return `Result` and share a
+/// name with `GpuBuffer::read_f32`, which panics. A method call written
+/// `receiver.read_f32(` is banned. Text scanning cannot infer the receiver's
+/// type (aliases, wrappers, shadowing), so a real file read that has to stay
+/// in method-call form is added here as an exact file, receiver text, and
+/// count — never by the receiver's name alone.
+const ALLOWED_SITES: &[Site] = &[];
 
 /// The identifier chain immediately before the dot (`self.st`, `st`); empty
 /// when the receiver is a call, index or other expression, so those never match.

@@ -278,6 +278,7 @@ pub mod qwen35_q4;
 pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
+pub mod shared;
 pub mod sq_norm;
 pub mod tensor;
 
@@ -300,6 +301,7 @@ pub use icb_smoke::{icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBin
 pub use mtl_tensor::{nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED};
 pub use ops::softcap_f32;
 pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode};
+pub use shared::{Shared, Timeline};
 pub use tensor::{DType, GpuBuffer, Tensor};
 
 /// Metallib produced by `build.rs`.

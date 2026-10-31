@@ -8,6 +8,14 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Pool ledger hook** (`src/pool_ledger.rs`; `GpuRuntime::set_pool_ledger`, `pool_resident`, `reclaim`).
+  A host that keeps one byte ledger (ojas's `Budget`) installs a `PoolLedger` on a runtime's buffer
+  pool. The pool then charges the bucket length of every buffer (`allocated_bytes_for`) before
+  `newBufferWithLength`, keeps free-listed buffers in a separate `Cached` balance, and on a refused
+  charge trims the free list, retries once and refuses with `LedgerRefused` (never waiting on the
+  GPU). `reclaim(timeline_value)` releases dropped buffers the GPU has finished, clamped to the
+  private lifetime event. No ledger is installed by default and behaviour is unchanged; the pool only
+  counts (`pool_resident`).
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
   A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
   derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison

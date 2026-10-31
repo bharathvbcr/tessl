@@ -242,6 +242,56 @@ impl PipelineCache {
     }
 }
 
+/// How the buffer allocator refused a request.
+///
+/// Every allocation entry point (`GpuRuntime::alloc_buffer*`, the tensor
+/// allocators built on them) still returns its failures as `String`, so
+/// existing callers keep working. This type is the one reader of those
+/// strings: `BufferPool::alloc` builds each message with the same
+/// constants and helpers [`is_allocation_failure`] reads, in this file, so a
+/// caller deciding "out of memory" never matches message fragments of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocFailure {
+    /// The request is past what the device can ever hold: more than
+    /// `maxBufferLength` or `isize::MAX` bytes, or a size whose rounded
+    /// bucket is. Permanent; freeing other buffers does not cure it.
+    Limit,
+    /// The device refused a buffer of an allowed size (`newBuffer` returned
+    /// nil). Buffers dropped but not yet recycled may free room, so a waited
+    /// commit or a pool trim can cure it.
+    Exhausted,
+}
+
+/// The text of a request-size refusal, after `buffer request {nbytes} `.
+const REQUEST_LIMIT_TEXT: &str = "exceeds host/device allocation limit";
+/// The text of a rounded-bucket refusal.
+const ROUNDED_LIMIT_MESSAGE: &str = "rounded buffer size exceeds device limit";
+/// The part of [`ROUNDED_LIMIT_MESSAGE`] that marks a permanent refusal.
+const DEVICE_LIMIT_TEXT: &str = "exceeds device limit";
+
+fn request_limit_message(nbytes: usize) -> String {
+    format!("buffer request {nbytes} {REQUEST_LIMIT_TEXT}")
+}
+
+fn new_buffer_failed_message(key: usize) -> String {
+    format!("newBuffer({key}) failed")
+}
+
+/// Read a failure `String` from the buffer allocator: `Some` when it is one
+/// of the allocator's refusals, `None` for any other error (a poisoned
+/// runtime, a missing pipeline, a message that merely mentions one).
+///
+/// `Limit` wins wherever its text sits in the string, so a permanent refusal
+/// is never taken for a retryable one. `Exhausted` needs the exact shape the
+/// allocator builds, `newBuffer(` + a decimal bucket size + `) failed`.
+pub fn is_allocation_failure(error: &str) -> Option<AllocFailure> {
+    if error.contains(REQUEST_LIMIT_TEXT) || error.contains(DEVICE_LIMIT_TEXT) {
+        return Some(AllocFailure::Limit);
+    }
+    let key = error.strip_prefix("newBuffer(")?.strip_suffix(") failed")?;
+    (!key.is_empty() && key.bytes().all(|b| b.is_ascii_digit())).then_some(AllocFailure::Exhausted)
+}
+
 struct BufferPool {
     freelist: HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
     cached_bytes: usize,
@@ -283,11 +333,11 @@ impl BufferPool {
         kind: BufferKind,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
         if nbytes > isize::MAX as usize || nbytes > self.max_buffer_length {
-            return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
+            return Err(request_limit_message(nbytes));
         }
         let key = Self::bucket(nbytes, kind)
             .filter(|&key| key <= self.max_buffer_length)
-            .ok_or("rounded buffer size exceeds device limit")?;
+            .ok_or_else(|| ROUNDED_LIMIT_MESSAGE.to_string())?;
         if let Some(v) = self.freelist.get_mut(&key) {
             if let Some(b) = v.pop() {
                 self.cached_bytes = self.cached_bytes.saturating_sub(key);
@@ -297,7 +347,7 @@ impl BufferPool {
         }
         let b = device
             .newBufferWithLength_options(key, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| format!("newBuffer({key}) failed"))?;
+            .ok_or_else(|| new_buffer_failed_message(key))?;
         Ok((b, false))
     }
 
@@ -3659,6 +3709,106 @@ mod audit_tests {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.alloc_buffer(usize::MAX)));
         assert!(outcome.is_ok(), "allocation arithmetic panicked");
         assert!(outcome.unwrap().is_err());
+    }
+
+    /// The allocator's real refusals, produced by `BufferPool::alloc` and
+    /// `GpuRuntime::alloc_buffer`, read as `Limit`. Each refuses before it
+    /// calls the device, so none holds memory.
+    #[test]
+    fn the_allocators_real_permanent_refusals_are_limit() {
+        let rt = GpuRuntime::new().unwrap();
+        let by_runtime = rt.alloc_buffer(usize::MAX).map(|_| ()).expect_err("past any device");
+        assert_eq!(
+            is_allocation_failure(&by_runtime),
+            Some(AllocFailure::Limit),
+            "{by_runtime}"
+        );
+        // Over the pool's `maxBufferLength`: the request-size check.
+        let over_request = BufferPool::new(0, 1 << 20)
+            .alloc(&rt.device, 2 << 20, BufferKind::Cold)
+            .map(|_| ())
+            .expect_err("over the buffer limit");
+        assert_eq!(over_request, request_limit_message(2 << 20));
+        assert_eq!(
+            is_allocation_failure(&over_request),
+            Some(AllocFailure::Limit),
+            "{over_request}"
+        );
+        // Within `maxBufferLength` but its page-rounded bucket is not: the
+        // rounded-size check.
+        let over_bucket = BufferPool::new(0, isize::MAX as usize)
+            .alloc(&rt.device, isize::MAX as usize, BufferKind::Cold)
+            .map(|_| ())
+            .expect_err("bucket past the limit");
+        assert_eq!(over_bucket, ROUNDED_LIMIT_MESSAGE);
+        assert_eq!(
+            is_allocation_failure(&over_bucket),
+            Some(AllocFailure::Limit),
+            "{over_bucket}"
+        );
+    }
+}
+
+/// `is_allocation_failure` against the messages the allocator builds, and
+/// against strings that are not allocation failures. Needs no device.
+#[cfg(test)]
+mod alloc_failure_tests {
+    use super::*;
+
+    #[test]
+    fn the_limit_texts_are_consistent() {
+        assert!(ROUNDED_LIMIT_MESSAGE.contains(DEVICE_LIMIT_TEXT));
+        assert!(request_limit_message(1).contains(REQUEST_LIMIT_TEXT));
+    }
+
+    /// `newBuffer` returning nil is the one refusal a test cannot drive
+    /// without asking Metal for an absurd length, so its message is read
+    /// from the helper `BufferPool::alloc` builds it with.
+    #[test]
+    fn every_message_the_allocator_builds_reads_as_its_class() {
+        for n in [0usize, 1, 255, 256, 16_384, 1 << 30, isize::MAX as usize, usize::MAX] {
+            assert_eq!(
+                is_allocation_failure(&request_limit_message(n)),
+                Some(AllocFailure::Limit),
+                "{n}"
+            );
+            assert_eq!(
+                is_allocation_failure(&new_buffer_failed_message(n)),
+                Some(AllocFailure::Exhausted),
+                "{n}"
+            );
+        }
+        assert_eq!(is_allocation_failure(ROUNDED_LIMIT_MESSAGE), Some(AllocFailure::Limit));
+    }
+
+    /// A permanent refusal wins wherever its text sits; a string that is not
+    /// exactly the allocator's `newBuffer(<digits>) failed` is not an allocation
+    /// failure, so a poisoned runtime's message that quotes one is not retried.
+    #[test]
+    fn only_the_allocators_shapes_are_allocation_failures() {
+        assert_eq!(
+            is_allocation_failure("newBuffer(8) failed exceeds device limit"),
+            Some(AllocFailure::Limit)
+        );
+        assert_eq!(
+            is_allocation_failure("x exceeds host/device allocation limit y"),
+            Some(AllocFailure::Limit)
+        );
+        for e in [
+            "",
+            "newBuffer failed",
+            "newBuffer() failed",
+            "newBuffer(-1) failed",
+            "newBuffer(12) x (34) failed",
+            " newBuffer(4096) failed",
+            "newBuffer(4096) failed ",
+            "newBuffer(\u{663}) failed",
+            "pipeline 'x' not found",
+            "bump arena exhausted: need 4 more bytes (cursor=0, cap=1)",
+            "runtime is poisoned after encode/submit failure (newBuffer(1) failed); recreate it",
+        ] {
+            assert_eq!(is_allocation_failure(e), None, "{e:?}");
+        }
     }
 }
 

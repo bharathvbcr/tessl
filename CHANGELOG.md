@@ -8,6 +8,13 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`tessl::is_allocation_failure` and `tessl::AllocFailure`: tessl owns the reading of its allocator's failures** (`src/runtime.rs`).
+  `GpuRuntime::alloc_buffer*` still return `String` errors, unchanged. `is_allocation_failure(&str)` returns
+  `Some(AllocFailure::Limit)` for a permanent refusal (request or rounded bucket past the device limit),
+  `Some(AllocFailure::Exhausted)` for `newBuffer({key}) failed`, and `None` for any other error.
+  `BufferPool::alloc` builds its messages with the same constants and helpers the parser reads, so a caller
+  no longer pins message fragments or `include_str!`s `runtime.rs` (ojas-metal did both).
+
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
   A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
   derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison

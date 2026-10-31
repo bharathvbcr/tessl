@@ -514,3 +514,20 @@ mod tests {
         ld.refuse_unread().unwrap();
     }
 }
+
+/// Open `path` for a reader, refusing anything but a regular file.
+pub(crate) fn open_regular_file(path: &std::path::Path) -> Result<(std::fs::File, u64), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let what = path.display();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{what}: {e}"))?;
+    let md = f.metadata().map_err(|e| format!("{what}: {e}"))?;
+    if !md.is_file() {
+        return Err(format!("{what}: not a regular file"));
+    }
+    Ok((f, md.len()))
+}
+

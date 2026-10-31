@@ -1272,7 +1272,7 @@ fn parse_decoder(j: Option<&Json>) -> Result<Vec<DecodeStep>, String> {
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<String, String> {
-    let (file, len) = crate::plain::open_regular_file(path)?;
+    let (file, len) = crate::loader::open_regular_file(path)?;
     if len > cap {
         return Err(format!("{}: {len} bytes, above the {cap}-byte cap", path.display()));
     }

@@ -146,7 +146,7 @@ pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
 /// not a directory); a file past [`MAX_CONFIG_BYTES`] is refused rather than
 /// read whole.
 pub fn read_config_text(path: &Path) -> Result<String, String> {
-    let (file, len) = crate::plain::open_regular_file(path)?;
+    let (file, len) = crate::loader::open_regular_file(path)?;
     if len > MAX_CONFIG_BYTES {
         return Err(format!(
             "{}: {len} bytes, above the {MAX_CONFIG_BYTES}-byte config cap",

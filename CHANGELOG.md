@@ -6,6 +6,25 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- **DO-NOT-MERGE-BEFORE-AB: the Qwen3.5 training step, its host AdamW and the 13 training C-ABI
+  symbols (ABI 13 -> 14).** Owner decision D5: ojas owns Metal training (the Tape over
+  `ojas-metal`); tessl keeps the kernels and their per-op launchers. Removed: `qwen35_train`
+  (`Qwen35Model::train_step*`, `train_forward`, `train_backward_into`, `Qwen35Grads`,
+  `PendingStep`, `Supervise`, the fused-AdamW step), the `qwen35_adamw` optimizer object
+  (`AdamW`, `AdamWConfig`, `UpdateRule`, `MomentStorage`, `Qwen35Model::adamw_step*`,
+  `grad_sq_norm`, the moment and aux reads and writes), `Qwen35Model::read_gradients` and
+  `read_gradient_host`, the C-ABI exports `tessl_qwen35_train_step`, `_step_ragged`, `_forward`,
+  `_backward`, `_discard`, `tessl_qwen35_hidden`, `tessl_qwen35_adamw_init`, `_free`, `_step`,
+  `_set_step_count`, `_step_count`, `tessl_qwen35_grad_sq_norm`, `tessl_gdn_train_forward` and
+  `_backward`, the `tessl_qwen35_copy` directions 1 and 3 to 8, the `tessl_torch` training
+  methods and `chunk_gated_delta_rule`, and the bins `bench_qwen35_train`, `bench_capi`,
+  `probe_train_memory`, `probe_soak` and `probe_storage_memory`. Kept: `adamw_step` (the f32
+  launcher `ojas-metal`'s legacy step calls) with `AdamWHyper`, `gdn_train`, `attn_train`,
+  `qwen35_bwd`, `cross_entropy`, `sq_norm` and every `.metal` kernel; the parameter table and
+  its copies (`excluded_from_weight_decay` moved to `qwen35_params`).
+
 ### Added
 
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).

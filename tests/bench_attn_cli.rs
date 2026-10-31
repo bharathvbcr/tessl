@@ -1,4 +1,4 @@
-//! `bench_qwen35_train --op=` and `bench_embedgemma2 --attn-kernel=` refuse bad
+//! `bench_embedgemma2 --attn-kernel=` refuses bad
 //! input before the GPU runtime starts and before any `METRIC` line.
 
 use std::process::Command;
@@ -30,25 +30,7 @@ fn assert_refused(bin: &str, envs: &[(&str, &str)], args: &[&str], needle: &str)
     );
 }
 
-const TRAIN: &str = env!("CARGO_BIN_EXE_bench_qwen35_train");
 const EG2: &str = env!("CARGO_BIN_EXE_bench_embedgemma2");
-
-#[test]
-fn train_op_filter_is_validated_before_the_runtime_in_every_mode() {
-    for extra in [&[][..], &["--check-only"], &["--step-only"], &["--bf16"]] {
-        let mut a = vec!["--op=no_such_op"];
-        a.extend_from_slice(extra);
-        assert_refused(TRAIN, &[], &a, "no such op");
-        let mut a = vec!["--op=swiglu_bwd", "--op=swiglu_bwd"];
-        a.extend_from_slice(extra);
-        assert_refused(TRAIN, &[], &a, "given twice");
-        // A repeat spelled two ways is still a repeat.
-        let mut a = vec!["--op=attn_train forward", "--op=attn_train_forward"];
-        a.extend_from_slice(extra);
-        assert_refused(TRAIN, &[], &a, "given twice");
-    }
-    assert_refused(TRAIN, &[], &["--op="], "no such op");
-}
 
 #[test]
 fn attn_kernel_refuses_bad_shapes_workloads_and_counts_before_any_metric() {

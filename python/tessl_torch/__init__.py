@@ -5,8 +5,12 @@
     loss.backward()
 
     model = tessl_torch.Qwen35(safetensors_path, config_json_path)
-    loss = model.train_step(ids)          # a whole Qwen3.5 step in tessl
-    grads = model.grads()                 # for a torch optimizer
+    params = model.parameters()           # an f32 copy of the weights, on MPS
+
+The Qwen3.5 training step, its gradients and its AdamW retired with ABI 14:
+ojas (the Tape over ojas-metal) owns Metal training, and tessl keeps the
+kernels. `Qwen35` here loads a checkpoint and reads and writes its
+parameters.
 
 Only the standard library and torch are needed: the library is loaded with
 ctypes, and MPS tensors are handed over as the MTLBuffer behind their storage
@@ -43,9 +47,7 @@ import torch
 __all__ = [
     "cross_entropy",
     "cross_entropy_rows",
-    "chunk_gated_delta_rule",
     "clip_coef",
-    "patch_transformers_qwen3_5",
     "Qwen35",
     "TesslError",
     "TesslPanic",
@@ -53,14 +55,12 @@ __all__ = [
     "library_path",
 ]
 
-_ABI_VERSION = 13
+_ABI_VERSION = 14
 _MAX_DIMS = 6
 _DTYPE_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 _ERR_LEN = 1024
 # GEMM operand codes: exact f32, or operands rounded to bf16 with f32 accumulation.
 _OPERANDS_CODE = {"f32": 0, "bf16": 1}
-# What Qwen35.train_forward scores: the causal-LM loss, or chosen rows.
-_SUPERVISE_CAUSAL, _SUPERVISE_ROWS = 0, 1
 
 
 _STATUS_PANIC = 2  # TESSL_PANIC: a bug in tessl, caught at the C boundary
@@ -244,19 +244,6 @@ class _CeArgs(ctypes.Structure):
     ]
 
 
-class _GdnArgs(ctypes.Structure):
-    _fields_ = [
-        ("batch", ctypes.c_uint32),
-        ("seq", ctypes.c_uint32),
-        ("heads", ctypes.c_uint32),
-        ("v_dim", ctypes.c_uint32),
-    ] + [
-        (name, _TensorRef)
-        for name in (
-            "q", "k", "v", "g", "beta", "s0", "ckpt", "o", "s_fin",
-            "d_o", "d_fin", "dq", "dk", "dv", "dg", "dbeta", "ds0",
-        )
-    ]
 
 
 _NAME_LEN = 128
@@ -319,10 +306,6 @@ def _load():
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
-        for name in ("tessl_gdn_train_forward", "tessl_gdn_train_backward"):
-            fn = getattr(lib, name)
-            fn.restype = ctypes.c_int32
-            fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_GdnArgs), ctypes.c_char_p, ctypes.c_size_t]
         err_args = [ctypes.c_char_p, ctypes.c_size_t]
         lib.tessl_qwen35_load.restype = ctypes.c_int32
         lib.tessl_qwen35_load.argtypes = [
@@ -335,62 +318,19 @@ def _load():
         lib.tessl_qwen35_param_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
         lib.tessl_qwen35_param_info.restype = ctypes.c_int32
         lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)] + err_args
-        lib.tessl_qwen35_train_step.restype = ctypes.c_int32
-        lib.tessl_qwen35_train_step.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_double),
-        ] + err_args
-        u32p = ctypes.POINTER(ctypes.c_uint32)
-        lib.tessl_qwen35_train_forward.restype = ctypes.c_int32
-        lib.tessl_qwen35_train_forward.argtypes = [
-            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, u32p, u32p, ctypes.c_uint64,
-            ctypes.c_float, ctypes.POINTER(ctypes.c_double),
-        ] + err_args
-        lib.tessl_qwen35_train_step_ragged.restype = ctypes.c_int32
-        lib.tessl_qwen35_train_step_ragged.argtypes = [
-            ctypes.c_void_p, u32p, ctypes.c_uint64, u32p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_uint64,
-        ] + err_args
-        lib.tessl_qwen35_hidden.restype = ctypes.c_int32
-        lib.tessl_qwen35_hidden.argtypes = [
-            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(_TensorRef),
-        ] + err_args
-        lib.tessl_qwen35_train_backward.restype = ctypes.c_int32
-        lib.tessl_qwen35_train_backward.argtypes = [
-            ctypes.c_void_p, u32p, ctypes.c_uint64, ctypes.POINTER(_TensorRef), ctypes.c_uint32,
-        ] + err_args
         f32p = ctypes.POINTER(ctypes.c_float)
         lib.tessl_qwen35_read_parameter_host.restype = ctypes.c_int32
         lib.tessl_qwen35_read_parameter_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, f32p, ctypes.c_uint64] + err_args
         lib.tessl_qwen35_write_parameter_host.restype = ctypes.c_int32
         lib.tessl_qwen35_write_parameter_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, f32p, ctypes.c_uint64] + err_args
-        lib.tessl_qwen35_train_discard.restype = ctypes.c_int32
-        lib.tessl_qwen35_train_discard.argtypes = [ctypes.c_void_p] + err_args
         lib.tessl_qwen35_copy.restype = ctypes.c_int32
         lib.tessl_qwen35_copy.argtypes = [
             ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_TensorRef), ctypes.c_uint64,
         ] + err_args
-        lib.tessl_qwen35_adamw_init.restype = ctypes.c_int32
-        lib.tessl_qwen35_adamw_init.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint32,
-        ] + err_args
-        lib.tessl_qwen35_adamw_free.restype = ctypes.c_int32
-        lib.tessl_qwen35_adamw_free.argtypes = [ctypes.c_void_p] + err_args
         lib.tessl_qwen35_describe.restype = ctypes.c_int32
         lib.tessl_qwen35_describe.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
         ] + err_args
-        lib.tessl_qwen35_adamw_step.restype = ctypes.c_int32
-        lib.tessl_qwen35_adamw_step.argtypes = [
-            ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-            ctypes.c_double, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
-        ] + err_args
-        lib.tessl_qwen35_adamw_step_count.restype = ctypes.c_int32
-        lib.tessl_qwen35_adamw_step_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)] + err_args
-        lib.tessl_qwen35_adamw_set_step_count.restype = ctypes.c_int32
-        lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64] + err_args
-        lib.tessl_qwen35_grad_sq_norm.restype = ctypes.c_int32
-        lib.tessl_qwen35_grad_sq_norm.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)] + err_args
         lib.tessl_clip_coef.restype = ctypes.c_float
         lib.tessl_clip_coef.argtypes = [ctypes.c_double, ctypes.c_double]
         _lib = lib
@@ -510,7 +450,7 @@ def _finish_torch_queue() -> None:
     thing that must not be done: tessl recycles memory off its private lifetime
     event, and the handoff event is separate so that foreign code signalling it
     cannot free memory early. So each call that gives tessl a torch buffer
-    (cross-entropy, GDN, ``hidden``, ``train_backward`` with a ``dh``, ``copy``)
+    (cross-entropy, ``copy``)
     waits here once; the calls that give it only host arrays do not."""
     torch.mps.synchronize()
 
@@ -778,160 +718,11 @@ def cross_entropy(
     return _CrossEntropy.apply(hidden, weight, targets, mask, reduction, chunk, operands)
 
 
-# ------------------------------------------------------ gated delta rule ---
+# ------------------------------------------------------ Qwen3.5 model ---
 
-_GDN_DK = 128
-_GDN_BV = 16
-_GDN_CKPT = 64
-_NULL_REF = _TensorRef()
-
-
-def _f32(t: torch.Tensor) -> torch.Tensor:
-    return t.detach().to(torch.float32).contiguous()
-
-
-def _gdn_args(B, T, H, Dv, **refs) -> _GdnArgs:
-    a = _GdnArgs()
-    a.batch, a.seq, a.heads, a.v_dim = (
-        _check_uint(n, v, 32) for n, v in (("batch", B), ("seq", T), ("heads", H), ("v_dim", Dv))
-    )
-    for name, t in refs.items():
-        setattr(a, name, _NULL_REF if t is None else _ref(t, name))
-    return a
-
-
-def _gdn_call(fn_name: str, args: _GdnArgs):
-    rt = _runtime()
-    err = ctypes.create_string_buffer(_ERR_LEN)
-    _finish_torch_queue()
-    status = getattr(rt.lib, fn_name)(rt.handle, ctypes.byref(args), err, _ERR_LEN)
-    _runtime_status(rt, status, err)
-
-
-class _GdnChunk(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, g, beta, initial_state):
-        B, T, H, Dk = q.shape
-        Dv = v.shape[-1]
-        qf, kf, vf, gf, bf = (_f32(x) for x in (q, k, v, g, beta))
-        s0 = None if initial_state is None else _f32(initial_state)
-        dev = q.device
-        o = torch.empty((B, T, H, Dv), dtype=torch.float32, device=dev)
-        s_fin = torch.empty((B, H, Dk, Dv), dtype=torch.float32, device=dev)
-        nc = -(-T // _GDN_CKPT)
-        ckpt = torch.empty((B, H, nc, Dk, Dv), dtype=torch.float32, device=dev)
-        _gdn_call(
-            "tessl_gdn_train_forward",
-            _gdn_args(B, T, H, Dv, q=qf, k=kf, v=vf, g=gf, beta=bf, s0=s0, ckpt=ckpt, o=o, s_fin=s_fin),
-        )
-        # The inputs as given (bf16 stays bf16) and one state per 64 tokens:
-        # everything else the backward needs it recomputes.
-        ctx.save_for_backward(q, k, v, g, beta, initial_state if initial_state is not None else torch.empty(0), ckpt)
-        ctx.has_s0 = initial_state is not None
-        ctx.dtypes = (q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype, None if initial_state is None else initial_state.dtype)
-        return o.to(v.dtype), s_fin
-
-    @staticmethod
-    def backward(ctx, d_o, d_fin):
-        q, k, v, g, beta, s0, ckpt = ctx.saved_tensors
-        B, T, H, Dk = q.shape
-        Dv = v.shape[-1]
-        qf, kf, vf, gf, bf = (_f32(x) for x in (q, k, v, g, beta))
-        s0f = _f32(s0) if ctx.has_s0 else None
-        dev = q.device
-        d_of = _f32(d_o) if d_o is not None else torch.zeros((B, T, H, Dv), dtype=torch.float32, device=dev)
-        d_finf = _f32(d_fin) if d_fin is not None else None
-        dq = torch.empty((B, T, H, Dk), dtype=torch.float32, device=dev)
-        dk = torch.empty_like(dq)
-        dv = torch.empty((B, T, H, Dv), dtype=torch.float32, device=dev)
-        dg = torch.empty((B, T, H), dtype=torch.float32, device=dev)
-        dbeta = torch.empty_like(dg)
-        ds0 = torch.empty((B, H, Dk, Dv), dtype=torch.float32, device=dev) if ctx.has_s0 else None
-        _gdn_call(
-            "tessl_gdn_train_backward",
-            _gdn_args(
-                B, T, H, Dv, q=qf, k=kf, v=vf, g=gf, beta=bf, s0=s0f, ckpt=ckpt,
-                d_o=d_of, d_fin=d_finf, dq=dq, dk=dk, dv=dv, dg=dg, dbeta=dbeta, ds0=ds0,
-            ),
-        )
-        tq, tk, tv, tg, tb, ts = ctx.dtypes
-        return (
-            dq.to(tq), dk.to(tk), dv.to(tv), dg.to(tg), dbeta.to(tb),
-            ds0.to(ts) if ds0 is not None else None,
-        )
-
-
-def chunk_gated_delta_rule(
-    query,
-    key,
-    value,
-    g,
-    beta,
-    chunk_size=64,
-    initial_state=None,
-    output_final_state=False,
-    use_qk_l2norm_in_kernel=False,
-    cu_seqlens=None,
-    **kwargs,
-):
-    """transformers' ``torch_chunk_gated_delta_rule``, on tessl's Metal kernels.
-
-    Same arguments and results: ``query``/``key`` ``[B, T, H, 128]``,
-    ``value`` ``[B, T, H, Dv]`` (``Dv`` a multiple of 16), ``g`` (the log
-    decay) and ``beta`` ``[B, T, H]``; returns ``(out [B, T, H, Dv],
-    final_state [B, H, 128, Dv] or None)``, differentiable in every input and
-    the initial state. The forward keeps only its inputs and one state per 64
-    tokens for the backward. ``chunk_size`` does not change the result (the
-    kernels checkpoint every 64 tokens regardless). Only the l2-normalized
-    form Qwen3.5 uses is implemented, and not ragged batches.
-    """
-    if not use_qk_l2norm_in_kernel:
-        raise TesslError("tessl's GDN kernels implement use_qk_l2norm_in_kernel=True only")
-    if cu_seqlens is not None:
-        raise TesslError(
-            "ragged batches (cu_seqlens) are not supported by the GDN kernel seam; "
-            "train a packed batch with Qwen35.train_step_ragged"
-        )
-    if query.dim() != 4 or query.shape != key.shape or query.shape[-1] != _GDN_DK:
-        raise TesslError(f"query and key must both be [B, T, H, {_GDN_DK}], got {tuple(query.shape)} and {tuple(key.shape)}")
-    B, T, H, _ = query.shape
-    if value.dim() != 4 or tuple(value.shape[:3]) != (B, T, H) or value.shape[-1] % _GDN_BV != 0:
-        raise TesslError(f"value must be [B, T, H, Dv] with Dv a multiple of {_GDN_BV}, got {tuple(value.shape)}")
-    for name, t in (("g", g), ("beta", beta)):
-        if tuple(t.shape) != (B, T, H):
-            raise TesslError(f"{name} must be [B, T, H] = {(B, T, H)}, got {tuple(t.shape)}")
-    if initial_state is not None and tuple(initial_state.shape) != (B, H, _GDN_DK, value.shape[-1]):
-        raise TesslError(f"initial_state must be {(B, H, _GDN_DK, value.shape[-1])}, got {tuple(initial_state.shape)}")
-    out, final = _GdnChunk.apply(query, key, value, g, beta, initial_state)
-    return out, (final if output_final_state else None)
-
-
-def patch_transformers_qwen3_5():
-    """Route transformers' Qwen3.5 chunked GDN through tessl.
-
-    Replaces ``modeling_qwen3_5.torch_chunk_gated_delta_rule`` (the torch
-    fallback transformers uses when ``fla`` is absent, as on macOS), which the
-    layer looks up at call time. Returns the function it replaced.
-    """
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as m
-
-    previous = m.torch_chunk_gated_delta_rule
-    m.torch_chunk_gated_delta_rule = chunk_gated_delta_rule
-    return previous
-
-
-# ------------------------------------------------------ Qwen3.5 training ---
-
-_READ_PARAMS, _READ_GRADS, _WRITE_PARAMS = 0, 1, 2
-_READ_ADAMW_M, _READ_ADAMW_V, _WRITE_ADAMW_M, _WRITE_ADAMW_V = 3, 4, 5, 6
-_READ_ADAMW_AUX, _WRITE_ADAMW_AUX = 7, 8
-# Stored precision codes (TESSL_F32, TESSL_BF16), and the AdamW update rules
-# and moment storages by the names tessl's AdamW::describe prints.
+_READ_PARAMS, _WRITE_PARAMS = 0, 2
+# Stored precision codes (TESSL_F32, TESSL_BF16).
 _PRECISION_CODE = {"f32": 0, "bf16": 1}
-_UPDATE_CODE = {"f32": 0, "f32-master": 1, "bf16-kahan": 2, "bf16-stochastic": 3}
-_MOMENTS_CODE = {"f32": 0, "bf16": 1, "block8": 2}
-# The rules that keep auxiliary state: an f32 master, or a Kahan compensation.
-_AUX_RULES = ("f32-master", "bf16-kahan")
 
 
 class Qwen35(_Owned):
@@ -990,8 +781,6 @@ class Qwen35(_Owned):
         self._own(rt.lib, handle)
         rt._models.add(self)
         self._precision = precision
-        # What adamw_init made the AdamW state with, or None.
-        self._adamw_config = None
         count = ctypes.c_uint64()
         self._check(rt.lib.tessl_qwen35_param_count(handle, ctypes.byref(count), err, _ERR_LEN), err)
         table = []
@@ -1004,12 +793,6 @@ class Qwen35(_Owned):
             decay_excluded.append(bool(info.decay_excluded))
         self._table = table
         self._decay_excluded = decay_excluded
-        self._has_grads = False
-        # A step between train_forward and train_backward, and whether the
-        # bank held a finished step's gradients before it (a discard leaves
-        # the bank as it was).
-        self._pending = False
-        self._grads_before_pending = False
         self._hidden = dict((n, s) for n, s, _ in table)["norm.weight"][0]
 
     def _check(self, status: int, err):
@@ -1077,36 +860,6 @@ class Qwen35(_Owned):
         ts = self._storage(torch.device(device))
         self._copy(_READ_PARAMS, ts)
         return self._views(ts)
-
-    def grads(self, device: str = "mps", into: dict | None = None) -> dict:
-        """The last ``train_step``'s gradients, laid out as ``parameters()``.
-
-        With ``into`` (a dict an earlier ``grads()`` or ``parameters()``
-        returned, such as the optimizer's ``.grad`` tensors), the gradients
-        are written into those tensors and ``into`` is returned: no new
-        memory, where a fresh call allocates another copy of every gradient
-        while the previous one is usually still alive. Every tensor is checked
-        before any is written."""
-        if not self._has_grads:
-            raise TesslError("no gradients yet; call train_step first")
-        if into is None:
-            ts = self._storage(torch.device(device))
-            self._copy(_READ_GRADS, ts)
-            return self._views(ts)
-        self._check_names("grads(into=...):", into)
-        ts = []
-        for name, shape, tr in self._table:
-            t = into[name]
-            if tuple(t.shape) != shape or t.dtype != torch.float32 or t.device.type != "mps":
-                raise TesslError(f"grads(into=...): {name} must be f32 {shape} on mps, "
-                                 f"got {t.dtype} {tuple(t.shape)} on {t.device}")
-            storage = t.t() if tr else t
-            if not storage.is_contiguous():
-                raise TesslError(f"grads(into=...): {name} is not laid out as grads() returns it"
-                                 f"{' (a transposed view of a contiguous [in, out] tensor)' if tr else ''}")
-            ts.append(storage)
-        self._copy(_READ_GRADS, ts)
-        return into
 
     def load_parameters(self, params) -> None:
         """Set every parameter from ``params`` (name -> tensor of the
@@ -1190,334 +943,6 @@ class Qwen35(_Owned):
         self._check(status, err)
         return out.value.decode()
 
-    def adamw_init(self, update: str | None = None, moments: str = "f32", seed: int = 0) -> None:
-        """Make AdamW state inside tessl: moments zeroed, step count 0. With
-        it a training loop needs no torch copy of the parameters or gradients.
-
-        An f32 model takes ``update="f32"`` (the default for it): torch's
-        AdamW, bit for bit. A bf16 model names how its bf16 weights take
-        their updates: ``"f32-master"`` (an f32 master of each weight),
-        ``"bf16-kahan"`` (a bf16 compensation of what rounding dropped) or
-        ``"bf16-stochastic"`` (stochastic rounding from ``seed``, the only
-        rule that takes one). ``moments`` is ``"f32"`` (twice the parameters'
-        memory, 16 GB on the 2B), ``"bf16"`` or ``"block8"`` (8-bit codes,
-        one f32 scale per 256 elements)."""
-        if update is None:
-            if self._precision != "f32":
-                raise TesslError("adamw_init: a bf16 model takes update='f32-master', 'bf16-kahan' or "
-                                 "'bf16-stochastic'")
-            update = "f32"
-        if update not in _UPDATE_CODE:
-            raise TesslError(f"adamw_init: update must be one of {sorted(_UPDATE_CODE)}, not {update!r}")
-        if moments not in _MOMENTS_CODE:
-            raise TesslError(f"adamw_init: moments must be one of {sorted(_MOMENTS_CODE)}, not {moments!r}")
-        seed = _check_uint("adamw_init: seed", seed, 64)
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(
-            self._rt.lib.tessl_qwen35_adamw_init(
-                self._handle, _UPDATE_CODE[update], seed, _MOMENTS_CODE[moments], err, _ERR_LEN),
-            err,
-        )
-        self._adamw_config = {"update": update, "seed": seed, "moments": moments}
-
-    def adamw_free(self) -> None:
-        """Drop the AdamW state, if any."""
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_adamw_free(self._handle, err, _ERR_LEN), err)
-        self._adamw_config = None
-
-    @property
-    def adamw_step_count(self) -> int:
-        """AdamW steps taken so far (torch's ``state["step"]``)."""
-        count = ctypes.c_uint64()
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_adamw_step_count(self._handle, ctypes.byref(count), err, _ERR_LEN), err)
-        return count.value
-
-    def adamw_state(self, device: str = "mps") -> dict:
-        """A checkpoint of the AdamW state: ``{"step": int, "config": {"update",
-        "seed", "moments"}, "exp_avg": {name: tensor}, "exp_avg_sq": {name:
-        tensor}}``, the moments laid out as ``parameters()`` (f32, decoded from
-        bf16 or 8-bit storage) and named as torch's AdamW names them, plus
-        ``"aux"`` (the f32 masters or the Kahan compensations, widened) under
-        a rule that keeps them. Saved with the parameters, it resumes the run
-        bit for bit through ``load_adamw_state``."""
-        if self._adamw_config is None:
-            raise TesslError("adamw_state: no AdamW state; call adamw_init first")
-        state = {"step": self.adamw_step_count, "config": dict(self._adamw_config)}
-        keys = [("exp_avg", _READ_ADAMW_M), ("exp_avg_sq", _READ_ADAMW_V)]
-        if self._adamw_config["update"] in _AUX_RULES:
-            keys.append(("aux", _READ_ADAMW_AUX))
-        for key, direction in keys:
-            ts = self._storage(torch.device(device))
-            self._copy(direction, ts)
-            state[key] = self._views(ts)
-        return state
-
-    def load_adamw_state(self, state: dict) -> None:
-        """Restore what ``adamw_state`` returned (or torch's AdamW state for
-        the same parameters, rearranged by name, into an f32 model's f32
-        AdamW) into the AdamW state that ``adamw_init()`` made. A checkpoint
-        without ``"config"`` is torch's AdamW: f32 rule and moments. A
-        checkpoint made under another configuration is refused, as is one
-        whose ``"aux"`` the rule needs and lacks or does not need and has.
-        Everything is checked before anything is written."""
-        required = {"step", "exp_avg", "exp_avg_sq"}
-        if not required <= set(state) or set(state) - required - {"config", "aux"}:
-            raise TesslError(
-                f"load_adamw_state: want keys step, exp_avg and exp_avg_sq (and config and aux as adamw_state "
-                f"writes them), got {sorted(state)}")
-        if self._adamw_config is None:
-            raise TesslError("load_adamw_state: no AdamW state; call tessl_qwen35_adamw_init first")
-        saved = state.get("config", {"update": "f32", "seed": 0, "moments": "f32"})
-        if saved != self._adamw_config:
-            raise TesslError(f"load_adamw_state: the checkpoint's AdamW is {saved}, this model's "
-                             f"{self._adamw_config}; call adamw_init with the checkpoint's configuration")
-        wants_aux = self._adamw_config["update"] in _AUX_RULES
-        if wants_aux != ("aux" in state):
-            raise TesslError(f"load_adamw_state: update {self._adamw_config['update']!r} "
-                             f"{'needs' if wants_aux else 'keeps no'} aux state, and the checkpoint "
-                             f"{'has none' if wants_aux else 'has some'}")
-        step = _check_uint("load_adamw_state: step", state["step"], 64)
-        m = self._staged("load_adamw_state: exp_avg", state["exp_avg"])
-        v = self._staged("load_adamw_state: exp_avg_sq", state["exp_avg_sq"])
-        aux = self._staged("load_adamw_state: aux", state["aux"]) if wants_aux else None
-        self._copy(_WRITE_ADAMW_M, m)
-        self._copy(_WRITE_ADAMW_V, v)
-        if aux is not None:
-            self._copy(_WRITE_ADAMW_AUX, aux)
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_adamw_set_step_count(self._handle, step, err, _ERR_LEN), err)
-
-    def grad_sq_norm(self) -> float:
-        """The sum of squares of every gradient the last ``train_step`` left:
-        the square of the global norm ``clip_grad_norm_`` takes. Add the
-        squares of any gradients outside tessl (a head of your own) before
-        forming ``clip_coef``."""
-        if not self._has_grads:
-            raise TesslError("no gradients yet; call train_step first")
-        out = ctypes.c_double()
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_grad_sq_norm(self._handle, ctypes.byref(out), err, _ERR_LEN), err)
-        return out.value
-
-    def adamw_step(self, lr: float, betas=(0.9, 0.999), eps: float = 1e-8, weight_decay=0.01,
-                   grad_scale: float = 1.0) -> None:
-        """One ``torch.optim.AdamW`` step (amsgrad and maximize off) on every
-        parameter, in tessl, from the last ``train_step``'s gradients.
-
-        ``weight_decay`` is a float, applied to every parameter except those
-        transformers' Trainer excludes (every norm and ``linear_attn.dt_bias``),
-        or a dict giving every parameter name its own. ``grad_scale``
-        multiplies every gradient before the update, as ``clip_grad_norm_``
-        scales ``.grad``: pass ``clip_coef(norm, max_norm)``. The gradients
-        ``grads()`` reads stay unscaled. Call ``adamw_init()`` first."""
-        if isinstance(weight_decay, dict):
-            self._check_names("adamw_step: weight_decay is", weight_decay)
-            wd = [float(weight_decay[name]) for name, _, _ in self._table]
-        else:
-            wd = [0.0 if ex else float(weight_decay) for ex in self._decay_excluded]
-        beta1, beta2 = betas
-        arr = (ctypes.c_float * len(wd))(*wd)
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        # No torch.mps.synchronize(): this call hands tessl no torch buffer
-        # (host arrays only; the model's weights, gradients and moments are
-        # tessl's own), so there is nothing on torch's queue to wait for, and
-        # draining it would only stall overlapping torch work. `guarded`
-        # still finishes tessl's work before the call returns.
-        self._check(
-            self._rt.lib.tessl_qwen35_adamw_step(
-                self._handle, float(lr), float(beta1), float(beta2), float(eps), float(grad_scale), arr, len(wd), err,
-                _ERR_LEN,
-            ),
-            err,
-        )
-
-    def _ids(self, ids) -> "_HostU32":
-        ids = torch.as_tensor(ids)
-        if ids.dim() != 1:
-            raise TesslError(f"ids must be 1-D (one sequence), got shape {tuple(ids.shape)}")
-        return _u32(ids, 1 << 32, "ids")
-
-    def train_forward(self, ids, operands: str = "f32", positions=None, targets=None, scale: float = 1.0) -> float:
-        """The forward and loss of one step, kept for ``hidden()`` and
-        ``train_backward()``; returns the loss.
-
-        With ``positions`` and ``targets`` (1-D, equal length, positions
-        distinct; both empty is allowed), the loss is the sum of the
-        cross-entropies of the hidden state at ``positions[i]`` against token
-        ``targets[i]``, and the gradients are those of ``scale`` times it: a
-        batch mean over ``N`` supervised rows split across several sequences
-        is ``scale=1/N`` on each. Without them it is transformers' causal-LM
-        loss, as ``train_step``. In transformers' shifted frame, the position
-        that predicts ``ids[p + 1]`` is ``p``."""
-        code = _operands_code(operands)
-        host = self._ids(ids)
-        n_ids = host.t.numel()
-        if (positions is None) != (targets is None):
-            raise TesslError("train_forward: give positions and targets together")
-        if positions is None:
-            sup, pos, tgt, n = _SUPERVISE_CAUSAL, None, None, 0
-        else:
-            pos = _u32(torch.as_tensor(positions), 1 << 32, "positions")
-            tgt = _u32(torch.as_tensor(targets), 1 << 32, "targets")
-            if pos.t.numel() != tgt.t.numel():
-                raise TesslError(f"train_forward: {pos.t.numel()} positions but {tgt.t.numel()} targets")
-            sup, n = _SUPERVISE_ROWS, pos.t.numel()
-        loss = ctypes.c_double()
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        # No torch.mps.synchronize(): this call hands tessl no torch buffer
-        # (host arrays only; the model's weights, gradients and moments are
-        # tessl's own), so there is nothing on torch's queue to wait for, and
-        # draining it would only stall overlapping torch work. `guarded`
-        # still finishes tessl's work before the call returns.
-        self._check(
-            self._rt.lib.tessl_qwen35_train_forward(
-                self._handle, host.ctypes_ptr, n_ids, code, sup,
-                pos.ctypes_ptr if n else None, tgt.ctypes_ptr if n else None, n, float(scale),
-                ctypes.byref(loss), err, _ERR_LEN,
-            ),
-            err,
-        )
-        self._grads_before_pending, self._has_grads, self._pending = self._has_grads, False, True
-        return loss.value
-
-    def hidden(self, positions) -> torch.Tensor:
-        """Rows ``positions`` of the pending step's final-norm output
-        (transformers' ``last_hidden_state``), a new f32 ``[n, hidden]``
-        tensor on MPS, for a loss outside tessl."""
-        pos = _u32(torch.as_tensor(positions), 1 << 32, "positions")
-        n = pos.t.numel()
-        out = torch.empty((n, self._hidden), dtype=torch.float32, device="mps")
-        if n == 0:
-            if not self._pending:
-                raise TesslError("hidden: no step is pending; call train_forward first")
-            return out
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        _finish_torch_queue()
-        ref = _ref(out, "out")
-        self._check(
-            self._rt.lib.tessl_qwen35_hidden(self._handle, pos.ctypes_ptr, n, ctypes.byref(ref), err, _ERR_LEN),
-            err,
-        )
-        return out
-
-    def train_backward(self, dh=None, positions=None, accumulate: bool = False) -> None:
-        """The pending step's backward: every parameter's gradient for
-        ``grads()``, over the previous ones or, with ``accumulate``, added to
-        them. ``dh`` (``[n, hidden]``, any dtype and device) is the gradient
-        of a loss outside tessl at rows ``positions`` of what ``hidden()``
-        reads, added to the step's own; rows of a repeated position are
-        summed first. A refused call keeps the step pending
-        (``train_discard()`` drops it)."""
-        accumulate = _flag("accumulate", accumulate)
-        if (dh is None) != (positions is None):
-            raise TesslError("train_backward: give dh and positions together")
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        if dh is None:
-            pos_ptr, n, ref = None, 0, None
-        else:
-            positions = _index_tensor(torch.as_tensor(positions), "positions")
-            if tuple(dh.shape) != (positions.numel(), self._hidden):
-                raise TesslError(
-                    f"train_backward: dh must be [{positions.numel()}, {self._hidden}], got {tuple(dh.shape)}"
-                )
-            dh32 = dh.detach().to(device="mps", dtype=torch.float32)
-            uniq, inv = torch.unique(positions, return_inverse=True)
-            if uniq.numel() != positions.numel():
-                dh32 = torch.zeros((uniq.numel(), self._hidden), dtype=torch.float32, device="mps").index_add_(
-                    0, inv.to("mps"), dh32
-                )
-                positions = uniq
-            dh32 = dh32.contiguous()
-            pos = _u32(positions, 1 << 32, "positions")
-            n = pos.t.numel()
-            pos_ptr = pos.ctypes_ptr if n else None
-            ref = ctypes.byref(_ref(dh32, "dh")) if n else None
-        if ref is not None:
-            _finish_torch_queue()
-        self._check(
-            self._rt.lib.tessl_qwen35_train_backward(self._handle, pos_ptr, n, ref, accumulate, err, _ERR_LEN),
-            err,
-        )
-        self._has_grads, self._pending = True, False
-
-    def train_discard(self) -> None:
-        """Drop the pending step, if any, without its backward; the
-        gradients are then as they were before it."""
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        self._check(self._rt.lib.tessl_qwen35_train_discard(self._handle, err, _ERR_LEN), err)
-        if self._pending:
-            self._has_grads, self._pending = self._grads_before_pending, False
-
-    def train_step(self, ids, operands: str = "f32") -> float:
-        """One training step on one sequence of token ids (a 1-D tensor or a
-        sequence of ints): returns transformers' causal-LM loss and keeps
-        every parameter's gradient for ``grads()``. The forward keeps only
-        each layer's input; each layer reruns just before its backward.
-        ``operands`` is the GEMMs': ``"f32"`` (exact) or ``"bf16"`` (operands
-        rounded to bf16, f32 accumulation; weights, activations and
-        gradients stay f32)."""
-        code = _operands_code(operands)
-        host = self._ids(ids)
-        loss = ctypes.c_double()
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        # No torch.mps.synchronize(): this call hands tessl no torch buffer
-        # (host arrays only; the model's weights, gradients and moments are
-        # tessl's own), so there is nothing on torch's queue to wait for, and
-        # draining it would only stall overlapping torch work. `guarded`
-        # still finishes tessl's work before the call returns.
-        self._has_grads = False
-        status = self._rt.lib.tessl_qwen35_train_step(
-            self._handle, host.ctypes_ptr, host.t.numel(), code, ctypes.byref(loss), err, _ERR_LEN,
-        )
-        del host
-        self._check(status, err)
-        self._has_grads = True
-        return loss.value
-
-    def train_step_ragged(self, ids, cu_seqlens, operands: str = "f32", accumulate: bool = False):
-        """One training step on several sequences packed end to end.
-
-        ``ids`` is the packed token ids (1-D, or ``[1, T]`` as transformers'
-        ``DataCollatorWithFlattening`` produces ``input_ids``) and
-        ``cu_seqlens`` the prefix offsets of its sequences as the
-        flash-attention varlen path takes them (``cu_seq_lens_q``: an int32
-        tensor of ``n_seq + 1`` values from 0 to ``T``, strictly rising, each
-        sequence at least two tokens). Each sequence trains as ``train_step``
-        would train it alone (positions restart, no state or attention crosses
-        a boundary). The gradients, kept for ``grads()``, are those of the
-        token mean over every sequence's predicted positions, over the
-        previous ones or, with ``accumulate``, added to them. Returns
-        ``(loss, per_sequence)``: that token-mean loss and a list of each
-        sequence's own causal-LM loss. A bad ``cu_seqlens`` is refused before
-        any GPU work (like ``train_step``, a refused call leaves this
-        object reporting no gradients until the next successful step)."""
-        code = _operands_code(operands)
-        accumulate = _flag("accumulate", accumulate)
-        ids = torch.as_tensor(ids)
-        if ids.dim() == 2 and ids.shape[0] == 1:
-            ids = ids[0]
-        host = self._ids(ids)
-        cu = torch.as_tensor(cu_seqlens)
-        if cu.dim() != 1:
-            raise TesslError(f"cu_seqlens must be 1-D, got shape {tuple(cu.shape)}")
-        cu_host = _u32(cu, 1 << 32, "cu_seqlens")
-        n_cu = cu_host.t.numel()
-        n_seq = max(n_cu - 1, 0)
-        per_seq = (ctypes.c_double * max(n_seq, 1))()
-        loss = ctypes.c_double()
-        err = ctypes.create_string_buffer(_ERR_LEN)
-        # Host arrays only, as train_step: nothing of torch's to wait for.
-        self._has_grads = False
-        status = self._rt.lib.tessl_qwen35_train_step_ragged(
-            self._handle, host.ctypes_ptr, host.t.numel(), cu_host.ctypes_ptr, n_cu, code, accumulate,
-            ctypes.byref(loss), per_seq, n_seq, err, _ERR_LEN,
-        )
-        del host, cu_host
-        self._check(status, err)
-        self._has_grads = True
-        return loss.value, list(per_seq)[:n_seq]
 
 
 from .embedgemma2 import EmbedGemma2  # noqa: E402  (after the definitions it imports from this module)

@@ -9,7 +9,6 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tessl::gemm::GemmOperands;
 use tessl::npy::read_npy;
 use tessl::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
 use tessl::qwen35_params::ParamInfo;
@@ -107,85 +106,6 @@ fn a_bf16_load_holds_the_same_weights_as_the_f32_load() {
     assert!(worst / scale < 2e-2, "bf16 logits off by {worst} at scale {scale}");
 }
 
-#[test]
-fn gradients_are_transformers_autograd_under_its_names() {
-    let (rt, model, _st) = load(Precision::F32);
-    let table = model.parameter_table().unwrap();
-    let step = model.train_step(&ids(), GemmOperands::ExactF32).unwrap();
-    let dst = alloc(&rt, &table);
-    model.read_gradients(&step.grads, &dst).unwrap();
-    let mut worst = 0.0f64;
-    for (p, t) in table.iter().zip(&dst) {
-        let a = read_npy(&fixture().join(format!("grad.model.{}.npy", p.name))).unwrap();
-        assert_eq!(a.shape, p.shape, "{}", p.name);
-        let want = a.f32_slice().unwrap();
-        let got = hf(p, t);
-        let peak = want.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-30);
-        let r = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / peak;
-        worst = worst.max(f64::from(r));
-        assert!(r <= 1e-4, "{}: {r:.3e}", p.name);
-    }
-    eprintln!("worst gradient through the table: {worst:.2e}");
-}
-
-#[test]
-fn a_write_round_trips_and_moves_both_forwards_together() {
-    let (rt, model, _st) = load(Precision::F32);
-    let ids = ids();
-    let table = model.parameter_table().unwrap();
-    let before = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    let params = alloc(&rt, &table);
-    model.read_parameters(&params).unwrap();
-
-    // Writing back what was read changes nothing.
-    model.write_parameters(&params).unwrap();
-    let same = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    assert_eq!(
-        same.loss.to_bits(),
-        before.loss.to_bits(),
-        "a write of the read values moved the loss"
-    );
-
-    // One SGD step: p - lr * g, written back, then read again.
-    let grads = alloc(&rt, &table);
-    model.read_gradients(&before.grads, &grads).unwrap();
-    let lr = 0.05f32;
-    let stepped: Vec<Tensor> = params
-        .iter()
-        .zip(&grads)
-        .map(|(p, g)| {
-            let v: Vec<f32> = p
-                .read_f32()
-                .unwrap()
-                .iter()
-                .zip(g.read_f32().unwrap())
-                .map(|(a, b)| a - lr * b)
-                .collect();
-            common::tensor_f32(&rt, p.shape(), &v)
-        })
-        .collect();
-    model.write_parameters(&stepped).unwrap();
-    let back = alloc(&rt, &table);
-    model.read_parameters(&back).unwrap();
-    for ((p, s), b) in table.iter().zip(&stepped).zip(&back) {
-        let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
-        // Exact, the embedding (an f32 table) and the norms included.
-        for (i, (x, y)) in b.iter().zip(&s).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "{}[{i}]: read back {x}, wrote {y}", p.name);
-        }
-    }
-    // Loss decreases along the negative gradient, and the training step and
-    // the inference forward (whose head reads the same table) agree.
-    let after = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    assert!(after.loss < before.loss, "loss {} -> {}", before.loss, after.loss);
-    let infer = inference_loss(&model, &ids);
-    assert!(
-        (infer - after.loss).abs() <= 1e-5 * after.loss,
-        "inference {infer} vs training {}",
-        after.loss
-    );
-}
-
 /// Any f32 written reads back with its bits, for every entry: the
 /// zero-centred norms are stored as their `w`, so a `w` below -0.5 (whose
 /// `1 + w` has finer steps than `w` itself) survives a write and a read, as
@@ -273,7 +193,7 @@ fn refusals_leave_the_model_untouched() {
     let (rt, model, _st) = load(Precision::F32);
     let ids = ids();
     let table = model.parameter_table().unwrap();
-    let before = model.train_step(&ids, GemmOperands::ExactF32).unwrap().loss;
+    let before = inference_loss(&model, &ids);
     let e = |r: Result<(), String>, needle: &str| {
         let m = r.expect_err(needle);
         assert!(m.contains(needle), "{m:?} lacks {needle:?}");
@@ -299,10 +219,7 @@ fn refusals_leave_the_model_untouched() {
     let mut wrong = alloc(&rt, &table);
     wrong[0] = bf;
     e(model.read_parameters(&wrong), "embed_tokens.weight must be f32");
-    assert_eq!(
-        model.train_step(&ids, GemmOperands::ExactF32).unwrap().loss.to_bits(),
-        before.to_bits()
-    );
+    assert_eq!(inference_loss(&model, &ids).to_bits(), before.to_bits());
 
     // Another runtime's tensors are refused before anything is copied.
     let (brt, bf16, _) = load(Precision::Bf16);
@@ -351,31 +268,11 @@ fn per_entry_host_copies_match_the_whole_table_copies() {
     for precision in [Precision::F32, Precision::Bf16] {
         let (rt, model) = load_tower(precision);
         let table = model.parameter_table().unwrap();
-        let ids = ids();
-        let step = model
-            .train_step(
-                &ids,
-                if precision == Precision::F32 {
-                    GemmOperands::ExactF32
-                } else {
-                    GemmOperands::Bf16
-                },
-            )
-            .unwrap();
         let params = whole(&rt, &model, &table);
-        let grads = alloc(&rt, &table);
-        model.read_gradients(&step.grads, &grads).unwrap();
         for (i, p) in table.iter().enumerate() {
             let mut got = vec![0.0f32; numel(p)];
             model.read_parameter_host(i, &mut got).unwrap();
             assert_eq!(bits(&got), bits(&params[i]), "{precision:?} {} parameter", p.name);
-            model.read_gradient_host(&step.grads, i, &mut got).unwrap();
-            assert_eq!(
-                bits(&got),
-                bits(&grads[i].read_f32().unwrap()),
-                "{precision:?} {} gradient",
-                p.name
-            );
         }
         // A read written back is the identity (bf16: widen then round is exact).
         for (i, p) in table.iter().enumerate() {
@@ -445,20 +342,7 @@ fn per_entry_host_refusals_move_nothing() {
         let _held = other.buffer.try_contents_f32().unwrap();
         e(model.read_parameter_host(1, &mut buf), "runtime busy");
         e(model.write_parameter_host(1, &vec![9.0; n]), "runtime busy");
-        let g = model.train_step(&ids, GemmOperands::ExactF32);
-        assert!(g.is_err(), "a train step ran under a host mapping");
     }
-    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    {
-        let held = rt.alloc_tensor_f32(&[1]).unwrap();
-        let _held = held.buffer.try_contents_f32().unwrap();
-        e(model.read_gradient_host(&step.grads, 1, &mut buf), "runtime busy");
-    }
-    e(model.read_gradient_host(&step.grads, 1, &mut buf[1..]), "takes");
-    // Another runtime's gradients are refused by name.
-    let (_, other, _) = load(Precision::F32);
-    let theirs = other.train_step(&ids, GemmOperands::ExactF32).unwrap();
-    e(model.read_gradient_host(&theirs.grads, 1, &mut buf), "another runtime");
     // Nothing moved: values the same, the session still continues.
     assert_eq!(
         whole(&rt, &model, &table).iter().map(|v| bits(v)).collect::<Vec<_>>(),
@@ -575,53 +459,53 @@ fn host_write_rounds_like_the_gpu_write_bit_for_bit() {
 fn per_entry_host_calls_refuse_on_a_poisoned_runtime() {
     let (rt, model, _st) = load(Precision::F32);
     let table = model.parameter_table().unwrap();
-    let ids = ids();
-    let step = model.train_step(&ids, GemmOperands::ExactF32).unwrap();
     let n = numel(&table[1]);
     rt.poison_as_shared_event_timeout_for_test();
     let mut buf = vec![0.0f32; n];
     for (what, r) in [
         ("read_parameter_host", model.read_parameter_host(1, &mut buf)),
-        ("read_gradient_host", model.read_gradient_host(&step.grads, 1, &mut buf)),
         ("write_parameter_host", model.write_parameter_host(1, &vec![7.0; n])),
     ] {
         assert!(r.is_err(), "{what} succeeded on a poisoned runtime");
     }
 }
 
-/// Every bf16 bit pattern (subnormals, NaN payloads of both signs, infinities,
-/// zeros) stored in a bf16 gradient bank reads out through the host copy as
-/// the GPU `read_gradients` widens it, bit for bit; every mismatch is listed.
+
+/// A write round-trips bit for bit, moves the inference forward, and a write
+/// of the values just read changes nothing. (The gradient-driven SGD step this
+/// test took before ABI 14 needed the retired training step; a fixed rescale
+/// stands in for the update.)
 #[test]
-fn host_read_widens_like_the_gpu_read_bit_for_bit() {
-    let (rt, model) = load_tower(Precision::Bf16);
+fn a_write_round_trips_and_moves_the_inference_forward() {
+    let (rt, model, _st) = load(Precision::F32);
+    let ids = ids();
     let table = model.parameter_table().unwrap();
-    let bank = tessl::qwen35_train::Qwen35Grads::zeros_like(&model).unwrap();
-    let gate = table
+    let before = inference_loss(&model, &ids);
+    let params = alloc(&rt, &table);
+    model.read_parameters(&params).unwrap();
+
+    // Writing back what was read changes nothing.
+    model.write_parameters(&params).unwrap();
+    let same = inference_loss(&model, &ids);
+    assert_eq!(same.to_bits(), before.to_bits(), "a write of the read values moved the loss");
+
+    let stepped: Vec<Tensor> = params
         .iter()
-        .position(|p| p.name == "layers.0.mlp.gate_proj.weight")
-        .unwrap();
-    // Entry 0 is a dense bf16 tensor; the gate is a packed window.
-    let targets = [(0usize, &bank.embed), (gate, &bank.layers[0].gate)];
-    for (i, t) in targets {
-        assert_eq!(t.dtype, tessl::DType::BF16, "{}", table[i].name);
-        let raw: Vec<u16> = (0..t.buffer.nbytes() / 2).map(|k| (k % 65536) as u16).collect();
-        t.buffer.write_bf16_bits(&raw);
-        let dst = alloc(&rt, &table);
-        model.read_gradients(&bank, &dst).unwrap();
-        let gpu = dst[i].read_f32().unwrap();
-        let mut host = vec![0.0f32; numel(&table[i])];
-        model.read_gradient_host(&bank, i, &mut host).unwrap();
-        let diff: Vec<(usize, u32, u32)> = (0..host.len())
-            .filter(|&k| host[k].to_bits() != gpu[k].to_bits())
-            .map(|k| (k, gpu[k].to_bits(), host[k].to_bits()))
-            .collect();
-        assert!(
-            diff.is_empty(),
-            "{}: {} of {} differ; (index, gpu bits, host bits) {diff:x?}",
-            table[i].name,
-            diff.len(),
-            host.len()
-        );
+        .map(|p| {
+            let v: Vec<f32> = p.read_f32().unwrap().iter().map(|a| a * 0.99 + 0.001).collect();
+            common::tensor_f32(&rt, p.shape(), &v)
+        })
+        .collect();
+    model.write_parameters(&stepped).unwrap();
+    let back = alloc(&rt, &table);
+    model.read_parameters(&back).unwrap();
+    for ((p, s), b) in table.iter().zip(&stepped).zip(&back) {
+        let (s, b) = (s.read_f32().unwrap(), b.read_f32().unwrap());
+        // Exact, the embedding (an f32 table) and the norms included.
+        for (i, (x, y)) in b.iter().zip(&s).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{}[{i}]: read back {x}, wrote {y}", p.name);
+        }
     }
+    let after = inference_loss(&model, &ids);
+    assert_ne!(after.to_bits(), before.to_bits(), "the write moved the inference forward not at all");
 }

@@ -7,9 +7,8 @@
 //! LM head of inference, written once in `Qwen35Model::layer` for the
 //! prefill, the staged prefill and decode alike, and what
 //! `tests/qwen35_model.rs` checks end to end against transformers' logits.
-//! Training ([`crate::qwen35_train`]) runs its own layer forward, on the
-//! training kernels and keeping what its backward reads;
-//! `tests/qwen35_train.rs` pins its hidden states to this forward's.
+//! Training (ojas's Tape over `ojas-metal`; tessl's own step retired with ABI 14)
+//! runs the training kernels, not this forward.
 //!
 //! # Layer
 //!
@@ -531,9 +530,8 @@ pub struct Qwen35Model {
     /// [`Self::with_gdn_scan_slice`]); [`GdnPrefillKernel::default`] unless chosen.
     gdn_prefill: GdnPrefillKernel,
     /// Bumped by every write to the weights after load
-    /// ([`Self::bump_param_generation`]). A [`crate::qwen35_train::PendingStep`]
-    /// records it at the forward, and the backward, which rebuilds each layer
-    /// from the weights it finds, refuses a step whose weights have moved.
+    /// ([`Self::bump_param_generation`]). A staged prefill or decode
+    /// records it and refuses to continue once the weights have moved.
     param_generation: AtomicU64,
     /// Test hook ([`Self::fail_layer_after_for_test`]): layers still to run
     /// before one fails; `usize::MAX` is off.
@@ -2713,8 +2711,8 @@ impl Acts {
         // Every activation is written in full before anything reads it — the
         // embedding gather fills `resid`, the norms fill `x`, the GEMMs fill
         // their outputs, the gate and activation kernels fill `g_y`, `a_y`
-        // and `m_mid` — so none is zeroed on the host. `tests/qwen35_train.rs`
-        // holds this with `set_poison_unzeroed`.
+        // and `m_mid` — so none is zeroed on the host. The test that held this with
+        // `set_poison_unzeroed` (`tests/qwen35_train.rs`) retired with ABI 14.
         let f32t = |cols: usize| rt.alloc_tensor_unzeroed(&[tu, cols], DType::F32);
         let act = |cols: usize| activation(rt, p, tu, cols);
         let f32s = |n: usize| rt.alloc_buffer(n.max(1) * 4);

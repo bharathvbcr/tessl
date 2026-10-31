@@ -15,10 +15,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
-    tessl_cross_entropy_rows, tessl_qwen35_free, tessl_qwen35_hidden, tessl_qwen35_load, tessl_qwen35_train_backward,
-    tessl_qwen35_train_forward, tessl_qwen35_train_step, tessl_runtime_free, tessl_runtime_new, TesslCeArgs,
-    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
-    TESSL_OPERANDS_EXACT_F32, TESSL_SUPERVISE_ROWS,
+    tessl_cross_entropy_rows, tessl_qwen35_free, tessl_qwen35_load, tessl_runtime_free, tessl_runtime_new, TesslCeArgs,
+    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_EXACT_F32,
 };
 use tessl::GpuRuntime;
 
@@ -107,77 +105,7 @@ fn an_oversized_n_is_refused_not_undefined() {
         assert!(m.contains(what), "{what}: {m}");
     };
 
-    let s = unsafe {
-        tessl_qwen35_train_step(
-            hs.1,
-            ids.as_ptr(),
-            HUGE,
-            TESSL_OPERANDS_EXACT_F32,
-            &mut loss,
-            err.as_mut_ptr(),
-            ERR_LEN,
-        )
-    };
-    too_big("tessl_qwen35_train_step", s, &err);
-    // The largest u32 count that still fits a slice is not the cap's business,
-    // the first count past it is: isize::MAX / 4 + 1 u32s.
-    let s = unsafe {
-        tessl_qwen35_train_step(
-            hs.1,
-            ids.as_ptr(),
-            (isize::MAX as u64) / 4 + 1,
-            TESSL_OPERANDS_EXACT_F32,
-            &mut loss,
-            err.as_mut_ptr(),
-            ERR_LEN,
-        )
-    };
-    too_big("largest slice", s, &err);
-
-    let s = unsafe {
-        tessl_qwen35_train_forward(
-            hs.1,
-            ids.as_ptr(),
-            HUGE,
-            TESSL_OPERANDS_EXACT_F32,
-            0,
-            ptr::null(),
-            ptr::null(),
-            0,
-            1.0,
-            &mut loss,
-            err.as_mut_ptr(),
-            ERR_LEN,
-        )
-    };
-    too_big("tessl_qwen35_train_forward", s, &err);
-    let s = unsafe {
-        tessl_qwen35_train_forward(
-            hs.1,
-            ids.as_ptr(),
-            ids.len() as u64,
-            TESSL_OPERANDS_EXACT_F32,
-            TESSL_SUPERVISE_ROWS,
-            ids.as_ptr(),
-            ids.as_ptr(),
-            HUGE,
-            1.0,
-            &mut loss,
-            err.as_mut_ptr(),
-            ERR_LEN,
-        )
-    };
-    too_big("positions", s, &err);
-
     with_gpu(|rt| {
-        let out = shared(rt, &[0.0; 8]);
-        let out_ref = tref(&out, &[1, 8]);
-        let s = unsafe { tessl_qwen35_hidden(hs.1, ids.as_ptr(), HUGE, &out_ref, err.as_mut_ptr(), ERR_LEN) };
-        too_big("tessl_qwen35_hidden", s, &err);
-        let s =
-            unsafe { tessl_qwen35_train_backward(hs.1, ids.as_ptr(), HUGE, &out_ref, 0, err.as_mut_ptr(), ERR_LEN) };
-        too_big("tessl_qwen35_train_backward", s, &err);
-
         let (hb, wb) = (shared(rt, &random_f32(640, 5)), shared(rt, &random_f32(64 * 300, 6)));
         let args = TesslCeArgs {
             hidden: tref(&hb, &[10, 64]),
@@ -205,22 +133,25 @@ fn a_null_slice_with_elements_is_refused() {
     let hs = Handles::new();
     let mut err = [0 as c_char; ERR_LEN];
     let mut loss = 0.0f64;
-    let s = unsafe {
-        tessl_qwen35_train_forward(
-            hs.1,
-            [1u32].as_ptr(),
-            1,
-            TESSL_OPERANDS_EXACT_F32,
-            TESSL_SUPERVISE_ROWS,
-            ptr::null(),
-            ptr::null(),
-            3,
-            1.0,
-            &mut loss,
-            err.as_mut_ptr(),
-            ERR_LEN,
-        )
-    };
+    let s = with_gpu(|rt| {
+        let (hb, wb) = (shared(rt, &random_f32(640, 5)), shared(rt, &random_f32(64 * 300, 6)));
+        let args = TesslCeArgs {
+            hidden: tref(&hb, &[10, 64]),
+            col_off: 0,
+            weight: tref(&wb, &[300, 64]),
+            rows: ptr::null(),
+            targets: ptr::null(),
+            n: 3,
+            reduction: 1,
+            operands: TESSL_OPERANDS_EXACT_F32,
+            chunk: 64,
+            want_grads: 0,
+            scale: 1.0,
+            dh: tref(&hb, &[10, 64]),
+            dw: tref(&wb, &[300, 64]),
+        };
+        unsafe { tessl_cross_entropy_rows(hs.0, &args, &mut loss, ptr::null_mut(), err.as_mut_ptr(), ERR_LEN) }
+    });
     assert_eq!(s, TESSL_ERR);
     assert!(msg(&err).contains("null"), "{}", msg(&err));
 }

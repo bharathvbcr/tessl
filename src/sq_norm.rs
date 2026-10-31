@@ -17,8 +17,7 @@
 //! without waiting, so a caller with its own command stream and scratch pool
 //! (`ojas-metal`'s `clip_grad_norm`) waits where it already waits.
 //! [`sq_norm`] is the allocate, encode, wait and decode in one call.
-//! [`crate::qwen35_model::Qwen35Model::grad_sq_norm`] is that over a model's
-//! gradients.
+//! (Tessl's `Qwen35Model::grad_sq_norm` retired with ABI 14.)
 
 use crate::dispatch::{set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;

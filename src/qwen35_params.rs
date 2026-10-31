@@ -1,6 +1,6 @@
-//! A Qwen3.5 model's parameters and gradients as transformers names them,
-//! copied between the model and caller tensors on the GPU, so a training loop
-//! outside tessl (torch, through [`crate::capi`]) can run the optimizer.
+//! A Qwen3.5 model's parameters as transformers names them, copied between
+//! the model and caller tensors on the GPU, so a training loop outside tessl
+//! (ojas's Tape, or torch through [`crate::capi`]) can read and set them.
 //!
 //! Each entry is one `Qwen3_5ForCausalLM` parameter, named as transformers
 //! names it below the text tower (`layers.3.mlp.gate_proj.weight`, without
@@ -23,8 +23,7 @@
 //! The matrices (the embedding and the packed projections) are stored in the
 //! model's [`Precision`]; everything else is f32 at either precision. The
 //! caller's tensors are always f32: a bf16 matrix reads out widened (exact)
-//! and a write rounds to nearest. Gradients come in the same layouts and the
-//! same rule (a bf16 bank's matrices are bf16). Every copy is a GPU dispatch,
+//! and a write rounds to nearest. Every copy is a GPU dispatch,
 //! since a caller's buffers may be GPU-private.
 
 use std::sync::Arc;
@@ -32,7 +31,6 @@ use std::sync::Arc;
 use crate::dispatch::{dispatch_2d, set_gpu_buf_offset, set_u32};
 use crate::nn::require_runtime;
 use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
-use crate::qwen35_train::{LayerGrads, MixerGrads, Qwen35Grads};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
@@ -59,6 +57,19 @@ impl ParamInfo {
     }
 }
 
+/// transformers' `Trainer.get_decay_parameter_names` exclusions, by name: a
+/// parameter whose name matches `bias`, `layernorm`, `rmsnorm`,
+/// `(^|\.)norm($|\.)` or `_norm($|\.)` takes no weight decay. On Qwen3.5 that
+/// is every norm and `linear_attn.dt_bias`. The parameter table reports it
+/// per entry (`tessl_qwen35_parameters`); the optimizer that applies it is the
+/// caller's.
+pub fn excluded_from_weight_decay(name: &str) -> bool {
+    if name.contains("bias") || name.contains("layernorm") || name.contains("rmsnorm") {
+        return true;
+    }
+    name.split('.').any(|seg| seg == "norm" || seg.ends_with("_norm"))
+}
+
 /// Where a value lives in tessl.
 #[derive(Clone, Copy)]
 pub(crate) enum Src<'a> {
@@ -69,15 +80,6 @@ pub(crate) enum Src<'a> {
     Packed(&'a Tensor, usize),
     /// A dense tensor (f32 or bf16) holding exactly the value.
     Dense(&'a Tensor),
-}
-
-impl Src<'_> {
-    fn buffer(&self) -> &GpuBuffer {
-        match self {
-            Src::Raw(b) => b,
-            Src::Packed(t, _) | Src::Dense(t) => &t.buffer,
-        }
-    }
 }
 
 /// One value's storage as a window: a buffer, the byte offset of its tensor,
@@ -174,11 +176,6 @@ impl<'a> Window<'a> {
 
     pub(crate) fn numel(&self) -> usize {
         self.rows * self.width
-    }
-
-    /// The same rows, columns and leading dimension (dtypes may differ).
-    pub(crate) fn same_layout(&self, o: &Window<'_>) -> bool {
-        (self.rows, self.width, self.ld, self.off) == (o.rows, o.width, o.ld, o.off)
     }
 }
 
@@ -287,16 +284,11 @@ pub(crate) fn window_write_host(
 pub(crate) struct Slot<'a> {
     pub(crate) info: ParamInfo,
     pub(crate) param: Src<'a>,
-    pub(crate) grad: Option<Src<'a>>,
 }
 
 impl Slot<'_> {
     pub(crate) fn param_window(&self) -> Window<'_> {
         Window::of(self.param, &self.info.shape)
-    }
-
-    pub(crate) fn grad_window(&self) -> Option<Window<'_>> {
-        self.grad.map(|g| Window::of(g, &self.info.shape))
     }
 }
 
@@ -317,8 +309,8 @@ fn offsets<const N: usize>(widths: [usize; N]) -> [usize; N] {
     out
 }
 
-/// The embedding's slot (table index 0), with its gradient if given.
-pub(crate) fn embed_slot<'a>(m: &'a Qwen35Model, grad: Option<&'a Tensor>) -> Result<Slot<'a>, String> {
+/// The embedding's slot (table index 0).
+pub(crate) fn embed_slot(m: &Qwen35Model) -> Result<Slot<'_>, String> {
     Ok(Slot {
         info: info(
             "embed_tokens.weight".into(),
@@ -326,17 +318,11 @@ pub(crate) fn embed_slot<'a>(m: &'a Qwen35Model, grad: Option<&'a Tensor>) -> Re
             false,
         ),
         param: Src::Dense(m.embed.dense()?),
-        grad: grad.map(Src::Dense),
     })
 }
 
-/// One layer's slots (table indices follow the previous layer's), with its
-/// gradients in `lg` if given.
-pub(crate) fn layer_slots<'a>(
-    m: &'a Qwen35Model,
-    l: usize,
-    lg: Option<&'a LayerGrads>,
-) -> Result<Vec<Slot<'a>>, String> {
+/// One layer's slots (table indices follow the previous layer's).
+pub(crate) fn layer_slots(m: &Qwen35Model, l: usize) -> Result<Vec<Slot<'_>>, String> {
     let cfg = &m.cfg;
     let (h, inter) = (cfg.hidden as usize, cfg.intermediate as usize);
     let layer = &m.layers[l];
@@ -344,11 +330,6 @@ pub(crate) fn layer_slots<'a>(
     let p = |s: &str| format!("layers.{l}.{s}");
     match &layer.mixer {
         Mixer::Gdn(w) => {
-            let gg = match lg.map(|x| &x.mixer) {
-                None => None,
-                Some(MixerGrads::Gdn(gg)) => Some(gg),
-                Some(MixerGrads::Attn(_)) => return Err(format!("layer {l}: attention gradients for a GDN layer")),
-            };
             let gd = cfg.gdn;
             let widths = gd.part_widths();
             let offs = offsets(widths);
@@ -359,42 +340,31 @@ pub(crate) fn layer_slots<'a>(
                 out.push(Slot {
                     info: info(p(&format!("linear_attn.{part}.weight")), &[widths[i], h], true),
                     param: Src::Packed(w.w_in.dense()?, offs[i]),
-                    grad: gg.map(|g| Src::Packed(&g.w_in, offs[i])),
                 });
             }
             let (vh, kw) = (gd.v_heads() as usize, cfg.conv_kernel as usize);
             out.push(Slot {
                 info: info(p("linear_attn.out_proj.weight"), &[h, gd.value_dim() as usize], true),
                 param: Src::Packed(w.w_out.dense()?, 0),
-                grad: gg.map(|g| Src::Packed(&g.w_out, 0)),
             });
             out.push(Slot {
                 info: info(p("linear_attn.conv1d.weight"), &[gd.conv_dim() as usize, 1, kw], false),
                 param: Src::Raw(&w.conv_w),
-                grad: gg.map(|g| Src::Raw(&g.conv_w)),
             });
             out.push(Slot {
                 info: info(p("linear_attn.A_log"), &[vh], false),
                 param: Src::Raw(&w.a_log),
-                grad: gg.map(|g| Src::Raw(&g.a_log)),
             });
             out.push(Slot {
                 info: info(p("linear_attn.dt_bias"), &[vh], false),
                 param: Src::Raw(&w.dt_bias),
-                grad: gg.map(|g| Src::Raw(&g.dt_bias)),
             });
             out.push(Slot {
                 info: info(p("linear_attn.norm.weight"), &[gd.v_dim() as usize], false),
                 param: Src::Raw(&w.norm_w),
-                grad: gg.map(|g| Src::Raw(&g.norm_w)),
             });
         }
         Mixer::Attn(w) => {
-            let ag = match lg.map(|x| &x.mixer) {
-                None => None,
-                Some(MixerGrads::Attn(ag)) => Some(ag),
-                Some(MixerGrads::Gdn(_)) => return Err(format!("layer {l}: GDN gradients for an attention layer")),
-            };
             let at = cfg.attn;
             let widths = at.part_widths();
             let offs = offsets(widths);
@@ -402,118 +372,74 @@ pub(crate) fn layer_slots<'a>(
                 out.push(Slot {
                     info: info(p(&format!("self_attn.{part}.weight")), &[widths[i], h], true),
                     param: Src::Packed(w.w_in.dense()?, offs[i]),
-                    grad: ag.map(|g| Src::Packed(&g.w_in, offs[i])),
                 });
             }
             let d = at.head_dim() as usize;
             out.push(Slot {
                 info: info(p("self_attn.o_proj.weight"), &[h, at.q_heads() as usize * d], true),
                 param: Src::Packed(w.w_out.dense()?, 0),
-                grad: ag.map(|g| Src::Packed(&g.w_out, 0)),
             });
             out.push(Slot {
                 info: info(p("self_attn.q_norm.weight"), &[d], false),
                 param: Src::Raw(&w.q_norm),
-                grad: ag.map(|g| Src::Raw(&g.q_norm)),
             });
             out.push(Slot {
                 info: info(p("self_attn.k_norm.weight"), &[d], false),
                 param: Src::Raw(&w.k_norm),
-                grad: ag.map(|g| Src::Raw(&g.k_norm)),
             });
         }
     }
     out.push(Slot {
         info: info(p("mlp.gate_proj.weight"), &[inter, h], true),
         param: Src::Packed(layer.gate.dense()?, 0),
-        grad: lg.map(|g| Src::Packed(&g.gate, 0)),
     });
     out.push(Slot {
         info: info(p("mlp.up_proj.weight"), &[inter, h], true),
         param: Src::Packed(layer.up.dense()?, 0),
-        grad: lg.map(|g| Src::Packed(&g.up, 0)),
     });
     out.push(Slot {
         info: info(p("mlp.down_proj.weight"), &[h, inter], true),
         param: Src::Packed(layer.down.dense()?, 0),
-        grad: lg.map(|g| Src::Packed(&g.down, 0)),
     });
     out.push(Slot {
         info: info(p("input_layernorm.weight"), &[h], false),
         param: Src::Raw(&layer.input_norm),
-        grad: lg.map(|g| Src::Raw(&g.input_norm)),
     });
     out.push(Slot {
         info: info(p("post_attention_layernorm.weight"), &[h], false),
         param: Src::Raw(&layer.post_norm),
-        grad: lg.map(|g| Src::Raw(&g.post_norm)),
     });
     Ok(out)
 }
 
 /// The slots after the last layer: the final norm, then an untied model's
-/// head, with their gradients if given.
-pub(crate) fn tail_slots<'a>(
-    m: &'a Qwen35Model,
-    grads: Option<(&'a GpuBuffer, Option<&'a Tensor>)>,
-) -> Result<Vec<Slot<'a>>, String> {
+/// head.
+pub(crate) fn tail_slots(m: &Qwen35Model) -> Result<Vec<Slot<'_>>, String> {
     let (h, vocab) = (m.cfg.hidden as usize, m.cfg.vocab as usize);
     let mut out = vec![Slot {
         info: info("norm.weight".into(), &[h], false),
         param: Src::Raw(&m.final_norm),
-        grad: grads.map(|(norm, _)| Src::Raw(norm)),
     }];
     // An untied model's head is the last entry, so the tied table's indices
     // are the untied one's.
     if let Some(head) = &m.lm_head {
-        let grad = match grads {
-            None => None,
-            Some((_, g)) => Some(Src::Dense(g.ok_or(
-                "the model has an untied lm_head but the gradients carry none (Qwen35Grads::zeros_like of this model)",
-            )?)),
-        };
         out.push(Slot {
             info: info(crate::qwen35_model::LM_HEAD_NAME.into(), &[vocab, h], false),
             param: Src::Dense(head.dense()?),
-            grad,
         });
-    } else if grads.is_some_and(|(_, g)| g.is_some()) {
-        return Err("the gradients carry an lm_head gradient but the model is tied".into());
     }
     Ok(out)
 }
 
-/// Every parameter in a fixed order, with its gradient in `grads` if given.
-pub(crate) fn slots<'a>(m: &'a Qwen35Model, grads: Option<&'a Qwen35Grads>) -> Result<Vec<Slot<'a>>, String> {
+/// Every parameter in a fixed order.
+pub(crate) fn slots(m: &Qwen35Model) -> Result<Vec<Slot<'_>>, String> {
     m.require_dense("Qwen35Model parameter table")?;
-    if let Some(g) = grads {
-        if g.layers.len() != m.layers.len() {
-            return Err(format!(
-                "gradients for {} layers, the model has {}",
-                g.layers.len(),
-                m.layers.len()
-            ));
-        }
-    }
-    let mut out = vec![embed_slot(m, grads.map(|g| &g.embed))?];
+    let mut out = vec![embed_slot(m)?];
     for l in 0..m.layers.len() {
-        out.extend(layer_slots(m, l, grads.map(|g| &g.layers[l]))?);
+        out.extend(layer_slots(m, l)?);
     }
-    out.extend(tail_slots(m, grads.map(|g| (&g.final_norm, g.lm_head.as_ref())))?);
-    check_grads_on_runtime(m, &out)?;
+    out.extend(tail_slots(m)?);
     Ok(out)
-}
-
-/// `Qwen35Grads`' fields are public, and an `AdamW` made for another model
-/// carries that model's runtime: refuse either before anything reads or
-/// writes through them.
-pub(crate) fn check_grads_on_runtime(m: &Qwen35Model, slots: &[Slot<'_>]) -> Result<(), String> {
-    for s in slots {
-        if let Some(g) = s.grad {
-            require_runtime(&m.rt, g.buffer(), format_args!("{}'s gradient", s.info.name))?;
-        }
-    }
-    Ok(())
 }
 
 /// Check the caller's tensors against the table before touching anything.
@@ -590,7 +516,7 @@ impl Qwen35Model {
 
     /// Every parameter, in the order the copies take their tensors.
     pub fn parameter_table(&self) -> Result<Vec<ParamInfo>, String> {
-        Ok(slots(self, None)?.into_iter().map(|s| s.info).collect())
+        Ok(slots(self)?.into_iter().map(|s| s.info).collect())
     }
 
     /// Copy every parameter's value into `dst` (one dense f32 tensor per
@@ -598,7 +524,7 @@ impl Qwen35Model {
     /// a bf16 matrix is widened exactly.
     pub fn read_parameters(&self, dst: &[Tensor]) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::read_parameters";
-        let slots = slots(self, None)?;
+        let slots = slots(self)?;
         check(WHAT, &self.rt, &slots, dst)?;
         for (s, t) in slots.iter().zip(dst) {
             self.read_one(s.param_window(), t)
@@ -607,33 +533,15 @@ impl Qwen35Model {
         self.rt.synchronize()
     }
 
-    /// Copy `grads` (from [`Self::train_step`] on this model, or a bank) into
-    /// `dst`, laid out as [`Self::read_parameters`] lays out the values.
-    pub fn read_gradients(&self, grads: &Qwen35Grads, dst: &[Tensor]) -> Result<(), String> {
-        const WHAT: &str = "Qwen35Model::read_gradients";
-        let slots = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
-        check(WHAT, &self.rt, &slots, dst)?;
-        for (s, t) in slots.iter().zip(dst) {
-            let g = s
-                .grad_window()
-                .ok_or_else(|| format!("{WHAT}: {} has no gradient", s.info.name))?;
-            self.read_one(g, t)
-                .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
-        }
-        self.rt.synchronize()
-    }
-
     /// Set every parameter from `src`, laid out as [`Self::read_parameters`]
     /// writes them; a bf16 matrix takes each value rounded to nearest. Every
     /// tensor is checked before anything is written. A
-    /// [`crate::qwen35_train::PendingStep`] from before the write can no
-    /// longer be backpropagated. An optimizer's f32 master
-    /// ([`crate::qwen35_adamw::UpdateRule::F32Master`]) is its own state and
-    /// is not moved by this; restore it with [`Self::write_adamw_aux`].
+    /// [`crate::qwen35_model::Decode`] or [`crate::qwen35_model::Staged`] from
+    /// before the write refuses to continue.
     pub fn write_parameters(&self, src: &[Tensor]) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::write_parameters";
         self.require_trainable(WHAT)?;
-        let slots = slots(self, None)?;
+        let slots = slots(self)?;
         check(WHAT, &self.rt, &slots, src)?;
         for s in &slots {
             s.param_window().check(format_args!("{WHAT}: {}", s.info.name))?;
@@ -654,21 +562,9 @@ impl Qwen35Model {
     /// work; refused as "runtime busy" while another host mapping is live.
     pub fn read_parameter_host(&self, index: usize, dst: &mut [f32]) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::read_parameter_host";
-        let slots = slots(self, None)?;
+        let slots = slots(self)?;
         let s = entry(WHAT, &slots, index, dst.len())?;
         window_read_host(&s.param_window(), dst, &format!("{WHAT}: {}", s.info.name))
-    }
-
-    /// Copy `grads`' entry `index` into `dst` on the host, as
-    /// [`Self::read_gradients`] lays it out; see [`Self::read_parameter_host`].
-    pub fn read_gradient_host(&self, grads: &Qwen35Grads, index: usize, dst: &mut [f32]) -> Result<(), String> {
-        const WHAT: &str = "Qwen35Model::read_gradient_host";
-        let slots = slots(self, Some(grads)).map_err(|e| format!("{WHAT}: {e}"))?;
-        let s = entry(WHAT, &slots, index, dst.len())?;
-        let g = s
-            .grad_window()
-            .ok_or_else(|| format!("{WHAT}: {} has no gradient", s.info.name))?;
-        window_read_host(&g, dst, &format!("{WHAT}: {}", s.info.name))
     }
 
     /// Set parameter-table entry `index` from `src` on the host, laid out as
@@ -676,14 +572,12 @@ impl Qwen35Model {
     /// stored as the GPU copy stores it: rounded to nearest even, a NaN canonical, an f32 subnormal flushed to a signed zero, see [`crate::tensor::f32_to_bf16_bits_gpu`]). The index, the length and the model are checked
     /// before anything moves, and the parameter generation is bumped once
     /// the mapping is held, before the first byte lands: a
-    /// [`crate::qwen35_train::PendingStep`], [`crate::qwen35_model::Decode`]
-    /// or [`crate::qwen35_model::Staged`] from before the write refuses to
-    /// continue. An optimizer's f32 master is its own state and is not moved
-    /// by this.
+    /// [`crate::qwen35_model::Decode`] or [`crate::qwen35_model::Staged`] from
+    /// before the write refuses to continue.
     pub fn write_parameter_host(&self, index: usize, src: &[f32]) -> Result<(), String> {
         const WHAT: &str = "Qwen35Model::write_parameter_host";
         self.require_trainable(WHAT)?;
-        let slots = slots(self, None)?;
+        let slots = slots(self)?;
         let s = entry(WHAT, &slots, index, src.len())?;
         window_write_host(&s.param_window(), src, &format!("{WHAT}: {}", s.info.name), || {
             self.bump_param_generation()

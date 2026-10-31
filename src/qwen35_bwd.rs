@@ -696,7 +696,7 @@ pub fn embed_rows_bwd(
 /// otherwise make a workspace for one call: no staging buffers, no copy
 /// dispatches, no padding. The kernel reads only `pos[..rows]`,
 /// `run_start[..=runs]` and `uniq[..runs]`, which is what these hold.
-pub(crate) fn embed_rows_bwd_once(
+pub fn embed_rows_bwd_once(
     rt: &Arc<GpuRuntime>,
     ids: &[u32],
     dh: &GpuBuffer,

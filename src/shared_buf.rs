@@ -562,6 +562,8 @@ mod tests {
         let other = rt.alloc_buffer(64).unwrap();
         assert_eq!((shared.last_use(), shared.last_write()), (0, 0));
 
+        // Both dispatches share one command buffer: the mid-commit threshold
+        // defaults to off (`TESSL_MID_COMMIT` unset), so no commit falls between them.
         let next = rt.last_signaled_value() + 1;
         copy_from_shared(&rt, &shared, &other, 16).unwrap();
         assert_eq!(

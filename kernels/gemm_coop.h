@@ -281,6 +281,10 @@ static inline float epi_axpby_strict(float p, float alpha, float beta, float pre
     return scaled + carried;
 }
 static inline float epi_add_strict(float v, float x) { return v + x; }
+/// The f32 -> bf16 -> f32 round trip of `cast_f32_to_bf16` then
+/// `cast_bf16_to_f32` (utils.metal's `D(in[gid])`, the same `bfloat(float)`
+/// conversion in the same fast-math module), kept in registers.
+static inline float epi_round_bf16(float v) { return float(bfloat(v)); }
 #pragma clang fp contract(fast)
 
 /// One tile: zero → run → [ACCUM: + C] / [EPILOGUE] → store, on `op`'s
@@ -292,12 +296,14 @@ static inline float epi_add_strict(float v, float x) { return v + x; }
 /// multiply_accumulate. EPILOGUE is `C = act(alpha * A@B + beta * C_prev +
 /// bias)`; `beta * C_prev` reuses the same trick (a second cooperative tensor
 /// loaded from C, combined in registers), so C is read once and written once
-/// rather than round-tripped per term.
+/// rather than round-tripped per term. A nonzero `round_bf16` (EPILOGUE only)
+/// then rounds every element to the nearest bf16 (ties to even) and widens it
+/// back, as a separate cast pass would, before the store.
 template <bool ACCUM, bool EPILOGUE, bool INTERIOR, int SM, int SN, bool STRICT, typename Op,
           typename VA, typename VB, typename VC>
 inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC,
                       device const float *bias, int tx, int ty, int M, int N,
-                      float alpha, float beta, uint act) {
+                      float alpha, float beta, uint act, uint round_bf16) {
     using TA = metal::remove_addrspace_t<VA>;
     using TB = metal::remove_addrspace_t<VB>;
     auto cT = op.template get_destination_cooperative_tensor<TA, TB, float>();
@@ -355,6 +361,11 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
             for (uint16_t i = 0; i < cT.get_capacity(); ++i)
                 if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], (GemmActivation)act);
         }
+        if (round_bf16 != 0u) {
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                if (cT.is_valid_element(i)) cT[i] = epi_round_bf16(cT[i]);
+        }
     }
     cT.store(tC);
 }
@@ -363,12 +374,14 @@ inline void coop_tile(thread Op &op, thread VA &tA, thread VB &tB, thread VC &tC
 /// `NSG` simdgroups, `TRANS_A` / `TRANS_B` for the TN / NT layouts, `RELAXED`
 /// for the reduced-precision f32 descriptor, the tile order from `Walk`.
 /// Interior tiles use offset pointer tensors; edges the bounds-checked slice
-/// path. `bias`, `alpha`, `beta` and `act` are read only with `EPILOGUE`.
+/// path. `bias`, `alpha`, `beta`, `act` and `round_bf16` are read only with
+/// `EPILOGUE`.
 template <typename ElemT, int SM, int SN, int NSG, bool TRANS_A, bool TRANS_B,
           bool RELAXED, bool ACCUM, bool EPILOGUE, typename Walk, bool STRICT = false>
 inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
                     uint M, uint N, uint K, uint tiles_n, uint tiles_m, uint tgpig,
-                    device const float *bias, float alpha, float beta, uint act) {
+                    device const float *bias, float alpha, float beta, uint act,
+                    uint round_bf16 = 0u) {
     constexpr auto d = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, TRANS_A, TRANS_B, RELAXED,
         matmul2d_descriptor::mode::multiply);
@@ -385,13 +398,13 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
         auto tB = gemm_b<TRANS_B>::template interior<SN>(B, (int)N, (int)K, tx);
         auto tC = gemm_c_interior<SM, SN>(C, (int)N, tx, ty, (int)N);
         coop_tile<ACCUM, EPILOGUE, true, SM, SN, STRICT>(op, tA, tB, tC, bias, tx, ty, (int)M,
-                                                 (int)N, alpha, beta, act);
+                                                 (int)N, alpha, beta, act, round_bf16);
     } else {
         auto tA = gemm_a<TRANS_A>::edge(A, (int)M, (int)K, ty);
         auto tB = gemm_b<TRANS_B>::edge(B, (int)N, (int)K, tx);
         auto tC = gemm_c_edge(C, (int)M, (int)N, tx, ty, (int)N);
         coop_tile<ACCUM, EPILOGUE, false, SM, SN, STRICT>(op, tA, tB, tC, bias, tx, ty, (int)M,
-                                                  (int)N, alpha, beta, act);
+                                                  (int)N, alpha, beta, act, round_bf16);
     }
 }
 

@@ -1,0 +1,27 @@
+tessl-sam-gemm gp/w34-nt-bias-round f535dd3 bench: the sam lane's NT bias and bias+round arms, three dispatches against gemm_nt_bf16_bias (M5 Pro), dirty 0
+19:14  up 4 days, 11:29, 1 user, load averages: 39.75 19.63 13.06
+   Compiling objc2 v0.6.4
+   Compiling objc2-encode v4.1.0
+   Compiling libc v0.2.186
+   Compiling bitflags v2.13.0
+   Compiling block2 v0.6.2
+   Compiling objc2-core-foundation v0.3.2
+   Compiling dispatch2 v0.3.1
+   Compiling tessl v0.2.0 (/Users/bharath/Code/research/tessl-sam-gemm)
+   Compiling objc2-foundation v0.3.2
+   Compiling numcheck v0.1.0 (/Users/bharath/Code/research/tessl-sam-gemm/numcheck)
+   Compiling objc2-metal v0.3.2
+    Finished `release` profile [optimized] target(s) in 17m 33s
+     Running tests/gemm_nt_bf16_bias.rs (target/release/deps/gemm_nt_bf16_bias-f84efbaf819a711f)
+
+running 5 tests
+test ragged_and_tile_sized_shapes_match_the_three_step_sequence_bit_for_bit ... ok
+test refuses_a_bias_that_is_not_f32_n_long_or_disjoint_from_c ... ok
+test sam_fc1_matches_the_three_step_sequence_bit_for_bit ... ok
+test sam_fc2_matches_the_three_step_sequence_bit_for_bit ... ok
+test sam_qkv_matches_the_three_step_sequence_bit_for_bit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+19:32  up 4 days, 11:47, 1 user, load averages: 50.73 50.96 44.14
+exit 0

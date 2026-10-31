@@ -42,6 +42,14 @@
 //! - `epi`: the fused epilogue (`beta = 1`, bias, SiLU) at N <= 512, where
 //!   the plain path takes 64x64: production against the 64x64 epilogue
 //!   kernel, for bf16, f16 and relaxed f32.
+//! - `sam` (not in the default set): SpikeTrack's SAM 3.1 trunk linears at
+//!   M = 5184 and 2304: Ojas's NT bf16 and exact-f32 calls against NN on
+//!   pre-transposed weights (production tile, both tiles), f16 operands and
+//!   the bias fused in the epilogue; and the NT bf16 call with a bias, and with
+//!   a bias and a bf16 round, as the three separate dispatches Ojas runs today
+//!   (`gemm_nt_bf16`, `bert::bias_add`, the casts through a bf16 scratch)
+//!   against `gemm_nt_bf16_bias` (one dispatch; bit-identical, checked before
+//!   anything is timed).
 
 // A paired lane takes its operands, its shape and the knobs of the run.
 #![allow(clippy::too_many_arguments)]
@@ -50,9 +58,11 @@ mod common;
 
 use objc2_metal::MTLComputePipelineState;
 use std::sync::Arc;
+use tessl::bert::bias_add;
 use tessl::gemm::{
-    cast_f32_to_bf16, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_nn_splitk_par_f32, gemm_small_m,
-    gemm_tiled, gemm_tn_bf16, Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
+    cast_bf16_to_f32_into, cast_f32_to_bf16, cast_f32_to_bf16_into, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue,
+    gemm_nn_splitk_par_f32, gemm_nt_bf16, gemm_nt_bf16_bias, gemm_nt_f32, gemm_small_m, gemm_tiled, gemm_tn_bf16,
+    Activation, BatchStrides, BatchedGemm, EpiTile, Epilogue, GemmBackend, GemmOperands,
 };
 use tessl::runtime::{mtl_size, GpuRuntime};
 use tessl::tensor::Tensor;
@@ -720,6 +730,176 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     Ok(())
 }
 
+/// `values` (`[rows, cols]` row-major) uploaded as f32, then narrowed to `elem`.
+fn upload_as(rt: &Arc<GpuRuntime>, elem: Elem, values: &[f32], shape: &[usize]) -> Result<Tensor, String> {
+    let t = rt.alloc_tensor_f32(shape)?;
+    t.buffer.write_f32(values);
+    match elem {
+        Elem::Bf16 => cast_f32_to_bf16(&t),
+        Elem::F16 => cast_f32_to_f16(&t),
+        Elem::Relaxed => Ok(t),
+    }
+}
+
+/// A named arm of the `sam` lane and the call it times.
+type SamArm<'a> = (&'static str, Box<dyn Fn() -> Result<(), String> + 'a>);
+
+/// SpikeTrack's SAM 3.1 PE ViT-L trunk linears, `x [M, K] @ W [N, K]^T + b`, at the
+/// 1008 input (M = 72 x 72 tokens) and the 672 one (M = 48 x 48). Ojas runs them as
+/// NT on `[N, K]` weights (`gemm_nt_f32`, or `gemm_nt_bf16` under Autocast) and adds
+/// the bias in a second pass. The arms ask what the same product costs as NN on
+/// weights transposed once at load (`gemm`, its tile rule, both tiles forced), on
+/// f16 operands, and with the bias fused (`gemm_epilogue`, `beta = 0`, no
+/// activation: GELU-erf is not an epilogue activation). Every arm computes the same
+/// product of the same values, so outputs are compared to the bf16 NT arm (max
+/// difference relative to its largest magnitude) rather than required bit-equal.
+/// The last four arms are the exception: `gemm_nt_bf16_bias` is required bit-equal
+/// to the three dispatches it replaces, with and without the bf16 round.
+fn sam_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
+    // (N, K, label): q/k/v (one 1024-wide linear each), the fused qkv, proj, fc1, fc2.
+    const NK: [(usize, usize, &str); 5] = [
+        (1024, 1024, "q|k|v|proj"),
+        (3072, 1024, "qkv fused"),
+        (4736, 1024, "fc1"),
+        (1024, 4736, "fc2"),
+        (256, 1024, "neck 1x1"),
+    ];
+    for m in [5184usize, 2304] {
+        for &(n, k, label) in &NK {
+            let x = common::fill(m * k, 0x5a1 ^ (m * k) as u64);
+            let w_nk = common::fill(n * k, 0x5b2 ^ (n * k) as u64);
+            let mut w_kn = vec![0f32; n * k];
+            for (r, row) in w_nk.chunks_exact(k).enumerate() {
+                for (c, &v) in row.iter().enumerate() {
+                    w_kn[c * n + r] = v;
+                }
+            }
+            let bias = rt.alloc_tensor_f32(&[n])?;
+            bias.buffer.write_f32(&common::fill(n, 0x5c3));
+            let (xf, wf_nk) = (
+                upload_as(rt, Elem::Relaxed, &x, &[m, k])?,
+                upload_as(rt, Elem::Relaxed, &w_nk, &[n, k])?,
+            );
+            rt.set_relaxed_precision(false);
+            let (xb, wb_nk, wb_kn) = (
+                upload_as(rt, Elem::Bf16, &x, &[m, k])?,
+                upload_as(rt, Elem::Bf16, &w_nk, &[n, k])?,
+                upload_as(rt, Elem::Bf16, &w_kn, &[k, n])?,
+            );
+            let (xh, wh_kn) = (
+                upload_as(rt, Elem::F16, &x, &[m, k])?,
+                upload_as(rt, Elem::F16, &w_kn, &[k, n])?,
+            );
+            // Zeroed: the epilogue arms read C (times beta = 0, and 0 x NaN is NaN).
+            let cs: Vec<Tensor> = (0..12)
+                .map(|_| {
+                    let t = rt.alloc_tensor_f32(&[m, n])?;
+                    t.buffer.write_f32(&vec![0f32; m * n]);
+                    Ok(t)
+                })
+                .collect::<Result<_, String>>()?;
+            let epi = Epilogue {
+                alpha: 1.0,
+                beta: 0.0,
+                bias: Some(&bias),
+                activation: Activation::None,
+            };
+            let halves = rt.alloc_tensor_bf16(&[m, n])?;
+            let calls: [SamArm<'_>; 12] = [
+                ("nt_bf16 (ojas)", Box::new(|| gemm_nt_bf16(&xb, &wb_nk, &cs[0]))),
+                (
+                    "nn_bf16",
+                    Box::new(|| gemm(&xb, &wb_kn, &cs[1], GemmBackend::TensorOps)),
+                ),
+                (
+                    "nn_bf16_128x64",
+                    Box::new(|| gemm_tiled(&xb, &wb_kn, &cs[2], GemmBackend::TensorOps, EpiTile::Wide)),
+                ),
+                (
+                    "nn_bf16_64x64",
+                    Box::new(|| gemm_tiled(&xb, &wb_kn, &cs[3], GemmBackend::TensorOps, EpiTile::Narrow)),
+                ),
+                ("nn_f16", Box::new(|| gemm(&xh, &wh_kn, &cs[4], GemmBackend::TensorOps))),
+                (
+                    "nn_bf16+bias epi",
+                    Box::new(|| gemm_epilogue(&xb, &wb_kn, &cs[5], GemmBackend::TensorOps, epi)),
+                ),
+                (
+                    "nn_f16+bias epi",
+                    Box::new(|| gemm_epilogue(&xh, &wh_kn, &cs[6], GemmBackend::TensorOps, epi)),
+                ),
+                (
+                    "nt_f32 exact (ojas)",
+                    Box::new(|| gemm_nt_f32(&xf, &wf_nk, &cs[7], GemmBackend::TensorOps)),
+                ),
+                (
+                    "nt_bf16+bias 3-step",
+                    Box::new(|| {
+                        gemm_nt_bf16(&xb, &wb_nk, &cs[8])?;
+                        bias_add(rt, &cs[8].buffer, &bias.buffer, m as u32, n as u32)
+                    }),
+                ),
+                (
+                    "nt_bf16+bias fused",
+                    Box::new(|| gemm_nt_bf16_bias(&xb, &wb_nk, &cs[9], &bias, false)),
+                ),
+                (
+                    "nt_bf16+bias+round 3-step",
+                    Box::new(|| {
+                        gemm_nt_bf16(&xb, &wb_nk, &cs[10])?;
+                        bias_add(rt, &cs[10].buffer, &bias.buffer, m as u32, n as u32)?;
+                        cast_f32_to_bf16_into(&cs[10], &halves)?;
+                        cast_bf16_to_f32_into(&halves, &cs[10])
+                    }),
+                ),
+                (
+                    "nt_bf16+bias+round fused",
+                    Box::new(|| gemm_nt_bf16_bias(&xb, &wb_nk, &cs[11], &bias, true)),
+                ),
+            ];
+            for (_, f) in &calls {
+                f()?;
+            }
+            rt.synchronize()?;
+            // The fused kernel replaces the three dispatches bit for bit, or its time means nothing.
+            for (three, fused) in [(8, 9), (10, 11)] {
+                let (want, got) = (cs[three].buffer.read_f32(), cs[fused].buffer.read_f32());
+                if let Some(i) = (0..m * n).find(|&i| want[i].to_bits() != got[i].to_bits()) {
+                    return Err(format!(
+                        "sam {label} M={m} N={n} K={k}: {} differs from {} at element {i}: {} vs {}",
+                        calls[fused].0, calls[three].0, got[i], want[i]
+                    ));
+                }
+            }
+            let base = cs[0].buffer.read_f32();
+            let diffs: Vec<String> = calls
+                .iter()
+                .zip(&cs)
+                .skip(1)
+                .map(|((name, _), c)| format!("{name} {:.1e}", rel_diff(&base[..m * n], &c.buffer.read_f32()[..m * n])))
+                .collect();
+            let reps = run.reps;
+            let mut arms: Vec<common::Arm<'_>> = calls.iter().map(|(name, f)| arm(name, rt, reps, f)).collect();
+            let medians = report(
+                &format!(
+                    "sam {label} M={m} N={n} K={k}  (max |diff| / max |nt_bf16|: {})",
+                    diffs.join(", ")
+                ),
+                &mut arms,
+                run,
+            )?;
+            let flop = 2.0 * (m * n * k) as f64;
+            let rates: Vec<String> = calls
+                .iter()
+                .zip(&medians)
+                .map(|((name, _), ms)| format!("{name} {:.1}", flop / (ms * 1e-3) / 1e12))
+                .collect();
+            println!("  TFLOP/s: {}", rates.join(", "));
+        }
+    }
+    Ok(())
+}
+
 fn smallm_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     const MS: [usize; 7] = [16, 32, 64, 128, 256, 512, 1024];
     const NK: [(usize, usize); 4] = [(3072, 768), (768, 3072), (4096, 4096), (2048, 2048)];
@@ -788,9 +968,10 @@ fn main() -> Result<(), String> {
             "nnsmall" => nnsmall_lane(&rt, &run)?,
             "batched" => batched_lane(&rt, &run)?,
             "epi" => epi_lane(&rt, &run)?,
+            "sam" => sam_lane(&rt, &run)?,
             other => {
                 return Err(format!(
-                    "BENCH_LANES: no lane {other:?} (splitk, smallm, nnsmall, batched, epi)"
+                    "BENCH_LANES: no lane {other:?} (splitk, smallm, nnsmall, batched, epi, sam)"
                 ))
             }
         }

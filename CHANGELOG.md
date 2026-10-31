@@ -8,6 +8,17 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`gemm_nt_bf16_bias`: the bf16 NT GEMM with a bias and an optional bf16 round in its register epilogue**
+  (`src/gemm.rs`, `kernels/gemm_coop.h`, `kernels/matmul_tensorops.metal`,
+  `tests/gemm_nt_bf16_bias.rs`, the `sam` lane of `src/bin/bench_gemm_routes.rs`).
+  `C[M,N] = round_opt(f32(A[M,K] @ B[N,K]^T) + bias[N])`, stored f32, for the callers
+  that ran `gemm_nt_bf16`, an f32 bias add and a cast to bf16 and back as three passes
+  over C. `matmul2d_tensorops_nt_bf16_f32_bias` is `matmul2d_tensorops_nt_bf16_f32`'s own
+  `mm_coop` instantiation (128x64 sg4, same descriptor, operand views and tile walk) with
+  the strict epilogue on, so the K reduction is the plain kernel's and the bias add is one
+  f32 add; the round is `float(bfloat(x))`, the `cast_f32_to_bf16` conversion. Bit-identical
+  to the three-pass sequence at SAM's fc1, fc2 and qkv shapes and at ragged ones, rounding
+  on and off. Kernel entry points: 317 -> 318.
 - **Layout constants exported for ojas-metal** (`src/qwen35_bwd.rs`, `src/runtime.rs`).
   `qwen35_bwd::{CONV_ROWS_PER_BLOCK, CONV_MAX_KW, GATED_UNITS_PER_BLOCK, GATED_RMS_BWD_MAX_DIM}`
   and `runtime::METAL4_CONST_ARENA_BYTES` are now `pub` (were private), so a client that sizes

@@ -105,6 +105,7 @@ In Round 2 optimization, cooperative destination registers were extended across 
 | **NN Default** | $128 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32` | **26,642 GFLOP/s** at $4096^3$ |
 | **NN Narrow ($N \le 512$; bf16 $M < 128$ or under 64 tiles of 128×64)** | $64 \times 64$, 4 sg | `matmul2d_tensorops_bf16_f32_64x64_sg4` (and f16, relaxed f32) | +6% on narrow-$N$; outruns 128×64 on short-$M$ bf16 (e.g. M=61 GDN in-proj) and 1.16–1.56× on bf16 grids under 64 tiles (`bench/results/bf16_smallm_coop_reconciled_m5pro.txt`) |
 | **Fused epilogue and batched** | the plain path's tile (`coop_narrow`) | `*_epi`, `*_batched` and their `_64x64_sg4` forms, every element type | Epilogue 64×64 1.11–2.01× where the rule picks it (`bench/results/gemm_coop_tiles_m5pro.txt`) |
+| **NT bf16 with bias and optional bf16 round** | $128 \times 64$, 4 sg (the NT kernel's own `mm_coop` instantiation) | `matmul2d_tensorops_nt_bf16_f32_bias` (`gemm_nt_bf16_bias`) | One dispatch in place of `gemm_nt_bf16` + bias add + the bf16 round trip; bit-identical to them (`tests/gemm_nt_bf16_bias.rs`) |
 | **TN bf16 Descriptor** | $128 \times 64$, 4 sg | `matmul2d_tensorops_tn_bf16_f32` | 1.52–1.98× over dynamic-$K$ multiply |
 | **NT bf16 ($dX$ Backward)** | $128 \times 64$, 4 sg | `matmul2d_tensorops_nt_bf16_f32` | 2.00–2.03× speedup at scale |
 | **Accumulate Paths** | $64 \times 64$, 4 sg | Zero $\to$ Run $\to$ Load-Add-Store (`TILE_COOP_ACCUM`) | 1.38–1.49× over `multiply_accumulate` |
@@ -178,7 +179,7 @@ Qwen3.5 kernels in `tessl::qwen35` add three sources and eleven more — see
 [qwen35.md](qwen35.md)). Counted over the whole crate on 2026-10-02 there are
 30 Metal sources and 205 entry points: the difference is the Qwen3.5 forward,
 backward and AdamW kernels. That count is a dated snapshot; the README's
-current figures (39 sources, 317 entry points) are the ones the build's own
+current figures (39 sources, 318 entry points) are the ones the build's own
 test checks. The `nn` ones arrived here by
 promotion out of `gemma-metal`, where they were reachable only as raw pipeline
 name strings through an overlay metallib — meaning a typo in a name was a

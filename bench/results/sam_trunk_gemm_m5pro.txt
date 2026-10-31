@@ -1,0 +1,119 @@
+tessl c9adc87 qwen35_model: the prefill GDN defaults to the chunked rule again; the simd recurrence is opt-in + the sam lane; Apple M5 Pro; 17:38  up 2 days,  9:54, 1 user, load averages: 8.45 8.24 8.39
+GPU Device Utilization % before: 75 18 18 17 19 
+    Finished `release` profile [optimized] target(s) in 0.97s
+     Running `target/release/bench_gemm_routes`
+device: Apple M5 Pro
+async encode, 20 GEMMs per command buffer, 8 calls per arm per round, 6 rounds (order reversed every other round) after 2 warmup calls; us per GEMM, median of per-round medians; ratio = first arm / this arm (> 1: this arm is faster), median of per-round ratios [range]
+
+sam q|k|v|proj M=5184 N=1024 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.0e-3, nn_bf16+bias epi 1.6e-2, nn_f16+bias epi 1.8e-2, nt_f32 exact (ojas) 2.0e-3)  (self-spread of nt_bf16 (ojas) 40.9%, EXCEEDS 10%)
+  nt_bf16 (ojas)             431.8 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    438.8 us   nt_bf16 (ojas)/this 0.99 [0.97–1.00]
+  nn_bf16_128x64             435.3 us   nt_bf16 (ojas)/this 0.99 [0.98–1.01]
+  nn_bf16_64x64              422.4 us   nt_bf16 (ojas)/this 1.02 [0.97–1.04]
+  nn_f16                     437.5 us   nt_bf16 (ojas)/this 0.99 [0.98–1.02]
+  nn_bf16+bias epi           512.3 us   nt_bf16 (ojas)/this 0.86 [0.78–0.89]
+  nn_f16+bias epi            507.5 us   nt_bf16 (ojas)/this 0.87 [0.76–0.90]
+  nt_f32 exact (ojas)       1817.2 us   nt_bf16 (ojas)/this 0.24 [0.20–0.26]
+  TFLOP/s: nt_bf16 (ojas) 25.2, nn_bf16 24.8, nn_bf16_128x64 25.0, nn_bf16_64x64 25.7, nn_f16 24.8, nn_bf16+bias epi 21.2, nn_f16+bias epi 21.4, nt_f32 exact (ojas) 6.0
+
+sam qkv fused M=5184 N=3072 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.0e-3, nn_bf16+bias epi 1.7e-2, nn_f16+bias epi 1.8e-2, nt_f32 exact (ojas) 2.0e-3)  (self-spread of nt_bf16 (ojas) 11.3%, EXCEEDS 10%)
+  nt_bf16 (ojas)            1383.6 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                   1402.5 us   nt_bf16 (ojas)/this 0.99 [0.93–1.02]
+  nn_bf16_128x64            1406.2 us   nt_bf16 (ojas)/this 0.98 [0.91–1.03]
+  nn_bf16_64x64             1409.7 us   nt_bf16 (ojas)/this 0.99 [0.87–1.05]
+  nn_f16                    1414.5 us   nt_bf16 (ojas)/this 1.00 [0.86–1.08]
+  nn_bf16+bias epi          1628.9 us   nt_bf16 (ojas)/this 0.87 [0.74–0.97]
+  nn_f16+bias epi           1605.4 us   nt_bf16 (ojas)/this 0.87 [0.75–0.98]
+  nt_f32 exact (ojas)       5998.4 us   nt_bf16 (ojas)/this 0.24 [0.21–0.26]
+  TFLOP/s: nt_bf16 (ojas) 23.6, nn_bf16 23.3, nn_bf16_128x64 23.2, nn_bf16_64x64 23.1, nn_f16 23.1, nn_bf16+bias epi 20.0, nn_f16+bias epi 20.3, nt_f32 exact (ojas) 5.4
+
+sam fc1 M=5184 N=4736 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 1.9e-2, nt_f32 exact (ojas) 2.1e-3)  (self-spread of nt_bf16 (ojas) 10.6%, EXCEEDS 10%)
+  nt_bf16 (ojas)            2120.1 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                   2141.5 us   nt_bf16 (ojas)/this 0.99 [0.97–1.01]
+  nn_bf16_128x64            2168.9 us   nt_bf16 (ojas)/this 0.98 [0.96–1.00]
+  nn_bf16_64x64             2192.5 us   nt_bf16 (ojas)/this 0.97 [0.94–1.00]
+  nn_f16                    2175.3 us   nt_bf16 (ojas)/this 0.96 [0.91–1.01]
+  nn_bf16+bias epi          2497.9 us   nt_bf16 (ojas)/this 0.82 [0.75–0.89]
+  nn_f16+bias epi           2449.1 us   nt_bf16 (ojas)/this 0.84 [0.75–0.92]
+  nt_f32 exact (ojas)       9359.9 us   nt_bf16 (ojas)/this 0.23 [0.21–0.23]
+  TFLOP/s: nt_bf16 (ojas) 23.7, nn_bf16 23.5, nn_bf16_128x64 23.2, nn_bf16_64x64 22.9, nn_f16 23.1, nn_bf16+bias epi 20.1, nn_f16+bias epi 20.5, nt_f32 exact (ojas) 5.4
+
+sam fc2 M=5184 N=1024 K=4736  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.2e-3, nn_bf16+bias epi 8.2e-3, nn_f16+bias epi 1.0e-2, nt_f32 exact (ojas) 2.2e-3)  (self-spread of nt_bf16 (ojas) 36.7%, EXCEEDS 10%)
+  nt_bf16 (ojas)            2266.2 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                   2278.6 us   nt_bf16 (ojas)/this 0.98 [0.93–1.07]
+  nn_bf16_128x64            2179.1 us   nt_bf16 (ojas)/this 1.00 [0.90–1.09]
+  nn_bf16_64x64             2531.8 us   nt_bf16 (ojas)/this 0.84 [0.76–1.01]
+  nn_f16                    2228.3 us   nt_bf16 (ojas)/this 0.97 [0.81–1.08]
+  nn_bf16+bias epi          2424.7 us   nt_bf16 (ojas)/this 0.89 [0.74–1.00]
+  nn_f16+bias epi           2554.9 us   nt_bf16 (ojas)/this 0.86 [0.73–0.97]
+  nt_f32 exact (ojas)       9623.6 us   nt_bf16 (ojas)/this 0.24 [0.18–0.25]
+  TFLOP/s: nt_bf16 (ojas) 22.2, nn_bf16 22.1, nn_bf16_128x64 23.1, nn_bf16_64x64 19.9, nn_f16 22.6, nn_bf16+bias epi 20.7, nn_f16+bias epi 19.7, nt_f32 exact (ojas) 5.2
+
+sam neck 1x1 M=5184 N=256 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.9e-2, nn_f16+bias epi 2.1e-2, nt_f32 exact (ojas) 2.1e-3)  (self-spread of nt_bf16 (ojas) 30.1%, EXCEEDS 10%)
+  nt_bf16 (ojas)             133.0 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    140.7 us   nt_bf16 (ojas)/this 0.97 [0.90–1.12]
+  nn_bf16_128x64             132.8 us   nt_bf16 (ojas)/this 0.97 [0.80–1.25]
+  nn_bf16_64x64              124.3 us   nt_bf16 (ojas)/this 1.04 [0.75–1.16]
+  nn_f16                     117.7 us   nt_bf16 (ojas)/this 1.13 [0.65–1.37]
+  nn_bf16+bias epi           136.5 us   nt_bf16 (ojas)/this 1.03 [0.74–1.09]
+  nn_f16+bias epi            136.8 us   nt_bf16 (ojas)/this 0.94 [0.62–1.14]
+  nt_f32 exact (ojas)        440.5 us   nt_bf16 (ojas)/this 0.29 [0.21–0.35]
+  TFLOP/s: nt_bf16 (ojas) 20.4, nn_bf16 19.3, nn_bf16_128x64 20.5, nn_bf16_64x64 21.9, nn_f16 23.1, nn_bf16+bias epi 19.9, nn_f16+bias epi 19.9, nt_f32 exact (ojas) 6.2
+
+sam q|k|v|proj M=2304 N=1024 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 2.0e-2, nt_f32 exact (ojas) 2.0e-3)  (self-spread of nt_bf16 (ojas) 25.8%, EXCEEDS 10%)
+  nt_bf16 (ojas)             209.6 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    201.6 us   nt_bf16 (ojas)/this 1.02 [0.88–1.19]
+  nn_bf16_128x64             200.1 us   nt_bf16 (ojas)/this 1.04 [0.95–1.22]
+  nn_bf16_64x64              193.1 us   nt_bf16 (ojas)/this 1.09 [0.92–1.35]
+  nn_f16                     206.9 us   nt_bf16 (ojas)/this 0.99 [0.68–1.08]
+  nn_bf16+bias epi           235.4 us   nt_bf16 (ojas)/this 0.85 [0.79–1.10]
+  nn_f16+bias epi            240.6 us   nt_bf16 (ojas)/this 0.86 [0.68–1.14]
+  nt_f32 exact (ojas)        818.9 us   nt_bf16 (ojas)/this 0.25 [0.23–0.33]
+  TFLOP/s: nt_bf16 (ojas) 23.1, nn_bf16 24.0, nn_bf16_128x64 24.1, nn_bf16_64x64 25.0, nn_f16 23.4, nn_bf16+bias epi 20.5, nn_f16+bias epi 20.1, nt_f32 exact (ojas) 5.9
+
+sam qkv fused M=2304 N=3072 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 1.9e-3, nn_bf16+bias epi 1.6e-2, nn_f16+bias epi 1.7e-2, nt_f32 exact (ojas) 1.8e-3)  (self-spread of nt_bf16 (ojas) 27.7%, EXCEEDS 10%)
+  nt_bf16 (ojas)             587.0 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    596.5 us   nt_bf16 (ojas)/this 0.99 [0.92–1.10]
+  nn_bf16_128x64             579.3 us   nt_bf16 (ojas)/this 1.02 [0.73–1.07]
+  nn_bf16_64x64              600.1 us   nt_bf16 (ojas)/this 0.99 [0.58–1.08]
+  nn_f16                     599.3 us   nt_bf16 (ojas)/this 0.96 [0.51–1.05]
+  nn_bf16+bias epi           651.6 us   nt_bf16 (ojas)/this 0.85 [0.63–0.94]
+  nn_f16+bias epi            764.1 us   nt_bf16 (ojas)/this 0.77 [0.59–0.98]
+  nt_f32 exact (ojas)       2422.4 us   nt_bf16 (ojas)/this 0.25 [0.21–0.26]
+  TFLOP/s: nt_bf16 (ojas) 24.7, nn_bf16 24.3, nn_bf16_128x64 25.0, nn_bf16_64x64 24.2, nn_f16 24.2, nn_bf16+bias epi 22.2, nn_f16+bias epi 19.0, nt_f32 exact (ojas) 6.0
+
+sam fc1 M=2304 N=4736 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 2.0e-2, nt_f32 exact (ojas) 2.0e-3)  (self-spread of nt_bf16 (ojas) 22.8%, EXCEEDS 10%)
+  nt_bf16 (ojas)             959.7 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    974.1 us   nt_bf16 (ojas)/this 0.98 [0.96–1.39]
+  nn_bf16_128x64             968.2 us   nt_bf16 (ojas)/this 0.99 [0.96–1.30]
+  nn_bf16_64x64              967.4 us   nt_bf16 (ojas)/this 0.99 [0.86–1.25]
+  nn_f16                     979.9 us   nt_bf16 (ojas)/this 0.99 [0.96–1.28]
+  nn_bf16+bias epi          1105.8 us   nt_bf16 (ojas)/this 0.86 [0.79–1.05]
+  nn_f16+bias epi           1131.4 us   nt_bf16 (ojas)/this 0.84 [0.77–1.10]
+  nt_f32 exact (ojas)       4138.6 us   nt_bf16 (ojas)/this 0.23 [0.22–0.29]
+  TFLOP/s: nt_bf16 (ojas) 23.3, nn_bf16 22.9, nn_bf16_128x64 23.1, nn_bf16_64x64 23.1, nn_f16 22.8, nn_bf16+bias epi 20.2, nn_f16+bias epi 19.8, nt_f32 exact (ojas) 5.4
+
+sam fc2 M=2304 N=1024 K=4736  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.3e-3, nn_bf16+bias epi 8.8e-3, nn_f16+bias epi 1.1e-2, nt_f32 exact (ojas) 2.3e-3)  (self-spread of nt_bf16 (ojas) 6.9%)
+  nt_bf16 (ojas)             919.8 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                    926.5 us   nt_bf16 (ojas)/this 0.99 [0.94–1.00]
+  nn_bf16_128x64             918.0 us   nt_bf16 (ojas)/this 0.99 [0.96–1.01]
+  nn_bf16_64x64             1179.9 us   nt_bf16 (ojas)/this 0.77 [0.75–0.80]
+  nn_f16                     921.4 us   nt_bf16 (ojas)/this 0.99 [0.95–1.02]
+  nn_bf16+bias epi           966.8 us   nt_bf16 (ojas)/this 0.95 [0.90–0.97]
+  nn_f16+bias epi            995.2 us   nt_bf16 (ojas)/this 0.90 [0.87–0.97]
+  nt_f32 exact (ojas)       3776.8 us   nt_bf16 (ojas)/this 0.24 [0.23–0.25]
+  TFLOP/s: nt_bf16 (ojas) 24.3, nn_bf16 24.1, nn_bf16_128x64 24.3, nn_bf16_64x64 18.9, nn_f16 24.3, nn_bf16+bias epi 23.1, nn_f16+bias epi 22.5, nt_f32 exact (ojas) 5.9
+
+sam neck 1x1 M=2304 N=256 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.2e-3, nn_bf16+bias epi 2.0e-2, nn_f16+bias epi 2.2e-2, nt_f32 exact (ojas) 2.2e-3)  (self-spread of nt_bf16 (ojas) 10.3%, EXCEEDS 10%)
+  nt_bf16 (ojas)              59.2 us   nt_bf16 (ojas)/this 1.00 [1.00–1.00]
+  nn_bf16                     59.9 us   nt_bf16 (ojas)/this 0.99 [0.98–1.01]
+  nn_bf16_128x64              59.8 us   nt_bf16 (ojas)/this 0.99 [0.97–1.01]
+  nn_bf16_64x64               60.4 us   nt_bf16 (ojas)/this 0.99 [0.97–1.03]
+  nn_f16                      60.3 us   nt_bf16 (ojas)/this 0.99 [0.98–1.01]
+  nn_bf16+bias epi            70.9 us   nt_bf16 (ojas)/this 0.84 [0.83–0.86]
+  nn_f16+bias epi             71.6 us   nt_bf16 (ojas)/this 0.84 [0.82–0.86]
+  nt_f32 exact (ojas)        226.4 us   nt_bf16 (ojas)/this 0.26 [0.26–0.27]
+  TFLOP/s: nt_bf16 (ojas) 20.4, nn_bf16 20.2, nn_bf16_128x64 20.2, nn_bf16_64x64 20.0, nn_f16 20.0, nn_bf16+bias epi 17.0, nn_f16+bias epi 16.9, nt_f32 exact (ojas) 5.3
+bench_gemm_routes: the production baseline moved more than 10% across rounds at 9 shape(s): sam q|k|v|proj M=5184 N=1024 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.0e-3, nn_bf16+bias epi 1.6e-2, nn_f16+bias epi 1.8e-2, nt_f32 exact (ojas) 2.0e-3), sam qkv fused M=5184 N=3072 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.0e-3, nn_bf16+bias epi 1.7e-2, nn_f16+bias epi 1.8e-2, nt_f32 exact (ojas) 2.0e-3), sam fc1 M=5184 N=4736 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 1.9e-2, nt_f32 exact (ojas) 2.1e-3), sam fc2 M=5184 N=1024 K=4736  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.2e-3, nn_bf16+bias epi 8.2e-3, nn_f16+bias epi 1.0e-2, nt_f32 exact (ojas) 2.2e-3), sam neck 1x1 M=5184 N=256 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.9e-2, nn_f16+bias epi 2.1e-2, nt_f32 exact (ojas) 2.1e-3), sam q|k|v|proj M=2304 N=1024 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 2.0e-2, nt_f32 exact (ojas) 2.0e-3), sam qkv fused M=2304 N=3072 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 1.9e-3, nn_bf16+bias epi 1.6e-2, nn_f16+bias epi 1.7e-2, nt_f32 exact (ojas) 1.8e-3), sam fc1 M=2304 N=4736 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.1e-3, nn_bf16+bias epi 1.8e-2, nn_f16+bias epi 2.0e-2, nt_f32 exact (ojas) 2.0e-3), sam neck 1x1 M=2304 N=256 K=1024  (max |diff| / max |nt_bf16|: nn_bf16 0.0e0, nn_bf16_128x64 0.0e0, nn_bf16_64x64 0.0e0, nn_f16 2.2e-3, nn_bf16+bias epi 2.0e-2, nn_f16+bias epi 2.2e-2, nt_f32 exact (ojas) 2.2e-3); their ratios are not comparable
+exit 3
+GPU Device Utilization % after: 98; 17:40  up 2 days,  9:56, 1 user, load averages: 38.89 17.54 11.87

@@ -35,6 +35,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
+use crate::shared::{RuntimePoison, Shared, Timeline};
+
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
 /// Public so a client that budgets against the arena (ojas-metal's inline
 /// uploads) derives its share from this number instead of copying it.
@@ -741,53 +743,12 @@ impl ParamsBuffer {
     }
 }
 
-/// The poison latch: set once an encode, a submit, a GPU fault, or the third
-/// consecutive wait-budget timeout fails, after which the runtime refuses
-/// every call. One or two budget timeouts do not set it. It keeps the first
-/// cause, because only the call that poisoned the runtime returns it; every
-/// later refusal would otherwise say only "poisoned", far from the fault.
-///
-/// Metal's feedback thread sets it too, where a panic cannot be recovered, so
-/// the lock takes a poisoned guard as it is.
-struct RuntimePoison {
-    set: AtomicBool,
-    cause: Mutex<Option<String>>,
-}
-
-impl RuntimePoison {
-    fn new() -> Self {
-        Self {
-            set: AtomicBool::new(false),
-            cause: Mutex::new(None),
-        }
-    }
-
-    /// Poison the runtime. A later cause does not replace the first.
-    fn set(&self, cause: impl Into<String>) {
-        {
-            let mut first = self.cause.lock().unwrap_or_else(PoisonError::into_inner);
-            if first.is_none() {
-                *first = Some(cause.into());
-            }
-        }
-        self.set.store(true, Ordering::Release);
-    }
-
-    fn is_set(&self) -> bool {
-        self.set.load(Ordering::Acquire)
-    }
-
-    /// The refusal a poisoned runtime returns, naming the first cause.
-    fn error(&self) -> String {
-        match &*self.cause.lock().unwrap_or_else(PoisonError::into_inner) {
-            Some(cause) => format!("runtime is poisoned after encode/submit failure ({cause}); recreate it"),
-            None => "runtime is poisoned after encode/submit failure; recreate it".into(),
-        }
-    }
-}
-
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
+    /// What this runtime shares with others made from the same [`Shared`]:
+    /// the poison latch (`poison` below is its clone, kept for the feedback
+    /// callback) and the commit clock.
+    shared: Arc<Shared>,
     poison: Arc<RuntimePoison>,
     /// Times `MTL4CommitFeedback` has been delivered. The command buffer
     /// protocol has no status; this counts the feedback path that does.
@@ -994,12 +955,34 @@ impl GpuRuntime {
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
-        Self::from_embedded_metallib(/*timestamps*/ true)
+        Self::from_embedded_metallib(/*timestamps*/ true, Shared::new())
     }
 
     /// Inference decode runtime: no CounterHeap timestamps (host encode tax).
     pub fn new_inference() -> Result<Arc<Self>, String> {
-        Self::from_embedded_metallib(/*timestamps*/ false)
+        Self::from_embedded_metallib(/*timestamps*/ false, Shared::new())
+    }
+
+    /// Like [`Self::new`], under a [`Shared`] other runtimes may also use: one
+    /// poison latch and one commit clock across them. Each runtime still owns
+    /// its queue, its pool and its buffers, and is `!Send` as before.
+    pub fn with_shared(shared: Arc<Shared>) -> Result<Arc<Self>, String> {
+        Self::from_embedded_metallib(/*timestamps*/ true, shared)
+    }
+
+    /// Like [`Self::new_inference`], under a [`Shared`] (see [`Self::with_shared`]).
+    pub fn with_shared_inference(shared: Arc<Shared>) -> Result<Arc<Self>, String> {
+        Self::from_embedded_metallib(/*timestamps*/ false, shared)
+    }
+
+    /// The [`Shared`] this runtime was made under.
+    pub fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    /// The timeline view of this runtime's private lifetime event.
+    pub fn timeline(&self) -> Timeline<'_> {
+        Timeline::new(self)
     }
 
     /// Shaders compiled by `build.rs`, embedded in this binary.
@@ -1008,7 +991,7 @@ impl GpuRuntime {
     /// `DEP_TESSL_METALLIB` for dependents). Opening a runtime does not read
     /// it. A docs.rs build has no shaders, so the slice is empty and
     /// [`Self::new`] fails instead of looking for a file that was never written.
-    fn from_embedded_metallib(timestamps: bool) -> Result<Arc<Self>, String> {
+    fn from_embedded_metallib(timestamps: bool, shared: Arc<Shared>) -> Result<Arc<Self>, String> {
         let bytes = embedded_metallib();
         if bytes.is_empty() {
             return Err(
@@ -1022,7 +1005,7 @@ impl GpuRuntime {
         let device =
             MTLCreateSystemDefaultDevice().ok_or_else(|| "MTLCreateSystemDefaultDevice returned nil".to_string())?;
         let library = library_from_data(&device, &data, "load embedded metallib")?;
-        Self::assemble(device, library, timestamps)
+        Self::assemble(device, library, timestamps, shared)
     }
 
     pub fn from_metallib_path(path: &Path) -> Result<Arc<Self>, String> {
@@ -1045,13 +1028,14 @@ impl GpuRuntime {
         }
         let data = DispatchData::from_bytes(&bytes);
         let library = library_from_data(&device, &data, "load metallib")?;
-        Self::assemble(device, library, timestamps)
+        Self::assemble(device, library, timestamps, Shared::new())
     }
 
     fn assemble(
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         library: Retained<ProtocolObject<dyn MTLLibrary>>,
         timestamps: bool,
+        shared: Arc<Shared>,
     ) -> Result<Arc<Self>, String> {
         let metal4 = try_init_metal4(&device, timestamps)
             .map_err(|err| format!("Metal 4 encode package unavailable ({err}); metal-runtime requires Metal 4"))?;
@@ -1082,7 +1066,8 @@ impl GpuRuntime {
         #[allow(clippy::arc_with_non_send_sync)]
         let rt = Arc::new_cyclic(|self_weak| Self {
             access_busy: Arc::new(AtomicBool::new(false)),
-            poison: Arc::new(RuntimePoison::new()),
+            poison: Arc::clone(&shared.poison),
+            shared,
             commit_feedback_reports: Arc::new(AtomicU64::new(0)),
             device,
             library,
@@ -1478,7 +1463,10 @@ impl GpuRuntime {
     }
 
     /// The shared-event value after which a release scheduled now is safe:
-    /// the next commit's. See [`Deferred`].
+    /// the next commit's, or a value no later than it. Under a [`Shared`]
+    /// several runtimes use, the next commit draws a value above this one, and
+    /// this runtime's event reaches that value only at that commit, so the
+    /// release still waits for exactly that commit. See [`Deferred`].
     fn release_point(&self) -> u64 {
         self.metal4.event_value.load(Ordering::Acquire) + 1
     }
@@ -1509,7 +1497,7 @@ impl GpuRuntime {
     /// A budget timeout leaves the runtime usable. The third consecutive one
     /// poisons it (DeviceLost) and later calls return that poison without
     /// waiting out another budget. A wait that reaches `value` clears the streak.
-    fn wait_lifetime_event(&self, value: u64) -> Result<(), String> {
+    pub(crate) fn wait_lifetime_event(&self, value: u64) -> Result<(), String> {
         if self.poison.is_set() {
             return Err(self.poison.error());
         }
@@ -2230,8 +2218,10 @@ impl GpuRuntime {
 
     /// The lifetime-event value whose completion proves everything recorded so
     /// far has finished: `event_value + 1` while a command buffer is open (the
-    /// next commit carries it), else `event_value` (the last commit already
-    /// did). Read-only.
+    /// next commit carries it, or a later value when runtimes share a
+    /// [`Shared`]: this runtime's event cannot pass `event_value` before that
+    /// commit, so waiting for `event_value + 1` still waits for it), else
+    /// `event_value` (the last commit already did). Read-only.
     ///
     /// Both reads happen under the `active_m4` lock. `commit_m4` clears
     /// `cb_open` and bumps `event_value` while holding that same lock, so the
@@ -2245,6 +2235,18 @@ impl GpuRuntime {
         } else {
             signaled
         }
+    }
+
+    /// Pretend a commit was submitted: draw its value from the commit clock
+    /// and publish it as `event_value`, without signaling anything. Tests that
+    /// stage an unfinished commit go through this, not a bare `fetch_add` on
+    /// `event_value`: a real commit afterwards draws from the same clock, so
+    /// it must stay ahead of every value staged here.
+    #[cfg(test)]
+    fn stage_submitted_commit_for_test(&self) -> u64 {
+        let value = self.shared.issue();
+        self.metal4.event_value.store(value, Ordering::Release);
+        value
     }
 
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
@@ -2525,7 +2527,17 @@ impl GpuRuntime {
         let watch = self.commit_with_feedback()?;
         batch.cb_open = false;
 
-        let next = m4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        // Drawn from the commit clock of the `Shared` this runtime was made
+        // under. A runtime with a `Shared` of its own draws 1, 2, 3, ... as it
+        // always did; runtimes sharing one see gaps where the others committed.
+        // Either way this runtime's own values only increase, and the store
+        // lands before the queue signals, as the `fetch_add` it replaces did.
+        let next = self.shared.issue();
+        debug_assert!(
+            next > m4.event_value.load(Ordering::Acquire),
+            "the commit clock fell behind this runtime's event value"
+        );
+        m4.event_value.store(next, Ordering::Release);
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
         // Queue order puts this after the lifetime signal, so the handoff
@@ -3908,7 +3920,7 @@ mod lifetime_event_tests {
         let rt = GpuRuntime::new().unwrap();
         rt.set_event_wait_ms(1).unwrap();
         // A commit that was submitted but whose signal has not landed.
-        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = rt.stage_submitted_commit_for_test();
         rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
 
         let started = std::time::Instant::now();
@@ -3946,7 +3958,7 @@ mod lifetime_event_tests {
     /// An allocator slot whose lifetime event has not reached `in_flight`, so
     /// the next wait blocks until the budget.
     fn arm_unsignaled_wait(rt: &GpuRuntime) -> u64 {
-        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = rt.stage_submitted_commit_for_test();
         rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
         value
     }
@@ -4065,7 +4077,7 @@ mod alloc_recycle_tests {
     /// A commit is "submitted" (the event counter is past what the lifetime
     /// event has reached) and not finished.
     fn pretend_in_flight(rt: &GpuRuntime) -> u64 {
-        rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1
+        rt.stage_submitted_commit_for_test()
     }
 
     #[test]

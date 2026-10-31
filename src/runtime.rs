@@ -2185,6 +2185,18 @@ impl GpuRuntime {
         }
     }
 
+    /// Pretend a commit was submitted: draw its value from the commit clock
+    /// and publish it as `event_value`, without signaling anything. Tests that
+    /// stage an unfinished commit go through this, not a bare `fetch_add` on
+    /// `event_value`: a real commit afterwards draws from the same clock, so
+    /// it must stay ahead of every value staged here.
+    #[cfg(test)]
+    fn stage_submitted_commit_for_test(&self) -> u64 {
+        let value = self.shared.issue();
+        self.metal4.event_value.store(value, Ordering::Release);
+        value
+    }
+
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
         // Do not call flush_residency here — caller may already hold `active_m4`.
         let m4 = &self.metal4;
@@ -2469,6 +2481,10 @@ impl GpuRuntime {
         // Either way this runtime's own values only increase, and the store
         // lands before the queue signals, as the `fetch_add` it replaces did.
         let next = self.shared.issue();
+        debug_assert!(
+            next > m4.event_value.load(Ordering::Acquire),
+            "the commit clock fell behind this runtime's event value"
+        );
         m4.event_value.store(next, Ordering::Release);
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
@@ -3732,7 +3748,7 @@ mod lifetime_event_tests {
         let rt = GpuRuntime::new().unwrap();
         rt.set_event_wait_ms(1).unwrap();
         // A commit that was submitted but whose signal has not landed.
-        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = rt.stage_submitted_commit_for_test();
         rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
 
         let started = std::time::Instant::now();
@@ -3770,7 +3786,7 @@ mod lifetime_event_tests {
     /// An allocator slot whose lifetime event has not reached `in_flight`, so
     /// the next wait blocks until the budget.
     fn arm_unsignaled_wait(rt: &GpuRuntime) -> u64 {
-        let value = rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1;
+        let value = rt.stage_submitted_commit_for_test();
         rt.metal4.allocators.lock().unwrap()[0].in_flight = value;
         value
     }
@@ -3889,7 +3905,7 @@ mod alloc_recycle_tests {
     /// A commit is "submitted" (the event counter is past what the lifetime
     /// event has reached) and not finished.
     fn pretend_in_flight(rt: &GpuRuntime) -> u64 {
-        rt.metal4.event_value.fetch_add(1, Ordering::AcqRel) + 1
+        rt.stage_submitted_commit_for_test()
     }
 
     #[test]

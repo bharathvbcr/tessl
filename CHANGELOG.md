@@ -8,6 +8,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`Shared`, `GpuRuntime::with_shared` and `Timeline`** (`src/shared.rs`). The poison latch and the
+  commit clock moved out of `GpuRuntime` into an `Arc<Shared>` (`Send + Sync`, no `unsafe`).
+  `with_shared`/`with_shared_inference` make runtimes that share poison and draw every commit's
+  timeline value from one monotone clock; `new()` and `new_inference()` give each runtime a
+  `Shared` of its own and behave as before (values 1, 2, 3, ... with no gaps). Runtimes under one
+  `Shared` see gaps in their own sequence where the others committed. `GpuRuntime::timeline()` is a
+  values-only view of the private lifetime event (`submitted`, `completed`, a budgeted `wait` that
+  refuses an unsubmitted value). The buffer pool and the deferred queues stay in the runtime: they
+  hold `Retained<MTLBuffer>`, which objc2 does not mark `Send`. The ICB-replay finding that blocks
+  per-buffer stamps is in the `src/shared.rs` module docs.
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
   A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
   derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison

@@ -3608,6 +3608,26 @@ mod audit_tests {
         assert_eq!(GpuRuntime::allocated_bytes_for(usize::MAX, BufferKind::Cold), u64::MAX);
     }
 
+    /// `allocated_bytes_for` is the pool's own bucket, which ojas-metal's
+    /// budgets call instead of rounding on their own: across every threshold
+    /// (256, a page, 1 MiB, either side of each) it equals the length the pool
+    /// makes the buffer at, for every kind that takes a size from the pool.
+    #[test]
+    fn allocated_bytes_for_matches_the_pool_across_every_threshold() {
+        let rt = GpuRuntime::new().unwrap();
+        let mut sizes = vec![0, 1, 255, 256, 257];
+        for edge in [ALLOC_PAGE_BYTES, POW2_BUCKET_MAX_BYTES, 4 * POW2_BUCKET_MAX_BYTES] {
+            sizes.extend([edge - 1, edge, edge + 1, edge + edge / 2 + 1]);
+        }
+        for kind in [BufferKind::Cold, BufferKind::Hot, BufferKind::Bump] {
+            for &n in &sizes {
+                let want = GpuRuntime::allocated_bytes_for(n, kind) as usize;
+                let b = rt.alloc_buffer_kind(n, kind).unwrap();
+                assert_eq!(b.metal().length(), want, "{n} {kind:?}");
+            }
+        }
+    }
+
     /// A recycled page-rounded Cold buffer serves the next request of the
     /// same size, and only that size.
     #[test]

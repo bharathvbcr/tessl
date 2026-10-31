@@ -1369,6 +1369,20 @@ impl GpuRuntime {
         }
     }
 
+    /// Destroy every cached buffer in the pool free list, releasing its ledger
+    /// charge. Returns the bytes freed. Free-listed buffers are idle: they
+    /// were parked after the GPU finished with them.
+    ///
+    /// Uses `try_lock` to avoid recursive deadlock if called while the pool
+    /// lock is already held on the calling thread.
+    pub fn trim_free_list(&self) -> usize {
+        if let Ok(mut pool) = self.pool.try_lock() {
+            pool.trim_free_list()
+        } else {
+            0
+        }
+    }
+
     /// Store `wired_budget` as `fraction` times `recommendedMaxWorkingSetSize`.
     ///
     /// A finite fraction is clamped to 0.5–0.95. A non-finite fraction is

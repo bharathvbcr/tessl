@@ -109,8 +109,8 @@ dispatch2 = "0.3"
 # Already the block crate objc2-metal uses for MTL4CommitFeedbackHandler.
 block2 = "0.6"
 libc = "0.2"
-ojas-core = { path = "../ojas/ojas-core" }
-ojas-io = { path = "../ojas/ojas-io" }
+ojas-core = { version = "0.1.0", path = "../ojas/ojas-core" }
+ojas-io = { version = "0.1.0", path = "../ojas/ojas-io" }
 
 [dev-dependencies]
 # Card ft-29323ca4. One std-only home. reduction_bound delegates to it.

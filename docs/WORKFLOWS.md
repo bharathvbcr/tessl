@@ -23,7 +23,7 @@ Tessl enforces a multi-stage testing pipeline designed to fail fast on syntax an
 | **Tier 2** | Device-Free Hosted Tests | Tests run under sandbox denying IOKit (`scripts/hosted_tests.sh`) | `./scripts/hosted_tests.sh` | Host only (< 30s) |
 | **Tier 3** | Metal Dialect & IR Check | MSL syntax, fast-math bounds, no Inf/NaN constants | `./scripts/check_kernel_ir.sh` | Metal toolchain |
 | **Tier 4** | Emulator & Contract Verification | Python MSL emulator contract checks vs PyTorch reference | `python3 tools/msl_emu/check_qwen35.py -k host_contract` | PyTorch oracle env |
-| **Tier 5** | Serialized GPU Tests & Examples | Device execution on Metal under exclusive lock | `./scripts/ci_local.sh` (or `tools/mac_heavy.sh`) | Apple Silicon Metal |
+| **Tier 5** | Serialized GPU Tests & Examples | Device execution on Metal under exclusive lock | `./scripts/ci_local.sh` (or Lappi-decision's `tools/mac_heavy.sh`) | Apple Silicon Metal |
 
 ---
 

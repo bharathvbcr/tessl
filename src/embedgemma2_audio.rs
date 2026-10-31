@@ -213,7 +213,7 @@ pub fn key_visible(t: usize, kp: i64, past: usize, rows: usize, omask: &[bool]) 
 /// `arange(ctx / 2, -1, -1)`), so a visible slot, at distance `t - kp = past -
 /// (j - i)`, reads row `j - i`, and row 0 (distance `past`) is never visible.
 pub fn rel_shift_source(i: usize, j: usize, rel_rows: usize) -> Option<usize> {
-    (j >= i && j - i < rel_rows).then_some(j - i)
+    (j >= i && j - i < rel_rows).then(|| j - i)
 }
 
 /// The sinusoidal relative-position table `[ctx / 2 + 1, hidden]`

@@ -71,7 +71,7 @@ impl HostFence {
     /// submitted. A value above that was set by something other than the queue
     /// and cannot be evidence of completion, so the runtime poisons and
     /// refuses the lifetime decision that was about to rest on it.
-    pub(super) fn checked_value(&self) -> Result<u64, String> {
+    pub(crate) fn checked_value(&self) -> Result<u64, String> {
         // Signaled first, then submitted: `event_value` is bumped before the
         // queue signals, so an honest event never reads above the second load.
         let signaled = self.lifetime_event.signaledValue();
@@ -141,6 +141,54 @@ impl HostFence {
             });
         }
         self.wait(stamp).map_err(HostAccessError::Runtime)
+    }
+}
+
+impl ojas_core::Timeline for HostFence {
+    fn submitted(&self) -> Result<u64, ojas_core::FenceError> {
+        if self.ensure_not_poisoned().is_err() {
+            return Err(ojas_core::FenceError::Poisoned);
+        }
+        Ok(self.submitted())
+    }
+
+    fn completed(&self) -> Result<u64, ojas_core::FenceError> {
+        if self.ensure_not_poisoned().is_err() {
+            return Err(ojas_core::FenceError::Poisoned);
+        }
+        self.checked_value().map_err(|_| ojas_core::FenceError::Poisoned)
+    }
+
+    fn current_value(&self) -> u64 {
+        self.checked_value().unwrap_or(0)
+    }
+
+    fn wait(&self, value: u64) -> Result<(), ojas_core::FenceError> {
+        match self.wait_stamp(value) {
+            Ok(()) => Ok(()),
+            Err(HostAccessError::NotSubmitted { needed, submitted }) => {
+                Err(ojas_core::FenceError::NotSubmitted {
+                    value: needed,
+                    submitted,
+                })
+            }
+            Err(HostAccessError::Busy(why)) => Err(ojas_core::FenceError::Busy { detail: why }),
+            Err(HostAccessError::Runtime(why)) => {
+                if why.contains("poisoned") || why.contains("DeviceLost") {
+                    Err(ojas_core::FenceError::Poisoned)
+                } else if why.contains("timeout") || why.contains("exceeded") {
+                    Err(ojas_core::FenceError::TimedOut {
+                        value,
+                        completed: self.current_value(),
+                    })
+                } else {
+                    Err(ojas_core::FenceError::Refused(ojas_core::OjasError::Backend {
+                        id: ojas_core::BackendId::Metal,
+                        detail: why,
+                    }))
+                }
+            }
+        }
     }
 }
 

@@ -59,14 +59,20 @@
 //! `SharedAlloc` is crate-private, so no other route puts the allocation on a
 //! tape. A tape therefore never contains a shared buffer.
 
+use std::any::Any;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLResource, MTLStorageMode};
+
+use ojas_core::{
+    BackendId, DeviceBuffer, FenceError, HostLease, HostLeaseMut, MappedBuffer, OjasError, Timeline,
+};
 
 use crate::runtime::host_fence::HostFence;
 use crate::runtime::GpuRuntime;
@@ -125,15 +131,26 @@ pub enum GpuRole {
 /// There is no public constructor and the type is not `Clone`: it is reached
 /// by `&` through [`SharedAlloc`], which is what keeps every lease inside the
 /// allocation's life.
+/// The `Send + Sync` core of a shared buffer. See the module docs.
+#[derive(Clone)]
 pub struct SharedBuf {
+    pub(crate) inner: Arc<SharedBufInner>,
+}
+
+pub(crate) struct SharedBufInner {
     /// `MTLBuffer::contents()` read once at construction. The address is fixed
     /// for the buffer's life.
     ptr: NonNull<u8>,
     /// The logical length in bytes (at most the `MTLBuffer`'s length).
     len: usize,
+    /// `MTLBuffer::gpuAddress()` read once at construction.
+    gpu_addr: u64,
     /// Keeps the memory behind `ptr` mapped. Never messaged after
     /// construction; its release on drop is the only Objective-C message.
     _mtl: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Retains the underlying pooled buffer so dropping a `SharedAlloc` does
+    /// not recycle the memory while a `SharedBuf` or `HostLease` is still live.
+    _pooled: Option<Arc<crate::tensor::PooledBuffer>>,
     /// Highest commit value of any GPU command that reads or writes the buffer.
     last_use: AtomicU64,
     /// Highest commit value of any GPU command that writes the buffer.
@@ -158,24 +175,23 @@ pub struct SharedBuf {
 //    thread, never through this struct.
 // 2. The pointee is `MTLStorageMode.shared` memory: Apple documents it as
 //    visible to CPU and GPU at one fixed address for the buffer's life, and
-//    the buffer is kept alive by `_mtl` (and by the borrow that ties every
-//    lease to the owning `SharedAlloc`, which keeps the pool from recycling
-//    it). Apple states no further thread-safety for `MTLBuffer`; what Metal
-//    leaves to the caller is exactly the CPU/GPU ordering that the stamps,
-//    the lease counter and the lifetime-event fence below enforce
+//    the buffer is kept alive by `_mtl` (and by `_pooled` which keeps the
+//    pool from recycling it). Apple states no further thread-safety for `MTLBuffer`;
+//    what Metal leaves to the caller is exactly the CPU/GPU ordering that the
+//    stamps, the lease counter and the lifetime-event fence below enforce
 //    (`MTLBuffer.rs:15-18`).
 // 3. Rust-side data races on the bytes are excluded by `lease`: any number of
 //    `&[u8]` readers or exactly one `&mut [u8]` writer, and a GPU bind is
 //    refused while a conflicting lease is live. The remaining fields are
 //    atomics and a `HostFence`, which is `Send + Sync` without `unsafe`
 //    (asserted in `runtime/host_fence.rs`).
-unsafe impl Send for SharedBuf {}
+unsafe impl Send for SharedBufInner {}
 // SAFETY: as `Send`; every `&self` method touches only atomics, the fence, or
 // bytes guarded by `lease`.
-unsafe impl Sync for SharedBuf {}
+unsafe impl Sync for SharedBufInner {}
 
 impl SharedBuf {
-    fn new(gpu: &GpuBuffer, len: usize, fence: HostFence) -> Result<Self, String> {
+    pub(crate) fn new(gpu: &GpuBuffer, len: usize, fence: HostFence) -> Result<Self, String> {
         let mtl = &gpu.inner.buffer;
         let mode = mtl.storageMode();
         if mode != MTLStorageMode::Shared {
@@ -187,20 +203,25 @@ impl SharedBuf {
                 gpu.nbytes()
             ));
         }
-        Ok(Self {
+        let inner = SharedBufInner {
             ptr: mtl.contents().cast::<u8>(),
             len,
+            gpu_addr: gpu.inner.gpu_addr,
             _mtl: mtl.clone(),
+            _pooled: Some(Arc::clone(&gpu.inner)),
             last_use: AtomicU64::new(0),
             last_write: AtomicU64::new(0),
             lease: AtomicI32::new(0),
             fence,
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
     /// Length in bytes.
     pub fn len(&self) -> usize {
-        self.len
+        self.inner.len
     }
 
     /// Always `false`: a shared buffer has at least one byte.
@@ -211,12 +232,12 @@ impl SharedBuf {
     /// Highest commit value of any GPU command that read or wrote the buffer
     /// (`0` if none has).
     pub fn last_use(&self) -> u64 {
-        self.last_use.load(Ordering::SeqCst)
+        self.inner.last_use.load(Ordering::SeqCst)
     }
 
     /// Highest commit value of any GPU command that wrote the buffer.
     pub fn last_write(&self) -> u64 {
-        self.last_write.load(Ordering::SeqCst)
+        self.inner.last_write.load(Ordering::SeqCst)
     }
 
     /// A read lease: any number may be live at once, alongside GPU reads.
@@ -227,8 +248,8 @@ impl SharedBuf {
     /// open command buffer, and with [`HostAccessError::Runtime`] when the
     /// runtime is poisoned. A refused call holds no lease.
     pub fn read(&self) -> Result<HostRead<'_>, HostAccessError> {
-        self.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
-        let mut cur = self.lease.load(Ordering::SeqCst);
+        self.inner.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
+        let mut cur = self.inner.lease.load(Ordering::SeqCst);
         loop {
             if cur < 0 {
                 return Err(HostAccessError::Busy("a host write lease is live".into()));
@@ -237,6 +258,7 @@ impl SharedBuf {
                 return Err(HostAccessError::Busy("too many host read leases".into()));
             }
             match self
+                .inner
                 .lease
                 .compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
             {
@@ -247,7 +269,7 @@ impl SharedBuf {
         // The slot is taken before the stamp is read; the guard releases it on
         // every error below.
         let lease = HostRead { buf: self };
-        self.fence.wait_stamp(self.last_write.load(Ordering::SeqCst))?;
+        self.inner.fence.wait_stamp(self.inner.last_write.load(Ordering::SeqCst))?;
         Ok(lease)
     }
 
@@ -258,8 +280,9 @@ impl SharedBuf {
     /// and with the same `NotSubmitted` / `Runtime` errors as [`Self::read`].
     /// A refused call holds no lease.
     pub fn write(&self) -> Result<HostWrite<'_>, HostAccessError> {
-        self.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
+        self.inner.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
         if self
+            .inner
             .lease
             .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -267,15 +290,63 @@ impl SharedBuf {
             return Err(HostAccessError::Busy("a host lease is live".into()));
         }
         let lease = HostWrite { buf: self };
-        self.fence.wait_stamp(self.last_use.load(Ordering::SeqCst))?;
+        self.inner.fence.wait_stamp(self.inner.last_use.load(Ordering::SeqCst))?;
         Ok(lease)
+    }
+
+    /// Acquire a boxed host read lease for `MappedBuffer`.
+    fn acquire_read(&self) -> Result<SharedHostReadLease, FenceError> {
+        self.inner.fence.ensure_not_poisoned().map_err(|_| FenceError::Poisoned)?;
+        let mut cur = self.inner.lease.load(Ordering::SeqCst);
+        loop {
+            if cur < 0 {
+                return Err(FenceError::Busy {
+                    detail: "a host write lease is live".into(),
+                });
+            }
+            if cur == i32::MAX {
+                return Err(FenceError::Busy {
+                    detail: "too many host read leases".into(),
+                });
+            }
+            match self.inner.lease.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
+        let stamp = self.inner.last_write.load(Ordering::SeqCst);
+        if let Err(e) = self.inner.fence.wait_stamp(stamp) {
+            self.inner.lease.fetch_sub(1, Ordering::SeqCst);
+            return Err(map_host_access_error(e, stamp, &self.inner.fence));
+        }
+        Ok(SharedHostReadLease {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Acquire a boxed host write lease for `MappedBuffer`.
+    fn acquire_write(&self) -> Result<SharedHostWriteLease, FenceError> {
+        self.inner.fence.ensure_not_poisoned().map_err(|_| FenceError::Poisoned)?;
+        if self.inner.lease.compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err(FenceError::Busy {
+                detail: "a host lease is live".into(),
+            });
+        }
+        let stamp = self.inner.last_use.load(Ordering::SeqCst);
+        if let Err(e) = self.inner.fence.wait_stamp(stamp) {
+            self.inner.lease.store(0, Ordering::SeqCst);
+            return Err(map_host_access_error(e, stamp, &self.inner.fence));
+        }
+        Ok(SharedHostWriteLease {
+            inner: Arc::clone(&self.inner),
+        })
     }
 
     /// Whether a GPU command may use the buffer in `role` right now, without
     /// stamping or poisoning anything. Advisory: a lease can be taken the
     /// next instant. The bind itself is the authoritative check.
     pub fn check_gpu_access(&self, role: GpuRole) -> Result<(), HostAccessError> {
-        Self::gpu_access(self.lease.load(Ordering::SeqCst), role)
+        Self::gpu_access(self.inner.lease.load(Ordering::SeqCst), role)
     }
 
     fn gpu_access(lease: i32, role: GpuRole) -> Result<(), HostAccessError> {
@@ -297,14 +368,31 @@ impl SharedBuf {
     /// second. A refused bind keeps its stamp; the stamp only ever makes a
     /// later lease wait for a commit that is still to come.
     pub(crate) fn stamp_gpu(&self, commit: u64, role: GpuRole) -> Result<(), HostAccessError> {
-        self.last_use.fetch_max(commit, Ordering::SeqCst);
+        self.inner.last_use.fetch_max(commit, Ordering::SeqCst);
         if role == GpuRole::Write {
-            self.last_write.fetch_max(commit, Ordering::SeqCst);
+            self.inner.last_write.fetch_max(commit, Ordering::SeqCst);
         }
-        Self::gpu_access(self.lease.load(Ordering::SeqCst), role)
+        Self::gpu_access(self.inner.lease.load(Ordering::SeqCst), role)
     }
 
     /// The bytes. Callers hold a lease.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.inner.bytes()
+    }
+
+    /// The bytes, mutably. Callers hold the write lease.
+    pub(crate) fn bytes_mut(&self) -> &mut [u8] {
+        self.inner.bytes_mut()
+    }
+
+    /// The address of the first byte, for the zero-copy checks.
+    #[doc(hidden)]
+    pub fn host_addr(&self) -> usize {
+        self.inner.ptr.as_ptr() as usize
+    }
+}
+
+impl SharedBufInner {
     fn bytes(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes while `_mtl` is retained, and
         // a caller holds a read or write lease, so no `&mut` to these bytes
@@ -312,19 +400,12 @@ impl SharedBuf {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
-    /// The bytes, mutably. Callers hold the write lease.
     #[allow(clippy::mut_from_ref)]
     fn bytes_mut(&self) -> &mut [u8] {
         // SAFETY: as `bytes`, and the caller holds the one write lease
         // (`lease == -1`), so no other reference to these bytes exists on any
         // thread, and the fence has put every GPU reader and writer behind us.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    /// The address of the first byte, for the zero-copy checks.
-    #[doc(hidden)]
-    pub fn host_addr(&self) -> usize {
-        self.ptr.as_ptr() as usize
     }
 }
 
@@ -375,7 +456,7 @@ impl Deref for HostRead<'_> {
 
 impl Drop for HostRead<'_> {
     fn drop(&mut self) {
-        self.buf.lease.fetch_sub(1, Ordering::SeqCst);
+        self.buf.inner.lease.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -422,7 +503,179 @@ impl DerefMut for HostWrite<'_> {
 
 impl Drop for HostWrite<'_> {
     fn drop(&mut self) {
-        self.buf.lease.store(0, Ordering::SeqCst);
+        self.buf.inner.lease.store(0, Ordering::SeqCst);
+    }
+}
+
+fn map_host_access_error(e: HostAccessError, stamp: u64, fence: &HostFence) -> FenceError {
+    match e {
+        HostAccessError::NotSubmitted { needed, submitted } => {
+            FenceError::NotSubmitted { value: needed, submitted }
+        }
+        HostAccessError::Busy(detail) => FenceError::Busy { detail },
+        HostAccessError::Runtime(why) => {
+            if why.contains("poisoned") || why.contains("DeviceLost") {
+                FenceError::Poisoned
+            } else if why.contains("timeout") || why.contains("exceeded") {
+                FenceError::TimedOut {
+                    value: stamp,
+                    completed: fence.checked_value().unwrap_or(0),
+                }
+            } else {
+                FenceError::Refused(OjasError::Backend {
+                    id: BackendId::Metal,
+                    detail: why,
+                })
+            }
+        }
+    }
+}
+
+/// A boxed, owning host read lease over a [`SharedBuf`].
+pub struct SharedHostReadLease {
+    inner: Arc<SharedBufInner>,
+}
+
+impl HostLease for SharedHostReadLease {
+    fn as_bytes(&self) -> &[u8] {
+        self.inner.bytes()
+    }
+
+    fn as_f32(&self) -> Result<&[f32], OjasError> {
+        words(self.inner.bytes()).ok_or_else(|| OjasError::Shape {
+            op: "HostLease::as_f32",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+
+    fn as_u32(&self) -> Result<&[u32], OjasError> {
+        words(self.inner.bytes()).ok_or_else(|| OjasError::Shape {
+            op: "HostLease::as_u32",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+}
+
+impl Drop for SharedHostReadLease {
+    fn drop(&mut self) {
+        self.inner.lease.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A boxed, owning exclusive host write lease over a [`SharedBuf`].
+pub struct SharedHostWriteLease {
+    inner: Arc<SharedBufInner>,
+}
+
+impl HostLease for SharedHostWriteLease {
+    fn as_bytes(&self) -> &[u8] {
+        self.inner.bytes()
+    }
+
+    fn as_f32(&self) -> Result<&[f32], OjasError> {
+        words(self.inner.bytes()).ok_or_else(|| OjasError::Shape {
+            op: "HostLease::as_f32",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+
+    fn as_u32(&self) -> Result<&[u32], OjasError> {
+        words(self.inner.bytes()).ok_or_else(|| OjasError::Shape {
+            op: "HostLease::as_u32",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+}
+
+impl HostLeaseMut for SharedHostWriteLease {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.inner.bytes_mut()
+    }
+
+    fn as_f32_mut(&mut self) -> Result<&mut [f32], OjasError> {
+        words_mut(self.inner.bytes_mut()).ok_or_else(|| OjasError::Shape {
+            op: "HostLeaseMut::as_f32_mut",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+
+    fn as_u32_mut(&mut self) -> Result<&mut [u32], OjasError> {
+        words_mut(self.inner.bytes_mut()).ok_or_else(|| OjasError::Shape {
+            op: "HostLeaseMut::as_u32_mut",
+            detail: "buffer length or address is not 4-aligned".to_string(),
+        })
+    }
+}
+
+impl Drop for SharedHostWriteLease {
+    fn drop(&mut self) {
+        self.inner.lease.store(0, Ordering::SeqCst);
+    }
+}
+
+impl fmt::Debug for SharedBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedBuf")
+            .field("len", &self.inner.len)
+            .field("gpu_addr", &self.inner.gpu_addr)
+            .field("last_use", &self.last_use())
+            .field("last_write", &self.last_write())
+            .field("lease", &self.inner.lease.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+impl DeviceBuffer for SharedBuf {
+    fn backend(&self) -> BackendId {
+        BackendId::Metal
+    }
+
+    fn byte_len(&self) -> usize {
+        self.inner.len
+    }
+
+    fn read_bytes(&self, offset: usize, len: usize) -> Result<Vec<u8>, OjasError> {
+        const OP: &str = "SharedBuf::read_bytes";
+        let end = offset.checked_add(len).ok_or_else(|| OjasError::OutOfRange {
+            op: OP,
+            detail: "offset + len overflows".into(),
+        })?;
+        if end > self.inner.len {
+            return Err(OjasError::OutOfRange {
+                op: OP,
+                detail: format!("range {offset}..{end} exceeds buffer length {}", self.inner.len),
+            });
+        }
+        let lease = self.acquire_read().map_err(|e| e.into_ojas(BackendId::Metal))?;
+        Ok(lease.as_bytes()[offset..end].to_vec())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl MappedBuffer for SharedBuf {
+    fn host_ptr(&self) -> *mut u8 {
+        self.inner.ptr.as_ptr()
+    }
+
+    fn gpu_address(&self) -> u64 {
+        self.inner.gpu_addr
+    }
+
+    fn timeline(&self) -> &dyn Timeline {
+        &self.inner.fence
+    }
+
+    fn host_read(&self) -> Result<Box<dyn HostLease>, FenceError> {
+        let lease = self.acquire_read()?;
+        Ok(Box::new(lease))
+    }
+
+    fn host_write(&self) -> Result<Box<dyn HostLeaseMut>, FenceError> {
+        let lease = self.acquire_write()?;
+        Ok(Box::new(lease))
     }
 }
 
@@ -442,6 +695,17 @@ impl SharedAlloc {
         let gpu = rt.alloc_buffer(nbytes.max(1))?;
         let core = SharedBuf::new(&gpu, nbytes.max(1), rt.host_fence().clone())?;
         Ok(Self { core, gpu })
+    }
+
+    /// Convert this allocation into an owning `SharedBuf` (implements `MappedBuffer`),
+    /// keeping the pool allocation alive as long as the `SharedBuf` is alive.
+    pub fn into_shared_buf(self) -> SharedBuf {
+        self.core
+    }
+
+    /// Access the underlying `SharedBuf` (implements `MappedBuffer`).
+    pub fn shared_buf(&self) -> SharedBuf {
+        self.core.clone()
     }
 
     /// The pooled buffer, for the binders. Crate-private on purpose: any other

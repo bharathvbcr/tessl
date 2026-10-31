@@ -93,6 +93,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ojas-core"
+version = "0.1.0"
+
+[[package]]
+name = "ojas-io"
+version = "0.1.0"
+dependencies = [
+ "ojas-core",
+]
+
+[[package]]
 name = "tessl"
 version = "0.2.0"
 dependencies = [
@@ -103,4 +114,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "ojas-core",
+ "ojas-io",
 ]

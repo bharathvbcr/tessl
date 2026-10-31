@@ -392,7 +392,7 @@ sequenceDiagram
     GPU-->>Evt: Signal event completion value
     Evt-->>RT: Flush pending_cold_recycle &amp; pending_retirement
     RT-->>Host: Return control to caller
-    Note over Host,RT: A buffer dropped after this wait is released by the next allocation (no command buffer open, lifetime event caught up), not only by the next commit
+    Note over Host,RT: A buffer dropped after this wait is released by the next allocation (no command buffer open, lifetime event caught up), not only by the next commit. synchronize() with no open batch calls observe_finished_feedback() to consume queued commit faults.
     end
 ```
 
@@ -441,8 +441,18 @@ tessl's queue signals. `GpuRuntime::shared_event()` is a separate handoff event
 the queue signals after it, so foreign code that signals it cannot make tessl
 free memory early. Waits on the GPU timeline are bounded by
 `GpuRuntime::event_wait_ms()` (default 30 s, range 1 ms to 1 h, overridden by
-`set_event_wait_ms` or `TESSL_EVENT_WAIT_MS`). Running out of budget returns a
-named error and does not poison the runtime.
+`set_event_wait_ms` or `TESSL_EVENT_WAIT_MS`). One or two consecutive wait-budget
+timeouts return a named error (`is_event_wait_timeout`) and leave the runtime
+usable; the third consecutive timeout poisons the runtime with a `Metal 4 DeviceLost`
+cause (so callers looping on retry stop). A completed wait clears the streak, and a
+poisoned runtime refuses subsequent waits immediately without spending another budget.
+
+Budget and working-set limits are queried via `GpuRuntime::memory_info()`.
+`GpuRuntime::set_wired_fraction` configures the printed wired budget (default 0.9×
+`recommendedMaxWorkingSetSize`), returning `Result<(), String>`: non-finite fractions
+(`NaN`, `±inf`) are refused and leave the budget unchanged, finite values are clamped
+to `[0.5, 0.95]`, and a poisoned `memory_info` lock returns an error. The printed
+budget is logged by training banners and is not an admission cap.
 
 ---
 

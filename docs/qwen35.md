@@ -748,12 +748,14 @@ GEMM operand. The forward is `Precision::Bf16`'s otherwise, so nothing in the la
 order is written twice: `Weight` (`qwen35_q4.rs`) is either a dense tensor or a Q4
 bank, and the model's one `project` / `project_residual` / head / embedding seam
 dispatches on it. Decode (`Decode::step`, one row) runs `nn::gemv_q4_mlx_simd`;
-prefill runs `nn::gemm_q4_mlx` up to 8 rows and the opt-in TensorOps
-`nn::gemm_q4_mlx_tensorops` above (it is the existing kernel; the prefill-speed work on it
-is `gp-nax-int4-tensorops-and-exact-f32-epilogue`'s, not this one's). The residual add
-is fused into the GEMV / small-M GEMM and is a separate `residual_add` after the TensorOps
-one. The embedding gathers through `nn::embed_lookup_q4_mlx`, the tied head is the
-embedding's bank, and an untied head has its own.
+prefill runs `nn::gemm_q4_mlx` up to 8 rows and `nn::gemm_q4_mlx_tensorops`
+for $M > 8$ (`Q4Weight::matmul` and `project_residual`; $M == 1$ decode stays
+on `gemv_q4_mlx_simd`). The residual add is fused into the GEMV / small-M GEMM
+and is a separate `residual_add` after the TensorOps one (`QUANT_PREFILL_GEMM_WIRED`
+in `src/mtl_tensor.rs` remains `false` because the host `MTLTensor` descriptor path
+is unwired and the kernel is not yet timed). The embedding gathers through
+`nn::embed_lookup_q4_mlx`, the tied head is the embedding's bank, and an untied
+head has its own.
 
 **The checkpoint layout, read from mlx-lm 0.32.0 (`mlx_lm/utils.py`, `models/qwen3_5.py`),
 not from memory.** Every `nn.Linear` and `nn.Embedding` whose last dimension is a

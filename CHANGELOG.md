@@ -8,6 +8,11 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Layout constants exported for ojas-metal** (`src/qwen35_bwd.rs`, `src/runtime.rs`).
+  `qwen35_bwd::{CONV_ROWS_PER_BLOCK, CONV_MAX_KW, GATED_UNITS_PER_BLOCK, GATED_RMS_BWD_MAX_DIM}`
+  and `runtime::METAL4_CONST_ARENA_BYTES` are now `pub` (were private), so a client that sizes
+  scratch or budgets against them imports the number instead of copying it. Additive; a test pins
+  the kernel-source constants and the `*_part_len` formulas.
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
   A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
   derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison

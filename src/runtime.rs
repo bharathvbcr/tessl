@@ -37,6 +37,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 use crate::shared::{RuntimePoison, Shared, Timeline};
 
+pub(crate) mod host_fence;
+use host_fence::{FenceParts, HostFence};
+
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
 /// Public so a client that budgets against the arena (ojas-metal's inline
 /// uploads) derives its share from this number instead of copying it.
@@ -449,10 +452,13 @@ pub(crate) struct Metal4EncodePackage {
     /// no lifetime decision reads it.
     pub handoff_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     /// Longest a runtime wait on `lifetime_event` blocks, in milliseconds.
-    event_wait_ms: AtomicU64,
+    ///
+    /// An `Arc` so the thread-safe [`HostFence`] reads the very same budget.
+    event_wait_ms: Arc<AtomicU64>,
     /// Budget timeouts since the last wait that reached its value. A success
-    /// stores 0. The third consecutive timeout poisons the runtime.
-    consecutive_wait_timeouts: AtomicU32,
+    /// stores 0. The third consecutive timeout poisons the runtime. An `Arc`
+    /// for the same reason as `event_wait_ms`.
+    consecutive_wait_timeouts: Arc<AtomicU32>,
     /// Scratch for scalar `[[buffer(N)]]` constants (M4 has no setBytes).
     /// 16 MiB bump arena; cursor advances per const pack and resets after a
     /// waiting commit -- `synchronize`, or the reclaim a scope triggers when
@@ -463,8 +469,9 @@ pub(crate) struct Metal4EncodePackage {
     pub const_cursor: Mutex<usize>,
     /// Last shared-event value a commit has signaled (or queued to signal).
     /// Atomic so a buffer drop on any thread can read its release point
-    /// without a lock-order question against `active_m4`.
-    event_value: AtomicU64,
+    /// without a lock-order question against `active_m4`. An `Arc` so the
+    /// thread-safe [`HostFence`] reads the same counter.
+    event_value: Arc<AtomicU64>,
     /// Allocations registered into `residency` (debug / telemetry).
     pub residency_count: AtomicUsize,
 }
@@ -750,6 +757,9 @@ pub struct GpuRuntime {
     /// callback) and the commit clock.
     shared: Arc<Shared>,
     poison: Arc<RuntimePoison>,
+    /// The thread-safe view of the lifetime event that host threads wait on
+    /// ([`crate::shared_buf`]); the runtime's own waits delegate to it.
+    fence: HostFence,
     /// Times `MTL4CommitFeedback` has been delivered. The command buffer
     /// protocol has no status; this counts the feedback path that does.
     commit_feedback_reports: Arc<AtomicU64>,
@@ -1056,6 +1066,14 @@ impl GpuRuntime {
             has_unified_memory: device.hasUnifiedMemory(),
         };
 
+        let poison = Arc::clone(&shared.poison);
+        let fence = HostFence::new(FenceParts {
+            lifetime_event: &metal4.lifetime_event,
+            submitted: &metal4.event_value,
+            wait_ms: &metal4.event_wait_ms,
+            timeouts: &metal4.consecutive_wait_timeouts,
+            poison: &poison,
+        });
         // clippy::arc_with_non_send_sync: `Retained<ProtocolObject<..>>` is not
         // marked Send/Sync by objc2, so this Arc trips the lint. `Rc` is not the
         // fix it suggests: `Arc<GpuRuntime>` is the type in every public
@@ -1066,8 +1084,9 @@ impl GpuRuntime {
         #[allow(clippy::arc_with_non_send_sync)]
         let rt = Arc::new_cyclic(|self_weak| Self {
             access_busy: Arc::new(AtomicBool::new(false)),
-            poison: Arc::clone(&shared.poison),
+            poison,
             shared,
+            fence,
             commit_feedback_reports: Arc::new(AtomicU64::new(0)),
             device,
             library,
@@ -1476,18 +1495,7 @@ impl GpuRuntime {
     /// and cannot be evidence of completion, so the runtime poisons and
     /// refuses the lifetime decision that was about to rest on it.
     fn checked_lifetime_value(&self) -> Result<u64, String> {
-        let m4 = &self.metal4;
-        // Signaled first, then submitted: `event_value` is bumped before the
-        // queue signals, so an honest event never reads above the second load.
-        let signaled = m4.lifetime_event.signaledValue();
-        let submitted = m4.event_value.load(Ordering::Acquire);
-        match lifetime_event_violation(signaled, submitted) {
-            Some(error) => {
-                self.poison.set(error.as_str());
-                Err(error)
-            }
-            None => Ok(signaled),
-        }
+        self.fence.checked_value()
     }
 
     /// Block until the lifetime event reaches `value` (a value this runtime
@@ -1497,29 +1505,10 @@ impl GpuRuntime {
     /// A budget timeout leaves the runtime usable. The third consecutive one
     /// poisons it (DeviceLost) and later calls return that poison without
     /// waiting out another budget. A wait that reaches `value` clears the streak.
+    /// The implementation is [`HostFence::wait`], shared with the host threads
+    /// that wait on a [`crate::shared_buf::SharedBuf`] fence.
     pub(crate) fn wait_lifetime_event(&self, value: u64) -> Result<(), String> {
-        if self.poison.is_set() {
-            return Err(self.poison.error());
-        }
-        let m4 = &self.metal4;
-        let budget = m4.event_wait_ms.load(Ordering::Acquire);
-        if !m4.lifetime_event.waitUntilSignaledValue_timeoutMS(value, budget) {
-            let streak = m4.consecutive_wait_timeouts.fetch_add(1, Ordering::AcqRel) + 1;
-            let signaled = m4.lifetime_event.signaledValue();
-            let submitted = m4.event_value.load(Ordering::Acquire);
-            if streak >= CONSECUTIVE_EVENT_WAIT_TIMEOUTS {
-                let error = format!(
-                    "Metal 4 DeviceLost: {streak} consecutive SharedEvent wait budgets exceeded \
-                     (last waited {budget} ms for lifetime event value {value}, reached {signaled}, \
-                     submitted {submitted}); the runtime is poisoned and will not keep retrying"
-                );
-                self.poison.set(error.as_str());
-                return Err(error);
-            }
-            return Err(event_wait_timeout_error(budget, value, signaled, submitted));
-        }
-        m4.consecutive_wait_timeouts.store(0, Ordering::Release);
-        self.checked_lifetime_value().map(|_| ())
+        self.fence.wait(value)
     }
 
     /// Latch a failure as permanent, except a wait that merely ran out of
@@ -3071,12 +3060,12 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
         residency,
         lifetime_event,
         handoff_event,
-        event_wait_ms: AtomicU64::new(event_wait_ms_from_env()),
-        consecutive_wait_timeouts: AtomicU32::new(0),
+        event_wait_ms: Arc::new(AtomicU64::new(event_wait_ms_from_env())),
+        consecutive_wait_timeouts: Arc::new(AtomicU32::new(0)),
         const_arena: crate::dispatch::ConstArena::new(&const_staging),
         const_staging,
         const_cursor: Mutex::new(0),
-        event_value: AtomicU64::new(0),
+        event_value: Arc::new(AtomicU64::new(0)),
         residency_count: AtomicUsize::new(1),
     })
 }

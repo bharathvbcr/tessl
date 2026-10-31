@@ -8,6 +8,17 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`SharedBuf` / `SharedAlloc`: zero-copy CPU/GPU sharing of a pooled buffer** (`src/shared_buf.rs`,
+  `src/runtime/host_fence.rs`, `Binder::bind_shared_ro` / `bind_shared_rw`). CPU threads lease the
+  bytes of a `StorageModeShared` pool buffer (`SharedBuf::read` / `write`) with no copy, fenced on
+  the commit timeline: each GPU bind stamps `last_use` / `last_write` with the commit that carries
+  it; a read lease waits for `last_write`, the exclusive write lease for `last_use`; a stamp above
+  what was submitted returns `HostAccessError::NotSubmitted` (flush, retry) instead of waiting; a
+  GPU bind against a conflicting live lease is refused; every fence checks poison and waits on the
+  private lifetime event. `SharedBuf` carries the crate's one audited `unsafe impl Send + Sync` for
+  a Metal buffer wrapper. `SharedAlloc` binds are refused during a DecodeIcb capture, so no tape
+  replays an unstamped bind. The runtime's own lifetime-event wait now delegates to the new
+  `HostFence`, so host threads and the encoding thread share one wait; additive otherwise.
 - **`numcheck` path crate: floating-point verification utilities** (`numcheck/`, card ft-29323ca4).
   A dedicated `#![forbid(unsafe_code)]` path crate providing `reduction_tolerance`
   derived as $4 \cdot \epsilon \cdot \sqrt{N} \cdot \text{scale}$, fp64 oracle comparison

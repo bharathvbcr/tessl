@@ -278,6 +278,7 @@ pub mod qwen35_q4;
 pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
+pub mod shared_buf;
 pub mod sq_norm;
 pub mod tensor;
 

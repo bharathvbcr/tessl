@@ -13,6 +13,7 @@ use objc2_metal::{
 };
 
 use crate::runtime::{mtl_size, GpuRuntime};
+use crate::shared_buf::{GpuRole, SharedAlloc};
 use crate::tensor::{GpuBuffer, Tensor};
 
 /// The const arena's host pointer, GPU address and length.
@@ -325,6 +326,46 @@ impl<'a> Binder<'a> {
             return;
         }
         self.bind_owned(b, byte_offset, index);
+    }
+
+    /// Bind a [`SharedAlloc`] the kernel only reads. Stamps the buffer's
+    /// `last_use` with the commit that will carry this command, so a host write
+    /// lease waits for it; host read leases are unaffected and may stay live.
+    /// Refused (like every binder error, poisoning the runtime) while a host
+    /// write lease is live, and during a DecodeIcb capture. See
+    /// [`crate::shared_buf`].
+    pub fn bind_shared_ro(&mut self, s: &SharedAlloc, index: usize) {
+        self.bind_shared(s, GpuRole::Read, index);
+    }
+
+    /// Bind a [`SharedAlloc`] the kernel writes. Stamps `last_use` and
+    /// `last_write`, so host read and write leases both wait for this command.
+    /// Refused while any host lease is live, and during a DecodeIcb capture.
+    /// [`crate::shared_buf::SharedBuf::check_gpu_access`] asks first without
+    /// poisoning.
+    pub fn bind_shared_rw(&mut self, s: &SharedAlloc, index: usize) {
+        self.bind_shared(s, GpuRole::Write, index);
+    }
+
+    fn bind_shared(&mut self, s: &SharedAlloc, role: GpuRole, index: usize) {
+        // A captured tape replays binds without running this code, so it would
+        // skip the stamp. A shared buffer therefore never goes on a tape.
+        if crate::decode_icb::decode_icb_capture_active() {
+            self.fail(
+                "a SharedAlloc bind is refused during an ICB capture: a replayed tape would skip its fence stamp",
+            );
+            return;
+        }
+        let gpu = s.gpu_buffer();
+        if !gpu.belongs_to(self.runtime) {
+            self.fail("buffer belongs to another runtime");
+            return;
+        }
+        if let Err(e) = s.stamp_gpu(self.runtime.pending_commit_value(), role) {
+            self.fail(e.to_string());
+            return;
+        }
+        self.bind_owned(gpu, 0, index);
     }
 
     /// Bind an owned buffer (runtime identity already checked) and record it

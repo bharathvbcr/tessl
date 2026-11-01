@@ -2,7 +2,20 @@
 name = "tessl"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.82"
+# The floor is ojas's, not a choice: `ojas-core` and `ojas-io` below are
+# mandatory path dependencies, both inherit `rust-version.workspace = true`
+# from ojas/Cargo.toml, and that workspace declares 1.97 (gusset's floor). Cargo
+# refuses to compile a dependency whose rust-version exceeds the toolchain, so
+# no tessl build below 1.97 is possible however this field reads.
+#
+# This said 1.82 until 2026-11-01, which was unreachable from the moment the
+# ojas dependency landed: ojas-core alone, compiled standalone at 1.82, gives
+# 535 errors, among them trait upcasting coercion (stable 1.86) and
+# `is_multiple_of` (stable 1.87). 1.82 was never the measured minimum either.
+# Verified at this floor: `cargo +1.97 check --locked --all-targets` and
+# `cargo +1.97 check --locked --features quant-prep` both pass. Do not lower
+# this below the ojas workspace's rust-version.
+rust-version = "1.97"
 description = "Low-overhead Metal 4 GEMM and GPU tensor runtime for Apple silicon, serving as the dedicated Metal 4 and Mac inference extension of ojas"
 repository = "https://github.com/bharathvbcr/tessl"
 documentation = "https://docs.rs/tessl"

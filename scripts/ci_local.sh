@@ -11,8 +11,8 @@ cd "$ROOT"
 # never ends with the same words as a run that checked everything.
 SKIPS=()
 
-echo "==> fmt"
-cargo fmt --all --check
+echo "==> fmt (tessl's own packages; see scripts/fmt_check.sh for why not --all)"
+./scripts/fmt_check.sh
 
 echo "==> build (release, all targets)"
 cargo build --release --all-targets

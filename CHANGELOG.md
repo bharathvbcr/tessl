@@ -239,6 +239,36 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Fixed
 
+- **CI could not resolve this manifest at all: no job checked out ojas** (`.github/workflows/ci.yml`,
+  `.github/workflows/metal-compile.yml`). `ojas-core` and `ojas-io` are mandatory path
+  dependencies at `../ojas/...`, and cargo resolves them before it builds, lints or tests
+  anything, so every cargo job failed ahead of its own steps — a second, newer cause of red CI
+  than the emulator host-contract check. Both workflows now reproduce the relative path the
+  manifest expects, mirroring ojas's own layout for tessl: this repository at
+  `code/research/tessl`, `bharathvbcr/ojas` at `code/research/ojas`, the sibling commit chosen by
+  `OJAS_REF` (default `main`) as ojas chooses tessl's with `TESSL_REF`. gusset is not needed:
+  `cargo metadata --locked` resolves in exactly that two-checkout layout.
+- **`rust-version = "1.82"` was unreachable, and the MSRV job hard-coded the same wrong number**
+  (`Cargo.toml`, `.github/workflows/ci.yml`). The floor is ojas's and not a choice: `ojas-core`
+  and `ojas-io` inherit `rust-version.workspace = true` from a workspace that declares 1.97, and
+  cargo refuses a dependency whose floor exceeds the toolchain. ojas-core compiled standalone at
+  1.82 gives 535 errors, including trait upcasting coercion (stable 1.86) and `is_multiple_of`
+  (stable 1.87). `rust-version` is now 1.97, verified with `cargo +1.97 check --locked
+  --all-targets` and `--features quant-prep`, and the `msrv` job reads the number out of
+  Cargo.toml (as ojas's does) instead of naming one, so the manifest and the job cannot drift
+  apart again. The documented claims follow (`README.md`, `src/lib.rs`).
+- **`cargo fmt --all` reached into the sibling checkouts** (`scripts/fmt_check.sh`,
+  `.github/workflows/ci.yml`, `scripts/ci_local.sh`). `--all` formats local path dependencies, so
+  once ojas is beside tessl it formatted `ojas-core` and `ojas-io`, and its `cargo metadata` call
+  loaded the whole ojas workspace and failed without a gusset checkout. The new script covers
+  exactly tessl's own packages — the crate and `numcheck`, which is a path dev-dependency rather
+  than a workspace member — the way `ojas/scripts/fmt_check.sh` does for ojas.
+- **The crate was not rustfmt-clean** (`src/loader.rs`, `src/runtime/host_fence.rs`,
+  `src/shared_buf.rs`, `tests/capi.rs`, `tests/capi_contract.rs`, `tests/capi_oversized.rs`,
+  `tests/kernel_coverage.rs`, `tests/qwen35_params.rs`, `tests/shared_runtime.rs`,
+  `tests/stress_trim_concurrency.rs`). Formatting drift since `def8c10` ("rustfmt at
+  max_width = 120 across the crate"), which the `fmt` job would fail on regardless of the
+  manifest: 28 hunks, no behaviour change.
 - **`synchronize` with no open batch consumes a queued commit fault** (`src/runtime.rs`).
   A waiting commit with no batch returned before `observe_finished_feedback`, so a
   `MTL4CommitFeedback` fault requeued after the batch was cleared stayed on its allocator

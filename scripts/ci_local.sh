@@ -11,6 +11,14 @@ cd "$ROOT"
 # never ends with the same words as a run that checked everything.
 SKIPS=()
 
+echo "==> sibling checkouts (ojas), before anything that would fail confusingly without them"
+# First, because every cargo step below resolves ../ojas/ojas-core and
+# ../ojas/ojas-io before it does anything else, and cargo's error for a missing
+# sibling names a package rather than the layout. --offline by default here: the
+# local registry cache is warm, and a network outage must not read as a broken
+# layout. ojas runs the mirror of this first in its own ci_local.sh.
+./scripts/check_siblings.sh
+
 echo "==> fmt (tessl's own packages; see scripts/fmt_check.sh for why not --all)"
 ./scripts/fmt_check.sh
 

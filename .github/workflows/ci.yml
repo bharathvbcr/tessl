@@ -70,6 +70,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - name: Sibling checkouts resolve (ojas)
+        # This job has no rust-cache step, so this really is the first cargo in
+        # it. Elsewhere the step sits ahead of rust-cache, whose restore runs
+        # `cargo metadata` itself.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       # Not `cargo fmt --all`: that formats local path dependencies too, so with
       # ojas checked out beside tessl it would reach into ojas-core and ojas-io
       # and hold this repository's CI to a sibling's formatting. Worse, its
@@ -178,10 +194,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: code/research/tessl
-
       - name: Python for the source-text gates
         # The parity harness below needs numpy.
         uses: actions/setup-python@v5
@@ -318,6 +349,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           # The engine builds into its own target dir (go/Makefile --target-dir).
@@ -403,10 +450,25 @@ jobs:
           ref: ${{ env.OJAS_REF }}
           path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: code/research/tessl
-
       - name: Install the Metal Toolchain
         run: |
           if xcrun --find metal >/dev/null 2>&1; then
@@ -508,6 +570,22 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal
           rustup default "$msrv"
           rustc --version
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: code/research/tessl
@@ -564,6 +642,22 @@ jobs:
           ref: ${{ env.OJAS_REF }}
           path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: code/research/tessl

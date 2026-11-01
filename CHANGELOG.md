@@ -237,6 +237,33 @@ All notable changes to `tessl` are recorded here. The format follows
   once, and `sq_norm` does all of it. `grad_sq_norm` is that over the model's
   gradients, with no change to its signature or to the C and Python entries.
 
+### Added
+
+- **`scripts/check_siblings.sh`: a preflight that names a broken sibling layout instead of letting
+  cargo misdescribe it** (`scripts/check_siblings.sh`, `scripts/ci_local.sh`,
+  `.github/workflows/ci.yml`). Runs first locally and, in CI, in each of the six jobs that run cargo
+  — before the Metal-toolchain download, so a layout error costs seconds rather than minutes. Four
+  checks, none skippable: the checkout kind; every out-of-tree `path` dependency, all reported rather
+  than stopping at the first, with parsing *zero* of them a hard failure (a check that passes for
+  having looked at nothing is the defect this file exists to catch); each sibling's branch, HEAD,
+  uncommitted paths and commits not on `origin/main`, loudly, because anything read from such a
+  checkout is not what that repository publishes; `cargo metadata --locked` as the authority, run
+  per gating lockfile rather than once at the root, because `go/engine` declares its own
+  `[workspace]` and the `go` and `gpu` jobs build *that* lockfile with `--locked` (it really was
+  stale until `d289a9c`); and a fifth check that the set of tracked lockfiles has not changed, so the
+  named subset in the fourth cannot go stale unnoticed. It is the mirror of
+  `ojas/scripts/check_siblings.sh` — ojas `4a30be6`, which at the time of writing is **unpushed**, on
+  ojas's local `main` only: ojas `origin/main` is `dac0b5b` and carries no such file, so cite it by
+  sha rather than as published. `tests/check_siblings_script.rs` holds every failure path below to
+  failing. It differs from ojas's copy where measurement said it should:
+  tessl does **not** refuse to run in a worktree, because a tessl worktree resolves and builds fine
+  wherever `../ojas` exists (measured: exit 0 beside a real ojas checkout, exit 101 where `../ojas`
+  is absent) — tessl has no `ojas-core` member of its own to collide with, which is the half of
+  ojas's problem that does not exist here. `--offline` by default so a network outage cannot read as
+  a broken layout, `--network` in CI because a fresh runner's registry cache is cold, and a cold
+  cache's failure is reported as the cache rather than the layout. Every failure path was exercised:
+  worktree without `../ojas`, absent sibling, parser matching nothing, cold registry.
+
 ### Fixed
 
 - **CI could not resolve this manifest at all: no job checked out ojas** (`.github/workflows/ci.yml`,

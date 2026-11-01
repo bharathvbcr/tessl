@@ -19,6 +19,10 @@ bin build_artifact_contract 2
 bin capi_contract 81
 bin ce_collapse_host 7
 bin check_kernel_ir_planted 6
+# Runs scripts/check_siblings.sh against fixture trees. Device-free, but slower
+# than its neighbours (~2 min): one case runs the real script over the real
+# checkout, which resolves two lockfiles with `cargo metadata`.
+bin check_siblings_script 7
 bin config_json_parsers 10
 bin dialect_lint_script 12
 bin docs_name_real_tools 7

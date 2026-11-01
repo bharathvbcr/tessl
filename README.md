@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>Low-overhead, zero-host-wait Metal 4 GEMM and GPU tensor runtime for Apple silicon.</strong><br>
-  Powered by Metal Performance Primitives (MPP) TensorOps <code>matmul2d</code>, neural network kernels, on-device Qwen3.5 training, and PyTorch interop.
+  <strong>Dedicated Apple Silicon / Metal 4 acceleration and Mac inference extension of ojas.</strong><br>
+  Low-overhead, zero-host-wait GPU tensor runtime powered by MPP TensorOps <code>matmul2d</code>, neural network kernels, zero-copy UMA memory sharing, and PyTorch interop.
 </p>
 
 ---
@@ -17,11 +17,17 @@
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
 > [!NOTE]
-> **Role & Unified Architecture.** tessl has two core roles. It is the **Mac inference engine**: hand-tuned Qwen3.5 prefill and decode, the decode ICB, KV caches, MLX Q4/Q8 quantization, EmbeddingGemma 2, BERT, and the fused kernels under them are its product. It is also the **Metal extension of [ojas](https://github.com/bharathvbcr/ojas)**, the universal Rust training framework: providing the Metal runtime, allocator, and compute kernels that ojas's Metal backend uses for training and general ops.
+> **Role & Unified Architecture.** tessl has two core roles. It is the **Mac inference engine**: hand-tuned Qwen3.5 prefill and decode, the decode ICB, KV caches, MLX Q4/Q8 quantization, EmbeddingGemma 2, BERT, and the fused kernels under them are its product. It is also the **dedicated Metal 4 extension of [ojas](https://github.com/bharathvbcr/ojas)**, the universal Rust training framework: providing the Metal runtime, allocator, and compute kernels that ojas's Metal backend uses for training and general ops.
 >
 > *Unified Memory & HAL Integration:* `SharedBuf` in `src/shared_buf.rs` implements ojas's `MappedBuffer` trait, providing zero-copy CPU/GPU memory sharing over pooled `StorageModeShared` allocations guarded by timeline fences and host leases (`HostLease`, `HostLeaseMut`). Memory allocations are tracked under `ojas_core::Budget` with `BudgetTrimHandler` clearing freelist caches under memory pressure.
 >
 > *ABI 14 Updates:* Under ABI version 14 (`tessl_abi_version`), tessl retired standalone whole-step training, gradient banks, and AdamW from its C-API surface into ojas's autograd `Tape` (`TapeStepProvider`), establishing ojas as the sole authoritative training engine while tessl focuses on hardware-accelerated Metal execution.
+>
+> **The Modularity Rationale (Why a Dedicated Extension):**
+> 1. *Decoupled Compile Cycles:* Xcode 26 and Metal toolchain compilation (`xcrun metal`, `metallib`, `-std=metal4.0`) remain fully isolated from ojas's multi-platform CI and standard Linux/Windows development environments.
+> 2. *Isolated Hardware Requirements:* Targets Apple Silicon Neural Accelerators and Metal 4 (`MTL4*`) directly without forcing macOS dependencies onto universal CPU/wgpu/CUDA users.
+> 3. *Independent Profiling:* Register occupancy sweeps, cooperative destination tile swizzling (`bench_gemm_sweep`), and ICB replay optimization iterate on specialized benchmark harnesses.
+> 4. *Independent Release Cadence:* Lightweight downstream Mac inference tools import tessl directly without dragging in the full ojas autograd and training framework.
 
 <p align="center">
   <a href="https://tessl.vbcr.dev/"><img src="https://img.shields.io/badge/website-tessl.vbcr.dev-F59E0B?style=flat&logo=safari&logoColor=white" alt="Website"></a>
@@ -94,7 +100,8 @@ The name is short for *tessellation* — the design centers around how matrix op
 
 ```mermaid
 flowchart TD
-    subgraph Downstream["Downstream Consumers & Ecosystem"]
+    subgraph Downstream["Primary Framework & Downstream Ecosystem"]
+        Ojas["ojas (Universal Training Framework)<br/>ojas-metal adapter &amp; ojas-core HAL"]
         Gemma["gemma-metal<br/>(LLM Inference Runtime)"]
         Arch02["tessl-arch02<br/>(Value Residual Training)"]
         CustomApp["Custom Overlays & Pipelines<br/>(links = 'tessl', DEP_TESSL_KERNELS)"]

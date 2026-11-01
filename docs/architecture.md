@@ -6,55 +6,60 @@ How `tessl` selects GEMM kernels, how cooperative destination registers eliminat
 
 ## tessl's role: Metal extension of ojas and the Mac inference engine
 
-Owner direction of 2026-10-31. This section states where tessl is meant to go,
-and marks what is already true (**current**) apart from what is a goal
-(**target**). Nothing below has been implemented by this change; it is
-documentation only.
-
-### Two products in one crate
-
-tessl is the Metal layer for Apple silicon, and it plays two roles:
+tessl is the dedicated Metal 4 layer for Apple silicon within the ojas ecosystem, playing two distinct roles:
 
 1. **The Mac inference engine.** Hand-tuned inference is tessl's product:
    Qwen3.5 prefill and decode (the fused decode kernels, the decode ICB and
    ping-pong replay, KV caches), quantization (MLX Q4 and Q8, the int8 GEMM),
    EmbeddingGemma 2, BERT and DistilBERT, and the fused kernels under them.
    These stay in tessl and keep getting faster. ojas does light inference only
-   (sampling and eval) and will not grow a second Mac inference engine.
-2. **ojas's Metal extension.** [ojas](https://github.com/bharathvbcr/ojas) is
+   (sampling and eval) and builds no second Mac inference engine.
+2. **ojas's dedicated Metal 4 extension.** [ojas](https://github.com/bharathvbcr/ojas) is
    the universal Rust framework, focused on training: `Tensor`, `DType`,
    `OjasError`, `Budget`, the `Backend` trait, shape validators, autocast, the
    autograd `Tape`, optimizers, training loops, data, checkpoints, IO and the
-   CPU reference backend. Its CUDA, HIP, wgpu and Metal backends plug in as
-   extensions. For Metal, tessl is that extension: the runtime, the allocator
-   and the kernels that the ojas Metal backend calls for training and general
-   ops.
+   CPU reference backend. For Metal, tessl is that extension: the runtime, the
+   allocator (`SharedBuf` with `MappedBuffer`), and the compute kernels that
+   the ojas Metal backend (`ojas-metal`) calls for training and general ops.
 
 ```mermaid
 flowchart TD
     accTitle: tessl's two roles
-    accDescr: ojas owns the training framework and the portable backends. tessl owns the Metal runtime, allocator and kernels and the hand-tuned inference paths. The ojas Metal backend and the ojas-qwen35 provider call down into tessl; tessl does not depend on ojas.
+    accDescr: ojas owns the training framework and the portable backends. tessl owns the Metal runtime, allocator and kernels and the hand-tuned inference paths. The ojas Metal backend and the ojas-qwen35 provider call down into tessl; tessl exports MappedBuffer and kernels.
 
-    subgraph OjasFw["ojas (training framework, portable)"]
-        Core["ojas-core: Tensor, DType, OjasError, Budget,<br/>Backend trait, validators, autocast"]
+    subgraph OjasFw["ojas (Universal Training Framework)"]
+        Core["ojas-core: Tensor, DType, OjasError, Budget,<br/>Backend trait, validators, autocast, HAL traits"]
         Tape["ojas-autograd Tape, optimizers, train loops,<br/>data, checkpoints, IO, CPU backend"]
         Other["CUDA, HIP, wgpu backends"]
-        MetalBe["ojas-metal (Metal Backend)<br/>ojas-qwen35 (whole-step provider)"]
+        MetalBe["ojas-metal (Metal Backend Adapter)<br/>ojas-qwen35 (TapeStepProvider)"]
     end
 
-    subgraph Tessl["tessl (Metal, macOS only)"]
-        Rt["Metal runtime + allocator + kernels<br/>(GpuRuntime, BufferKind pools, GEMM, nn)"]
+    subgraph Tessl["tessl (Dedicated Metal 4 Extension, macOS only)"]
+        Rt["Metal runtime + allocator + kernels<br/>(GpuRuntime, BufferKind pools, SharedBuf, GEMM, nn)"]
         Inf["Hand-tuned inference<br/>Qwen3.5 prefill/decode, ICB, KV caches, Q4/Q8,<br/>EmbeddingGemma 2, BERT"]
-        Tr["Hand-written Qwen3.5 training<br/>qwen35_train, qwen35_bwd, qwen35_adamw<br/>(future under review)"]
+        TrKern["Training kernels<br/>qwen35_bwd, gdn_train, cross_entropy<br/>(whole-step retired to ojas Tape)"]
     end
 
     Core --> Tape
     Tape --> Other
     Tape --> MetalBe
-    MetalBe -->|"path dependency"| Rt
+    MetalBe -->|"HAL Traits & Kernels"| Rt
     Inf --> Rt
-    Tr --> Rt
+    TrKern --> Rt
 ```
+
+### The Modularity Rationale: Why tessl is a separate checkout
+
+Maintaining `tessl` as a distinct crate and repository from `ojas` is an intentional architectural boundary:
+
+1. **Decoupled Compile Cycles & Toolchain Isolation:**
+   `ojas` compiles cleanly across Linux, macOS, and Windows. `tessl` strictly requires Xcode 26, the macOS Metal Toolchain (`xcrun metal`, `metallib`), and Objective-C bindings (`objc2-metal`). Separating `tessl` isolates Xcode build requirements and AOT shader compilation from universal multi-platform training builds.
+2. **Isolated Hardware Requirements:**
+   `tessl` targets the neural accelerators on Apple M-series chips through Metal 4 (`MTL4*`) and MPP TensorOps `matmul2d`. Users requiring portable CPU, wgpu, or CUDA training are not burdened by macOS-specific dependencies.
+3. **Independent Profiling & Register Tuning:**
+   Tuning Metal kernels requires register-occupancy sweeps, tile geometry optimization (`bench_gemm_sweep`, `bench_gemm_tile_tune`), and ICB replay benchmarks, which iterate independently of neural autograd tape development.
+4. **Independent Release Cadence:**
+   Mac inference applications (such as local embedding servers or CLI decoders) can consume `tessl` directly without dragging in the full training framework.
 
 ### What tessl owns
 

@@ -55,6 +55,7 @@ Thumbs.db
 *~
 
 # Local development, agents & tooling caches
+.agents/
 .claude/
 .gemini/
 

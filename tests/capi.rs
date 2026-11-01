@@ -448,7 +448,7 @@ fn every_runtime_entry_refuses_a_foreign_thread_before_looking_at_its_arguments(
     let calls = std::thread::spawn(move || runtime_entries(raw as *mut TesslRuntime))
         .join()
         .unwrap();
-    assert_eq!(calls.len(), 6);
+    assert_eq!(calls.len(), 4);
     for (name, status, message) in &calls {
         assert_eq!(*status, TESSL_ERR, "{name}");
         assert!(
@@ -693,7 +693,7 @@ fn a_refused_cross_entropy_call_keeps_the_cached_workspace() {
             };
             (s, loss, msg(&err))
         };
-        let builds = || unsafe { tessl::capi::test_workspace_builds(handle.0) }.0;
+        let builds = || unsafe { tessl::capi::test_workspace_builds(handle.0) };
 
         let good = ce_args(&hb, &wb, &rows, &targets, 64);
         let (s, first, m) = call(&good);

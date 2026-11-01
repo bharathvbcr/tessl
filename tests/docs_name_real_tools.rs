@@ -25,11 +25,14 @@ fn crate_root() -> PathBuf {
 /// that the surrounding text says the tool does not exist; it is not a way to
 /// silence a broken reference.
 const DELIBERATELY_ABSENT: &[&str] = &[
-    // The Qwen3.5 training-step benches retired with the step (ABI 14, owner decision
+    // The Qwen3.5 training-step benches and sources retired with the step (ABI 14, owner decision
     // D5, `CHANGELOG.md`). The docs still name them inside committed measurement
-    // records (`bench/results/`, `docs/qwen35.md`) of the step that no longer exists.
+    // records (`bench/results/`, `docs/qwen35.md`, `docs/architecture.md`) of the step that no longer exists.
     "bench_qwen35_train",
     "bench_capi",
+    "qwen35_train",
+    "qwen35_adamw",
+    "test_gdn",
     // Named only inside the corrections recording that it was removed. If a
     // real interleaved coop A/B binary ever lands under this name, delete this
     // entry rather than the text.

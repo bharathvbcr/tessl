@@ -1186,3 +1186,4 @@ pub unsafe extern "C" fn tessl_qwen35_describe(
             Ok(())
         })
     }
+}

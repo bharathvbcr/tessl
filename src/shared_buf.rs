@@ -70,9 +70,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLResource, MTLStorageMode};
 
-use ojas_core::{
-    BackendId, DeviceBuffer, FenceError, HostLease, HostLeaseMut, MappedBuffer, OjasError, Timeline,
-};
+use ojas_core::{BackendId, DeviceBuffer, FenceError, HostLease, HostLeaseMut, MappedBuffer, OjasError, Timeline};
 
 use crate::runtime::host_fence::HostFence;
 use crate::runtime::GpuRuntime;
@@ -214,9 +212,7 @@ impl SharedBuf {
             lease: AtomicI32::new(0),
             fence,
         };
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        Ok(Self { inner: Arc::new(inner) })
     }
 
     /// Length in bytes.
@@ -248,7 +244,10 @@ impl SharedBuf {
     /// open command buffer, and with [`HostAccessError::Runtime`] when the
     /// runtime is poisoned. A refused call holds no lease.
     pub fn read(&self) -> Result<HostRead<'_>, HostAccessError> {
-        self.inner.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
+        self.inner
+            .fence
+            .ensure_not_poisoned()
+            .map_err(HostAccessError::Runtime)?;
         let mut cur = self.inner.lease.load(Ordering::SeqCst);
         loop {
             if cur < 0 {
@@ -269,7 +268,9 @@ impl SharedBuf {
         // The slot is taken before the stamp is read; the guard releases it on
         // every error below.
         let lease = HostRead { buf: self };
-        self.inner.fence.wait_stamp(self.inner.last_write.load(Ordering::SeqCst))?;
+        self.inner
+            .fence
+            .wait_stamp(self.inner.last_write.load(Ordering::SeqCst))?;
         Ok(lease)
     }
 
@@ -280,7 +281,10 @@ impl SharedBuf {
     /// and with the same `NotSubmitted` / `Runtime` errors as [`Self::read`].
     /// A refused call holds no lease.
     pub fn write(&self) -> Result<HostWrite<'_>, HostAccessError> {
-        self.inner.fence.ensure_not_poisoned().map_err(HostAccessError::Runtime)?;
+        self.inner
+            .fence
+            .ensure_not_poisoned()
+            .map_err(HostAccessError::Runtime)?;
         if self
             .inner
             .lease
@@ -290,13 +294,18 @@ impl SharedBuf {
             return Err(HostAccessError::Busy("a host lease is live".into()));
         }
         let lease = HostWrite { buf: self };
-        self.inner.fence.wait_stamp(self.inner.last_use.load(Ordering::SeqCst))?;
+        self.inner
+            .fence
+            .wait_stamp(self.inner.last_use.load(Ordering::SeqCst))?;
         Ok(lease)
     }
 
     /// Acquire a boxed host read lease for `MappedBuffer`.
     fn acquire_read(&self) -> Result<SharedHostReadLease, FenceError> {
-        self.inner.fence.ensure_not_poisoned().map_err(|_| FenceError::Poisoned)?;
+        self.inner
+            .fence
+            .ensure_not_poisoned()
+            .map_err(|_| FenceError::Poisoned)?;
         let mut cur = self.inner.lease.load(Ordering::SeqCst);
         loop {
             if cur < 0 {
@@ -309,7 +318,11 @@ impl SharedBuf {
                     detail: "too many host read leases".into(),
                 });
             }
-            match self.inner.lease.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            match self
+                .inner
+                .lease
+                .compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(now) => cur = now,
             }
@@ -326,8 +339,16 @@ impl SharedBuf {
 
     /// Acquire a boxed host write lease for `MappedBuffer`.
     fn acquire_write(&self) -> Result<SharedHostWriteLease, FenceError> {
-        self.inner.fence.ensure_not_poisoned().map_err(|_| FenceError::Poisoned)?;
-        if self.inner.lease.compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        self.inner
+            .fence
+            .ensure_not_poisoned()
+            .map_err(|_| FenceError::Poisoned)?;
+        if self
+            .inner
+            .lease
+            .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(FenceError::Busy {
                 detail: "a host lease is live".into(),
             });
@@ -509,9 +530,10 @@ impl Drop for HostWrite<'_> {
 
 fn map_host_access_error(e: HostAccessError, stamp: u64, fence: &HostFence) -> FenceError {
     match e {
-        HostAccessError::NotSubmitted { needed, submitted } => {
-            FenceError::NotSubmitted { value: needed, submitted }
-        }
+        HostAccessError::NotSubmitted { needed, submitted } => FenceError::NotSubmitted {
+            value: needed,
+            submitted,
+        },
         HostAccessError::Busy(detail) => FenceError::Busy { detail },
         HostAccessError::Runtime(why) => {
             if why.contains("poisoned") || why.contains("DeviceLost") {

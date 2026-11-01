@@ -965,10 +965,7 @@ fn a_narrowed_argument_width_is_caught() {
         "lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_ParamInfo)]",
     );
     let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
-    assert!(
-        mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"),
-        "{p:?}"
-    );
+    assert!(mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"), "{p:?}");
 }
 
 #[test]
@@ -1005,10 +1002,7 @@ fn a_changed_rust_width_is_caught() {
         "tessl_qwen35_param_info(\n    model: *mut TesslQwen35,\n    index: u32,",
     );
     let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
-    assert!(
-        mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"),
-        "{p:?}"
-    );
+    assert!(mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"), "{p:?}");
 }
 
 #[test]
@@ -2191,7 +2185,10 @@ fn abi_14_exports_none_of_the_retired_training_symbols() {
     let py = parse_py_abi(&read(PY));
     for name in RETIRED {
         assert!(!rust.fns.contains_key(name), "{name} is still exported by src/capi.rs");
-        assert!(!py.fns.contains_key(name), "{name} is still declared by the Python binding");
+        assert!(
+            !py.fns.contains_key(name),
+            "{name} is still declared by the Python binding"
+        );
     }
     // `tessl_qwen35_hidden` read a pending step; it went with them.
     assert!(!rust.fns.contains_key("tessl_qwen35_hidden"));

@@ -68,17 +68,9 @@ use objc2_metal::MTLBuffer;
 use crate::cross_entropy::{
     check_grad_tensor, cross_entropy_rows, validate_ce_inputs, CeGrads, CeHidden, CeWorkspace, Reduction,
 };
-use crate::gdn_train::{
-    gdn_train_backward, gdn_train_forward, validate_gdn_backward, GdnTrainDims, GdnTrainGrads, GdnTrainInputs,
-    GdnTrainWorkspace,
-};
 use crate::gemm::GemmOperands;
-use crate::qwen35_adamw::{
-    excluded_from_weight_decay, AdamW, AdamWConfig, AdamWHyper, Moment, MomentStorage, UpdateRule,
-};
 use crate::qwen35_model::{Precision, Qwen35Config, Qwen35Model};
-use crate::qwen35_params::ParamInfo;
-use crate::qwen35_train::{check_cu_seqlens, PendingStep, Qwen35Grads, Supervise};
+use crate::qwen35_params::{excluded_from_weight_decay, ParamInfo};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::CheckpointView;
 use crate::tensor::{DType, Tensor};
@@ -89,7 +81,14 @@ pub const TESSL_PANIC: i32 = 2;
 
 /// Bumped on any change to a `#[repr(C)]` layout or an entry point's
 /// signature; the Python side refuses a library whose version differs.
-pub const TESSL_ABI_VERSION: u32 = 13;
+///
+/// 14 retired the Qwen3.5 training step: `tessl_qwen35_train_step`, `_step_ragged`,
+/// `_forward`, `_backward`, `_discard`, `tessl_qwen35_hidden` (it read a pending
+/// step), `tessl_qwen35_adamw_init`/`_free`/`_step`/`_set_step_count`/`_step_count`,
+/// `tessl_qwen35_grad_sq_norm` and `tessl_gdn_train_forward`/`_backward`, and
+/// the `tessl_qwen35_copy` directions that read gradients or AdamW state. Ojas
+/// owns Metal training (the Tape); tessl keeps the kernels.
+pub const TESSL_ABI_VERSION: u32 = 14;
 
 /// Largest tensor rank a [`TesslTensorRef`] carries.
 pub const TESSL_MAX_DIMS: usize = 6;
@@ -112,49 +111,6 @@ fn parse_precision(code: u32, what: &str) -> Result<Precision, String> {
         TESSL_BF16 => Ok(Precision::Bf16),
         c => Err(format!("{what}: precision code {c} is neither 0 (f32) nor 1 (bf16)")),
     }
-}
-
-/// [`tessl_qwen35_adamw_init`] update-rule codes ([`UpdateRule`]).
-pub const TESSL_UPDATE_F32: u32 = 0;
-pub const TESSL_UPDATE_F32_MASTER: u32 = 1;
-pub const TESSL_UPDATE_BF16_KAHAN: u32 = 2;
-pub const TESSL_UPDATE_BF16_STOCHASTIC: u32 = 3;
-
-/// [`tessl_qwen35_adamw_init`] moment-storage codes ([`MomentStorage`]).
-pub const TESSL_MOMENTS_F32: u32 = 0;
-pub const TESSL_MOMENTS_BF16: u32 = 1;
-pub const TESSL_MOMENTS_BLOCK8: u32 = 2;
-
-/// The [`AdamWConfig`] the codes name; `seed` belongs to the stochastic
-/// rule alone and must be 0 under any other.
-fn parse_adamw_config(update: u32, seed: u64, moments: u32, what: &str) -> Result<AdamWConfig, String> {
-    let update = match update {
-        TESSL_UPDATE_F32 => UpdateRule::F32,
-        TESSL_UPDATE_F32_MASTER => UpdateRule::F32Master,
-        TESSL_UPDATE_BF16_KAHAN => UpdateRule::Bf16Kahan,
-        TESSL_UPDATE_BF16_STOCHASTIC => UpdateRule::Bf16Stochastic { seed },
-        c => {
-            return Err(format!(
-                "{what}: update code {c} is not 0 (f32), 1 (f32 master), 2 (bf16 Kahan) or 3 (bf16 stochastic)"
-            ))
-        }
-    };
-    if seed != 0 && !matches!(update, UpdateRule::Bf16Stochastic { .. }) {
-        return Err(format!(
-            "{what}: seed {seed} given to a rule that takes none (only 3, bf16 stochastic, does)"
-        ));
-    }
-    let moments = match moments {
-        TESSL_MOMENTS_F32 => MomentStorage::F32,
-        TESSL_MOMENTS_BF16 => MomentStorage::Bf16,
-        TESSL_MOMENTS_BLOCK8 => MomentStorage::Block8,
-        c => {
-            return Err(format!(
-                "{what}: moments code {c} is not 0 (f32), 1 (bf16) or 2 (8-bit blocks)"
-            ))
-        }
-    };
-    Ok(AdamWConfig { update, moments })
 }
 
 pub(crate) fn parse_operands(code: u32, what: &str) -> Result<GemmOperands, String> {
@@ -222,11 +178,8 @@ pub struct TesslRuntime {
     /// The last cross-entropy workspace, reused while it fits.
     ce_ws: Option<CeWorkspace>,
     ce_ws_key: (u32, u32, DType, GemmOperands),
-    /// The last GDN backward workspace, reused for the same shape.
-    gdn_ws: Option<GdnTrainWorkspace>,
     /// Workspaces built, for [`test_workspace_builds`].
     ce_builds: u64,
-    gdn_builds: u64,
 }
 
 /// The ABI version this library implements ([`TESSL_ABI_VERSION`]).
@@ -236,14 +189,14 @@ pub extern "C" fn tessl_abi_version() -> u32 {
 }
 
 /// `torch.nn.utils.clip_grad_norm_`'s coefficient for a global gradient norm
-/// `total_norm` (the square root of [`tessl_qwen35_grad_sq_norm`]'s value) and
+/// `total_norm` (the square root of a squared-gradient sum) and
 /// a bound `max_norm`, in torch's f32 arithmetic: both inputs rounded to f32,
 /// `reciprocal(total_norm + 1e-6) * max_norm` (what `max_norm / tensor` is in
 /// torch: `Tensor.__rtruediv__` multiplies the reciprocal, which differs from a
 /// division in the last bit for about one input in eight), clamped to at
-/// most one. A NaN norm gives NaN, as `torch.clamp` does. Pass the result as
-/// [`tessl_qwen35_adamw_step`]'s `grad_scale` and scale any gradients outside
-/// tessl by it too. No handle, no failure: a pure function, like
+/// most one. A NaN norm gives NaN, as `torch.clamp` does. Scale gradients by
+/// the result in whatever optimizer applies them (the Qwen3.5 step that took it as
+/// `grad_scale` was retired with ABI 14). No handle, no failure: a pure function, like
 /// [`tessl_abi_version`].
 #[no_mangle]
 pub extern "C" fn tessl_clip_coef(total_norm: f64, max_norm: f64) -> f32 {
@@ -307,9 +260,7 @@ pub unsafe extern "C" fn tessl_runtime_new(err: *mut c_char, err_len: usize) -> 
             owner: std::thread::current().id(),
             ce_ws: None,
             ce_ws_key: (0, 0, DType::F32, GemmOperands::ExactF32),
-            gdn_ws: None,
             ce_builds: 0,
-            gdn_builds: 0,
         })),
         Ok(Err(e)) => {
             // SAFETY: forwarded from this function's contract.
@@ -357,8 +308,7 @@ pub unsafe extern "C" fn tessl_synchronize(handle: *mut TesslRuntime, err: *mut 
 /// On batches each call's kernels into command buffers that are committed
 /// without a wait per kernel; the call still waits once before it returns,
 /// success or failure, so no call leaves work in flight. Turning it off waits
-/// for everything submitted so far before the mode changes. Either switch
-/// leaves a pending [`tessl_qwen35_train_forward`] step usable: the mode only
+/// for everything submitted so far before the mode changes. The mode only
 /// decides how later kernels are committed, never what they compute. ABI 12.
 ///
 /// # Safety
@@ -823,182 +773,6 @@ unsafe fn write_err(err: *mut c_char, err_len: usize, msg: &str) {
     }
 }
 
-/// Arguments of [`tessl_gdn_train_forward`] and [`tessl_gdn_train_backward`];
-/// see [`crate::gdn_train`]. Every tensor is dense f32. A null `buffer` means
-/// "absent" for `s0`, `s_fin`, `d_fin` and `ds0`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct TesslGdnArgs {
-    pub batch: u32,
-    pub seq: u32,
-    pub heads: u32,
-    pub v_dim: u32,
-    /// `[B, T, H, 128]`.
-    pub q: TesslTensorRef,
-    pub k: TesslTensorRef,
-    /// `[B, T, H, Dv]`.
-    pub v: TesslTensorRef,
-    /// `[B, T, H]`.
-    pub g: TesslTensorRef,
-    pub beta: TesslTensorRef,
-    /// `[B, H, 128, Dv]`, optional.
-    pub s0: TesslTensorRef,
-    /// `[B, H, NC, 128, Dv]`, NC = ceil(T / 64): written by the forward,
-    /// read by the backward.
-    pub ckpt: TesslTensorRef,
-    /// Forward: `o` `[B, T, H, Dv]` and optionally `s_fin` `[B, H, 128, Dv]`.
-    pub o: TesslTensorRef,
-    pub s_fin: TesslTensorRef,
-    /// Backward: `d_o`, optionally `d_fin`, and the gradients (`ds0` exactly
-    /// when `s0` is given).
-    pub d_o: TesslTensorRef,
-    pub d_fin: TesslTensorRef,
-    pub dq: TesslTensorRef,
-    pub dk: TesslTensorRef,
-    pub dv: TesslTensorRef,
-    pub dg: TesslTensorRef,
-    pub dbeta: TesslTensorRef,
-    pub ds0: TesslTensorRef,
-}
-
-/// # Safety
-/// As [`wrap`] for a non-null `t.buffer`.
-unsafe fn wrap_opt(rt: &Arc<GpuRuntime>, t: &TesslTensorRef, name: &str) -> Result<Option<Tensor>, String> {
-    if t.buffer.is_null() {
-        Ok(None)
-    } else {
-        // SAFETY: forwarded.
-        unsafe { wrap(rt, t, name) }.map(Some)
-    }
-}
-
-/// The inputs both directions read, wrapped.
-struct GdnWrapped {
-    dims: GdnTrainDims,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    g: Tensor,
-    beta: Tensor,
-    s0: Option<Tensor>,
-    ckpt: Tensor,
-}
-
-impl GdnWrapped {
-    /// # Safety
-    /// `a`'s buffers satisfy the module contract.
-    unsafe fn new(rt: &Arc<GpuRuntime>, a: &TesslGdnArgs) -> Result<Self, String> {
-        // SAFETY (each wrap): forwarded from this function's contract.
-        unsafe {
-            Ok(Self {
-                dims: GdnTrainDims {
-                    batch: a.batch,
-                    seq: a.seq,
-                    heads: a.heads,
-                    v_dim: a.v_dim,
-                },
-                q: wrap(rt, &a.q, "q")?,
-                k: wrap(rt, &a.k, "k")?,
-                v: wrap(rt, &a.v, "v")?,
-                g: wrap(rt, &a.g, "g")?,
-                beta: wrap(rt, &a.beta, "beta")?,
-                s0: wrap_opt(rt, &a.s0, "s0")?,
-                ckpt: wrap(rt, &a.ckpt, "ckpt")?,
-            })
-        }
-    }
-
-    fn inputs(&self) -> GdnTrainInputs<'_> {
-        GdnTrainInputs {
-            q: &self.q,
-            k: &self.k,
-            v: &self.v,
-            g: &self.g,
-            beta: &self.beta,
-            s0: self.s0.as_ref(),
-        }
-    }
-}
-
-/// [`crate::gdn_train::gdn_train_forward`] over caller buffers.
-///
-/// # Safety
-/// As [`tessl_cross_entropy_rows`], with `args` a valid [`TesslGdnArgs`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_gdn_train_forward(
-    handle: *mut TesslRuntime,
-    args: *const TesslGdnArgs,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(handle, err, err_len, |h| {
-            if args.is_null() {
-                return Err("tessl_gdn_train_forward: null args".into());
-            }
-            let a = &*args;
-            let rt = Arc::clone(&h.rt);
-            let x = GdnWrapped::new(&rt, a)?;
-            let o = wrap(&rt, &a.o, "o")?;
-            let s_fin = wrap_opt(&rt, &a.s_fin, "s_fin")?;
-            gdn_train_forward(&rt, x.dims, x.inputs(), &o, s_fin.as_ref(), &x.ckpt)
-        })
-    }
-}
-
-/// [`crate::gdn_train::gdn_train_backward`] over caller buffers. The
-/// backward workspace is cached per handle and per shape.
-///
-/// # Safety
-/// As [`tessl_gdn_train_forward`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_gdn_train_backward(
-    handle: *mut TesslRuntime,
-    args: *const TesslGdnArgs,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(handle, err, err_len, |h| {
-            if args.is_null() {
-                return Err("tessl_gdn_train_backward: null args".into());
-            }
-            let a = &*args;
-            let rt = Arc::clone(&h.rt);
-            let x = GdnWrapped::new(&rt, a)?;
-            let d_o = wrap(&rt, &a.d_o, "d_o")?;
-            let d_fin = wrap_opt(&rt, &a.d_fin, "d_fin")?;
-            let (dq, dk, dv) = (
-                wrap(&rt, &a.dq, "dq")?,
-                wrap(&rt, &a.dk, "dk")?,
-                wrap(&rt, &a.dv, "dv")?,
-            );
-            let (dg, dbeta) = (wrap(&rt, &a.dg, "dg")?, wrap(&rt, &a.dbeta, "dbeta")?);
-            let ds0 = wrap_opt(&rt, &a.ds0, "ds0")?;
-            let grads = GdnTrainGrads {
-                dq: &dq,
-                dk: &dk,
-                dv: &dv,
-                dg: &dg,
-                dbeta: &dbeta,
-                ds0: ds0.as_ref(),
-            };
-            // Checked before the cached workspace is replaced: a refused call
-            // keeps it and allocates nothing.
-            validate_gdn_backward(&rt, x.dims, &x.inputs(), &x.ckpt, &d_o, d_fin.as_ref(), &grads)?;
-            if h.gdn_ws.as_ref().map(GdnTrainWorkspace::dims) != Some(x.dims) {
-                h.gdn_ws = None;
-                h.gdn_ws = Some(GdnTrainWorkspace::new(&rt, x.dims)?);
-                h.gdn_builds += 1;
-            }
-            let ws = h.gdn_ws.as_ref().ok_or("tessl_gdn_train_backward: workspace missing")?;
-            gdn_train_backward(&rt, x.dims, x.inputs(), &x.ckpt, &d_o, d_fin.as_ref(), ws, grads)
-        })
-    }
-}
-
 // ------------------------------------------------------------ Qwen3.5 ---
 
 /// Longest parameter name a [`TesslParamInfo`] carries, NUL included.
@@ -1006,19 +780,9 @@ pub const TESSL_NAME_LEN: usize = 128;
 
 /// [`tessl_qwen35_copy`] directions.
 pub const TESSL_READ_PARAMS: u32 = 0;
-pub const TESSL_READ_GRADS: u32 = 1;
 pub const TESSL_WRITE_PARAMS: u32 = 2;
-/// AdamW state ([`tessl_qwen35_adamw_init`]): torch's `exp_avg` and
-/// `exp_avg_sq`, read or written in the parameters' layouts.
-pub const TESSL_READ_ADAMW_M: u32 = 3;
-pub const TESSL_READ_ADAMW_V: u32 = 4;
-pub const TESSL_WRITE_ADAMW_M: u32 = 5;
-pub const TESSL_WRITE_ADAMW_V: u32 = 6;
-/// A bf16 model's AdamW auxiliary state, in the parameters' layouts: the f32
-/// masters ([`TESSL_UPDATE_F32_MASTER`]) or the Kahan compensations
-/// ([`TESSL_UPDATE_BF16_KAHAN`]); refused under rules that keep none.
-pub const TESSL_READ_ADAMW_AUX: u32 = 7;
-pub const TESSL_WRITE_ADAMW_AUX: u32 = 8;
+// Directions 1 (read gradients) and 3 to 8 (AdamW state) were retired with
+// ABI 14 and are refused.
 
 /// One entry of a model's parameter table; see
 /// [`crate::qwen35_params::ParamInfo`].
@@ -1032,105 +796,20 @@ pub struct TesslParamInfo {
     /// the 2-D `shape`.
     pub transposed: u32,
     /// Non-zero: transformers' Trainer excludes this parameter from weight
-    /// decay ([`crate::qwen35_adamw::excluded_from_weight_decay`]), the
-    /// default [`tessl_qwen35_adamw_step`] callers start from.
+    /// decay ([`crate::qwen35_params::excluded_from_weight_decay`]), the
+    /// default an optimizer outside tessl starts from.
     pub decay_excluded: u32,
     /// transformers' shape; the first `ndim` entries are used.
     pub shape: [u64; TESSL_MAX_DIMS],
 }
 
-/// What the handle's gradient bank holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BankState {
-    /// Zeros, as allocated: nothing has run into it.
-    Empty,
-    /// A finished step's gradients (or several, accumulated).
-    Ready,
-    /// A step into it was refused or failed part way: neither.
-    Dirty,
-}
-
-/// What a [`tessl_qwen35_load`] pointer owns: an f32 or bf16 model, its gradient
-/// bank (allocated by the first step and reused by every later one), a step
-/// between [`tessl_qwen35_train_forward`] and [`tessl_qwen35_train_backward`],
-/// and AdamW state once [`tessl_qwen35_adamw_init`] made it.
+/// What a [`tessl_qwen35_load`] pointer owns: an f32 or bf16 model and its
+/// parameter table. The training step, gradient bank and AdamW state this
+/// handle used to carry were retired with ABI 14.
 pub struct TesslQwen35 {
     model: Qwen35Model,
     table: Vec<ParamInfo>,
-    grads: Option<Qwen35Grads>,
-    bank: BankState,
-    pending: Option<PendingStep>,
-    adamw: Option<AdamW>,
     owner: ThreadId,
-}
-
-impl TesslQwen35 {
-    /// The bank, allocated (zeroed) on first use.
-    fn bank(&mut self) -> Result<&Qwen35Grads, String> {
-        if self.grads.is_none() {
-            self.grads = Some(Qwen35Grads::zeros_like(&self.model)?);
-            self.bank = BankState::Empty;
-        }
-        self.grads.as_ref().ok_or_else(|| "no gradient bank".to_string())
-    }
-
-    /// Refuse a host write to entry `index` when the optimizer keeps auxiliary
-    /// state for it (a bf16 entry under [`UpdateRule::F32Master`] or
-    /// [`UpdateRule::Bf16Kahan`]): the next step reads that state, not the
-    /// weight, so the write would be lost. An index past the table is left to
-    /// the write's own range check.
-    fn refuse_stale_aux(&self, what: &str, index: usize) -> Result<(), String> {
-        let Some(state) = &self.adamw else {
-            return Ok(());
-        };
-        let rule = match state.config().update {
-            UpdateRule::F32Master => "f32-master",
-            UpdateRule::Bf16Kahan => "bf16-kahan",
-            _ => return Ok(()),
-        };
-        let slots = crate::qwen35_params::slots(&self.model, None)?;
-        let (Some(slot), Some(info)) = (slots.get(index), self.table.get(index)) else {
-            return Ok(());
-        };
-        if slot.param_window().dtype != DType::BF16 {
-            return Ok(());
-        }
-        Err(format!(
-            "{what}: {} (index {index}) has auxiliary optimizer state under the {rule} rule, which \
-             the next tessl_qwen35_adamw_step would rebuild the weight from, losing this write; write \
-             the parameters and the auxiliary state together with tessl_qwen35_copy \
-             (TESSL_WRITE_PARAMS, then TESSL_WRITE_ADAMW_AUX), or write before tessl_qwen35_adamw_init",
-            info.name
-        ))
-    }
-
-    fn no_pending(&self, what: &str) -> Result<(), String> {
-        if self.pending.is_some() {
-            return Err(format!(
-                "{what}: a step is pending; call tessl_qwen35_train_backward or tessl_qwen35_train_discard first"
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// The bank's gradients, when they are a finished step's and no step is
-/// pending.
-fn ready_grads<'a>(
-    what: &str,
-    grads: &'a Option<Qwen35Grads>,
-    bank: BankState,
-    pending: &Option<PendingStep>,
-) -> Result<&'a Qwen35Grads, String> {
-    if pending.is_some() {
-        return Err(format!(
-            "{what}: a step is pending; call tessl_qwen35_train_backward or tessl_qwen35_train_discard first"
-        ));
-    }
-    match (grads, bank) {
-        (Some(g), BankState::Ready) => Ok(g),
-        _ => Err(format!("{what}: no gradients yet; run tessl_qwen35_train_step first")),
-    }
 }
 
 impl Handle for TesslQwen35 {
@@ -1156,7 +835,7 @@ unsafe fn c_str<'a>(s: *const c_char, what: &str) -> Result<&'a str, String> {
         .map_err(|_| format!("{what} is not UTF-8"))
 }
 
-/// Load the text tower of a Qwen3.5 checkpoint for training, on `runtime`'s
+/// Load the text tower of a Qwen3.5 checkpoint, on `runtime`'s
 /// device, into a new handle written to `*out`: in f32 ([`TESSL_F32`]), or
 /// with its matrices stored in bf16 ([`TESSL_BF16`]; f32 arithmetic, and its
 /// steps take [`TESSL_OPERANDS_BF16`]).
@@ -1219,10 +898,6 @@ pub unsafe extern "C" fn tessl_qwen35_load(
             built = Some(Box::new(TesslQwen35 {
                 model,
                 table,
-                grads: None,
-                bank: BankState::Empty,
-                pending: None,
-                adamw: None,
                 owner: h.owner,
             }));
             if POISON_AFTER_LOAD.load(Ordering::Relaxed) {
@@ -1252,16 +927,16 @@ pub fn test_poison_after_load(on: bool) {
     POISON_AFTER_LOAD.store(on, Ordering::Relaxed);
 }
 
-/// Test hook: how many cross-entropy and GDN backward workspaces `runtime`
+/// Test hook: how many cross-entropy workspaces `runtime`
 /// has built, so a test can tell a reused cache from a rebuilt one.
 ///
 /// # Safety
 /// `runtime` is a live handle from [`tessl_runtime_new`].
 #[doc(hidden)]
-pub unsafe fn test_workspace_builds(runtime: *const TesslRuntime) -> (u64, u64) {
+pub unsafe fn test_workspace_builds(runtime: *const TesslRuntime) -> u64 {
     // SAFETY: live by the contract.
     let h = unsafe { &*runtime };
-    (h.ce_builds, h.gdn_builds)
+    h.ce_builds
 }
 
 /// Test hook: [`GpuRuntime::external_wrap_total`] of the model's runtime.
@@ -1354,344 +1029,17 @@ pub unsafe extern "C" fn tessl_qwen35_param_info(
     }
 }
 
-/// One training step on the `n` token ids at `ids` (one sequence), its GEMMs
-/// on `operands` ([`TESSL_OPERANDS_EXACT_F32`] or [`TESSL_OPERANDS_BF16`]):
-/// writes the loss to `*loss` and every parameter's gradient into the
-/// handle's bank for [`tessl_qwen35_copy`], over the previous step's. A
-/// refused call (null or oversized arguments, a bad `operands`, a pending
-/// step) leaves the bank as it was; a step that starts and then fails leaves
-/// none.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s and
-/// `loss` is writable.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_train_step(
-    model: *mut TesslQwen35,
-    ids: *const u32,
-    n: u64,
-    operands: u32,
-    loss: *mut f64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_train_step";
-            if ids.is_null() || loss.is_null() {
-                return Err(format!("{WHAT}: null ids or loss"));
-            }
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            let ids = checked_slice(ids, n, WHAT, "ids")?;
-            // A refused argument or a pending step leaves the bank as it was;
-            // only a step that starts and fails leaves none.
-            let operands = parse_operands(operands, WHAT)?;
-            h.no_pending(WHAT)?;
-            h.bank()?;
-            h.bank = BankState::Dirty;
-            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
-            *loss = h.model.train_step_into(ids, operands, Supervise::Causal, bank, false)?;
-            h.bank = BankState::Ready;
-            Ok(())
-        })
-    }
-}
-
-/// One training step on several sequences packed end to end in the `n` token
-/// ids at `ids`, cut at `cu_seqlens` (`n_cu` prefix offsets, `n_seq + 1`
-/// values from 0 to `n`; the layout of transformers' `cu_seq_lens_q`), its
-/// GEMMs on `operands` as [`tessl_qwen35_train_step`]
-/// ([`Qwen35Model::train_step_ragged_into`]). Each sequence is trained as it
-/// would be alone; the gradients are those of the token mean over every
-/// sequence's predicted positions, written into the handle's bank for
-/// [`tessl_qwen35_copy`], over the previous step's or, when `accumulate` is 1,
-/// added to them. `*loss` is that token-mean loss and `per_seq[i]` sequence
-/// `i`'s own mean loss (what [`tessl_qwen35_train_step`] reports for it
-/// alone); `n_per_seq` must be exactly `n_cu - 1`. A bad `cu_seqlens` (not
-/// from 0 to `n`, not strictly rising, a sequence under two tokens), a null
-/// pointer, a length mismatch, an `accumulate` other than 0 or 1, accumulating
-/// onto a failed step's partial bank and a pending step are all refused
-/// before any GPU work, with the bank as it was. ABI 13.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s,
-/// `cu_seqlens` to `n_cu` readable `u32`s, `loss` is writable and `per_seq`
-/// points to `n_per_seq` writable `f64`s.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_train_step_ragged(
-    model: *mut TesslQwen35,
-    ids: *const u32,
-    n: u64,
-    cu_seqlens: *const u32,
-    n_cu: u64,
-    operands: u32,
-    accumulate: u32,
-    loss: *mut f64,
-    per_seq: *mut f64,
-    n_per_seq: u64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_train_step_ragged";
-            if ids.is_null() || cu_seqlens.is_null() || loss.is_null() || per_seq.is_null() {
-                return Err(format!("{WHAT}: null ids, cu_seqlens, loss or per_seq"));
-            }
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            let n_cu = usize::try_from(n_cu).map_err(|_| format!("{WHAT}: n_cu overflows usize"))?;
-            let n_per_seq = usize::try_from(n_per_seq).map_err(|_| format!("{WHAT}: n_per_seq overflows usize"))?;
-            let ids = checked_slice(ids, n, WHAT, "ids")?;
-            let cu = checked_slice(cu_seqlens, n_cu, WHAT, "cu_seqlens")?;
-            let ranges = check_cu_seqlens(cu, ids.len()).map_err(|e| format!("{WHAT}: {e}"))?;
-            if n_per_seq != ranges.len() {
-                return Err(format!(
-                    "{WHAT}: per_seq holds {n_per_seq} losses for {} sequences",
-                    ranges.len()
-                ));
-            }
-            let per_out = checked_slice_mut(per_seq, n_per_seq, WHAT, "per_seq")?;
-            let operands = parse_operands(operands, WHAT)?;
-            if accumulate > 1 {
-                return Err(format!("{WHAT}: accumulate {accumulate} is not 0 or 1"));
-            }
-            let accumulate = accumulate == 1;
-            h.no_pending(WHAT)?;
-            h.bank()?;
-            if accumulate && h.bank == BankState::Dirty {
-                return Err(format!(
-                    "{WHAT}: the bank holds a failed step's partial gradients; start again with accumulate = 0"
-                ));
-            }
-            h.bank = BankState::Dirty;
-            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
-            let r = h.model.train_step_ragged_into(ids, cu, operands, bank, accumulate)?;
-            h.bank = BankState::Ready;
-            if r.per_sequence.len() != per_out.len() {
-                return Err(format!(
-                    "{WHAT}: the step returned {} per-sequence losses",
-                    r.per_sequence.len()
-                ));
-            }
-            per_out.copy_from_slice(&r.per_sequence);
-            *loss = r.loss;
-            Ok(())
-        })
-    }
-}
-
-/// [`tessl_qwen35_train_forward`]: transformers' causal-LM loss, the mean
-/// over every next-token prediction ([`Supervise::Causal`]).
-pub const TESSL_SUPERVISE_CAUSAL: u32 = 0;
-/// [`tessl_qwen35_train_forward`]: the hidden state at `positions[i]` scored
-/// against `targets[i]`, the sum, with the gradients of `scale` times it
-/// ([`Supervise::Rows`]; no rows at all is allowed).
-pub const TESSL_SUPERVISE_ROWS: u32 = 1;
-
-/// The forward and loss of one step on the `n` token ids at `ids`, kept in
-/// the handle for [`tessl_qwen35_hidden`] and [`tessl_qwen35_train_backward`]
-/// ([`Qwen35Model::train_forward`]). `supervise` picks the loss:
-/// [`TESSL_SUPERVISE_CAUSAL`] (`positions` and `targets` null, `n_rows` 0) or
-/// [`TESSL_SUPERVISE_ROWS`] (`n_rows` positions and targets; null only when
-/// `n_rows` is 0). The loss goes to `*loss`. Refused while a step is pending.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `ids` points to `n` readable `u32`s,
-/// `positions` and `targets` to `n_rows` each, and `loss` is writable.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_train_forward(
-    model: *mut TesslQwen35,
-    ids: *const u32,
-    n: u64,
-    operands: u32,
-    supervise: u32,
-    positions: *const u32,
-    targets: *const u32,
-    n_rows: u64,
-    scale: f32,
-    loss: *mut f64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_train_forward";
-            if ids.is_null() || loss.is_null() {
-                return Err(format!("{WHAT}: null ids or loss"));
-            }
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            let n_rows = usize::try_from(n_rows).map_err(|_| format!("{WHAT}: n_rows overflows usize"))?;
-            let ids = checked_slice(ids, n, WHAT, "ids")?;
-            let operands = parse_operands(operands, WHAT)?;
-            let rows = |p: *const u32, name: &str| -> Result<&[u32], String> {
-                match (p.is_null(), n_rows) {
-                    (true, 0) => Ok(&[]),
-                    (true, _) => Err(format!("{WHAT}: null {name} for {n_rows} rows")),
-                    (false, k) => checked_slice(p, k, WHAT, name),
-                }
-            };
-            let sup = match supervise {
-                TESSL_SUPERVISE_CAUSAL => {
-                    if n_rows != 0 || !positions.is_null() || !targets.is_null() {
-                        return Err(format!("{WHAT}: the causal loss takes no positions or targets"));
-                    }
-                    Supervise::Causal
-                }
-                TESSL_SUPERVISE_ROWS => Supervise::Rows {
-                    positions: rows(positions, "positions")?,
-                    targets: rows(targets, "targets")?,
-                    scale,
-                },
-                s => {
-                    return Err(format!(
-                    "{WHAT}: supervise {s} is not {TESSL_SUPERVISE_CAUSAL} (causal) or {TESSL_SUPERVISE_ROWS} (rows)"
-                ))
-                }
-            };
-            h.no_pending(WHAT)?;
-            let p = h.model.train_forward(ids, operands, sup)?;
-            *loss = p.loss();
-            h.pending = Some(p);
-            Ok(())
-        })
-    }
-}
-
-/// Rows `positions` of the pending step's final-norm output (transformers'
-/// `last_hidden_state`) into `out`, dense f32 `[n, hidden]`
-/// ([`PendingStep::hidden`]). Positions may repeat.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `positions` points to `n` readable
-/// `u32`s (null only when `n` is 0) and `out` to a [`TesslTensorRef`] whose
-/// buffer satisfies the module contract.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_hidden(
-    model: *mut TesslQwen35,
-    positions: *const u32,
-    n: u64,
-    out: *const TesslTensorRef,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_hidden";
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            if out.is_null() || (positions.is_null() && n != 0) {
-                return Err(format!("{WHAT}: null positions or out"));
-            }
-            let positions = if n == 0 {
-                &[][..]
-            } else {
-                checked_slice(positions, n, WHAT, "positions")?
-            };
-            let p = h
-                .pending
-                .as_ref()
-                .ok_or_else(|| format!("{WHAT}: no step is pending; call tessl_qwen35_train_forward first"))?;
-            let out = wrap(&h.model.rt, &*out, "out")?;
-            p.hidden(positions, &out)
-        })
-    }
-}
-
-/// The pending step's backward into the handle's bank: over it, or added to
-/// it when `accumulate` is non-zero ([`Qwen35Model::train_backward_into`]).
-/// `dh`, when not null, is the gradient of a loss outside tessl at rows
-/// `positions` (distinct) of the final norm's output, dense f32
-/// `[n, hidden]`; null with `n` 0 adds none. Everything is checked before
-/// anything runs, and a refusal keeps the step pending; once the backward
-/// runs the step is consumed. Accumulating onto a bank a failed step left
-/// part-written is refused. The parameters must not change in between: a
-/// [`TESSL_WRITE_PARAMS`] copy is refused while a step is pending.
-///
-/// # Safety
-/// As [`tessl_qwen35_hidden`], for `positions` and `dh`.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_train_backward(
-    model: *mut TesslQwen35,
-    positions: *const u32,
-    n: u64,
-    dh: *const TesslTensorRef,
-    accumulate: u32,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_train_backward";
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            let rt = Arc::clone(&h.model.rt);
-            let dh = match (dh.is_null(), positions.is_null(), n) {
-                (true, true, 0) => None,
-                (false, false, k) => Some((checked_slice(positions, k, WHAT, "positions")?, wrap(&rt, &*dh, "dh")?)),
-                (false, true, 0) => Some((&[][..], wrap(&rt, &*dh, "dh")?)),
-                _ => {
-                    return Err(format!(
-                        "{WHAT}: dh and positions must both be given, or both null with n 0"
-                    ))
-                }
-            };
-            let dh = dh.as_ref().map(|(p, t)| (*p, t));
-            let accumulate = accumulate != 0;
-            {
-                let p = h
-                    .pending
-                    .as_ref()
-                    .ok_or_else(|| format!("{WHAT}: no step is pending; call tessl_qwen35_train_forward first"))?;
-                h.model.check_pending(WHAT, p, dh)?;
-            }
-            h.bank()?;
-            if accumulate && h.bank == BankState::Dirty {
-                return Err(format!(
-                    "{WHAT}: the bank holds a failed step's partial gradients; start again with accumulate = 0"
-                ));
-            }
-            let p = h.pending.take().ok_or("no pending step")?;
-            h.bank = BankState::Dirty;
-            let bank = h.grads.as_ref().ok_or("no gradient bank")?;
-            h.model.train_backward_into(p, dh, bank, accumulate)?;
-            h.bank = BankState::Ready;
-            Ok(())
-        })
-    }
-}
-
-/// Drop the pending step, if any, without its backward.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_train_discard(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            h.pending = None;
-            Ok(())
-        })
-    }
-}
-
 fn bad_copy_direction(what: &str, d: u32) -> String {
     format!(
-        "{what}: direction {d} is not 0 (read params), 1 (read grads), 2 (write params), \
-         3 or 4 (read AdamW m or v), 5 or 6 (write AdamW m or v) or 7 or 8 (read or write \
-         the AdamW auxiliary state)"
+        "{what}: direction {d} is not 0 (read params) or 2 (write params); 1 (read grads) and \
+         3 to 8 (AdamW state) were retired with ABI 14"
     )
 }
 
 /// Copy between the model and `n` caller tensors, one per parameter-table
 /// entry in order, each dense f32 of the entry's shape (transposed when the
-/// entry says so): [`TESSL_READ_PARAMS`] and [`TESSL_READ_GRADS`] (the last
-/// step's) fill them, [`TESSL_WRITE_PARAMS`] sets the parameters from them,
-/// and [`TESSL_READ_ADAMW_M`] ... [`TESSL_WRITE_ADAMW_V`] read or set the AdamW
-/// moments in the same layouts. Values are transformers' (see
+/// entry says so): [`TESSL_READ_PARAMS`] fills them and [`TESSL_WRITE_PARAMS`]
+/// sets the parameters from them. Values are transformers' (see
 /// [`crate::qwen35_params`] for the layouts tessl keeps them in). Every
 /// tensor is checked before anything is copied.
 ///
@@ -1719,18 +1067,9 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                 return Err(format!("{WHAT}: null tensors"));
             }
             let refs = checked_slice(tensors, n, WHAT, "tensors")?;
-            // The direction and the state it needs, before any tensor is wrapped.
-            match direction {
-                TESSL_READ_PARAMS => {}
-                TESSL_READ_GRADS => {
-                    ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
-                }
-                TESSL_WRITE_PARAMS => h.no_pending(WHAT)?,
-                TESSL_READ_ADAMW_M..=TESSL_WRITE_ADAMW_AUX if h.adamw.is_none() => {
-                    return Err(format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"));
-                }
-                TESSL_READ_ADAMW_M..=TESSL_WRITE_ADAMW_AUX => {}
-                d => return Err(bad_copy_direction(WHAT, d)),
+            // The direction, before any tensor is wrapped.
+            if !matches!(direction, TESSL_READ_PARAMS | TESSL_WRITE_PARAMS) {
+                return Err(bad_copy_direction(WHAT, direction));
             }
             let rt = Arc::clone(&h.model.rt);
             let ts = refs
@@ -1740,44 +1079,7 @@ pub unsafe extern "C" fn tessl_qwen35_copy(
                 .collect::<Result<Vec<_>, _>>()?;
             match direction {
                 TESSL_READ_PARAMS => h.model.read_parameters(&ts),
-                TESSL_READ_GRADS => {
-                    let g = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
-                    h.model.read_gradients(g, &ts)
-                }
-                TESSL_WRITE_PARAMS => {
-                    // The backward rebuilds each layer from the forward's inputs
-                    // with the weights it finds: they must be the forward's.
-                    h.no_pending(WHAT)?;
-                    h.model.write_parameters(&ts)
-                }
-                TESSL_READ_ADAMW_M | TESSL_READ_ADAMW_V | TESSL_WRITE_ADAMW_M | TESSL_WRITE_ADAMW_V => {
-                    let state = h
-                        .adamw
-                        .as_mut()
-                        .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
-                    let which = if matches!(direction, TESSL_READ_ADAMW_M | TESSL_WRITE_ADAMW_M) {
-                        Moment::First
-                    } else {
-                        Moment::Second
-                    };
-                    if direction <= TESSL_READ_ADAMW_V {
-                        h.model.read_adamw_moment(state, which, &ts)
-                    } else {
-                        h.model.write_adamw_moment(state, which, &ts)
-                    }
-                }
-                TESSL_READ_ADAMW_AUX | TESSL_WRITE_ADAMW_AUX => {
-                    let state = h
-                        .adamw
-                        .as_mut()
-                        .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
-                    if direction == TESSL_READ_ADAMW_AUX {
-                        h.model.read_adamw_aux(state, &ts)
-                    } else {
-                        h.model.write_adamw_aux(state, &ts)
-                    }
-                }
-                d => Err(bad_copy_direction(WHAT, d)),
+                _ => h.model.write_parameters(&ts),
             }
         })
     }
@@ -1820,18 +1122,7 @@ pub unsafe extern "C" fn tessl_qwen35_read_parameter_host(
 /// Set parameter-table entry `index` from the `n` host f32s at `src`, laid
 /// out as [`tessl_qwen35_read_parameter_host`] reads them (a bf16 matrix takes
 /// each value rounded as the GPU copy rounds it). Only that entry is written
-/// ([`Qwen35Model::write_parameter_host`]), refused while a step is pending as
-/// [`TESSL_WRITE_PARAMS`] is.
-///
-/// Refused too, before anything moves, when the handle's AdamW state keeps
-/// auxiliary state for the entry (a bf16 entry under the f32-master or
-/// bf16-kahan rule): the next [`tessl_qwen35_adamw_step`] rebuilds the weight
-/// from that state and would silently overwrite this write. There is no
-/// per-entry auxiliary write; write the parameters and the auxiliary state
-/// together with [`tessl_qwen35_copy`] ([`TESSL_WRITE_PARAMS`] and
-/// [`TESSL_WRITE_ADAMW_AUX`]), or write this entry before
-/// [`tessl_qwen35_adamw_init`]. An f32 entry, a model with no AdamW state and
-/// the other update rules are written as asked.
+/// ([`Qwen35Model::write_parameter_host`]).
 ///
 /// # Safety
 /// As [`tessl_qwen35_param_count`]; `src` points to `n` readable f32s.
@@ -1854,50 +1145,13 @@ pub unsafe extern "C" fn tessl_qwen35_write_parameter_host(
                 return Err(format!("{WHAT}: null src"));
             }
             let src = checked_slice(src, n, WHAT, "src")?;
-            h.no_pending(WHAT)?;
-            h.refuse_stale_aux(WHAT, index)?;
             h.model.write_parameter_host(index, src)?;
             Ok(())
         })
     }
 }
 
-/// Make the handle's AdamW state ([`AdamW::with_config`]): `update`
-/// ([`TESSL_UPDATE_F32`] for an f32 model; [`TESSL_UPDATE_F32_MASTER`],
-/// [`TESSL_UPDATE_BF16_KAHAN`] or [`TESSL_UPDATE_BF16_STOCHASTIC`] with its
-/// `seed` for a bf16 one; `seed` is 0 otherwise) and `moments`
-/// ([`TESSL_MOMENTS_F32`], [`TESSL_MOMENTS_BF16`] or
-/// [`TESSL_MOMENTS_BLOCK8`]). Moments zeroed, step count 0; f32 moments are
-/// twice the parameters' memory (16 GB on the 2B). Refused if the handle has
-/// one.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_init(
-    model: *mut TesslQwen35,
-    update: u32,
-    seed: u64,
-    moments: u32,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_adamw_init";
-            if h.adamw.is_some() {
-                return Err(format!("{WHAT}: the model already has AdamW state"));
-            }
-            let config = parse_adamw_config(update, seed, moments, WHAT)?;
-            h.adamw = Some(AdamW::with_config(&h.model, config)?);
-            Ok(())
-        })
-    }
-}
-
-/// What the handle holds, as one line ([`Qwen35Model::describe`], then
-/// [`AdamW::describe`] once it has AdamW state), NUL-terminated into `out`
+/// What the handle holds, as one line ([`Qwen35Model::describe`]), NUL-terminated into `out`
 /// (`len` bytes). The line's length plus the NUL is written to `*needed`;
 /// a `len` below it is refused and `out` left as it was.
 ///
@@ -1920,11 +1174,7 @@ pub unsafe extern "C" fn tessl_qwen35_describe(
             if out.is_null() || needed.is_null() {
                 return Err(format!("{WHAT}: null out or needed"));
             }
-            let mut line = h.model.describe();
-            if let Some(state) = &h.adamw {
-                line.push_str("; ");
-                line.push_str(&state.describe());
-            }
+            let line = h.model.describe();
             let n = line.len() + 1;
             *needed = n as u64;
             if (len as u128) < n as u128 {
@@ -1936,154 +1186,3 @@ pub unsafe extern "C" fn tessl_qwen35_describe(
             Ok(())
         })
     }
-}
-
-/// Drop the handle's AdamW state, if any.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_free(model: *mut TesslQwen35, err: *mut c_char, err_len: usize) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            h.adamw = None;
-            Ok(())
-        })
-    }
-}
-
-/// One AdamW step ([`crate::qwen35_adamw`]) on every parameter from the last
-/// [`tessl_qwen35_train_step`]'s gradients, which stay in the handle, with
-/// `weight_decay[i]` for parameter-table entry `i` (`n` must be the table's
-/// length) and every gradient multiplied by `grad_scale` first (1, or the
-/// clip coefficient formed from [`tessl_qwen35_grad_sq_norm`]; the
-/// gradients themselves are left as they are). Everything is checked before
-/// anything moves.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `weight_decay` points to `n` readable
-/// `f32`s.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_step(
-    model: *mut TesslQwen35,
-    lr: f64,
-    beta1: f64,
-    beta2: f64,
-    eps: f64,
-    grad_scale: f64,
-    weight_decay: *const f32,
-    n: u64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_adamw_step";
-            let n = usize::try_from(n).map_err(|_| format!("{WHAT}: n overflows usize"))?;
-            if n != h.table.len() {
-                return Err(format!("{WHAT}: {n} weight decays for {} parameters", h.table.len()));
-            }
-            if weight_decay.is_null() {
-                return Err(format!("{WHAT}: null weight_decay"));
-            }
-            let wd = checked_slice(weight_decay, n, WHAT, "weight_decay")?;
-            let grads = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
-            let state = h
-                .adamw
-                .as_mut()
-                .ok_or_else(|| format!("{WHAT}: no AdamW state; call tessl_qwen35_adamw_init first"))?;
-            h.model.adamw_step(
-                grads,
-                state,
-                &AdamWHyper {
-                    lr,
-                    beta1,
-                    beta2,
-                    eps,
-                    grad_scale,
-                },
-                wd,
-            )
-        })
-    }
-}
-
-/// The sum of squares of every gradient the last [`tessl_qwen35_train_step`]
-/// left ([`Qwen35Model::grad_sq_norm`]), written to `*out`: the square of
-/// the global norm `clip_grad_norm_` takes, before any gradients outside
-/// the model are added.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `out` points to a writable `f64`.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_grad_sq_norm(
-    model: *mut TesslQwen35,
-    out: *mut f64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_grad_sq_norm";
-            if out.is_null() {
-                return Err(format!("{WHAT}: null out"));
-            }
-            let grads = ready_grads(WHAT, &h.grads, h.bank, &h.pending)?;
-            *out = h.model.grad_sq_norm(grads)?;
-            Ok(())
-        })
-    }
-}
-
-/// Set the AdamW step count, restoring a checkpoint together with the
-/// moments written through [`tessl_qwen35_copy`].
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`].
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_set_step_count(
-    model: *mut TesslQwen35,
-    step: u64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            let state = h
-                .adamw
-                .as_mut()
-                .ok_or("tessl_qwen35_adamw_set_step_count: no AdamW state")?;
-            state.set_step_count(step);
-            Ok(())
-        })
-    }
-}
-
-/// The AdamW steps taken so far, written to `*out`.
-///
-/// # Safety
-/// As [`tessl_qwen35_param_count`]; `out` is writable.
-#[no_mangle]
-pub unsafe extern "C" fn tessl_qwen35_adamw_step_count(
-    model: *mut TesslQwen35,
-    out: *mut u64,
-    err: *mut c_char,
-    err_len: usize,
-) -> i32 {
-    // SAFETY: forwarded from this function's contract.
-    unsafe {
-        guarded(model, err, err_len, |h| {
-            const WHAT: &str = "tessl_qwen35_adamw_step_count";
-            if out.is_null() {
-                return Err(format!("{WHAT}: null out"));
-            }
-            let state = h.adamw.as_ref().ok_or_else(|| format!("{WHAT}: no AdamW state"))?;
-            *out = state.step_count();
-            Ok(())
-        })
-    }
-}

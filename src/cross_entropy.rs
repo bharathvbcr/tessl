@@ -324,7 +324,7 @@ pub fn cross_entropy_rows_accumulating(
 /// f32 `[w, hidden]` rows (a view of the caller's scratch, written by the
 /// chunk's GEMM). Whatever it encodes runs before the next chunk's GEMM
 /// overwrites the scratch.
-pub(crate) type DwSink<'a> = &'a mut dyn FnMut(usize, &Tensor) -> Result<(), String>;
+pub type DwSink<'a> = &'a mut dyn FnMut(usize, &Tensor) -> Result<(), String>;
 
 /// [`cross_entropy_rows`] with `dW` handed over a chunk at a time instead of
 /// written into a `[vocab, hidden]` tensor: each chunk's `dlogitsᵀ @ h` is
@@ -332,7 +332,7 @@ pub(crate) type DwSink<'a> = &'a mut dyn FnMut(usize, &Tensor) -> Result<(), Str
 /// `sink`. For a gradient that is not kept whole in f32: a bf16 bank's
 /// embedding, which takes each chunk rounded.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cross_entropy_rows_chunked(
+pub fn cross_entropy_rows_chunked(
     rt: &Arc<GpuRuntime>,
     h: CeHidden<'_>,
     weight: &Tensor,
@@ -723,8 +723,8 @@ fn ws_buffers(ws: &CeWorkspace) -> Vec<(&'static str, &GpuBuffer)> {
 /// `[rows, width]` tensor into a dense f32 `[positions.len(), width]` one
 /// (positions may repeat), with the gather that starts [`cross_entropy_rows`].
 /// For reading a few positions of a sequence's hidden states without the
-/// rest: [`crate::qwen35_train::PendingStep::hidden`], and the Qwen3.5
-/// forward's chosen logit rows. Encoded, not waited for.
+/// rest: the Qwen3.5 forward's chosen logit rows (and, before ABI 14, a
+/// pending training step's hidden rows). Encoded, not waited for.
 pub(crate) fn gather_rows_f32(
     rt: &Arc<GpuRuntime>,
     what: &str,

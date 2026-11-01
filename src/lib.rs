@@ -80,8 +80,7 @@
 //! | [`gdn_train`] | The gated delta rule for training: forward and backward at transformers' op seam |
 //! | [`attn_train`] | Full attention for training: the forward with its log-sum-exp, and the backward |
 //! | [`attn_prefill_bf16`] | Qwen3.5 prefill attention with bf16 Q/K/V tiles (opt-in; the f32 path stays the default) |
-//! | [`qwen35_train`] | One training step of the Qwen3.5 text model: loss and every parameter's gradient |
-//! | [`qwen35_adamw`] | AdamW over a Qwen3.5 model's own parameters, in place (torch.optim.AdamW's update) |
+//! | [`qwen35_adamw`] | One AdamW step on device-resident f32 tensors, in place (the launcher of `qwen35_adamw.metal`'s f32 kernel) |
 //! | [`embedgemma2_tok`] | EmbeddingGemma 2's tokenizer in Rust: the snapshot's BPE `tokenizer.json`, the ids sentence-transformers feeds the model, decode |
 //! | [`media`] | Native image, audio and video decoding for EmbeddingGemma 2 through ImageIO, AudioToolbox and AVFoundation: a file or its bytes to the raw inputs `embedgemma2_pre` takes |
 //! | [`embedgemma2_media`] | An image, audio or video file (or its bytes) to the towers' inputs: `media` decoding then `embedgemma2_pre` preprocessing, one medium at a time |
@@ -121,9 +120,9 @@
 //! delta rule's training forward and backward in [`gdn_train`], and the
 //! backward of the layer's row-local ops in [`qwen35_bwd`], and full
 //! attention's training forward and backward in [`attn_train`]. A whole
-//! training step (loss and every parameter's gradient) is
-//! [`qwen35_model::Qwen35Model::train_step`], in [`qwen35_train`], and an AdamW
-//! step over the model's own parameters is [`qwen35_adamw`]. The EmbeddingGemma 2
+//! training step is not here: it retired with ABI 14, and ojas (the Tape over
+//! `ojas-metal`) owns Metal training on these kernels. One AdamW step over
+//! device tensors is [`qwen35_adamw`]. The EmbeddingGemma 2
 //! text encoder (bidirectional windowed attention, row-range mean pooling and
 //! normalization) is [`embedgemma2`], and its vision tower and multimodal
 //! embedder (image patches to soft tokens) are [`embedgemma2_vision`], and the
@@ -276,7 +275,6 @@ pub mod qwen35_bwd;
 pub mod qwen35_model;
 pub mod qwen35_params;
 pub mod qwen35_q4;
-pub mod qwen35_train;
 pub mod runtime;
 pub mod safetensors;
 pub mod shared;

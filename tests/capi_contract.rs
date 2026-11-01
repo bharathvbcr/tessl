@@ -17,11 +17,9 @@ use std::ffi::{c_char, CStr};
 use std::ptr;
 
 use tessl::capi::{
-    tessl_cross_entropy_rows, tessl_gdn_train_backward, tessl_gdn_train_forward, tessl_qwen35_adamw_free,
-    tessl_qwen35_adamw_set_step_count, tessl_qwen35_adamw_step_count, tessl_qwen35_free, tessl_qwen35_grad_sq_norm,
-    tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_train_discard, tessl_qwen35_train_step,
-    tessl_qwen35_train_step_ragged, tessl_runtime_free, tessl_runtime_poisoned, tessl_synchronize, TesslQwen35,
-    TesslRuntime, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32, TESSL_OK,
+    tessl_cross_entropy_rows, tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_runtime_free,
+    tessl_runtime_poisoned, tessl_synchronize, TesslQwen35, TesslRuntime, TESSL_ABI_VERSION, TESSL_ERR, TESSL_F32,
+    TESSL_OK,
 };
 
 const ERR_LEN: usize = 512;
@@ -51,12 +49,6 @@ fn runtime_entries(rt: *mut TesslRuntime) -> Vec<Call> {
         run(&mut out, "tessl_cross_entropy_rows", &|e, n| {
             tessl_cross_entropy_rows(rt, ptr::null(), ptr::null_mut(), ptr::null_mut(), e, n)
         });
-        run(&mut out, "tessl_gdn_train_forward", &|e, n| {
-            tessl_gdn_train_forward(rt, ptr::null(), e, n)
-        });
-        run(&mut out, "tessl_gdn_train_backward", &|e, n| {
-            tessl_gdn_train_backward(rt, ptr::null(), e, n)
-        });
         run(&mut out, "tessl_qwen35_load", &|e, n| {
             let mut m = ptr::null_mut();
             tessl_qwen35_load(rt, ptr::null(), ptr::null(), ptr::null(), TESSL_F32, &mut m, e, n)
@@ -72,40 +64,6 @@ fn model_entries(model: *mut TesslQwen35) -> Vec<Call> {
         run(&mut out, "tessl_qwen35_param_count", &|e, n| {
             tessl_qwen35_param_count(model, ptr::null_mut(), e, n)
         });
-        run(&mut out, "tessl_qwen35_train_step", &|e, n| {
-            tessl_qwen35_train_step(model, ptr::null(), 0, 0, ptr::null_mut(), e, n)
-        });
-        run(&mut out, "tessl_qwen35_train_step_ragged", &|e, n| {
-            tessl_qwen35_train_step_ragged(
-                model,
-                ptr::null(),
-                0,
-                ptr::null(),
-                0,
-                0,
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-                e,
-                n,
-            )
-        });
-        run(&mut out, "tessl_qwen35_train_discard", &|e, n| {
-            tessl_qwen35_train_discard(model, e, n)
-        });
-        run(&mut out, "tessl_qwen35_adamw_free", &|e, n| {
-            tessl_qwen35_adamw_free(model, e, n)
-        });
-        run(&mut out, "tessl_qwen35_grad_sq_norm", &|e, n| {
-            tessl_qwen35_grad_sq_norm(model, ptr::null_mut(), e, n)
-        });
-        run(&mut out, "tessl_qwen35_adamw_step_count", &|e, n| {
-            tessl_qwen35_adamw_step_count(model, ptr::null_mut(), e, n)
-        });
-        run(&mut out, "tessl_qwen35_adamw_set_step_count", &|e, n| {
-            tessl_qwen35_adamw_set_step_count(model, 0, e, n)
-        });
     }
     out
 }
@@ -116,7 +74,7 @@ fn a_null_handle_is_a_refusal_with_a_message_and_a_null_free_is_a_no_op() {
         .into_iter()
         .chain(model_entries(ptr::null_mut()))
         .collect();
-    assert_eq!(calls.len(), 14);
+    assert_eq!(calls.len(), 5);
     for (name, status, message) in calls {
         assert_eq!(status, TESSL_ERR, "{name}");
         assert!(message.starts_with("null "), "{name}: {message:?}");
@@ -899,29 +857,6 @@ fn rust_layouts() -> Vec<RustLayout> {
             dh,
             dw
         }),
-        rust_layout!(TesslGdnArgs {
-            batch,
-            seq,
-            heads,
-            v_dim,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            s0,
-            ckpt,
-            o,
-            s_fin,
-            d_o,
-            d_fin,
-            dq,
-            dk,
-            dv,
-            dg,
-            dbeta,
-            ds0
-        }),
         rust_layout!(TesslParamInfo {
             name,
             ndim,
@@ -940,7 +875,7 @@ fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
     let rust = parse_rust_abi(&read(RS));
     let py = parse_py_abi(&read(PY));
     // A parser that quietly found nothing would pass vacuously.
-    assert!(rust.fns.len() >= 26, "parsed only {} C functions", rust.fns.len());
+    assert!(rust.fns.len() >= 15, "parsed only {} C functions", rust.fns.len());
     assert!(rust.fns.contains_key("tessl_runtime_poisoned"));
     let problems = fn_problems(&rust, &py, UNBOUND_EXPORTS);
     assert!(problems.is_empty(), "C ABI / ctypes mismatch:\n{}", problems.join("\n"));
@@ -950,7 +885,7 @@ fn every_c_function_is_declared_in_python_with_the_same_arity_and_widths() {
 fn every_repr_c_struct_matches_its_ctypes_structure_field_for_field() {
     let rust = parse_rust_abi(&read(RS));
     let py = parse_py_abi(&read(PY));
-    assert!(rust.structs.len() >= 4, "parsed only {} structs", rust.structs.len());
+    assert!(rust.structs.len() >= 3, "parsed only {} structs", rust.structs.len());
     let problems = struct_problems(&rust, &py);
     assert!(problems.is_empty(), "struct layout mismatch:\n{}", problems.join("\n"));
 }
@@ -1026,12 +961,12 @@ fn the_unmodified_sources_are_clean() {
 fn a_narrowed_argument_width_is_caught() {
     let (rust, _) = real();
     let py = py_faulted(
-        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64]",
-        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint32]",
+        "lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)]",
+        "lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(_ParamInfo)]",
     );
     let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
     assert!(
-        mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1 `step`"),
+        mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"),
         "{p:?}"
     );
 }
@@ -1066,12 +1001,12 @@ fn a_changed_rust_width_is_caught() {
     let (_, py) = real();
     let rs = fault(
         &read(RS),
-        "tessl_qwen35_adamw_set_step_count(\n    model: *mut TesslQwen35,\n    step: u64,",
-        "tessl_qwen35_adamw_set_step_count(\n    model: *mut TesslQwen35,\n    step: u32,",
+        "tessl_qwen35_param_info(\n    model: *mut TesslQwen35,\n    index: u64,",
+        "tessl_qwen35_param_info(\n    model: *mut TesslQwen35,\n    index: u32,",
     );
     let p = fn_problems(&parse_rust_abi(&rs), &py, UNBOUND_EXPORTS);
     assert!(
-        mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1 `step`"),
+        mentions(&p, "tessl_qwen35_param_info: argument 1 `index`"),
         "{p:?}"
     );
 }
@@ -1222,13 +1157,13 @@ fn a_pointer_field_is_eight_bytes_whatever_its_pointee() {
 #[test]
 fn a_pointer_to_the_wrong_scalar_is_not_masked_by_the_void_wildcard() {
     let (rust, _) = real();
-    // set_step_count takes a u64 by value; make Python pass a pointer instead.
+    // param_info takes its index as a u64 by value; make Python pass a pointer instead.
     let py = py_faulted(
-        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_uint64]",
-        "lib.tessl_qwen35_adamw_set_step_count.argtypes = [ctypes.c_void_p, ctypes.c_void_p]",
+        "lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_ParamInfo)]",
+        "lib.tessl_qwen35_param_info.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_ParamInfo)]",
     );
     let p = fn_problems(&rust, &py, UNBOUND_EXPORTS);
-    assert!(mentions(&p, "tessl_qwen35_adamw_set_step_count: argument 1"), "{p:?}");
+    assert!(mentions(&p, "tessl_qwen35_param_info: argument 1"), "{p:?}");
 }
 
 #[test]
@@ -2229,4 +2164,46 @@ fn only_the_two_known_modules_export_c_entry_points() {
     );
     found.sort();
     assert_eq!(found, [RS, RS_EG2]);
+}
+
+/// ABI 14 retired the Qwen3.5 training step. The C source no longer exports
+/// any of its 13 symbols, the binding no longer declares them, and the version
+/// both sides check is 14. Fails on the pre-retirement tree (13 exports, ABI 13).
+#[test]
+fn abi_14_exports_none_of_the_retired_training_symbols() {
+    const RETIRED: [&str; 13] = [
+        "tessl_qwen35_train_step",
+        "tessl_qwen35_train_step_ragged",
+        "tessl_qwen35_train_forward",
+        "tessl_qwen35_train_backward",
+        "tessl_qwen35_train_discard",
+        "tessl_qwen35_adamw_init",
+        "tessl_qwen35_adamw_free",
+        "tessl_qwen35_adamw_step",
+        "tessl_qwen35_adamw_set_step_count",
+        "tessl_qwen35_adamw_step_count",
+        "tessl_qwen35_grad_sq_norm",
+        "tessl_gdn_train_forward",
+        "tessl_gdn_train_backward",
+    ];
+    assert_eq!(TESSL_ABI_VERSION, 14);
+    let rust = parse_rust_abi(&read(RS));
+    let py = parse_py_abi(&read(PY));
+    for name in RETIRED {
+        assert!(!rust.fns.contains_key(name), "{name} is still exported by src/capi.rs");
+        assert!(!py.fns.contains_key(name), "{name} is still declared by the Python binding");
+    }
+    // `tessl_qwen35_hidden` read a pending step; it went with them.
+    assert!(!rust.fns.contains_key("tessl_qwen35_hidden"));
+    assert!(!py.fns.contains_key("tessl_qwen35_hidden"));
+    // What stays: the parameter table, the copies and the cross-entropy.
+    for name in [
+        "tessl_qwen35_load",
+        "tessl_qwen35_copy",
+        "tessl_qwen35_param_info",
+        "tessl_cross_entropy_rows",
+        "tessl_clip_coef",
+    ] {
+        assert!(rust.fns.contains_key(name), "{name} must stay");
+    }
 }

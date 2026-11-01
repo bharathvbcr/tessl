@@ -626,25 +626,15 @@ fn mlx_q4_load_refusals() {
     });
 }
 
-/// A quantized model has no dense tensors: training, the parameter table and
-/// the optimizer refuse it with a message, and the answer scorer (which reads a
+/// A quantized model has no dense tensors: the parameter table refuses it with a message, and the answer scorer (which reads a
 /// dense head) refuses too; none panics.
 #[test]
 fn mlx_q4_model_refuses_what_needs_dense_weights() {
-    use tessl::gemm::GemmOperands;
-    use tessl::qwen35_train::Qwen35Grads;
     with_gpu(|rt| {
         let net = Net::new(5);
         let model = load_q4(rt, &net.mlx_entries()).unwrap();
         let ids = seq(6);
-        assert!(Qwen35Grads::zeros_like(&model).err().unwrap().contains("MLX 4-bit"));
         assert!(model.parameter_table().err().unwrap().contains("MLX 4-bit"));
-        assert!(model
-            .train_step(&ids, GemmOperands::Bf16)
-            .map(|_| ())
-            .unwrap_err()
-            .contains("MLX 4-bit"));
-        assert_eq!(model.train_step_bytes(6, GemmOperands::Bf16), u64::MAX);
         let staged = model.begin(&ids).unwrap();
         assert!(staged.score_answers(&[5], &[1, 2]).err().unwrap().contains("MLX 4-bit"));
         assert!(model.describe().contains("MLX affine 4-bit"), "{}", model.describe());

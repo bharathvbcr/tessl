@@ -1,5 +1,14 @@
 # tessl_torch
 
+> **ABI 14 (DO-NOT-MERGE-BEFORE-AB, owner decision D5): the Qwen3.5 training surface below is retired.**
+> `Qwen35.train_step`, `train_forward`, `train_backward`, `train_discard`, `hidden`, `grads`,
+> `grad_sq_norm`, the `adamw_*` methods, `chunk_gated_delta_rule` and
+> `patch_transformers_qwen3_5` no longer exist; ojas (the Tape over `ojas-metal`) owns Metal
+> training. What remains: `cross_entropy`, `cross_entropy_rows`, `clip_coef`, and `Qwen35` for
+> loading a checkpoint and reading or writing its parameters (`parameters`, `load_parameters`,
+> `read_parameter`, `write_parameter`, `describe`). The sections that describe the retired methods
+> are kept as the record of what ABI 13 offered.
+
 torch bindings for tessl's Metal kernels, loaded with `ctypes` from the C ABI
 in `src/capi.rs` (`libtessl.dylib`). Nothing beyond torch and the standard
 library is needed.

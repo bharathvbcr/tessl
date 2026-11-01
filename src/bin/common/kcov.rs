@@ -816,43 +816,6 @@ pub fn suites() -> Vec<Suite> {
         suite("bench_qwen35_layers", &["--attn-tiles", "256"], &[]),
         suite("bench_qwen35_layers", &["--paired-attn", "256"], &[]),
         suite("bench_qwen35_layers", &["--paired-gdn-recurrent", "1"], &[]),
-        // Qwen3.5 training: the per-op gate (every forward and backward op at the
-        // 2B's shapes, f32 and bf16 operands), whole steps and a clipped optimizer
-        // step on the test fixture's tiny tower (f32 and bf16 storage), a padded
-        // batch with a span row, and every AdamW step kernel.
-        suite("bench_qwen35_train", &["64", "--check-only"], &[]),
-        suite("bench_qwen35_train", &["64", "--check-only", "--bf16"], &[]),
-        suite(
-            "bench_qwen35_train",
-            &[
-                "64",
-                "--step=64",
-                "--clip=64",
-                "--batch=2,16,1",
-                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
-            ],
-            &[],
-        ),
-        suite(
-            "bench_qwen35_train",
-            &[
-                "64",
-                "--storage=bf16",
-                "--step=64",
-                "--clip=64",
-                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
-            ],
-            &[],
-        ),
-        suite(
-            "bench_qwen35_train",
-            &[
-                "64",
-                "--adamw-matrix",
-                "--random-config={crate}/tests/fixtures/qwen35_train/config.json",
-            ],
-            &[],
-        ),
     ]);
     v
 }

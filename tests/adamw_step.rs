@@ -1,6 +1,6 @@
 //! Generic device AdamW against a non-contracted f32 reference.
 //!
-//! The bound is the one `tests/qwen35_adamw.rs` uses for the model step:
+//! The bound is the one the retired model-step test used:
 //! `2e-6` absolute. Values are large enough that an f32 contraction changes
 //! bits by more than that, so a kernel compiled with contraction on fails
 //! this test.

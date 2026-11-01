@@ -25,8 +25,8 @@ RUNTIME, MODEL = 0xBEEF0000, 0xDEAD0000
 
 
 class FakeLib:
-    """Records every call; ``status`` is what the model's AdamW entry points
-    and the GDN entries return."""
+    """Records every call; ``status`` is what a model's parameter
+    read returns."""
 
     def __init__(self):
         self.calls = []
@@ -63,6 +63,9 @@ class FakeLib:
 
     def tessl_qwen35_read_parameter_host(self, h, index, dst, count, err, n):
         self.calls.append(("tessl_qwen35_read_parameter_host", (index, count)))
+        if self.status:
+            err.value = b"boom"
+            return self.status
         if self.parameter_status:
             err.value = b"parameter refused"
             return self.parameter_status
@@ -76,14 +79,6 @@ class FakeLib:
             err.value = b"parameter refused"
             return self.parameter_status
         self.written = [src[k] for k in range(count)]
-        return 0
-
-    def tessl_qwen35_train_step_ragged(self, h, ids, n, cu, n_cu, operands, acc, loss, per_seq, n_seq, err, n_err):
-        self.ragged = ([ids[k] for k in range(n)], [cu[k] for k in range(n_cu)], operands, acc, n_seq)
-        self.calls.append(("tessl_qwen35_train_step_ragged", h.value))
-        loss._obj.value = 1.5
-        for k in range(n_seq):
-            per_seq[k] = 0.25 * (k + 1)
         return 0
 
     def tessl_runtime_poisoned(self, h, out, err, n):
@@ -111,20 +106,6 @@ class FakeLib:
         info._obj.ndim = 1
         info._obj.shape[0] = 4
         return 0
-
-    def tessl_qwen35_adamw_free(self, h, err, n):
-        self._rec("tessl_qwen35_adamw_free", h)
-        err.value = b"boom"
-        return self.status
-
-    def tessl_qwen35_adamw_init(self, h, update, seed, moments, err, n):
-        self._rec("tessl_qwen35_adamw_init", h)
-        return 0
-
-    def tessl_gdn_train_forward(self, rt, args, err, n):
-        self._rec("tessl_gdn_train_forward", rt)
-        err.value = b"boom"
-        return self.status
 
 
 class HostCase(unittest.TestCase):
@@ -173,7 +154,7 @@ class Ownership(HostCase):
         self.assertTrue(model.closed)
         before = len(self.lib.calls)
         with self.assertRaisesRegex(TesslError, "closed"):
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertEqual(len(self.lib.calls), before)
 
     def test_a_closed_runtime_is_replaced_on_the_next_call(self):
@@ -235,47 +216,19 @@ class OneParameter(HostCase):
         self.assertFalse(self.model_.closed)
 
 
-class RaggedStep(HostCase):
-    """train_step_ragged hands the library u32 ids and prefix offsets (the
-    int32 tensor DataCollatorWithFlattening's cu_seq_lens_q is) and one
-    per-sequence slot for each sequence."""
-
-    def test_a_flattened_batch_reaches_the_library_as_u32_with_its_losses_back(self):
-        loss, per = self.model().train_step_ragged(
-            torch.tensor([[7, 8, 9, 1, 2]]), torch.tensor([0, 3, 5], dtype=torch.int32), operands="bf16", accumulate=True
-        )
-        self.assertEqual((loss, per), (1.5, [0.25, 0.5]))
-        self.assertEqual(self.lib.ragged, ([7, 8, 9, 1, 2], [0, 3, 5], 1, 1, 2))
-
-    def test_a_malformed_argument_is_refused_before_the_library(self):
-        m = self.model()
-        ids = torch.tensor([1, 2, 3, 4])
-        for kw, needle in (
-            (dict(cu_seqlens=torch.tensor([[0, 4]])), "cu_seqlens must be 1-D"),
-            (dict(cu_seqlens=torch.tensor([0.0, 4.0])), "cu_seqlens must be an integer tensor"),
-            (dict(cu_seqlens=torch.tensor([-1, 4])), "cu_seqlens must lie in"),
-            (dict(cu_seqlens=[0, 4], accumulate=2), "accumulate"),
-            (dict(cu_seqlens=[0, 4], operands="fp8"), "operands"),
-        ):
-            with self.assertRaisesRegex(TesslError, needle):
-                m.train_step_ragged(ids, **kw)
-        with self.assertRaisesRegex(TesslError, "ids must be 1-D"):
-            m.train_step_ragged(torch.zeros(2, 2, dtype=torch.long), [0, 4])
-        self.assertEqual(self.calls("tessl_qwen35_train_step_ragged"), [])
-
 
 class Panic(HostCase):
     def test_a_panic_status_raises_tesslpanic_and_closes_the_model(self):
         model = self.model()
         self.lib.status = 2
         with self.assertRaises(TesslPanic) as caught:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertIn("boom", str(caught.exception))
         self.assertTrue(model.closed)
         self.assertEqual(self.calls("tessl_qwen35_free"), [("tessl_qwen35_free", MODEL)])
         before = len(self.lib.calls)
         with self.assertRaises(TesslError) as later:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertNotIsInstance(later.exception, TesslPanic)
         self.assertEqual(len(self.lib.calls), before)
         model.close()
@@ -285,18 +238,9 @@ class Panic(HostCase):
         model = self.model()
         self.lib.status = 1
         with self.assertRaises(TesslError) as caught:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertNotIsInstance(caught.exception, TesslPanic)
         self.assertFalse(model.closed)
-
-    def test_a_panic_in_a_runtime_call_drops_the_threads_runtime(self):
-        rt = tessl_torch._runtime()
-        self.lib.status = 2
-        with self.assertRaises(TesslPanic):
-            tessl_torch._gdn_call("tessl_gdn_train_forward", tessl_torch._GdnArgs())
-        self.assertTrue(rt.closed)
-        self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
-        self.assertFalse(tessl_torch._runtime().closed)
 
     def test_a_load_panic_closes_the_runtime_that_panicked(self):
         self.lib.load_status = 2
@@ -317,7 +261,7 @@ class Panic(HostCase):
         model = self.model()
         self.lib.status = 2
         with self.assertRaises(TesslPanic):
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertEqual(self.calls("tessl_runtime_free"), [("tessl_runtime_free", RUNTIME)])
         self.assertTrue(tessl_torch._runtime() is not model._rt)
 
@@ -330,7 +274,7 @@ class Poisoned(HostCase):
         self.assertIs(other._rt, rt)
         self.lib.status, self.lib.poisoned = 1, 1
         with self.assertRaises(TesslPoisoned) as caught:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertIsInstance(caught.exception, TesslError)
         self.assertNotIsInstance(caught.exception, TesslPanic)
         self.assertIn("boom", str(caught.exception))  # names the original error
@@ -342,21 +286,13 @@ class Poisoned(HostCase):
         model = self.model()
         self.lib.status, self.lib.poisoned = 1, 1
         with self.assertRaises(TesslPoisoned):
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.lib.status, self.lib.poisoned = 0, 0
         fresh = tessl_torch._runtime()
         self.assertFalse(fresh.closed)
         self.assertIsNot(fresh, model._rt)
         self.assertEqual(len(self.calls("tessl_runtime_new")), 2)
         self.assertFalse(self.model().closed)
-
-    def test_a_runtime_call_that_poisons_the_runtime_raises_tesslpoisoned(self):
-        rt = tessl_torch._runtime()
-        self.lib.status, self.lib.poisoned = 1, 1
-        with self.assertRaisesRegex(TesslPoisoned, "boom"):
-            tessl_torch._gdn_call("tessl_gdn_train_forward", tessl_torch._GdnArgs())
-        self.assertTrue(rt.closed)
-        self.assertIsNot(tessl_torch._runtime(), rt)
 
     def test_a_load_that_poisons_the_runtime_raises_tesslpoisoned(self):
         self.lib.load_status, self.lib.poisoned = 1, 1
@@ -368,7 +304,7 @@ class Poisoned(HostCase):
         model = self.model()
         self.lib.status, self.lib.poisoned = 1, 0
         with self.assertRaises(TesslError) as caught:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertNotIsInstance(caught.exception, TesslPoisoned)
         self.assertFalse(model.closed or model._rt.closed)
         self.assertEqual(self.calls("tessl_runtime_free"), [])
@@ -377,7 +313,7 @@ class Poisoned(HostCase):
         model = self.model()
         self.lib.status, self.lib.poisoned, self.lib.poison_query_status = 1, 1, 1
         with self.assertRaises(TesslError) as caught:
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertNotIsInstance(caught.exception, TesslPoisoned)
         self.assertFalse(model.closed)
 
@@ -385,7 +321,7 @@ class Poisoned(HostCase):
         model = self.model()
         self.lib.status, self.lib.poisoned = 2, 1
         with self.assertRaises(TesslPanic):
-            model.adamw_free()
+            model.read_parameter("norm.weight")
         self.assertEqual(self.calls("tessl_runtime_poisoned"), [])
 
 
@@ -443,43 +379,12 @@ class Ranges(HostCase):
             with self.assertRaisesRegex(TesslError, "accumulate"):
                 tessl_torch._flag("accumulate", bad)
 
-    def test_a_non_integral_step_is_a_tessl_error(self):
-        model = self.model()
-        model.adamw_init()
-        for step in (float("nan"), 3.9, "3", None, True):
-            state = {"step": step, "exp_avg": {}, "exp_avg_sq": {}}
-            with self.assertRaisesRegex(TesslError, "step"):
-                model.load_adamw_state(state)
-
-    def test_train_backward_accumulate_is_a_flag(self):
-        model = self.model()
-        with self.assertRaisesRegex(TesslError, "accumulate"):
-            model.train_backward(accumulate=2**32)
-
     def test_float_and_bool_index_tensors_are_refused_and_empty_ones_are_not(self):
         for bad in (torch.tensor([3.5]), torch.tensor([True]), torch.tensor([1.0])):
             with self.assertRaisesRegex(TesslError, "ids must be an integer tensor"):
                 tessl_torch._u32(bad, 10, "ids")
         self.assertEqual(tessl_torch._u32(torch.tensor([3, 4]), 10, "ids").t.tolist(), [3, 4])
         self.assertEqual(tessl_torch._u32(torch.as_tensor([]), 10, "ids").t.numel(), 0)
-        with self.assertRaisesRegex(TesslError, "ids must be an integer tensor"):
-            self.model().train_step(torch.tensor([1.5, 2.5]))
-
-    def test_gdn_dims_are_range_checked(self):
-        with self.assertRaisesRegex(TesslError, "seq"):
-            tessl_torch._gdn_args(1, 2**32, 1, 1)
-
-    def test_the_adamw_step_count_and_seed_are_range_checked(self):
-        model = self.model()
-        model.adamw_init()
-        state = {"step": 2**64, "exp_avg": {}, "exp_avg_sq": {}}
-        with self.assertRaisesRegex(TesslError, "step"):
-            model.load_adamw_state(state)
-        state["step"] = -1
-        with self.assertRaisesRegex(TesslError, "step -1 is negative"):
-            model.load_adamw_state(state)
-        with self.assertRaisesRegex(TesslError, "seed"):
-            self.model().adamw_init(seed=2**64)
 
 
 if __name__ == "__main__":

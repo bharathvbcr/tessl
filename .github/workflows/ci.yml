@@ -21,7 +21,8 @@ name: CI
 # have been pushed.
 #
 # Every job that runs cargo therefore needs both checkouts and
-# `defaults.run.working-directory`. Action inputs are NOT affected by that
+# `defaults.run.working-directory`. `kernel-emulator` is the exception and says
+# so at its own steps: it runs no cargo at all. Action inputs are NOT affected by that
 # default, so every path handed to an action (setup-python's
 # cache-dependency-path, setup-go's go-version-file, rust-cache's workspaces)
 # is spelled from $GITHUB_WORKSPACE.
@@ -99,14 +100,16 @@ jobs:
       run:
         working-directory: code/research/tessl
     steps:
+      # The one job with no ojas checkout, because it is the one job that runs
+      # no cargo: the dialect lint is a bare `rustc` (which reads no manifest)
+      # and everything else is python, so nothing here resolves a path
+      # dependency (`rg -n '\bcargo\b' tools/msl_emu/` matches nothing). It is
+      # still checked out at the same nested path as every other job so the
+      # layout is uniform. ADD AN OJAS CHECKOUT, like the jobs below, before
+      # adding any cargo step here.
       - uses: actions/checkout@v4
         with:
           path: code/research/tessl
-      - uses: actions/checkout@v4
-        with:
-          repository: bharathvbcr/ojas
-          ref: ${{ env.OJAS_REF }}
-          path: code/research/ojas
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

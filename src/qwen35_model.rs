@@ -551,6 +551,7 @@ impl Qwen35Model {
     /// the rest were not: the model is no longer any step's weights. The
     /// first cause is kept. The same latch as a [`Staged`] or [`Decode`]
     /// session's `broken`, on the model, since what tore is the weights.
+    #[allow(dead_code)]
     pub(crate) fn mark_torn(&self, cause: String) {
         let _ = self.torn.set(cause);
     }
@@ -739,6 +740,7 @@ impl Qwen35Model {
     /// dense embedding and answers f32: its callers are the training byte
     /// bounds, which return `u64::MAX` for a quantized model before using it
     /// (fail closed: no step "fits"), and the entry points that refuse it first.
+    #[allow(dead_code)]
     pub(crate) fn table_dtype(&self) -> DType {
         self.embed.dense().map_or(DType::F32, |t| t.dtype)
     }

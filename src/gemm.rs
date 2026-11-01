@@ -1491,6 +1491,7 @@ impl GemmOperands {
     /// under [`Self::Bf16`] (a bf16 `B`, such as a bf16-stored weight, is
     /// used as it is), nothing under [`Self::ExactF32`]. Like every
     /// temporary, they stay allocated until the next waited commit.
+    #[allow(dead_code)]
     pub(crate) fn nn_scratch_bytes(self, m: usize, n: usize, k: usize, b: DType) -> u64 {
         match self {
             Self::ExactF32 => 0,
@@ -1503,6 +1504,7 @@ impl GemmOperands {
     /// ([`tn_par_k_tile`] under [`Self::ExactF32`], [`tn_par_bf16_k_tile`]
     /// under [`Self::Bf16`]), or the transposed `A` a device without
     /// TensorOps takes.
+    #[allow(dead_code)]
     pub(crate) fn tn_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize) -> u64 {
         match self {
             Self::Bf16 => {
@@ -1526,6 +1528,7 @@ impl GemmOperands {
     /// As [`Self::nn_scratch_bytes`], for [`Self::nt`] (`C [m, n]`, shared
     /// dimension `k`, `B` of dtype `b`): under [`Self::ExactF32`], the
     /// transposed `B` a device without TensorOps takes.
+    #[allow(dead_code)]
     pub(crate) fn nt_scratch_bytes(self, has_tensorops: bool, m: usize, n: usize, k: usize, b: DType) -> u64 {
         match self {
             Self::Bf16 => bf16_copies(m.saturating_mul(k), narrowed(n.saturating_mul(k), b)),
@@ -1537,6 +1540,7 @@ impl GemmOperands {
 
 /// Allocated bytes of the bf16 operand copies [`ensure_bf16`] makes, of
 /// `a` and `b` elements (0: the operand is already bf16, no copy).
+#[allow(dead_code)]
 fn bf16_copies(a: usize, b: usize) -> u64 {
     [a, b]
         .iter()
@@ -1546,6 +1550,7 @@ fn bf16_copies(a: usize, b: usize) -> u64 {
 }
 
 /// Elements [`ensure_bf16`] copies for an operand of `n` elements of `dtype`.
+#[allow(dead_code)]
 fn narrowed(n: usize, dtype: DType) -> usize {
     if dtype == DType::BF16 {
         0
@@ -1555,6 +1560,7 @@ fn narrowed(n: usize, dtype: DType) -> usize {
 }
 
 /// Allocated bytes of one f32 temporary (`alloc_temp_f32`, from the pool).
+#[allow(dead_code)]
 fn f32_temp(n: usize) -> u64 {
     GpuRuntime::allocated_bytes_for(n.saturating_mul(4), BufferKind::Cold)
 }

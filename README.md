@@ -16,6 +16,11 @@
 
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
+> [!NOTE]
+> **Role (direction of 2026-10-31).** tessl has two jobs. It is the **Mac inference engine**: hand-tuned Qwen3.5 prefill and decode, the decode ICB, KV caches, MLX Q4/Q8 quantization, EmbeddingGemma 2, BERT and the fused kernels under them are its product. It is also the **Metal extension of [ojas](https://github.com/bharathvbcr/ojas)**, the universal Rust training framework: the Metal runtime, allocator and kernels that ojas's Metal backend uses for training and general ops. tessl does not depend on ojas, and should not grow generic training logic, a second autograd, or a second Tensor, Budget or error model.
+>
+> *Target versus current:* the shared runtime and single CPU/GPU memory pool with ojas are goals, not shipped (today each ojas consumer opens its own `GpuRuntime`). tessl's own hand-written Qwen3.5 training (`qwen35_train.rs`, `qwen35_bwd.rs`, `qwen35_adamw.rs`) still works and is documented below; its long-term home is an **open decision under review**, not settled. See [tessl's role](docs/architecture.md#tessls-role-metal-extension-of-ojas-and-the-mac-inference-engine).
+
 <p align="center">
   <a href="https://tessl.vbcr.dev/"><img src="https://img.shields.io/badge/website-tessl.vbcr.dev-F59E0B?style=flat&logo=safari&logoColor=white" alt="Website"></a>
   <a href="https://crates.io/crates/tessl"><img src="https://img.shields.io/crates/v/tessl.svg" alt="crates.io"></a>

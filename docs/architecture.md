@@ -4,6 +4,163 @@ How `tessl` selects GEMM kernels, how cooperative destination registers eliminat
 
 ---
 
+## tessl's role: Metal extension of ojas and the Mac inference engine
+
+Owner direction of 2026-10-31. This section states where tessl is meant to go,
+and marks what is already true (**current**) apart from what is a goal
+(**target**). Nothing below has been implemented by this change; it is
+documentation only.
+
+### Two products in one crate
+
+tessl is the Metal layer for Apple silicon, and it plays two roles:
+
+1. **The Mac inference engine.** Hand-tuned inference is tessl's product:
+   Qwen3.5 prefill and decode (the fused decode kernels, the decode ICB and
+   ping-pong replay, KV caches), quantization (MLX Q4 and Q8, the int8 GEMM),
+   EmbeddingGemma 2, BERT and DistilBERT, and the fused kernels under them.
+   These stay in tessl and keep getting faster. ojas does light inference only
+   (sampling and eval) and will not grow a second Mac inference engine.
+2. **ojas's Metal extension.** [ojas](https://github.com/bharathvbcr/ojas) is
+   the universal Rust framework, focused on training: `Tensor`, `DType`,
+   `OjasError`, `Budget`, the `Backend` trait, shape validators, autocast, the
+   autograd `Tape`, optimizers, training loops, data, checkpoints, IO and the
+   CPU reference backend. Its CUDA, HIP, wgpu and Metal backends plug in as
+   extensions. For Metal, tessl is that extension: the runtime, the allocator
+   and the kernels that the ojas Metal backend calls for training and general
+   ops.
+
+```mermaid
+flowchart TD
+    accTitle: tessl's two roles
+    accDescr: ojas owns the training framework and the portable backends. tessl owns the Metal runtime, allocator and kernels and the hand-tuned inference paths. The ojas Metal backend and the ojas-qwen35 provider call down into tessl; tessl does not depend on ojas.
+
+    subgraph OjasFw["ojas (training framework, portable)"]
+        Core["ojas-core: Tensor, DType, OjasError, Budget,<br/>Backend trait, validators, autocast"]
+        Tape["ojas-autograd Tape, optimizers, train loops,<br/>data, checkpoints, IO, CPU backend"]
+        Other["CUDA, HIP, wgpu backends"]
+        MetalBe["ojas-metal (Metal Backend)<br/>ojas-qwen35 (whole-step provider)"]
+    end
+
+    subgraph Tessl["tessl (Metal, macOS only)"]
+        Rt["Metal runtime + allocator + kernels<br/>(GpuRuntime, BufferKind pools, GEMM, nn)"]
+        Inf["Hand-tuned inference<br/>Qwen3.5 prefill/decode, ICB, KV caches, Q4/Q8,<br/>EmbeddingGemma 2, BERT"]
+        Tr["Hand-written Qwen3.5 training<br/>qwen35_train, qwen35_bwd, qwen35_adamw<br/>(future under review)"]
+    end
+
+    Core --> Tape
+    Tape --> Other
+    Tape --> MetalBe
+    MetalBe -->|"path dependency"| Rt
+    Inf --> Rt
+    Tr --> Rt
+```
+
+### What tessl owns
+
+- **The Metal runtime:** `GpuRuntime` (one device, one `MTL4CommandQueue`,
+  encoder lease, shared events, residency set, pipeline cache), the dispatch
+  `Binder`, and the Metal 4 execution model described below.
+- **The allocator:** the `BufferKind` pools (Hot, Cold, Bump, External), the
+  deferred recycle on command-buffer completion, and `StorageModeShared`
+  buffers, which are what let CPU and GPU address the same bytes on Apple
+  silicon.
+- **The kernels:** the GEMM family (MPP TensorOps and the simdgroup fallback),
+  the `nn` library with its validate-before-encode boundary, reductions,
+  attention, quantized GEMV and GEMM, and the Qwen3.5, EmbeddingGemma 2 and BERT
+  kernels.
+- **The hand-tuned inference paths** listed above, including their tests,
+  benchmarks and the C ABI, Python and Go bindings that expose them.
+
+### What tessl should not grow
+
+The goals are no duplicate code between the two repositories, and one memory
+pool for CPU and GPU on unified memory. So, in tessl:
+
+- **No generic training logic.** Optimizer scalar formation, gradient clipping
+  policy, learning-rate schedules, loss scaling, checkpoint schema and training
+  loops belong to ojas. A new optimizer or schedule is added there once and
+  reaches Metal as kernels, not as a second implementation here.
+- **No second autograd.** tessl has no tape today, and should not get one. A
+  model's backward is either a hand-written per-layer pass for one model
+  (below) or ojas's `Tape` over `Backend` ops. It is not a third thing.
+- **No second `Tensor`, `Budget` or error model.** tessl's `Tensor` is a thin
+  view over a Metal buffer tied to one runtime, and its entry points report
+  errors as `String`s (for example in `gemm.rs`). It should not grow a budget, a placement model or a
+  typed-error taxonomy that duplicates `ojas-core`. Where ojas needs a
+  typed allocation failure, the owner of the allocator (tessl) exposes a typed
+  error and ojas maps it; ojas should not have to match message text.
+- **No portable-backend abstractions.** tessl is Metal and macOS only. The
+  `Backend` trait, the CPU, wgpu, CUDA and HIP paths and anything that must
+  build off macOS live in ojas.
+
+### How ojas uses tessl
+
+**Current (verified in the ojas tree on 2026-10-31).**
+
+- `ojas-metal` takes tessl as an optional path dependency
+  (`metal = ["dep:tessl"]`, `../../tessl`). Its `MetalBackend` runs ojas
+  `Backend` ops on a dedicated device thread that owns a tessl `GpuRuntime`
+  (that runtime is deliberately `!Send` and `!Sync`; see
+  [Runtime Access Lease](#runtime-access-lease)). It adds its own metallib to
+  that runtime (`add_metallib_bytes`) and allocates its buffers through tessl's
+  pool.
+- `ojas-qwen35` depends on tessl by path, builds only on macOS, and is not an
+  ojas `Backend`. It runs tessl's Qwen3.5 training step as one provider-level
+  unit, and puts ojas types (`Tensor`, `Budget`, `check_adamw`, `next_step`,
+  `clip_scale`) around it.
+- tessl does not depend on ojas (`Cargo.toml` has no ojas entry), and declares
+  `links = "tessl"`, so every crate in one build, ojas's included, must resolve
+  to a single tessl source.
+- The two repositories do not yet share a runtime or a pool. ojas-metal
+  (`device.rs`, `gpu.rs`) and ojas-qwen35 (`step.rs`) each call
+  `GpuRuntime::new()`, so one process can hold several runtimes, each with its
+  own queue, pool and pipeline cache. ojas `Budget` counts requested bytes and
+  refuses; tessl's pool counts bucketed bytes and does not refuse.
+
+**Target (not implemented).**
+
+- One shared runtime and one allocator handle per process, created once, so the
+  ojas CPU backend and every Metal consumer draw from one pool on unified
+  memory, with ojas `Budget` charging the same bytes the pool holds.
+- Duplicated Metal kernels (for example the several AdamW, RMSNorm and softmax
+  implementations across the two repositories) converge on one owner per
+  behavior. The numeric contracts differ today (ojas builds with safe math and
+  a fixed reduction order for `Numerics::Exact`; tessl builds with fast math
+  and tree reductions), so a shared kernel needs an explicit decision about
+  which tier it serves.
+- A typed allocation error from tessl in place of string matching.
+
+None of the target items is promised on a date. They are the direction of the
+unification work, and each needs its own measured, tested change.
+
+### Open decision: the future of tessl's Qwen3.5 training
+
+**Current.** tessl contains a complete hand-written Qwen3.5 training step:
+`src/qwen35_train.rs` (4,725 lines), `src/qwen35_bwd.rs` (988) and
+`src/qwen35_adamw.rs` (1,518), with `gdn_train.rs`, `attn_train.rs` and
+`cross_entropy.rs` beneath them. It is what `ojas-qwen35` and the
+`tessl_torch` binding drive today, and [qwen35.md](qwen35.md) holds its
+measurements.
+
+**Open.** It overlaps the ojas goal in two ways: it is a second backward
+strategy (a hand-written per-layer pass with activation recompute, against
+ojas's `Tape` of `Backend` ops), and its AdamW is one of several
+implementations of the same math. Whether this code stays in tessl as a model
+provider, moves its generic parts (optimizer scalars, clipping, grouping) to
+ojas and keeps only the kernels, or is replaced by ojas's `Tape` over tessl
+kernels, is **an open decision under review, not settled**. Until it is
+decided:
+
+- Do not delete or rewrite these files for the sake of unification.
+- Do not add new training features here that ojas would also need (a new
+  optimizer, a new schedule); put them in ojas and call down to tessl kernels.
+- Keep the kernels, tests and bindings working. The measurements in
+  [qwen35.md](qwen35.md) remain the baseline any replacement is judged
+  against.
+
+---
+
 ## GEMM Pipeline & Kernel Selection
 
 Every GEMM invocation validates tensors, resolves layout orientations (NN, TN, NT), and routes execution to the optimal Metal Performance Primitives (MPP) TensorOps kernel.

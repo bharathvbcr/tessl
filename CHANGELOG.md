@@ -263,6 +263,12 @@ All notable changes to `tessl` are recorded here. The format follows
   loaded the whole ojas workspace and failed without a gusset checkout. The new script covers
   exactly tessl's own packages — the crate and `numcheck`, which is a path dev-dependency rather
   than a workspace member — the way `ojas/scripts/fmt_check.sh` does for ojas.
+- **`go/engine/Cargo.lock` predated the ojas path dependency** (`go/engine/Cargo.lock`). The engine
+  depends on `tessl = { path = "../.." }`, so `ojas-core` and `ojas-io` are in its graph, but the
+  lockfile was last written by `607dc0e` and named neither. `make -C go unit` (the `go` job) and
+  `make -C go device` (the `gpu` job) build it with `--locked`, so both refused it: *"cannot update
+  the lock file .../go/engine/Cargo.lock because --locked was passed"*. Regenerated: the two path
+  packages and tessl's dependency list, 13 added lines, nothing else moved.
 - **The crate was not rustfmt-clean** (`src/loader.rs`, `src/runtime/host_fence.rs`,
   `src/shared_buf.rs`, `tests/capi.rs`, `tests/capi_contract.rs`, `tests/capi_oversized.rs`,
   `tests/kernel_coverage.rs`, `tests/qwen35_params.rs`, `tests/shared_runtime.rs`,

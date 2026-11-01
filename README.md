@@ -17,9 +17,11 @@
 The name is short for *tessellation* — the design centers around how matrix operations are partitioned into tile geometries and the order in which those tiles are traversed.
 
 > [!NOTE]
-> **Role (direction of 2026-10-31).** tessl has two jobs. It is the **Mac inference engine**: hand-tuned Qwen3.5 prefill and decode, the decode ICB, KV caches, MLX Q4/Q8 quantization, EmbeddingGemma 2, BERT and the fused kernels under them are its product. It is also the **Metal extension of [ojas](https://github.com/bharathvbcr/ojas)**, the universal Rust training framework: the Metal runtime, allocator and kernels that ojas's Metal backend uses for training and general ops. tessl does not depend on ojas, and should not grow generic training logic, a second autograd, or a second Tensor, Budget or error model.
+> **Role & Unified Architecture.** tessl has two core roles. It is the **Mac inference engine**: hand-tuned Qwen3.5 prefill and decode, the decode ICB, KV caches, MLX Q4/Q8 quantization, EmbeddingGemma 2, BERT, and the fused kernels under them are its product. It is also the **Metal extension of [ojas](https://github.com/bharathvbcr/ojas)**, the universal Rust training framework: providing the Metal runtime, allocator, and compute kernels that ojas's Metal backend uses for training and general ops.
 >
-> *Target versus current:* the shared runtime and single CPU/GPU memory pool with ojas are goals, not shipped (today each ojas consumer opens its own `GpuRuntime`). tessl's own hand-written Qwen3.5 training (`qwen35_train.rs`, `qwen35_bwd.rs`, `qwen35_adamw.rs`) still works and is documented below; its long-term home is an **open decision under review**, not settled. See [tessl's role](docs/architecture.md#tessls-role-metal-extension-of-ojas-and-the-mac-inference-engine).
+> *Unified Memory & HAL Integration:* `SharedBuf` in `src/shared_buf.rs` implements ojas's `MappedBuffer` trait, providing zero-copy CPU/GPU memory sharing over pooled `StorageModeShared` allocations guarded by timeline fences and host leases (`HostLease`, `HostLeaseMut`). Memory allocations are tracked under `ojas_core::Budget` with `BudgetTrimHandler` clearing freelist caches under memory pressure.
+>
+> *ABI 14 Updates:* Under ABI version 14 (`tessl_abi_version`), tessl retired standalone whole-step training, gradient banks, and AdamW from its C-API surface into ojas's autograd `Tape` (`TapeStepProvider`), establishing ojas as the sole authoritative training engine while tessl focuses on hardware-accelerated Metal execution.
 
 <p align="center">
   <a href="https://tessl.vbcr.dev/"><img src="https://img.shields.io/badge/website-tessl.vbcr.dev-F59E0B?style=flat&logo=safari&logoColor=white" alt="Website"></a>
@@ -250,6 +252,7 @@ flowchart TD
 - **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion (`pending_cold_recycle`). A buffer dropped after a wait is also released by the next allocation, when no command buffer is open and the GPU has finished everything submitted, so it serves that allocation without a commit in between.
 - **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
 - **`BufferKind::External`**: Caller-owned `MTLBuffer` allocations wrapped through [`Tensor::from_mtl_buffer`](https://docs.rs/tessl). Stays resident in the working set without entering the cold freelist upon drop.
+- **`SharedBuf` Zero-Copy UMA Sharing**: Implements `MappedBuffer` from `ojas-core`. Provides zero-copy CPU/GPU memory sharing over pooled `StorageModeShared` buffers with timeline fences (`last_use`, `last_write`), mutual exclusion leases, and poison detection on failed dispatches.
 - **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets into the 31-slot argument table.
 
 ---

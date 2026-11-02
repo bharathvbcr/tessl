@@ -26,6 +26,14 @@
 # instead: `lib shared_buf::tests:: 1` would run all 14 of them, 13 of which
 # open a device.
 #
+# Three names below already end with another module's, inert only because
+# those files hold no tests today: `embedgemma2::tests::` also reaches
+# `capi_embedgemma2::tests::`, `json::tests::` reaches `config_json::tests::`,
+# and `media::` reaches `embedgemma2_media::`. One #[test] added to
+# src/capi_embedgemma2.rs therefore arrives under an entry that names
+# embedgemma2, and that is a C-ABI surface where a test may well open a
+# runtime. Check the filter, not the module name, when a count moves.
+#
 # Usage: scripts/hosted_tests.sh [--outside] [MANIFEST]
 #   default    every entry except `outside`, under the sandbox
 #   --outside  only the `outside` entries, after the sandboxed step

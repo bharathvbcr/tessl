@@ -39,6 +39,24 @@ const DEVICE_MARKERS: &[&str] = &[
     "MTLCreateSystemDefaultDevice",
 ];
 
+/// Call paths that name a device type but provably open nothing: a pure
+/// associated function on it. Without this, `GpuRuntime::is_event_wait_timeout`
+/// — which classifies an error string and takes no `self` — reads as a device
+/// marker, and a module filter over a test that calls it is refused although
+/// every test it selects is device-free.
+///
+/// Each entry is `(the path a call site writes, the file that defines it, its
+/// own name there)`. The last two are not decoration:
+/// `the_device_marker_exemptions_are_still_pure` re-reads each body and refuses
+/// the exemption the moment it stops being true. An exemption asserted once and
+/// never re-checked would go on passing the day its function grew a device
+/// call, and would be the very thing hiding it.
+const DEVICE_MARKER_EXEMPT: &[(&str, &str, &str)] = &[(
+    "GpuRuntime::is_event_wait_timeout",
+    "src/runtime.rs",
+    "is_event_wait_timeout",
+)];
+
 #[derive(Debug, PartialEq)]
 enum Entry {
     Bin(String),
@@ -136,6 +154,18 @@ fn defined_fns(src: &str) -> HashSet<String> {
         .collect()
 }
 
+/// `body` with every `DEVICE_MARKER_EXEMPT` call path replaced, so the marker
+/// scan does not read a device type's name out of a call that opens nothing.
+/// Nothing else is touched: a mention of the type in any other form still
+/// counts, which is what keeps this narrower than retiring the marker.
+fn without_exempt_calls(body: &str) -> String {
+    let mut out = body.to_string();
+    for (path, _, _) in DEVICE_MARKER_EXEMPT {
+        out = out.replace(path, "exempt_pure_call");
+    }
+    out
+}
+
 /// A device marker reachable from `test` through functions defined in `src`.
 fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
     let src = strip_comments(src);
@@ -152,8 +182,12 @@ fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
             }
             continue;
         };
+        // Only the exempt call paths are blanked, and only for the marker scan;
+        // every other mention of a device type still counts, and the call-graph
+        // walk below still sees the body as written.
+        let scanned = without_exempt_calls(body);
         for m in DEVICE_MARKERS {
-            if body.contains(m) {
+            if scanned.contains(m) {
                 return Ok(Some(format!("{name} mentions {m}")));
             }
         }
@@ -858,6 +892,59 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
     check_exact_device_free("exact planted_bin is_clean\n", &dir);
 
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Every `DEVICE_MARKER_EXEMPT` entry is exempt because its own body opens
+/// nothing — re-read here rather than taken on trust.
+///
+/// This is the half that keeps the exemption honest over time. A name in a list
+/// is a claim someone checked once; it would go on passing the day its function
+/// grew a device call, and the exemption is exactly what would hide that from
+/// every test calling it. So the claim is re-derived on every run, from the same
+/// `fn_body` and `DEVICE_MARKERS` the scan itself uses.
+#[test]
+fn the_device_marker_exemptions_are_still_pure() {
+    assert!(
+        !DEVICE_MARKER_EXEMPT.is_empty(),
+        "no exemptions to check: if the list is emptied, drop this test with it \
+         rather than leaving one that asserts nothing"
+    );
+    for (path, file, name) in DEVICE_MARKER_EXEMPT {
+        let full = root().join(file);
+        let src = fs::read_to_string(&full).unwrap_or_else(|e| panic!("{path}: cannot read {}: {e}", full.display()));
+        let stripped = strip_comments(&src);
+
+        // One definition, or `fn_body` would be reading whichever came first.
+        let defined = fn_definitions(&blank_literals(&src), name);
+        assert_eq!(
+            defined,
+            1,
+            "{path}: {} defines `fn {name}(` {defined} time(s), so which body the \
+             exemption rests on is not decidable",
+            full.display()
+        );
+
+        let body = fn_body(&stripped, name).unwrap_or_else(|| panic!("{path}: no `fn {name}(` in {}", full.display()));
+        for m in DEVICE_MARKERS {
+            assert!(
+                !body.contains(m),
+                "{path} is exempt from the device scan, but its body in {} now mentions \
+                 {m}. The exemption is no longer true, and leaving it would hide a device \
+                 call from every test that calls this.",
+                full.display()
+            );
+        }
+
+        // And the exemption must still be able to fire: a path that matches no
+        // call form exempts nothing and quietly stops carrying its weight.
+        assert_eq!(
+            without_exempt_calls(&format!("let _ = {path}(x);"))
+                .matches(path)
+                .count(),
+            0,
+            "{path}: the exemption did not rewrite its own call form"
+        );
+    }
 }
 
 #[test]

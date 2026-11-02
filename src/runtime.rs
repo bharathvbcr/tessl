@@ -1066,7 +1066,7 @@ impl GpuRuntime {
 
     /// Latch a test-only poison. Its cause is not a budget-timeout error:
     /// [`Self::is_event_wait_timeout`] is false for it, and
-    /// [`Self::poison_on_failure`] stores it. A real SharedEvent wait that runs
+    /// `poison_on_failure` stores it. A real SharedEvent wait that runs
     /// out of budget does not call this. The first and second consecutive
     /// budget timeouts leave the runtime usable; the third poisons it with a
     /// DeviceLost cause of its own.

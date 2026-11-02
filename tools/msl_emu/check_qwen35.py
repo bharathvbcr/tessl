@@ -70,28 +70,53 @@ def run(kernel, params, inputs, outputs):
     return first
 
 
+def _write_case(d, kernel, params, inputs, outputs):
+    """The harness's input directory: one .bin a buffer, plus params.txt."""
+    for name, t in inputs.items():
+        t = t.contiguous()
+        if t.dtype == torch.float64:
+            t = t.float()
+        with open(os.path.join(d, name + ".bin"), "wb") as f:
+            f.write(t.numpy().tobytes())
+    for name, (dtype, n) in outputs.items():
+        if name in inputs:
+            continue  # in-place: the input is the initial contents
+        # Pre-fill outputs with NaN so an element the kernel never wrote is
+        # visible as such rather than as a plausible zero.
+        fill = torch.full((n,), float("nan"), dtype=torch.float32)
+        data = fill.to(torch.bfloat16).view(torch.int16) if dtype == "bf16" else fill
+        with open(os.path.join(d, name + ".bin"), "wb") as f:
+            f.write(data.numpy().tobytes())
+    with open(os.path.join(d, "params.txt"), "w") as f:
+        f.write(f"kernel {kernel}\n")
+        f.write("outputs " + " ".join(outputs) + "\n")
+        for k, v in params.items():
+            f.write(f"{k} {v}\n")
+
+
+def expect_refusal(kernel, params, inputs, outputs, needle, tag):
+    """Run one case and require the harness to refuse it, naming `needle`.
+
+    An emulator that returns numbers for a dispatch the host would reject is
+    reporting that something was checked which was not run, so these cases hold
+    the refusal itself, not the output.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        _write_case(d, kernel, params, inputs, outputs)
+        p = subprocess.run([HARNESS, d], env=dict(os.environ, MSL_EMU_TG_ORDER="forward"),
+                           capture_output=True, text=True)
+    said = (p.stdout or "") + (p.stderr or "")
+    if p.returncode != 0 and needle in said:
+        print(f"  [ok  ] {tag}: refused, exit {p.returncode}")
+        return
+    print(f"  [FAIL] {tag}: expected a non-zero exit naming {needle!r}, got exit {p.returncode}: "
+          f"{said.strip()[-300:]!r}")
+    FAILURES.append(tag)
+
+
 def _run_once(kernel, params, inputs, outputs, order):
     with tempfile.TemporaryDirectory() as d:
-        for name, t in inputs.items():
-            t = t.contiguous()
-            if t.dtype == torch.float64:
-                t = t.float()
-            with open(os.path.join(d, name + ".bin"), "wb") as f:
-                f.write(t.numpy().tobytes())
-        for name, (dtype, n) in outputs.items():
-            if name in inputs:
-                continue  # in-place: the input is the initial contents
-            # Pre-fill outputs with NaN so an element the kernel never wrote is
-            # visible as such rather than as a plausible zero.
-            fill = torch.full((n,), float("nan"), dtype=torch.float32)
-            data = fill.to(torch.bfloat16).view(torch.int16) if dtype == "bf16" else fill
-            with open(os.path.join(d, name + ".bin"), "wb") as f:
-                f.write(data.numpy().tobytes())
-        with open(os.path.join(d, "params.txt"), "w") as f:
-            f.write(f"kernel {kernel}\n")
-            f.write("outputs " + " ".join(outputs) + "\n")
-            for k, v in params.items():
-                f.write(f"{k} {v}\n")
+        _write_case(d, kernel, params, inputs, outputs)
         subprocess.run([HARNESS, d], check=True, env=dict(os.environ, MSL_EMU_TG_ORDER=order))
         res = {}
         for name, (dtype, n) in outputs.items():
@@ -172,13 +197,29 @@ def case_conv(B, T, C, KW, with_state, bcast_state, seed):
 # ------------------------------------------------------------------- the GDN
 
 
-def gdn_layout(B, T, Hk, Hv, Dv, seed, a_scale=1.0, a_log_lo=-2.0, a_log_hi=1.0, dt_shift=0.0):
-    """Random operands in the fused-projection layouts the kernels read."""
+def gdn_vec(kernel):
+    """Whether `kernel` reads q and k as float4s (`GDN_SIMD_KERNEL`'s `VEC`)."""
+    return kernel.endswith("_vec")
+
+
+def gdn_layout(B, T, Hk, Hv, Dv, seed, a_scale=1.0, a_log_lo=-2.0, a_log_hi=1.0, dt_shift=0.0, vec=False):
+    """Random operands in the fused-projection layouts the kernels read.
+
+    `q_off` and the row stride are deliberately odd, so a kernel that assumes
+    either is a multiple of anything is caught. The `_vec` kernels are the
+    exception: they read q and k as `float4`s, and the host refuses the dispatch
+    unless `ld`, `q_off` and `k_off` are multiples of 4 (`qwen35.rs`'s
+    `variant.vec()` check), because a 16-byte load off a 16-byte boundary is
+    undefined. They get the smallest offset and pad that satisfy it and are
+    still non-zero, so nothing assumes those are zero either.
+    """
     g = seeded(seed)
     key_dim, value_dim = Hk * DK, Hv * Dv
-    pad = 7
+    # key_dim and value_dim are multiples of 4, so these carry the alignment.
+    pad = 8 if vec else 7
+    off = 4 if vec else 3
     ld_qkv = 2 * key_dim + value_dim + pad
-    q_off, k_off, v_off = 3, 3 + key_dim, 3 + 2 * key_dim
+    q_off, k_off, v_off = off, off + key_dim, off + 2 * key_dim
     qkv = torch.randn(B * T, ld_qkv, generator=g)
     # z | b | a, the tail of the projection, in its own buffer.
     ld_ab = value_dim + 2 * Hv + 5
@@ -226,7 +267,7 @@ def gdn_f64(q, k, v, g, beta, state):
 
 
 def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
-    L = gdn_layout(B, T, Hk, Hv, Dv, seed, **layout_kw)
+    L = gdn_layout(B, T, Hk, Hv, Dv, seed, vec=gdn_vec(kernel), **layout_kw)
     g_ = seeded(seed + 1000)
     snap = None
     if state_mode == "batch":
@@ -306,7 +347,7 @@ def case_gdn(kernel, B, T, Hk, Hv, Dv, seed, state_mode="none", **layout_kw):
 def case_recurrent_in_place(seed, kernel="qwen35_gdn_recurrent"):
     """state_out == state_in, one state per batch row."""
     B, T, Hk, Hv, Dv = 2, 3, 1, 2, 64
-    L = gdn_layout(B, T, Hk, Hv, Dv, seed)
+    L = gdn_layout(B, T, Hk, Hv, Dv, seed, vec=gdn_vec(kernel))
     state0 = torch.randn(B, Hv, DK, Dv, generator=seeded(seed + 1)) * 0.1
     ref, ref_state = gdn_f64(*gdn_operands(L, B, T, Hk, Hv, Dv, torch.float64), state0)
     params = dict(B=B, T=T, Hk=Hk, Hv=Hv, Dv=Dv, ld_qkv=L["ld_qkv"], q_off=L["q_off"], k_off=L["k_off"],
@@ -318,6 +359,34 @@ def case_recurrent_in_place(seed, kernel="qwen35_gdn_recurrent"):
               {"out": ("f32", B * T * Hv * Dv), "state_in": ("f32", B * Hv * DK * Dv)})
     check(f"{kernel} in-place out", out["out"], ref.reshape(-1), 1e-5)
     check(f"{kernel} in-place state", out["state_in"], ref_state.reshape(-1), 1e-5)
+
+
+def case_vec_misaligned_refused(seed=140):
+    """A `_vec` kernel at an unaligned layout must be refused, not run.
+
+    `qwen35_gdn_recurrent_simd_l8_vec` reads q and k as `float4`s, and the host
+    refuses the dispatch unless `ld`, `q_off` and `k_off` are multiples of 4
+    (`qwen35.rs`'s `variant.vec()` check). Handed the unaligned layout the
+    scalar kernels are tested at, its 16-byte load lands 12 bytes past a
+    16-byte boundary. That is undefined, and what it does is the compiler's
+    choice: Apple clang reads it with `movups` and the case passes, x86-64 GCC
+    at -O2 emits `movaps` and the harness dies with SIGSEGV — which is what the
+    `simd_recurrent_T1_snapshot` case did on every hosted run of this job. So
+    the emulator refuses the access on every platform, and this case holds it
+    to that.
+    """
+    kernel = "qwen35_gdn_recurrent_simd_l8_vec"
+    B, T, Hk, Hv, Dv = 1, 1, 1, 1, 32
+    L = gdn_layout(B, T, Hk, Hv, Dv, seed)  # vec=False: q_off and ld_qkv are 3 mod 4
+    assert L["q_off"] % 4 and L["ld_qkv"] % 4, "this case needs a layout the host would refuse"
+    ld_out, out_off = Hv * Dv + 9, 4
+    params = dict(B=B, T=T, Hk=Hk, Hv=Hv, Dv=Dv, ld_qkv=L["ld_qkv"], q_off=L["q_off"], k_off=L["k_off"],
+                  v_off=L["v_off"], ld_ab=L["ld_ab"], a_off=L["a_off"], b_off=L["b_off"], ld_out=ld_out,
+                  out_off=out_off, state_bstride=Hv * DK * Dv, flags=2)
+    inputs = {k_: L[k_] for k_ in ("qkv", "ab", "a_log", "dt_bias")}
+    outs = {"out": ("f32", B * T * ld_out), "state_out": ("f32", B * Hv * DK * Dv)}
+    expect_refusal(kernel, params, inputs, outs, "not float4-aligned",
+                   f"{kernel} at q_off {L['q_off']}, ld {L['ld_qkv']}")
 
 
 def case_chunk_ws(seed):
@@ -1487,6 +1556,7 @@ CASES = [
     ("config_2b_simd_recurrent", lambda: [case_gdn(k, 2, 2, 16, 16, 128, 135, state_mode="snapshot")
                                           for k in SIMD_KERNELS]),
     ("simd_recurrent_in_place", lambda: [case_recurrent_in_place(114, k) for k in SIMD_KERNELS]),
+    ("vec_misaligned_refused", case_vec_misaligned_refused),
     ("gated_norm", lambda: [case_gated_norm(bf, 15) for bf in (False, True)]),
     ("qk_norm_rope", lambda: case_qk_norm_rope(16)),
     ("qk_rope_posbuf", lambda: case_qk_rope_posbuf(29)),

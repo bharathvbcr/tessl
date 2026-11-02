@@ -24,7 +24,7 @@
 //!   larger than memory is legitimate there — but tessl's readers hand whole
 //!   tensors to host code, so a pre-check fits them. The budget, its wording
 //!   and the per-read allocation check are all computed by
-//!   [`plain::check_payload_budget`], still the one owner shared with the
+//!   `plain::check_payload_budget`, still the one owner shared with the
 //!   `.npy` reader.
 //!
 //! What this module no longer contains is the parser: about 950 lines of

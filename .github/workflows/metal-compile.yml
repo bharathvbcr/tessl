@@ -6,6 +6,11 @@ name: Metal compile
 # does. It compiles and links, and runs nothing on a GPU, so it can check a
 # branch whose kernels have never met a Metal compiler without putting them on
 # anyone's hardware.
+#
+# Like every cargo job in ci.yml, this one needs the sibling ojas checkout: the
+# `ojas-core` / `ojas-io` path dependencies in Cargo.toml are resolved before
+# build.rs ever shells out to `xcrun metal`. The layout and OJAS_REF are ci.yml's;
+# that file's header explains them.
 on:
   push:
     paths:
@@ -26,6 +31,10 @@ on:
       - "Cargo.lock"
       - ".github/workflows/metal-compile.yml"
   workflow_dispatch:
+    inputs:
+      ojas_ref:
+        description: ojas ref
+        default: main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,17 +42,30 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  OJAS_REF: ${{ inputs.ojas_ref || 'main' }}
 
 jobs:
   compile:
     name: Metal 4 compile + link (no GPU)
     runs-on: macos-26
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code/research/tessl
 
       - name: Report the toolchain
         run: |

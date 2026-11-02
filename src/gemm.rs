@@ -104,7 +104,7 @@ pub(crate) const GEMM_VIEW_ALIGN: usize = 16;
 /// Refuse an operand view that does not start on [`GEMM_VIEW_ALIGN`]. The
 /// error names the public entry point and the operand.
 fn require_view_alignment(t: &Tensor, entry: &str, operand: &str) -> Result<(), String> {
-    if t.byte_offset % GEMM_VIEW_ALIGN != 0 {
+    if !t.byte_offset.is_multiple_of(GEMM_VIEW_ALIGN) {
         return Err(format!(
             "{entry}: operand {operand} byte_offset {} is not {GEMM_VIEW_ALIGN}-byte aligned \
              (every GEMM operand view must start on a {GEMM_VIEW_ALIGN}-byte boundary)",
@@ -585,7 +585,7 @@ fn dispatch_simdgroup(
     n: usize,
     k: usize,
 ) -> Result<(), String> {
-    let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
+    let kernel = if !m.is_multiple_of(16) || !n.is_multiple_of(16) || !k.is_multiple_of(8) {
         "matmul_simdgroup_edges_f32"
     } else {
         GemmBackend::Simdgroup.kernel_name_f32()
@@ -1941,7 +1941,7 @@ fn par_shape(what: &str, (m, n, k): (usize, usize, usize), k_tile: usize, tile: 
     // (16 when M and N are even). The kernel offsets its own pointers, so no
     // binding sees these starts; parallel_bf16_tn_partitions_cover_all_of_k
     // runs k_tile 4 at M = 13, N = 99.
-    if k_tile == 0 || k_tile % 4 != 0 {
+    if k_tile == 0 || !k_tile.is_multiple_of(4) {
         return Err(format!(
             "{what}: a K partition of {k_tile}, not a positive multiple of 4"
         ));
@@ -2656,7 +2656,7 @@ mod tests {
                     let k_tile = tn_par_bf16_k_tile(m, n, k);
                     let scratch = k.div_ceil(k_tile) * (m * n).div_ceil(4) * 4;
                     assert!(scratch <= TN_PAR_MAX_SCRATCH, "({m}, {n}, {k}) at {k_tile}: {scratch}");
-                    assert!(k_tile % 4 == 0 && k_tile >= 256, "({m}, {n}, {k}): {k_tile}");
+                    assert!(k_tile.is_multiple_of(4) && k_tile >= 256, "({m}, {n}, {k}): {k_tile}");
                 }
             }
         }

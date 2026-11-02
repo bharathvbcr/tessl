@@ -855,7 +855,7 @@ fn sharded_index_survives_mutation() {
 fn npy_bytes(version: u8, dict: &str, payload: &[u8]) -> Vec<u8> {
     let prefix = if version == 1 { 10 } else { 12 };
     let mut header = dict.as_bytes().to_vec();
-    while (prefix + header.len() + 1) % 64 != 0 {
+    while !(prefix + header.len() + 1).is_multiple_of(64) {
         header.push(b' ');
     }
     header.push(b'\n');

@@ -8,7 +8,7 @@
 # with "0 passed", and a renamed test then reads as a pass; here
 #   bin    NAME COUNT     the whole integration binary tests/NAME.rs: exactly COUNT tests ran
 #   bins   COUNT          every unit test of the src/bin targets (`--bins`): COUNT in total
-#   lib    FILTER COUNT   `--lib` filtered by name prefix: exactly COUNT tests ran
+#   lib    FILTER COUNT   `--lib` filtered by name substring: exactly COUNT tests ran
 #   exact  lib|BIN NAME.. each NAME run with --exact: exactly as many tests ran as
 #                         names given, so one name that matches nothing fails
 #   ignored BIN NAME      one #[ignore]d test, run on purpose with --ignored --exact: it ran
@@ -18,6 +18,21 @@
 # COUNT is exact, so a deleted or renamed test fails here, and a new one fails here
 # until the manifest is updated; the completeness check finds the ones a list of
 # names would miss. A malformed manifest line fails too.
+#
+# A `lib` FILTER is libtest's own match, which is a substring and not a prefix:
+# `shared::tests::` would also select the tests of a later `foo_shared::tests::`,
+# and a module entry runs every test its filter reaches. That is why a module
+# whose tests are not all device-free is listed under `exact` name by name
+# instead: `lib shared_buf::tests:: 1` would run all 14 of them, 13 of which
+# open a device.
+#
+# Three names below already end with another module's, inert only because
+# those files hold no tests today: `embedgemma2::tests::` also reaches
+# `capi_embedgemma2::tests::`, `json::tests::` reaches `config_json::tests::`,
+# and `media::` reaches `embedgemma2_media::`. One #[test] added to
+# src/capi_embedgemma2.rs therefore arrives under an entry that names
+# embedgemma2, and that is a C-ABI surface where a test may well open a
+# runtime. Check the filter, not the module name, when a count moves.
 #
 # Usage: scripts/hosted_tests.sh [--outside] [MANIFEST]
 #   default    every entry except `outside`, under the sandbox

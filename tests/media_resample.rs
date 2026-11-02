@@ -31,7 +31,9 @@ fn read(name: &str) -> Vec<u8> {
 
 fn f32s(name: &str) -> Vec<f32> {
     read(name)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -56,7 +58,9 @@ fn wav(name: &str) -> (Vec<f32>, usize, u32) {
             rate = u32::from_le_bytes(b[at + 12..at + 16].try_into().unwrap());
         } else if id == b"data" {
             let samples = b[at + 8..at + 8 + len]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
                 .collect();
             return (samples, channels, rate);

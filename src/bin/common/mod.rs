@@ -246,7 +246,7 @@ pub fn require_kernels<'a>(rt: &tessl::GpuRuntime, bin: &str, kernels: impl Into
 /// even rounds, reversed on odd ones, so every arm runs first and last
 /// equally often and a clock that drifts during a round lands on every arm.
 pub fn round_order(round: usize, arms: usize) -> Vec<usize> {
-    if round % 2 == 0 {
+    if round.is_multiple_of(2) {
         (0..arms).collect()
     } else {
         (0..arms).rev().collect()

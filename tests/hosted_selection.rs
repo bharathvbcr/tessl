@@ -161,7 +161,22 @@ fn defined_fns(src: &str) -> HashSet<String> {
 fn without_exempt_calls(body: &str) -> String {
     let mut out = body.to_string();
     for (path, _, _) in DEVICE_MARKER_EXEMPT {
-        out = out.replace(path, "exempt_pure_call");
+        // Only where the path is the whole callee, i.e. followed directly by
+        // `(`. A plain `replace` is a prefix match: it would also blank the
+        // front of a longer name — `…is_event_wait_timeout_and_opens()` — and
+        // hide a device call behind an exemption that never covered it. Anything
+        // else, a bare reference included, is left to be flagged.
+        let mut from = 0;
+        while let Some(i) = out[from..].find(path) {
+            let at = from + i;
+            let after = at + path.len();
+            if out[after..].starts_with('(') {
+                out.replace_range(at..after, "exempt_pure_call");
+                from = at + "exempt_pure_call".len();
+            } else {
+                from = after;
+            }
+        }
     }
     out
 }
@@ -804,7 +819,11 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
     let dir = std::env::temp_dir().join(format!("tessl-hosted-selection-planted-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("src")).unwrap();
-    fs::write(dir.join("src/lib.rs"), "pub mod planted;\npub mod clean;\n").unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod planted;\npub mod clean;\npub mod exempt_edge;\n",
+    )
+    .unwrap();
     fs::write(
         dir.join("src/planted.rs"),
         concat!(
@@ -822,7 +841,27 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
     .unwrap();
     fs::write(
         dir.join("src/clean.rs"),
-        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds_up() {\n        assert_eq!(2 + 2, 4);\n    }\n}\n",
+        concat!(
+            "#[cfg(test)]\nmod tests {\n",
+            "    #[test]\n    fn adds_up() {\n        assert_eq!(2 + 2, 4);\n    }\n",
+            // The exempt call itself, so the exemption is shown to fire.
+            "    #[test]\n    fn calls_the_exempt_pure_function() {\n",
+            "        assert!(!GpuRuntime::is_event_wait_timeout(\"x\"));\n    }\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/exempt_edge.rs"),
+        concat!(
+            // A longer name sharing the exempt path's prefix. The exemption must
+            // not reach it: a prefix match here would blank `GpuRuntime` and
+            // wave a real device call through.
+            "#[cfg(test)]\nmod tests {\n",
+            "    #[test]\n    fn a_longer_name_sharing_the_prefix_is_not_exempt() {\n",
+            "        let _ = GpuRuntime::is_event_wait_timeout_and_then_opens_one(\"x\");\n    }\n",
+            "}\n",
+        ),
     )
     .unwrap();
 
@@ -831,6 +870,8 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
         lib_tests_in(&dir).iter().map(|t| t.path.as_str()).collect::<Vec<_>>(),
         [
             "clean::tests::adds_up",
+            "clean::tests::calls_the_exempt_pure_function",
+            "exempt_edge::tests::a_longer_name_sharing_the_prefix_is_not_exempt",
             "planted::tests::is_clean",
             "planted::tests::opens_a_device",
         ],
@@ -846,7 +887,17 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
         refused("lib planted::tests:: 2\n", check_lib_device_free),
         "a `lib` entry selecting a device-opening test was reported clean"
     );
-    check_lib_device_free("lib clean::tests:: 1\n", &dir);
+    check_lib_device_free("lib clean::tests:: 2\n", &dir);
+
+    // The exemption fires for the exact call form and reaches no further. Both
+    // halves matter: without the first, `lib shared::tests::` is refused for a
+    // test that opens nothing; without the second, the exemption is a prefix
+    // match and a longer name that *does* open a device rides in behind it.
+    assert!(
+        refused("lib exempt_edge::tests:: 1\n", check_lib_device_free),
+        "a longer name sharing the exempt path's prefix was treated as exempt, \
+         which would hide a real device call"
+    );
 
     // And the count: a pin that does not match what the filter selects.
     assert!(
@@ -915,6 +966,11 @@ fn the_device_marker_exemptions_are_still_pure() {
         let stripped = strip_comments(&src);
 
         // One definition, or `fn_body` would be reading whichever came first.
+        // Counted over literal-blanked source, which cannot mistake a `fn x(`
+        // inside a string for a definition; the marker check below stays on
+        // `strip_comments` output, both to match what `device_marker` itself
+        // scans and because keeping string contents is the conservative side
+        // for a check whose job is to refuse the exemption.
         let defined = fn_definitions(&blank_literals(&src), name);
         assert_eq!(
             defined,

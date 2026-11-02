@@ -231,8 +231,8 @@ fn fp8_and_complex_tensors_open_and_read_raw() {
     // span check rejects them before the dtype conversion runs. `F4` at shape
     // [2] is exactly one byte, so it reaches the conversion, which is the
     // case that actually exercises this module's refusal.
-    let h = format!(r#"{{"a":{{"dtype":"F4","shape":[2],"data_offsets":[0,1]}}}}"#);
-    expect_rejected("F4", &h, &[0], "unsupported dtype");
+    let h = r#"{"a":{"dtype":"F4","shape":[2],"data_offsets":[0,1]}}"#;
+    expect_rejected("F4", h, &[0], "unsupported dtype");
     for tag in ["F6_E2M3", "F6_E3M2"] {
         let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[2],"data_offsets":[0,1]}}}}"#);
         expect_rejected(tag, &h, &[0], "is not a whole number of bytes");

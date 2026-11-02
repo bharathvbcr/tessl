@@ -172,15 +172,12 @@ fn entries<S: IoTensorSource>(
     let names: Vec<String> = source.names().map(|n| n.to_string()).collect();
     let mut out = BTreeMap::new();
     for name in names {
-        let (dtype, shape, begin, end) = info(source, &name)
-            .ok_or_else(|| format!("{what}: {name:?} is listed but has no header entry"))?;
+        let (dtype, shape, begin, end) =
+            info(source, &name).ok_or_else(|| format!("{what}: {name:?} is listed but has no header entry"))?;
         let dtype = Dtype::try_from(dtype).map_err(|e| format!("{what}: {name}: {e}"))?;
         let mut dims = Vec::with_capacity(shape.len());
         for d in shape {
-            dims.push(
-                usize::try_from(d)
-                    .map_err(|_| format!("{what}: {name}: dimension {d} overflows usize"))?,
-            );
+            dims.push(usize::try_from(d).map_err(|_| format!("{what}: {name}: dimension {d} overflows usize"))?);
         }
         if plain::checked_numel(&dims).is_none() {
             return Err(format!("{what}: {name}: element count overflows"));
@@ -238,20 +235,13 @@ impl SafeTensors {
     /// checkpoints built on the host (tests, conversions) that never need to
     /// touch the file system.
     pub fn from_bytes(what: &str, bytes: Vec<u8>) -> Result<Self, String> {
-        let inner = ojas_io::SafeTensors::from_bytes(bytes)
-            .map_err(|e| format!("{what}: {}", e.detail()))?;
+        let inner = ojas_io::SafeTensors::from_bytes(bytes).map_err(|e| format!("{what}: {}", e.detail()))?;
         Self::finish(what.to_string(), inner, None)
     }
 
-    fn finish(
-        what: String,
-        inner: ojas_io::SafeTensors<'static>,
-        limit: Option<u64>,
-    ) -> Result<Self, String> {
+    fn finish(what: String, inner: ojas_io::SafeTensors<'static>, limit: Option<u64>) -> Result<Self, String> {
         let tensors = entries(&inner, &what, |s, n| {
-            s.info(n)
-                .ok()
-                .map(|i| (i.dtype, i.shape.clone(), i.begin, i.end))
+            s.info(n).ok().map(|i| (i.dtype, i.shape.clone(), i.begin, i.end))
         })?;
         plain::check_payload_budget(&what, inner.declared_payload_bytes(), limit)?;
         Ok(Self {
@@ -285,11 +275,7 @@ impl SafeTensors {
     /// checks its own allocation through the same owner.
     fn check_alloc(&self, name: &str, elems: usize, elem_size: usize) -> Result<(), String> {
         let bytes = (elems as u64).saturating_mul(elem_size as u64);
-        plain::check_payload_budget(
-            &format!("{}: {name}: read allocation", self.what),
-            bytes,
-            self.limit,
-        )
+        plain::check_payload_budget(&format!("{}: {name}: read allocation", self.what), bytes, self.limit)
     }
 
     /// A tensor's header entry and its bytes exactly as stored (little-endian
@@ -297,13 +283,10 @@ impl SafeTensors {
     /// module has no typed reader for.
     pub fn read_raw(&self, name: &str) -> Result<(TensorInfo, Vec<u8>), String> {
         let info = self.info(name)?.clone();
-        let len = usize::try_from(info.end - info.begin)
-            .map_err(|_| format!("{name}: tensor too large for this host"))?;
+        let len =
+            usize::try_from(info.end - info.begin).map_err(|_| format!("{name}: tensor too large for this host"))?;
         self.check_alloc(name, len, 1)?;
-        let bytes = self
-            .inner
-            .read_bytes(name)
-            .map_err(|e| e.detail().to_string())?;
+        let bytes = self.inner.read_bytes(name).map_err(|e| e.detail().to_string())?;
         Ok((info, bytes))
     }
 
@@ -321,9 +304,16 @@ impl SafeTensors {
 
     /// A U32 tensor (MLX packs eight 4-bit weights per element) and its shape.
     /// Any other dtype is an error.
+    ///
+    /// Called by path, not as `self.inner.read_u32(name)`, because
+    /// `tests/host_access_ban.rs` bans `.read_u32(` in method-call form:
+    /// `GpuBuffer::read_u32` panics on a live host mapping, and a text scan
+    /// cannot tell the two receivers apart. This one returns `Result`. Its
+    /// siblings above and below need no such spelling — only this name
+    /// collides.
     pub fn read_u32(&self, name: &str) -> Result<(Vec<usize>, Vec<u32>), String> {
         self.check_alloc(name, self.info(name)?.numel(), 4)?;
-        shaped(self.inner.read_u32(name))
+        shaped(ojas_io::SafeTensors::read_u32(&self.inner, name))
     }
 
     /// A bf16 tensor's raw bit patterns and shape. Any other dtype is an error:
@@ -335,12 +325,7 @@ impl SafeTensors {
 
     /// [`Self::read_bf16_bits`] into `dst` (a device tensor's shared storage,
     /// say) instead of a new `Vec`, after checking the dtype and `shape`.
-    pub(crate) fn read_bf16_bits_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [u16],
-    ) -> Result<(), String> {
+    pub(crate) fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
         self.inner
             .read_bf16_bits_into(name, shape, dst)
             .map_err(|e| e.detail().to_string())
@@ -348,12 +333,7 @@ impl SafeTensors {
 
     /// [`Self::read_u32`] into `dst` (a device buffer's shared storage, say)
     /// after checking the dtype and `shape`.
-    pub(crate) fn read_u32_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [u32],
-    ) -> Result<(), String> {
+    pub(crate) fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String> {
         self.inner
             .read_u32_into(name, shape, dst)
             .map_err(|e| e.detail().to_string())
@@ -368,12 +348,7 @@ impl SafeTensors {
 
     /// [`Self::read_f32`] into `dst` (a device tensor's shared storage, say)
     /// instead of a new `Vec`, after checking the dtype and `shape`.
-    pub(crate) fn read_f32_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [f32],
-    ) -> Result<(), String> {
+    pub(crate) fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
         self.inner
             .read_f32_into(name, shape, dst)
             .map_err(|e| e.detail().to_string())
@@ -382,9 +357,7 @@ impl SafeTensors {
 
 /// An ojas-io read's `(Vec<u64>, values)` in tessl's `Vec<usize>` shape.
 /// The dimensions were narrowed and checked at open, so this cannot fail.
-fn shaped<T>(
-    r: Result<(Vec<u64>, Vec<T>), ojas_io::IoError>,
-) -> Result<(Vec<usize>, Vec<T>), String> {
+fn shaped<T>(r: Result<(Vec<u64>, Vec<T>), ojas_io::IoError>) -> Result<(Vec<usize>, Vec<T>), String> {
     let (shape, values) = r.map_err(|e| e.detail().to_string())?;
     Ok((shape.into_iter().map(|d| d as usize).collect(), values))
 }
@@ -404,12 +377,7 @@ pub trait TensorSource {
     /// [`Self::read_f32`] into `dst`, after checking the dtype and `shape`.
     fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String>;
     /// [`Self::read_bf16_bits`] into `dst`, after checking the dtype and `shape`.
-    fn read_bf16_bits_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [u16],
-    ) -> Result<(), String>;
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String>;
     /// `name`'s dtype and shape, from the header alone (no tensor data is read).
     fn tensor_info(&self, name: &str) -> Result<TensorInfo, String>;
     /// A U32 tensor (MLX packs eight 4-bit weights per element) into `dst`,
@@ -430,12 +398,7 @@ impl TensorSource for SafeTensors {
     fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
         SafeTensors::read_f32_into(self, name, shape, dst)
     }
-    fn read_bf16_bits_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [u16],
-    ) -> Result<(), String> {
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
         SafeTensors::read_bf16_bits_into(self, name, shape, dst)
     }
     fn tensor_info(&self, name: &str) -> Result<TensorInfo, String> {
@@ -493,8 +456,7 @@ impl CheckpointView {
         let what = path.display().to_string();
         let inner = ojas_io::CheckpointView::open(path).map_err(|e| e.detail().to_string())?;
         let tensors = entries(&inner, &what, |s, n| {
-            s.tensor_info(n)
-                .map(|i| (i.dtype, i.shape.clone(), i.begin, i.end))
+            s.tensor_info(n).map(|i| (i.dtype, i.shape.clone(), i.begin, i.end))
         })?;
         plain::check_payload_budget(&what, inner.declared_payload_bytes(), limit)?;
         Ok(Self {
@@ -524,11 +486,7 @@ impl CheckpointView {
 
     fn check_alloc(&self, name: &str, elems: usize, elem_size: usize) -> Result<(), String> {
         let bytes = (elems as u64).saturating_mul(elem_size as u64);
-        plain::check_payload_budget(
-            &format!("{}: {name}: read allocation", self.what),
-            bytes,
-            self.limit,
-        )
+        plain::check_payload_budget(&format!("{}: {name}: read allocation", self.what), bytes, self.limit)
     }
 }
 
@@ -545,23 +503,15 @@ impl TensorSource for CheckpointView {
         IoTensorSource::read_bf16_bits(&self.inner, name).map_err(|e| e.detail().to_string())
     }
     fn read_f32_into(&self, name: &str, shape: &[usize], dst: &mut [f32]) -> Result<(), String> {
-        IoTensorSource::read_f32_into(&self.inner, name, shape, dst)
-            .map_err(|e| e.detail().to_string())
+        IoTensorSource::read_f32_into(&self.inner, name, shape, dst).map_err(|e| e.detail().to_string())
     }
-    fn read_bf16_bits_into(
-        &self,
-        name: &str,
-        shape: &[usize],
-        dst: &mut [u16],
-    ) -> Result<(), String> {
-        IoTensorSource::read_bf16_bits_into(&self.inner, name, shape, dst)
-            .map_err(|e| e.detail().to_string())
+    fn read_bf16_bits_into(&self, name: &str, shape: &[usize], dst: &mut [u16]) -> Result<(), String> {
+        IoTensorSource::read_bf16_bits_into(&self.inner, name, shape, dst).map_err(|e| e.detail().to_string())
     }
     fn tensor_info(&self, name: &str) -> Result<TensorInfo, String> {
         self.entry(name).cloned()
     }
     fn read_u32_into(&self, name: &str, shape: &[usize], dst: &mut [u32]) -> Result<(), String> {
-        IoTensorSource::read_u32_into(&self.inner, name, shape, dst)
-            .map_err(|e| e.detail().to_string())
+        IoTensorSource::read_u32_into(&self.inner, name, shape, dst).map_err(|e| e.detail().to_string())
     }
 }

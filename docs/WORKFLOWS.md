@@ -19,6 +19,7 @@ Tessl enforces a multi-stage testing pipeline designed to fail fast on syntax an
 
 | Tier | Gate | Scope | Command | Hardware Req |
 |---|---|---|---|---|
+| **Tier 0** | Fast Inner Loop (< 15s) | Incremental check, optional clippy, targeted unit test | `./scripts/dev_fast_check.sh [test_filter]` (`--check-only`, `--clippy`) | Host / serialized 1-thread (< 15s) |
 | **Tier 1** | Fast Formatting & Compile | Workspace compile & clippy | `cargo check --all-targets && cargo clippy --release --all-targets -- -D warnings` | Host only (< 15s) |
 | **Tier 2** | Device-Free Hosted Tests | Tests run under sandbox denying IOKit (`scripts/hosted_tests.sh`) | `./scripts/hosted_tests.sh` | Host only (< 30s) |
 | **Tier 3** | Metal Dialect & IR Check | MSL syntax, fast-math bounds, no Inf/NaN constants | `./scripts/check_kernel_ir.sh` | Metal toolchain |

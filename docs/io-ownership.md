@@ -96,9 +96,16 @@ behaviour and is now
 `header_amplification_is_refused_not_merely_bounded`: it pins the refusal, that
 the refusal costs no large allocation, and that a header below the budget still
 reads. That is a harder bound than the ratio check it replaced, which is the
-property the test was reaching for — but it is a real narrowing of what this
-crate can load, and it is the one thing in this change that wants the owner's
-eye.
+property the test was reaching for.
+
+**Ratified by the owner on 2026-11-02: keep the bound.** It is a real
+narrowing of what this crate can load, which is why it was put to the owner
+rather than recorded as a detail; the answer is that the reader both
+repositories go through stays the stricter of the two. Loosening it later is a
+decision about `ojas-io`'s `JsonLimits`, not about this adapter, and
+`ojas-io/tests/stream_writer.rs` will have to agree with whatever it becomes —
+it refuses layouts the reader would refuse, which is what made the 32x
+alternative fail.
 
 ## Verified by running
 

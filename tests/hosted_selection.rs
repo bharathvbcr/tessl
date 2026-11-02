@@ -821,6 +821,25 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
     );
     check_lib_counts("lib planted::tests:: 2\n", &dir);
 
+    // Substring, not prefix. `ted::tests::` is a prefix of nothing, yet libtest
+    // would select both planted tests with it, because a bare filter matches
+    // anywhere in the path. Pinned here so that "tidying" the resolver to
+    // `starts_with` fails rather than quietly scanning a smaller set than the
+    // gate runs — the same shape as the planted entries above, making the
+    // wiring's assumption explicit instead of incidental.
+    assert_eq!(
+        lib_tests_matching(&lib_tests_in(&dir), "ted::tests::")
+            .iter()
+            .map(|t| t.path.as_str())
+            .collect::<Vec<_>>(),
+        ["planted::tests::is_clean", "planted::tests::opens_a_device"],
+        "a filter that is a prefix of nothing selected nothing: this is matching by prefix"
+    );
+    assert!(
+        refused("lib ted::tests:: 2\n", check_lib_device_free),
+        "a device test reached by a mid-path filter was reported clean"
+    );
+
     // The `exact` arm, through its own manifest loop rather than the scanner.
     fs::create_dir_all(dir.join("tests")).unwrap();
     fs::write(

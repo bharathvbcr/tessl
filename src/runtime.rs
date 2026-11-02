@@ -2091,7 +2091,10 @@ impl GpuRuntime {
         if self.poison.is_set() {
             return Err(self.poison.error());
         }
-        let Some(b) = self.device.newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared) else {
+        let Some(b) = self
+            .device
+            .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
+        else {
             return Err(new_buffer_failed_message(nbytes));
         };
         self.register_residency(&b);

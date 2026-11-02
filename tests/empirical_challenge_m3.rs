@@ -24,7 +24,9 @@ fn challenge_shared_buf_to_gpu_buffer_lifecycle() {
         let shared = alloc.shared_buf();
 
         // 1. Verify to_gpu_buffer returns Some(GpuBuffer)
-        let gpu_buf = shared.to_gpu_buffer().expect("to_gpu_buffer must return Some for pooled alloc");
+        let gpu_buf = shared
+            .to_gpu_buffer()
+            .expect("to_gpu_buffer must return Some for pooled alloc");
         assert_eq!(gpu_buf.nbytes(), nbytes);
 
         // 2. Write data via host_write on MappedBuffer trait

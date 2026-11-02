@@ -1194,23 +1194,58 @@ mod adversarial {
         }
     }
 
-    /// Text-to-structure amplification is linear and bounded: 5M `0` dims
-    /// (10 MB) make one allocation of about 27x the input (the `Json` array),
-    /// well inside the harness's 64x bound but worth pinning, since a 100 MB
-    /// header reaches the same ratio. A growth in node size shows up here.
+    /// Text-to-structure amplification is bounded by a refusal, not by a
+    /// ratio this reader happens to land on.
+    ///
+    /// This used to assert that 5M `0` dims (10 MB) were *read*, with one
+    /// allocation of about 27x the input, "well inside the harness's 64x
+    /// bound but worth pinning". That was the right property to care about
+    /// and the wrong way to hold it: the reader built the tree and the test
+    /// checked afterwards that it had not grown too much.
+    ///
+    /// ojas-io's reader, which owns the parse since the owner put IO in ojas
+    /// (2026-11-01), budgets the tree as it builds it — `8 * input + 64 KiB` —
+    /// and refuses a header that would exceed it. A dimension-dense header
+    /// builds about sixteen tree bytes per input byte, so the two cross at
+    /// about 8 KiB of dimension text: measured at 4,099 dimensions / an
+    /// 8,257-byte header, pinned in
+    /// `ojas-io/tests/header_amplification.rs`. This reader is therefore
+    /// narrower than it was, deliberately, and the amplification bound is now
+    /// a hard one.
+    ///
+    /// What is given up is the ability to open a header made almost entirely
+    /// of shape dimensions. Nothing writes one: a header's bytes are mostly
+    /// tensor names and dtype tags, real tensors have rank 5 at most, and the
+    /// 2B's whole header is about 90 KB — the companion test there opens a
+    /// 630-tensor header to keep that honest. What is gained is that a
+    /// hostile header cannot make the reader allocate at all, which is the
+    /// property this test was reaching for.
     #[test]
-    fn header_amplification_is_pinned() {
+    fn header_amplification_is_refused_not_merely_bounded() {
         let dims = vec!["0"; 5_000_000].join(",");
         let h = format!(r#"{{"x":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#);
         let b = st_bytes(&h, 0);
         let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+        assert!(o.violations.is_empty(), "{:?}", o.violations);
+        assert!(!o.ok, "a 10 MB dimension-dense header must be refused");
+        let e = o.err.as_deref().unwrap_or("");
+        assert!(e.contains("byte budget exceeded"), "{e}");
+        // The refusal costs no large allocation: the tree is abandoned at the
+        // budget, so the biggest thing allocated is the header text itself.
         let max = MAX_ALLOC.with(Cell::get);
-        assert!(o.ok && o.violations.is_empty(), "{:?} {:?}", o.err, o.violations);
         assert!(
             max <= 32 * b.len(),
             "single allocation {max} B for a {} B header",
             b.len()
         );
+
+        // A header below the budget still reads, so this is a bound and not a
+        // blanket refusal of dimensions.
+        let dims = vec!["0"; 1_000].join(",");
+        let h = format!(r#"{{"x":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#);
+        let b = st_bytes(&h, 0);
+        let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+        assert!(o.ok && o.violations.is_empty(), "{:?} {:?}", o.err, o.violations);
     }
 
     /// JSON number edges under the config syntax: huge exponent is a named

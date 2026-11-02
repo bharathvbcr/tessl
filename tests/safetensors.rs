@@ -221,10 +221,26 @@ fn fp8_and_complex_tensors_open_and_read_raw() {
     }
     // Not widened by a reader that does not know the format.
     assert!(st.read_f32("e4m3").unwrap_err().contains("cannot read F8E4M3"));
-    // The sub-byte types stay refused: their sizes are not whole bytes.
-    for tag in ["F4", "F6_E2M3", "F6_E3M2"] {
+    // The sub-byte types stay refused, which is this module's contract and
+    // not the reader's: `Dtype` has no variant for them and `TryFrom<StDtype>`
+    // errors on all three, so a checkpoint naming one cannot be opened here.
+    //
+    // Two of the three are refused earlier and in other words. ojas-io sizes
+    // sub-byte dtypes from their bit width and refuses a span that is not
+    // bit-exact, and `F6_E2M3`/`F6_E3M2` at shape [2] are twelve bits, so the
+    // span check rejects them before the dtype conversion runs. `F4` at shape
+    // [2] is exactly one byte, so it reaches the conversion, which is the
+    // case that actually exercises this module's refusal.
+    let h = format!(r#"{{"a":{{"dtype":"F4","shape":[2],"data_offsets":[0,1]}}}}"#);
+    expect_rejected("F4", &h, &[0], "unsupported dtype");
+    for tag in ["F6_E2M3", "F6_E3M2"] {
         let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[2],"data_offsets":[0,1]}}}}"#);
-        expect_rejected(tag, &h, &[0], "unsupported dtype");
+        expect_rejected(tag, &h, &[0], "is not a whole number of bytes");
+    }
+    // And a bit-exact span of either is refused by the dtype, not the span.
+    for tag in ["F6_E2M3", "F6_E3M2"] {
+        let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[4],"data_offsets":[0,3]}}}}"#);
+        expect_rejected(tag, &h, &[0, 0, 0], "unsupported dtype");
     }
 }
 
@@ -295,7 +311,8 @@ fn header_length_is_bounded_by_the_file_and_the_cap() {
     let past = h.len() as u64 + data.len() as u64 + 1;
     assert!(open_err(raw("past", past, h, &data)).contains("past the end"));
     // One byte short of the header: the JSON is cut and fails to parse.
-    assert!(open_err(raw("cut", h.len() as u64 - 1, h, &data)).contains("header JSON"));
+    // The needle was "header JSON"; the parser now says which token it wanted.
+    assert!(open_err(raw("cut", h.len() as u64 - 1, h, &data)).contains("expected ',' or '}'"));
 }
 
 #[test]
@@ -317,15 +334,20 @@ fn json_outside_the_formats_subset_is_rejected() {
         (
             "neg",
             r#"{"a":{"dtype":"F32","shape":[-1],"data_offsets":[0,4]}}"#,
-            "unsupported JSON value",
+            // was "unsupported JSON value": the grammar admits the negative
+            // number and the schema walk refuses it where an unsigned
+            // dimension belongs.
+            "non-integer",
         ),
         (
             "lead0",
             r#"{"a":{"dtype":"F32","shape":[01],"data_offsets":[0,4]}}"#,
             "leading zero",
         ),
-        ("null", r#"{"a":null}"#, "unsupported JSON value"),
-        ("bool", r#"{"a":true}"#, "unsupported JSON value"),
+        // was "unsupported JSON value" for both: the value is refused at the
+        // position it sits in, which is where a tensor entry belongs.
+        ("null", r#"{"a":null}"#, "entry is not an object"),
+        ("bool", r#"{"a":true}"#, "entry is not an object"),
         (
             "u64",
             r#"{"a":{"dtype":"F32","shape":[18446744073709551616],"data_offsets":[0,4]}}"#,
@@ -441,7 +463,9 @@ fn entries_must_be_exactly_dtype_shape_and_offsets() {
         (
             "dtype_name",
             r#"{"a":{"dtype":"F8","shape":[1],"data_offsets":[0,4]}}"#,
-            "unsupported dtype",
+            // was "unsupported dtype": an unknown tag is now refused by the
+            // reader that owns the tag table, and it names the table.
+            "unknown dtype \"F8\"",
         ),
         ("entry_type", r#"{"a":"F32"}"#, "not an object"),
         ("meta_type", r#"{"__metadata__":[1]}"#, "__metadata__ is not an object"),
@@ -478,20 +502,26 @@ fn offsets_must_match_the_shape_and_tile_the_data_exactly() {
             "overlap",
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[2,6]}}"#,
             &d8[..6],
-            "no gap or overlap",
+            // was "no gap or overlap"; the new message also names the tensor
+            // and the byte it should have started at.
+            "gap or overlap",
         ),
         (
             "gap",
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"U8","shape":[2],"data_offsets":[6,8]}}"#,
             &d8,
-            "no gap or overlap",
+            // was "no gap or overlap"
+            "gap or overlap",
         ),
         ("unindexed", ONE_F32, &d8, "cover 4 of 8"),
         (
             "numel",
             r#"{"a":{"dtype":"U8","shape":[4294967296,4294967296],"data_offsets":[0,0]}}"#,
             &[],
-            "element count overflows",
+            // was "element count overflows": the product is refused by the
+            // reader while it validates the span, before this module sees the
+            // entry at all.
+            "shape product overflows",
         ),
         (
             "bytes",

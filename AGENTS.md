@@ -17,13 +17,14 @@ Two sibling checkouts are path dependencies and must exist for any build:
 
 - **Metal 4 Only:** Built strictly on Metal 4 primitives (`MTL4CommandBuffer`, `MTL4ComputeCommandEncoder`, `MTL4ArgumentTable`, `MTLResidencySet`). Legacy `MTLCommandQueue` and command buffer paths are deliberately absent.
 - **Zero Host Wait:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
-- **Unified Memory Safety via `SharedBuf`:** `SharedBuf` (`src/shared_buf.rs`) implements `ojas_core::MappedBuffer` over pooled `StorageModeShared` allocations. Host access acquires RAII leases (`HostLease`, `HostLeaseMut`) synchronized with GPU completion stamps (`last_use`, `last_write`) on the `Timeline`. Leases prevent concurrent GPU binds (`FenceError::Busy`). Memory allocations are tracked under `ojas_core::Budget` with `BudgetTrimHandler` clearing freelist caches under memory pressure.
-- **No Generic Training Logic:** Optimizer scalar formation, gradient clipping policy, learning-rate schedules, loss scaling, checkpoint schemas, and autograd tape live in `ojas`. A step is driven through `ojas-model::TapeStepProvider`.
+- **Unified Memory Safety via `SharedBuf`:** `SharedBuf` (`src/shared_buf.rs`) implements `ojas_core::MappedBuffer` over pooled `StorageModeShared` allocations and exposes `SharedBuf::to_gpu_buffer()` for zero-copy device buffer adoption. Host access acquires RAII leases (`HostLease`, `HostLeaseMut`) synchronized with GPU completion stamps (`last_use`, `last_write`) on the `Timeline`. Leases prevent concurrent GPU binds (`FenceError::Busy`). Memory allocations are tracked under `ojas_core::Budget` (`PoolLedger` in `src/pool_ledger.rs`) with `BudgetTrimHandler` clearing freelist caches under memory pressure.
+- **No Generic Training or IO Logic:** Optimizer scalar formation (`ojas_core::AdamWScalars`), gradient clipping policy, learning-rate schedules, loss scaling, checkpoint/safetensors/JSON/NPY schemas (`ojas-io`), and autograd tape live in `ojas`. `src/lib.rs` re-exports `ojas_io::{npy, safetensors}` and `src/qwen35_adamw.rs` delegates scalars to `ojas_core::AdamWScalars::new`. A training step is driven through `ojas-model::TapeStepProvider`.
 - **Fail-Closed Verification:** Entry points validate extents, bounds, and dtypes before command encoding (`validate_gemm`, `nn::require`). Failures return typed errors or descriptive error messages; they never fail silently or corrupt GPU state.
 
 ## Testing & Verification
 
 ```sh
+./scripts/dev_fast_check.sh          # <15s fast inner loop (check + unit tests; --check-only or --clippy)
 cargo test --release -- --test-threads=1
 cargo check
 ```

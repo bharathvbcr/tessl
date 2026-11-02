@@ -11,7 +11,7 @@ Comprehensive architectural references, kernel documentation, benchmarks, and pl
 | [**tessl's role**](architecture.md#tessls-role-metal-extension-of-ojas-and-the-mac-inference-engine) | Metal extension of ojas and the Mac inference engine: what tessl owns, what it should not grow, how ojas uses it, and the open decision on its Qwen3.5 training. Target versus current. |
 | [**Architecture**](architecture.md) | Deep dive into Metal 4 execution, kernel selection, cooperative destination register accumulation, memory hierarchies, and tile swizzling. |
 | [**Benchmarking**](benchmarking.md) | Measurement methodology, paired sweep protocol, thermal and clock drift mitigations, and performance comparison against PyTorch MPS and MLX. |
-| [**IO ownership**](io-ownership.md) | Owner decision of 2026-11-01: ojas owns safetensors IO, so `src/safetensors.rs` is an adapter over `ojas_io::safetensors` with no parser of its own. What the adapter keeps and why, and the one input it no longer loads. |
+| [**IO ownership**](io-ownership.md) | Owner decision of 2026-11-01 (completed in Milestone M2, 2026-11-02): ojas owns safetensors, JSON, and NPY IO. `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` are retired in full; `src/lib.rs` re-exports `ojas_io::{npy, safetensors}` and `src/config_json.rs` consumes `ojas_io::json`. |
 | [**Verification**](verification.md) | Correctness guarantees: static tile geometry audits, shape fuzzing, CPU emulation (`tools/msl_emu`), and numerical parity ladders. |
 
 ---

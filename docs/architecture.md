@@ -95,83 +95,43 @@ pool for CPU and GPU on unified memory. So, in tessl:
   typed-error taxonomy that duplicates `ojas-core`. Where ojas needs a
   typed allocation failure, the owner of the allocator (tessl) exposes a typed
   error and ojas maps it; ojas should not have to match message text.
-- **No second safetensors parser.** Decided by the owner on 2026-11-01: ojas
-  owns safetensors IO and checkpoints, and `ojas_io::safetensors` is the
-  canonical reader. tessl's `safetensors` module is a thin adapter over it —
-  its own 950-line parser is deleted — keeping only what is tessl's: the
-  `String`-error, `Vec<usize>`-shape surface its loaders call, a 19-variant
-  `Dtype` that refuses the sub-byte floats through `TryFrom<StDtype>`, and the
-  physical-memory payload default. The header grammar, offset validation,
-  tiling, positioned reads, the file-identity re-check and the index bound are
-  ojas-io's. See [`io-ownership.md`](io-ownership.md).
+- **No second safetensors, JSON, or NPY parser.** Decided by the owner on 2026-11-01
+  and completed in Milestone M2 on 2026-11-02: ojas owns safetensors, JSON, and NPY IO
+  and checkpoints (`ojas_io::safetensors`, `ojas_io::json`, `ojas_io::npy`). tessl's
+  `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` (-1,645 LOC) are
+  deleted in full: `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly
+  and `src/config_json.rs` consumes `ojas_io::json::{JsonValue, JsonLimits}`. See
+  [`io-ownership.md`](io-ownership.md).
 - **No portable-backend abstractions.** tessl is Metal and macOS only. The
   `Backend` trait, the CPU, wgpu, CUDA and HIP paths and anything that must
   build off macOS live in ojas.
 
 ### How ojas uses tessl
 
-**Current (verified in the ojas tree on 2026-10-31).**
+**Current (verified in the ojas and tessl trees on 2026-11-02 after Milestones M1–M5).**
 
-- `ojas-metal` takes tessl as an optional path dependency
-  (`metal = ["dep:tessl"]`, `../../tessl`). Its `MetalBackend` runs ojas
-  `Backend` ops on a dedicated device thread that owns a tessl `GpuRuntime`
-  (that runtime is deliberately `!Send` and `!Sync`; see
-  [Runtime Access Lease](#runtime-access-lease)). It adds its own metallib to
-  that runtime (`add_metallib_bytes`) and allocates its buffers through tessl's
-  pool.
-- `ojas-qwen35` depends on tessl by path, builds only on macOS, and is not an
-  ojas `Backend`. It runs tessl's Qwen3.5 training step as one provider-level
-  unit, and puts ojas types (`Tensor`, `Budget`, `check_adamw`, `next_step`,
-  `clip_scale`) around it.
-- tessl does not depend on ojas (`Cargo.toml` has no ojas entry), and declares
-  `links = "tessl"`, so every crate in one build, ojas's included, must resolve
-  to a single tessl source.
-- The two repositories do not yet share a runtime or a pool. ojas-metal
-  (`device.rs`, `gpu.rs`) and ojas-qwen35 (`step.rs`) each call
-  `GpuRuntime::new()`, so one process can hold several runtimes, each with its
-  own queue, pool and pipeline cache. ojas `Budget` counts requested bytes and
-  refuses; tessl's pool counts bucketed bytes and does not refuse.
-
-**Target (not implemented).**
-
-- One shared runtime and one allocator handle per process, created once, so the
-  ojas CPU backend and every Metal consumer draw from one pool on unified
-  memory, with ojas `Budget` charging the same bytes the pool holds.
-- Duplicated Metal kernels (for example the several AdamW, RMSNorm and softmax
-  implementations across the two repositories) converge on one owner per
-  behavior. The numeric contracts differ today (ojas builds with safe math and
-  a fixed reduction order for `Numerics::Exact`; tessl builds with fast math
-  and tree reductions), so a shared kernel needs an explicit decision about
-  which tier it serves.
-- A typed allocation error from tessl in place of string matching.
-
-None of the target items is promised on a date. They are the direction of the
-unification work, and each needs its own measured, tested change.
-
-### Open decision: the future of tessl's Qwen3.5 training
-
-**Current.** tessl contains a complete hand-written Qwen3.5 training step:
-`src/qwen35_train.rs` (4,725 lines), `src/qwen35_bwd.rs` (988) and
-`src/qwen35_adamw.rs` (1,518), with `gdn_train.rs`, `attn_train.rs` and
-`cross_entropy.rs` beneath them. It is what `ojas-qwen35` and the
-`tessl_torch` binding drive today, and [qwen35.md](qwen35.md) holds its
-measurements.
-
-**Open.** It overlaps the ojas goal in two ways: it is a second backward
-strategy (a hand-written per-layer pass with activation recompute, against
-ojas's `Tape` of `Backend` ops), and its AdamW is one of several
-implementations of the same math. Whether this code stays in tessl as a model
-provider, moves its generic parts (optimizer scalars, clipping, grouping) to
-ojas and keeps only the kernels, or is replaced by ojas's `Tape` over tessl
-kernels, is **an open decision under review, not settled**. Until it is
-decided:
-
-- Do not delete or rewrite these files for the sake of unification.
-- Do not add new training features here that ojas would also need (a new
-  optimizer, a new schedule); put them in ojas and call down to tessl kernels.
-- Keep the kernels, tests and bindings working. The measurements in
-  [qwen35.md](qwen35.md) remain the baseline any replacement is judged
-  against.
+- `ojas-metal` takes tessl as a path dependency on macOS (`metal = ["dep:tessl"]`). Its
+  `MetalBackend` runs ojas `Backend` ops on a dedicated device thread that owns a tessl
+  `GpuRuntime` (that runtime is deliberately `!Send` and `!Sync`; see
+  [Runtime Access Lease](#runtime-access-lease)). It adds its own metallib to that runtime
+  (`add_metallib_bytes`) and allocates its buffers through tessl's pool.
+- **Unified Memory & Shared Pool Ledger (`SharedBuf` and `PoolLedger`):** `src/shared_buf.rs`
+  implements `ojas_core::MappedBuffer` over pooled `StorageModeShared` Metal buffers, guarded
+  by per-buffer commit timeline fences (`src/runtime/host_fence.rs`, `last_use` / `last_write`)
+  and RAII host leases (`HostLease`, `HostLeaseMut`), plus `SharedBuf::to_gpu_buffer()` so
+  `ojas-metal`'s `Backend::upload` adopts a mapped `SharedBuf` directly into its device buffer
+  table with zero byte copies (`mem_after == mem_before`). `src/pool_ledger.rs` (`PoolLedger`)
+  wires `tessl`'s `BufferPool` directly to `ojas_core::Budget`, trimming freelist caches under
+  memory pressure (`BudgetTrimHandler`) and mapping pool capacity refusals to
+  `OjasError::CapacityExceeded`.
+- **Single-Owner Training (`TapeStepProvider` & ABI 14):** Under ABI 14, standalone whole-step
+  Qwen3.5 training (`src/qwen35_train.rs`), gradient banks, and the standalone AdamW optimizer
+  object were retired from tessl into ojas's `Tape` (`ojas_model::qwen35::TapeStepProvider`).
+  `src/qwen35_adamw.rs` retains only the per-op f32 kernel launcher (`adamw_step`) and delegates
+  bias-correction and weight-decay scalar computation to `ojas_core::AdamWScalars::new`.
+- `tessl` depends on `ojas-core` (for HAL traits and `AdamWScalars`) and `ojas-io` (for
+  `safetensors`, `json`, and `npy`), and declares `links = "tessl"`, so every crate in one build
+  resolves to a single tessl source.
 
 ---
 

@@ -8,6 +8,12 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Removed
 
+- **Duplicate `safetensors`, `json`, `npy`, and `plain` parsers (-1,645 LOC)** (`src/lib.rs`,
+  `src/config_json.rs`, `docs/io-ownership.md`). Completed Milestone M2 IO unification:
+  deleted `src/safetensors.rs` (517 lines), `src/json.rs` (482 lines), `src/npy.rs` (599 lines),
+  and `src/plain.rs` (47 lines). `src/lib.rs` now re-exports `pub use ojas_io::{npy, safetensors};`
+  directly, `src/config_json.rs` parses model configs via `ojas_io::json::{JsonValue, JsonLimits}`,
+  and `src/qwen35_adamw.rs` delegates AdamW step scalar formation to `ojas_core::AdamWScalars::new`.
 - **DO-NOT-MERGE-BEFORE-AB: the Qwen3.5 training step, its host AdamW and the 13 training C-ABI
   symbols (ABI 13 -> 14).** Owner decision D5: ojas owns Metal training (the Tape over
   `ojas-metal`); tessl keeps the kernels and their per-op launchers. Removed: `qwen35_train`

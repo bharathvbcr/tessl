@@ -1,6 +1,6 @@
-# Decision: ojas owns safetensors IO; tessl's reader is an adapter
+# Decision: ojas owns safetensors, JSON, and NPY IO; tessl re-exports ojas-io
 
-Owner decision, 2026-11-01. The ojas side of this record is
+Owner decision, 2026-11-01 (completed in Milestone M2, 2026-11-02). The ojas side of this record is
 [`ojas/docs/io-ownership.md`](https://github.com/bharathvbcr/ojas/blob/main/docs/io-ownership.md),
 which carries the full evidence; this is the same decision stated from tessl's
 side. It is the IO slice of the ownership split: ojas is the training framework
@@ -11,14 +11,17 @@ inference engine.
 
 `src/safetensors.rs` held a complete, strict `.safetensors` parser — 950 lines
 of header grammar, offset validation, tiling checks, index parsing and
-positioned reads. ojas-io had another one. The two were kept in step by hand.
+positioned reads — alongside standalone parsers in `src/json.rs` (482 lines),
+`src/npy.rs` (599 lines), and `src/plain.rs` (47 lines). `ojas-io` had its own
+copies.
 
-That parser is **deleted**. `src/safetensors.rs` is now a **517-line** adapter
-over `ojas_io::safetensors`, and across the three source files touched the
-change is **295 insertions against 663 deletions — a net 368 lines out of
-tessl**, and one of two parsers for one format gone. With this record and the
-doc alignment, the whole change here is 407 insertions against 663 deletions
-over seven files.
+In the initial P8 step (2026-11-01, recorded below), `src/safetensors.rs` was reduced
+to a 517-line adapter over `ojas_io::safetensors`. In Milestone M2 (2026-11-02),
+`ojas-io` absorbed `.npy` v1.0/v2.0 reading/writing and the remaining safetensors
+helper surface so that **`src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and
+`src/plain.rs` (-1,645 LOC total) were deleted in full**. `src/lib.rs` now
+re-exports `pub use ojas_io::{npy, safetensors};` directly and `src/config_json.rs`
+parses model configs through `ojas_io::json::{JsonValue, JsonLimits}`.
 
 The tree as a whole did **not** shrink, and it is worth saying so rather than
 reporting only this side of it: ojas-io grew by 1,396 insertions against 82
@@ -259,3 +262,17 @@ any more.
 `widen_in_place`, which was byte-for-byte identical to ojas-io's, is deleted
 with the parser. Its only test moved to `ojas-io/tests/half_float.rs` rather
 than being deleted with the duplicate it covered.
+
+---
+
+## Milestone M2 Update (2026-11-02): Full Retirement of `src/{safetensors,json,npy,plain}.rs`
+
+Following the P8 adapter phase above, Milestone M2 completed the IO and optimizer-scalar unification across `ojas` and `tessl`:
+
+1. **`src/safetensors.rs` (517 lines), `src/json.rs` (482 lines), `src/npy.rs` (599 lines), and `src/plain.rs` (47 lines) are deleted (-1,645 LOC):**
+   - `ojas-io/src/npy.rs` absorbed `.npy` v1.0/v2.0 reading and writing (`read_f32`, `read_i32`, `read_u32`, `write_f32`, `write_u32`, `from_bytes`, and `read_*_with_limit`).
+   - `ojas-io/src/safetensors.rs` absorbed `SafeTensors::header_bytes`, `HeaderEntry` / `TensorEntry` accessors, and `Dtype` / `StDtype` re-exports.
+   - `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly.
+   - `src/config_json.rs` uses `ojas_io::json::{JsonValue, JsonLimits}`.
+2. **AdamW scalar deduplication:**
+   - `src/qwen35_adamw.rs` delegates step bias-correction and weight-decay scalar calculation to `ojas_core::AdamWScalars::new`.

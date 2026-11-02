@@ -184,7 +184,7 @@ cherry-pick of this work's fourteen commits, not a range.
 | `cargo test --release --lib parser_mutation::` | **16 passed, 0 failed** |
 | `cargo clippy --all-targets -- -D warnings` | clean |
 | `rustfmt --check` on the three files touched | clean |
-| `cargo test --release` (whole suite) | **not re-run — see below** |
+| `cargo test --release --no-fail-fast` (whole suite) | **2,252 passed, 0 failed**, 56 ignored, 206 binaries |
 
 `tests/safetensors.rs` kept its rejection semantics. Of the 52 malformed inputs
 it covers, 42 keep their exact needle and 10 are the same refusal in different
@@ -202,24 +202,41 @@ ojas-io.
 The ignored test is `opens_the_qwen35_2b_checkpoint`, which needs the 4.5 GB
 file from the Hugging Face cache; it was ignored before this change too.
 
-### The one check still outstanding
+### The whole suite, and what it took to run it
 
-**The whole suite has not been run green end to end, and is not claimed to
-have been.** It ran complete once on this work: **1,435 passed, 1 failed, 36
-ignored over 128 binaries**. The single failure was
-`host_access_ban::library_code_never_calls_a_panicking_host_accessor`, which
-caught the adapter calling `.read_u32(` in method-call form — a real defect,
-found by this repo's own guard rather than by review, and fixed in the commit
-after. That guard is green now, with the two other binaries the fix touched.
-
-Two attempts to re-run the whole suite after the fix produced no result. The
-first was `SIGKILL`ed mid-compile with the machine at load 38 from other work.
-The second failed to build in six seconds, with no test run, because another
-session holds this checkout and has `src/config_json.rs` and
+**`cargo test --release --no-fail-fast`: 2,252 passed, 0 failed, 56 ignored over
+206 binaries, exit 0** — at `d42305f`, from a detached worktree beside the real
+`../ojas` with its own `CARGO_TARGET_DIR`. The live checkout could not give this
+number: another session holds it with `src/config_json.rs` and
 `src/qwen35_adamw.rs` part-way through a `Json` → `JsonValue` rename that does
-not compile yet; neither file belongs to this change and neither was touched.
-So one clean end-to-end run of this suite, once that refactor lands, is the
-remaining check.
+not compile, and with `src/safetensors.rs` deleted from the working tree. Those
+files are not this change's and were not touched. The worktree asserts before
+testing that `enum Dtype` and `impl TryFrom<StDtype>` are present in
+`src/safetensors.rs`, so the run cannot silently be of someone else's tree.
+
+Getting there took four attempts, and the three that produced no number are
+worth recording because each failed differently: one `SIGKILL`ed mid-compile at
+load 38 from other work; one built for six seconds and ran nothing, on that
+rename; and one ran 74 of the 206 binaries and stopped, because `cargo test`
+abandons the remaining binaries at the first failure unless told otherwise. The
+final run passes `--no-fail-fast` for exactly that reason — 128 binaries in an
+earlier run was where it aborted, not the size of this suite.
+
+Three of this repository's own gates caught defects in this work, each by
+running rather than by review, and each is fixed:
+`host_access_ban::library_code_never_calls_a_panicking_host_accessor` on the
+adapter calling `.read_u32(` in method-call form; `cargo fmt --all --check` on
+the adapter being wrapped at 100 columns against this repo's 120; and
+`docs_name_real_tools::every_bench_binary_and_path_the_docs_name_exists` on this
+very record naming two of ojas-io's test files as though they were this crate's.
+
+**What no CI run covers, here or anywhere.** `GPU suite on bare metal` and
+`GEMM sweep on bare metal` are both gated on `vars.HAS_METAL_RUNNER == 'true'`,
+which is not set, so they **skip** — identically in the baseline, so this is
+pre-existing rather than caused by any change. No hosted run of this repository
+exercises the Metal path at all, and a green badge should not be read as
+covering it. The 2,252 above were run locally on the real GPU, which is
+currently the only place that path runs.
 
 Separately and not caused by this work: `cargo fmt --all --check` fails on ten
 files this change never touched — `src/shared_buf.rs`, `src/loader.rs`,

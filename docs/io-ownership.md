@@ -62,10 +62,20 @@ ojas-io's and is not duplicated.
   tessl declines them, because every path below this module is written in whole
   bytes. `TryFrom<StDtype> for Dtype` errors on all three, applied once per
   header at open, so the refusal is enforced by the type rather than
-  documented. `pub type Dtype = StDtype` was rejected: it would put three
-  variants in this namespace and break the exhaustive matches in
-  `src/qwen35.rs` (:1774, :2779, :3518, :3610) and the 19-variant array in
-  `tests/qwen35_mlx_q4_adversarial.rs`.
+  documented. `pub type Dtype = StDtype` was rejected, but **not for the
+  reason the card gives**, which was checked on 2026-11-02 and is wrong: the
+  four matches at `src/qwen35.rs` :1774, :2779, :3518 and :3610 are on
+  `DType`, ojas-core's compute dtype, each with a catch-all arm, and that file
+  never names `safetensors::Dtype`; `const ALL_DTYPES: [Dtype; 19]` in
+  `tests/qwen35_mlx_q4_adversarial.rs` is an array literal, which needs no
+  exhaustiveness. The alias would compile.
+
+  The reason it is rejected is behavioural, and survives that correction: the
+  alias puts `F4`, `F6_E2M3` and `F6_E3M2` into this crate's namespace with no
+  gate, so a checkpoint naming one would be **opened** here instead of refused,
+  and every path below this module is written in whole bytes. It would also
+  leave `ALL_DTYPES` sweeping 19 of 22 variants — three of them exactly the
+  ones newly admitted.
 - **The payload policy.** A `None` limit means this machine's physical memory
   here, and a checkpoint declaring more is refused at open. ojas-io treats
   `None` as unbounded deliberately — it validates a header without loading the

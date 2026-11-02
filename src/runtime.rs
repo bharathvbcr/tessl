@@ -2084,6 +2084,32 @@ impl GpuRuntime {
         self.alloc_buffer_kind(nbytes, BufferKind::Cold)
     }
 
+    /// A buffer allocated directly without charging the pool ledger.
+    /// Used for internal backend infrastructure (status slab, spare buffer)
+    /// that does not count toward user tensor budgets.
+    pub fn alloc_internal_buffer(&self, nbytes: usize) -> Result<crate::tensor::GpuBuffer, String> {
+        if self.poison.is_set() {
+            return Err(self.poison.error());
+        }
+        let Some(b) = self.device.newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared) else {
+            return Err(new_buffer_failed_message(nbytes));
+        };
+        self.register_residency(&b);
+        let weak = self.self_weak.clone();
+        let gpu_addr = b.gpuAddress();
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(crate::tensor::GpuBuffer {
+            inner: Arc::new(crate::tensor::PooledBuffer {
+                buffer: b,
+                nbytes,
+                kind: BufferKind::External,
+                runtime: weak,
+                gpu_addr,
+                ledger: None,
+            }),
+        })
+    }
+
     /// A fresh buffer holding `data`, written on the host without waiting
     /// for the GPU: no command can be using a buffer that has just come
     /// from the pool (fresh, or retired after the GPU finished with it).

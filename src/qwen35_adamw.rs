@@ -81,31 +81,20 @@ fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
 
 /// Host-side scalars, in the order `kernels/qwen35_adamw_math.h` reads them.
 ///
-/// `step` is torch's count after it has incremented (1-based). The formation
-/// is f64, then each value is stored as f32. `weight_decay` is one tensor's.
+/// `step` is torch's count after it has incremented (1-based).
+/// Delegates canonical scalar formation to `ojas_core::AdamWScalars`.
 fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
-    let AdamWHyper {
-        lr,
-        beta1,
-        beta2,
-        eps,
-        grad_scale,
-    } = *hyper;
-    let t = step as f64;
-    let bc1 = 1.0 - beta1.powf(t);
-    let bc2 = 1.0 - beta2.powf(t);
-    let step_size = lr / bc1;
-    let bc2_sqrt = bc2.powf(0.5);
-    [
-        (1.0 - lr * weight_decay) as f32,
-        (1.0 - beta1) as f32,
-        beta2 as f32,
-        (1.0 - beta2) as f32,
-        step_size as f32,
-        bc2_sqrt as f32,
-        eps as f32,
-        grad_scale as f32,
-    ]
+    let config = ojas_core::AdamWConfig {
+        lr: hyper.lr,
+        beta1: hyper.beta1,
+        beta2: hyper.beta2,
+        eps: hyper.eps,
+        weight_decay,
+    };
+    let step_before = step.saturating_sub(1);
+    let s = ojas_core::AdamWScalars::new(config, step_before).expect("validated hyperparameters");
+    let w = s.f32_words("adamw_step").expect("finite f32 words");
+    [w[0], w[1], w[2], w[3], w[4], w[5], w[6], hyper.grad_scale as f32]
 }
 
 fn le_bytes<const N: usize, T: Copy>(xs: [T; N], f: impl Fn(T) -> [u8; 4]) -> Vec<u8> {

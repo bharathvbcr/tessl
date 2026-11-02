@@ -758,7 +758,7 @@ pub unsafe fn gemv_q8_with_scalars(
     if group_size == 0 {
         return Err("gemv_q8: group_size must be non-zero".into());
     }
-    if cols % group_size != 0 {
+    if !cols.is_multiple_of(group_size) {
         return Err(format!(
             "gemv_q8: cols {cols} is not a multiple of group_size {group_size}; \
              the kernel would silently drop the ragged tail group"
@@ -1205,7 +1205,7 @@ impl DecodeHeadBlock {
             DecodeHeadBlock::Group => group,
             DecodeHeadBlock::AllHeads => heads,
         };
-        ((1..=32).contains(&n) && heads % n == 0).then_some(n)
+        ((1..=32).contains(&n) && heads.is_multiple_of(n)).then_some(n)
     }
 
     pub fn parse(v: &str) -> Result<Self, String> {
@@ -2395,7 +2395,7 @@ fn validate_attn_dims(
     if dims.heads_kv == 0 {
         return Err(format!("{what}: heads_kv must be non-zero"));
     }
-    if dims.heads % dims.heads_kv != 0 {
+    if !dims.heads.is_multiple_of(dims.heads_kv) {
         return Err(format!(
             "{what}: heads {} is not a multiple of heads_kv {} — grouped-query \
              attention maps a whole number of query heads onto each kv head",
@@ -2472,7 +2472,7 @@ impl QkvRopeDims {
                 self.rotary_dim, self.head_dim
             ));
         }
-        if self.rotary_dim % 2 != 0 {
+        if !self.rotary_dim.is_multiple_of(2) {
             return Err(format!(
                 "{what}: rotary_dim {} is odd; RoPE rotates (even, odd) pairs",
                 self.rotary_dim
@@ -3255,7 +3255,7 @@ impl QuantShape {
         if self.group_size == 0 {
             return Err(format!("{what}: group_size must be non-zero"));
         }
-        if self.cols % self.group_size != 0 {
+        if !self.cols.is_multiple_of(self.group_size) {
             return Err(format!(
                 "{what}: cols {} is not a multiple of group_size {}; the kernels \
                  compute `cols / group_size` with integer division and would \
@@ -3289,7 +3289,7 @@ pub struct Q4Bank<'a> {
 impl Q4Bank<'_> {
     fn validate(&self, rt: &GpuRuntime, shape: &QuantShape, what: impl fmt::Display + Copy) -> Result<(), String> {
         shape.validate(what)?;
-        if shape.group_size % 8 != 0 {
+        if !shape.group_size.is_multiple_of(8) {
             return Err(format!(
                 "{what}: group_size {} must be a multiple of 8; the kernels peel each \
                  group through 4-byte `uint` loads at `packed + row * cols / 2 + \
@@ -3362,7 +3362,7 @@ impl Q4MlxBank<'_> {
             ..*shape
         };
         const SIMD_BLOCK: u32 = 512;
-        if shape.group_size % 32 != 0 || SIMD_BLOCK % shape.group_size != 0 {
+        if !shape.group_size.is_multiple_of(32) || !SIMD_BLOCK.is_multiple_of(shape.group_size) {
             return Err(format!(
                 "{what}: group_size {} is outside the MLX kernel domain \
                  {{32, 64, 128, 256, 512}}; the row kernels peel each group through \

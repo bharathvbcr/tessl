@@ -639,7 +639,7 @@ pub fn convert_interleaved(
             detail: "zero channels".into(),
         });
     }
-    if frames.len() % channels != 0 {
+    if !frames.len().is_multiple_of(channels) {
         return Err(MediaError::Invalid {
             what: "resample",
             detail: format!(

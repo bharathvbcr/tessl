@@ -88,7 +88,7 @@ pub fn attn_prefill_bf16_with_tile(
             dims.window
         ));
     }
-    if dims.heads_kv == 0 || dims.heads % dims.heads_kv != 0 {
+    if dims.heads_kv == 0 || !dims.heads.is_multiple_of(dims.heads_kv) {
         return Err(format!(
             "{WHAT}: heads {} must be a non-zero multiple of heads_kv {}",
             dims.heads, dims.heads_kv

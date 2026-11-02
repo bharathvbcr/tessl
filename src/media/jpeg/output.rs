@@ -179,7 +179,7 @@ impl Decoder<'_> {
             }
             Upsample::H1V2Fancy => {
                 let inrow = y / 2;
-                let (other, bias) = if y % 2 == 0 {
+                let (other, bias) = if y.is_multiple_of(2) {
                     (inrow.saturating_sub(1), 1u32)
                 } else {
                     ((inrow + 1).min(dh - 1), 2u32)
@@ -197,7 +197,7 @@ impl Decoder<'_> {
             }
             Upsample::H2V2Fancy => {
                 let inrow = y / 2;
-                let other = if y % 2 == 0 {
+                let other = if y.is_multiple_of(2) {
                     inrow.saturating_sub(1)
                 } else {
                     (inrow + 1).min(dh - 1)

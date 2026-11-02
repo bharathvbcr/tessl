@@ -226,7 +226,7 @@ impl Flavor {
     /// this size: a width that is a multiple of 16 and an even height (an odd-height
     /// 4:2:2 picture, whatever its width, takes the table converter).
     pub fn uses_neon(self, width: usize, height: usize) -> bool {
-        self == Flavor::Aarch64 && width % 16 == 0 && height % 2 == 0
+        self == Flavor::Aarch64 && width.is_multiple_of(16) && height.is_multiple_of(2)
     }
 }
 
@@ -648,14 +648,14 @@ fn chroma_taps(filter: ChromaFilter, ch: usize, r: usize) -> ([(usize, i32); 4],
     let j = (r / 2) as isize;
     match filter {
         ChromaFilter::Bilinear => {
-            let other = if r % 2 == 0 { j - 1 } else { j + 1 };
+            let other = if r.is_multiple_of(2) { j - 1 } else { j + 1 };
             ([(clamp(j), 3072), (clamp(other), 1024), (0, 0), (0, 0)], 2)
         }
         ChromaFilter::Bicubic => match r {
             0 => ([(0, 4432), (1, -336), (0, 0), (0, 0)], 2),
             1 => ([(0, 3226), (1, 985), (2, -115), (0, 0)], 3),
             2 => ([(0, 959), (1, 3473), (2, -336), (0, 0)], 3),
-            _ if r % 2 == 0 => (
+            _ if r.is_multiple_of(2) => (
                 [
                     (clamp(j - 2), -115),
                     (clamp(j - 1), 985),
@@ -701,10 +701,10 @@ pub fn check_shape(layout: Layout, width: usize, height: usize, filter: ChromaFi
     if width == 0 || height == 0 {
         return Err(size_error);
     }
-    if chroma != Chroma::C444 && width % 2 != 0 {
+    if chroma != Chroma::C444 && !width.is_multiple_of(2) {
         return Err(size_error);
     }
-    if chroma == Chroma::C420 && height % 2 != 0 {
+    if chroma == Chroma::C420 && !height.is_multiple_of(2) {
         return Err(size_error);
     }
     if chroma == Chroma::C420 && depth > 8 && height > 2 && height < min_height(filter) {

@@ -276,11 +276,11 @@ fn axial_qkv_norm_rope_to(
     const WHAT: &str = "embedgemma2_vision::axial_qkv_norm_rope";
     let s = shape;
     if s.head_dim == 0
-        || s.head_dim % 4 != 0
+        || !s.head_dim.is_multiple_of(4)
         || s.head_dim > MAX_ROPE_HEAD_DIM
         || s.q_heads == 0
         || s.kv_heads == 0
-        || s.q_heads % s.kv_heads != 0
+        || !s.q_heads.is_multiple_of(s.kv_heads)
     {
         return Err(format!(
             "{WHAT}: head_dim must be a positive multiple of 4 up to {MAX_ROPE_HEAD_DIM} and q_heads a multiple of \
@@ -674,7 +674,7 @@ pub struct PoolPlan {
 pub fn plan_pooling(positions: &[i32], valid: usize, kernel: u32) -> Result<PoolPlan, String> {
     const WHAT: &str = "plan_pooling";
     let total = positions.len() / 2;
-    if positions.len() % 2 != 0 || valid == 0 || valid > total {
+    if !positions.len().is_multiple_of(2) || valid == 0 || valid > total {
         return Err(format!(
             "{WHAT}: {} position values with {valid} real patches",
             positions.len()
@@ -682,7 +682,7 @@ pub fn plan_pooling(positions: &[i32], valid: usize, kernel: u32) -> Result<Pool
     }
     let k = i64::from(kernel);
     let kk = (k * k) as usize;
-    if kernel < 2 || total % kk != 0 || total / kk == 0 {
+    if kernel < 2 || !total.is_multiple_of(kk) || total / kk == 0 {
         return Err(format!(
             "{WHAT}: cannot pool {total} patches with a {kernel}x{kernel} kernel: k² times the output length \
              must equal the patch count"
@@ -1222,7 +1222,7 @@ impl EmbedGemma2VisionModel {
         let what = format!("EmbedGemma2VisionModel::encode_images: image {i}");
         let cfg = &self.cfg;
         let pd = cfg.patch_dim() as usize;
-        if img.position_ids.len() % 2 != 0 || img.position_ids.is_empty() {
+        if !img.position_ids.len().is_multiple_of(2) || img.position_ids.is_empty() {
             return Err(format!(
                 "{what}: position_ids has {} values; need [P, 2] with P > 0",
                 img.position_ids.len()

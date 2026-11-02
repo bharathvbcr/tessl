@@ -220,7 +220,7 @@ pub fn read_npy_with_limit(path: &Path, limit: Option<u64>) -> Result<NpyArray, 
 /// unless the version is 3.
 fn check_header_framing(what: &str, version: u8, prefix: u64, header: &str) -> Result<(), String> {
     let total = prefix + header.len() as u64;
-    if total % NPY_ALIGN != 0 {
+    if !total.is_multiple_of(NPY_ALIGN) {
         return Err(format!(
             "{what}: header is not padded to a multiple of {NPY_ALIGN} bytes ({total} bytes before the data)"
         ));

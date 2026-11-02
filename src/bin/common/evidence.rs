@@ -65,7 +65,7 @@ pub fn parse_ratio_spread_limit(text: &str) -> Res<f64> {
 /// Even rounds, at least four, give exact AB/BA balance, a paired median and a
 /// drift estimate; the inner count is each child process's median sample size.
 pub fn validate_evidence_sample_counts(rounds: usize, iters: Option<usize>) -> Res<()> {
-    if rounds < MIN_OUTER_ROUNDS || rounds % 2 != 0 {
+    if rounds < MIN_OUTER_ROUNDS || !rounds.is_multiple_of(2) {
         return Err(format!(
             "rounds must be an even integer >= {MIN_OUTER_ROUNDS} for exact AB/BA balance, a paired median, \
              and drift estimation; got {rounds}"

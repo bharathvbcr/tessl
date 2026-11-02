@@ -517,7 +517,7 @@ pub fn attn_qk_norm_rope_bwd(
             s.head_dim
         ));
     }
-    if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
+    if !s.rotary_dim.is_multiple_of(2) || s.rotary_dim > s.head_dim {
         return Err(format!(
             "{WHAT}: rotary_dim must be even and at most head_dim, got {} of {}",
             s.rotary_dim, s.head_dim

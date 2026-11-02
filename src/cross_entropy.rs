@@ -148,7 +148,7 @@ impl CeWorkspace {
         }
         // 16-byte GEMM operand alignment for every chunk's weight view (v0 * hidden
         // elements in), in either dtype.
-        if hidden % 8 != 0 {
+        if !hidden.is_multiple_of(8) {
             return Err(format!("{WHAT}: hidden must be a multiple of 8, got {hidden}"));
         }
         if !matches!(weight_dtype, DType::F32 | DType::BF16) {

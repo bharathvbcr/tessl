@@ -185,7 +185,7 @@ fn int4b_and_uint4b_nibble_order_and_signedness_are_as_measured() {
             let order = |i: usize| -> u8 {
                 let byte = packed_low_first[i / 2];
                 let (lo, hi) = (byte & 0xf, byte >> 4);
-                match (i % 2 == 0) == low_first {
+                match i.is_multiple_of(2) == low_first {
                     true => lo,
                     false => hi,
                 }
@@ -205,7 +205,7 @@ fn int4b_and_uint4b_nibble_order_and_signedness_are_as_measured() {
 
         let order = |i: usize| -> u8 {
             let byte = packed_low_first[i / 2];
-            if (i % 2 == 0) == MEASURED_LOW_NIBBLE_FIRST {
+            if i.is_multiple_of(2) == MEASURED_LOW_NIBBLE_FIRST {
                 byte & 0xf
             } else {
                 byte >> 4

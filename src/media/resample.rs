@@ -373,7 +373,7 @@ fn design_bank(taps: usize, phases: usize, cutoff: f64, extra_row: bool) -> Vec<
 fn dot(c: &[f32], x: &[f32]) -> f32 {
     let main = c.len() & !7;
     let mut acc = [0f32; 4];
-    for (cb, xb) in c[..main].chunks_exact(8).zip(x[..main].chunks_exact(8)) {
+    for (cb, xb) in c[..main].as_chunks::<8>().0.iter().zip(x[..main].as_chunks::<8>().0) {
         let ((c0, c1), (x0, x1)) = (cb.split_at(4), xb.split_at(4));
         for ((a, cj), xj) in acc.iter_mut().zip(c0).zip(x0) {
             *a = cj.mul_add(*xj, *a);
@@ -639,7 +639,7 @@ pub fn convert_interleaved(
             detail: "zero channels".into(),
         });
     }
-    if frames.len() % channels != 0 {
+    if !frames.len().is_multiple_of(channels) {
         return Err(MediaError::Invalid {
             what: "resample",
             detail: format!(

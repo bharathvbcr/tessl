@@ -60,9 +60,7 @@ fn stress_concurrent_budget_charges_under_high_contention() {
                     }
                 }
 
-                if active_reservations.len() >= 8
-                    || (rng_state % 5 == 0 && !active_reservations.is_empty())
-                {
+                if active_reservations.len() >= 8 || (rng_state.is_multiple_of(5) && !active_reservations.is_empty()) {
                     let to_drop = (rng_state as usize % active_reservations.len()) + 1;
                     for _ in 0..to_drop {
                         if let Some(r) = active_reservations.pop() {
@@ -157,10 +155,7 @@ fn stress_concurrent_trim_free_list_under_heavy_contention() {
         drop(held);
         let final_freed = rt.trim_free_list();
         let resident = rt.pool_resident();
-        assert_eq!(
-            resident.cached_bytes, 0,
-            "After final trim, cached_bytes must be 0"
-        );
+        assert_eq!(resident.cached_bytes, 0, "After final trim, cached_bytes must be 0");
         final_freed
     });
 
@@ -188,7 +183,7 @@ fn stress_concurrent_trim_free_list_under_heavy_contention() {
                 rng_state ^= rng_state >> 7;
                 rng_state ^= rng_state << 17;
 
-                if rng_state % 3 == 0 {
+                if rng_state.is_multiple_of(3) {
                     // Send trim request with reply channel
                     let (reply_tx, reply_rx) = mpsc::channel();
                     if cmd_tx.send(DeviceCmd::TrimFreeList(reply_tx)).is_ok() {

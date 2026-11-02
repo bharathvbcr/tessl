@@ -166,12 +166,10 @@ impl ojas_core::Timeline for HostFence {
     fn wait(&self, value: u64) -> Result<(), ojas_core::FenceError> {
         match self.wait_stamp(value) {
             Ok(()) => Ok(()),
-            Err(HostAccessError::NotSubmitted { needed, submitted }) => {
-                Err(ojas_core::FenceError::NotSubmitted {
-                    value: needed,
-                    submitted,
-                })
-            }
+            Err(HostAccessError::NotSubmitted { needed, submitted }) => Err(ojas_core::FenceError::NotSubmitted {
+                value: needed,
+                submitted,
+            }),
             Err(HostAccessError::Busy(why)) => Err(ojas_core::FenceError::Busy { detail: why }),
             Err(HostAccessError::Runtime(why)) => {
                 if why.contains("poisoned") || why.contains("DeviceLost") {

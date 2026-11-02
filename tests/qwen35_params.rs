@@ -470,7 +470,6 @@ fn per_entry_host_calls_refuse_on_a_poisoned_runtime() {
     }
 }
 
-
 /// A write round-trips bit for bit, moves the inference forward, and a write
 /// of the values just read changes nothing. (The gradient-driven SGD step this
 /// test took before ABI 14 needed the retired training step; a fixed rescale
@@ -487,7 +486,11 @@ fn a_write_round_trips_and_moves_the_inference_forward() {
     // Writing back what was read changes nothing.
     model.write_parameters(&params).unwrap();
     let same = inference_loss(&model, &ids);
-    assert_eq!(same.to_bits(), before.to_bits(), "a write of the read values moved the loss");
+    assert_eq!(
+        same.to_bits(),
+        before.to_bits(),
+        "a write of the read values moved the loss"
+    );
 
     let stepped: Vec<Tensor> = params
         .iter()
@@ -507,5 +510,9 @@ fn a_write_round_trips_and_moves_the_inference_forward() {
         }
     }
     let after = inference_loss(&model, &ids);
-    assert_ne!(after.to_bits(), before.to_bits(), "the write moved the inference forward not at all");
+    assert_ne!(
+        after.to_bits(),
+        before.to_bits(),
+        "the write moved the inference forward not at all"
+    );
 }

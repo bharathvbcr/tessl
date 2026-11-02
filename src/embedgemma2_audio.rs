@@ -443,7 +443,7 @@ impl AudioConfig {
                 self.context_left
             ));
         }
-        if self.hidden % self.heads != 0 || self.hidden % 2 != 0 {
+        if !self.hidden.is_multiple_of(self.heads) || !self.hidden.is_multiple_of(2) {
             return bad(format!(
                 "hidden_size {} must be even and a multiple of num_attention_heads {}",
                 self.hidden, self.heads
@@ -465,7 +465,7 @@ impl AudioConfig {
                 self.chunk, self.context_left
             ));
         }
-        if self.sub_channels[0] % 4 != 0 || self.sub_channels[0] > MAX_C0 || self.sub_channels[1] > MAX_C1 {
+        if !self.sub_channels[0].is_multiple_of(4) || self.sub_channels[0] > MAX_C0 || self.sub_channels[1] > MAX_C1 {
             return bad(format!(
                 "subsampling_conv_channels {:?}: the first must be a multiple of 4 and at most {MAX_C0}, the second at most {MAX_C1}",
                 self.sub_channels

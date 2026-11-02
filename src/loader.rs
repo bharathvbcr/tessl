@@ -530,4 +530,3 @@ mod tests {
         ld.refuse_unread().unwrap();
     }
 }
-

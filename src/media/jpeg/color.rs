@@ -49,14 +49,14 @@ impl Tables {
     }
 
     pub fn ycc_to_rgb(&self, y: &[u8], cb: &[u8], cr: &[u8], out: &mut [u8]) {
-        for (px, ((&y, &cb), &cr)) in out.chunks_exact_mut(3).zip(y.iter().zip(cb).zip(cr)) {
+        for (px, ((&y, &cb), &cr)) in out.as_chunks_mut::<3>().0.iter_mut().zip(y.iter().zip(cb).zip(cr)) {
             px.copy_from_slice(&self.rgb(y, cb, cr));
         }
     }
 
     /// YCCK to CMYK (`ycck_cmyk_convert`), then to RGB.
     pub fn ycck_to_rgb(&self, y: &[u8], cb: &[u8], cr: &[u8], k: &[u8], out: &mut [u8]) {
-        for (i, px) in out.chunks_exact_mut(3).enumerate() {
+        for (i, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let [r, g, b] = self.rgb(y[i], cb[i], cr[i]);
             let (c, m, ye) = (255 - r, 255 - g, 255 - b);
             let kk = u32::from(k[i]);
@@ -81,13 +81,13 @@ fn cmy_k(k: u32, cmy: u8) -> u8 {
 }
 
 pub(crate) fn gray_to_rgb(y: &[u8], out: &mut [u8]) {
-    for (px, &v) in out.chunks_exact_mut(3).zip(y) {
+    for (px, &v) in out.as_chunks_mut::<3>().0.iter_mut().zip(y) {
         px.fill(v);
     }
 }
 
 pub(crate) fn interleave_rgb(r: &[u8], g: &[u8], b: &[u8], out: &mut [u8]) {
-    for (i, px) in out.chunks_exact_mut(3).enumerate() {
+    for (i, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         px[0] = r[i];
         px[1] = g[i];
         px[2] = b[i];
@@ -95,7 +95,7 @@ pub(crate) fn interleave_rgb(r: &[u8], g: &[u8], b: &[u8], out: &mut [u8]) {
 }
 
 pub(crate) fn cmyk_to_rgb(c: &[u8], m: &[u8], y: &[u8], k: &[u8], out: &mut [u8]) {
-    for (i, px) in out.chunks_exact_mut(3).enumerate() {
+    for (i, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         let kk = u32::from(k[i]);
         px[0] = cmy_k(kk, c[i]);
         px[1] = cmy_k(kk, m[i]);

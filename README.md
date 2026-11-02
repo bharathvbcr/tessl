@@ -37,7 +37,7 @@ The name is short for *tessellation* — the design centers around how matrix op
   <a href="#license"><img src="https://img.shields.io/crates/l/tessl.svg" alt="MIT OR Apache-2.0"></a>
   <img src="https://img.shields.io/badge/Metal_4-macOS_26+-007AFF?style=flat&logo=apple&logoColor=white" alt="Metal 4">
   <img src="https://img.shields.io/badge/Hardware-Apple_Silicon_M--series-000000?style=flat&logo=apple&logoColor=white" alt="Apple Silicon">
-  <img src="https://img.shields.io/badge/Rust-1.82+-DEA584?style=flat&logo=rust&logoColor=white" alt="Rust 1.82+">
+  <img src="https://img.shields.io/badge/Rust-1.97+-DEA584?style=flat&logo=rust&logoColor=white" alt="Rust 1.97+">
 </p>
 
 <p align="center">
@@ -652,7 +652,7 @@ suite is warning-free. Each row is a capability the crate does not have.
 
 - **OS:** Apple Silicon, macOS 26 or newer
 - **Toolchain:** Xcode 26 with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
-- **Language:** Rust 1.82+
+- **Language:** Rust 1.97+ (the floor the `ojas-core` / `ojas-io` path dependencies inherit from the ojas workspace)
 
 ---
 

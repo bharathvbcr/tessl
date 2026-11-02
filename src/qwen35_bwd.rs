@@ -37,7 +37,7 @@ const RMS_ROWS_PER_BLOCK: u32 = 32;
 /// block, which a caller sizing it without a runtime (ojas-metal) must agree on.
 pub const GATED_UNITS_PER_BLOCK: u32 = 64;
 const GATED_THREADS: usize = 128;
-/// Widest row [`gated_rms_norm_bwd`] takes: 32 lanes of [`MAX_COLS`] columns.
+/// Widest row [`gated_rms_norm_bwd`] takes: 32 lanes of `MAX_COLS` columns.
 pub const GATED_RMS_BWD_MAX_DIM: u32 = 32 * MAX_COLS;
 
 /// Whether two windows of `rows` rows can touch the same element. Windows of
@@ -517,7 +517,7 @@ pub fn attn_qk_norm_rope_bwd(
             s.head_dim
         ));
     }
-    if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
+    if !s.rotary_dim.is_multiple_of(2) || s.rotary_dim > s.head_dim {
         return Err(format!(
             "{WHAT}: rotary_dim must be even and at most head_dim, got {} of {}",
             s.rotary_dim, s.head_dim

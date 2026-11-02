@@ -1066,7 +1066,7 @@ impl GpuRuntime {
 
     /// Latch a test-only poison. Its cause is not a budget-timeout error:
     /// [`Self::is_event_wait_timeout`] is false for it, and
-    /// [`Self::poison_on_failure`] stores it. A real SharedEvent wait that runs
+    /// `poison_on_failure` stores it. A real SharedEvent wait that runs
     /// out of budget does not call this. The first and second consecutive
     /// budget timeouts leave the runtime usable; the third poisons it with a
     /// DeviceLost cause of its own.
@@ -3532,7 +3532,7 @@ mod timestamp_decode_tests {
         let mut raw = vec![0u8; need + 1];
         // Pick the offset that lands the payload on an odd address whatever the
         // allocator returned.
-        let off = usize::from(raw.as_ptr() as usize % 2 == 0);
+        let off = usize::from((raw.as_ptr() as usize).is_multiple_of(2));
         raw[off..off + 8].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_ne_bytes());
         raw[off + 8..off + 16].copy_from_slice(&0x0fed_cba9_8765_4321u64.to_ne_bytes());
         let bytes = &raw[off..];

@@ -126,8 +126,8 @@ fn oracle_ok(w: &TensorInfo, s: Option<&TensorInfo>, b: Option<&TensorInfo>, row
     // An empty matrix has nothing to load (`zero_row_and_zero_column_parts_are_refused`).
     rows != 0
         && cols != 0
-        && cols % 64 == 0
-        && cols % 8 == 0
+        && cols.is_multiple_of(64)
+        && cols.is_multiple_of(8)
         && fits(w, Dtype::U32, cols / 8)
         && s.is_some_and(|t| fits(t, Dtype::BF16, cols / 64))
         && b.is_some_and(|t| fits(t, Dtype::BF16, cols / 64))

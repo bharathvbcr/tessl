@@ -120,7 +120,9 @@ fn the_decoders_planes_are_the_planes_ffmpeg_decodes() {
                 if bps == 1 {
                     raw.iter().map(|&b| u32::from(b)).collect()
                 } else {
-                    raw.chunks_exact(2)
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]]) >> 6))
                         .collect()
                 }

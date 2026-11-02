@@ -16,7 +16,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use tessl::capi::{
     tessl_cross_entropy_rows, tessl_qwen35_free, tessl_qwen35_load, tessl_runtime_free, tessl_runtime_new, TesslCeArgs,
-    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_EXACT_F32,
+    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ERR, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
+    TESSL_OPERANDS_EXACT_F32,
 };
 use tessl::GpuRuntime;
 

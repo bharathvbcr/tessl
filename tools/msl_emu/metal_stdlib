@@ -58,6 +58,50 @@ namespace metal {
 
 // ---------------------------------------------------------------- vectors ---
 
+namespace emu {
+// Defined with the rest of the runtime below; declared here because the vector
+// types are what call it.
+inline void fail(const char *msg);
+
+/// The address of a 16-byte vector, as a number the compiler knows nothing
+/// about. Without this the check below folds to nothing: a `float4 *` points at
+/// a 16-byte-aligned type, so a compiler may assume it is aligned and delete
+/// the test — the same assumption that turns a misaligned access into a
+/// `movaps` and a fault. The empty asm makes `a` opaque, so the test survives.
+inline uintptr_t vec_addr(const void *p) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    asm volatile("" : "+r"(a));
+    return a;
+}
+
+/// Every 16-byte vector access a kernel makes, checked.
+///
+/// `float4` and `uint4` are 16-byte aligned on the GPU, and the kernels reach
+/// them by casting a `device float *` (or `uint *`) window to `float4 *` — so
+/// an access through a window the host did not align is undefined, and what it
+/// does is the compiler's choice: Apple clang loads it with `movups` (x86-64)
+/// or `ldr q` (arm64) and the run passes, while x86-64 GCC at -O2 emits
+/// `movaps`, which faults. A check only the CI compiler makes is not a check,
+/// so the emulator refuses the access here, on every platform, and names the
+/// address.
+///
+/// It sees whole-vector reads and writes (`v = p4[j]`, `*(float4 *)p`,
+/// `p4[j] = v`), which is how every kernel in this repo touches these types.
+/// Reading one component through a misaligned pointer (`p4[j].x`) is a scalar
+/// access the compiler lowers without alignment requirements, and it is not
+/// checked.
+inline void require_vec16(const void *p, const char *what) {
+    const uintptr_t a = vec_addr(p);
+    if ((a & 15u) == 0u) return;
+    char msg[192];
+    std::snprintf(msg, sizeof msg,
+                  "%s at %p is %u bytes past a 16-byte boundary: this window is not float4-aligned "
+                  "(the host refuses such a layout; see qwen35.rs's `variant.vec()` check)",
+                  what, p, unsigned(a & 15u));
+    fail(msg);
+}
+} // namespace emu
+
 template <typename T>
 struct vec2 {
     T x, y;
@@ -74,10 +118,28 @@ struct vec3 {
 };
 /// `float4` as tessl's flash-attention kernels use it: elementwise arithmetic
 /// and scalar broadcast, 16-byte aligned so a `float *` reinterpreted as
-/// `float4 *` (with -fno-strict-aliasing) reads the same four floats.
+/// `float4 *` (with -fno-strict-aliasing) reads the same four floats. Copying
+/// one is where a kernel's 16-byte load and store happen, so that is where
+/// `emu::require_vec16` holds the address to the alignment the type declares.
 struct alignas(16) float4 {
     float x, y, z, w;
     float4() = default;
+    float4(const float4 &o) {
+        emu::require_vec16(&o, "float4 load");
+        x = o.x;
+        y = o.y;
+        z = o.z;
+        w = o.w;
+    }
+    float4 &operator=(const float4 &o) {
+        emu::require_vec16(&o, "float4 load");
+        emu::require_vec16(this, "float4 store");
+        x = o.x;
+        y = o.y;
+        z = o.z;
+        w = o.w;
+        return *this;
+    }
     explicit float4(float s) : x(s), y(s), z(s), w(s) {}
     float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
     float4 operator+(const float4 &o) const { return {x + o.x, y + o.y, z + o.z, w + o.w}; }
@@ -92,6 +154,16 @@ inline float4 operator*(float s, const float4 &v) { return v * s; }
 struct alignas(16) uint4 {
     uint w[4];
     uint4() = default;
+    uint4(const uint4 &o) {
+        emu::require_vec16(&o, "uint4 load");
+        for (uint i = 0u; i < 4u; ++i) w[i] = o.w[i];
+    }
+    uint4 &operator=(const uint4 &o) {
+        emu::require_vec16(&o, "uint4 load");
+        emu::require_vec16(this, "uint4 store");
+        for (uint i = 0u; i < 4u; ++i) w[i] = o.w[i];
+        return *this;
+    }
     uint operator[](uint i) const { return w[i]; }
     uint &operator[](uint i) { return w[i]; }
 };

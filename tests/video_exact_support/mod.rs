@@ -269,7 +269,11 @@ impl FormatCase {
         let samples: Vec<u16> = if self.layout.depth == 8 {
             raw.iter().map(|&b| u16::from(b)).collect()
         } else {
-            raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
         };
         let (cw, ch) = self.chroma_size();
         let (ny, nc) = (self.width * self.height, cw * ch);

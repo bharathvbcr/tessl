@@ -803,13 +803,13 @@ pub struct GdnDims {
 
 impl GdnDims {
     fn validate(&self, what: &str) -> Result<(), String> {
-        if self.k_heads == 0 || self.v_heads == 0 || self.v_heads % self.k_heads != 0 {
+        if self.k_heads == 0 || self.v_heads == 0 || !self.v_heads.is_multiple_of(self.k_heads) {
             return Err(format!(
                 "{what}: v_heads ({}) must be a non-zero multiple of k_heads ({})",
                 self.v_heads, self.k_heads
             ));
         }
-        if self.v_dim == 0 || self.v_dim % GDN_VALUE_BLOCK != 0 {
+        if self.v_dim == 0 || !self.v_dim.is_multiple_of(GDN_VALUE_BLOCK) {
             return Err(format!(
                 "{what}: v_dim must be a non-zero multiple of {GDN_VALUE_BLOCK}, got {}",
                 self.v_dim
@@ -2257,7 +2257,7 @@ fn qk_norm_rope_as(
         }
         _ => return Err(format!("{WHAT}: targets must be f32 or bf16, got {out:?}")),
     }
-    if s.rotary_dim % 2 != 0 || s.rotary_dim > s.head_dim {
+    if !s.rotary_dim.is_multiple_of(2) || s.rotary_dim > s.head_dim {
         return Err(format!(
             "{WHAT}: rotary_dim must be even and at most head_dim, got {} of {}",
             s.rotary_dim, s.head_dim
@@ -2633,7 +2633,7 @@ fn require_window_at<T>(
     what: impl fmt::Display + Copy,
 ) -> Result<(), String> {
     let elem = std::mem::size_of::<T>();
-    if elem == 0 || byte_off % elem != 0 {
+    if elem == 0 || !byte_off.is_multiple_of(elem) {
         return Err(format!("{what}: byte offset {byte_off} is not aligned to {elem}"));
     }
     let base = byte_off / elem;

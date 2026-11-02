@@ -163,7 +163,7 @@ impl<'a> Window<'a> {
             .and_then(|x| x.checked_add(self.off + self.width))
             .ok_or_else(|| format!("{what}: window overflows"))?;
         let have = self.buf.nbytes().saturating_sub(self.byte_off) / size;
-        if self.byte_off % size != 0 || last > have || self.width > self.ld {
+        if !self.byte_off.is_multiple_of(size) || last > have || self.width > self.ld {
             return Err(format!(
                 "{what}: window of {last} elements does not fit its buffer's {have}"
             ));

@@ -1345,7 +1345,7 @@ unsafe fn raw_images<'a>(
     // SAFETY: forwarded from this function's contract.
     let dims = unsafe { checked_slice(dims, 3 * n, what, "image_dims") }?;
     let mut total = 0u64;
-    for (i, d) in dims.chunks_exact(3).enumerate() {
+    for (i, d) in dims.as_chunks::<3>().0.iter().enumerate() {
         let (h, w, c) = (d[0], d[1], d[2]);
         if h == 0 || w == 0 {
             return Err(format!("{what}: image {i} is {h}x{w}, which has no pixels"));
@@ -1373,7 +1373,9 @@ unsafe fn raw_images<'a>(
     // SAFETY: forwarded from this function's contract.
     let mut rest = unsafe { checked_slice(pixels, len, what, "pixels") }?;
     Ok(dims
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|d| {
             let (height, width, channels) = (d[0] as usize, d[1] as usize, d[2] as usize);
             let (data, tail) = rest.split_at(height * width * channels);
@@ -1428,7 +1430,7 @@ unsafe fn raw_videos<'a>(
         ));
     }
     let mut total = 0u64;
-    for (i, (d, w)) in dims.chunks_exact(2).zip(offsets.windows(2)).enumerate() {
+    for (i, (d, w)) in dims.as_chunks::<2>().0.iter().zip(offsets.windows(2)).enumerate() {
         let (h, wd) = (d[0], d[1]);
         if h == 0 || wd == 0 {
             return Err(format!("{what}: video {i} is {h}x{wd}, which has no pixels"));
@@ -1457,7 +1459,9 @@ unsafe fn raw_videos<'a>(
     // SAFETY: forwarded from this function's contract.
     let mut rest = unsafe { checked_slice(frames, len, what, "frames") }?;
     Ok(dims
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .zip(offsets.windows(2))
         .zip(fps)
         .map(|((d, w), &fps)| {
@@ -2593,7 +2597,7 @@ pub unsafe extern "C" fn tessl_embedgemma2_image_soft_token_count(
             let out = checked_slice_mut(out, n, WHAT, "out")?;
             let pre = front.pre(snapshot, WHAT)?;
             let mut counts = Vec::with_capacity(n);
-            for (i, d) in dims.chunks_exact(2).enumerate() {
+            for (i, d) in dims.as_chunks::<2>().0.iter().enumerate() {
                 let (height, width) = (d[0], d[1]);
                 if height == 0 || width == 0 {
                     return Err(format!("{WHAT}: image {i} is {height}x{width}, which has no pixels"));
@@ -3061,7 +3065,7 @@ unsafe fn video_table<'a>(
     // Byte cuts to the frame cuts `raw_videos` takes: each video a whole number
     // of its frames.
     let mut frame_cuts = vec![0u64];
-    for (i, (w, d)) in cuts.windows(2).zip(dims_s.chunks_exact(2)).enumerate() {
+    for (i, (w, d)) in cuts.windows(2).zip(dims_s.as_chunks::<2>().0).enumerate() {
         let frame = u64::from(d[0]) * u64::from(d[1]) * 3;
         if frame == 0 || (w[1] - w[0]) % frame != 0 {
             return Err(format!(
@@ -3091,7 +3095,9 @@ fn empty_table<'a, R>(what: &str, noun: &str, blob_len: u64) -> Result<Table<'a,
 /// The first `keep` samples of native-endian f32 PCM in `bytes`.
 fn pcm_from_bytes(bytes: &[u8], keep: usize) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(keep)
         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .collect()

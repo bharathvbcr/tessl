@@ -50,7 +50,7 @@ pub struct AttnTrainDims {
 
 impl AttnTrainDims {
     fn validate(&self, what: &str) -> Result<(), String> {
-        if self.q_heads == 0 || self.kv_heads == 0 || self.q_heads % self.kv_heads != 0 {
+        if self.q_heads == 0 || self.kv_heads == 0 || !self.q_heads.is_multiple_of(self.kv_heads) {
             return Err(format!(
                 "{what}: q_heads must be a non-zero multiple of kv_heads, got {} and {}",
                 self.q_heads, self.kv_heads

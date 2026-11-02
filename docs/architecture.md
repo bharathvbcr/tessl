@@ -95,6 +95,15 @@ pool for CPU and GPU on unified memory. So, in tessl:
   typed-error taxonomy that duplicates `ojas-core`. Where ojas needs a
   typed allocation failure, the owner of the allocator (tessl) exposes a typed
   error and ojas maps it; ojas should not have to match message text.
+- **No second safetensors parser.** Decided by the owner on 2026-11-01: ojas
+  owns safetensors IO and checkpoints, and `ojas_io::safetensors` is the
+  canonical reader. tessl's `safetensors` module is a thin adapter over it —
+  its own 950-line parser is deleted — keeping only what is tessl's: the
+  `String`-error, `Vec<usize>`-shape surface its loaders call, a 19-variant
+  `Dtype` that refuses the sub-byte floats through `TryFrom<StDtype>`, and the
+  physical-memory payload default. The header grammar, offset validation,
+  tiling, positioned reads, the file-identity re-check and the index bound are
+  ojas-io's. See [`io-ownership.md`](io-ownership.md).
 - **No portable-backend abstractions.** tessl is Metal and macOS only. The
   `Backend` trait, the CPU, wgpu, CUDA and HIP paths and anything that must
   build off macOS live in ojas.

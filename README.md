@@ -23,6 +23,8 @@ The name is short for *tessellation* — the design centers around how matrix op
 >
 > *ABI 14 Updates:* Under ABI version 14 (`tessl_abi_version`), tessl retired standalone whole-step training, gradient banks, and AdamW from its C-API surface into ojas's autograd `Tape` (`TapeStepProvider`), establishing ojas as the sole authoritative training engine while tessl focuses on hardware-accelerated Metal execution.
 >
+> *Checkpoint IO:* The owner decided on 2026-11-01 that ojas owns safetensors IO, so `src/safetensors.rs` is a thin adapter over `ojas_io::safetensors` and has no parser of its own. It keeps only what is tessl's — the `String`-error, `Vec<usize>`-shape surface its loaders call, a `Dtype` that refuses the sub-byte floats, and the physical-memory payload default — while the header grammar, offset validation, positioned reads and shard index are ojas-io's. See [`docs/io-ownership.md`](docs/io-ownership.md).
+>
 > **The Modularity Rationale (Why a Dedicated Extension):**
 > 1. *Decoupled Compile Cycles:* Xcode 26 and Metal toolchain compilation (`xcrun metal`, `metallib`, `-std=metal4.0`) remain fully isolated from ojas's multi-platform CI and standard Linux/Windows development environments.
 > 2. *Isolated Hardware Requirements:* Targets Apple Silicon Neural Accelerators and Metal 4 (`MTL4*`) directly without forcing macOS dependencies onto universal CPU/wgpu/CUDA users.

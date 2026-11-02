@@ -98,7 +98,7 @@ pool for CPU and GPU on unified memory. So, in tessl:
 - **No second safetensors, JSON, or NPY parser.** Decided by the owner on 2026-11-01
   and completed in Milestone M2 on 2026-11-02: ojas owns safetensors, JSON, and NPY IO
   and checkpoints (`ojas_io::safetensors`, `ojas_io::json`, `ojas_io::npy`). tessl's
-  `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` (-1,645 LOC) are
+  `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` (-1,595 LOC) are
   deleted in full: `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly
   and `src/config_json.rs` consumes `ojas_io::json::{JsonValue, JsonLimits}`. See
   [`io-ownership.md`](io-ownership.md).

@@ -11,15 +11,15 @@ inference engine.
 
 `src/safetensors.rs` held a complete, strict `.safetensors` parser — 950 lines
 of header grammar, offset validation, tiling checks, index parsing and
-positioned reads — alongside standalone parsers in `src/json.rs` (482 lines),
-`src/npy.rs` (599 lines), and `src/plain.rs` (47 lines). `ojas-io` had its own
+positioned reads — alongside standalone parsers in `src/json.rs` (516 lines),
+`src/npy.rs` (417 lines), and `src/plain.rs` (145 lines). `ojas-io` had its own
 copies.
 
 In the initial P8 step (2026-11-01, recorded below), `src/safetensors.rs` was reduced
 to a 517-line adapter over `ojas_io::safetensors`. In Milestone M2 (2026-11-02),
 `ojas-io` absorbed `.npy` v1.0/v2.0 reading/writing and the remaining safetensors
 helper surface so that **`src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and
-`src/plain.rs` (-1,645 LOC total) were deleted in full**. `src/lib.rs` now
+`src/plain.rs` (-1,595 LOC total) were deleted in full**. `src/lib.rs` now
 re-exports `pub use ojas_io::{npy, safetensors};` directly and `src/config_json.rs`
 parses model configs through `ojas_io::json::{JsonValue, JsonLimits}`.
 
@@ -269,7 +269,7 @@ than being deleted with the duplicate it covered.
 
 Following the P8 adapter phase above, Milestone M2 completed the IO and optimizer-scalar unification across `ojas` and `tessl`:
 
-1. **`src/safetensors.rs` (517 lines), `src/json.rs` (482 lines), `src/npy.rs` (599 lines), and `src/plain.rs` (47 lines) are deleted (-1,645 LOC):**
+1. **`src/safetensors.rs` (517 lines), `src/json.rs` (516 lines), `src/npy.rs` (417 lines), and `src/plain.rs` (145 lines) are deleted (-1,595 LOC):**
    - `ojas-io/src/npy.rs` absorbed `.npy` v1.0/v2.0 reading and writing (`read_f32`, `read_i32`, `read_u32`, `write_f32`, `write_u32`, `from_bytes`, and `read_*_with_limit`).
    - `ojas-io/src/safetensors.rs` absorbed `SafeTensors::header_bytes`, `HeaderEntry` / `TensorEntry` accessors, and `Dtype` / `StDtype` re-exports.
    - `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly.

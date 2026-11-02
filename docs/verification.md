@@ -486,8 +486,9 @@ it" and "there was nothing to catch" look identical in a log.
 
 ## 7. Parser mutation tests
 
-`src/json.rs`, `src/safetensors.rs` and `src/npy.rs` are hand-written parsers of
-downloaded files. Besides their hand cases, `src/parser_mutation.rs` drives each
+The JSON, safetensors and npy readers are hand-written parsers of downloaded
+files. They were tessl's `src/json.rs`, `src/safetensors.rs` and `src/npy.rs`
+until Milestone M2 (2026-11-02) and are ojas-io's now (`docs/io-ownership.md`). Besides their hand cases, `src/parser_mutation.rs` drives each
 with seeded mutations of valid seeds (a Qwen3.5-style `config.json`, a four-tensor
 safetensors file, npy v1/v2/v3 files): truncation at every byte, every single-bit
 flip, boundary integers (0, 1, length +-1, `u16/u32/u64::MAX`, the header cap)

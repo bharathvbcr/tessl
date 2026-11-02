@@ -23,7 +23,7 @@ The name is short for *tessellation* — the design centers around how matrix op
 >
 > *ABI 14 Updates:* Under ABI version 14 (`tessl_abi_version`), tessl retired standalone whole-step training, gradient banks, and host AdamW from its C-API surface into ojas's autograd `Tape` (`TapeStepProvider`), establishing ojas as the sole authoritative training engine while tessl focuses on hardware-accelerated Metal execution (`src/qwen35_adamw.rs` delegates scalar calculation to `ojas_core::AdamWScalars::new`).
 >
-> *Checkpoint & Format IO:* The owner decided on 2026-11-01 (completed in Milestone M2 on 2026-11-02) that ojas owns safetensors, JSON, and NPY IO. `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` (-1,645 LOC) are retired in full: `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly and `src/config_json.rs` consumes `ojas_io::json::{JsonValue, JsonLimits}`. See [`docs/io-ownership.md`](docs/io-ownership.md).
+> *Checkpoint & Format IO:* The owner decided on 2026-11-01 (completed in Milestone M2 on 2026-11-02) that ojas owns safetensors, JSON, and NPY IO. `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` (-1,595 LOC) are retired in full: `src/lib.rs` re-exports `pub use ojas_io::{npy, safetensors};` directly and `src/config_json.rs` consumes `ojas_io::json::{JsonValue, JsonLimits}`. See [`docs/io-ownership.md`](docs/io-ownership.md).
 >
 > **The Modularity Rationale (Why a Dedicated Extension):**
 > 1. *Decoupled Compile Cycles:* Xcode 26 and Metal toolchain compilation (`xcrun metal`, `metallib`, `-std=metal4.0`) remain fully isolated from ojas's multi-platform CI and standard Linux/Windows development environments.

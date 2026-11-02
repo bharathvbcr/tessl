@@ -1949,7 +1949,9 @@ it (`merge_word` only flushes it at the next known character).
 
 ### Load and the JSON parser
 
-`tokenizer.json` is 32 MB. It goes through `src/json.rs` (the crate's strict
+Since Milestone M2 (2026-11-02) the parse is `ojas_io::json` with the
+tokenizer's own `JsonLimits`; `src/json.rs` is gone (`docs/io-ownership.md`). As
+first written: `tokenizer.json` is 32 MB. It goes through `src/json.rs` (the crate's strict
 parser: unique keys, valid UTF-8, RFC escapes, no trailing bytes) with `Syntax {
 uints_only: true, literals: true, max_depth: 6 }`: that set already fits the
 format (non-negative integers, `null` and booleans, containers four deep), so

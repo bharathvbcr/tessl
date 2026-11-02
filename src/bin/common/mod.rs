@@ -339,7 +339,7 @@ pub fn unique_stamp() -> String {
 /// Refuse an existing `path` that is not a regular file, without blocking.
 ///
 /// The open is `O_NONBLOCK` and the answer comes from `fstat` of that handle,
-/// as `tessl::plain::open_regular_file` does for checkpoints: a FIFO with no
+/// as `ojas_io::open_regular_file` does for checkpoints: a FIFO with no
 /// reader or writer must not hang the caller, and a device or directory is not
 /// something to replace. A missing path is fine.
 pub fn refuse_non_regular_target(path: &std::path::Path) -> Result<(), String> {

@@ -226,7 +226,7 @@ impl Flavor {
     /// this size: a width that is a multiple of 16 and an even height (an odd-height
     /// 4:2:2 picture, whatever its width, takes the table converter).
     pub fn uses_neon(self, width: usize, height: usize) -> bool {
-        self == Flavor::Aarch64 && width % 16 == 0 && height % 2 == 0
+        self == Flavor::Aarch64 && width.is_multiple_of(16) && height.is_multiple_of(2)
     }
 }
 
@@ -648,14 +648,14 @@ fn chroma_taps(filter: ChromaFilter, ch: usize, r: usize) -> ([(usize, i32); 4],
     let j = (r / 2) as isize;
     match filter {
         ChromaFilter::Bilinear => {
-            let other = if r % 2 == 0 { j - 1 } else { j + 1 };
+            let other = if r.is_multiple_of(2) { j - 1 } else { j + 1 };
             ([(clamp(j), 3072), (clamp(other), 1024), (0, 0), (0, 0)], 2)
         }
         ChromaFilter::Bicubic => match r {
             0 => ([(0, 4432), (1, -336), (0, 0), (0, 0)], 2),
             1 => ([(0, 3226), (1, 985), (2, -115), (0, 0)], 3),
             2 => ([(0, 959), (1, 3473), (2, -336), (0, 0)], 3),
-            _ if r % 2 == 0 => (
+            _ if r.is_multiple_of(2) => (
                 [
                     (clamp(j - 2), -115),
                     (clamp(j - 1), 985),
@@ -701,10 +701,10 @@ pub fn check_shape(layout: Layout, width: usize, height: usize, filter: ChromaFi
     if width == 0 || height == 0 {
         return Err(size_error);
     }
-    if chroma != Chroma::C444 && width % 2 != 0 {
+    if chroma != Chroma::C444 && !width.is_multiple_of(2) {
         return Err(size_error);
     }
-    if chroma == Chroma::C420 && height % 2 != 0 {
+    if chroma == Chroma::C420 && !height.is_multiple_of(2) {
         return Err(size_error);
     }
     if chroma == Chroma::C420 && depth > 8 && height > 2 && height < min_height(filter) {
@@ -831,9 +831,11 @@ fn fill_replicated<T: Sample>(
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
         let chroma = &p.uv[crow * p.uv_stride..crow * p.uv_stride + w];
         for ((ys, cs), d) in luma
-            .chunks_exact(2)
-            .zip(chroma.chunks_exact(2))
-            .zip(dst.chunks_exact_mut(6))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(chroma.as_chunks::<2>().0)
+            .zip(dst.as_chunks_mut::<6>().0.iter_mut())
         {
             let (u, v) = (cs[0].get() as usize, cs[1].get() as usize);
             d[..3].copy_from_slice(&px(ys[0].get() as usize, u, v));
@@ -849,7 +851,11 @@ fn fill_direct<T: Sample>(p: &Picture<'_, T>, d: &Direct, first: usize, band: &m
         let row = first + k;
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
         let chroma = &p.uv[row * p.uv_stride..row * p.uv_stride + 2 * w];
-        for ((ys, cs), px) in luma.iter().zip(chroma.chunks_exact(2)).zip(dst.chunks_exact_mut(3)) {
+        for ((ys, cs), px) in luma
+            .iter()
+            .zip(chroma.as_chunks::<2>().0)
+            .zip(dst.as_chunks_mut::<3>().0.iter_mut())
+        {
             px.copy_from_slice(&d.pixel(ys.get(), cs[0].get(), cs[1].get()));
         }
     }
@@ -874,7 +880,7 @@ fn fill_rounded<T: Sample>(p: &Picture<'_, T>, t: &Table, filter: Option<ChromaF
         match filter {
             None => {
                 let chroma = &p.uv[row * p.uv_stride..row * p.uv_stride + 2 * cw];
-                for (c, pair) in chroma.chunks_exact(2).enumerate() {
+                for (c, pair) in chroma.as_chunks::<2>().0.iter().enumerate() {
                     cb[c] = round_to_8(pair[0].get()).min(255);
                     cr[c] = round_to_8(pair[1].get()).min(255);
                 }
@@ -895,7 +901,13 @@ fn fill_rounded<T: Sample>(p: &Picture<'_, T>, t: &Table, filter: Option<ChromaF
             }
         }
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
-        for (c, (ys, d)) in luma.chunks_exact(2).zip(dst.chunks_exact_mut(6)).enumerate() {
+        for (c, (ys, d)) in luma
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<6>().0.iter_mut())
+            .enumerate()
+        {
             d[..3].copy_from_slice(&t.pixel(round_to_8(ys[0].get()), cb[c], cr[c]));
             d[3..].copy_from_slice(&t.pixel(round_to_8(ys[1].get()), cb[c], cr[c]));
         }

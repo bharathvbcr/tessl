@@ -14,7 +14,7 @@
 //! | OS | macOS 26 or newer |
 //! | Hardware | Apple M-series with neural accelerators, for the TensorOps path |
 //! | Toolchain | Xcode 26 with the Metal Toolchain component |
-//! | Rust | 1.82+ |
+//! | Rust | 1.97+ (the ojas workspace floor; see `Cargo.toml`) |
 //!
 //! The Metal compiler is **not** part of Xcode. It is a separately downloaded
 //! component, and without it `build.rs` fails at the shader compile step:

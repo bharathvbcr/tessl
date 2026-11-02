@@ -148,7 +148,7 @@ fn npy(version: u8, dict: &str, pad_to: usize, newline: bool, payload: &[u8]) ->
     let prefix = if version == 1 { 10 } else { 12 };
     let mut h = dict.as_bytes().to_vec();
     if pad_to > 0 {
-        while (prefix + h.len() + usize::from(newline)) % pad_to != 0 {
+        while !(prefix + h.len() + usize::from(newline)).is_multiple_of(pad_to) {
             h.push(b' ');
         }
     }
@@ -205,14 +205,14 @@ fn npy_headers_follow_the_format_spec_in_every_version() {
         // Aligned but without the terminator: the last pad byte is a space.
         let mut h = DICT.to_string();
         let prefix = if v == 1 { 10 } else { 12 };
-        while (prefix + h.len()) % 64 != 0 {
+        while !(prefix + h.len()).is_multiple_of(64) {
             h.push(' ');
         }
         let e = npy_result(&s, &npy(v, &h, 0, false, &PAYLOAD)).unwrap_err();
         assert!(e.contains("does not end with a newline"), "v{v}: {e}");
         // Padding that is not spaces (a NUL before the newline).
         let mut h = DICT.to_string();
-        while (prefix + h.len() + 1) % 64 != 0 {
+        while !(prefix + h.len() + 1).is_multiple_of(64) {
             h.push('\0');
         }
         let e = npy_result(&s, &npy(v, &h, 0, true, &PAYLOAD)).unwrap_err();

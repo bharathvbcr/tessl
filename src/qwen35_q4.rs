@@ -397,7 +397,7 @@ pub fn check_part(
             cols,
         });
     }
-    if cols % group != 0 || cols % NIBBLES_PER_WORD != 0 {
+    if !cols.is_multiple_of(group) || !cols.is_multiple_of(NIBBLES_PER_WORD) {
         return Err(MlxQ4Error::Cols {
             tensor: weight_name.into(),
             cols,
@@ -464,7 +464,7 @@ impl Q4Weight {
     pub(crate) fn alloc(rt: &Arc<GpuRuntime>, rows: usize, cols: usize) -> Result<Self, String> {
         let group = MLX_Q4_GROUP as usize;
         let (rows32, cols32) = match (u32::try_from(rows), u32::try_from(cols)) {
-            (Ok(r), Ok(c)) if c as usize % group == 0 => (r, c),
+            (Ok(r), Ok(c)) if (c as usize).is_multiple_of(group) => (r, c),
             _ => return Err(format!("Q4Weight: {rows} x {cols} does not fit a group-{group} bank")),
         };
         let weights = rows

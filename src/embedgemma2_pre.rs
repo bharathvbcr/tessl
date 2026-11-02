@@ -759,12 +759,12 @@ fn resize_with(
     for_row_blocks(&mut mid, row_mid, pass_threads(h, row_mid), |first, block| {
         for (r, out_row) in block.chunks_exact_mut(row_mid).enumerate() {
             let in_row = &src[(first + r) * row_in..][..row_in];
-            for (x, px) in out_row.chunks_exact_mut(3).enumerate() {
+            for (x, px) in out_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (start, n, off) = (across.start[x], across.len[x], across.off[x]);
                 let taps = &across.w[off..off + n];
                 let pixels = &in_row[start * 3..(start + n) * 3];
                 let (mut a0, mut a1, mut a2) = (half, half, half);
-                for (&wt, p) in taps.iter().zip(pixels.chunks_exact(3)) {
+                for (&wt, p) in taps.iter().zip(pixels.as_chunks::<3>().0) {
                     a0 += wt * i32::from(p[0]);
                     a1 += wt * i32::from(p[1]);
                     a2 += wt * i32::from(p[2]);
@@ -862,9 +862,23 @@ impl<'a> RawImage<'a> {
         use std::borrow::Cow;
         match self.channels {
             3 => Cow::Borrowed(self.data),
-            4 => Cow::Owned(self.data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()),
+            4 => Cow::Owned(
+                self.data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[0], p[1], p[2]])
+                    .collect(),
+            ),
             1 => Cow::Owned(self.data.iter().flat_map(|&g| [g, g, g]).collect()),
-            _ => Cow::Owned(self.data.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect()),
+            _ => Cow::Owned(
+                self.data
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[0], p[0], p[0]])
+                    .collect(),
+            ),
         }
     }
 }
@@ -1775,7 +1789,7 @@ mod tests {
         let floor = (1e-3f64).ln() as f32;
         let real = a.mask.iter().filter(|&&m| m).count();
         assert!(real > 0 && real < a.mask.len());
-        for (i, row) in a.input_features.chunks_exact(128).enumerate() {
+        for (i, row) in a.input_features.as_chunks::<128>().0.iter().enumerate() {
             let want = if a.mask[i] { floor } else { 0.0 };
             assert!(row.iter().all(|&v| v == want), "frame {i}");
         }

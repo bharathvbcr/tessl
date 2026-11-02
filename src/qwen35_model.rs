@@ -394,7 +394,7 @@ impl Qwen35Config {
         {
             return Err("Qwen35Config: rms_norm_eps and rope_theta must be positive".into());
         }
-        if self.attn.q_heads() % self.attn.kv_heads() != 0 {
+        if !self.attn.q_heads().is_multiple_of(self.attn.kv_heads()) {
             return Err(format!(
                 "Qwen35Config: {} query heads do not group over {} kv_heads (num_attention_heads must be a \
                  multiple of num_key_value_heads)",
@@ -402,7 +402,7 @@ impl Qwen35Config {
                 self.attn.kv_heads()
             ));
         }
-        if self.rotary_dim % 2 != 0 || self.rotary_dim > self.attn.head_dim() {
+        if !self.rotary_dim.is_multiple_of(2) || self.rotary_dim > self.attn.head_dim() {
             return Err("Qwen35Config: rotary_dim must be even and at most head_dim".into());
         }
         if self.attn.head_dim() != qwen35::PREFIX_ATTN_HEAD_DIM {

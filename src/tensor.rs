@@ -57,7 +57,7 @@ pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, Str
 /// in `nbytes`.
 fn check_view_bounds(nbytes: usize, shape: &[usize], dtype: DType, byte_offset: usize) -> Result<(), String> {
     let bytes = checked_nbytes(shape, dtype)?;
-    if byte_offset % dtype.size_of() != 0 || byte_offset.checked_add(bytes).is_none_or(|end| end > nbytes) {
+    if !byte_offset.is_multiple_of(dtype.size_of()) || byte_offset.checked_add(bytes).is_none_or(|end| end > nbytes) {
         return Err("tensor view is misaligned or out of bounds".into());
     }
     Ok(())
@@ -211,8 +211,8 @@ impl GpuBuffer {
                  copy it into a shared buffer on the GPU first"
             ));
         }
-        if self.nbytes() % std::mem::size_of::<T>() != 0
-            || self.metal().contents().as_ptr() as usize % std::mem::align_of::<T>() != 0
+        if !self.nbytes().is_multiple_of(std::mem::size_of::<T>())
+            || !(self.metal().contents().as_ptr() as usize).is_multiple_of(std::mem::align_of::<T>())
         {
             return Err("host mapping size/alignment mismatch".into());
         }

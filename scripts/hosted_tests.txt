@@ -19,6 +19,10 @@ bin build_artifact_contract 2
 bin capi_contract 81
 bin ce_collapse_host 7
 bin check_kernel_ir_planted 6
+# Runs scripts/check_siblings.sh against fixture trees. Device-free, but slower
+# than its neighbours (~2 min): one case runs the real script over the real
+# checkout, which resolves two lockfiles with `cargo metadata`.
+bin check_siblings_script 7
 bin config_json_parsers 10
 bin dialect_lint_script 12
 bin docs_name_real_tools 7
@@ -97,11 +101,12 @@ exact qkv_rope no_rms_eps_validator_admits_zero
 exact qwen35_bwd conv_reference_backward_is_the_derivative gate_reference_backward_is_the_derivative gated_rms_norm_reference_backward_is_the_derivative qk_norm_rope_reference_backward_is_the_derivative rms_norm_reference_backward_is_the_derivative
 exact qwen35_kernels gdn_reference_matches_transformers pack_linear_weights_rejects_overflowing_widths_and_skips_empty_rows rope_reference_matches_transformers
 exact qwen35_model mamba_ssm_dtype_other_than_float32_is_refused_at_the_config nonzero_attention_dropout_is_refused_at_the_config the_real_2b_config_shape_still_loads q4_checkpoint_gate_fails_closed_when_the_checkpoint_is_missing logit_dev_identical_rows_are_exact logit_dev_one_flipped_argmax_is_one_miss_with_positive_kl logit_dev_nan_and_inf_never_pass_a_bound logit_dev_within_rel_is_false_for_nan_and_inf_operands logit_dev_nan_in_the_last_element_is_not_skipped_by_max logit_dev_zero_reference_scale_only_matches_exactly logit_dev_shape_mismatch_panics logit_dev_vocab_not_dividing_len_panics ear_matches_a_hand_computed_two_row_case ear_of_identical_logits_is_one_and_nonfinite_never_clears ear_k_beyond_the_vocab_panics logit_dev_empty_panics
+exact stress_trim_concurrency stress_concurrent_budget_charges_under_high_contention
 exact tune_rigs_refuse_missing_variants every_rig_that_flags_drift_exits_3
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 271
+bins 251
 
 # Library tests.
 lib ab_flags::tests:: 10
@@ -115,11 +120,18 @@ lib gemm::small_m_select:: 4
 lib par_batch::tests:: 6
 lib media:: 19
 lib parser_mutation:: 16
+lib pool_ledger::tests:: 3
 lib qwen35::tests:: 6
+lib qwen35_bwd::layout_tests:: 2
 exact lib encode_batch::tests::batch_shape_refusals_in_order
 exact lib gdn_train::tests::the_chunked_workspace_bytes_follow_the_key_heads
+lib runtime::alloc_failure_tests:: 3
 lib runtime::drop_wait_tests:: 1
 lib runtime::timestamp_decode_tests:: 2
+lib shared::tests:: 4
+# Only this one of shared_buf::tests:: 14 is device-free; the rest open a device,
+# so this is named rather than taken as a module.
+exact lib shared_buf::tests::the_core_and_its_errors_are_send_and_sync
 lib sq_norm::tests:: 2
 exact lib cb_replay::tests::api_gap_survey_names_mtl4_and_icb cb_replay::tests::ledger_recycles_an_in_flight_slot_instead_of_wedging cb_replay::tests::mark_live_step_advances_ping_pong cb_replay::tests::not_wired_message_names_every_surveyed_gap cb_replay::tests::note_layer_live_replay_is_not_counted_as_a_tape_replay cb_replay::tests::on_gpu_complete_does_not_discard_an_open_recording cb_replay::tests::ping_pong_record_ready_dry_replay cb_replay::tests::try_replay_not_wired_by_default cb_replay::tests::try_replay_ready_not_wired_after_live decode_icb::tests::a_nested_nop_guard_restores_its_parent decode_icb::tests::binder_encode_nop_does_not_cross_thread_boundaries decode_icb::tests::decode_icb_flag_default_off gemm::tests::bf16_parallel_split_k_width_follows_the_threadgroup_count gemm::tests::few_tile_long_k_tn_takes_parallel_partitions gemm::tests::long_k_nn_with_a_large_b_takes_k_partitions gemm::tests::parity_metric_rejects_nonfinite_and_length_mismatch icb_smoke::tests::icb_smoke_flag_default_off nn::tests::static_attention_entry_names_match_the_kernel_naming_scheme runtime::lifetime_event_tests::a_lifetime_event_above_what_was_submitted_is_a_violation runtime::tests::feedback_wait_returns_at_once_when_the_callback_already_ran runtime::tests::feedback_wait_sees_a_failure_reported_from_another_thread runtime::tests::feedback_wait_wakes_on_the_callback_not_on_a_poll_tick runtime::tests::feedback_wait_without_a_callback_gives_up_at_the_limit tensor::contract_tests::bf16_preserves_special_values_and_ties tensor::contract_tests::gpu_matching_bf16_cast_canonicalises_nan_and_flushes_subnormals
 

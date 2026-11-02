@@ -1785,7 +1785,7 @@ fn bgra_to_rgb(image: CfTypeRef, format: u32, w: usize, h: usize) -> Result<Vec<
         // starting at `base`; this reads the first `4 * w` of row `y`.
         let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
         let dst = &mut rgb[y * w * 3..(y + 1) * w * 3];
-        for (px, out) in row.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
+        for (px, out) in row.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<3>().0.iter_mut()) {
             out[0] = px[2];
             out[1] = px[1];
             out[2] = px[0];

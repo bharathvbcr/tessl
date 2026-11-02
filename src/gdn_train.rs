@@ -67,7 +67,7 @@ impl GdnTrainDims {
         if self.batch == 0 || self.seq == 0 || self.heads == 0 {
             return Err(format!("{what}: batch, seq and heads must be non-zero"));
         }
-        if self.v_dim == 0 || self.v_dim % GDN_TRAIN_BV != 0 {
+        if self.v_dim == 0 || !self.v_dim.is_multiple_of(GDN_TRAIN_BV) {
             return Err(format!(
                 "{what}: v_dim must be a non-zero multiple of {GDN_TRAIN_BV}, got {}",
                 self.v_dim
@@ -260,7 +260,7 @@ impl GdnTrainWorkspace {
 
     fn build(rt: &Arc<GpuRuntime>, dims: GdnTrainDims, kernel: GdnTrainKernel, key_heads: u32) -> Result<Self, String> {
         dims.validate("GdnTrainWorkspace")?;
-        if key_heads == 0 || dims.heads % key_heads != 0 {
+        if key_heads == 0 || !dims.heads.is_multiple_of(key_heads) {
             return Err(format!(
                 "GdnTrainWorkspace: {} value heads are not a multiple of {key_heads} key heads",
                 dims.heads
@@ -574,7 +574,7 @@ impl GdnTrainWindowedInputs<'_> {
             d.v_dim as usize,
             GDN_TRAIN_DK as usize,
         );
-        if self.key_heads == 0 || d.heads % self.key_heads != 0 {
+        if self.key_heads == 0 || !d.heads.is_multiple_of(self.key_heads) {
             return Err(format!(
                 "{what}: {} value heads are not a multiple of {} key heads",
                 d.heads, self.key_heads

@@ -1077,7 +1077,8 @@ fn write_entry(model: *mut TesslQwen35, i: usize, src: &[f32]) -> (i32, String) 
     (s, msg(&err))
 }
 
-/// A NaN payload no read produces; a fn because `f32::from_bits` is const only from 1.83 (MSRV 1.82).
+/// A NaN payload no read produces. (A fn from when the floor was 1.82; `f32::from_bits`
+/// is const from 1.83, well under the 1.97 this crate now declares.)
 fn guard() -> f32 {
     f32::from_bits(0x7FC0_DEAD)
 }

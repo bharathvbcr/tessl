@@ -1,13 +1,45 @@
 name: CI
 
+# tessl builds against the sibling ojas checkout through two mandatory path
+# dependencies (Cargo.toml: `ojas-core`, `ojas-io` at `../ojas/...`), so cargo
+# cannot resolve this manifest at all without ojas on disk — before a test, a
+# lint or a build script runs. ojas is public: github.com/bharathvbcr/ojas.
+#
+# The checkout layout below reproduces the relative path, and is the mirror
+# image of ojas's own (ojas/.github/workflows/test.yml, which checks tessl out
+# beside itself):
+#   $GITHUB_WORKSPACE/code/research/tessl   <- this repository
+#   $GITHUB_WORKSPACE/code/research/ojas
+# gusset is deliberately absent: tessl's own graph does not reach it (verified
+# by `cargo metadata --locked` in exactly this two-checkout layout), and the one
+# command that did walk the whole ojas workspace — `cargo fmt --all`, which
+# formats local path dependencies too — is no longer used here. See the `fmt`
+# job.
+#
+# OJAS_REF picks the sibling commit, the way ojas's TESSL_REF picks tessl's. It
+# defaults to main, so a run only reproduces a local tree whose ojas changes
+# have been pushed.
+#
+# Every job that runs cargo therefore needs both checkouts and
+# `defaults.run.working-directory`. `kernel-emulator` is the exception and says
+# so at its own steps: it runs no cargo at all. Action inputs are NOT affected by that
+# default, so every path handed to an action (setup-python's
+# cache-dependency-path, setup-go's go-version-file, rust-cache's workspaces)
+# is spelled from $GITHUB_WORKSPACE.
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ojas_ref:
+        description: ojas ref
+        default: main
 
 env:
   CARGO_TERM_COLOR: always
+  OJAS_REF: ${{ inputs.ojas_ref || 'main' }}
 
 # A newer push to the same branch supersedes an in-flight run.
 concurrency:
@@ -23,12 +55,45 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+
+      - name: Sibling checkouts resolve (ojas)
+        # This job has no rust-cache step, so this really is the first cargo in
+        # it. Elsewhere the step sits ahead of rust-cache, whose restore runs
+        # `cargo metadata` itself.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
+      # Not `cargo fmt --all`: that formats local path dependencies too, so with
+      # ojas checked out beside tessl it would reach into ojas-core and ojas-io
+      # and hold this repository's CI to a sibling's formatting. Worse, its
+      # `cargo metadata` call loads the whole ojas workspace, which path-depends
+      # on gusset, and fails outright without a third checkout. The script
+      # covers exactly tessl's own packages. ojas does the same, for the same
+      # reason (ojas/scripts/fmt_check.sh).
+      - run: ./scripts/fmt_check.sh
 
   # ---------------------------------------------------------------------------
   # The Qwen3.5 kernels on a CPU emulator, against transformers' own code.
@@ -47,13 +112,25 @@ jobs:
   kernel-emulator:
     name: qwen35 kernels (CPU emulator vs transformers)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
+      # The one job with no ojas checkout, because it is the one job that runs
+      # no cargo: the dialect lint is a bare `rustc` (which reads no manifest)
+      # and everything else is python, so nothing here resolves a path
+      # dependency (`rg -n '\bcargo\b' tools/msl_emu/` matches nothing). It is
+      # still checked out at the same nested path as every other job so the
+      # layout is uniform. ADD AN OJAS CHECKOUT, like the jobs below, before
+      # adding any cargo step here.
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: tools/msl_emu/requirements.txt
+          cache-dependency-path: code/research/tessl/tools/msl_emu/requirements.txt
       - uses: dtolnay/rust-toolchain@stable
       - name: MSL dialect lint
         # No Metal compiler on Linux: fail instead on any construct the Qwen3.5
@@ -102,20 +179,47 @@ jobs:
   check:
     name: build + clippy + docs
     runs-on: macos-26
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code/research/tessl
       - name: Python for the source-text gates
         # The parity harness below needs numpy.
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: tools/msl_emu/requirements.txt
+          cache-dependency-path: code/research/tessl/tools/msl_emu/requirements.txt
 
       - name: Report the toolchain this runner actually has
         # Recorded rather than assumed: the image's default Xcode floats, and
@@ -230,19 +334,45 @@ jobs:
   go:
     name: Go binding (unit tier)
     runs-on: macos-26
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
         with:
           # The engine builds into its own target dir (go/Makefile --target-dir).
-          workspaces: go/engine -> target
+          workspaces: code/research/tessl/go/engine -> target
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go/go.mod
-          cache-dependency-path: go/go.sum
+          go-version-file: code/research/tessl/go/go.mod
+          cache-dependency-path: code/research/tessl/go/go.sum
 
       - name: Install the Metal Toolchain
         run: |
@@ -307,11 +437,38 @@ jobs:
     name: GPU suite on bare metal
     if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code/research/tessl
       - name: Install the Metal Toolchain
         run: |
           if xcrun --find metal >/dev/null 2>&1; then
@@ -366,8 +523,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go/go.mod
-          cache-dependency-path: go/go.sum
+          go-version-file: code/research/tessl/go/go.mod
+          cache-dependency-path: code/research/tessl/go/go.sum
 
       - name: Go binding device tests
         # The Go package against tessl's own C ABI on the tiny checkpoint, bit
@@ -377,19 +534,61 @@ jobs:
         run: make -C go device
 
   # ---------------------------------------------------------------------------
-  # Cargo.toml claims `rust-version = "1.82"`. Unverified that is just a string
-  # in a manifest, so this builds against exactly that toolchain.
+  # Unverified, `rust-version` is just a string in a manifest, so this builds
+  # against exactly the toolchain Cargo.toml declares.
+  #
+  # The version is READ OUT of Cargo.toml rather than written here, as ojas does
+  # (ojas/.github/workflows/test.yml, its `msrv` job). A hard-coded toolchain is
+  # how this job came to install 1.82 for a crate that cannot build below 1.97:
+  # the manifest and the job drifted apart silently, and the job name said 1.82
+  # too. Read from the one source of truth and they cannot.
   #
   # `--locked` because the MSRV promise is about building the shipped lockfile,
   # not about whatever a fresh resolve happens to pick today.
   # ---------------------------------------------------------------------------
   msrv:
-    name: MSRV 1.82
+    name: MSRV (the rust-version Cargo.toml declares)
     runs-on: macos-26
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
+      - name: Rust toolchain at the declared rust-version
+        # `test -n` so a renamed or reformatted field fails here instead of
+        # quietly installing whatever `rustup default ""` would pick.
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\([0-9.]*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+          rustc --version
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code/research/tessl
       - name: Install the Metal Toolchain
         run: |
           if xcrun --find metal >/dev/null 2>&1; then
@@ -399,8 +598,9 @@ jobs:
           fi
           xcrun metal --version
       - name: Check the library and all targets
-        # `--all-targets` is safe here: this crate declares no dev-dependencies,
-        # so the tests build against the same toolchain floor as the library.
+        # `--all-targets` also builds the `numcheck` path dev-dependency, whose
+        # own floor (1.82) is below this one, so the tests are held to the same
+        # toolchain as the library.
         run: cargo check --locked --all-targets
       - name: Check with quant-prep enabled
         # The feature is off by default, which means nothing else in this
@@ -429,10 +629,38 @@ jobs:
     name: GEMM sweep on bare metal
     if: ${{ vars.HAS_METAL_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, macOS, ARM64]
+    defaults:
+      run:
+        working-directory: code/research/tessl
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: code/research/tessl
+      - uses: actions/checkout@v4
+        with:
+          repository: bharathvbcr/ojas
+          ref: ${{ env.OJAS_REF }}
+          path: code/research/ojas
       - uses: dtolnay/rust-toolchain@stable
+      - name: Sibling checkouts resolve (ojas)
+        # The first thing in this job that touches cargo, and deliberately
+        # ahead of rust-cache: that action's restore runs `cargo metadata`
+        # itself, so a preflight placed after it is not first and cargo's own
+        # error for an absent sibling lands above this message in the log.
+        #
+        # Cargo resolves ../ojas/ojas-core and ../ojas/ojas-io before it does
+        # anything else, and its error for an absent sibling names a package
+        # and a searched path, which reads like a dependency problem rather
+        # than a layout one: that is how this repository's CI stayed red while
+        # every job failed ahead of its own first step. --network because a
+        # fresh runner's cargo registry cache is cold, and --offline cannot
+        # resolve a graph whose crates are not cached (measured: it fails on
+        # `block2`, naming the crates.io index).
+        run: ./scripts/check_siblings.sh --network
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code/research/tessl
       # No `cargo test` here: the `gpu` job above runs the suite on this same
       # runner. This job is for numbers.
       - name: Bit-exact parity probe against the reference SIMD path

@@ -138,7 +138,7 @@ pub fn embed_layer_norm(
             tables.positions
         ));
     }
-    if rows % seq != 0 {
+    if !rows.is_multiple_of(seq) {
         return Err(format!(
             "{WHAT}: rows {rows} is not a whole number of {seq}-position sequences"
         ));
@@ -509,7 +509,7 @@ impl BertConfig {
                 "config.json: layer_norm_eps must be positive, got {layer_norm_eps}"
             ));
         }
-        if cfg.hidden % cfg.heads != 0 {
+        if !cfg.hidden.is_multiple_of(cfg.heads) {
             return Err(format!(
                 "config.json: {hidden_k} {} is not a multiple of {heads_k} {}",
                 cfg.hidden, cfg.heads

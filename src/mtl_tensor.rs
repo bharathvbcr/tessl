@@ -299,7 +299,7 @@ pub unsafe fn tensor_from_buffer(
     if align.align == 0 {
         return Err("tensorSizeAndAlignWithDescriptor reported zero alignment".into());
     }
-    if byte_offset % align.align != 0 {
+    if !byte_offset.is_multiple_of(align.align) {
         return Err(format!(
             "tensor buffer offset {byte_offset} not aligned to {}",
             align.align

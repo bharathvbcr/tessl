@@ -243,8 +243,71 @@ All notable changes to `tessl` are recorded here. The format follows
   once, and `sq_norm` does all of it. `grad_sq_norm` is that over the model's
   gradients, with no change to its signature or to the C and Python entries.
 
+### Added
+
+- **`scripts/check_siblings.sh`: a preflight that names a broken sibling layout instead of letting
+  cargo misdescribe it** (`scripts/check_siblings.sh`, `scripts/ci_local.sh`,
+  `.github/workflows/ci.yml`). Runs first locally and, in CI, in each of the six jobs that run cargo
+  — before the Metal-toolchain download, so a layout error costs seconds rather than minutes. Four
+  checks, none skippable: the checkout kind; every out-of-tree `path` dependency, all reported rather
+  than stopping at the first, with parsing *zero* of them a hard failure (a check that passes for
+  having looked at nothing is the defect this file exists to catch); each sibling's branch, HEAD,
+  uncommitted paths and commits not on `origin/main`, loudly, because anything read from such a
+  checkout is not what that repository publishes; `cargo metadata --locked` as the authority, run
+  per gating lockfile rather than once at the root, because `go/engine` declares its own
+  `[workspace]` and the `go` and `gpu` jobs build *that* lockfile with `--locked` (it really was
+  stale until `d289a9c`); and a fifth check that the set of tracked lockfiles has not changed, so the
+  named subset in the fourth cannot go stale unnoticed. It is the mirror of
+  `ojas/scripts/check_siblings.sh` — ojas `4a30be6`, which at the time of writing is **unpushed**, on
+  ojas's local `main` only: ojas `origin/main` is `dac0b5b` and carries no such file, so cite it by
+  sha rather than as published. `tests/check_siblings_script.rs` holds every failure path below to
+  failing. It differs from ojas's copy where measurement said it should:
+  tessl does **not** refuse to run in a worktree, because a tessl worktree resolves and builds fine
+  wherever `../ojas` exists (measured: exit 0 beside a real ojas checkout, exit 101 where `../ojas`
+  is absent) — tessl has no `ojas-core` member of its own to collide with, which is the half of
+  ojas's problem that does not exist here. `--offline` by default so a network outage cannot read as
+  a broken layout, `--network` in CI because a fresh runner's registry cache is cold, and a cold
+  cache's failure is reported as the cache rather than the layout. Every failure path was exercised:
+  worktree without `../ojas`, absent sibling, parser matching nothing, cold registry.
+
 ### Fixed
 
+- **CI could not resolve this manifest at all: no job checked out ojas** (`.github/workflows/ci.yml`,
+  `.github/workflows/metal-compile.yml`). `ojas-core` and `ojas-io` are mandatory path
+  dependencies at `../ojas/...`, and cargo resolves them before it builds, lints or tests
+  anything, so every cargo job failed ahead of its own steps — a second, newer cause of red CI
+  than the emulator host-contract check. Both workflows now reproduce the relative path the
+  manifest expects, mirroring ojas's own layout for tessl: this repository at
+  `code/research/tessl`, `bharathvbcr/ojas` at `code/research/ojas`, the sibling commit chosen by
+  `OJAS_REF` (default `main`) as ojas chooses tessl's with `TESSL_REF`. gusset is not needed:
+  `cargo metadata --locked` resolves in exactly that two-checkout layout.
+- **`rust-version = "1.82"` was unreachable, and the MSRV job hard-coded the same wrong number**
+  (`Cargo.toml`, `.github/workflows/ci.yml`). The floor is ojas's and not a choice: `ojas-core`
+  and `ojas-io` inherit `rust-version.workspace = true` from a workspace that declares 1.97, and
+  cargo refuses a dependency whose floor exceeds the toolchain. ojas-core compiled standalone at
+  1.82 gives 535 errors, including trait upcasting coercion (stable 1.86) and `is_multiple_of`
+  (stable 1.87). `rust-version` is now 1.97, verified with `cargo +1.97 check --locked
+  --all-targets` and `--features quant-prep`, and the `msrv` job reads the number out of
+  Cargo.toml (as ojas's does) instead of naming one, so the manifest and the job cannot drift
+  apart again. The documented claims follow (`README.md`, `src/lib.rs`).
+- **`cargo fmt --all` reached into the sibling checkouts** (`scripts/fmt_check.sh`,
+  `.github/workflows/ci.yml`, `scripts/ci_local.sh`). `--all` formats local path dependencies, so
+  once ojas is beside tessl it formatted `ojas-core` and `ojas-io`, and its `cargo metadata` call
+  loaded the whole ojas workspace and failed without a gusset checkout. The new script covers
+  exactly tessl's own packages — the crate and `numcheck`, which is a path dev-dependency rather
+  than a workspace member — the way `ojas/scripts/fmt_check.sh` does for ojas.
+- **`go/engine/Cargo.lock` predated the ojas path dependency** (`go/engine/Cargo.lock`). The engine
+  depends on `tessl = { path = "../.." }`, so `ojas-core` and `ojas-io` are in its graph, but the
+  lockfile was last written by `607dc0e` and named neither. `make -C go unit` (the `go` job) and
+  `make -C go device` (the `gpu` job) build it with `--locked`, so both refused it: *"cannot update
+  the lock file .../go/engine/Cargo.lock because --locked was passed"*. Regenerated: the two path
+  packages and tessl's dependency list, 13 added lines, nothing else moved.
+- **The crate was not rustfmt-clean** (`src/loader.rs`, `src/runtime/host_fence.rs`,
+  `src/shared_buf.rs`, `tests/capi.rs`, `tests/capi_contract.rs`, `tests/capi_oversized.rs`,
+  `tests/kernel_coverage.rs`, `tests/qwen35_params.rs`, `tests/shared_runtime.rs`,
+  `tests/stress_trim_concurrency.rs`). Formatting drift since `def8c10` ("rustfmt at
+  max_width = 120 across the crate"), which the `fmt` job would fail on regardless of the
+  manifest: 28 hunks, no behaviour change.
 - **`synchronize` with no open batch consumes a queued commit fault** (`src/runtime.rs`).
   A waiting commit with no batch returned before `observe_finished_feedback`, so a
   `MTL4CommitFeedback` fault requeued after the batch was cleared stayed on its allocator

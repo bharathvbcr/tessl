@@ -23,7 +23,8 @@ over seven files.
 The tree as a whole did **not** shrink, and it is worth saying so rather than
 reporting only this side of it: ojas-io grew by 1,396 insertions against 82
 deletions to take the format over, of which about 385 lines are new tests —
-`tests/tessl_rejection_corpus.rs` (246), `tests/header_amplification.rs` (101)
+`ojas-io/tests/tessl_rejection_corpus.rs` (246),
+`ojas-io/tests/header_amplification.rs` (101)
 and the `widen_in_place` test that moved here with the code it covers (38).
 What was removed is the duplicate; what was added is the discipline the
 surviving reader did not have, with its tests.

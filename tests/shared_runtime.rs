@@ -135,9 +135,7 @@ fn a_runtime_with_its_own_shared_is_unchanged() {
 #[test]
 fn adversarial_shared_buf_uma_and_placement_invariants() {
     let _guard = gpu_lock();
-    use ojas_core::{
-        BackendId, Budget, BudgetTrimHandler, DType, DeviceBuffer, MappedBuffer, OjasError, Tensor,
-    };
+    use ojas_core::{BackendId, Budget, BudgetTrimHandler, DType, DeviceBuffer, MappedBuffer, OjasError, Tensor};
     use tessl::shared_buf::{SharedAlloc, SharedBuf};
 
     // 1. Confirm that BudgetTrimHandler is accessible from crate root in downstream code
@@ -201,12 +199,7 @@ fn adversarial_shared_buf_uma_and_placement_invariants() {
     // Also verify Bf16 tensor placement check
     let bf16_alloc = SharedAlloc::new(&rt, count * 2).expect("bf16 alloc");
     let bf16_buf: SharedBuf = bf16_alloc.shared_buf();
-    let bf16_tensor = Tensor::from_mapped(
-        Arc::new(bf16_buf),
-        &[count],
-        DType::Bf16,
-        &budget,
-    ).expect("bf16 tensor");
+    let bf16_tensor = Tensor::from_mapped(Arc::new(bf16_buf), &[count], DType::Bf16, &budget).expect("bf16 tensor");
     assert!(matches!(
         bf16_tensor.bf16_slice().unwrap_err(),
         OjasError::Placement {
@@ -236,4 +229,3 @@ fn adversarial_shared_buf_uma_and_placement_invariants() {
     let freed = rt.trim_free_list();
     let _ = freed;
 }
-

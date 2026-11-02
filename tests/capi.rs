@@ -16,12 +16,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSharedEvent};
 use tessl::capi::{
-    tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_copy,
-    tessl_qwen35_free, tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info,
-    tessl_qwen35_read_parameter_host, tessl_qwen35_write_parameter_host, tessl_runtime_free, tessl_runtime_new,
-    tessl_runtime_poisoned, tessl_runtime_set_async_encode, tessl_synchronize, TesslCeArgs, TesslParamInfo,
-    TesslQwen35, TesslRuntime, TesslTensorRef, TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32,
-    TESSL_MAX_DIMS, TESSL_OK, TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
+    tessl_abi_version, tessl_cross_entropy_rows, tessl_mtl_buffer_length, tessl_qwen35_copy, tessl_qwen35_free,
+    tessl_qwen35_load, tessl_qwen35_param_count, tessl_qwen35_param_info, tessl_qwen35_read_parameter_host,
+    tessl_qwen35_write_parameter_host, tessl_runtime_free, tessl_runtime_new, tessl_runtime_poisoned,
+    tessl_runtime_set_async_encode, tessl_synchronize, TesslCeArgs, TesslParamInfo, TesslQwen35, TesslRuntime,
+    TesslTensorRef, TESSL_ABI_VERSION, TESSL_BF16, TESSL_ERR, TESSL_F16, TESSL_F32, TESSL_MAX_DIMS, TESSL_OK,
+    TESSL_OPERANDS_BF16, TESSL_OPERANDS_EXACT_F32, TESSL_READ_PARAMS, TESSL_WRITE_PARAMS,
 };
 use tessl::cross_entropy::{cross_entropy_rows, CeGrads, CeHidden, CeWorkspace, Reduction};
 use tessl::gemm::GemmOperands;
@@ -889,7 +889,10 @@ fn a_fresh_runtime_on_the_poisoned_thread_loads_and_runs_a_model() {
     let b = Handle::new();
     assert_eq!(poisoned(b.0), 0);
     let model = load_model(b.0);
-    assert!(param_count(model) > 0, "the model on the fresh runtime has a parameter table");
+    assert!(
+        param_count(model) > 0,
+        "the model on the fresh runtime has a parameter table"
+    );
     assert_eq!(poisoned(b.0), 0);
     assert_eq!(unsafe { tessl_qwen35_free(model) }, TESSL_OK);
 }
@@ -1381,4 +1384,3 @@ fn turning_async_encode_off_waits_for_work_in_flight() {
         "the copy had not finished when the switch returned"
     );
 }
-

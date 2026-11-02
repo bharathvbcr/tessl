@@ -330,7 +330,7 @@ fn check_audio(line: &Line, dir: &Path, cfg: &PreConfig) -> (f64, f64) {
     assert_eq!(feat.shape, [frames, 128]);
     let (abs, rel) = diffs(&got.input_features, feat.f32_slice().unwrap());
     // Masked frames are exact zeros, not just close.
-    for (i, row) in got.input_features.chunks_exact(128).enumerate() {
+    for (i, row) in got.input_features.as_chunks::<128>().0.iter().enumerate() {
         if !got.mask[i] {
             assert!(row.iter().all(|&v| v == 0.0), "{} masked frame {i}", line.name);
         }

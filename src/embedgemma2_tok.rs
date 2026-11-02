@@ -118,12 +118,12 @@ struct VocabIndex {
 fn hash_bytes(b: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let mut h = 0xcbf2_9ce4_8422_2325u64 ^ b.len() as u64;
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+    let (words, rest) = b.as_chunks::<8>();
+    for c in words {
+        let w = u64::from_le_bytes(*c);
         h = (h.rotate_left(5) ^ w).wrapping_mul(K);
     }
-    for &x in chunks.remainder() {
+    for &x in rest {
         h = (h.rotate_left(5) ^ u64::from(x)).wrapping_mul(K);
     }
     h ^ (h >> 29)

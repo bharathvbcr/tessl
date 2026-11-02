@@ -169,7 +169,7 @@ impl Decoder<'_> {
                 let l = dw - 1;
                 out[0] = r[0];
                 out[1] = ((u32::from(r[0]) * 3 + u32::from(r[1]) + 2) >> 2) as u8;
-                for (pair, w3) in out[2..2 * l].chunks_exact_mut(2).zip(r.windows(3)) {
+                for (pair, w3) in out[2..2 * l].as_chunks_mut::<2>().0.iter_mut().zip(r.windows(3)) {
                     let v = u32::from(w3[1]) * 3;
                     pair[0] = ((v + u32::from(w3[0]) + 1) >> 2) as u8;
                     pair[1] = ((v + u32::from(w3[2]) + 2) >> 2) as u8;
@@ -179,7 +179,7 @@ impl Decoder<'_> {
             }
             Upsample::H1V2Fancy => {
                 let inrow = y / 2;
-                let (other, bias) = if y % 2 == 0 {
+                let (other, bias) = if y.is_multiple_of(2) {
                     (inrow.saturating_sub(1), 1u32)
                 } else {
                     ((inrow + 1).min(dh - 1), 2u32)
@@ -197,7 +197,7 @@ impl Decoder<'_> {
             }
             Upsample::H2V2Fancy => {
                 let inrow = y / 2;
-                let other = if y % 2 == 0 {
+                let other = if y.is_multiple_of(2) {
                     inrow.saturating_sub(1)
                 } else {
                     (inrow + 1).min(dh - 1)
@@ -213,7 +213,7 @@ impl Decoder<'_> {
                 let l = dw - 1;
                 out[0] = ((cs(0) * 4 + 8) >> 4) as u8;
                 out[1] = ((cs(0) * 3 + cs(1) + 7) >> 4) as u8;
-                for (pair, w3) in out[2..2 * l].chunks_exact_mut(2).zip(tmp.windows(3)) {
+                for (pair, w3) in out[2..2 * l].as_chunks_mut::<2>().0.iter_mut().zip(tmp.windows(3)) {
                     let v = u32::from(w3[1]) * 3;
                     pair[0] = ((v + u32::from(w3[0]) + 8) >> 4) as u8;
                     pair[1] = ((v + u32::from(w3[2]) + 7) >> 4) as u8;

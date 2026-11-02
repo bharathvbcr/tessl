@@ -13,10 +13,20 @@ inference engine.
 of header grammar, offset validation, tiling checks, index parsing and
 positioned reads. ojas-io had another one. The two were kept in step by hand.
 
-That parser is **deleted**. `src/safetensors.rs` is now a 567-line adapter over
-`ojas_io::safetensors`, and across the three files touched the change is 355
-insertions against 673 deletions: a net 318 lines out of tessl, and one of two
-parsers for one format gone.
+That parser is **deleted**. `src/safetensors.rs` is now a **517-line** adapter
+over `ojas_io::safetensors`, and across the three source files touched the
+change is **295 insertions against 663 deletions — a net 368 lines out of
+tessl**, and one of two parsers for one format gone. With this record and the
+doc alignment, the whole change here is 407 insertions against 663 deletions
+over seven files.
+
+The tree as a whole did **not** shrink, and it is worth saying so rather than
+reporting only this side of it: ojas-io grew by 1,396 insertions against 82
+deletions to take the format over, of which about 385 lines are new tests —
+`tests/tessl_rejection_corpus.rs` (246), `tests/header_amplification.rs` (101)
+and the `widen_in_place` test that moved here with the code it covers (38).
+What was removed is the duplicate; what was added is the discipline the
+surviving reader did not have, with its tests.
 
 `ojas-io` was already a declared path dependency of this crate and was used
 nowhere, so this needed no `Cargo.toml` change and no MSRV ask.
@@ -29,10 +39,23 @@ reads, the file-identity re-check, the index bound, shard validation — is
 ojas-io's and is not duplicated.
 
 - **The surface.** `String` errors, `Vec<usize>` shapes, and the method names
-  the loaders already call. All 47 files outside `src/safetensors.rs` that
-  reference `SafeTensors`, `CheckpointView`, `Dtype` or `TensorInfo` compile
-  untouched. That was the design constraint, not an outcome: if they had needed
-  editing, the adapter would not have been faithful.
+  the loaders already call. **46 of the 48** files outside `src/safetensors.rs`
+  that reference `SafeTensors`, `CheckpointView`, `Dtype` or `TensorInfo`
+  compile untouched (48 by `git grep -l` over tracked files, excluding `docs/`;
+  the card counted 47). That was the design constraint, not an outcome: if the
+  loaders had needed editing, the adapter would not have been faithful.
+
+  The two edited are both tests of the reader itself, not callers of it:
+
+  - `tests/safetensors.rs`, the rejection-parity gate: of the 52 malformed
+    inputs it covers, 42 keep their exact needle and 10 are the same refusal in
+    ojas-io's words, each annotated in place with the needle it had, and the
+    sub-byte block gained two bit-exact inputs. No assertion was deleted or
+    weakened.
+  - `src/parser_mutation.rs`, whose `header_amplification_is_pinned` pinned the
+    behaviour this change deliberately narrows. It is now
+    `header_amplification_is_refused_not_merely_bounded`, which pins the
+    refusal instead — a harder bound than the ratio check it replaced.
 - **The dtype contract.** `Dtype` keeps its nineteen variants and no sub-byte
   float. ojas-io supports `F4`, `F6_E2M3` and `F6_E3M2` on a checked path,
   sizing them from their bit width and refusing a span that is not bit-exact;
@@ -79,12 +102,15 @@ eye.
 
 ## Verified by running
 
-| Suite | Result |
+| Check | Result |
 | :--- | :--- |
-| `cargo test --release --test safetensors` | 12 passed, 0 failed, 1 ignored |
-| `cargo test --release --test reader_bounds` | 12 passed, 0 failed (file unedited) |
-| `cargo test --release --lib parser_mutation::` | 16 passed, 0 failed |
-| `cargo check --all-targets` | clean, no warnings |
+| `cargo test --release --test host_access_ban` | **6 passed, 0 failed** |
+| `cargo test --release --test safetensors` | **12 passed, 0 failed** |
+| `cargo test --release --test reader_bounds` | **12 passed, 0 failed**, 1 ignored, file unedited |
+| `cargo test --release --lib parser_mutation::` | **16 passed, 0 failed** |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `rustfmt --check` on the three files touched | clean |
+| `cargo test --release` (whole suite) | **not re-run — see below** |
 
 `tests/safetensors.rs` kept its rejection semantics. Of the 52 malformed inputs
 it covers, 42 keep their exact needle and 10 are the same refusal in different
@@ -92,8 +118,44 @@ words, each annotated in place with the needle it had; the sub-byte case gained
 two inputs rather than losing any. No test was deleted or weakened to make the
 adapter pass.
 
+`tests/reader_bounds.rs` matters most of the five: it pins this crate's budget
+wording in twenty `contains(..)` assertions — "payload budget exceeded", "physical memory",
+"the caller's limit of 1073741824", "declares 16 tensor bytes", "read
+allocation" — and it passes with no edit at all. That is the evidence that
+tessl's payload policy stayed tessl's rather than being pushed down into
+ojas-io.
+
 The ignored test is `opens_the_qwen35_2b_checkpoint`, which needs the 4.5 GB
 file from the Hugging Face cache; it was ignored before this change too.
+
+### The one check still outstanding
+
+**The whole suite has not been run green end to end, and is not claimed to
+have been.** It ran complete once on this work: **1,435 passed, 1 failed, 36
+ignored over 128 binaries**. The single failure was
+`host_access_ban::library_code_never_calls_a_panicking_host_accessor`, which
+caught the adapter calling `.read_u32(` in method-call form — a real defect,
+found by this repo's own guard rather than by review, and fixed in the commit
+after. That guard is green now, with the two other binaries the fix touched.
+
+Two attempts to re-run the whole suite after the fix produced no result. The
+first was `SIGKILL`ed mid-compile with the machine at load 38 from other work.
+The second failed to build in six seconds, with no test run, because another
+session holds this checkout and has `src/config_json.rs` and
+`src/qwen35_adamw.rs` part-way through a `Json` → `JsonValue` rename that does
+not compile yet; neither file belongs to this change and neither was touched.
+So one clean end-to-end run of this suite, once that refactor lands, is the
+remaining check.
+
+Separately and not caused by this work: `cargo fmt --all --check` fails on ten
+files this change never touched — `src/shared_buf.rs`, `src/loader.rs`,
+`src/runtime/host_fence.rs`, `tests/capi.rs`, `tests/capi_contract.rs`,
+`tests/capi_oversized.rs`, `tests/kernel_coverage.rs`, `tests/qwen35_params.rs`,
+`tests/shared_runtime.rs` and `tests/stress_trim_concurrency.rs` — all wrapped
+at 100 columns where `rustfmt.toml` says 120. The `fmt` job in
+`.github/workflows/ci.yml` is therefore red on `main` independently of this
+change. `src/safetensors.rs` was in that state too, for one commit, and is not
+any more.
 
 `widen_in_place`, which was byte-for-byte identical to ojas-io's, is deleted
 with the parser. Its only test moved to `ojas-io/tests/half_float.rs` rather

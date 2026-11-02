@@ -831,9 +831,11 @@ fn fill_replicated<T: Sample>(
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
         let chroma = &p.uv[crow * p.uv_stride..crow * p.uv_stride + w];
         for ((ys, cs), d) in luma
-            .chunks_exact(2)
-            .zip(chroma.chunks_exact(2))
-            .zip(dst.chunks_exact_mut(6))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(chroma.as_chunks::<2>().0)
+            .zip(dst.as_chunks_mut::<6>().0.iter_mut())
         {
             let (u, v) = (cs[0].get() as usize, cs[1].get() as usize);
             d[..3].copy_from_slice(&px(ys[0].get() as usize, u, v));
@@ -849,7 +851,11 @@ fn fill_direct<T: Sample>(p: &Picture<'_, T>, d: &Direct, first: usize, band: &m
         let row = first + k;
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
         let chroma = &p.uv[row * p.uv_stride..row * p.uv_stride + 2 * w];
-        for ((ys, cs), px) in luma.iter().zip(chroma.chunks_exact(2)).zip(dst.chunks_exact_mut(3)) {
+        for ((ys, cs), px) in luma
+            .iter()
+            .zip(chroma.as_chunks::<2>().0)
+            .zip(dst.as_chunks_mut::<3>().0.iter_mut())
+        {
             px.copy_from_slice(&d.pixel(ys.get(), cs[0].get(), cs[1].get()));
         }
     }
@@ -874,7 +880,7 @@ fn fill_rounded<T: Sample>(p: &Picture<'_, T>, t: &Table, filter: Option<ChromaF
         match filter {
             None => {
                 let chroma = &p.uv[row * p.uv_stride..row * p.uv_stride + 2 * cw];
-                for (c, pair) in chroma.chunks_exact(2).enumerate() {
+                for (c, pair) in chroma.as_chunks::<2>().0.iter().enumerate() {
                     cb[c] = round_to_8(pair[0].get()).min(255);
                     cr[c] = round_to_8(pair[1].get()).min(255);
                 }
@@ -895,7 +901,13 @@ fn fill_rounded<T: Sample>(p: &Picture<'_, T>, t: &Table, filter: Option<ChromaF
             }
         }
         let luma = &p.y[row * p.y_stride..row * p.y_stride + w];
-        for (c, (ys, d)) in luma.chunks_exact(2).zip(dst.chunks_exact_mut(6)).enumerate() {
+        for (c, (ys, d)) in luma
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<6>().0.iter_mut())
+            .enumerate()
+        {
             d[..3].copy_from_slice(&t.pixel(round_to_8(ys[0].get()), cb[c], cr[c]));
             d[3..].copy_from_slice(&t.pixel(round_to_8(ys[1].get()), cb[c], cr[c]));
         }

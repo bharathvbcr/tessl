@@ -45,7 +45,9 @@ pub fn pool_dense(hidden: &[f64], positions: &[i32], k: usize, h: usize) -> (Vec
     let length = total / (k * k);
     assert_eq!(length * k * k, total, "pool: k² times the output length must be P");
     let clamped: Vec<(i64, i64)> = positions
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (i64::from(p[0]).max(0), i64::from(p[1]).max(0)))
         .collect();
     let max_x = clamped.iter().map(|c| c.0).max().unwrap() + 1;

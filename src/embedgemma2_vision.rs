@@ -690,7 +690,7 @@ pub fn plan_pooling(positions: &[i32], valid: usize, kernel: u32) -> Result<Pool
     }
     let length = total / kk;
     let mut max_x = 0i64;
-    for (i, xy) in positions[..2 * valid].chunks_exact(2).enumerate() {
+    for (i, xy) in positions[..2 * valid].as_chunks::<2>().0.iter().enumerate() {
         if xy[0] < 0 || xy[1] < 0 {
             return Err(format!("{WHAT}: real patch {i} has position ({}, {})", xy[0], xy[1]));
         }

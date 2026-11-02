@@ -124,7 +124,6 @@ use crate::embedgemma2::{
     encoder_attn, encoder_attn_bf16, encoder_attn_bf16_supports, project, EncoderAttnDims, SoftSegment,
 };
 use crate::gemm::{cast_f32_to_bf16_into, GemmOperands};
-use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{
     attn_kv_capacity, attn_kv_capacity_bf16, bind_rope_inv_freq, require, require_disjoint_writes, rms_norm_bf16,
@@ -135,6 +134,7 @@ use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
+use ojas_io::json::JsonValue;
 
 /// Images per forward, and so the most one tower batch holds. A call may hold
 /// more ([`MAX_CALL_IMAGES`], [`MAX_CALL_PATCHES`]): it runs as several
@@ -509,12 +509,12 @@ impl VisionConfig {
             .ok_or("config.json: missing \"vision_config\"")?;
         let text_cfg = root.get("text_config").ok_or("config.json: missing \"text_config\"")?;
         let uint_of = config_json::uint;
-        let num_of = |obj: &Json, k: &str| config_json::float(config_json::field(obj, k)?, k);
+        let num_of = |obj: &JsonValue, k: &str| config_json::float(config_json::field(obj, k)?, k);
         let str_of = config_json::string;
         let flag = |k: &str| -> Result<bool, String> {
             match c.get(k) {
                 None => Ok(false),
-                Some(Json::Bool(b)) => Ok(*b),
+                Some(JsonValue::Bool(b)) => Ok(*b),
                 Some(v) => Err(format!("config.json: vision_config.{k} must be a boolean, got {v:?}")),
             }
         };
@@ -541,11 +541,14 @@ impl VisionConfig {
         }
         match c.get("attention_dropout") {
             None => {}
-            Some(Json::Num { value, .. }) if *value == 0.0 => {}
             Some(v) => {
-                return Err(format!(
-                    "config.json: vision_config.attention_dropout must be 0, got {v:?}"
-                ))
+                let p = config_json::float(v, "attention_dropout")
+                    .map_err(|_| format!("config.json: vision_config.attention_dropout must be 0, got {v:?}"))?;
+                if p != 0.0 {
+                    return Err(format!(
+                        "config.json: vision_config.attention_dropout must be 0, got {v:?}"
+                    ));
+                }
             }
         }
 

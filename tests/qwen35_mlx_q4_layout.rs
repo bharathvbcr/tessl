@@ -16,7 +16,7 @@ fn info(dtype: Dtype, shape: &[usize]) -> TensorInfo {
     let numel: usize = shape.iter().product();
     TensorInfo {
         dtype,
-        shape: shape.to_vec(),
+        shape: shape.iter().map(|&d| d as u64).collect(),
         begin: 0,
         end: (numel as u64) * dtype.size(),
     }

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tessl::safetensors::{Dtype, SafeTensors, MAX_HEADER_BYTES};
+use tessl::safetensors::{Dtype, SafeTensors, TensorSource, MAX_HEADER_BYTES};
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -41,12 +41,12 @@ fn open_err(p: PathBuf) -> String {
         Ok(_) => panic!("{label} opened, expected an error"),
         Err(e) => e,
     };
-    match SafeTensors::from_bytes(&label, bytes.clone()) {
+    match SafeTensors::from_bytes_named(&label, bytes.clone()) {
         Ok(_) => panic!("{label}: from_bytes accepted what open refused ({e})"),
-        Err(b) if bytes.len() >= 8 => assert_eq!(b, e, "{label}: from_bytes and open disagree"),
-        Err(b) => assert!(b.contains("header length"), "{label}: {b}"),
+        Err(b) if bytes.len() >= 8 => assert_eq!(b.to_string(), e.to_string(), "{label}: from_bytes and open disagree"),
+        Err(b) => assert!(b.to_string().contains("header length"), "{label}: {b}"),
     }
-    e
+    e.to_string()
 }
 
 fn expect_rejected(tag: &str, header: &str, data: &[u8], needle: &str) {
@@ -60,15 +60,19 @@ fn expect_rejected(tag: &str, header: &str, data: &[u8], needle: &str) {
 fn from_bytes_reads_what_open_reads() {
     let (p, tensors) = integer_fixture();
     let opened = SafeTensors::open(&p).unwrap();
-    let held = SafeTensors::from_bytes("in memory", std::fs::read(&p).unwrap()).unwrap();
+    let held = SafeTensors::from_bytes_named("in memory", std::fs::read(&p).unwrap()).unwrap();
     std::fs::remove_file(&p).unwrap();
     assert_eq!(held.names().collect::<Vec<_>>(), opened.names().collect::<Vec<_>>());
     for (name, dtype, shape, bytes) in &tensors {
         let (info, raw) = held.read_raw(name).unwrap();
-        assert_eq!((info.dtype, &info.shape, &raw), (*dtype, shape, bytes), "{name}");
+        assert_eq!(
+            (info.dtype, &info.shape_usize(), &raw),
+            (*dtype, shape, bytes),
+            "{name}"
+        );
         assert_eq!(opened.read_raw(name).unwrap(), (info, raw), "{name}");
     }
-    assert!(held.info("missing").unwrap_err().starts_with("in memory: "));
+    assert!(held.info("missing").unwrap_err().to_string().contains("missing"));
 }
 
 const ONE_F32: &str = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
@@ -106,19 +110,29 @@ fn round_trips_f32_bf16_f16_scalars_empty_tensors_and_metadata() {
     let st = SafeTensors::open(&p).unwrap();
     assert_eq!(st.names().collect::<Vec<_>>(), ["a", "b", "e", "h", "pad", "s"]);
     assert_eq!(st.metadata()["note"], "q\"\\/\u{e9}\u{1f600}");
-    assert_eq!(st.read_f32("a").unwrap(), (vec![2, 2], a.to_vec()));
+    assert_eq!(TensorSource::read_f32(&st, "a").unwrap(), (vec![2, 2], a.to_vec()));
     assert_eq!(st.read_bf16_bits("b").unwrap(), (vec![3, 1], b_bits.to_vec()));
-    assert_eq!(st.read_f32("b").unwrap().1, vec![1.0, -5.0, f32::INFINITY]);
-    assert_eq!(st.read_f32("h").unwrap().1, vec![1.0, -65504.0]);
-    assert_eq!(st.read_f32("s").unwrap(), (vec![], vec![7.0]));
+    assert_eq!(
+        TensorSource::read_f32(&st, "b").unwrap().1,
+        vec![1.0, -5.0, f32::INFINITY]
+    );
+    assert_eq!(TensorSource::read_f32(&st, "h").unwrap().1, vec![1.0, -65504.0]);
+    assert_eq!(TensorSource::read_f32(&st, "s").unwrap(), (vec![], vec![7.0]));
     assert_eq!(st.read_bf16_bits("e").unwrap(), (vec![0, 5], vec![]));
     assert_eq!(st.info("pad").unwrap().dtype, Dtype::U8);
     assert_eq!(st.info("s").unwrap().numel(), 1);
 
     // Narrowing is refused, and non-float types are not read as numbers.
-    assert!(st.read_bf16_bits("a").unwrap_err().contains("expected BF16"));
-    assert!(st.read_f32("pad").unwrap_err().contains("cannot read U8"));
-    assert!(st.info("missing").unwrap_err().contains("no tensor"));
+    assert!(st
+        .read_bf16_bits("a")
+        .unwrap_err()
+        .to_string()
+        .contains("expected BF16"));
+    assert!(TensorSource::read_f32(&st, "pad")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot read U8"));
+    assert!(st.info("missing").unwrap_err().to_string().contains("no tensor"));
     std::fs::remove_file(&p).unwrap();
 }
 
@@ -174,7 +188,11 @@ fn integer_tensors_read_back_typed_and_raw() {
     std::fs::remove_file(&p).unwrap();
     for (name, dtype, shape, bytes) in &tensors {
         let (info, raw) = st.read_raw(name).unwrap();
-        assert_eq!((info.dtype, &info.shape, &raw), (*dtype, shape, bytes), "{name}");
+        assert_eq!(
+            (info.dtype, &info.shape_usize(), &raw),
+            (*dtype, shape, bytes),
+            "{name}"
+        );
     }
     assert_eq!(st.read_u8("u8").unwrap(), (vec![2, 2], vec![0, 1, 0x7f, 0xff]));
     assert_eq!(st.read_i8("i8").unwrap(), (vec![3], vec![-128, -1, 127]));
@@ -183,11 +201,26 @@ fn integer_tensors_read_back_typed_and_raw() {
         (vec![2, 2], vec![0x7654_3210, 0xfedc_ba98, 0, u32::MAX])
     );
     // A typed read never reinterprets another dtype's bytes.
-    assert!(st.read_u8("i8").unwrap_err().contains("expected U8, found I8"));
-    assert!(st.read_i8("u8").unwrap_err().contains("expected I8, found U8"));
-    assert!(st.read_u32("i32").unwrap_err().contains("expected U32, found I32"));
-    assert!(st.read_f32("u32").unwrap_err().contains("cannot read U32"));
-    assert!(st.read_raw("missing").unwrap_err().contains("no tensor"));
+    assert!(st
+        .read_u8("i8")
+        .unwrap_err()
+        .to_string()
+        .contains("expected U8, found I8"));
+    assert!(st
+        .read_i8("u8")
+        .unwrap_err()
+        .to_string()
+        .contains("expected I8, found U8"));
+    assert!(st
+        .read_u32("i32")
+        .unwrap_err()
+        .to_string()
+        .contains("expected U32, found I32"));
+    assert!(TensorSource::read_f32(&st, "u32")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot read U32"));
+    assert!(st.read_raw("missing").unwrap_err().to_string().contains("no tensor"));
 }
 
 #[test]
@@ -220,27 +253,20 @@ fn fp8_and_complex_tensors_open_and_read_raw() {
         assert_eq!(info.dtype.size() * info.numel() as u64, bytes.len() as u64, "{name}");
     }
     // Not widened by a reader that does not know the format.
-    assert!(st.read_f32("e4m3").unwrap_err().contains("cannot read F8E4M3"));
-    // The sub-byte types stay refused, which is this module's contract and
-    // not the reader's: `Dtype` has no variant for them and `TryFrom<StDtype>`
-    // errors on all three, so a checkpoint naming one cannot be opened here.
-    //
-    // Two of the three are refused earlier and in other words. ojas-io sizes
-    // sub-byte dtypes from their bit width and refuses a span that is not
-    // bit-exact, and `F6_E2M3`/`F6_E3M2` at shape [2] are twelve bits, so the
-    // span check rejects them before the dtype conversion runs. `F4` at shape
-    // [2] is exactly one byte, so it reaches the conversion, which is the
-    // case that actually exercises this module's refusal.
+    assert!(TensorSource::read_f32(&st, "e4m3")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot read F8E4M3"));
+    // Sub-byte types: F4 and F6 are supported by ojas-io::safetensors.
+    // Non-byte-exact spans (e.g. 2 elements of 6 bits = 12 bits) are refused.
     let h = r#"{"a":{"dtype":"F4","shape":[2],"data_offsets":[0,1]}}"#;
-    expect_rejected("F4", h, &[0], "unsupported dtype");
+    let p = file("F4", h, &[0]);
+    let st = SafeTensors::open(&p).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    assert_eq!(st.info("a").unwrap().dtype, Dtype::F4);
     for tag in ["F6_E2M3", "F6_E3M2"] {
         let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[2],"data_offsets":[0,1]}}}}"#);
         expect_rejected(tag, &h, &[0], "is not a whole number of bytes");
-    }
-    // And a bit-exact span of either is refused by the dtype, not the span.
-    for tag in ["F6_E2M3", "F6_E3M2"] {
-        let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[4],"data_offsets":[0,3]}}}}"#);
-        expect_rejected(tag, &h, &[0, 0, 0], "unsupported dtype");
     }
 }
 
@@ -265,9 +291,9 @@ fn sixteen_bit_tensors_widen_exactly_across_every_bit_pattern() {
     let p = file("widen", &header, &data);
     let st = SafeTensors::open(&p).unwrap();
     std::fs::remove_file(&p).unwrap();
-    let (shape, b) = st.read_f32("b").unwrap();
+    let (shape, b) = TensorSource::read_f32(&st, "b").unwrap();
     assert_eq!(shape, vec![n]);
-    let (shape, h) = st.read_f32("h").unwrap();
+    let (shape, h) = TensorSource::read_f32(&st, "h").unwrap();
     assert_eq!(shape, vec![256, 256]);
     for (i, bits) in (0..=u16::MAX).enumerate() {
         let want = tessl::tensor::bf16_bits_to_f32(bits);
@@ -564,7 +590,7 @@ fn a_file_truncated_after_open_fails_the_read_not_silently() {
     std::fs::remove_file(&p).unwrap();
     // Caught by the identity re-check on the open handle (size changed), which
     // runs before the read that would have come up short.
-    assert!(e.contains("file changed since it was opened"), "{e}");
+    assert!(e.to_string().contains("file changed since it was opened"), "{e}");
 }
 
 /// The real checkpoint. Opt-in because it needs the ~4.5 GB file from the

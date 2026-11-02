@@ -28,8 +28,7 @@
 //! The scorer is `common/parity.rs`; `tests/gemm_parity.rs` holds its contract.
 //! Exit status: 0 clean, 1 a check failed or could not run, 2 usage.
 
-#[path = "../json.rs"]
-#[allow(dead_code)]
+#[path = "common/json.rs"]
 mod json;
 #[path = "common/parity.rs"]
 mod parity;

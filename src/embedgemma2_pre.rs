@@ -87,7 +87,9 @@ use std::path::Path;
 use crate::embedgemma2_audio::{out_mask, AudioInput};
 use crate::embedgemma2_mm::read_config_text;
 use crate::embedgemma2_vision::ImageInput;
-use crate::json::{self, Json, NumForm, Syntax};
+use ojas_io::json::{self, JsonLimits, JsonNumber, JsonValue};
+
+type Json = JsonValue;
 
 /// Most pixels (`width * height`) of one input image.
 pub const MAX_IMAGE_PIXELS: usize = 1 << 28;
@@ -252,13 +254,6 @@ pub struct PreConfig {
     pub video: VideoConfig,
 }
 
-const SYNTAX: Syntax = Syntax {
-    what: "processor_config.json",
-    max_depth: 8,
-    uints_only: false,
-    literals: true,
-};
-
 /// A section of the config with typed, defaulted reads.
 struct Section<'a> {
     name: &'a str,
@@ -273,7 +268,9 @@ impl Section<'_> {
     fn num(&self, key: &str, default: f64) -> Result<f64, String> {
         match self.obj.get(key) {
             None => Ok(default),
-            Some(Json::Num { value, .. }) => Ok(*value),
+            Some(Json::Number(JsonNumber::F64(v))) => Ok(*v),
+            Some(Json::Number(JsonNumber::U64(n))) => Ok(*n as f64),
+            Some(Json::Number(JsonNumber::I64(n))) => Ok(*n as f64),
             Some(v) => Err(self.err(key, "a number", v)),
         }
     }
@@ -281,11 +278,7 @@ impl Section<'_> {
     fn uint(&self, key: &str, default: u64) -> Result<u64, String> {
         match self.obj.get(key) {
             None => Ok(default),
-            Some(Json::Num {
-                form: NumForm::Uint,
-                int: n,
-                ..
-            }) => Ok(*n),
+            Some(Json::Number(JsonNumber::U64(n))) => Ok(*n),
             Some(v) => Err(self.err(key, "a non-negative integer", v)),
         }
     }
@@ -301,7 +294,7 @@ impl Section<'_> {
     fn text(&self, key: &str, default: &str) -> Result<String, String> {
         match self.obj.get(key) {
             None => Ok(default.to_string()),
-            Some(Json::Str(s)) => Ok(s.clone()),
+            Some(Json::String(s)) => Ok(s.clone()),
             Some(v) => Err(self.err(key, "a string", v)),
         }
     }
@@ -453,7 +446,8 @@ fn video_config(s: &Section<'_>) -> Result<VideoConfig, String> {
     let fps = match s.obj.get("fps") {
         None => Some(1.0),
         Some(Json::Null) => None,
-        Some(Json::Num { value, .. }) if value.is_finite() && *value > 0.0 => Some(*value),
+        Some(Json::Number(JsonNumber::F64(value))) if value.is_finite() && *value > 0.0 => Some(*value),
+        Some(Json::Number(JsonNumber::U64(value))) if *value > 0 => Some(*value as f64),
         Some(v) => return Err(s.err("fps", "a positive number or null", v)),
     };
     let max_frames = s.usize("max_frames", 32)?;
@@ -483,7 +477,12 @@ fn video_config(s: &Section<'_>) -> Result<VideoConfig, String> {
 impl PreConfig {
     /// Parse the text of a snapshot's `processor_config.json`.
     pub fn from_json(text: &str) -> Result<Self, String> {
-        let root = json::parse(text, SYNTAX)?;
+        let limits = JsonLimits {
+            max_depth: 8,
+            ..JsonLimits::DEFAULT
+        };
+        let root =
+            json::parse_json_with(text, &limits).map_err(|e| format!("processor_config.json: {}", e.detail()))?;
         if !matches!(root, Json::Object(_)) {
             return Err("processor_config.json: the root is not an object".into());
         }

@@ -102,7 +102,6 @@ use crate::config_json;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2_tok::Tokenizer;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, gemm_nt_f32, gemm_small_m, GemmBackend, GemmOperands};
-use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{
     dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes, rms_norm_bf16, rms_norm_f32,
@@ -114,6 +113,7 @@ use crate::qwen35_model::Precision;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
+use ojas_io::json::JsonValue;
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
 
@@ -1218,12 +1218,12 @@ impl EmbedGemma2Config {
         let root = config_json::parse_object(text)?;
         let c = root.get("text_config").unwrap_or(&root);
         let uint = |k: &str| config_json::uint(c, k);
-        let num = |obj: &Json, k: &str| config_json::float(config_json::field(obj, k)?, k);
+        let num = |obj: &JsonValue, k: &str| config_json::float(config_json::field(obj, k)?, k);
         // An id that may be absent (or null: a text-only config); a present one
         // must be a u32.
-        let opt_uint = |obj: &Json, k: &str| -> Result<Option<u32>, String> {
+        let opt_uint = |obj: &JsonValue, k: &str| -> Result<Option<u32>, String> {
             match obj.get(k) {
-                None | Some(Json::Null) => Ok(None),
+                None | Some(JsonValue::Null) => Ok(None),
                 Some(_) => config_json::uint(obj, k).map(Some),
             }
         };
@@ -1242,7 +1242,7 @@ impl EmbedGemma2Config {
                 ))
             }
         }
-        if let Some(Json::Bool(true)) = c.get("attention_bias") {
+        if let Some(JsonValue::Bool(true)) = c.get("attention_bias") {
             return Err("config.json: attention_bias is not supported".into());
         }
 
@@ -1278,12 +1278,12 @@ impl EmbedGemma2Config {
         }
 
         let types: Vec<bool> = match c.get("layer_types") {
-            Some(Json::Array(a)) => a
+            Some(JsonValue::Array(a)) => a
                 .iter()
                 .enumerate()
                 .map(|(i, t)| match t {
-                    Json::Str(s) if s == "sliding_attention" => Ok(true),
-                    Json::Str(s) if s == "full_attention" => Ok(false),
+                    JsonValue::String(s) if s == "sliding_attention" => Ok(true),
+                    JsonValue::String(s) if s == "full_attention" => Ok(false),
                     t => Err(format!(
                         "config.json: layer_types[{i}] = {t:?} is not a known layer type"
                     )),
@@ -1302,8 +1302,8 @@ impl EmbedGemma2Config {
         // Per-layer overrides, keyed by layer index ("05" in the checkpoint).
         let mut overrides: Vec<(Option<u32>, Option<u32>)> = vec![(None, None); n_layers];
         match c.get("per_layer_config") {
-            None | Some(Json::Null) => {}
-            Some(Json::Object(fields)) => {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::Object(fields)) => {
                 for (key, v) in fields {
                     let i: usize = key
                         .parse()
@@ -1311,10 +1311,10 @@ impl EmbedGemma2Config {
                     if i >= n_layers {
                         return Err(format!("config.json: per_layer_config names layer {i} of {n_layers}"));
                     }
-                    if !matches!(v, Json::Object(_)) {
+                    if !matches!(v, JsonValue::Object(_)) {
                         return Err(format!("config.json: per_layer_config[{key:?}] is not an object"));
                     }
-                    if let Json::Object(inner) = v {
+                    if let JsonValue::Object(inner) = v {
                         for (name, _) in inner {
                             if name != "head_dim" && name != "num_key_value_heads" {
                                 return Err(format!(
@@ -1338,7 +1338,7 @@ impl EmbedGemma2Config {
                 .get(kind)
                 .ok_or_else(|| format!("config.json: rope_parameters.{kind} is missing"))?;
             match p.get("rope_type") {
-                Some(Json::Str(t)) if t == "default" => {}
+                Some(JsonValue::String(t)) if t == "default" => {}
                 other => {
                     return Err(format!(
                         "config.json: rope_parameters.{kind}.rope_type must be \"default\", got {other:?}"

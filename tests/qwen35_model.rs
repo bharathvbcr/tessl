@@ -68,7 +68,7 @@ use tessl::GpuRuntime;
 
 const PREFIX: &str = "model.language_model.";
 
-fn checkpoint() -> SafeTensors {
+fn checkpoint() -> SafeTensors<'static> {
     let path = std::env::var("QWEN35_2B_SAFETENSORS")
         .expect("set QWEN35_2B_SAFETENSORS to the Qwen3.5-2B-Base .safetensors file");
     SafeTensors::open(Path::new(&path)).unwrap()
@@ -1621,7 +1621,7 @@ fn entries_of(st: &SafeTensors) -> Vec<Entry> {
             let (info, bytes) = st.read_raw(name).unwrap();
             let dtype = format!("{:?}", info.dtype).to_uppercase();
             assert!(dtype == "F32" || dtype == "BF16", "{name}: fixture dtype {dtype}");
-            (name.to_string(), dtype, info.shape, bytes)
+            (name.to_string(), dtype, info.shape_usize(), bytes)
         })
         .collect()
 }
@@ -1647,12 +1647,12 @@ fn safetensors_bytes(entries: &[Entry]) -> Vec<u8> {
     out
 }
 
-fn checkpoint_of(entries: &[Entry]) -> SafeTensors {
-    SafeTensors::from_bytes("qwen35 loader test", safetensors_bytes(entries)).unwrap()
+fn checkpoint_of(entries: &[Entry]) -> SafeTensors<'static> {
+    SafeTensors::from_bytes_named("qwen35 loader test", safetensors_bytes(entries)).unwrap()
 }
 
 /// `st`'s tensors plus `extra` `(name, shape)` F32 zeros, as a checkpoint.
-fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors {
+fn checkpoint_with(st: &SafeTensors, extra: &[(&str, &[usize])]) -> SafeTensors<'static> {
     let mut entries = entries_of(st);
     for &(name, shape) in extra {
         let n: usize = shape.iter().product();
@@ -1828,7 +1828,7 @@ fn untied_logits() -> Vec<f32> {
     a.f32_slice().unwrap().to_vec()
 }
 
-fn untied_checkpoint() -> SafeTensors {
+fn untied_checkpoint() -> SafeTensors<'static> {
     SafeTensors::open(&untied_fixture().join("model.safetensors")).unwrap()
 }
 

@@ -7,8 +7,7 @@
 
 // The crate's strict parser, shared the way bench_paired shares it; this tool
 // does not use its object lookup.
-#[allow(dead_code)]
-#[path = "../../json.rs"]
+#[path = "../common/json.rs"]
 mod json;
 
 #[allow(dead_code)]

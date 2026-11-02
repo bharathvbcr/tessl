@@ -461,7 +461,7 @@ fn video_soft_tokens_are_what_preprocessing_makes() {
 
 struct Fixture {
     c: Configs,
-    st: SafeTensors,
+    st: SafeTensors<'static>,
 }
 
 fn fixture(tag: &str, operands: GemmOperands) -> Fixture {

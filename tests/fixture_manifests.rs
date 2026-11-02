@@ -24,8 +24,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
+#[path = "../src/bin/common/json.rs"]
 mod json;
 
 use json::{Json, Syntax};

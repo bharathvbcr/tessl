@@ -136,8 +136,7 @@
 //! qwen35_fused_swiglu_gemm_m5pro.txt` hold those comparisons).
 
 mod common;
-#[path = "../json.rs"]
-#[allow(dead_code)]
+#[path = "common/json.rs"]
 mod json;
 #[path = "common/prefill_ids.rs"]
 mod prefill_ids;

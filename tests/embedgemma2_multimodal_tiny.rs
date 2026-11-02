@@ -74,7 +74,7 @@ fn drift(a: &[f32], b: &[f32]) -> f64 {
 /// same models for the by-hand composition.
 struct Fixture {
     c: Configs,
-    st: SafeTensors,
+    st: SafeTensors<'static>,
 }
 
 fn fixture(tag: &str, operands: GemmOperands) -> Fixture {

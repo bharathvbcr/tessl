@@ -30,9 +30,11 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use crate::json::{self, Syntax};
+#[path = "bin/common/json.rs"]
+mod json;
 use crate::npy::read_npy;
 use crate::safetensors::{CheckpointView, Dtype, SafeTensors, TensorSource, INDEX_FILE_NAME};
+use json::Syntax;
 
 // ---------------------------------------------------------------- allocation
 
@@ -248,6 +250,12 @@ enum Fail {
 impl From<String> for Fail {
     fn from(e: String) -> Self {
         Fail::Refused(e)
+    }
+}
+
+impl From<ojas_io::IoError> for Fail {
+    fn from(e: ojas_io::IoError) -> Self {
+        Fail::Refused(e.to_string())
     }
 }
 
@@ -504,7 +512,7 @@ fn st_seed() -> Vec<u8> {
 fn check_safetensors(bytes: &[u8], scratch: &Scratch) -> Outcome {
     let input = bytes.to_vec();
     run(input.len(), || {
-        let from_mem = SafeTensors::from_bytes("mutated", input.clone());
+        let from_mem = SafeTensors::from_bytes_named("mutated", input.clone());
         let path = scratch.write("m.safetensors", &input);
         let from_file = SafeTensors::open(&path);
         if from_mem.is_ok() != from_file.is_ok() {
@@ -518,21 +526,25 @@ fn check_safetensors(bytes: &[u8], scratch: &Scratch) -> Outcome {
         }
         let (st, file_st) = match (from_mem, from_file) {
             (Ok(a), Ok(b)) => (a, b),
-            (Err(e), Err(_)) => return Err(Fail::Refused(e)),
+            (Err(e), Err(_)) => return Err(Fail::Refused(e.to_string())),
             _ => unreachable!(),
         };
         for s in [&st, &file_st] {
             let names: Vec<String> = s.names().map(str::to_string).collect();
             for n in names {
                 // The header was accepted, so every listed tensor reads back whole.
-                let bad = |e: String| Fail::Inconsistent(format!("{n}: {e}"));
+                let bad = |e: ojas_io::IoError| Fail::Inconsistent(format!("{n}: {e}"));
                 let info = s.info(&n).map_err(bad)?.clone();
                 let (info2, raw) = s.read_raw(&n).map_err(bad)?;
                 if info2 != info || raw.len() as u64 != info.end - info.begin {
-                    return Err(bad("read_raw disagrees with its header entry".into()));
+                    return Err(Fail::Inconsistent(format!(
+                        "{n}: read_raw disagrees with its header entry"
+                    )));
                 }
                 if raw.len() as u64 != info.numel() as u64 * info.dtype.size() {
-                    return Err(bad("byte length is not numel x dtype size".into()));
+                    return Err(Fail::Inconsistent(format!(
+                        "{n}: byte length is not numel x dtype size"
+                    )));
                 }
                 // The typed readers may refuse a dtype; they must not panic.
                 let _ = s.read_f32(&n);
@@ -551,7 +563,7 @@ fn safetensors_parser_survives_mutation() {
     let scratch = Scratch::new("st");
     let seed_bytes = st_seed();
     {
-        let st = SafeTensors::from_bytes("seed", seed_bytes.clone()).expect("the seed file must be valid");
+        let st = SafeTensors::from_bytes_named("seed", seed_bytes.clone()).expect("the seed file must be valid");
         assert_eq!(st.names().count(), 4);
         assert_eq!(st.info("b.bf16").unwrap().dtype, Dtype::BF16);
     }
@@ -743,10 +755,10 @@ fn safetensors_shape_verdict_is_independent_of_dimension_order() {
     fn verdict(dims: &[u64]) -> Verdict {
         let shape = dims.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
         let header = format!(r#"{{"t":{{"dtype":"U8","shape":[{shape}],"data_offsets":[0,0]}}}}"#);
-        match SafeTensors::from_bytes("shape", st_bytes(&header, 0)) {
+        match SafeTensors::from_bytes_named("shape", st_bytes(&header, 0)) {
             Ok(_) => Verdict::Accepted,
-            Err(e) if e.contains("overflows") => Verdict::Overflow,
-            Err(e) if e.contains("bytes in data_offsets") => Verdict::Mismatch,
+            Err(e) if e.detail().contains("overflow") => Verdict::Overflow,
+            Err(e) if e.detail().contains("bytes in data_offsets") => Verdict::Mismatch,
             Err(e) => panic!("{dims:?}: unexpected refusal {e}"),
         }
     }
@@ -812,7 +824,7 @@ fn check_index(bytes: &[u8], scratch: &Scratch) -> Outcome {
             )));
         }
         for n in names {
-            let bad = |e: String| Fail::Inconsistent(format!("{n}: {e}"));
+            let bad = |e: ojas_io::IoError| Fail::Inconsistent(format!("{n}: {e}"));
             if n == "b.bf16" {
                 st.read_bf16_bits(&n).map_err(bad)?;
             } else if n == "a.f32" {
@@ -1129,7 +1141,7 @@ mod adversarial {
             .unwrap()
             .success());
         let p1 = fifo.clone();
-        let st = timed(move || SafeTensors::open(&p1).map(|_| ()));
+        let st = timed(move || SafeTensors::open(&p1).map(|_| ()).map_err(|e| e.to_string()));
         let p2 = fifo.clone();
         let npy = timed(move || read_npy(&p2).map(|_| ()));
         // Release any blocked readers so the process can exit cleanly. A
@@ -1168,7 +1180,7 @@ mod adversarial {
             .success());
         for p in [link, swapped] {
             let p1 = p.clone();
-            let st = timed(move || SafeTensors::open(&p1).map(|_| ()));
+            let st = timed(move || SafeTensors::open(&p1).map(|_| ()).map_err(|e| e.to_string()));
             let p2 = p.clone();
             let npy = timed(move || read_npy(&p2).map(|_| ()));
             drop(std::fs::OpenOptions::new().read(true).write(true).open(&fifo));
@@ -1188,7 +1200,7 @@ mod adversarial {
         for (extra, ok) in [(0usize, true), (1, false)] {
             let h = format!("{{}}{}", " ".repeat(cap + extra - 2));
             let b = st_bytes(&h, 0);
-            let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+            let o = run(b.len(), || SafeTensors::from_bytes_named("m", b.clone()).map(|_| ()));
             assert!(o.violations.is_empty(), "{:?}", o.violations);
             assert_eq!(o.ok, ok, "header of cap+{extra}: {:?}", o.err);
         }
@@ -1225,7 +1237,7 @@ mod adversarial {
         let dims = vec!["0"; 5_000_000].join(",");
         let h = format!(r#"{{"x":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#);
         let b = st_bytes(&h, 0);
-        let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+        let o = run(b.len(), || SafeTensors::from_bytes_named("m", b.clone()).map(|_| ()));
         assert!(o.violations.is_empty(), "{:?}", o.violations);
         assert!(!o.ok, "a 10 MB dimension-dense header must be refused");
         let e = o.err.as_deref().unwrap_or("");
@@ -1244,7 +1256,7 @@ mod adversarial {
         let dims = vec!["0"; 1_000].join(",");
         let h = format!(r#"{{"x":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#);
         let b = st_bytes(&h, 0);
-        let o = run(b.len(), || SafeTensors::from_bytes("m", b.clone()).map(|_| ()));
+        let o = run(b.len(), || SafeTensors::from_bytes_named("m", b.clone()).map(|_| ()));
         assert!(o.ok && o.violations.is_empty(), "{:?} {:?}", o.err, o.violations);
     }
 
@@ -1255,10 +1267,11 @@ mod adversarial {
     fn json_number_and_string_edges() {
         let parse = |t: &str| run(t.len(), || json::parse(t, CONFIG_SYNTAX).map(|_| ()));
         assert!(!parse(r#"{"a":1e999999999}"#).ok);
-        for t in [r#"{"a":-0}"#, r#"{"a":18446744073709551616}"#, r#"{"a":-0e-999999999}"#] {
+        for t in [r#"{"a":-0}"#, r#"{"a":-0e-999999999}"#] {
             let o = parse(t);
             assert!(o.ok && o.violations.is_empty(), "{t}: {:?}", o.err);
         }
+        assert!(!parse(r#"{"a":18446744073709551616}"#).ok);
         let digits = format!("{{\"a\":{}}}", "9".repeat(1_000_000));
         let o = parse(&digits);
         assert!(o.err.is_some() && o.violations.is_empty(), "{:?}", o.violations);

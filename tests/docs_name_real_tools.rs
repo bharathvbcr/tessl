@@ -37,6 +37,11 @@ const DELIBERATELY_ABSENT: &[&str] = &[
     // real interleaved coop A/B binary ever lands under this name, delete this
     // entry rather than the text.
     "bench_gemm_coop_ab",
+    // Safe IO formats migrated to ojas-io (ABI 15, owner decision).
+    "safetensors",
+    "json",
+    "npy",
+    "plain",
 ];
 
 /// Pull `` `bench_foo` `` style identifiers out of markdown.

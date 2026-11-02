@@ -63,7 +63,9 @@ use std::collections::BinaryHeap;
 use std::io::Read;
 use std::path::Path;
 
-use crate::json::{self, Json, NumForm, Syntax};
+use ojas_io::json::{self, JsonLimits, JsonNumber, JsonValue};
+
+type Json = JsonValue;
 
 /// Largest `tokenizer.json` read, in bytes (the checkpoint's is 32 MB).
 pub const MAX_TOKENIZER_BYTES: u64 = 256 << 20;
@@ -76,19 +78,67 @@ pub const MAX_TEXT_BYTES: usize = 1 << 28;
 
 const NONE: u32 = u32::MAX;
 
-const TOKENIZER_SYNTAX: Syntax = Syntax {
-    what: "tokenizer.json",
-    max_depth: 6,
-    uints_only: true,
-    literals: true,
-};
+fn has_negative(j: &JsonValue) -> bool {
+    match j {
+        JsonValue::Number(JsonNumber::I64(_)) => true,
+        JsonValue::Number(JsonNumber::F64(f)) if *f < 0.0 => true,
+        JsonValue::Array(items) => items.iter().any(has_negative),
+        JsonValue::Object(entries) => entries.iter().any(|(_, v)| has_negative(v)),
+        _ => false,
+    }
+}
 
-const CONFIG_SYNTAX: Syntax = Syntax {
-    what: "tokenizer config",
-    max_depth: 4,
-    uints_only: false,
-    literals: true,
-};
+fn sanitize_config_numbers(text: &str) -> Cow<'_, str> {
+    let mut modified = false;
+    let mut out = String::with_capacity(text.len() + 16);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let len = i - start;
+            let is_float = (i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'e' || bytes[i] == b'E'))
+                || (start > 0 && bytes[start - 1] == b'.');
+            if len >= 20 && !is_float {
+                out.push_str(&text[start..i]);
+                out.push_str(".0");
+                modified = true;
+                continue;
+            } else {
+                out.push_str(&text[start..i]);
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    if modified {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn parse_json_doc(text: &str, what: &str, max_depth: usize) -> Result<JsonValue, String> {
+    let text = if what == "tokenizer config" {
+        sanitize_config_numbers(text)
+    } else {
+        Cow::Borrowed(text)
+    };
+    let limits = JsonLimits {
+        max_depth,
+        max_input_bytes: MAX_TOKENIZER_BYTES as usize,
+        ..JsonLimits::DEFAULT
+    };
+    let root = json::parse_json_with(&text, &limits).map_err(|e| format!("{what}: {}", e.detail()))?;
+    if what == "tokenizer.json" && has_negative(&root) {
+        return Err(format!("{what}: unsupported JSON value"));
+    }
+    Ok(root)
+}
 
 /// One added token: matched in the raw text, never split by the BPE.
 struct Added {
@@ -283,7 +333,7 @@ fn get<'a>(obj: &'a Json, key: &str) -> Option<&'a Json> {
 
 fn as_str<'a>(j: &'a Json, what: &str) -> Result<&'a str, String> {
     match j {
-        Json::Str(s) => Ok(s),
+        Json::String(s) => Ok(s),
         _ => Err(format!("tokenizer.json: {what} is not a string")),
     }
 }
@@ -297,18 +347,14 @@ fn as_bool(j: Option<&Json>, what: &str) -> Result<bool, String> {
 
 fn as_u32(j: &Json, what: &str) -> Result<u32, String> {
     match j {
-        Json::Num {
-            form: NumForm::Uint,
-            int: v,
-            ..
-        } if *v < u64::from(u32::MAX) => Ok(*v as u32),
+        Json::Number(JsonNumber::U64(v)) if *v < u64::from(u32::MAX) => Ok(*v as u32),
         _ => Err(format!("tokenizer.json: {what} is not an integer below 2^32 - 1")),
     }
 }
 
 fn type_of<'a>(j: &'a Json, what: &str) -> Result<&'a str, String> {
     match get(j, "type") {
-        Some(Json::Str(s)) => Ok(s),
+        Some(Json::String(s)) => Ok(s),
         _ => Err(format!("tokenizer.json: {what} has no \"type\"")),
     }
 }
@@ -316,8 +362,8 @@ fn type_of<'a>(j: &'a Json, what: &str) -> Result<&'a str, String> {
 /// `{"String": s}` (a literal pattern), the only pattern form supported.
 fn string_pattern(j: Option<&Json>, what: &str) -> Result<String, String> {
     match j.and_then(|p| get(p, "String")) {
-        Some(Json::Str(s)) if !s.is_empty() => Ok(s.clone()),
-        Some(Json::Str(_)) => Err(format!("tokenizer.json: {what} has an empty pattern")),
+        Some(Json::String(s)) if !s.is_empty() => Ok(s.clone()),
+        Some(Json::String(_)) => Err(format!("tokenizer.json: {what} has an empty pattern")),
         _ => Err(format!(
             "tokenizer.json: {what}: only a literal {{\"String\": ...}} pattern is supported"
         )),
@@ -394,7 +440,7 @@ impl Tokenizer {
     /// prompts yet: add them with [`Self::with_tokenizer_config`] and
     /// [`Self::with_prompts`], or use [`Self::from_snapshot`].
     pub fn from_json(text: &str) -> Result<Self, String> {
-        let root = json::parse(text, TOKENIZER_SYNTAX)?;
+        let root = parse_json_doc(text, "tokenizer.json", 6)?;
         Self::from_root(root)
     }
 
@@ -443,16 +489,16 @@ impl Tokenizer {
     /// sentence-transformers rule off for a text that starts with it; each
     /// placeholder token the file names is refused in a text.
     pub fn with_tokenizer_config(mut self, text: &str) -> Result<Self, String> {
-        let root = json::parse(text, CONFIG_SYNTAX)?;
+        let root = parse_json_doc(text, "tokenizer config", 4)?;
         if !matches!(root, Json::Object(_)) {
             return Err("tokenizer config: the root is not an object".into());
         }
         let token = |key: &str| -> Result<Option<String>, String> {
             match get(&root, key) {
                 None | Some(Json::Null) => Ok(None),
-                Some(Json::Str(s)) => Ok(Some(s.clone())),
+                Some(Json::String(s)) => Ok(Some(s.clone())),
                 Some(o @ Json::Object(_)) => match get(o, "content") {
-                    Some(Json::Str(s)) => Ok(Some(s.clone())),
+                    Some(Json::String(s)) => Ok(Some(s.clone())),
                     _ => Err(format!("tokenizer config: {key} has no string content")),
                 },
                 Some(_) => Err(format!("tokenizer config: {key} is not a string")),
@@ -472,7 +518,7 @@ impl Tokenizer {
     /// `default_prompt_name` (null or absent for none, otherwise it must name
     /// one of the prompts) from the text of a `config_sentence_transformers.json`.
     pub fn with_prompts(mut self, text: &str) -> Result<Self, String> {
-        let root = json::parse(text, CONFIG_SYNTAX)?;
+        let root = parse_json_doc(text, "config_sentence_transformers.json", 4)?;
         self.prompts.clear();
         self.default_prompt = None;
         match get(&root, "prompts") {
@@ -480,7 +526,7 @@ impl Tokenizer {
             Some(Json::Object(fields)) => {
                 for (name, v) in fields {
                     match v {
-                        Json::Str(p) => self.prompts.push((name.clone(), p.clone())),
+                        Json::String(p) => self.prompts.push((name.clone(), p.clone())),
                         _ => {
                             return Err(format!(
                                 "config_sentence_transformers.json: prompt {name:?} is not a string"
@@ -493,7 +539,7 @@ impl Tokenizer {
         }
         match get(&root, "default_prompt_name") {
             None | Some(Json::Null) => {}
-            Some(Json::Str(name)) => {
+            Some(Json::String(name)) => {
                 if self.prompt(name).is_none() {
                     return Err(format!(
                         "config_sentence_transformers.json: default_prompt_name {name:?} is not one of its prompts"
@@ -580,7 +626,7 @@ impl Tokenizer {
         };
         let unk_text = match get(&model, "unk_token") {
             None | Some(Json::Null) => None,
-            Some(Json::Str(s)) => Some(s.clone()),
+            Some(Json::String(s)) => Some(s.clone()),
             Some(_) => return Err("tokenizer.json: model.unk_token is not a string".into()),
         };
 
@@ -681,10 +727,10 @@ impl Tokenizer {
             let rank = rank as u32;
             let (a, b): (&str, &str) = match m {
                 Json::Array(p) => match p.as_slice() {
-                    [Json::Str(a), Json::Str(b)] => (a, b),
+                    [Json::String(a), Json::String(b)] => (a, b),
                     _ => return Err(format!("tokenizer.json: merge {rank} is not a pair of strings")),
                 },
-                Json::Str(s) => {
+                Json::String(s) => {
                     let mut parts = s.split(' ');
                     match (parts.next(), parts.next(), parts.next()) {
                         (Some(a), Some(b), None) => (a, b),
@@ -1233,7 +1279,7 @@ fn parse_pre_tokenizer(j: Option<&Json>) -> Result<Option<String>, String> {
         "Split" => {
             let delim = string_pattern(get(j, "pattern"), "the Split pre-tokenizer")?;
             match (get(j, "behavior"), get(j, "invert")) {
-                (Some(Json::Str(b)), Some(Json::Bool(false))) if b == "MergedWithPrevious" => Ok(Some(delim)),
+                (Some(Json::String(b)), Some(Json::Bool(false))) if b == "MergedWithPrevious" => Ok(Some(delim)),
                 _ => Err(
                     "tokenizer.json: the Split pre-tokenizer is supported only as MergedWithPrevious, invert false"
                         .into(),

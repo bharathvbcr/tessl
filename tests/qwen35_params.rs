@@ -19,7 +19,7 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train")
 }
 
-fn load(precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model, SafeTensors) {
+fn load(precision: Precision) -> (Arc<GpuRuntime>, Qwen35Model, SafeTensors<'static>) {
     let rt = GpuRuntime::new().unwrap();
     let st = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
     let cfg = Qwen35Config::from_config_file(&fixture().join("config.json")).unwrap();
@@ -77,8 +77,13 @@ fn values_are_the_checkpoints_under_transformers_names() {
     let dst = alloc(&rt, &table);
     model.read_parameters(&dst).unwrap();
     for (p, t) in table.iter().zip(&dst) {
-        let (shape, w) = st.read_f32(&format!("model.{}", p.name)).unwrap();
-        assert_eq!(shape, p.shape, "{}", p.name);
+        let (shape, w) = st.read_f32_widened(&format!("model.{}", p.name)).unwrap();
+        assert_eq!(
+            shape,
+            p.shape.iter().map(|&d| d as u64).collect::<Vec<_>>(),
+            "{}",
+            p.name
+        );
         let got = hf(p, t);
         // The checkpoint's bits, the zero-centred norms' w included.
         for (i, (a, b)) in got.iter().zip(&w).enumerate() {
@@ -470,7 +475,6 @@ fn per_entry_host_calls_refuse_on_a_poisoned_runtime() {
     }
 }
 
-
 /// A write round-trips bit for bit, moves the inference forward, and a write
 /// of the values just read changes nothing. (The gradient-driven SGD step this
 /// test took before ABI 14 needed the retired training step; a fixed rescale
@@ -487,7 +491,11 @@ fn a_write_round_trips_and_moves_the_inference_forward() {
     // Writing back what was read changes nothing.
     model.write_parameters(&params).unwrap();
     let same = inference_loss(&model, &ids);
-    assert_eq!(same.to_bits(), before.to_bits(), "a write of the read values moved the loss");
+    assert_eq!(
+        same.to_bits(),
+        before.to_bits(),
+        "a write of the read values moved the loss"
+    );
 
     let stepped: Vec<Tensor> = params
         .iter()
@@ -507,5 +515,9 @@ fn a_write_round_trips_and_moves_the_inference_forward() {
         }
     }
     let after = inference_loss(&model, &ids);
-    assert_ne!(after.to_bits(), before.to_bits(), "the write moved the inference forward not at all");
+    assert_ne!(
+        after.to_bits(),
+        before.to_bits(),
+        "the write moved the inference forward not at all"
+    );
 }

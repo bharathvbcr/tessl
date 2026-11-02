@@ -23,8 +23,7 @@
 //! another. Exit status: 0 done, 1 a run failed or did not report a lane (no
 //! winner is picked from a partial sweep), 2 usage.
 
-#[path = "../json.rs"]
-#[allow(dead_code)]
+#[path = "common/json.rs"]
 mod json;
 #[path = "common/proc.rs"]
 mod proc;

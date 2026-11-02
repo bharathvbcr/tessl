@@ -74,7 +74,7 @@ fn fixture_entries() -> Vec<Entry> {
         .into_iter()
         .map(|n| {
             let (info, bytes) = st.read_raw(&n).unwrap();
-            (n, info.dtype, info.shape, bytes)
+            (n, info.dtype, info.shape_usize(), bytes)
         })
         .collect()
 }
@@ -115,7 +115,9 @@ fn tiny_config() -> Qwen35Config {
 }
 
 fn open_err(path: &Path) -> String {
-    CheckpointView::open(path).expect_err("this checkpoint must be refused")
+    CheckpointView::open(path)
+        .expect_err("this checkpoint must be refused")
+        .to_string()
 }
 
 #[test]
@@ -258,7 +260,7 @@ fn a_symlinked_shard_outside_the_directory_loads() {
     assert_eq!(view.shard_count(), 2);
     let single = SafeTensors::open(&fixture().join("model.safetensors")).unwrap();
     for e in &all {
-        let (_, want) = single.read_f32(&e.0).unwrap();
+        let (_, want) = TensorSource::read_f32(&single, &e.0).unwrap();
         let (_, got) = view.read_f32(&e.0).unwrap();
         assert!(
             want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
@@ -290,7 +292,7 @@ fn a_fifo_or_directory_shard_is_refused_without_blocking() {
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(20))
             .unwrap_or_else(|_| panic!("{special}: open blocked"));
-        let err = r.expect_err("a non-regular shard must be refused");
+        let err = r.expect_err("a non-regular shard must be refused").to_string();
         assert!(err.contains("not a regular file"), "{special}: {err}");
     }
 }
@@ -556,10 +558,13 @@ fn many_distinct_shards_that_exhaust_fds_fail_named_and_release() {
     std::fs::write(sc.0.join(INDEX_FILE_NAME), index_text(&p)).unwrap();
     match CheckpointView::open(&sc.0) {
         Ok(v) => assert_eq!(v.shard_count(), 400),
-        Err(e) => assert!(
-            e.contains("s0") && e.to_lowercase().contains("too many open files"),
-            "{e}"
-        ),
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains("s0") && s.to_lowercase().contains("too many open files"),
+                "{e}"
+            );
+        }
     }
     // Nothing leaked: the process can still open files.
     CheckpointView::open(&fixture().join("model.safetensors")).unwrap();

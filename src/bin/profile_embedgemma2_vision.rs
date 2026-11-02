@@ -148,8 +148,8 @@ struct Weights {
 }
 
 fn norm_buf(rt: &Arc<GpuRuntime>, st: &SafeTensors, name: &str, dim: usize) -> Result<GpuBuffer, String> {
-    let (shape, data) = st.read_f32(&format!("{TOWER}{name}"))?;
-    if shape != [dim] {
+    let (shape, data) = st.read_f32_widened(&format!("{TOWER}{name}"))?;
+    if shape != [dim as u64] {
         return Err(format!("{name}: shape {shape:?}, expected [{dim}]"));
     }
     let b = rt.alloc_buffer_hot(dim.max(1) * 4)?;
@@ -178,7 +178,7 @@ fn pack_linear(
         let full = format!("{prefix}{name}");
         if bf16 {
             let (shape, w) = st.read_bf16_bits(&full)?;
-            if shape != [*out, inf] {
+            if shape != [*out as u64, inf as u64] {
                 return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
             }
             let mut dst = t.buffer.try_contents_u16()?;
@@ -188,8 +188,8 @@ fn pack_linear(
                 }
             }
         } else {
-            let (shape, w) = st.read_f32(&full)?;
-            if shape != [*out, inf] {
+            let (shape, w) = st.read_f32_widened(&full)?;
+            if shape != [*out as u64, inf as u64] {
                 return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
             }
             let mut dst = t.buffer.try_contents_f32()?;
@@ -219,7 +219,7 @@ impl Weights {
         let size = cfg.position_embedding_size as usize;
         let pos_table = rt.alloc_tensor_bf16_hot(&[2, size, h])?;
         let (shape, bits) = st.read_bf16_bits(&format!("{TOWER}patch_embedder.position_embedding_table"))?;
-        if shape != [2, size, h] {
+        if shape != [2, size as u64, h as u64] {
             return Err(format!("position table: shape {shape:?}"));
         }
         pos_table.buffer.try_contents_u16()?.copy_from_slice(&bits);

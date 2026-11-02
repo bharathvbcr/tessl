@@ -48,11 +48,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::config_json;
-use crate::json::Json;
 use crate::nn::{self, Q4MlxBank, Q4MlxLayout, QuantShape, GEMM_Q4_MLX_MAX_M};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::{Dtype, TensorInfo};
 use crate::tensor::{DType, GpuBuffer, Tensor};
+use ojas_io::json::JsonValue;
 
 // The peak-footprint reader the bench bins and tests share.
 #[path = "bin/common/footprint.rs"]
@@ -218,7 +218,7 @@ impl MlxQuant {
             }
             (Some(q), _) | (None, Some(q)) => q,
         };
-        let Json::Object(entries) = q else {
+        let JsonValue::Object(entries) = q else {
             return Err(MlxQ4Error::MalformedConfig {
                 key: "quantization".into(),
                 why: format!("must be an object, got {q:?}"),
@@ -410,10 +410,11 @@ pub fn check_part(
         });
     }
     let want = vec![rows, cols / NIBBLES_PER_WORD];
-    if weight.shape != want {
+    let weight_shape = weight.shape_usize();
+    if weight_shape != want {
         return Err(MlxQ4Error::Shape {
             tensor: weight_name.into(),
-            found: weight.shape.clone(),
+            found: weight_shape,
             want,
         });
     }
@@ -435,10 +436,11 @@ pub fn check_part(
             });
         }
         let want = vec![rows, cols / group];
-        if info.shape != want {
+        let info_shape = info.shape_usize();
+        if info_shape != want {
             return Err(MlxQ4Error::Shape {
                 tensor: name,
-                found: info.shape.clone(),
+                found: info_shape,
                 want,
             });
         }

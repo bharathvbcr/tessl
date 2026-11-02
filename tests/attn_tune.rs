@@ -15,8 +15,7 @@
 //! The first group is the knob-table contract of the retired
 //! `bench/test_parity_harness.py::tune_knob_contract`.
 
-#[path = "../src/json.rs"]
-#[allow(dead_code)]
+#[path = "../src/bin/common/json.rs"]
 mod json;
 #[path = "../src/bin/common/proc.rs"]
 mod proc;

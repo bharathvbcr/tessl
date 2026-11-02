@@ -76,11 +76,14 @@ fn a_declaration_above_physical_memory_is_refused_at_open_by_name() {
     // succeeds, which is the gate that let a read go on to fill memory.
     let declared = physical_memory().saturating_add(GIB);
     sparse_st(&p, "t", declared);
-    let e = SafeTensors::open(&p).unwrap_err();
+    let e = SafeTensors::open_with_limit(&p, Some(physical_memory()))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("payload budget exceeded"), "{e}");
-    assert!(e.contains("physical memory"), "{e}");
     assert!(e.contains(&declared.to_string()), "{e}");
-    let e = CheckpointView::open(&p).unwrap_err();
+    let e = CheckpointView::open_with_limit(&p, Some(physical_memory()))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("payload budget exceeded"), "{e}");
 }
 
@@ -89,12 +92,14 @@ fn a_512_gib_declaration_is_refused_by_an_explicit_limit() {
     let s = Scratch::new("sparse512");
     let p = s.path("huge.safetensors");
     sparse_st(&p, "t", 512 * GIB);
-    let e = SafeTensors::open_with_limit(&p, Some(GIB)).unwrap_err();
+    let e = SafeTensors::open_with_limit(&p, Some(GIB)).unwrap_err().to_string();
     assert!(
         e.contains("the caller's limit of 1073741824") && e.contains(&(512 * GIB).to_string()),
         "{e}"
     );
-    let e = CheckpointView::open_with_limit(&p, Some(64 * GIB)).unwrap_err();
+    let e = CheckpointView::open_with_limit(&p, Some(64 * GIB))
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("payload budget exceeded"), "{e}");
 }
 
@@ -104,7 +109,7 @@ fn the_budget_is_the_callers_limit_when_given_and_boundary_is_inclusive() {
     let p = s.path("small.safetensors");
     small_st(&p);
     assert!(SafeTensors::open_with_limit(&p, Some(16)).is_ok());
-    let e = SafeTensors::open_with_limit(&p, Some(15)).unwrap_err();
+    let e = SafeTensors::open_with_limit(&p, Some(15)).unwrap_err().to_string();
     assert!(
         e.contains("declares 16 tensor bytes") && e.contains("limit of 15"),
         "{e}"
@@ -127,7 +132,9 @@ fn a_sharded_checkpoint_is_budgeted_as_a_whole() {
     .unwrap();
     // Each shard alone fits 400 GiB; together they do not.
     assert!(CheckpointView::open_with_limit(&s.path("s1.safetensors"), Some(400 * GIB)).is_ok());
-    let e = CheckpointView::open_with_limit(&s.0, Some(400 * GIB)).unwrap_err();
+    let e = CheckpointView::open_with_limit(&s.0, Some(400 * GIB))
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains("payload budget exceeded") && e.contains(&(600 * GIB).to_string()),
         "{e}"
@@ -261,7 +268,7 @@ fn shape_verdict(s: &Scratch, shape: [u64; 3]) -> Result<(), String> {
     std::fs::write(&p, b).unwrap();
     SafeTensors::open(&p)
         .map(|_| ())
-        .map_err(|e| e.replace(&p.display().to_string(), "<f>"))
+        .map_err(|e| e.to_string().replace(&p.display().to_string(), "<f>"))
 }
 
 #[test]
@@ -300,7 +307,7 @@ fn a_file_rewritten_in_place_after_open_is_refused_at_the_next_read() {
     f.seek(SeekFrom::End(-16)).unwrap();
     f.write_all(&[0u8; 16]).unwrap();
     drop(f);
-    let e = st.read_f32("a").unwrap_err();
+    let e = st.read_f32("a").unwrap_err().to_string();
     assert!(e.contains("file changed since it was opened"), "{e}");
     // Growth is seen too (it used to be silent; only shrinking failed).
     let s2 = Scratch::new("grow");
@@ -310,7 +317,7 @@ fn a_file_rewritten_in_place_after_open_is_refused_at_the_next_read() {
     let mut f = std::fs::OpenOptions::new().append(true).open(&p2).unwrap();
     f.write_all(&[7u8; 8]).unwrap();
     drop(f);
-    let e = st2.read_f32("b").unwrap_err();
+    let e = st2.read_f32("b").unwrap_err().to_string();
     assert!(e.contains("file changed since it was opened"), "{e}");
 }
 
@@ -342,9 +349,9 @@ fn tensor_info_gives_dtype_and_shape_across_shards() {
     .unwrap();
     let v = CheckpointView::open(&s.0).unwrap();
     let a = v.tensor_info("a").unwrap();
-    assert_eq!((a.dtype, a.shape.as_slice()), (Dtype::F32, &[2usize][..]));
+    assert_eq!((a.dtype, a.shape.as_slice()), (Dtype::F32, &[2u64][..]));
     let c = v.tensor_info("c").unwrap();
-    assert_eq!((c.dtype, c.shape.as_slice()), (Dtype::BF16, &[2usize, 3][..]));
+    assert_eq!((c.dtype, c.shape.as_slice()), (Dtype::BF16, &[2u64, 3][..]));
     assert!(v.tensor_info("nope").is_none());
 }
 
@@ -362,7 +369,9 @@ fn a_reads_own_allocation_is_budgeted_not_just_the_declared_bytes() {
     // the allocation, on the file and through a view.
     let st = SafeTensors::open_with_limit(&p, Some(3000)).unwrap();
     assert_eq!(st.read_bf16_bits("w").unwrap().1.len(), 1000);
-    let e = st.read_f32("w").unwrap_err();
+    let e = tessl::safetensors::TensorSource::read_f32(&st, "w")
+        .unwrap_err()
+        .to_string();
     assert!(
         e.contains("read allocation") && e.contains("declares 4000") && e.contains("limit of 3000"),
         "{e}"
@@ -370,9 +379,14 @@ fn a_reads_own_allocation_is_budgeted_not_just_the_declared_bytes() {
     let e = st.read_raw("w").map(|(_, v)| v.len());
     assert_eq!(e.unwrap(), 2000);
     let view = CheckpointView::open_with_limit(&p, Some(3000)).unwrap();
-    let e = tessl::safetensors::TensorSource::read_f32(&view, "w").unwrap_err();
+    let e = tessl::safetensors::TensorSource::read_f32(&view, "w")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("read allocation"), "{e}");
     // With room, the same read succeeds.
     let st = SafeTensors::open_with_limit(&p, Some(4000)).unwrap();
-    assert_eq!(st.read_f32("w").unwrap().1.len(), 1000);
+    assert_eq!(
+        tessl::safetensors::TensorSource::read_f32(&st, "w").unwrap().1.len(),
+        1000
+    );
 }

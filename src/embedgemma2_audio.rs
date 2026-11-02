@@ -118,13 +118,13 @@ use crate::config_json;
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_gpu_buf, set_u32};
 use crate::embedgemma2::SoftSegment;
 use crate::gemm::{cast_f32_to_bf16_into, gemm, select_backend, GemmBackend, GemmOperands};
-use crate::json::{Json, NumForm};
 use crate::loader::Loader;
 use crate::nn::{dispatch_tg_1d, reduce_tptg, require, require_disjoint_writes};
 use crate::qwen35_model::Precision;
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::safetensors::SafeTensors;
 use crate::tensor::{gpu_copy, DType, GpuBuffer, Tensor};
+use ojas_io::json::{JsonNumber, JsonValue};
 
 /// Frames (rows of `input_features`) one forward holds. Bounds the largest
 /// activation, the first conv's output `[ceil(F/2), 64 * 128]`: 268 MB of f32
@@ -339,17 +339,17 @@ impl AudioConfig {
             .ok_or("config.json: missing \"audio_config\"")?;
         let uint = |k: &str| config_json::uint(c, k);
         let num = |k: &str| config_json::float(config_json::field(c, k)?, k);
-        if let Some(Json::Str(t)) = c.get("model_type") {
+        if let Some(JsonValue::String(t)) = c.get("model_type") {
             if t != "gemma4_audio" {
                 return Err(format!("config.json: audio model_type {t:?} is not gemma4_audio"));
             }
         }
         match c.get("hidden_act") {
-            Some(Json::Str(a)) if a == "silu" => {}
+            Some(JsonValue::String(a)) if a == "silu" => {}
             other => return Err(format!("config.json: audio hidden_act must be silu, got {other:?}")),
         }
         let clipped_linears = match c.get("use_clipped_linears") {
-            Some(Json::Bool(b)) => *b,
+            Some(JsonValue::Bool(b)) => *b,
             other => {
                 return Err(format!(
                     "config.json: use_clipped_linears must be a bool, got {other:?}"
@@ -363,14 +363,12 @@ impl AudioConfig {
             ));
         }
         let channels: Vec<u32> = match c.get("subsampling_conv_channels") {
-            Some(Json::Array(a)) => a
+            Some(JsonValue::Array(a)) => a
                 .iter()
                 .map(|v| match v {
-                    Json::Num {
-                        form: NumForm::Uint,
-                        int: n,
-                        ..
-                    } => u32::try_from(*n).map_err(|_| "config.json: a subsampling channel exceeds u32".to_string()),
+                    JsonValue::Number(JsonNumber::U64(n)) => {
+                        u32::try_from(*n).map_err(|_| "config.json: a subsampling channel exceeds u32".to_string())
+                    }
                     v => Err(format!("config.json: subsampling_conv_channels entry {v:?}")),
                 })
                 .collect::<Result<_, _>>()?,

@@ -134,7 +134,7 @@ fn staged_refusals() {
 }
 
 fn read_norm_w(st: &SafeTensors) -> Vec<f32> {
-    st.read_f32("model.norm.weight").unwrap().1
+    st.read_f32_widened("model.norm.weight").unwrap().1
 }
 
 /// `rms_norm(x) * (1 + w)` per row in f64.

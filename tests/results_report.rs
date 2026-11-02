@@ -13,8 +13,7 @@
 //!   spellings chosen to tell Python's `int`, `float`, `repr` and `json.dumps`
 //!   apart from a naive port (`5` against `5.0`, `1e-05`, `1e+16`, `é`).
 
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
+#[path = "../src/bin/common/json.rs"]
 mod json;
 
 use json::{Json, Syntax};

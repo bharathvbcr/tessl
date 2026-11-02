@@ -80,7 +80,7 @@ fn info(dtype: Dtype, shape: &[usize]) -> TensorInfo {
         .unwrap_or(0);
     TensorInfo {
         dtype,
-        shape: shape.to_vec(),
+        shape: shape.iter().map(|&d| d as u64).collect(),
         begin: 0,
         end: numel.saturating_mul(dtype.size()),
     }
@@ -122,7 +122,7 @@ fn dim(rng: &mut Rng) -> usize {
 /// The independent oracle: what `check_part` must accept, written from the
 /// layout table in the module docs and nothing else.
 fn oracle_ok(w: &TensorInfo, s: Option<&TensorInfo>, b: Option<&TensorInfo>, rows: usize, cols: usize) -> bool {
-    let fits = |t: &TensorInfo, dt: Dtype, last: usize| t.dtype == dt && t.shape == [rows, last];
+    let fits = |t: &TensorInfo, dt: Dtype, last: usize| t.dtype == dt && t.shape == [rows as u64, last as u64];
     // An empty matrix has nothing to load (`zero_row_and_zero_column_parts_are_refused`).
     rows != 0
         && cols != 0
@@ -163,15 +163,15 @@ fn check_part_agrees_with_the_layout_oracle_and_never_panics() {
                     what.push(format!("tensor {pick} dtype {dtype:?}"));
                 }
                 1 => {
-                    t.shape = vec![r, c];
+                    t.shape = vec![r as u64, c as u64];
                     what.push(format!("tensor {pick} shape [{r}, {c}]"));
                 }
                 2 => {
-                    t.shape = vec![r];
+                    t.shape = vec![r as u64];
                     what.push(format!("tensor {pick} rank 1 [{r}]"));
                 }
                 3 => {
-                    t.shape = vec![1, r, c];
+                    t.shape = vec![1, r as u64, c as u64];
                     what.push(format!("tensor {pick} rank 3"));
                 }
                 4 => {
@@ -375,7 +375,7 @@ fn mutated_part_headers_never_panic_and_accepted_ones_are_byte_exact() {
             }
         }
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            match SafeTensors::from_bytes("adv", bytes.clone()) {
+            match SafeTensors::from_bytes_named("adv", bytes.clone()) {
                 Ok(st) => load_check(&st, rows, cols).map(|a| (true, a)),
                 Err(_) => Ok((false, false)),
             }
@@ -402,7 +402,7 @@ fn a_vast_declared_shape_over_a_tiny_buffer_is_refused_at_parse() {
         let mut f = (header.len() as u64).to_le_bytes().to_vec();
         f.extend(header.into_bytes());
         f.extend([0u8; 16]);
-        assert!(SafeTensors::from_bytes("adv", f).is_err(), "{r} x {c} parsed");
+        assert!(SafeTensors::from_bytes_named("adv", f).is_err(), "{r} x {c} parsed");
     }
 }
 

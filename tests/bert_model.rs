@@ -145,7 +145,7 @@ fn distilbert_matches_transformers() {
 
 /// Rewrite `model.safetensors` of `name` with the two tensors' data exchanged
 /// (same shape), as safetensors bytes.
-fn with_swapped(name: &str, a: &str, b: &str) -> SafeTensors {
+fn with_swapped(name: &str, a: &str, b: &str) -> SafeTensors<'static> {
     let st = SafeTensors::open(&dir(name).join("model.safetensors")).unwrap();
     let mut names: Vec<String> = st.names().map(str::to_string).collect();
     names.sort();
@@ -167,7 +167,7 @@ fn with_swapped(name: &str, a: &str, b: &str) -> SafeTensors {
         if i > 0 {
             header.push(',');
         }
-        let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
         header.push_str(&format!(
             "\"{n}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{start},{}]}}",
             dims.join(","),
@@ -178,7 +178,7 @@ fn with_swapped(name: &str, a: &str, b: &str) -> SafeTensors {
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(&data);
-    SafeTensors::from_bytes("swapped", bytes).unwrap()
+    SafeTensors::from_bytes_named("swapped", bytes).unwrap()
 }
 
 /// The comparison has teeth: exchanging two layers' FFN output weights (same

@@ -579,8 +579,8 @@ pub fn weights_for(cfg: &EmbedGemma2Config, seed: u64, operands: GemmOperands) -
     random_weights(cfg, seed, operands == GemmOperands::Bf16)
 }
 
-pub fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors {
-    SafeTensors::from_bytes(tag, bytes).unwrap()
+pub fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors<'static> {
+    SafeTensors::from_bytes_named(tag, bytes).unwrap()
 }
 
 pub fn max_abs(a: &[f32], b: &[f64]) -> f64 {

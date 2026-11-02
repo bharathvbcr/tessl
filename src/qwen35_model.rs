@@ -97,7 +97,6 @@ use crate::attn_prefill_bf16::{self, AttnProbTile};
 use crate::config_json::{self, field, float};
 use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
-use crate::json::Json;
 use crate::loader::Loader;
 use crate::nn::{AttnDims, DecodeScratch, GEMM_Q4_MLX_MAX_M};
 use crate::qwen35::{
@@ -111,6 +110,7 @@ use crate::qwen35_q4::{
 use crate::runtime::{BufferKind, GpuRuntime};
 use crate::safetensors::TensorSource;
 use crate::tensor::{DType, GpuBuffer, Tensor};
+use ojas_io::json::JsonValue;
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
 
@@ -218,7 +218,7 @@ impl Qwen35Config {
             .into_iter()
             .flatten()
         {
-            let Json::Bool(b) = t else {
+            let JsonValue::Bool(b) = t else {
                 return Err(format!(
                     "config.json: tie_word_embeddings must be true or false, got {t:?}"
                 ));
@@ -274,19 +274,19 @@ impl Qwen35Config {
         }
         match c.get("mlp_only_layers") {
             None => {}
-            Some(Json::Array(a)) if a.is_empty() => {}
+            Some(JsonValue::Array(a)) if a.is_empty() => {}
             Some(v) => return Err(format!("config.json: mlp_only_layers {v:?} is not supported")),
         }
 
         let hidden = uint("hidden_size")?;
         let n_layers = uint("num_hidden_layers")?;
         let layers: Vec<LayerKind> = match c.get("layer_types") {
-            Some(Json::Array(a)) => a
+            Some(JsonValue::Array(a)) => a
                 .iter()
                 .enumerate()
                 .map(|(i, t)| match t {
-                    Json::Str(s) if s == "linear_attention" => Ok(LayerKind::LinearAttention),
-                    Json::Str(s) if s == "full_attention" => Ok(LayerKind::FullAttention),
+                    JsonValue::String(s) if s == "linear_attention" => Ok(LayerKind::LinearAttention),
+                    JsonValue::String(s) if s == "full_attention" => Ok(LayerKind::FullAttention),
                     t => Err(format!(
                         "config.json: layer_types[{i}] = {t:?} is not a known layer type"
                     )),
@@ -335,7 +335,7 @@ impl Qwen35Config {
         // RoPE: rope_parameters (transformers 5) or the older flat fields.
         let rope = c.get("rope_parameters").unwrap_or(c);
         if let Some(t) = rope.get("rope_type").or_else(|| rope.get("type")) {
-            if t != &Json::Str("default".into()) {
+            if t != &JsonValue::String("default".into()) {
                 return Err(format!(
                     "config.json: rope_type {t:?} is not supported (only \"default\")"
                 ));
@@ -777,8 +777,11 @@ impl Qwen35Model {
                 continue;
             }
             let name = format!("{prefix}layers.{l}.linear_attn.conv1d.weight");
-            let info = st.tensor_info(&name).map_err(|why| MlxQ4Error::Convention { why })?;
-            let c = NormConvention::from_conv_shape(&name, &info.shape, conv_dim, kernel)?;
+            let info = st
+                .tensor_info(&name)
+                .map_err(|why| MlxQ4Error::Convention { why: why.to_string() })?;
+            let shape = info.shape_usize();
+            let c = NormConvention::from_conv_shape(&name, &shape, conv_dim, kernel)?;
             if found.replace(c).is_some_and(|prev| prev != c) {
                 return Err(MlxQ4Error::Convention {
                     why: format!("{name} is in a different layout than an earlier layer's"),

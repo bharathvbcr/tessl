@@ -112,7 +112,7 @@ fn hand_ids(soft_per_frame: &[usize]) -> Vec<u32> {
 
 struct Fixture {
     c: Configs,
-    st: SafeTensors,
+    st: SafeTensors<'static>,
 }
 
 fn fixture(tag: &str, operands: GemmOperands) -> Fixture {

@@ -116,12 +116,12 @@ fn tensors(family: BertFamily) -> Vec<(String, Vec<usize>)> {
 
 /// Random f32 weights for every tensor, as safetensors bytes. Norm weights
 /// sit near 1 so the activations stay well scaled.
-fn checkpoint(family: BertFamily, seed: u64) -> SafeTensors {
+fn checkpoint(family: BertFamily, seed: u64) -> SafeTensors<'static> {
     checkpoint_with(family, seed, &[])
 }
 
 /// [`checkpoint`] plus `extra` tensors `BertSparseModel::load` never reads.
-fn checkpoint_with(family: BertFamily, seed: u64, extra: &[(&str, &[usize])]) -> SafeTensors {
+fn checkpoint_with(family: BertFamily, seed: u64, extra: &[(&str, &[usize])]) -> SafeTensors<'static> {
     let mut rng = SplitMix::new(seed);
     let mut header = String::from("{");
     let mut data: Vec<u8> = Vec::new();
@@ -150,7 +150,7 @@ fn checkpoint_with(family: BertFamily, seed: u64, extra: &[(&str, &[usize])]) ->
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(&data);
-    SafeTensors::from_bytes("bert_tiny", bytes).unwrap()
+    SafeTensors::from_bytes_named("bert_tiny", bytes).unwrap()
 }
 
 /// `SEQUENCES` token sequences of 3 to `MAX_SEQ` ids; the first is

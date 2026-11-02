@@ -256,18 +256,16 @@ pub mod gdn_train;
 pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;
-mod json;
 mod loader;
 pub mod media;
 #[cfg(feature = "quant-prep")]
 pub mod mtl_tensor;
 pub mod nn;
-pub mod npy;
+pub use ojas_io::npy;
 pub mod ops;
 mod par_batch;
 #[cfg(test)]
 mod parser_mutation;
-mod plain;
 pub mod pool_ledger;
 pub mod qwen35;
 pub mod qwen35_adamw;
@@ -276,7 +274,7 @@ pub mod qwen35_model;
 pub mod qwen35_params;
 pub mod qwen35_q4;
 pub mod runtime;
-pub mod safetensors;
+pub use ojas_io::safetensors;
 pub mod shared;
 pub mod shared_buf;
 pub mod sq_norm;

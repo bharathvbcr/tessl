@@ -156,8 +156,8 @@ fn safetensors_bytes(w: &Weights, extra: &[(&str, &[usize])], skip: &[&str]) -> 
     pack_safetensors(&tensors)
 }
 
-fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors {
-    SafeTensors::from_bytes(tag, bytes).unwrap()
+fn open(tag: &str, bytes: Vec<u8>) -> SafeTensors<'static> {
+    SafeTensors::from_bytes_named(tag, bytes).unwrap()
 }
 
 /// One synthetic image: a `w x h` raster of patches then `pad` padding

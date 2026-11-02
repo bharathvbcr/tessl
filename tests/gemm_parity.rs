@@ -13,8 +13,7 @@
 //! corresponds to a way an earlier harness returned a clean-looking report over
 //! a dump it had not actually verified.
 
-#[path = "../src/json.rs"]
-#[allow(dead_code)]
+#[path = "../src/bin/common/json.rs"]
 mod json;
 #[path = "../src/bin/common/parity.rs"]
 mod parity;

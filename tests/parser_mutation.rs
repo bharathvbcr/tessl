@@ -236,7 +236,7 @@ fn st_seeds() -> Vec<Vec<u8>> {
 
 /// Parse `bytes` and check every promise; the result is whether it was `Ok`.
 fn check_st(label: &str, bytes: &[u8]) -> bool {
-    let (res, largest) = measure(|| SafeTensors::from_bytes("mem", bytes.to_vec()));
+    let (res, largest) = measure(|| SafeTensors::from_bytes_named("mem", bytes.to_vec()));
     // `to_vec` is the harness's own copy, `bytes.len()` at most.
     assert!(
         largest <= alloc_bound(bytes.len()),
@@ -245,7 +245,7 @@ fn check_st(label: &str, bytes: &[u8]) -> bool {
     );
     match res {
         Err(e) => {
-            assert!(!e.is_empty(), "{label}: empty error");
+            assert!(!e.to_string().is_empty(), "{label}: empty error");
             false
         }
         Ok(st) => {
@@ -257,7 +257,7 @@ fn check_st(label: &str, bytes: &[u8]) -> bool {
                     info.begin <= info.end && info.end <= data_len,
                     "{label}: {name} outside buffer"
                 );
-                let numel: u64 = info.shape.iter().map(|&d| d as u64).product();
+                let numel: u64 = info.shape.iter().product();
                 assert_eq!(numel * info.dtype.size(), info.end - info.begin, "{label}: {name} size");
                 spans.push((info.begin, info.end));
                 let ((_, raw), largest) = measure(|| st.read_raw(name).unwrap());
@@ -297,7 +297,7 @@ fn check_st_file(label: &str, bytes: &[u8]) {
         "{label}: open allocated {largest} for a {}-byte file",
         bytes.len()
     );
-    let from_mem = SafeTensors::from_bytes("mem", bytes.to_vec());
+    let from_mem = SafeTensors::from_bytes_named("mem", bytes.to_vec());
     assert_eq!(res.is_ok(), from_mem.is_ok(), "{label}: open and from_bytes disagree");
     if let (Ok(a), Ok(b)) = (res, from_mem) {
         assert_eq!(a.names().collect::<Vec<_>>(), b.names().collect::<Vec<_>>(), "{label}");

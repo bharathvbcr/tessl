@@ -66,7 +66,7 @@ mod common;
 
 #[path = "common/evidence.rs"]
 mod evidence;
-#[path = "../json.rs"]
+#[path = "common/json.rs"]
 mod json;
 
 use std::collections::{BTreeMap, BTreeSet};

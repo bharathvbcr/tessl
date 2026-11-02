@@ -205,8 +205,8 @@ struct Weights {
 }
 
 fn norm_buf(rt: &Arc<GpuRuntime>, st: &SafeTensors, name: &str, dim: usize) -> Result<GpuBuffer, String> {
-    let (shape, data) = st.read_f32(&format!("{PREFIX}{name}"))?;
-    if shape != [dim] {
+    let (shape, data) = st.read_f32_widened(&format!("{PREFIX}{name}"))?;
+    if shape != [dim as u64] {
         return Err(format!("{name}: shape {shape:?}, expected [{dim}]"));
     }
     let b = rt.alloc_buffer_hot(dim.max(1) * 4)?;
@@ -231,7 +231,7 @@ fn pack_linear(
         let mut col0 = 0;
         for (name, out) in parts {
             let (shape, w) = st.read_bf16_bits(&format!("{PREFIX}{name}"))?;
-            if shape != [*out, inf] {
+            if shape != [*out as u64, inf as u64] {
                 return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
             }
             for o in 0..*out {
@@ -248,8 +248,8 @@ fn pack_linear(
     let mut dst = t.buffer.try_contents_f32()?;
     let mut col0 = 0;
     for (name, out) in parts {
-        let (shape, w) = st.read_f32(&format!("{PREFIX}{name}"))?;
-        if shape != [*out, inf] {
+        let (shape, w) = st.read_f32_widened(&format!("{PREFIX}{name}"))?;
+        if shape != [*out as u64, inf as u64] {
             return Err(format!("{name}: shape {shape:?}, expected [{out}, {inf}]"));
         }
         for o in 0..*out {
@@ -274,7 +274,7 @@ impl Weights {
         let n_layers = cfg.layers.len();
         let embed = rt.alloc_tensor_bf16_hot(&[vocab, h])?;
         let (shape, bits) = st.read_bf16_bits(&format!("{PREFIX}embed_tokens.weight"))?;
-        if shape != [vocab, h] {
+        if shape != [vocab as u64, h as u64] {
             return Err(format!("embed_tokens: shape {shape:?}"));
         }
         embed.buffer.try_contents_u16()?.copy_from_slice(&bits);
@@ -283,15 +283,15 @@ impl Weights {
         let ple_w = if bf16 {
             let t = rt.alloc_tensor_bf16_hot(&[n_layers * ple, h])?;
             let (shape, bits) = st.read_bf16_bits(&ple_name)?;
-            if shape != [n_layers * ple, h] {
+            if shape != [(n_layers * ple) as u64, h as u64] {
                 return Err(format!("ple projection: shape {shape:?}"));
             }
             t.buffer.try_contents_u16()?.copy_from_slice(&bits);
             t
         } else {
             let t = rt.alloc_tensor_f32_hot(&[n_layers * ple, h])?;
-            let (shape, data) = st.read_f32(&ple_name)?;
-            if shape != [n_layers * ple, h] {
+            let (shape, data) = st.read_f32_widened(&ple_name)?;
+            if shape != [(n_layers * ple) as u64, h as u64] {
                 return Err(format!("ple projection: shape {shape:?}"));
             }
             t.buffer.try_contents_f32()?.copy_from_slice(&data);
@@ -310,7 +310,7 @@ impl Weights {
         for (i, &spec) in cfg.layers.iter().enumerate() {
             let p = |s: &str| format!("layers.{i}.{s}");
             let (d, q, kv) = (spec.head_dim as usize, cfg.q_heads as usize, spec.kv_heads as usize);
-            let scalar = st.read_f32(&format!("{PREFIX}{}", p("layer_scalar")))?.1;
+            let scalar = st.read_f32_widened(&format!("{PREFIX}{}", p("layer_scalar")))?.1;
             if scalar.len() != 1 {
                 return Err(format!("layer {i}: layer_scalar has {} values", scalar.len()));
             }

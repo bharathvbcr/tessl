@@ -120,7 +120,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn safetensors(entries: &[Entry]) -> SafeTensors {
+fn safetensors(entries: &[Entry]) -> SafeTensors<'static> {
     let (mut header, mut data) = (String::from("{"), Vec::new());
     for (i, (name, dtype, shape, bytes)) in entries.iter().enumerate() {
         let shape: Vec<String> = shape.iter().map(usize::to_string).collect();
@@ -137,7 +137,7 @@ fn safetensors(entries: &[Entry]) -> SafeTensors {
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
     out.extend(header.into_bytes());
     out.extend(data);
-    SafeTensors::from_bytes("qwen35_mlx_q4 test", out).unwrap()
+    SafeTensors::from_bytes_named("qwen35_mlx_q4 test", out).unwrap()
 }
 
 /// Four layers (GDN, attention, GDN, attention) at the tiny fixture's widths

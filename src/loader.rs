@@ -31,9 +31,15 @@ use crate::runtime::GpuRuntime;
 use crate::safetensors::TensorSource;
 use crate::tensor::{GpuBuffer, Tensor};
 
+use ojas_io::IoError;
+
 /// A whole-tensor read's `(shape, elements)` with the shape checked against
 /// the one the model expects: the single owner of the loader's shape error.
-fn shape_checked<T>(name: &str, shape: &[usize], read: Result<(Vec<usize>, Vec<T>), String>) -> Result<Vec<T>, String> {
+fn shape_checked<T>(
+    name: &str,
+    shape: &[usize],
+    read: Result<(Vec<usize>, Vec<T>), IoError>,
+) -> Result<Vec<T>, String> {
     let (got, data) = read?;
     if got != shape {
         return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
@@ -98,7 +104,9 @@ impl<'a> Loader<'a> {
     /// [`Self::f32_into`] for a tensor named `name` as the checkpoint spells it.
     pub(crate) fn f32_into_root(&self, name: &str, shape: &[usize], t: &Tensor) -> Result<(), String> {
         let name = self.take_root(name);
-        self.st.read_f32_into(&name, shape, &mut t.buffer.try_contents_f32()?)
+        self.st
+            .read_f32_into(&name, shape, &mut t.buffer.try_contents_f32()?)
+            .map_err(|e| e.to_string())
     }
 
     /// [`Self::bf16_into`] for a tensor named `name` as the checkpoint spells it.
@@ -106,6 +114,7 @@ impl<'a> Loader<'a> {
         let name = self.take_root(name);
         self.st
             .read_bf16_bits_into(&name, shape, &mut t.buffer.try_contents_u16()?)
+            .map_err(|e| e.to_string())
     }
 
     /// Check tensor `name` (as the checkpoint spells it) has `shape`, from the
@@ -115,7 +124,7 @@ impl<'a> Loader<'a> {
     /// by the device running out of memory. The message is the one the reads
     /// give for the same mismatch.
     pub(crate) fn expect_shape(&self, name: &str, shape: &[usize]) -> Result<(), String> {
-        let got = self.st.tensor_info(name)?.shape;
+        let got = self.st.tensor_info(name)?.shape_usize();
         if got != shape {
             return Err(format!("{name}: shape {got:?}, expected {shape:?}"));
         }
@@ -382,7 +391,7 @@ mod tests {
 
     /// safetensors bytes for `(name, dtype, shape, values)`; bf16 values are
     /// taken as given (they are chosen exactly representable).
-    fn checkpoint(tensors: &[(&str, &str, Vec<usize>, Vec<f32>)]) -> SafeTensors {
+    fn checkpoint(tensors: &[(&str, &str, Vec<usize>, Vec<f32>)]) -> SafeTensors<'static> {
         let (mut header, mut data) = (String::from("{"), Vec::new());
         for (i, (name, dtype, shape, vals)) in tensors.iter().enumerate() {
             let bytes: Vec<u8> = match *dtype {
@@ -406,7 +415,7 @@ mod tests {
         let mut out = (header.len() as u64).to_le_bytes().to_vec();
         out.extend(header.into_bytes());
         out.extend(data);
-        SafeTensors::from_bytes("loader test", out).unwrap()
+        SafeTensors::from_bytes_named("loader test", out).unwrap()
     }
 
     /// The f32/bf16 readers (host `Vec` and straight-into-tensor, prefixed and
@@ -530,4 +539,3 @@ mod tests {
         ld.refuse_unread().unwrap();
     }
 }
-

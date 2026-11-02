@@ -55,7 +55,7 @@ impl Decoder<'_> {
                 self.ss, self.se, self.ah, self.al
             ));
         }
-        if self.restart_interval != 0 && self.restart_interval as usize % self.mcus_per_row != 0 {
+        if self.restart_interval != 0 && !(self.restart_interval as usize).is_multiple_of(self.mcus_per_row) {
             return invalid(format!(
                 "restart interval {} is not a multiple of the {} MCUs in a row (JERR_BAD_RESTART)",
                 self.restart_interval, self.mcus_per_row

@@ -46,6 +46,17 @@ moves those logits by O(1). Each of those was injected and caught.
   the driver requires all three to agree bit for bit: a GPU promises no order,
   so a kernel whose threadgroups write each other's outputs must not pass on
   the luck of one.
+- Every 16-byte vector access is checked. The kernels reach `float4` and
+  `uint4` by casting a `device float *` (or `uint *`) window, and an access
+  through a window the host did not align is undefined: Apple clang reads it
+  with `movups`/`ldr q` and the run passes, x86-64 g++ at `-O2` emits `movaps`
+  and faults. Rather than leave that to the compiler, `metal_stdlib` holds the
+  address of each whole-vector read and write to 16 bytes and refuses a
+  misaligned one by name. The address is laundered through an empty `asm`
+  first, because a compiler may otherwise assume a pointer to a 16-byte-aligned
+  type is aligned and delete the test — the same assumption that produces the
+  fault. Reading one component of a misaligned vector (`p4[j].x`) is a scalar
+  access and is not checked.
 - `MSL_EMU_ULP=N` perturbs each non-`precise::` `exp`/`log`/`rsqrt`/`pow`/`sin`/
   `cos` by a deterministic ±N ulps, a stand-in for Metal's fast math. `exp`
   gets ±(N + floor(2|x|)), following Metal's documented `3 + floor(2|x|)`-ulp

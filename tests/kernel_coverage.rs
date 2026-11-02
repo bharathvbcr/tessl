@@ -672,12 +672,8 @@ fn the_suite_list_reaches_the_breadth_it_claims() {
     assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3 + 4 + 8);
     // Every suite is a probe, not a measurement: bounded by its environment or,
     // for the Qwen3.5 benches, by its arguments.
-    let bounded_by_args = |a: &str| {
-        a == "--iters=1"
-            || a == "--check-only"
-            || a == "--attn-tiles"
-            || a.starts_with("--paired-")
-    };
+    let bounded_by_args =
+        |a: &str| a == "--iters=1" || a == "--check-only" || a == "--attn-tiles" || a.starts_with("--paired-");
     for x in &s {
         assert!(
             x.env

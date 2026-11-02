@@ -283,7 +283,7 @@ fn an_unsupported_dtype_is_still_refused_and_named() {
     let header = "{'descr': '<c16', 'fortran_order': False, 'shape': (1,), }\n";
     // Pad per the npy spec: spaces to a 64-byte data start, then the newline.
     let mut header = header.trim_end_matches('\n').to_string();
-    while (10 + header.len() + 1) % 64 != 0 {
+    while !(10 + header.len() + 1).is_multiple_of(64) {
         header.push(' ');
     }
     header.push('\n');

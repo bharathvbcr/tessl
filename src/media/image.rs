@@ -333,7 +333,7 @@ fn decode_jpeg_native(bytes: &[u8], options: &ImageOptions) -> Result<DecodedIma
         ImageLayout::Rgb => (3, img.rgb),
         ImageLayout::Rgba => {
             let mut rgba = Vec::with_capacity(width * height * 4);
-            for px in img.rgb.chunks_exact(3) {
+            for px in img.rgb.as_chunks::<3>().0 {
                 rgba.extend_from_slice(px);
                 rgba.push(255);
             }
@@ -861,7 +861,7 @@ fn draw_srgb(img: CfTypeRef, w: usize, h: usize, layout: ImageLayout) -> Result<
     drop(ctx);
     let channels = if layout == ImageLayout::Rgb { 3 } else { 4 };
     let mut out = vec![0u8; w * h * channels];
-    for (src, dst) in buf.chunks_exact(4).zip(out.chunks_exact_mut(channels)) {
+    for (src, dst) in buf.as_chunks::<4>().0.iter().zip(out.chunks_exact_mut(channels)) {
         let a = u32::from(src[3]);
         for k in 0..3 {
             dst[k] = match a {

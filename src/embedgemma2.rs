@@ -336,7 +336,7 @@ pub fn encoder_attn_with(
     const WHAT: &str = "embedgemma2::encoder_attn";
     let (entry, lanes, groups) = encoder_attn_entry(dims.head_dim)
         .ok_or_else(|| format!("{WHAT}: head dim {} has no kernel (32, 64, 256 or 512)", dims.head_dim))?;
-    if dims.heads == 0 || dims.heads_kv == 0 || dims.heads % dims.heads_kv != 0 {
+    if dims.heads == 0 || dims.heads_kv == 0 || !dims.heads.is_multiple_of(dims.heads_kv) {
         return Err(format!(
             "{WHAT}: heads ({}) must be a non-zero multiple of heads_kv ({})",
             dims.heads, dims.heads_kv

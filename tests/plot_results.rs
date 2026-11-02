@@ -1271,7 +1271,7 @@ fn video_color_draws_a_bar_and_a_median_per_path_of_every_call() {
     } else {
         2
     };
-    assert!(drawn > 0 && drawn % paths == 0);
+    assert!(drawn > 0 && drawn.is_multiple_of(paths));
     let e = elems("video-color");
     assert_eq!(count(&e, "bar"), drawn);
     assert_eq!(count(&e, "median"), drawn);

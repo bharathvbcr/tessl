@@ -279,6 +279,33 @@ fn run_decode(
         rt, &qb, &kb, &vb, &o_dec, &scratch, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, false,
     )
     .unwrap();
+    rt.synchronize().unwrap();
+    // The same three values bound as constants instead of device buffers: the
+    // same kernels, so bit for bit the buffer path's output.
+    let o_val = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+    nn::flash_attn_decode_values(
+        rt,
+        &qb,
+        &kb,
+        &vb,
+        &o_val,
+        &scratch,
+        s.tkv as u32,
+        q_off,
+        kv_off,
+        dims,
+        s.d as u32,
+        s.tkv,
+        false,
+    )
+    .unwrap();
+    rt.synchronize().unwrap();
+    let bits = |b: &GpuBuffer| b.read_f32().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&o_val),
+        bits(&o_dec),
+        "decode values path differs from the buffer path"
+    );
     match window {
         Some(_) => {
             let hd = match s.d {

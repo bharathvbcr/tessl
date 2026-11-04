@@ -16,6 +16,7 @@ Ignore legacy README phase roadmaps as Apple-API truth; prefer these docs +
 | [`beta_nightly_gap.md`](beta_nightly_gap.md) | 2026-10-30 beta, nightly, and doc-gap check: no seed after 27.2, GPU cores 20, wired budget 0.9× the 48 GiB recommendation, mlx `ahead_by` 58, mlx-swift metal-cpp header is not `8cdde68`. |
 | [`metal4_mpp.md`](metal4_mpp.md) | Metal 4 encode-only, MPP §2.3 DONE vs open, residency, NAX util gate |
 | [`coreml_metal_ml.md`](coreml_metal_ml.md) | Deploy-only Core ML / ANE (QAT ≠ train) |
+| [`fusion_and_placement.md`](fusion_and_placement.md) | Before a megakernel, fused region or Core ML export: when they pay (vision at batch 1) and when they do not (decode GEMV, placement boundaries), with the 2026-11 SpikeTrack and gemma-metal evidence |
 | [`optimization_map.md`](optimization_map.md) | **Start here for work** — live gates **58.4 / 276** + Audit 6 backlog |
 
 ## Stack root

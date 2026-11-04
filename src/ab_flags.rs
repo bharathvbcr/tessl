@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicI8, Ordering};
 const ENV_HAZARD_BARRIERS: &[&str] = &["TESSL_HAZARD_BARRIERS", "METAL_RUNTIME_HAZARD_BARRIERS"];
 const ENV_COARSE_BARRIERS: &[&str] = &["TESSL_COARSE_BARRIERS", "METAL_RUNTIME_COARSE_BARRIERS"];
 const ENV_QWEN35_DECODE_FUSION: &[&str] = &["TESSL_QWEN35_DECODE_FUSION"];
+const ENV_DISPATCH_STAMPS: &[&str] = &["TESSL_DISPATCH_STAMPS"];
 
 /// The recognised spellings, exact and case-sensitive. `None` means "this value
 /// does not decide the flag" — for an unset name *and* for a set-but-unrecognised
@@ -157,6 +158,22 @@ static QWEN35_DECODE_FUSION: TriFlag = TriFlag::new();
 /// can still be switched either way with `Decode::set_fusion`.
 pub fn qwen35_decode_fusion() -> bool {
     QWEN35_DECODE_FUSION.get(ENV_QWEN35_DECODE_FUSION, || false)
+}
+
+/// Unset (read env), off = no per-dispatch GPU timestamps, on = one Precise stamp after every dispatch.
+static DISPATCH_STAMPS: TriFlag = TriFlag::new();
+
+/// Per-dispatch GPU timestamps (profiling only; see [`crate::dispatch_stamps`]).
+/// Default off. `TESSL_DISPATCH_STAMPS=1` turns it on. The stamp heap is created
+/// when a runtime is built with the flag on, so set it before building the
+/// runtime; after that it can be flipped per command buffer.
+pub fn dispatch_stamps() -> bool {
+    DISPATCH_STAMPS.get(ENV_DISPATCH_STAMPS, || false)
+}
+
+/// Force per-dispatch GPU timestamps on or off, overriding the env.
+pub fn set_dispatch_stamps(on: bool) {
+    DISPATCH_STAMPS.set(on);
 }
 
 /// Pure core of [`need_barrier`], split out so the truth table can be pinned by
@@ -325,6 +342,7 @@ mod tests {
             ("hazard_barriers", ENV_HAZARD_BARRIERS),
             ("coarse_barriers", ENV_COARSE_BARRIERS),
             ("qwen35_decode_fusion", ENV_QWEN35_DECODE_FUSION),
+            ("dispatch_stamps", ENV_DISPATCH_STAMPS),
         ];
         for (flag, names) in lists {
             assert!(!names.is_empty(), "{flag} has no env names");

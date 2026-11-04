@@ -8,7 +8,9 @@ compute-unit assignment do **not** replace the Metal 4 training loop (Muon,
 custom FA bwd, clip-soft, value-resid). They apply to **exported** graphs only.
 
 Related: [`optimization_map.md`](optimization_map.md) ·
-[`DECISIONS.md`](../../../ojas/arch02/metal-native/DECISIONS.md) **M6**.
+[`DECISIONS.md`](../../../ojas/arch02/metal-native/DECISIONS.md) **M6** ·
+[`fusion_and_placement.md`](fusion_and_placement.md) (measured inference placements: Core ML programs
+inside a Metal frame, the Neural Engine, and the host-copy cost at the boundary).
 
 ## Primary sources
 

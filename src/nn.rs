@@ -1498,6 +1498,71 @@ pub fn flash_attn_decode(
     )
 }
 
+/// [`flash_attn_decode`] with the live key count and positions known at
+/// encode time, bound as constants instead of read from device buffers.
+///
+/// A caller whose per-token values live on the host would otherwise write
+/// them into a device buffer first, and a host write maps the buffer, which
+/// commits the open command buffer and waits for the GPU. A command buffer
+/// encoded this way cannot be replayed for a later token (the values are
+/// fixed); replay callers use [`flash_attn_decode`]. `tkv` is clamped to
+/// `kv_capacity` by both passes, as a device value is.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode_values(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    scratch: &DecodeScratch,
+    tkv: u32,
+    q_pos_offset: u32,
+    kv_pos_offset: u32,
+    dims: AttnDims,
+    head_dim: u32,
+    kv_capacity: usize,
+    out_bf16: bool,
+) -> Result<(), String> {
+    flash_attn_decode_encode(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        scratch,
+        DecodeLive::Values {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        },
+        dims,
+        head_dim,
+        kv_capacity,
+        decode_chunk_for(head_dim),
+        decode_lanes_for(head_dim),
+        None,
+        None,
+        out_bf16,
+    )
+}
+
+/// Where the decode passes read the live key count and the positions.
+#[derive(Clone, Copy)]
+enum DecodeLive<'a> {
+    /// Device `u32`s, read at execution (replayable).
+    Buffers {
+        tkv: &'a GpuBuffer,
+        q_pos_offset: &'a GpuBuffer,
+        kv_pos_offset: &'a GpuBuffer,
+    },
+    /// Values bound through the binder's constant arena at encode.
+    Values {
+        tkv: u32,
+        q_pos_offset: u32,
+        kv_pos_offset: u32,
+    },
+}
+
 /// [`flash_attn_decode`] with an explicit chunk size, for the tuning sweep.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_decode_with_chunk(
@@ -1525,6 +1590,49 @@ pub fn flash_attn_decode_with_chunk(
     head_block: Option<DecodeHeadBlock>,
     out_bf16: bool,
 ) -> Result<(), String> {
+    flash_attn_decode_encode(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        scratch,
+        DecodeLive::Buffers {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        },
+        dims,
+        head_dim,
+        kv_capacity,
+        chunk,
+        lanes,
+        reduce_threads,
+        head_block,
+        out_bf16,
+    )
+}
+
+/// The one body of [`flash_attn_decode_with_chunk`] and
+/// [`flash_attn_decode_values`].
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_decode_encode(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    scratch: &DecodeScratch,
+    live: DecodeLive<'_>,
+    dims: AttnDims,
+    head_dim: u32,
+    kv_capacity: usize,
+    chunk: DecodeChunk,
+    lanes: RowsLanes,
+    reduce_threads: Option<usize>,
+    head_block: Option<DecodeHeadBlock>,
+    out_bf16: bool,
+) -> Result<(), String> {
     let (partial_entry, reduce_entry) = decode_entries(head_dim, chunk, lanes)
         .ok_or_else(|| format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)"))?;
     if dims.tq != 1 {
@@ -1536,10 +1644,17 @@ pub fn flash_attn_decode_with_chunk(
     }
     require_attn_runtime(rt, q, k, v, o, "flash_attn_decode")?;
     let actual_kv_capacity = validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_decode", out_bf16)?;
-    validate_attn_live_scalar_aliases(&dims, o, tkv, q_pos_offset, kv_pos_offset, "flash_attn_decode")?;
-    require::<u32>(rt, tkv, 1, "flash_attn_decode tkv")?;
-    require::<u32>(rt, q_pos_offset, 1, "flash_attn_decode q_pos_offset")?;
-    require::<u32>(rt, kv_pos_offset, 1, "flash_attn_decode kv_pos_offset")?;
+    if let DecodeLive::Buffers {
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+    } = live
+    {
+        validate_attn_live_scalar_aliases(&dims, o, tkv, q_pos_offset, kv_pos_offset, "flash_attn_decode")?;
+        require::<u32>(rt, tkv, 1, "flash_attn_decode tkv")?;
+        require::<u32>(rt, q_pos_offset, 1, "flash_attn_decode q_pos_offset")?;
+        require::<u32>(rt, kv_pos_offset, 1, "flash_attn_decode kv_pos_offset")?;
+    }
     let kv_capacity =
         u32::try_from(kv_capacity).map_err(|_| "flash_attn_decode: kv_capacity exceeds the device u32 range")?;
     if kv_capacity == 0 {
@@ -1556,6 +1671,27 @@ pub fn flash_attn_decode_with_chunk(
              layout capacity {actual_kv_capacity}"
         ));
     }
+    let base = [("q", q), ("k", k), ("v", v), ("o", o)];
+    let with_live;
+    let operands: &[(&str, &GpuBuffer)] = match live {
+        DecodeLive::Buffers {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        } => {
+            with_live = [
+                base[0],
+                base[1],
+                base[2],
+                base[3],
+                ("tkv", tkv),
+                ("q_pos_offset", q_pos_offset),
+                ("kv_pos_offset", kv_pos_offset),
+            ];
+            &with_live
+        }
+        DecodeLive::Values { .. } => &base,
+    };
     let chunks = scratch.check(
         rt,
         "flash_attn_decode",
@@ -1564,15 +1700,7 @@ pub fn flash_attn_decode_with_chunk(
         kv_capacity as usize,
         head_dim,
         chunk.keys(),
-        &[
-            ("q", q),
-            ("k", k),
-            ("v", v),
-            ("o", o),
-            ("tkv", tkv),
-            ("q_pos_offset", q_pos_offset),
-            ("kv_pos_offset", kv_pos_offset),
-        ],
+        operands,
     )?;
     let scratch = scratch.buffer();
     // Deliberately not zeroed. The reduce pass reads chunks
@@ -1634,13 +1762,11 @@ pub fn flash_attn_decode_with_chunk(
         set_gpu_buf(bnd, v, 2);
         set_gpu_buf(bnd, scratch, 3);
         set_u32(bnd, dims.batch, 4);
-        set_gpu_buf(bnd, tkv, 6);
+        bind_decode_live(bnd, live, 6, Some((11, 12)));
         set_u32(bnd, dims.heads, 7);
         set_u32(bnd, dims.heads_kv, 8);
         set_u32(bnd, dims.window, 9);
         set_f32(bnd, dims.scale, 10);
-        set_gpu_buf(bnd, q_pos_offset, 11);
-        set_gpu_buf(bnd, kv_pos_offset, 12);
         set_u32(bnd, kv_capacity, 13);
         bnd.dispatch(partial_groups, partial_threads);
         if bnd.needs_explicit_barriers() {
@@ -1651,13 +1777,49 @@ pub fn flash_attn_decode_with_chunk(
         set_gpu_buf(bnd, scratch, 0);
         set_gpu_buf(bnd, o, 1);
         set_u32(bnd, dims.batch, 2);
-        set_gpu_buf(bnd, tkv, 3);
+        bind_decode_live(bnd, live, 3, None);
         set_u32(bnd, dims.heads, 4);
         set_u32(bnd, u32::from(out_bf16), 5);
         set_u32(bnd, kv_capacity, 6);
         bnd.dispatch(reduce_groups, reduce_threads);
         Ok(())
     })
+}
+
+/// Bind the live key count at `tkv_slot`, and the query and key position
+/// offsets at `pos_slots`, from wherever `live` keeps them. Each kernel slot
+/// is a `device const uint *` it reads element 0 of, which a constant-arena
+/// bind of one `u32` satisfies.
+fn bind_decode_live(
+    bnd: &mut crate::dispatch::Binder<'_>,
+    live: DecodeLive<'_>,
+    tkv_slot: usize,
+    pos_slots: Option<(usize, usize)>,
+) {
+    match live {
+        DecodeLive::Buffers {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        } => {
+            set_gpu_buf(bnd, tkv, tkv_slot);
+            if let Some((q_slot, kv_slot)) = pos_slots {
+                set_gpu_buf(bnd, q_pos_offset, q_slot);
+                set_gpu_buf(bnd, kv_pos_offset, kv_slot);
+            }
+        }
+        DecodeLive::Values {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        } => {
+            set_u32(bnd, tkv, tkv_slot);
+            if let Some((q_slot, kv_slot)) = pos_slots {
+                set_u32(bnd, q_pos_offset, q_slot);
+                set_u32(bnd, kv_pos_offset, kv_slot);
+            }
+        }
+    }
 }
 
 /// Simdgroups per threadgroup in the row-parallel kernels.
@@ -2822,8 +2984,12 @@ pub fn validate_rms_qkv_rope(
 /// keep all stable scalar storage alive and resident for every execution.
 /// For [`QkvRopeVariant::PosBufferKvStore`] only, the callback may additionally
 /// replace slot 16 with an aligned, in-bounds byte-offset view of the validated
-/// [`KvStoreTarget::dst_offset`] buffer. This supports a stable scalar pool;
-/// the callback must preserve that buffer's runtime, lifetime, and `u32` ABI.
+/// [`KvStoreTarget::dst_offset`] buffer, or with one `u32` bound through
+/// [`crate::dispatch::Binder::bind_u32`]. The first supports a stable scalar
+/// pool, and the callback must preserve that buffer's runtime, lifetime, and
+/// `u32` ABI; the second carries the same value in the binder's constant arena,
+/// which lives as long as the command buffer. Either way the kernel reads one
+/// `u32` there and refuses an offset that would store past slot 17's capacity.
 ///
 /// When `q_only` is set, slot 8 (`Hkv`) is rebound to zero after `scalars`
 /// returns. The q-only grid is `T * Hq` head rows rounded up to a whole

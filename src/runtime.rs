@@ -202,6 +202,15 @@ impl PipelineCache {
             .map(|(name, _)| name.as_str())
     }
 
+    /// Kernel names keyed by pipeline object address, for per-dispatch stamps.
+    pub(crate) fn names_by_ptr(&self) -> HashMap<usize, String> {
+        self.plain
+            .iter()
+            .chain(self.icb.iter())
+            .map(|(name, p)| (Retained::as_ptr(p) as *const () as usize, name.clone()))
+            .collect()
+    }
+
     fn get_or_create(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
@@ -554,6 +563,10 @@ pub(crate) struct Metal4EncodePackage {
     pub command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     pub argument_table: PersistentArgumentTable,
     pub counter_heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
+    /// Per-dispatch timestamp heap ([`crate::dispatch_stamps`]); `Some` only when
+    /// the runtime was built with `TESSL_DISPATCH_STAMPS` on. Separate from
+    /// `counter_heap` so `new_inference()` semantics do not change.
+    pub stamp_heap: Option<Retained<ProtocolObject<dyn MTL4CounterHeap>>>,
     pub residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     /// The private lifetime event. Every decision about when GPU memory is
     /// free (allocator reset, const-arena rewind, pool recycle, the drop
@@ -900,6 +913,10 @@ pub struct GpuRuntime {
     active_m4: Mutex<Option<ActiveMetal4Batch>>,
     /// Last CounterHeap (t0, t1) resolved at synchronize.
     last_m4_stamps: Mutex<Option<(u64, u64)>>,
+    /// Per-dispatch stamp metadata for the open command buffer.
+    pub(crate) stamp_log: Mutex<crate::dispatch_stamps::StampLog>,
+    /// Last resolved per-dispatch stamps ([`Self::take_dispatch_stamps`]).
+    last_dispatch_stamps: Mutex<Option<Result<crate::dispatch_stamps::DispatchStampBatch, String>>>,
     /// `with_binder` calls since the last [`Self::take_dispatch_count`]
     /// (fusion/telemetry). Commits do not clear it; only the taker does.
     ///
@@ -1215,6 +1232,8 @@ impl GpuRuntime {
             serialized: AtomicBool::new(false),
             active_m4: Mutex::new(None),
             last_m4_stamps: Mutex::new(None),
+            stamp_log: Mutex::new(crate::dispatch_stamps::StampLog::default()),
+            last_dispatch_stamps: Mutex::new(None),
             dispatch_count: AtomicUsize::new(0),
             precision: AtomicU8::new(PrecisionMode::F32.to_u8()),
             relaxed_precision: AtomicBool::new(false),
@@ -1409,6 +1428,40 @@ impl GpuRuntime {
     /// Last CounterHeap (t0, t1) from the most recent Metal 4 synchronize, if any.
     pub fn take_metal4_stamps(&self) -> Option<(u64, u64)> {
         self.last_m4_stamps.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Per-dispatch stamps from the most recent waiting commit, if the command
+    /// buffer was armed (see [`crate::dispatch_stamps`]). `Some(Err(_))` means
+    /// stamps were pending but could not be read back; it is never a clean batch.
+    pub fn take_dispatch_stamps(&self) -> Option<Result<crate::dispatch_stamps::DispatchStampBatch, String>> {
+        self.last_dispatch_stamps.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Kernel names keyed by pipeline address (per-dispatch stamp tagging).
+    pub(crate) fn pipeline_names_by_ptr(&self) -> Result<HashMap<usize, String>, String> {
+        Ok(self.pipelines.lock().map_err(|e| e.to_string())?.names_by_ptr())
+    }
+
+    /// Keep a resolved command buffer's stamps until taken. A token that spans
+    /// several waiting commits (host mappings commit and wait) accumulates into
+    /// one batch; an error from any of them sticks.
+    pub(crate) fn store_dispatch_stamps(&self, result: Result<crate::dispatch_stamps::DispatchStampBatch, String>) {
+        let Ok(mut slot) = self.last_dispatch_stamps.lock() else {
+            return;
+        };
+        *slot = Some(match (slot.take(), result) {
+            (Some(Err(e)), _) | (_, Err(e)) => Err(e),
+            (Some(Ok(mut prev)), Ok(next)) => {
+                prev.merge(next);
+                Ok(prev)
+            }
+            (None, Ok(next)) => Ok(next),
+        });
+    }
+
+    /// True when this runtime owns a per-dispatch stamp heap.
+    pub fn dispatch_stamp_heap_available(&self) -> bool {
+        self.metal4.stamp_heap.is_some()
     }
 
     pub(crate) fn weak_self(&self) -> Weak<GpuRuntime> {
@@ -2529,6 +2582,7 @@ impl GpuRuntime {
                 }
                 stamped = true;
             }
+            self.arm_dispatch_stamps();
             *batch = Some(ActiveMetal4Batch {
                 dispatches: 0,
                 cb_open: true,
@@ -2574,6 +2628,7 @@ impl GpuRuntime {
                     MTLStages::Dispatch,
                     MTL4VisibilityOptions::Device,
                 );
+                self.stamp_origin(&e);
                 batch.encoder = Some(e);
             }
             // A capture also carries the state across a command-buffer boundary
@@ -2783,6 +2838,7 @@ impl GpuRuntime {
             self.wait_lifetime_event(next)?;
             crate::infer_trace::record_sync_wait(t0);
             self.reset_all_allocators()?;
+            self.resolve_dispatch_stamps();
             if write_t1 {
                 if let Some(heap) = m4.counter_heap.as_ref() {
                     if let Ok(stamps) = resolve_two_timestamps(heap) {
@@ -3007,6 +3063,9 @@ impl GpuRuntime {
         if let Some(counter_heap) = &self.metal4.counter_heap {
             std::mem::forget(counter_heap.clone());
         }
+        if let Some(stamp_heap) = &self.metal4.stamp_heap {
+            std::mem::forget(stamp_heap.clone());
+        }
         std::mem::forget(self.metal4.residency.clone());
         std::mem::forget(self.metal4.lifetime_event.clone());
         std::mem::forget(self.metal4.handoff_event.clone());
@@ -3173,9 +3232,30 @@ fn probe_system_memory_size() -> u64 {
 }
 
 fn resolve_two_timestamps(heap: &ProtocolObject<dyn MTL4CounterHeap>) -> Result<(u64, u64), String> {
-    let data: Retained<NSData> = unsafe { heap.resolveCounterRange(NSRange { location: 0, length: 2 }) }
-        .ok_or_else(|| "resolveCounterRange returned nil".to_string())?;
-    let need = 2 * std::mem::size_of::<MTL4TimestampHeapEntry>();
+    let v = resolve_timestamps(heap, 2)?;
+    Ok((v[0], v[1]))
+}
+
+/// Resolve the first `n` entries of a timestamp heap into raw GPU ticks.
+/// The GPU work that wrote them must have completed.
+pub(crate) fn resolve_timestamps(heap: &ProtocolObject<dyn MTL4CounterHeap>, n: usize) -> Result<Vec<u64>, String> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n > heap.count() {
+        return Err(format!(
+            "timestamp resolve of {n} entries exceeds heap of {}",
+            heap.count()
+        ));
+    }
+    let data: Retained<NSData> = unsafe {
+        heap.resolveCounterRange(NSRange {
+            location: 0,
+            length: n as _,
+        })
+    }
+    .ok_or_else(|| "resolveCounterRange returned nil".to_string())?;
+    let need = n * std::mem::size_of::<MTL4TimestampHeapEntry>();
     let bytes = data.length();
     if bytes < need {
         return Err(format!("timestamp resolve too small: {bytes} bytes (need {need})"));
@@ -3186,34 +3266,41 @@ fn resolve_two_timestamps(heap: &ProtocolObject<dyn MTL4CounterHeap>) -> Result<
     unsafe {
         data.getBytes_length(NonNull::new(buf.as_mut_ptr().cast()).unwrap(), need);
     }
-    decode_two_timestamps(&buf)
+    decode_timestamps(&buf, n)
 }
 
 /// Decode two `MTL4TimestampHeapEntry` values out of resolved counter bytes.
+#[cfg(test)]
+fn decode_two_timestamps(bytes: &[u8]) -> Result<(u64, u64), String> {
+    let v = decode_timestamps(bytes, 2)?;
+    Ok((v[0], v[1]))
+}
+
+/// Decode `n` `MTL4TimestampHeapEntry` values out of resolved counter bytes.
 ///
-/// Split out from [`resolve_two_timestamps`] so the byte decode is testable
+/// Split out from [`resolve_timestamps`] so the byte decode is testable
 /// without a device, and so the alignment contract lives in one place: the
 /// staging buffer is a `Vec<u8>` (alignment 1), while the entry type is
 /// 8-aligned, so every read here goes through `read_unaligned`.
-fn decode_two_timestamps(bytes: &[u8]) -> Result<(u64, u64), String> {
-    let need = std::mem::size_of::<[MTL4TimestampHeapEntry; 2]>();
+pub(crate) fn decode_timestamps(bytes: &[u8], n: usize) -> Result<Vec<u64>, String> {
+    let need = n
+        .checked_mul(std::mem::size_of::<MTL4TimestampHeapEntry>())
+        .ok_or_else(|| "timestamp decode size overflow".to_string())?;
     if bytes.len() < need {
         return Err(format!(
             "timestamp decode too small: {} bytes (need {need})",
             bytes.len()
         ));
     }
-    // SAFETY: the length check above puts both entries fully inside `bytes`.
+    // SAFETY: the length check above puts all `n` entries fully inside `bytes`.
     // `read_unaligned` imposes no alignment requirement on the source, which is
     // what makes reading out of a `Vec<u8>` sound; `MTL4TimestampHeapEntry` is
     // a `#[repr(C)]` struct of one `u64`, so every bit pattern is a valid value
     // and the copy it makes is well defined.
-    unsafe {
-        let ptr = bytes.as_ptr().cast::<MTL4TimestampHeapEntry>();
-        let a = std::ptr::read_unaligned(ptr).timestamp;
-        let b = std::ptr::read_unaligned(ptr.add(1)).timestamp;
-        Ok((a, b))
-    }
+    let ptr = bytes.as_ptr().cast::<MTL4TimestampHeapEntry>();
+    Ok((0..n)
+        .map(|i| unsafe { std::ptr::read_unaligned(ptr.add(i)).timestamp })
+        .collect())
 }
 
 fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> Result<Metal4EncodePackage, String> {
@@ -3248,6 +3335,23 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("[metal-runtime] MTL4CounterHeap unavailable ({e}); timestamps off");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let stamp_heap = if crate::ab_flags::dispatch_stamps() {
+        let heap_desc = MTL4CounterHeapDescriptor::new();
+        heap_desc.setType(MTL4CounterHeapType::Timestamp);
+        unsafe {
+            heap_desc.setCount(crate::dispatch_stamps::STAMP_HEAP_SLOTS as _);
+        }
+        match device.newCounterHeapWithDescriptor_error(&heap_desc) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("[metal-runtime] dispatch-stamp heap unavailable ({e}); per-dispatch stamps off");
                 None
             }
         }
@@ -3297,6 +3401,7 @@ fn try_init_metal4(device: &ProtocolObject<dyn MTLDevice>, timestamps: bool) -> 
             max_buffers: ARGUMENT_TABLE_MAX_BUFFERS as u64,
         },
         counter_heap,
+        stamp_heap,
         residency,
         lifetime_event,
         handoff_event,
@@ -3573,6 +3678,26 @@ mod timestamp_decode_tests {
         let (a, b) = decode_two_timestamps(bytes).expect("decode");
         assert_eq!(a, 0x0123_4567_89ab_cdef);
         assert_eq!(b, 0x0fed_cba9_8765_4321);
+    }
+
+    /// The N-entry decode keeps the order of the entries and refuses a buffer
+    /// one byte short of N, however large N is.
+    #[test]
+    fn decodes_n_entries_in_order_from_an_unaligned_buffer() {
+        const N: usize = 37;
+        let mut raw = vec![0u8; N * 8 + 1];
+        let off = usize::from((raw.as_ptr() as usize).is_multiple_of(2));
+        for i in 0..N {
+            raw[off + i * 8..off + i * 8 + 8].copy_from_slice(&(1000 + i as u64).to_ne_bytes());
+        }
+        let v = decode_timestamps(&raw[off..off + N * 8], N).expect("decode");
+        assert_eq!(v, (0..N as u64).map(|i| 1000 + i).collect::<Vec<_>>());
+        let err = decode_timestamps(&raw[off..off + N * 8 - 1], N).expect_err("short");
+        assert!(err.contains("too small"), "{err}");
+        assert!(
+            decode_timestamps(&raw, usize::MAX).is_err(),
+            "size overflow must refuse"
+        );
     }
 
     #[test]

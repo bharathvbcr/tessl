@@ -78,6 +78,12 @@ pub struct Binder<'a> {
     /// every caller knowing the graph. The runtime carries the flag from one
     /// scope to the next.
     hazard_pending: bool,
+    /// Per-dispatch GPU stamps are armed for the open command buffer
+    /// ([`crate::dispatch_stamps`]). Latched at construction, like
+    /// `skip_auto_barriers`.
+    stamps_on: bool,
+    /// Address of the pipeline last set, for stamp tagging (only kept when `stamps_on`).
+    stamp_pipeline: usize,
 }
 
 impl<'a> Binder<'a> {
@@ -164,6 +170,8 @@ impl<'a> Binder<'a> {
             last_arg_table_ptr: None,
             skip_auto_barriers,
             hazard_pending,
+            stamps_on: runtime.dispatch_stamps_armed(),
+            stamp_pipeline: 0,
         }
     }
 
@@ -232,6 +240,9 @@ impl<'a> Binder<'a> {
         }
         self.max_threads = Some(pipeline.maxTotalThreadsPerThreadgroup());
         self.enc.setComputePipelineState(pipeline);
+        if self.stamps_on {
+            self.stamp_pipeline = pipeline as *const ProtocolObject<dyn MTLComputePipelineState> as *const () as usize;
+        }
         if crate::decode_icb::decode_icb_capture_active() {
             // Retain via pipeline cache clone path: callers pass cache Retained refs.
             // We re-lookup is unavailable here — store a raw retain if possible.
@@ -498,6 +509,9 @@ impl<'a> Binder<'a> {
         self.enc
             .dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
         crate::infer_trace::on_dispatch();
+        if self.stamps_on {
+            self.runtime.stamp_after_dispatch(self.enc, self.stamp_pipeline);
+        }
         self.hazard_pending = self.skip_auto_barriers;
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_dispatch(threadgroups, threads_per_tg);
@@ -510,6 +524,9 @@ impl<'a> Binder<'a> {
                     MTL4VisibilityOptions::Device,
                 );
             crate::infer_trace::on_barrier();
+            if self.stamps_on {
+                self.runtime.stamp_note_barrier();
+            }
             // Freeze always-on auto-barrier into the DecodeIcb tape.
             if crate::decode_icb::decode_icb_capture_active() {
                 crate::decode_icb::capture_note_barrier();
@@ -538,6 +555,9 @@ impl<'a> Binder<'a> {
                 MTL4VisibilityOptions::Device,
             );
         crate::infer_trace::on_barrier();
+        if self.stamps_on {
+            self.runtime.stamp_note_barrier();
+        }
         self.hazard_pending = false;
         // Shipping hazard skip-auto: RAW edges land here — capture for tape replay.
         if crate::decode_icb::decode_icb_capture_active() {
@@ -604,6 +624,9 @@ impl<'a> Binder<'a> {
             self.enc.executeCommandsInBuffer_withRange(icb, range);
         }
         crate::infer_trace::on_dispatch();
+        if self.stamps_on {
+            self.runtime.stamp_after_dispatch(self.enc, 0);
+        }
         self.hazard_pending = self.skip_auto_barriers;
         if !self.skip_auto_barriers {
             self.enc
@@ -613,6 +636,9 @@ impl<'a> Binder<'a> {
                     MTL4VisibilityOptions::Device,
                 );
             crate::infer_trace::on_barrier();
+            if self.stamps_on {
+                self.runtime.stamp_note_barrier();
+            }
             if crate::decode_icb::decode_icb_capture_active() {
                 crate::decode_icb::capture_note_barrier();
             }

@@ -246,7 +246,9 @@ fn undersized_operands_are_refused_before_dispatch() {
 }
 
 fn seq_i8(n: usize, seed: i32) -> Vec<i8> {
-    (0..n).map(|i| ((i as i32).wrapping_mul(13).wrapping_add(seed) % 17 - 8) as i8).collect()
+    (0..n)
+        .map(|i| ((i as i32).wrapping_mul(13).wrapping_add(seed) % 17 - 8) as i8)
+        .collect()
 }
 
 fn f32_buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
@@ -402,13 +404,34 @@ fn quant_row(row: &[f32]) -> Result<(Vec<i8>, f32), ()> {
 
 #[test]
 fn pipeline_names_select_gemv_small_tile_and_wide_tile() {
-    assert_eq!(nn::i8_gemm_pipeline_name(1, nn::I8BLayout::RowMajorKN, 0).unwrap(), "i8_gemv_dequant");
-    assert_eq!(nn::i8_gemm_pipeline_name(1, nn::I8BLayout::TransposedNK, 128).unwrap(), "i8_gemv_dequant");
-    assert_eq!(nn::i8_gemm_pipeline_name(2, nn::I8BLayout::RowMajorKN, 0).unwrap(), "i8_w8a8_64");
-    assert_eq!(nn::i8_gemm_pipeline_name(64, nn::I8BLayout::TransposedNK, 0).unwrap(), "i8_w8a8_64_nt");
-    assert_eq!(nn::i8_gemm_pipeline_name(65, nn::I8BLayout::RowMajorKN, 0).unwrap(), "i8_w8a8_128");
-    assert_eq!(nn::i8_gemm_pipeline_name(96, nn::I8BLayout::TransposedNK, 64).unwrap(), "i8_w8a8_g64_128_nt");
-    assert_eq!(nn::i8_gemm_pipeline_name(64, nn::I8BLayout::RowMajorKN, 256).unwrap(), "i8_w8a8_g256_64");
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(1, nn::I8BLayout::RowMajorKN, 0).unwrap(),
+        "i8_gemv_dequant"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(1, nn::I8BLayout::TransposedNK, 128).unwrap(),
+        "i8_gemv_dequant"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(2, nn::I8BLayout::RowMajorKN, 0).unwrap(),
+        "i8_w8a8_64"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(64, nn::I8BLayout::TransposedNK, 0).unwrap(),
+        "i8_w8a8_64_nt"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(65, nn::I8BLayout::RowMajorKN, 0).unwrap(),
+        "i8_w8a8_128"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(96, nn::I8BLayout::TransposedNK, 64).unwrap(),
+        "i8_w8a8_g64_128_nt"
+    );
+    assert_eq!(
+        nn::i8_gemm_pipeline_name(64, nn::I8BLayout::RowMajorKN, 256).unwrap(),
+        "i8_w8a8_g256_64"
+    );
     let err = nn::i8_gemm_pipeline_name(0, nn::I8BLayout::RowMajorKN, 0).unwrap_err();
     assert!(err.contains("non-zero"), "{err}");
     let err = nn::i8_gemm_pipeline_name(4, nn::I8BLayout::RowMajorKN, 32).unwrap_err();
@@ -419,10 +442,7 @@ fn pipeline_names_select_gemv_small_tile_and_wide_tile() {
 #[test]
 fn per_row_quantize_matches_the_round_ties_even_oracle() {
     with_gpu(|rt| {
-        let rows = [
-            vec![0.0f32, 0.0, 0.0, 0.0],
-            vec![127.0, -63.5, 63.5, 0.0],
-        ];
+        let rows = [vec![0.0f32, 0.0, 0.0, 0.0], vec![127.0, -63.5, 63.5, 0.0]];
         let cols = 4u32;
         let flat: Vec<f32> = rows.iter().flatten().copied().collect();
         let x = f32_buf(rt, &flat);
@@ -503,8 +523,13 @@ fn scalar_f32_matches_legacy_dequant_and_the_integer_oracle() {
 #[test]
 fn per_row_scale_transposed_b_bias_and_per_column_match_the_integer_oracle() {
     with_gpu(|rt| {
-        for &(m, n, k, nt) in &[(1u32, 5, 9, false), (7, 5, 13, true), (64, 6, 11, false), (65, 6, 11, true), (96, 7, 17, true)]
-        {
+        for &(m, n, k, nt) in &[
+            (1u32, 5, 9, false),
+            (7, 5, 13, true),
+            (64, 6, 11, false),
+            (65, 6, 11, true),
+            (96, 7, 17, true),
+        ] {
             let a = seq_i8((m * k) as usize, 3);
             let b = seq_i8((n * k) as usize, 9);
             let rows: Vec<f32> = (0..m).map(|i| [0.5, 1.0, 2.0, 4.0][i as usize % 4]).collect();
@@ -513,7 +538,11 @@ fn per_row_scale_transposed_b_bias_and_per_column_match_the_integer_oracle() {
             let row_buf = f32_buf(rt, &rows);
             let col_buf = f32_buf(rt, &cols);
             let bias = f32_buf(rt, &bias_v);
-            let layout = if nt { nn::I8BLayout::TransposedNK } else { nn::I8BLayout::RowMajorKN };
+            let layout = if nt {
+                nn::I8BLayout::TransposedNK
+            } else {
+                nn::I8BLayout::RowMajorKN
+            };
             let b_matrix = if nt {
                 b.clone()
             } else {
@@ -590,7 +619,11 @@ fn group_scales_flush_in_ascending_group_order() {
                 kn
             };
             let sb = f32_buf(rt, &scales);
-            let layout = if nt { nn::I8BLayout::TransposedNK } else { nn::I8BLayout::RowMajorKN };
+            let layout = if nt {
+                nn::I8BLayout::TransposedNK
+            } else {
+                nn::I8BLayout::RowMajorKN
+            };
             let got = run_case(
                 rt,
                 Case {
@@ -623,7 +656,11 @@ fn group_scales_flush_in_ascending_group_order() {
             if groups > 1 {
                 let summed_scales: f32 = scales.iter().step_by(n as usize).take(groups).sum();
                 let collapsed = (k as f32) * summed_scales;
-                assert_ne!(want[0].to_bits(), collapsed.to_bits(), "group flush collapsed into one multiply");
+                assert_ne!(
+                    want[0].to_bits(),
+                    collapsed.to_bits(),
+                    "group flush collapsed into one multiply"
+                );
             }
         }
     });
@@ -637,7 +674,18 @@ fn f16_and_bf16_stores_match_the_gpu_cast() {
         let b = vec![1i8; (k * n) as usize];
         let bias_v = vec![0.5f32; n as usize];
         let bias = f32_buf(rt, &bias_v);
-        let want = oracle_full(&a, &b, m as usize, n as usize, k as usize, false, None, 1.0, None, Some(&bias_v));
+        let want = oracle_full(
+            &a,
+            &b,
+            m as usize,
+            n as usize,
+            k as usize,
+            false,
+            None,
+            1.0,
+            None,
+            Some(&bias_v),
+        );
         for out in [nn::I8Out::F16, nn::I8Out::Bf16] {
             let got = run_case(
                 rt,
@@ -680,7 +728,11 @@ fn m1_gemv_and_small_m_tile_match_the_integer_oracle() {
             ];
             for (m, n, k, nt, name) in specs {
                 let before = tessl::runtime::traced_kernel_count(name);
-                let a = if k > 64 { vec![1i8; (m * k) as usize] } else { seq_i8((m * k) as usize, 1) };
+                let a = if k > 64 {
+                    vec![1i8; (m * k) as usize]
+                } else {
+                    seq_i8((m * k) as usize, 1)
+                };
                 let b = if k > 64 {
                     let mut kn = vec![1i8; (k * n) as usize];
                     if nt {
@@ -707,7 +759,11 @@ fn m1_gemv_and_small_m_tile_match_the_integer_oracle() {
                         m,
                         n,
                         k,
-                        layout: if nt { nn::I8BLayout::TransposedNK } else { nn::I8BLayout::RowMajorKN },
+                        layout: if nt {
+                            nn::I8BLayout::TransposedNK
+                        } else {
+                            nn::I8BLayout::RowMajorKN
+                        },
                         a_scale: nn::I8AScale::Scalar(1.0),
                         b_scale: nn::I8BScale::None,
                         bias: None,
@@ -726,7 +782,10 @@ fn m1_gemv_and_small_m_tile_match_the_integer_oracle() {
         return;
     };
     assert!(out.contains("TRACE i8_gemv_dequant delta=1"), "{out}");
-    assert!(out.contains("TRACE i8_w8a8_64 delta=1") || out.contains("TRACE i8_w8a8_64 delta=2"), "{out}");
+    assert!(
+        out.contains("TRACE i8_w8a8_64 delta=1") || out.contains("TRACE i8_w8a8_64 delta=2"),
+        "{out}"
+    );
     assert!(out.contains("TRACE i8_w8a8_128 delta=1"), "{out}");
     assert!(out.contains("TRACE i8_w8a8_64_nt delta=1"), "{out}");
 }
@@ -764,7 +823,9 @@ fn two_runs_are_bit_identical() {
             first.push(got.read_f32());
         }
         assert_exact(&first[0], &first[1], "rerun");
-        let want = oracle_group(&a, &b, m as usize, n as usize, k as usize, 64, false, None, 0.5, &scales, None);
+        let want = oracle_group(
+            &a, &b, m as usize, n as usize, k as usize, 64, false, None, 0.5, &scales, None,
+        );
         assert_exact(&first[0], &want, "group rerun vs oracle");
     });
 }
@@ -825,7 +886,10 @@ fn non_finite_scale_is_refused_without_a_dispatch() {
                 n: 2,
                 k: 32,
                 a_scale: nn::I8AScale::Scalar(1.0),
-                b_scale: nn::I8BScale::PerGroup { scales: &scales, group: 48 },
+                b_scale: nn::I8BScale::PerGroup {
+                    scales: &scales,
+                    group: 48,
+                },
                 bias: None,
                 b_layout: nn::I8BLayout::RowMajorKN,
                 out: nn::I8Out::F32,

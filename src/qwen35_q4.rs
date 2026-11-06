@@ -707,10 +707,7 @@ mod tests {
             .expect("spawn child test");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert!(
-            out.status.success(),
-            "child {test_name} failed:\n{stdout}\n{stderr}"
-        );
+        assert!(out.status.success(), "child {test_name} failed:\n{stdout}\n{stderr}");
         assert!(
             stdout.contains("1 passed"),
             "child ran no test (filter out of sync with {test_name}?):\n{stdout}"
@@ -779,7 +776,11 @@ mod tests {
         }
         for (i, v) in sb.iter_mut().enumerate() {
             let u = ((i * 17) % 64) as f32 / 64.0;
-            *v = round_bf16(if i % 2 == 0 { 0.03125 + 0.0625 * u } else { -0.25 + 0.5 * u });
+            *v = round_bf16(if i % 2 == 0 {
+                0.03125 + 0.0625 * u
+            } else {
+                -0.25 + 0.5 * u
+            });
         }
         let mut packed = vec![0u8; N * K / 2];
         for (i, &q) in nibbles.iter().enumerate() {
@@ -796,12 +797,7 @@ mod tests {
         let w = Q4Weight::alloc(rt, N, K).unwrap();
         w.packed().write_bytes(&packed);
         w.scales_biases().write_bytes(&le_bytes(&sb_bits));
-        Bank {
-            w,
-            nibbles,
-            sb,
-            packed,
-        }
+        Bank { w, nibbles, sb, packed }
     }
 
     fn activation(rt: &Arc<GpuRuntime>, m: usize, seed: u32) -> (crate::Tensor, Vec<f32>) {
@@ -823,7 +819,12 @@ mod tests {
             let allow = bound * mag[i] + 1e-6;
             let frac = if allow == 0.0 { err } else { err / allow };
             worst = worst.max(frac);
-            assert!(err <= allow, "{what} [{i}]: |{err}| > {allow} (got {} want {})", got[i], want[i]);
+            assert!(
+                err <= allow,
+                "{what} [{i}]: |{err}| > {allow} (got {} want {})",
+                got[i],
+                want[i]
+            );
         }
         println!("{what}: worst fraction {worst:.4}");
     }
@@ -873,7 +874,10 @@ mod tests {
             let err = bank.w.matmul(&rt, &x, &y, Some(&y.buffer)).unwrap_err();
             assert!(err.contains("no fused residual add"), "{err}");
             assert_eq!(counts(), before, "M={m} residual refusal encoded a kernel");
-            assert!(y.read_f32().unwrap().iter().all(|v| *v == SENTINEL), "M={m} residual refusal wrote y");
+            assert!(
+                y.read_f32().unwrap().iter().all(|v| *v == SENTINEL),
+                "M={m} residual refusal wrote y"
+            );
 
             y.write_f32(&vec![SENTINEL; m * N]).unwrap();
             bank.w.matmul(&rt, &x, &y, None).unwrap();
@@ -889,8 +893,14 @@ mod tests {
             let resid = rt.alloc_buffer(m * N * 4).unwrap();
             let resid0 = vec![0.25f32; m * N];
             resid.write_f32(&resid0);
-            qwen35::residual_add(&rt, Cols::dense(&y.buffer, N as u32), Cols::dense(&resid, N as u32), m as u32, N as u32)
-                .unwrap();
+            qwen35::residual_add(
+                &rt,
+                Cols::dense(&y.buffer, N as u32),
+                Cols::dense(&resid, N as u32),
+                m as u32,
+                N as u32,
+            )
+            .unwrap();
             rt.synchronize().unwrap();
             let summed = resid.read_f32();
             for i in 0..m * N {
@@ -927,7 +937,11 @@ mod tests {
             assert!(err <= allow, "M=1 fused residual [{i}]: {err} > {allow}");
         }
         let after = counts();
-        assert_eq!(after.1, before.1 + 1, "M=1 residual did not request gemv_q4_mlx_simd_add");
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "M=1 residual did not request gemv_q4_mlx_simd_add"
+        );
         assert_eq!(after.3, before.3, "M=1 residual requested the cooperative GEMM");
 
         let packed_after = bank.w.packed().contents_u8()[..bank.packed.len()].to_vec();

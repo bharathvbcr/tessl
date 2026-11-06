@@ -621,7 +621,9 @@ fn time_calls(
         rt.synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         if !ms.is_finite() || ms <= 0.0 {
-            return Err(format!("cooperative quant GEMM sample {ms} is not a positive finite time"));
+            return Err(format!(
+                "cooperative quant GEMM sample {ms} is not a positive finite time"
+            ));
         }
         samples.push(ms);
     }
@@ -734,16 +736,7 @@ fn quant_coop_grid() -> Result<(), String> {
         eprintln!("timing {Q8_KERNEL} M={m}");
         let samples = time_calls(&rt, warmup, repeat, || {
             gemm_q8_tensorops(
-                &rt,
-                &q8_packed,
-                &q8_scale,
-                &q8_zero,
-                &q8_x,
-                &y,
-                N as u32,
-                K as u32,
-                Q8_GROUP,
-                m as u32,
+                &rt, &q8_packed, &q8_scale, &q8_zero, &q8_x, &y, N as u32, K as u32, Q8_GROUP, m as u32,
             )
         })?;
         rows.push(quant_row(Q8_KERNEL, m, Q8_GROUP, repeat, &samples)?);

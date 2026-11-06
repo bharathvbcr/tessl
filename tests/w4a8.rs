@@ -135,8 +135,20 @@ fn both_arms_match_one_integer_oracle() {
             let a = seq_i8((m * k) as usize, 2, 16);
             let b = seq_i8((n * k) as usize, 5, 16);
             let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, 0, None, None);
-            let unpacked = run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::UnpackZp8)
-                .expect("unpack");
+            let unpacked = run(
+                rt,
+                &a,
+                &b,
+                m,
+                n,
+                k,
+                1.0,
+                I8BScale::None,
+                None,
+                I8Out::F32,
+                W4Arm::UnpackZp8,
+            )
+            .expect("unpack");
             assert_exact(&unpacked.read_f32(), &want, &format!("unpack {m}x{n}x{k}"));
             match run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b) {
                 Ok(got) => assert_exact(&got.read_f32(), &want, &format!("int4b {m}x{n}x{k}")),
@@ -163,7 +175,17 @@ fn group_scales_match_the_ordered_flush() {
                 }
             }
             let sb = buf(rt, &scales);
-            let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, group as usize, Some(&scales), None);
+            let want = oracle(
+                &a,
+                &b,
+                m as usize,
+                n as usize,
+                k as usize,
+                1.0,
+                group as usize,
+                Some(&scales),
+                None,
+            );
             let scale = I8BScale::PerGroup { scales: &sb, group };
             let unpacked = run(rt, &a, &b, m, n, k, 1.0, scale, None, I8Out::F32, W4Arm::UnpackZp8).expect("unpack");
             assert_exact(&unpacked.read_f32(), &want, &format!("unpack group {group}"));
@@ -190,8 +212,20 @@ fn f16_store_bias_and_two_runs_are_stable() {
         let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, 0, None, Some(&bias_v));
         let mut bits = Vec::new();
         for _ in 0..2 {
-            let got = run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, Some(&bias), I8Out::F16, W4Arm::UnpackZp8)
-                .expect("f16");
+            let got = run(
+                rt,
+                &a,
+                &b,
+                m,
+                n,
+                k,
+                1.0,
+                I8BScale::None,
+                Some(&bias),
+                I8Out::F16,
+                W4Arm::UnpackZp8,
+            )
+            .expect("f16");
             bits.push(got.contents_u16()[..(m * n) as usize].to_vec());
         }
         assert_eq!(bits[0], bits[1]);
@@ -208,11 +242,25 @@ fn bad_k_and_per_column_scales_are_refused_before_dispatch() {
         let a = vec![1i8; (m * k) as usize];
         let b = vec![1i8; (n * k) as usize];
         let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, 0, None, None);
-        let unpacked = run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::UnpackZp8).expect("k=48");
+        let unpacked = run(
+            rt,
+            &a,
+            &b,
+            m,
+            n,
+            k,
+            1.0,
+            I8BScale::None,
+            None,
+            I8Out::F32,
+            W4Arm::UnpackZp8,
+        )
+        .expect("k=48");
         assert_exact(&unpacked.read_f32(), &want, "unpack k=48");
 
         rt.take_dispatch_count();
-        let err = run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b).expect_err("k=48 int4b");
+        let err =
+            run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b).expect_err("k=48 int4b");
         assert!(err.contains("32"), "{err}");
         assert!(!err.contains("unsupported"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
@@ -221,13 +269,37 @@ fn bad_k_and_per_column_scales_are_refused_before_dispatch() {
         let b32 = vec![1i8; (n * 32) as usize];
         let col = buf(rt, &[1.0, 1.0, 1.0]);
         rt.take_dispatch_count();
-        let err = run(rt, &a32, &b32, m, n, 32, 1.0, I8BScale::PerColumn(&col), None, I8Out::F32, W4Arm::UnpackZp8)
-            .expect_err("per-column");
+        let err = run(
+            rt,
+            &a32,
+            &b32,
+            m,
+            n,
+            32,
+            1.0,
+            I8BScale::PerColumn(&col),
+            None,
+            I8Out::F32,
+            W4Arm::UnpackZp8,
+        )
+        .expect_err("per-column");
         assert!(err.contains("per-column"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
 
-        let err = run(rt, &a32, &b32, m, n, 32, f32::INFINITY, I8BScale::None, None, I8Out::F32, W4Arm::UnpackZp8)
-            .expect_err("non-finite");
+        let err = run(
+            rt,
+            &a32,
+            &b32,
+            m,
+            n,
+            32,
+            f32::INFINITY,
+            I8BScale::None,
+            None,
+            I8Out::F32,
+            W4Arm::UnpackZp8,
+        )
+        .expect_err("non-finite");
         assert!(err.contains("finite"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
 

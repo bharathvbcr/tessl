@@ -126,8 +126,12 @@ fn main() {
     // a compile). It lives in a subdirectory precisely so the directory glob
     // below cannot pick it up by accident.
     let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
-    let mut tensorops_sources: Vec<PathBuf> =
-        vec![kernels_dir.join("matmul_tensorops.metal"), kernels_dir.join("conv2d_tensorops.metal")];
+    let mut tensorops_sources: Vec<PathBuf> = vec![
+        kernels_dir.join("matmul_tensorops.metal"),
+        kernels_dir.join("conv2d_tensorops.metal"),
+        kernels_dir.join("i8_w8a8.metal"),
+        kernels_dir.join("w4a8_tensorops.metal"),
+    ];
     if want_tune {
         let mut tune = metal_sources(&kernels_dir.join("tune"));
         if tune.is_empty() {
@@ -145,7 +149,12 @@ fn main() {
     }
 
     // All other .metal sources (simdgroup GEMM + util kernels).
-    let skip: &[&str] = &["matmul_tensorops.metal", "conv2d_tensorops.metal"];
+    let skip: &[&str] = &[
+        "matmul_tensorops.metal",
+        "conv2d_tensorops.metal",
+        "i8_w8a8.metal",
+        "w4a8_tensorops.metal",
+    ];
     let others: Vec<PathBuf> = metal_sources(&kernels_dir)
         .into_iter()
         .filter(|p| !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s)))
@@ -273,7 +282,14 @@ fn main() {
 /// the `2e-6` absolute bound by one ulp (`6.104e-5` at element 20 of step 1).
 /// The measured step time is in `bench/results/fp_contract.txt`.
 fn disable_fp_contract(src: &Path) -> bool {
-    const OFF: &[&str] = &["qwen35_adamw.metal"];
+    const OFF: &[&str] = &[
+        "qwen35_adamw.metal",
+        "i8_w8a8.metal",
+        "w4a8_tensorops.metal",
+        "gqa_decode.metal",
+        // Numerics::Exact linear products: acc + (a * b), two roundings.
+        "matmul_fixed_order.metal",
+    ];
     src.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| OFF.contains(&name))

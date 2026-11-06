@@ -98,7 +98,7 @@ use crate::config_json::{self, field, float};
 use crate::cross_entropy::gather_rows_f32;
 use crate::gemm::{gemm, gemm_nt_f32, use_relaxed_f32, GemmBackend};
 use crate::loader::Loader;
-use crate::nn::{AttnDims, DecodeScratch, GEMM_Q4_MLX_MAX_M};
+use crate::nn::{AttnDims, DecodeScratch};
 use crate::qwen35::{
     self, AttnProjLayout, AttnShape, AttnTargets, Cols, GdnDims, GdnParams, GdnProjLayout, GdnScanSlice,
     GdnSimdScalars, GdnSimdVariant, GdnWorkspace, LmHead, OutCols, SharedPrefix, StateIn,
@@ -1663,12 +1663,14 @@ impl Qwen35Model {
         };
         let w_out = match w_out {
             Weight::Dense(t) => t,
-            // The Q4 kernels add the residual in the same dispatch for up to
-            // eight rows (the output is the residual itself, the one writable
-            // alias they allow); more rows go through the TensorOps GEMM into
-            // `proj_out` and the same add the F32 forward uses.
-            Weight::Q4(q) if a.t <= GEMM_Q4_MLX_MAX_M => {
-                return q.matmul(&self.rt, y, &a.resid, Some(&a.resid.buffer));
+            // One row fuses the residual inside the GEMV (the output is the
+            // residual itself). More than one row runs the TensorOps GEMM,
+            // which has no fused residual, into `proj_out`; the add is the
+            // same one the F32 forward uses, so it is not dropped. Zero rows
+            // return before that add: the matmul is a no-op.
+            Weight::Q4(q) if a.t <= 1 => {
+                let fused = (a.t == 1).then_some(&a.resid.buffer);
+                return q.matmul(&self.rt, y, &a.resid, fused);
             }
             Weight::Q4(q) => {
                 q.matmul(&self.rt, y, &a.proj_out, None)?;

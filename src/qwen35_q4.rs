@@ -48,7 +48,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::config_json;
-use crate::nn::{self, Q4MlxBank, Q4MlxLayout, QuantShape, GEMM_Q4_MLX_MAX_M};
+use crate::nn::{self, Q4MlxBank, Q4MlxLayout, QuantShape};
 use crate::runtime::GpuRuntime;
 use crate::safetensors::{Dtype, TensorInfo};
 use crate::tensor::{DType, GpuBuffer, Tensor};
@@ -97,7 +97,7 @@ pub enum MlxQ4Error {
         found: Vec<usize>,
         want: Vec<usize>,
     },
-    /// The device has no TensorOps, which every prefill of more than 8 rows
+    /// The device has no TensorOps, which every prefill of more than one row
     /// needs ([`crate::nn::gemm_q4_mlx_tensorops`]); refused at load rather
     /// than mid-forward.
     NoTensorOps,
@@ -158,7 +158,7 @@ impl fmt::Display for MlxQ4Error {
             ),
             Self::NoTensorOps => write!(
                 f,
-                "this device has no TensorOps, which the Q4 prefill GEMM (more than 8 rows) needs; an MLX 4-bit \
+                "this device has no TensorOps, which the Q4 prefill GEMM (more than one row) needs; an MLX 4-bit \
                  model is refused at load rather than failing mid-forward"
             ),
             Self::Empty { tensor, rows, cols } => {
@@ -509,12 +509,14 @@ impl Q4Weight {
         }
     }
 
-    /// `y[m, rows] = x[m, cols] @ Wᵀ` (+ `resid`, elementwise, for `m` up to
-    /// [`GEMM_Q4_MLX_MAX_M`]). `x` is bf16, `y` f32, both whole tensors. One
-    /// row runs the decode GEMV, two to eight rows the small-batch kernel (one
-    /// read of the weights for all of them), and more the TensorOps Q4 GEMM
-    /// ([`nn::gemm_q4_mlx_tensorops`]; no fused residual, so `resid` there is
-    /// refused: the caller adds it). All three read the same bank.
+    /// `y[m, rows] = x[m, cols] @ Wᵀ`. `x` is bf16, `y` f32, both whole tensors.
+    /// One row runs the decode GEMV ([`nn::gemv_q4_mlx_simd`]), and fuses
+    /// `resid` when it is set. More than one row runs
+    /// [`nn::gemm_q4_mlx_tensorops`], which dequantizes inside the matmul and
+    /// has no fused residual: `resid` there is an error, and the caller adds
+    /// it afterwards. Both read the same bank. A group, device, or shape the
+    /// cooperative kernel refuses is that kernel's error, returned before it
+    /// encodes.
     pub(crate) fn matmul(
         &self,
         rt: &Arc<GpuRuntime>,
@@ -550,9 +552,6 @@ impl Q4Weight {
         match m {
             0 => Ok(()),
             1 => nn::gemv_q4_mlx_simd(rt, bank, &x.buffer, &y.buffer, shape, Q4MlxLayout::RowMajor, resid),
-            2..=GEMM_Q4_MLX_MAX_M => {
-                nn::gemm_q4_mlx(rt, bank, &x.buffer, &y.buffer, shape, m, Q4MlxLayout::RowMajor, resid)
-            }
             _ if resid.is_some() => Err(format!(
                 "{WHAT}: {m} rows run on the TensorOps GEMM, which has no fused residual add"
             )),
@@ -677,4 +676,263 @@ pub struct MlxQ4LoadReport {
 /// The process's peak footprint now; refuses rather than report 0.
 pub(crate) fn peak_footprint_now() -> Result<u64, String> {
     footprint::peak_footprint()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Q4Weight;
+    use crate::qwen35::{self, Cols};
+    use crate::runtime::{kernel_trace_enabled, traced_kernel_count};
+    use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits};
+    use crate::GpuRuntime;
+    use std::sync::Arc;
+
+    const N: usize = 32;
+    const K: usize = 256;
+    const GROUP: usize = 64;
+    const SENTINEL: f32 = -7.7e28;
+
+    fn in_traced_child(test_name: &str, body: impl FnOnce()) -> Option<String> {
+        const CHILD: &str = "TESSL_TRACED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            body();
+            return None;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1", "--nocapture", test_name])
+            .env(CHILD, "1")
+            .env("TESSL_KERNEL_TRACE", "1")
+            .output()
+            .expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "child {test_name} failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "child ran no test (filter out of sync with {test_name}?):\n{stdout}"
+        );
+        Some(stdout)
+    }
+
+    fn round_bf16(x: f32) -> f32 {
+        bf16_bits_to_f32(f32_to_bf16_bits(x))
+    }
+
+    fn gamma(terms: usize) -> f64 {
+        let tu = terms as f64 * 2f64.powi(-24);
+        tu / (1.0 - tu)
+    }
+
+    /// f64 product of the loaded operands: `s * q * x + b * xsum` per group.
+    fn reference(x: &[f32], nibbles: &[u8], sb: &[f32], m: usize) -> (Vec<f64>, Vec<f64>) {
+        let groups = K / GROUP;
+        let mut want = vec![0.0f64; m * N];
+        let mut mag = vec![0.0f64; m * N];
+        for mi in 0..m {
+            for ni in 0..N {
+                let (mut acc, mut s_mag) = (0.0, 0.0);
+                for g in 0..groups {
+                    let (s, b) = (sb[(ni * groups + g) * 2] as f64, sb[(ni * groups + g) * 2 + 1] as f64);
+                    let (mut qx, mut aqx, mut xsum, mut ax) = (0.0, 0.0, 0.0, 0.0);
+                    for j in 0..GROUP {
+                        let xv = x[mi * K + g * GROUP + j] as f64;
+                        let q = nibbles[ni * K + g * GROUP + j] as f64;
+                        qx += q * xv;
+                        aqx += q * xv.abs();
+                        xsum += xv;
+                        ax += xv.abs();
+                    }
+                    acc += s * qx + b * xsum;
+                    s_mag += s.abs() * aqx + b.abs() * ax;
+                }
+                want[mi * N + ni] = acc;
+                mag[mi * N + ni] = s_mag;
+            }
+        }
+        (want, mag)
+    }
+
+    fn le_bytes(bits: &[u16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bits.len() * 2);
+        for b in bits {
+            out.extend_from_slice(&b.to_le_bytes());
+        }
+        out
+    }
+
+    struct Bank {
+        w: Q4Weight,
+        nibbles: Vec<u8>,
+        sb: Vec<f32>,
+        packed: Vec<u8>,
+    }
+
+    fn bank(rt: &Arc<GpuRuntime>) -> Bank {
+        let mut nibbles = vec![0u8; N * K];
+        let mut sb = vec![0f32; N * (K / GROUP) * 2];
+        for (i, q) in nibbles.iter_mut().enumerate() {
+            *q = ((i * 3) % 16) as u8;
+        }
+        for (i, v) in sb.iter_mut().enumerate() {
+            let u = ((i * 17) % 64) as f32 / 64.0;
+            *v = round_bf16(if i % 2 == 0 { 0.03125 + 0.0625 * u } else { -0.25 + 0.5 * u });
+        }
+        let mut packed = vec![0u8; N * K / 2];
+        for (i, &q) in nibbles.iter().enumerate() {
+            if i % 2 == 0 {
+                packed[i / 2] |= q;
+            } else {
+                packed[i / 2] |= q << 4;
+            }
+        }
+        let mut sb_bits = Vec::with_capacity(sb.len());
+        for &v in &sb {
+            sb_bits.push(f32_to_bf16_bits(v));
+        }
+        let w = Q4Weight::alloc(rt, N, K).unwrap();
+        w.packed().write_bytes(&packed);
+        w.scales_biases().write_bytes(&le_bytes(&sb_bits));
+        Bank {
+            w,
+            nibbles,
+            sb,
+            packed,
+        }
+    }
+
+    fn activation(rt: &Arc<GpuRuntime>, m: usize, seed: u32) -> (crate::Tensor, Vec<f32>) {
+        let x: Vec<f32> = (0..m * K)
+            .map(|i| round_bf16((((i as u32).wrapping_mul(seed)) % 128) as f32 / 64.0 - 1.0))
+            .collect();
+        let bits: Vec<u16> = x.iter().copied().map(f32_to_bf16_bits).collect();
+        let t = rt.alloc_tensor_bf16(&[m, K]).unwrap();
+        t.buffer.write_bytes(&le_bytes(&bits));
+        (t, x)
+    }
+
+    fn assert_close(got: &[f32], want: &[f64], mag: &[f64], what: &str) {
+        let bound = gamma(K + 2 * (K / GROUP) + GROUP);
+        let mut worst = 0.0f64;
+        for i in 0..got.len() {
+            assert!(got[i].is_finite() && got[i] != SENTINEL, "{what}: unwritten {i}");
+            let err = (got[i] as f64 - want[i]).abs();
+            let allow = bound * mag[i] + 1e-6;
+            let frac = if allow == 0.0 { err } else { err / allow };
+            worst = worst.max(frac);
+            assert!(err <= allow, "{what} [{i}]: |{err}| > {allow} (got {} want {})", got[i], want[i]);
+        }
+        println!("{what}: worst fraction {worst:.4}");
+    }
+
+    fn counts() -> (u64, u64, u64, u64) {
+        (
+            traced_kernel_count("gemv_q4_mlx_simd"),
+            traced_kernel_count("gemv_q4_mlx_simd_add"),
+            traced_kernel_count("gemm_q4_mlx_simd"),
+            traced_kernel_count("gemm_q4_mlx_tensorops_g64"),
+        )
+    }
+
+    /// Shipped `Q4Weight::matmul`: M=1 is the GEMV, M>1 (including 2..=8) is
+    /// the cooperative TensorOps matmul, and a fused residual for M>1 is the
+    /// existing error. The model adds that residual afterwards.
+    #[test]
+    fn q4_weight_matmul_routes_cooperative() {
+        const NAME: &str = "qwen35_q4::tests::q4_weight_matmul_routes_cooperative";
+        let Some(out) = in_traced_child(NAME, run) else {
+            return;
+        };
+        println!("{out}");
+    }
+
+    fn run() {
+        assert!(kernel_trace_enabled(), "TESSL_KERNEL_TRACE did not arm the trace");
+        let rt = GpuRuntime::new().expect("Metal device");
+        let bank = bank(&rt);
+        let packed_before = bank.w.packed().contents_u8()[..bank.packed.len()].to_vec();
+
+        // Refused shape: no encode.
+        let (x_bad, _) = activation(&rt, 2, 3);
+        let y_bad = rt.alloc_tensor_f32(&[2, N + 1]).unwrap();
+        let before = counts();
+        let err = bank.w.matmul(&rt, &x_bad, &y_bad, None).unwrap_err();
+        assert!(err.contains("do not fit"), "{err}");
+        assert_eq!(counts(), before, "a refused shape encoded a kernel");
+
+        // M>1 fused residual: the explicit error, and the add is not dropped
+        // when the caller does what `project_residual` does.
+        for m in [2usize, 8, 16] {
+            let (x, xv) = activation(&rt, m, 9 + m as u32);
+            let y = rt.alloc_tensor_f32(&[m, N]).unwrap();
+            y.write_f32(&vec![SENTINEL; m * N]).unwrap();
+            let before = counts();
+            let err = bank.w.matmul(&rt, &x, &y, Some(&y.buffer)).unwrap_err();
+            assert!(err.contains("no fused residual add"), "{err}");
+            assert_eq!(counts(), before, "M={m} residual refusal encoded a kernel");
+            assert!(y.read_f32().unwrap().iter().all(|v| *v == SENTINEL), "M={m} residual refusal wrote y");
+
+            y.write_f32(&vec![SENTINEL; m * N]).unwrap();
+            bank.w.matmul(&rt, &x, &y, None).unwrap();
+            rt.synchronize().unwrap();
+            let (want, mag) = reference(&xv, &bank.nibbles, &bank.sb, m);
+            let got = y.read_f32().unwrap();
+            assert_close(&got, &want, &mag, &format!("Q4Weight M={m}"));
+            let after = counts();
+            assert_eq!(after.3, before.3 + 1, "M={m} did not request gemm_q4_mlx_tensorops_g64");
+            assert_eq!(after.0, before.0, "M={m} requested the GEMV");
+            assert_eq!(after.2, before.2, "M={m} requested gemm_q4_mlx_simd");
+
+            let resid = rt.alloc_buffer(m * N * 4).unwrap();
+            let resid0 = vec![0.25f32; m * N];
+            resid.write_f32(&resid0);
+            qwen35::residual_add(&rt, Cols::dense(&y.buffer, N as u32), Cols::dense(&resid, N as u32), m as u32, N as u32)
+                .unwrap();
+            rt.synchronize().unwrap();
+            let summed = resid.read_f32();
+            for i in 0..m * N {
+                let expect = want[i] + resid0[i] as f64;
+                let err = (summed[i] as f64 - expect).abs();
+                let allow = gamma(K + 2 * (K / GROUP) + GROUP) * mag[i] + 1e-5;
+                assert!(err <= allow, "residual add M={m} [{i}]: {err} > {allow}");
+            }
+        }
+
+        // M=1 stays on the GEMV, with and without the fused residual.
+        let (x, xv) = activation(&rt, 1, 11);
+        let y = rt.alloc_tensor_f32(&[1, N]).unwrap();
+        y.write_f32(&vec![SENTINEL; N]).unwrap();
+        let before = counts();
+        bank.w.matmul(&rt, &x, &y, None).unwrap();
+        rt.synchronize().unwrap();
+        let (want, mag) = reference(&xv, &bank.nibbles, &bank.sb, 1);
+        assert_close(&y.read_f32().unwrap(), &want, &mag, "Q4Weight M=1");
+        let after = counts();
+        assert_eq!(after.0, before.0 + 1, "M=1 did not request gemv_q4_mlx_simd");
+        assert_eq!(after.3, before.3, "M=1 requested the cooperative GEMM");
+
+        let resid0 = vec![0.25f32; N];
+        y.write_f32(&resid0).unwrap();
+        let before = counts();
+        bank.w.matmul(&rt, &x, &y, Some(&y.buffer)).unwrap();
+        rt.synchronize().unwrap();
+        let got = y.read_f32().unwrap();
+        for i in 0..N {
+            let expect = want[i] + resid0[i] as f64;
+            let err = (got[i] as f64 - expect).abs();
+            let allow = gamma(K + 2 * (K / GROUP) + GROUP) * mag[i] + 1e-5;
+            assert!(err <= allow, "M=1 fused residual [{i}]: {err} > {allow}");
+        }
+        let after = counts();
+        assert_eq!(after.1, before.1 + 1, "M=1 residual did not request gemv_q4_mlx_simd_add");
+        assert_eq!(after.3, before.3, "M=1 residual requested the cooperative GEMM");
+
+        let packed_after = bank.w.packed().contents_u8()[..bank.packed.len()].to_vec();
+        assert_eq!(packed_before, packed_after, "host dequant rewrote the packed weights");
+        assert_eq!(packed_before, bank.packed);
+        println!("q4 weight router: M=1 GEMV, M=2/8/16 cooperative, residual kept");
+    }
 }

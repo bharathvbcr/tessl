@@ -747,13 +747,13 @@ dense one, with their rows concatenated in one bank instead of their columns in 
 GEMM operand. The forward is `Precision::Bf16`'s otherwise, so nothing in the layer
 order is written twice: `Weight` (`qwen35_q4.rs`) is either a dense tensor or a Q4
 bank, and the model's one `project` / `project_residual` / head / embedding seam
-dispatches on it. Decode (`Decode::step`, one row) runs `nn::gemv_q4_mlx_simd`;
-prefill runs `nn::gemm_q4_mlx` up to 8 rows and `nn::gemm_q4_mlx_tensorops`
-for $M > 8$ (`Q4Weight::matmul` and `project_residual`; $M == 1$ decode stays
-on `gemv_q4_mlx_simd`). The residual add is fused into the GEMV / small-M GEMM
-and is a separate `residual_add` after the TensorOps one (`QUANT_PREFILL_GEMM_WIRED`
+dispatches on it. Decode (`Decode::step`, one row) runs `nn::gemv_q4_mlx_simd`.
+Prefill of more than one row runs `nn::gemm_q4_mlx_tensorops`
+(`Q4Weight::matmul` and `project_residual`). $M == 1$ stays on
+`gemv_q4_mlx_simd`. A fused residual for $M > 1$ is refused inside `matmul`
+and applied as a separate `residual_add`. `QUANT_PREFILL_GEMM_WIRED`
 in `src/mtl_tensor.rs` remains `false` because the host `MTLTensor` descriptor path
-is unwired and the kernel is not yet timed). The embedding gathers through
+is unwired. The kernel was timed on `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed. The embedding gathers through
 `nn::embed_lookup_q4_mlx`, the tied head is the embedding's bank, and an untied
 head has its own.
 
@@ -783,7 +783,7 @@ tower under either key prefix (the 239 MB `Qwen3.8-27B-MTP-4bit` drafter is one)
 checkpoint; a matrix with no rows or no columns; a NaN or infinity in any scale, bias or norm
 (and in the GDN conv, `A_log`, `dt_bias` and gated norm), by tensor name and index, checked
 as the values are copied; and a device without TensorOps, refused at load because every
-prefill of more than 8 rows needs the TensorOps GEMM (`MlxQ4Error::NoTensorOps`), not
+prefill of more than one row needs the TensorOps GEMM (`MlxQ4Error::NoTensorOps`), not
 mid-forward. Every part's headers are checked against the config's shape **before** its bank
 is allocated, so a config that is wrong for the file is refused by name with the device
 untouched; the dense loader had the same allocate-then-check order for its tables and packed
@@ -882,7 +882,7 @@ far under 0.99, and tessl reproduces mlx-lm's own Q4 forward on the same weights
 EAR (asserted within 5e-3), so the loss is the 4-bit group-64 format and not the tessl path. A bf16
 reference cannot anchor the bar: exact fp32 scores only 0.988 (default prompt) and 0.992 (text)
 against transformers' bf16 forward, so the bf16 forward itself sits at the bar.
-Q8 is not measured, since no Qwen3.5 path loads Q8 weights (`gemv_q8` is a standalone kernel).
+No Qwen3.5 path loads Q8 weights. `gemv_q8` remains the standalone GEMV, and `nn::gemm_q8_tensorops` is a separate per-group matmul2d that this model does not call. That kernel was timed on `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed.
 Numbers, formula and provenance: `bench/results/qwen35_ear_m5pro.txt`.
 
 **Toward Qwen3.8-27B (AC2), what this stage leaves.** Config parse: done and tested on the real

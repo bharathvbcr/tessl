@@ -68,7 +68,10 @@ inf_nan_constants() {
 
 compile() { # compile <src> <std> <out.ll>
   local src="$1" std="$2" ll="$3" extra=()
-  [[ "$(basename "$src")" == "qwen35_adamw.metal" ]] && extra=(-ffp-contract=off)
+  case "$(basename "$src")" in
+    qwen35_adamw.metal|i8_w8a8.metal|w4a8_tensorops.metal|gqa_decode.metal|matmul_fixed_order.metal)
+      extra=(-ffp-contract=off) ;;
+  esac
   "$METAL" "-std=$std" -O2 -fmetal-math-mode=fast -isysroot "$SDK" \
     -mmacosx-version-min=26.0 ${extra[@]+"${extra[@]}"} \
     -S -emit-llvm "$src" -o "$ll" 2>"$ll.err"

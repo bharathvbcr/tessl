@@ -55,7 +55,11 @@ constant uint SG_W = 32;
 // rows, against 32 at D=128/R=8. Same arithmetic per byte, four times the L1
 // traffic. `SGT` is now compiled per instantiation and swept with
 // BENCH_ATTN_ROWS_SGT; 32 simdgroups is 1024 threads, the Metal maximum.
-#define ROWS_KERNEL(NAME, D, R, SGT)                                          \
+#define ROWS_KERNEL(NAME, D, R, SGT) ROWS_KERNEL_KV(NAME, D, D, R, SGT)
+// DK is the Q and K head size. DV is the V and O head size. Equal heads pass
+// the same value through ROWS_KERNEL. A lane owns float4s of both heads, so
+// each of DK and DV must satisfy D % (4*R) == 0.
+#define ROWS_KERNEL_KV(NAME, DK, DV, R, SGT)                                  \
 kernel void NAME(                                                             \
     device const float *Q [[buffer(0)]],                                      \
     device const float *K [[buffer(1)]],                                      \
@@ -80,9 +84,11 @@ kernel void NAME(                                                             \
        per step. The scalar mapping issued one memory instruction per FMA at  \
        D=512 (16 K loads and 16 V loads against 32 multiply-adds), which is   \
        an ALU pipeline starved by address arithmetic rather than by DRAM.     \
-       D % (4R) == 0 for every instantiation, and K/Q/V row bases are         \
-       multiples of D, so the float4 reads are aligned. */                    \
-    constexpr uint DPV = (D) / (4u * (R));                                    \
+       DK % (4R) == 0 and DV % (4R) == 0 for every instantiation, and      \
+       K/Q row bases are multiples of DK and V/O of DV, so the float4 reads   \
+       are aligned. */                                                        \
+    constexpr uint DPVK = (DK) / (4u * (R));                                  \
+    constexpr uint DPVV = (DV) / (4u * (R));                                  \
     constexpr uint RPT = (SGT) * RPS;  /* query rows per threadgroup */       \
     const uint tid = tpitg.x;                                                 \
     const uint sg = tid / SG_W;                                               \
@@ -106,12 +112,18 @@ kernel void NAME(                                                             \
                                                                               \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
-    const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
-    const ulong kv_head_base =                                                \
-        (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);            \
-    const ulong q_pos_stride = (ulong)H * (D);                                \
+    const ulong k_pos_stride = (ulong)Hkv * (DK);                            \
+    const ulong v_pos_stride = (ulong)Hkv * (DV);                            \
+    const ulong k_head_base =                                                 \
+        (ulong)b * kv_capacity * k_pos_stride + (ulong)hkv * (DK);           \
+    const ulong v_head_base =                                                 \
+        (ulong)b * kv_capacity * v_pos_stride + (ulong)hkv * (DV);           \
+    const ulong q_pos_stride = (ulong)H * (DK);                               \
+    const ulong o_pos_stride = (ulong)H * (DV);                               \
     const ulong q_head_base =                                                 \
-        (ulong)b * Tq * q_pos_stride + (ulong)h * (D);                        \
+        (ulong)b * Tq * q_pos_stride + (ulong)h * (DK);                       \
+    const ulong o_head_base =                                                 \
+        (ulong)b * Tq * o_pos_stride + (ulong)h * (DV);                       \
     const ulong q_off_i = (ulong)(*q_pos_offset_ptr);                         \
     const ulong kv_off = (ulong)(*kv_pos_offset_ptr);                         \
     const ulong q_abs = q_off_i + (ulong)t_q;                                 \
@@ -135,34 +147,35 @@ kernel void NAME(                                                             \
     const ulong causal_end = (q_hi >= kv_off) ? q_hi - kv_off + 1ul : 0ul;    \
     const ulong t_end = min((ulong)Tkv, causal_end);                          \
                                                                               \
-    const ulong o_off = q_head_base + (ulong)t_q * q_pos_stride;             \
-    float4 q_reg[DPV];                                                        \
-    float4 acc[DPV];                                                          \
-    for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
+    const ulong q_off = q_head_base + (ulong)t_q * q_pos_stride;            \
+    const ulong o_off = o_head_base + (ulong)t_q * o_pos_stride;             \
+    float4 q_reg[DPVK];                                                       \
+    float4 acc[DPVV];                                                         \
+    for (uint j = 0; j < DPVV; ++j) { acc[j] = float4(0.0f); }                \
     /* The seeds and the "has seen a key" flag: see attn_rows_step. */      \
     float m_i = -FLT_MAX;                                                     \
     float l_i = 0.0f;                                                         \
                                                                               \
     if (t_start < t_end) {                                                    \
-        const ulong q_base = o_off;                                           \
-        device const float4 *Q4 = (device const float4 *)(Q + q_base);        \
-        for (uint j = 0; j < DPV; ++j) {                                      \
+        device const float4 *Q4 = (device const float4 *)(Q + q_off);         \
+        for (uint j = 0; j < DPVK; ++j) {                                     \
             q_reg[j] = row_live ? Q4[dl + j * (R)] : float4(0.0f);            \
         }                                                                     \
         for (uint t = (uint)t_start; t < (uint)t_end; ++t) {                  \
-            const ulong kv_base = kv_head_base + (ulong)t * kv_pos_stride;   \
-            const float part = attn_rows_dot<DPV, (R)>(                       \
-                q_reg, (device const float4 *)(K + kv_base), dl);             \
+            const ulong k_base = k_head_base + (ulong)t * k_pos_stride;      \
+            const ulong v_base = v_head_base + (ulong)t * v_pos_stride;      \
+            const float part = attn_rows_dot<DPVK, (R)>(                      \
+                q_reg, (device const float4 *)(K + k_base), dl);              \
             const ulong k_abs = kv_off + (ulong)t;                            \
             const bool live = row_live && k_abs <= q_abs && k_abs >= my_lo;   \
-            attn_rows_step<DPV, (R)>(part, live, scale,                       \
-                (device const float4 *)(V + kv_base), dl, acc, m_i, l_i);     \
+            attn_rows_step<DPVV, (R)>(part, live, scale,                      \
+                (device const float4 *)(V + v_base), dl, acc, m_i, l_i);      \
         }                                                                     \
     }                                                                         \
                                                                               \
     if (!row_live) { return; }                                                \
     const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;                   \
-    attn_rows_store<DPV, (R)>(O, o_off, dl, acc, inv_l, out_bf16);           \
+    attn_rows_store<DPVV, (R)>(O, o_off, dl, acc, inv_l, out_bf16);          \
     (void)B;                                                                  \
 }
 
@@ -197,3 +210,7 @@ ROWS_KERNEL(flash_attn_rows_h512_r8_g32, 512, 8, 32)
 // R=8 gives 64 % 32 == 0 and two float4s per lane. R=32 would be a zero
 // trip count (DPV = 0). One instantiation: the host default is R=8, SGT=8.
 ROWS_KERNEL(flash_attn_rows_h64_r8_g8, 64, 8, 8)
+// Unequal heads: score over DK, accumulate over DV. R=8 because 4*8=32
+// divides 192, 128, 576 and 512. R=32 does not (576 % 128 == 64).
+ROWS_KERNEL_KV(flash_attn_rows_dk192_dv128_r8_g8, 192, 128, 8, 8)
+ROWS_KERNEL_KV(flash_attn_rows_dk576_dv512_r8_g8, 576, 512, 8, 8)

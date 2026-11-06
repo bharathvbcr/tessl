@@ -374,9 +374,8 @@ fn load_q4(rt: &Arc<GpuRuntime>, entries: &[Entry]) -> Result<Qwen35Model, Strin
 const TINY_BOUND: f64 = 3e-2;
 
 /// The synthetic checkpoint's Q4 forward reproduces the dequantized dense
-/// forward, at one row (decode GEMV is not in play for forward, but the head's
-/// and the projections' small-M kernel is), five rows (the 2..=8 GEMM) and
-/// seventy (the TensorOps GEMM, past the GDN chunk).
+/// forward, at one row (the decode GEMV) and at five and seventy rows (the
+/// TensorOps GEMM; seventy is past the GDN chunk).
 #[test]
 fn mlx_q4_tiny_checkpoint_matches_its_dequantized_f32_model() {
     with_gpu(|rt| {
@@ -414,7 +413,7 @@ fn mlx_q4_tiny_checkpoint_matches_its_dequantized_f32_model() {
 /// Decode smoke: the Q4 path's prefill then decoded tokens match its own
 /// forward at the last row, in the style of
 /// `prefill_then_decode_matches_forward_at_the_last_row`. Prefill lengths cover
-/// the small-M GEMM (1, 5, 8) and the TensorOps GEMM (9, 70); every decoded
+/// the GEMV (1) and the TensorOps GEMM (5, 8, 9, 70); every decoded
 /// step runs the GEMV. Bound 2e-2, the tiny Bf16 model's.
 #[test]
 fn mlx_q4_tiny_prefill_then_decode_matches_forward_at_the_last_row() {
@@ -916,8 +915,8 @@ fn mlx_q4_2b_attribution_against_mlx_lm_float32() {
 /// Q4 forward's last row at that length to 2e-2 of the largest logit (the tiny
 /// Bf16 model's bound), with the greedy token the same unless the forward's own
 /// top two logits are within that tolerance (a tie the two summation orders may
-/// break either way). `n` of 5 prefills on the small-M GEMM, 150 on the
-/// TensorOps one; the decoded rows run the GEMV.
+/// break either way). `n` of 5 and 150 both prefill on the TensorOps GEMM;
+/// the decoded rows run the GEMV.
 #[test]
 #[ignore]
 fn mlx_q4_2b_prefill_then_decode_matches_forward_at_the_last_row() {
@@ -1068,10 +1067,10 @@ fn adv_mlx_q4_exact_weights_match_dense_bf16_and_a_swapped_window_does_not() {
     });
 }
 
-/// Attack 5 (routing): every row count around both cuts, and large ragged
-/// ones, run Q4 and agree with the dequantized F32 model. 7 / 8 are the last
-/// small-M sizes, 9 the first TensorOps one; 33, 129 and 300 are ragged against
-/// the 32-row tile and past the GDN chunk.
+/// Attack 5 (routing): row counts on either side of the GEMV/TensorOps cut,
+/// and large ragged ones, run Q4 and agree with the dequantized F32 model.
+/// 1 is the GEMV; 2 and above are the TensorOps GEMM. 33, 129 and 300 are
+/// ragged against the 32-row tile and past the GDN chunk.
 #[test]
 fn adv_mlx_q4_routing_boundaries_and_ragged_row_counts_match_dense() {
     with_gpu(|rt| {

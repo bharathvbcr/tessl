@@ -57,7 +57,7 @@ use tessl::gemm::{
     gemm_nt_train, gemm_tn_accum_train, gemm_tn_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
     GemmBackend,
 };
-use tessl::nn::{gemm_q4_mlx_tensorops, Q4MlxBank, QuantShape};
+use tessl::nn::{gemm_q4_mlx_tensorops, gemm_q8_tensorops, Q4MlxBank, QuantShape};
 use tessl::runtime::{GpuRuntime, PrecisionMode};
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer, Tensor};
 
@@ -604,8 +604,246 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn time_calls(
+    rt: &Arc<GpuRuntime>,
+    warmup: usize,
+    repeat: usize,
+    mut once: impl FnMut() -> Result<(), String>,
+) -> Result<Vec<f64>, String> {
+    for _ in 0..warmup {
+        once()?;
+        rt.synchronize()?;
+    }
+    let mut samples = Vec::with_capacity(repeat);
+    for _ in 0..repeat {
+        let t0 = Instant::now();
+        once()?;
+        rt.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        if !ms.is_finite() || ms <= 0.0 {
+            return Err(format!("cooperative quant GEMM sample {ms} is not a positive finite time"));
+        }
+        samples.push(ms);
+    }
+    Ok(samples)
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn tool_capture(program: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => {
+            let mut text = String::new();
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+            if !out.stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            (out.status.success(), text)
+        }
+        Err(e) => (false, format!("{program}: {e}")),
+    }
+}
+
+fn quant_row(kernel: &str, m: usize, group: u32, repeat: usize, samples: &[f64]) -> Result<String, String> {
+    let med = median(samples.to_vec())?;
+    let times = samples.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+    Ok(format!(
+        r#"{{"kernel":"{kernel}","runtime":"tessl","device_rows":true,"m":{m},"n":4096,"k":4096,"group_size":{group},"repeat":{repeat},"times_ms":[{times}],"median_ms":{med:.6}}}"#
+    ))
+}
+
+/// `(M, 4096, 4096)` for the eight M in the quant-coop grid.
+///
+/// `cargo run --release --bin bench_gemm_variants -- --quant-coop`
+///
+/// Times `gemm_q4_mlx_tensorops` (group 64) and `gemm_q8_tensorops` (group 32)
+/// on device. MLX `nax`, torch MPS, and a fan pin are attempted in the same
+/// process; a tool that cannot run contributes its own error text.
+fn quant_coop_grid() -> Result<(), String> {
+    const N: usize = 4096;
+    const K: usize = 4096;
+    const MAX_M: usize = 2048;
+    const MS: [usize; 8] = [1, 16, 64, 128, 256, 512, 1024, 2048];
+    const Q4_GROUP: u32 = 64;
+    const Q8_GROUP: u32 = 32;
+    const Q4_KERNEL: &str = "gemm_q4_mlx_tensorops_g64";
+    const Q8_KERNEL: &str = "gemm_q8_tensorops_g32";
+
+    let rt = GpuRuntime::new()?;
+    if !rt.has_tensorops() {
+        return Err("TensorOps is unavailable; the cooperative quant GEMM has no host path".into());
+    }
+    let device = rt.device_name();
+    let warmup = env_usize("BENCH_WARMUP", 2, 0)?;
+    let repeat = env_usize("BENCH_ITERS", 5, 1)?;
+
+    let q4_packed = rt.alloc_buffer(N * K / 2)?;
+    q4_packed.try_write_bytes(&vec![0x11u8; N * K / 2])?;
+    let q4_pairs = N * (K / Q4_GROUP as usize);
+    let q4_sb = rt.alloc_buffer(q4_pairs * 4)?;
+    q4_sb.try_write_bf16_bits(&vec![0x3f80u16; q4_pairs * 2])?;
+    let q4_x = rt.alloc_buffer(MAX_M * K * 2)?;
+    q4_x.try_write_bf16_bits(&vec![0x3f00u16; MAX_M * K])?;
+    let y = rt.alloc_buffer(MAX_M * N * 4)?;
+    y.try_write_f32(&vec![0.0f32; MAX_M * N])?;
+
+    let q8_packed = rt.alloc_buffer(N * K)?;
+    q8_packed.try_write_bytes(&vec![1u8; N * K])?;
+    let q8_groups = K / Q8_GROUP as usize;
+    let q8_scale = rt.alloc_buffer(N * q8_groups * 4)?;
+    q8_scale.try_write_f32(&vec![0.01f32; N * q8_groups])?;
+    let q8_zero = rt.alloc_buffer(N * q8_groups * 4)?;
+    q8_zero.try_write_f32(&vec![0.0f32; N * q8_groups])?;
+    let q8_x = rt.alloc_buffer(MAX_M * K * 4)?;
+    q8_x.try_write_f32(&vec![0.25f32; MAX_M * K])?;
+
+    let mut rows = Vec::with_capacity(MS.len() * 2);
+    for &m in &MS {
+        eprintln!("timing {Q4_KERNEL} M={m}");
+        let samples = time_calls(&rt, warmup, repeat, || {
+            let bank = Q4MlxBank {
+                packed: &q4_packed,
+                scales_biases: &q4_sb,
+            };
+            let shape = QuantShape {
+                rows: N as u32,
+                cols: K as u32,
+                group_size: Q4_GROUP,
+            };
+            gemm_q4_mlx_tensorops(&rt, bank, &q4_x, &y, shape, m as u32)
+        })?;
+        rows.push(quant_row(Q4_KERNEL, m, Q4_GROUP, repeat, &samples)?);
+        eprintln!("timing {Q8_KERNEL} M={m}");
+        let samples = time_calls(&rt, warmup, repeat, || {
+            gemm_q8_tensorops(
+                &rt,
+                &q8_packed,
+                &q8_scale,
+                &q8_zero,
+                &q8_x,
+                &y,
+                N as u32,
+                K as u32,
+                Q8_GROUP,
+                m as u32,
+            )
+        })?;
+        rows.push(quant_row(Q8_KERNEL, m, Q8_GROUP, repeat, &samples)?);
+    }
+
+    let (nax_ok, nax_text) = tool_capture("python3", &["-c", NAX_ATTEMPT]);
+    let (mps_ok, mps_text) = tool_capture("python3", &["-c", MPS_ATTEMPT]);
+    let (fan_ok, fan_text) = tool_capture("sh", &["-c", FAN_ATTEMPT]);
+    let fan_pinned = fan_ok && fan_text.contains("FAN_PIN_EXIT:0");
+
+    println!(
+        r#"{{"device":{},"kernels":["{Q4_KERNEL}","{Q8_KERNEL}"],"warmup":{warmup},"repeat":{repeat},"shapes":"M x 4096 x 4096","m":[1,16,64,128,256,512,1024,2048],"tessl":[{}],"nax":{{"ok":{nax_ok},"output":{}}},"mps":{{"ok":{mps_ok},"output":{}}},"fan_pin":{{"ok":{fan_pinned},"output":{}}}}}"#,
+        json_string(&device),
+        rows.join(","),
+        json_string(&nax_text),
+        json_string(&mps_text),
+        json_string(&fan_text),
+    );
+    Ok(())
+}
+
+const NAX_ATTEMPT: &str = r#"
+import os, sys, time
+try:
+    import mlx.core as mx
+except Exception as e:
+    sys.stderr.write("%s: %s\n" % (type(e).__name__, e))
+    sys.exit(1)
+nax = getattr(mx, "nax", None)
+if nax is None:
+    sys.stderr.write("AttributeError: module 'mlx.core' has no attribute 'nax'\n")
+    sys.exit(1)
+matmul = getattr(nax, "matmul", None)
+if matmul is None:
+    sys.stderr.write("AttributeError: mlx.core.nax has no matmul; names: %s\n" % ", ".join(dir(nax)))
+    sys.exit(1)
+repeat = int(os.environ.get("BENCH_ITERS", "5"))
+warmup = int(os.environ.get("BENCH_WARMUP", "2"))
+ms = [1, 16, 64, 128, 256, 512, 1024, 2048]
+out = []
+for m in ms:
+    a = mx.random.uniform(shape=(m, 4096))
+    b = mx.random.uniform(shape=(4096, 4096))
+    mx.eval(a, b)
+    for _ in range(warmup):
+        mx.eval(matmul(a, b))
+    samples = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        mx.eval(matmul(a, b))
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    out.append({"m": m, "times_ms": samples})
+print(out)
+"#;
+
+const MPS_ATTEMPT: &str = r#"
+import os, sys, time
+try:
+    import torch
+except Exception as e:
+    sys.stderr.write("%s: %s\n" % (type(e).__name__, e))
+    sys.exit(1)
+if not torch.backends.mps.is_available():
+    sys.stderr.write("RuntimeError: torch.backends.mps.is_available() is False\n")
+    sys.exit(1)
+repeat = int(os.environ.get("BENCH_ITERS", "5"))
+warmup = int(os.environ.get("BENCH_WARMUP", "2"))
+ms = [1, 16, 64, 128, 256, 512, 1024, 2048]
+out = []
+for m in ms:
+    a = torch.randn(m, 4096, device="mps")
+    b = torch.randn(4096, 4096, device="mps")
+    torch.mps.synchronize()
+    for _ in range(warmup):
+        torch.matmul(a, b)
+        torch.mps.synchronize()
+    samples = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        torch.matmul(a, b)
+        torch.mps.synchronize()
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    out.append({"m": m, "times_ms": samples})
+print(out)
+"#;
+
+const FAN_ATTEMPT: &str = r#"
+sudo -n powermetrics -n 1 -i 100 --samplers smc
+echo FAN_PIN_EXIT:$?
+command -v smc || echo "smc: command not found"
+command -v smcif || echo "smcif: command not found"
+exit 0
+"#;
+
 fn main() -> Result<(), String> {
-    let outcome = run();
+    let outcome = if std::env::args().any(|a| a == "--quant-coop") {
+        quant_coop_grid()
+    } else {
+        run()
+    };
     common::emit_kernel_trace();
     outcome
 }

@@ -310,14 +310,14 @@ Qwen3.5 kernels in `tessl::qwen35` add three sources and eleven more — see
 [qwen35.md](qwen35.md)). Counted over the whole crate on 2026-10-02 there are
 30 Metal sources and 205 entry points: the difference is the Qwen3.5 forward,
 backward and AdamW kernels. That count is a dated snapshot; the README's
-current figures (39 sources, 318 entry points) are the ones the build's own
-test checks. The `nn` ones arrived here by
+current figures (45 sources, 366 entry points) are the ones the build's own
+test checks (`tests/docs_name_real_tools.rs`). The `nn` ones arrived here by
 promotion out of `gemma-metal`, where they were reachable only as raw pipeline
 name strings through an overlay metallib — meaning a typo in a name was a
 runtime failure, and nothing checked that a buffer was large enough for the grid
 being dispatched over it.
 
-`src/nn.rs` is the boundary that ended that. It has 90 public free functions
+`src/nn.rs` is the boundary that ended that. It has 95 public free functions
 (the count `tests/docs_name_real_tools.rs` checks the README against; it
 includes the `validate_*` helpers and the unsafe `_with_scalars` variants),
 and each entry point resolves the pipeline by a name fixed at the call site and
@@ -465,14 +465,62 @@ TensorOps itself accepts `int4b_format`, and the shader-side tensor constructor
 for it exists (compile-checked: `device uchar *` handle, right operand only;
 see the `QUANT_PREFILL_GEMM_WIRED` doc in `src/mtl_tensor.rs` and
 `tools/probes/int4b/`). `nn::gemm_q4_mlx_tensorops` is that GEMM. Qwen Q4 with
-`M>8` calls it (`Q4Weight::matmul` and `project_residual`); `M==1` stays on
-`gemv_q4_mlx_simd` and `M` in `2..=8` stays on `gemm_q4_mlx`. It has not been
-timed, so no speedup is claimed. `QUANT_PREFILL_GEMM_WIRED` stays false because
+`M>1` calls it (`Q4Weight::matmul` and `project_residual`); `M==1` stays on
+`gemv_q4_mlx_simd`. A fused residual for `M>1` is a separate add. It was timed
+on `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512, 1024, 2048}. No
+speedup is claimed. `QUANT_PREFILL_GEMM_WIRED` stays false because
 the host-created `MTLTensor` Int4 descriptor is still unbound. An earlier
 version of this document and the README blamed `MTLTensorDataType::Int4` being
 unbound in objc2-metal 0.3 for the missing GEMM. That binding is still unbound,
 and it gates host-created descriptors only. The kernel builds tensors from raw
 device pointers.
+
+### Q8 affine matmul2d
+
+`nn::gemm_q8_tensorops` computes `Y[M, N] = X[M, K] @ W[N, K]^T` with
+`W = scale * (q - zero)`. Groups are 32, 64, and 128, each its own entry point
+(`gemm_q8_tensorops_g32`, `_g64`, `_g128`). The right operand of `matmul2d` is
+the packed `int8` codes (`float × int8_t → float`). The epilogue folds
+`scale * P + (-scale * zero) * xsum` in f32 registers, and the kernel computes
+`xsum`. `M == 1` decode stays on `nn::gemv_q8`, which accepts any group that
+divides `K`. This entry accepts `M >= 1` and does not call the GEMV. A group
+outside {32, 64, 128}, a ragged `K`, an extent past `i32::MAX`, or a device
+without TensorOps is an error before encode. Nothing runs on the host. The
+test bound is an f32 gamma (`tests/gemm_q8_tensorops.rs`), not bit-identity
+with the CPU or with `gemv_q8`. It was timed on `(M, 4096, 4096)` for M in
+{1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed. gemma-metal's
+multi-row Q8 path calls it. Qwen does not load Q8 weights.
+
+### Int8 pipeline, W4A8, and decode GQA
+
+`i8_pipeline::gemm_i8` is a separate int8×int8→int32 GEMM from
+`gemm_i8_dequant`. It takes per-row activation scales (`quantize_i8_rows`,
+absmax, `scale = max/127`), an optional bias, f32/f16/bf16 stores, a `[N, K]`
+weight layout, and per-group weight scales at 64, 128, and 256 flushed in
+order. `M == 1` is the int8 GEMV. `M <= 64` uses the 64 tile and a larger `M`
+the 128 tile. Int32 sums are exact inside the documented `K` bound. A refused
+call does not run on the host. `gemm_i8_dequant` is unchanged.
+
+`i8_pipeline::gemm_w4a8` has two arms over one logical matrix.
+`W4Arm::Int4b` uses shader `int4b_format`. `W4Arm::UnpackZp8` unpacks an
+unsigned nibble minus 8 on the GPU and then runs the int8 GEMM. A failed int4b
+probe returns an error containing `unsupported` and does not fall back to the
+unpack arm or the host.
+
+`i8_pipeline::gqa_decode` is decode-only grouped-query attention (query length
+1) for head dims 32, 64, 128, 256, and 512. Any other dimension is named in
+the error and is not dispatched. Prefill attention is unchanged.
+
+## Fixed-order f32
+
+`gemm_fixed_order_nn`, `gemm_fixed_order_tn`, and `gemm_fixed_order_nt` write
+each output as `acc = +0`, then `acc = acc + (a * b)` for `k` ascending.
+Contraction is off, so the multiply and the add are two roundings, and one
+thread writes one output. TensorOps and the simdgroup tile match
+`gemm_f32_cpu` on short `K` and on integer products. They disagree on
+order-sensitive products whose `K` fills a hardware chunk. These three kernels
+match that CPU fold bit for bit (`tests/gemm_fixed_order.rs`). They do not
+replace the 32×32 `matmul2d` tile.
 
 ---
 

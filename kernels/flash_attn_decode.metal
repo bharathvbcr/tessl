@@ -46,7 +46,10 @@ constant uint SIMD_W = 32;
 /// instead. Both passes clamp `Tkv` to that same bound before deriving an
 /// address. Chunks past the clamped value return immediately, and the reduce
 /// pass visits exactly the chunks the partial pass wrote.
-#define DECODE_PARTIAL_KERNEL(NAME, D, CH, R)                                 \
+#define DECODE_PARTIAL_KERNEL(NAME, D, CH, R) DECODE_PARTIAL_KV(NAME, D, D, CH, R)
+// DK is the Q and K head size. DV is the V, accumulator and output head size.
+// The reduce pass only sees DV. Both heads must satisfy D % (4*R) == 0.
+#define DECODE_PARTIAL_KV(NAME, DK, DV, CH, R)                                \
 kernel void NAME(                                                             \
     device const float *Q [[buffer(0)]],                                      \
     device const float *K [[buffer(1)]],                                      \
@@ -67,8 +70,8 @@ kernel void NAME(                                                             \
 {                                                                             \
     /* Head dims per lane, as float4s -- a lane owns four *consecutive* dims  \
        per step, so one instruction moves 16R bytes across the R lanes of a   \
-       key group instead of 4R. D % (4R) == 0 for every instantiation and     \
-       `K + kv_base` is D-aligned, so the reads are aligned.                   \
+       key group instead of 4R. DK % (4R) == 0 and DV % (4R) == 0, and K     \
+       rows are DK-aligned and V rows DV-aligned, so the reads are aligned.   \
                                                                               \
        This was measured *twice*, with opposite results, and the order        \
        matters. On the one-simdgroup-per-threadgroup kernel it lost 8-14% at  \
@@ -80,7 +83,8 @@ kernel void NAME(                                                             \
        which wide loads use better. It is worth 1.1x at D=512 and neutral     \
        elsewhere. A tuning result is only valid against the kernel it was     \
        measured on. */                                                        \
-    constexpr uint DPV = (D) / (4u * (R));                                    \
+    constexpr uint DPVK = (DK) / (4u * (R));                                  \
+    constexpr uint DPVV = (DV) / (4u * (R));                                  \
     constexpr uint KPG = SIMD_W / (R); /* keys in flight per simdgroup */     \
     /* One simdgroup per query head, and the `H/Hkv` heads that share a KV    \
        head are put in the *same* threadgroup so they walk K and V together.   \
@@ -125,9 +129,12 @@ kernel void NAME(                                                             \
     const uint n_k = min((uint)(CH), Tkv - t_k0);                             \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
-    const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
-    const ulong kv_head_base =                                                \
-        (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);            \
+    const ulong k_pos_stride = (ulong)Hkv * (DK);                            \
+    const ulong v_pos_stride = (ulong)Hkv * (DV);                            \
+    const ulong k_head_base =                                                 \
+        (ulong)b * kv_capacity * k_pos_stride + (ulong)hkv * (DK);           \
+    const ulong v_head_base =                                                 \
+        (ulong)b * kv_capacity * v_pos_stride + (ulong)hkv * (DV);           \
                                                                               \
     const ulong q_abs = (ulong)(*q_pos_offset_ptr);                           \
     const ulong kv_pos_offset = (ulong)(*kv_pos_offset_ptr);                  \
@@ -137,13 +144,13 @@ kernel void NAME(                                                             \
         : q_abs - window_back;                                                 \
                                                                               \
     /* Tq == 1, so the single query row is index 0. */                        \
-    const ulong q_off = bh * (D);                                             \
+    const ulong q_off = bh * (DK);                                            \
     device const float4 *Q4 = (device const float4 *)(Q + q_off);             \
-    float4 q_reg[DPV];                                                        \
-    for (uint j = 0; j < DPV; ++j) { q_reg[j] = Q4[dl + j * (R)]; }           \
+    float4 q_reg[DPVK];                                                       \
+    for (uint j = 0; j < DPVK; ++j) { q_reg[j] = Q4[dl + j * (R)]; }          \
                                                                               \
-    float4 acc[DPV];                                                          \
-    for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
+    float4 acc[DPVV];                                                         \
+    for (uint j = 0; j < DPVV; ++j) { acc[j] = float4(0.0f); }                \
     /* -FLT_MAX and `l_i > 0` as the seen flag, as in flash_attn_rows: fast   \
        math may assume no value is infinite. */                               \
     float m_i = -FLT_MAX;                                                     \
@@ -166,7 +173,7 @@ kernel void NAME(                                                             \
         : 0ul;                                                                \
     const ulong lo_i = max((ulong)t_k0, local_lo);                            \
     const ulong hi_i = min((ulong)t_k0 + n_k, local_hi);                      \
-    const uint stride0 = (D) + 2u;                                            \
+    const uint stride0 = (DV) + 2u;                                           \
     const uint n_chunks = Tkv / (CH) + ((Tkv % (CH)) != 0u ? 1u : 0u);        \
     const ulong base0 = (bh * n_chunks + chunk) * stride0;                    \
     if (lo_i >= hi_i) {                                                       \
@@ -177,7 +184,7 @@ kernel void NAME(                                                             \
             partials[base0] = -FLT_MAX;                                       \
             partials[base0 + 1u] = 0.0f;                                      \
         }                                                                     \
-        for (uint d = lane; d < (D); d += SIMD_W) {                           \
+        for (uint d = lane; d < (DV); d += SIMD_W) {                          \
             partials[base0 + 2u + d] = 0.0f;                                  \
         }                                                                     \
         return;                                                               \
@@ -192,10 +199,11 @@ kernel void NAME(                                                             \
         const uint t = it * KPG + grp;                                        \
         const uint tt = min(t, live - 1u);                                    \
         const uint key = (uint)lo_i + tt;                                     \
-        const ulong kv_base = kv_head_base + (ulong)key * kv_pos_stride;      \
-        device const float4 *K4 = (device const float4 *)(K + kv_base);       \
+        const ulong k_base = k_head_base + (ulong)key * k_pos_stride;         \
+        const ulong v_base = v_head_base + (ulong)key * v_pos_stride;         \
+        device const float4 *K4 = (device const float4 *)(K + k_base);        \
         float4 dot4 = float4(0.0f);                                           \
-        for (uint j = 0; j < DPV; ++j) {                                      \
+        for (uint j = 0; j < DPVK; ++j) {                                     \
             dot4 += q_reg[j] * K4[dl + j * (R)];                              \
         }                                                                     \
         float part = dot4.x + dot4.y + dot4.z + dot4.w;                       \
@@ -207,8 +215,8 @@ kernel void NAME(                                                             \
         const float m_new = max(m_i, s);                                      \
         const float alpha = (l_i > 0.0f) ? exp(m_i - m_new) : 0.0f;           \
         const float p = key_live ? exp(s - m_new) : 0.0f;                     \
-        device const float4 *V4 = (device const float4 *)(V + kv_base);       \
-        for (uint j = 0; j < DPV; ++j) {                                      \
+        device const float4 *V4 = (device const float4 *)(V + v_base);        \
+        for (uint j = 0; j < DPVV; ++j) {                                     \
             acc[j] = acc[j] * alpha + p * V4[dl + j * (R)];                   \
         }                                                                     \
         l_i = l_i * alpha + p;                                                \
@@ -230,7 +238,7 @@ kernel void NAME(                                                             \
     for (uint off = (R); off < SIMD_W; off <<= 1) {                           \
         l_all += simd_shuffle_xor(l_all, off);                                \
     }                                                                         \
-    for (uint j = 0; j < DPV; ++j) {                                          \
+    for (uint j = 0; j < DPVV; ++j) {                                         \
         float4 a = acc[j] * w;                                                \
         for (uint off = (R); off < SIMD_W; off <<= 1) {                       \
             a.x += simd_shuffle_xor(a.x, off);                                \
@@ -242,12 +250,12 @@ kernel void NAME(                                                             \
     }                                                                         \
                                                                               \
     /* Group 0's R lanes cover dims dl + j*R for all j, i.e. every dim, so it \
-       alone writes. The layout stays canonical [m, l, acc[D]] whatever R is, \
+       alone writes. The layout stays canonical [m, l, acc[DV]] whatever R is,\
        which is why the reduce pass needs no R of its own. */                 \
     if (grp != 0u) { return; }                                                \
     const ulong base = base0;                                                 \
     if (lane == 0u) { partials[base] = m_all; partials[base + 1u] = l_all; }  \
-    for (uint j = 0; j < DPV; ++j) {                                          \
+    for (uint j = 0; j < DPVV; ++j) {                                         \
         const uint d0 = 4u * (dl + j * (R));                                  \
         partials[base + 2u + d0 + 0u] = acc[j].x;                             \
         partials[base + 2u + d0 + 1u] = acc[j].y;                             \
@@ -362,3 +370,11 @@ DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h256_c256, 256, 256)
 DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h512_c64, 512, 64)
 DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h512_c128, 512, 128)
 DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h512_c256, 512, 256)
+// Equal 64: R=32 is illegal (64 % 128 != 0). One instantiation, the host
+// default chunk 256 and R=8. The reduce is new because no D=64 reduce exists.
+DECODE_PARTIAL_KERNEL(flash_attn_decode_partial_h64_c256_r8, 64, 256, 8)
+DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h64_c256, 64, 256)
+// Unequal pairs. The reduce pass only reads DV, so 192/128 reuses the D=128
+// reduce and 576/512 reuses the D=512 reduce. R=32 does not divide 576.
+DECODE_PARTIAL_KV(flash_attn_decode_partial_dk192_dv128_c256_r8, 192, 128, 256, 8)
+DECODE_PARTIAL_KV(flash_attn_decode_partial_dk576_dv512_c128_r16, 576, 512, 128, 16)

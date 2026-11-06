@@ -33,6 +33,30 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Q8 affine matmul2d** (`nn::gemm_q8_tensorops`, `kernels/gemm_q8_tensorops.metal`,
+  `tests/gemm_q8_tensorops.rs`). `Y[M, N] = X[M, K] @ W[N, K]^T` with
+  `W = scale * (q - zero)`, groups 32, 64, and 128. The `matmul2d` right operand
+  is the packed `int8` codes (`float × int8_t → float`); the epilogue folds the
+  affine in f32 registers. `gemv_q8` stays the M=1 decode path and still accepts
+  any dividing group. A refused shape or a missing TensorOps device errors before
+  encode and does not run on the host. Agreement with an f64 affine is an f32
+  gamma bound, not bit-identity. Timed on `(M, 4096, 4096)` for M in
+  {1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed. gemma-metal's
+  multi-row Q8 path calls it. Qwen does not load Q8 weights.
+- **Int8 pipeline, W4A8, and decode-only GQA** (`src/i8_pipeline.rs`,
+  `kernels/i8_w8a8.metal`, `kernels/w4a8_tensorops.metal`, `kernels/gqa_decode.metal`).
+  `gemm_i8` is int8×int8→int32 with per-row activation scales, optional bias,
+  f16/bf16 stores, an `[N, K]` layout, and per-group scales 64/128/256.
+  `M == 1` is a GEMV and `M <= 64` uses the smaller tile. `gemm_w4a8` has an
+  `int4b` arm and a zero-point-8 unpack arm against one oracle; a failed int4b
+  probe is an explicit unsupported error with no host fallback. `gqa_decode`
+  covers head dims 32, 64, 128, 256, and 512 and leaves prefill unchanged.
+  `nn::gemm_i8_dequant` is unchanged.
+- **Fixed-order f32 GEMM** (`gemm_fixed_order_nn`, `gemm_fixed_order_tn`,
+  `gemm_fixed_order_nt`, `kernels/matmul_fixed_order.metal`). Each output is an
+  ascending-k left fold with contraction off and one thread per output, matching
+  `gemm_f32_cpu` bit for bit. TensorOps and the simdgroup tile are not this path.
+  The 32×32 `matmul2d` tile is unchanged.
 - **`gemm_nt_bf16_bias`: the bf16 NT GEMM with a bias and an optional bf16 round in its register epilogue**
   (`src/gemm.rs`, `kernels/gemm_coop.h`, `kernels/matmul_tensorops.metal`,
   `tests/gemm_nt_bf16_bias.rs`, the `sam` lane of `src/bin/bench_gemm_routes.rs`).
@@ -101,11 +125,13 @@ All notable changes to `tessl` are recorded here. The format follows
   identity across preserving choices (`AutoCoopTile` vs `ForcedMatchingCoopTile`), while changing
   choices (`PreferTnSplitk`, `SplitKVersusOneLaunch`, `EpiTileWidth`, `Dtype`) are explicitly
   documented as arithmetic-altering.
-- **Qwen Q4 $M > 8$ TensorOps GEMM routing** (`src/qwen35_q4.rs`, `src/qwen35_model.rs`).
-  Qwen Q4 with $M > 8$ routes to `nn::gemm_q4_mlx_tensorops` (`Q4Weight::matmul`, `project_residual`).
-  $M = 1$ remains on `gemv_q4_mlx_simd` and $M \in 2..=8$ stays on `gemm_q4_mlx`.
+- **Qwen Q4 $M > 1$ TensorOps GEMM routing** (`src/qwen35_q4.rs`, `src/qwen35_model.rs`).
+  Qwen Q4 with $M > 1$ routes to `nn::gemm_q4_mlx_tensorops` (`Q4Weight::matmul`, `project_residual`).
+  $M = 1$ remains on `gemv_q4_mlx_simd`. A fused residual for $M > 1$ is a separate add: the
+  cooperative kernel has none.
   `QUANT_PREFILL_GEMM_WIRED` in `src/mtl_tensor.rs` remains `false` because the host `MTLTensor`
-  descriptor path is unwired and the kernel is not yet timed.
+  descriptor path is unwired. The kernel was timed on `(M, 4096, 4096)` for M in
+  {1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed.
 - **`tessl-embed`: EmbeddingGemma 2 behind Ollama's `/api/embed` on 127.0.0.1**
   (`go/cmd/tessl-embed`, `go/Makefile`, `go/README.md`). An in-process HTTP server
   serving the text encoder over Ollama's embedding protocol (`/api/embed`,

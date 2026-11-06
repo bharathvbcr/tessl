@@ -12,3 +12,37 @@
 mtl_tensor_fill_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)
 mtl_tensor_read_i8: test-only: src/mtl_tensor.rs (only dispatch is a #[cfg(test)] test behind the off-by-default quant-prep feature)
 gemv_q4_mlx_simd_gate_up_silu: test-only: tests/qwen35_decode_fusion.rs (the Q4 decode MLP; no bench loads a Q4 model, the tiny Q4 checkpoint in tests/qwen35_mlx_q4.rs runs it end to end)
+i8_quantize_rows: test-only: tests/gemm_i8.rs per-row absmax quantize, checked against a host round-ties-even oracle
+i8_gemv_dequant: test-only: tests/gemm_i8.rs M=1 int8 GEMV dequant
+i8_w8a8_64: test-only: tests/gemm_i8.rs small-M W8A8 tile
+i8_w8a8_64_nt: test-only: tests/gemm_i8.rs small-M W8A8 tile, transposed B
+i8_w8a8_128: test-only: tests/gemm_i8.rs wide W8A8 tile
+i8_w8a8_128_nt: test-only: tests/gemm_i8.rs wide W8A8 tile, transposed B
+i8_w8a8_g64_64: test-only: tests/gemm_i8.rs group-64 small tile
+i8_w8a8_g64_64_nt: test-only: tests/gemm_i8.rs group-64 small tile, transposed B
+i8_w8a8_g64_128: test-only: tests/gemm_i8.rs group-64 wide tile
+i8_w8a8_g64_128_nt: test-only: tests/gemm_i8.rs group-64 wide tile, transposed B
+i8_w8a8_g128_64: test-only: tests/gemm_i8.rs group-128 small tile
+i8_w8a8_g128_64_nt: test-only: tests/gemm_i8.rs group-128 small tile, transposed B
+i8_w8a8_g128_128: test-only: tests/gemm_i8.rs group-128 wide tile
+i8_w8a8_g128_128_nt: test-only: tests/gemm_i8.rs group-128 wide tile, transposed B
+i8_w8a8_g256_64: test-only: tests/gemm_i8.rs group-256 small tile
+i8_w8a8_g256_64_nt: test-only: tests/gemm_i8.rs group-256 small tile, transposed B
+i8_w8a8_g256_128: test-only: tests/gemm_i8.rs group-256 wide tile
+i8_w8a8_g256_128_nt: test-only: tests/gemm_i8.rs group-256 wide tile, transposed B
+w4a8_i4_32: test-only: tests/w4a8.rs int4b W4A8 tile
+w4a8_i4_g64: test-only: tests/w4a8.rs int4b group 64
+w4a8_i4_g128: test-only: tests/w4a8.rs int4b group 128
+w4a8_i4_g256: test-only: tests/w4a8.rs int4b group 256
+w4a8_unpack_zp8: test-only: tests/w4a8.rs zero-point-8 nibble unpack
+gqa_decode_h32: test-only: tests/gqa_decode.rs decode GQA head dim 32
+gqa_decode_h64: test-only: tests/gqa_decode.rs decode GQA head dim 64
+gqa_decode_h128: test-only: tests/gqa_decode.rs decode GQA head dim 128
+gqa_decode_h256: test-only: tests/gqa_decode.rs decode GQA head dim 256
+gqa_decode_h512: test-only: tests/gqa_decode.rs decode GQA head dim 512
+matmul_fixed_order_nn_f32: test-only: tests/gemm_fixed_order.rs ascending-k NN, bit-identical to gemm_f32_cpu
+matmul_fixed_order_nt_f32: test-only: tests/gemm_fixed_order.rs ascending-k NT, the linear forward layout
+matmul_fixed_order_tn_f32: test-only: tests/gemm_fixed_order.rs ascending-k TN, the linear weight gradient
+gemm_q8_tensorops_g32: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 32
+gemm_q8_tensorops_g64: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 64
+gemm_q8_tensorops_g128: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 128

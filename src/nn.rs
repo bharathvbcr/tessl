@@ -304,6 +304,115 @@ fn validate_attn_storage_for(
     Ok(capacity)
 }
 
+/// Storage check for a key head and a different value head.
+///
+/// Q and K are `key_dim` wide. V and O are `value_dim` wide. When the two
+/// widths are equal the position count is the same integer division as
+/// [`validate_attn_storage_for`], including its refusal when K and V disagree.
+/// When they differ, a power-of-two buffer bucket does not divide both widths
+/// to the same count, so the shared capacity is the smaller count both buffers
+/// fully back. That count is the kernel's batch stride.
+#[allow(clippy::too_many_arguments)]
+fn validate_attn_storage_pair(
+    dims: &AttnDims,
+    key_dim: u32,
+    value_dim: u32,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    what: &str,
+    out_bf16: bool,
+) -> Result<u32, String> {
+    if key_dim == 0 || value_dim == 0 {
+        return Err(format!("{what}: head_dim must be non-zero"));
+    }
+    if dims.heads_kv == 0 {
+        return Err(format!("{what}: heads_kv must be non-zero"));
+    }
+    if !dims.heads.is_multiple_of(dims.heads_kv) {
+        return Err(format!(
+            "{what}: heads {} is not a multiple of heads_kv {} — grouped-query \
+             attention maps a whole number of query heads onto each kv head",
+            dims.heads, dims.heads_kv
+        ));
+    }
+    if !dims.scale.is_finite() {
+        return Err(format!("{what}: scale must be finite, got {}", dims.scale));
+    }
+    let grid_y = elems_product(&[dims.batch, dims.heads], what)?;
+    if grid_y > u32::MAX as usize {
+        return Err(format!("{what}: B*H grid extent {grid_y} exceeds Metal uint indexing"));
+    }
+    let nq = elems_product(&[dims.batch, dims.tq, dims.heads, key_dim], what)?;
+    let no = elems_product(&[dims.batch, dims.tq, dims.heads, value_dim], what)?;
+    require_capacity::<f32>(q, nq, format_args!("{what} q"))?;
+    if out_bf16 {
+        require_capacity::<u16>(o, no, format_args!("{what} o (bf16)"))?;
+    } else {
+        require_capacity::<f32>(o, no, format_args!("{what} o"))?;
+    }
+    let capacity = attn_kv_capacity_pair(k, v, dims.batch, dims.heads_kv, key_dim, value_dim, what)?;
+    let has_work = dims.batch != 0 && dims.tq != 0 && dims.heads != 0;
+    if !has_work {
+        return Ok(capacity);
+    }
+    if out_bf16 && o.aliases(q) {
+        return Err(format!("{what}: bf16 output must not alias the f32 q input"));
+    }
+    for (input, name) in [(k, "k"), (v, "v")] {
+        if o.aliases(input) {
+            return Err(format!("{what}: output must not alias read-only {name} input"));
+        }
+    }
+    if capacity == 0 {
+        return Err(format!(
+            "{what}: K/V buffers do not jointly back one complete KV position"
+        ));
+    }
+    Ok(capacity)
+}
+
+/// Position count backed by K at `key_dim` and V at `value_dim`.
+fn attn_kv_capacity_pair(
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    batch: u32,
+    heads_kv: u32,
+    key_dim: u32,
+    value_dim: u32,
+    what: &str,
+) -> Result<u32, String> {
+    if heads_kv == 0 {
+        return Err(format!("{what}: heads_kv must be non-zero"));
+    }
+    if key_dim == 0 || value_dim == 0 {
+        return Err(format!("{what}: head_dim must be non-zero"));
+    }
+    let per_k = elems_product(&[batch, heads_kv, key_dim], what)?;
+    let per_v = elems_product(&[batch, heads_kv, value_dim], what)?;
+    if per_k == 0 || per_v == 0 {
+        return Ok(0);
+    }
+    let k_positions = capacity_of::<f32>(k) / per_k;
+    let v_positions = capacity_of::<f32>(v) / per_v;
+    if key_dim == value_dim {
+        if k_positions != v_positions {
+            return Err(format!(
+                "{what}: K and V imply different fixed capacities ({k_positions} vs \
+                 {v_positions} positions)"
+            ));
+        }
+        return u32::try_from(k_positions)
+            .map_err(|_| format!("{what}: KV capacity {k_positions} exceeds the device u32 range"));
+    }
+    if k_positions == 0 || v_positions == 0 {
+        return Ok(0);
+    }
+    let positions = k_positions.min(v_positions);
+    u32::try_from(positions).map_err(|_| format!("{what}: KV capacity {positions} exceeds the device u32 range"))
+}
+
 fn require_attn_runtime(
     rt: &GpuRuntime,
     q: &GpuBuffer,
@@ -791,6 +900,139 @@ pub unsafe fn gemv_q8_with_scalars(
         set_gpu_buf(bnd, x, 3);
         set_gpu_buf(bnd, y, 4);
         scalars(bnd);
+    })
+}
+
+// ---------------------------------------------- Q8 GEMM on TensorOps ---
+
+/// Group sizes `kernels/gemm_q8_tensorops.metal` instantiates. The `matmul2d`
+/// descriptor's K is the group, so each size is its own entry point. Any other
+/// divisor, including the ones [`gemv_q8`] accepts, is refused here rather than
+/// computed by that GEMV.
+pub const GEMM_Q8_TENSOROPS_GROUP_SIZES: [u32; 3] = [32, 64, 128];
+
+/// Output tile edge of `gemm_q8_tensorops_g*` (32x32, four simdgroups).
+const Q8_TENSOROPS_TILE: usize = 32;
+
+/// Largest `cols` (K) [`gemm_q8_tensorops`] accepts for `m` activation rows,
+/// `n` output rows and `group_size`. The first refused K is this plus
+/// `group_size`.
+///
+/// The products accumulate in f32 (`float` x `int8_t` -> `float`), so there is
+/// no int32 exact-K bound. What int32 bounds is the extent arithmetic: the
+/// kernel casts `M`, `N` and `K` to `int` and indexes `x` at `row * K`, the
+/// weight tensor at `n * K` elements, `y` at `m * N`, and the scale and zero
+/// tables at `n * (K / G)`. The binding products are `m * K` and `n * K`. With
+/// `K` a multiple of `G`, that is `K <= floor(i32::MAX / max(m, n))` rounded
+/// down to a multiple of `G`.
+pub fn gemm_q8_tensorops_max_k(m: u32, n: u32, group_size: u32) -> u32 {
+    let widest = u64::from(m.max(n).max(1));
+    let k = (i32::MAX as u64 / widest).min(u64::from(u32::MAX));
+    let g = u64::from(group_size.max(1));
+    (k / g * g) as u32
+}
+
+/// `Y[M, rows] = X[M, cols] @ W[rows, cols]^T` with group-wise affine Q8
+/// weights on the TensorOps matrix units.
+///
+/// Same packing as [`gemv_q8`]: row-major `int8` codes, `w = scale * (q - zero)`,
+/// scales and zeros shaped `[rows, cols / group_size]`. Activations and the
+/// output are f32. `M == 1` decode stays on [`gemv_q8`] (any group size that
+/// divides `cols`). This entry is the `M >= 1` matmul, including a one-row
+/// call a test can check, and it does not call the GEMV.
+///
+/// One `matmul2d` per K group reads the int8 codes in place (`float` x
+/// `int8_t`, float destination) and folds `s * P + (-s * z) * xsum` in f32
+/// registers. `xsum` is computed in the kernel. Ragged `M` and `rows` are
+/// clipped, not read past.
+///
+/// Refused before any encode: no TensorOps on the device, `group_size` outside
+/// [`GEMM_Q8_TENSOROPS_GROUP_SIZES`], `cols == 0`, `cols` not a multiple of the
+/// group, any indexed extent over `i32::MAX` (see [`gemm_q8_tensorops_max_k`]),
+/// a short buffer, or `y` overlapping an input. `m == 0` or `rows == 0` is a
+/// no-op after that validation. Nothing here runs on the host.
+///
+/// Accuracy: f32 accumulation in an unspecified order. Each output is within
+/// `gamma_t * S` of the f64 product of the loaded operands, with
+/// `t = cols + 2 * cols / group_size + group_size`,
+/// `gamma_t = t * 2^-24 / (1 - t * 2^-24)` and
+/// `S = sum_g |s| sum|q x| + |s * z| sum|x|`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_q8_tensorops(
+    rt: &Arc<GpuRuntime>,
+    packed: &GpuBuffer,
+    scales: &GpuBuffer,
+    zeros: &GpuBuffer,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+    group_size: u32,
+    m: u32,
+) -> Result<(), String> {
+    const WHAT: &str = "gemm_q8_tensorops";
+    if !rt.has_tensorops() {
+        return Err(format!("{WHAT}: TensorOps is unavailable on this device"));
+    }
+    let entry = match group_size {
+        32 => "gemm_q8_tensorops_g32",
+        64 => "gemm_q8_tensorops_g64",
+        128 => "gemm_q8_tensorops_g128",
+        g => {
+            return Err(format!(
+                "{WHAT}: group_size {g} is not one of {GEMM_Q8_TENSOROPS_GROUP_SIZES:?}; the \
+                 matmul2d descriptor's K is the group, so each size is its own entry point"
+            ))
+        }
+    };
+    if cols == 0 {
+        return Err(format!("{WHAT}: cols must be non-zero"));
+    }
+    if !cols.is_multiple_of(group_size) {
+        return Err(format!(
+            "{WHAT}: cols {cols} is not a multiple of group_size {group_size}"
+        ));
+    }
+    let (n, k) = (rows, cols);
+    let groups = k / group_size;
+    // The kernel's int32 extents and indices; see `gemm_q8_tensorops_max_k`.
+    // Checked before any buffer length so an oversize shape is named as such.
+    for (numel, what) in [
+        (elems(m, k, WHAT)?, "gemm_q8_tensorops x (m * cols)"),
+        (elems(n, k, WHAT)?, "gemm_q8_tensorops weights (rows * cols)"),
+        (elems(m, n, WHAT)?, "gemm_q8_tensorops y (m * rows)"),
+        (
+            elems(n, groups, WHAT)?,
+            "gemm_q8_tensorops scales and zeros (rows * groups)",
+        ),
+    ] {
+        crate::gemm::require_i32_extent(numel, what)?;
+    }
+    require::<i8>(rt, packed, elems(n, k, WHAT)?, format_args!("{WHAT} packed"))?;
+    require::<f32>(rt, scales, elems(n, groups, WHAT)?, format_args!("{WHAT} scales"))?;
+    require::<f32>(rt, zeros, elems(n, groups, WHAT)?, format_args!("{WHAT} zeros"))?;
+    require::<f32>(rt, x, elems(m, k, WHAT)?, format_args!("{WHAT} x"))?;
+    require::<f32>(rt, y, elems(m, n, WHAT)?, format_args!("{WHAT} y"))?;
+    require_disjoint_writes(
+        WHAT,
+        &[("y", y)],
+        &[("packed", packed), ("scales", scales), ("zeros", zeros), ("x", x)],
+    )?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline(entry)?;
+    let tiles_n = (n as usize).div_ceil(Q8_TENSOROPS_TILE);
+    let tiles_m = (m as usize).div_ceil(Q8_TENSOROPS_TILE);
+    dispatch_2d_tg(rt, &p, tiles_n, tiles_m, 128, |bnd| {
+        set_gpu_buf(bnd, packed, 0);
+        set_gpu_buf(bnd, scales, 1);
+        set_gpu_buf(bnd, zeros, 2);
+        set_gpu_buf(bnd, x, 3);
+        set_gpu_buf(bnd, y, 4);
+        set_u32(bnd, m, 5);
+        set_u32(bnd, n, 6);
+        set_u32(bnd, k, 7);
     })
 }
 
@@ -1306,8 +1548,48 @@ fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(&'static str,
         (512, C64) => at!(512, 64),
         (512, C128) => at!(512, 128),
         (512, C256) => at!(512, 256),
+        // D=64 is one instantiation: R=32 does not divide the float4 map.
+        (64, C256) if r == RowsLanes::R8 => (
+            "flash_attn_decode_partial_h64_c256_r8",
+            "flash_attn_decode_reduce_h64_c256",
+        ),
         _ => return None,
     })
+}
+
+/// Decode entry for a key/value head pair. The reduce pass only reads the
+/// value head, so 192/128 and 576/512 reuse the equal-head reduce at that
+/// value size and chunk.
+fn decode_entries_kv(dk: u32, dv: u32, c: DecodeChunk, r: RowsLanes) -> Option<(&'static str, &'static str)> {
+    if dk == dv {
+        return decode_entries(dk, c, r);
+    }
+    match (dk, dv, c, r) {
+        (192, 128, DecodeChunk::C256, RowsLanes::R8) => Some((
+            "flash_attn_decode_partial_dk192_dv128_c256_r8",
+            "flash_attn_decode_reduce_h128_c256",
+        )),
+        (576, 512, DecodeChunk::C128, RowsLanes::R16) => Some((
+            "flash_attn_decode_partial_dk576_dv512_c128_r16",
+            "flash_attn_decode_reduce_h512_c128",
+        )),
+        _ => None,
+    }
+}
+
+fn decode_missing(key_dim: u32, value_dim: u32) -> String {
+    if key_dim != value_dim {
+        format!(
+            "flash_attn_decode: head pair {key_dim}/{value_dim} has no kernel \
+             (equal 64, 128, 256, 512, or 192/128, 576/512)"
+        )
+    } else if key_dim == 64 {
+        "flash_attn_decode: head dim 64 is instantiated only as \
+         flash_attn_decode_partial_h64_c256_r8"
+            .to_string()
+    } else {
+        format!("flash_attn_decode: head dim {key_dim} has no decode kernel (64, 128, 256 or 512)")
+    }
 }
 
 /// Lanes per key in the decode partial pass, per head dimension.
@@ -1537,6 +1819,7 @@ pub fn flash_attn_decode_values(
         },
         dims,
         head_dim,
+        head_dim,
         kv_capacity,
         decode_chunk_for(head_dim),
         decode_lanes_for(head_dim),
@@ -1604,6 +1887,7 @@ pub fn flash_attn_decode_with_chunk(
         },
         dims,
         head_dim,
+        head_dim,
         kv_capacity,
         chunk,
         lanes,
@@ -1611,6 +1895,65 @@ pub fn flash_attn_decode_with_chunk(
         head_block,
         out_bf16,
     )
+}
+
+/// [`flash_attn_decode`] for a key head size and a value head size.
+///
+/// Equal sizes use the same chunk and lane count as [`flash_attn_decode`].
+/// 192/128 and 576/512 are one instantiation each. Scratch is the value head:
+/// [`DecodeScratch::new`] with `value_dim`. A pair with no kernel is named in
+/// the error and is not encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode_kv(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    scratch: &DecodeScratch,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    key_dim: u32,
+    value_dim: u32,
+    kv_capacity: usize,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let (chunk, lanes) = decode_kv_schedule(key_dim, value_dim);
+    flash_attn_decode_encode(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        scratch,
+        DecodeLive::Buffers {
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+        },
+        dims,
+        key_dim,
+        value_dim,
+        kv_capacity,
+        chunk,
+        lanes,
+        None,
+        None,
+        out_bf16,
+    )
+}
+
+fn decode_kv_schedule(key_dim: u32, value_dim: u32) -> (DecodeChunk, RowsLanes) {
+    if key_dim == value_dim {
+        return (decode_chunk_for(key_dim), decode_lanes_for(key_dim));
+    }
+    match (key_dim, value_dim) {
+        (192, 128) => (DecodeChunk::C256, RowsLanes::R8),
+        (576, 512) => (DecodeChunk::C128, RowsLanes::R16),
+        _ => (decode_chunk_for(value_dim), decode_lanes_for(value_dim)),
+    }
 }
 
 /// The one body of [`flash_attn_decode_with_chunk`] and
@@ -1626,6 +1969,7 @@ fn flash_attn_decode_encode(
     live: DecodeLive<'_>,
     dims: AttnDims,
     head_dim: u32,
+    value_dim: u32,
     kv_capacity: usize,
     chunk: DecodeChunk,
     lanes: RowsLanes,
@@ -1633,8 +1977,8 @@ fn flash_attn_decode_encode(
     head_block: Option<DecodeHeadBlock>,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let (partial_entry, reduce_entry) = decode_entries(head_dim, chunk, lanes)
-        .ok_or_else(|| format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)"))?;
+    let (partial_entry, reduce_entry) =
+        decode_entries_kv(head_dim, value_dim, chunk, lanes).ok_or_else(|| decode_missing(head_dim, value_dim))?;
     if dims.tq != 1 {
         return Err(format!(
             "flash_attn_decode is the Tq == 1 path; got Tq = {}. Use flash_attn_swa \
@@ -1643,7 +1987,11 @@ fn flash_attn_decode_encode(
         ));
     }
     require_attn_runtime(rt, q, k, v, o, "flash_attn_decode")?;
-    let actual_kv_capacity = validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_decode", out_bf16)?;
+    let actual_kv_capacity = if head_dim == value_dim {
+        validate_attn_storage_for(&dims, head_dim, q, k, v, o, "flash_attn_decode", out_bf16)?
+    } else {
+        validate_attn_storage_pair(&dims, head_dim, value_dim, q, k, v, o, "flash_attn_decode", out_bf16)?
+    };
     if let DecodeLive::Buffers {
         tkv,
         q_pos_offset,
@@ -1698,7 +2046,7 @@ fn flash_attn_decode_encode(
         dims.batch,
         dims.heads,
         kv_capacity as usize,
-        head_dim,
+        value_dim,
         chunk.keys(),
         operands,
     )?;
@@ -1739,7 +2087,7 @@ fn flash_attn_decode_encode(
     // and at the Metal maximum of 1024.
     let reduce_width = reduce_threads
         .unwrap_or(DECODE_REDUCE_THREADS)
-        .min(head_dim as usize)
+        .min(value_dim as usize)
         .max(32);
     let partial_groups = mtl_size(chunks, partial_y, 1);
     let partial_threads = mtl_size(partial_sgs * 32, 1, 1);
@@ -1961,8 +2309,27 @@ pub fn rows_groups_for(d: u32) -> RowsGroups {
 }
 
 /// `flash_attn_rows_h{d}_r{lanes}_g{groups}` as a static name, for the
-/// instantiations that are compiled.
+/// instantiations that are compiled. Equal heads only; unequal pairs go
+/// through [`rows_entry_kv`].
 fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<&'static str> {
+    rows_entry_kv(d, d, r, g)
+}
+
+/// Prefill entry for a key/value head pair. Equal sizes keep the `h{d}` names.
+/// 192/128 and 576/512 are one instantiation each (R=8, SGT=8): R=32 does not
+/// divide 192 or 576 (`D % (4*R) == 0`).
+fn rows_entry_kv(dk: u32, dv: u32, r: RowsLanes, g: RowsGroups) -> Option<&'static str> {
+    if dk != dv {
+        return match (dk, dv, r, g) {
+            (192, 128, RowsLanes::R8, RowsGroups::G8) => Some("flash_attn_rows_dk192_dv128_r8_g8"),
+            (576, 512, RowsLanes::R8, RowsGroups::G8) => Some("flash_attn_rows_dk576_dv512_r8_g8"),
+            _ => None,
+        };
+    }
+    rows_entry_equal(dk, r, g)
+}
+
+fn rows_entry_equal(d: u32, r: RowsLanes, g: RowsGroups) -> Option<&'static str> {
     macro_rules! at {
         ($d:literal) => {
             match (r, g) {
@@ -2047,14 +2414,7 @@ pub fn flash_attn_rows_with_lanes(
     groups: RowsGroups,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let entry = rows_entry(head_dim, lanes, groups).ok_or_else(|| {
-        if head_dim == 64 {
-            "flash_attn_rows: head dim 64 is instantiated only as flash_attn_rows_h64_r8_g8".to_string()
-        } else {
-            format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
-        }
-    })?;
-    let kv_capacity = validate_rows_attn_call(
+    flash_attn_rows_dispatch(
         rt,
         q,
         k,
@@ -2063,14 +2423,128 @@ pub fn flash_attn_rows_with_lanes(
         tkv,
         q_pos_offset,
         kv_pos_offset,
-        &dims,
+        dims,
         head_dim,
+        head_dim,
+        lanes,
+        groups,
         out_bf16,
-        "flash_attn_rows",
-    )?;
+    )
+}
+
+/// [`flash_attn_rows`] for a key head size and a value head size.
+///
+/// Equal sizes use [`rows_lanes_for`] and [`rows_groups_for`]. 192/128 and
+/// 576/512 are compiled at R=8, SGT=8. A pair with no kernel is named in the
+/// error and is not encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_rows_kv(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    key_dim: u32,
+    value_dim: u32,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let (lanes, groups) = if key_dim == value_dim {
+        (rows_lanes_for(key_dim), rows_groups_for(key_dim))
+    } else {
+        (RowsLanes::R8, RowsGroups::G8)
+    };
+    flash_attn_rows_dispatch(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        key_dim,
+        value_dim,
+        lanes,
+        groups,
+        out_bf16,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_rows_dispatch(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    key_dim: u32,
+    value_dim: u32,
+    lanes: RowsLanes,
+    groups: RowsGroups,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let entry = if key_dim == value_dim {
+        rows_entry(key_dim, lanes, groups)
+    } else {
+        rows_entry_kv(key_dim, value_dim, lanes, groups)
+    }
+    .ok_or_else(|| {
+        if key_dim != value_dim {
+            format!(
+                "flash_attn_rows: head pair {key_dim}/{value_dim} has no kernel \
+                 (equal 64, 128, 256, 512, or 192/128, 576/512)"
+            )
+        } else if key_dim == 64 {
+            "flash_attn_rows: head dim 64 is instantiated only as flash_attn_rows_h64_r8_g8".to_string()
+        } else {
+            format!("flash_attn_rows: head dim {key_dim} has no kernel (128, 256 or 512)")
+        }
+    })?;
+    let kv_capacity = if key_dim == value_dim {
+        validate_rows_attn_call(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            &dims,
+            key_dim,
+            out_bf16,
+            "flash_attn_rows",
+        )?
+    } else {
+        validate_rows_attn_pair(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            &dims,
+            key_dim,
+            value_dim,
+            out_bf16,
+            "flash_attn_rows",
+        )?
+    };
 
     // Rows per threadgroup is `SGT` simdgroups times 32/R rows each, so the
-    // grid depends on both values the kernel was compiled for.
+    // grid depends on both values the kernel was compiled for. The pipeline
+    // is resolved only after the entry and the buffers have been checked.
     let rows_per_tg = groups.count() * (32 / lanes.width());
     let groups_x = (dims.tq as usize).div_ceil(rows_per_tg);
     let groups_y = elems_product(&[dims.batch, dims.heads], "flash_attn_rows grid")?;
@@ -2092,6 +2566,31 @@ pub fn flash_attn_rows_with_lanes(
         set_u32(bnd, u32::from(out_bf16), 13);
         set_u32(bnd, kv_capacity, 14);
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_rows_attn_pair(
+    rt: &GpuRuntime,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: &AttnDims,
+    key_dim: u32,
+    value_dim: u32,
+    out_bf16: bool,
+    what: &str,
+) -> Result<u32, String> {
+    require_attn_runtime(rt, q, k, v, o, what)?;
+    let kv_capacity = validate_attn_storage_pair(dims, key_dim, value_dim, q, k, v, o, what, out_bf16)?;
+    validate_attn_live_scalar_aliases(dims, o, tkv, q_pos_offset, kv_pos_offset, what)?;
+    require::<u32>(rt, tkv, 1, format_args!("{what} tkv"))?;
+    require::<u32>(rt, q_pos_offset, 1, format_args!("{what} q_pos_offset"))?;
+    require::<u32>(rt, kv_pos_offset, 1, format_args!("{what} kv_pos_offset"))?;
+    Ok(kv_capacity)
 }
 
 /// Every check [`flash_attn_rows`]' buffer contract needs, for any kernel that
@@ -4821,10 +5320,12 @@ pub fn gemm_q4_mlx_tensorops_max_k(m: u32, n: u32, group_size: u32) -> u32 {
 }
 
 /// `Y[M, rows] = X[M, cols] @ W[rows, cols]^T` with MLX Q4 weights on the
-/// TensorOps matrix units. Qwen Q4 calls this when `M` exceeds
-/// [`GEMM_Q4_MLX_MAX_M`] (`Q4Weight::matmul`, `project_residual`). `M == 1`
-/// stays on [`gemv_q4_mlx_simd`] and `M` in `2..=8` stays on [`gemm_q4_mlx`].
-/// There is no M ceiling on this kernel. It has not been timed.
+/// TensorOps matrix units. Qwen Q4 calls this for every `M > 1`
+/// (`Q4Weight::matmul`). `M == 1` stays on [`gemv_q4_mlx_simd`]. The kernel
+/// has no fused residual, so that caller refuses `resid` when `M > 1` and the
+/// model adds it afterwards. There is no M ceiling on this kernel. Timed on
+/// `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512, 1024, 2048}. No
+/// speedup is claimed.
 ///
 /// Same bank, activation (bf16), output (f32) and shape arguments as
 /// [`gemm_q4_mlx`], row-major bank only (no `layout`, no `resid`). The kernel
@@ -5041,10 +5542,11 @@ fn row_reduce(
 /// The same is true of Int4: `metal::int4b_format` exists in the shading
 /// language and TensorOps accepts it. The shader-side constructor takes a
 /// `device uchar *` handle, right operand only. The GEMM is
-/// [`gemm_q4_mlx_tensorops`], and Qwen Q4 calls it when `M` exceeds
-/// [`GEMM_Q4_MLX_MAX_M`].
+/// [`gemm_q4_mlx_tensorops`], and Qwen Q4 calls it for every `M > 1`.
 /// `QUANT_PREFILL_GEMM_WIRED` in `mtl_tensor` stays false for the host
-/// `MTLTensor` Int4 descriptor path, and because that Q4 kernel is not yet timed.
+/// `MTLTensor` Int4 descriptor path. That Q4 kernel was timed on
+/// `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512, 1024, 2048}.
+/// No speedup is claimed.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_i8_dequant(
     rt: &Arc<GpuRuntime>,
@@ -5129,6 +5631,11 @@ pub fn gemm_i8_dequant(
     })
 }
 
+pub use crate::i8_pipeline::{
+    gemm_i8, gemm_w4a8, gqa_decode, i8_gemm_pipeline_name, quantize_i8_rows, I8AScale, I8BLayout, I8BScale, I8Gemm,
+    I8Out, W4Arm, W4Gemm, ATTENTION_HEAD_DIMS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5159,12 +5666,19 @@ mod tests {
         for d in [64u32, 96, 128, 256, 512] {
             for r in lanes {
                 for c in chunks {
-                    let want = matches!(d, 128 | 256 | 512).then(|| {
-                        (
+                    let want = if matches!(d, 128 | 256 | 512) {
+                        Some((
                             format!("flash_attn_decode_partial_h{d}_c{}_r{}", c.keys(), r.width()),
                             format!("flash_attn_decode_reduce_h{d}_c{}", c.keys()),
-                        )
-                    });
+                        ))
+                    } else if d == 64 && c == DecodeChunk::C256 && r == RowsLanes::R8 {
+                        Some((
+                            "flash_attn_decode_partial_h64_c256_r8".to_string(),
+                            "flash_attn_decode_reduce_h64_c256".to_string(),
+                        ))
+                    } else {
+                        None
+                    };
                     let got = decode_entries(d, c, r).map(|(p, q)| (p.to_string(), q.to_string()));
                     assert_eq!(got, want, "decode d={d} c={} r={}", c.keys(), r.width());
                 }
@@ -5176,5 +5690,45 @@ mod tests {
                 }
             }
         }
+        let rows_src = include_str!("../kernels/flash_attn_rows.metal");
+        let decode_src = include_str!("../kernels/flash_attn_decode.metal");
+        let rows_unequal = [
+            (
+                192,
+                128,
+                "flash_attn_rows_dk192_dv128_r8_g8",
+                "ROWS_KERNEL_KV(flash_attn_rows_dk192_dv128_r8_g8, 192, 128, 8, 8)",
+            ),
+            (
+                576,
+                512,
+                "flash_attn_rows_dk576_dv512_r8_g8",
+                "ROWS_KERNEL_KV(flash_attn_rows_dk576_dv512_r8_g8, 576, 512, 8, 8)",
+            ),
+        ];
+        for (dk, dv, name, line) in rows_unequal {
+            assert_eq!(rows_entry_kv(dk, dv, RowsLanes::R8, RowsGroups::G8), Some(name));
+            assert!(rows_src.contains(line), "rows shader is missing {line}");
+            assert!(rows_entry_kv(dk, dv, RowsLanes::R32, RowsGroups::G8).is_none());
+        }
+        assert!(rows_entry_kv(96, 80, RowsLanes::R8, RowsGroups::G8).is_none());
+        let (partial, reduce) = decode_entries_kv(192, 128, DecodeChunk::C256, RowsLanes::R8).unwrap();
+        assert_eq!(partial, "flash_attn_decode_partial_dk192_dv128_c256_r8");
+        assert_eq!(reduce, "flash_attn_decode_reduce_h128_c256");
+        assert!(
+            decode_src.contains("DECODE_PARTIAL_KV(flash_attn_decode_partial_dk192_dv128_c256_r8, 192, 128, 256, 8)")
+        );
+        let (partial, reduce) = decode_entries_kv(576, 512, DecodeChunk::C128, RowsLanes::R16).unwrap();
+        assert_eq!(partial, "flash_attn_decode_partial_dk576_dv512_c128_r16");
+        assert_eq!(reduce, "flash_attn_decode_reduce_h512_c128");
+        assert!(
+            decode_src.contains("DECODE_PARTIAL_KV(flash_attn_decode_partial_dk576_dv512_c128_r16, 576, 512, 128, 16)")
+        );
+        assert!(decode_src.contains("DECODE_PARTIAL_KERNEL(flash_attn_decode_partial_h64_c256_r8, 64, 256, 8)"));
+        assert!(decode_src.contains("DECODE_REDUCE_KERNEL(flash_attn_decode_reduce_h64_c256, 64, 256)"));
+        assert!(decode_entries_kv(576, 512, DecodeChunk::C128, RowsLanes::R32).is_none());
+        assert!(decode_entries_kv(96, 80, DecodeChunk::C256, RowsLanes::R8).is_none());
+        assert!(decode_entries(64, DecodeChunk::C128, RowsLanes::R8).is_none());
+        assert!(decode_entries(64, DecodeChunk::C256, RowsLanes::R16).is_none());
     }
 }

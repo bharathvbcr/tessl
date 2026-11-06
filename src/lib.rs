@@ -107,11 +107,13 @@
 //!
 //! # Kernels
 //!
-//! 40 Metal sources compile to 326 kernel entry points: RMSNorm, gated MLP
+//! 45 Metal sources compile to 366 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
-//! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, an exact int8 GEMM, KV
-//! cache stores, embedding lookup, row-wise softmax/sum/max, and softcap
-//! sampling. [`nn`] exposes them through 91 shape-checked functions. The
+//! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV and a per-group matmul2d
+//! GEMM, an exact int8×int8 GEMM, W4A8, decode-only GQA, a fixed-order f32
+//! GEMM, KV cache stores, embedding lookup, row-wise
+//! softmax/sum/max, and softcap sampling. [`nn`] exposes them through 95
+//! shape-checked functions. The
 //! Qwen3.5 layer kernels — the gated delta net (chunked prefill and
 //! snapshot-reading decode), its causal conv and gated norm, the attention
 //! extras, and answer-row scoring — are in [`qwen35`], and the whole
@@ -240,8 +242,8 @@ pub mod bert;
 pub mod capi;
 pub mod capi_embedgemma2;
 pub mod cb_replay;
-pub mod conv;
 mod config_json;
+pub mod conv;
 pub mod cross_entropy;
 pub mod decode_icb;
 pub mod dispatch;
@@ -256,6 +258,7 @@ pub mod embedgemma2_vision;
 mod encode_batch;
 pub mod gdn_train;
 pub mod gemm;
+mod i8_pipeline;
 pub mod icb_smoke;
 pub mod infer_trace;
 mod loader;

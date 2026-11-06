@@ -62,11 +62,12 @@ impl QuantDType {
 ///
 /// `MTLTensorDataType::Int4` is not bound in objc2-metal 0.3, which gates only the
 /// host-created `MTLTensor` descriptor path; TensorOps itself accepts
-/// `int4b_format`. Qwen Q4 with `M > 8` calls
-/// [`crate::nn::gemm_q4_mlx_tensorops`]. `M == 1` stays on `gemv_q4_mlx_simd`
-/// and `M` in `2..=8` stays on `gemm_q4_mlx`. [`QUANT_PREFILL_GEMM_WIRED`] stays
-/// false because this module's host descriptor path is not that GEMM and the
-/// kernel has not been timed.
+/// `int4b_format`. Qwen Q4 with `M > 1` calls
+/// [`crate::nn::gemm_q4_mlx_tensorops`]. `M == 1` stays on `gemv_q4_mlx_simd`.
+/// A fused residual for `M > 1` is a separate add. [`QUANT_PREFILL_GEMM_WIRED`]
+/// stays false because this module's host descriptor path is not that GEMM.
+/// The kernel was timed on `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256,
+/// 512, 1024, 2048}. No speedup is claimed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NaxVerifyReadiness {
     pub int8_tensorops_dtype: bool,
@@ -84,12 +85,14 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         fp8_e8m0_tensorops_dtype: QuantDType::Fp8E8M0.to_mtl().is_ok(),
         // Const, not a call into a stub that returns `Err` so this can read
         // `.is_ok()` off it. The host MTLTensor Int4 path is unwired. Qwen Q4
-        // with M>8 calls gemm_q4_mlx_tensorops; that kernel is not yet timed.
+        // with M>1 calls gemm_q4_mlx_tensorops. That kernel was timed on
+        // (M, 4096, 4096) for M in {1, 16, 64, 128, 256, 512, 1024, 2048}.
+        // No speedup is claimed.
         quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
         note: "MTLTensorDataType::Int4 is not bound in objc2-metal 0.3, which gates only host-created MTLTensor \
-               descriptors (TensorOps itself accepts int4b_format). Qwen Q4 with M>8 calls nn::gemm_q4_mlx_tensorops; \
-               M==1 stays on gemv_q4_mlx_simd and M in 2..=8 stays on gemm_q4_mlx. QUANT_PREFILL_GEMM_WIRED stays false \
-               because that host descriptor path is unwired and the TensorOps Q4 GEMM is not yet timed.",
+               descriptors (TensorOps itself accepts int4b_format). Qwen Q4 with M>1 calls nn::gemm_q4_mlx_tensorops; \
+               M==1 stays on gemv_q4_mlx_simd. A fused residual for M>1 is a separate add. QUANT_PREFILL_GEMM_WIRED \
+               stays false because that host descriptor path is unwired. The TensorOps Q4 GEMM was timed on (M, 4096, 4096) for M in {1, 16, 64, 128, 256, 512, 1024, 2048}. No speedup is claimed.",
     }
 }
 
@@ -138,11 +141,12 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 ///
 /// That GEMM is [`crate::nn::gemm_q4_mlx_tensorops`]
 /// (`kernels/gemm_q4_mlx_tensorops.metal`, in-kernel `xsum`). Qwen Q4 with
-/// `M>8` calls it (`Q4Weight::matmul`, `project_residual`). `M==1` stays on
-/// `gemv_q4_mlx_simd` and `M` in `2..=8` stays on `gemm_q4_mlx`. This flag
-/// stays `false` because the host `MTLTensor` descriptor path still has no
-/// Int4 constructor, and because the routed kernel has not been timed. It
-/// does not mean the Qwen route is unwired.
+/// `M>1` calls it (`Q4Weight::matmul`, `project_residual`). `M==1` stays on
+/// `gemv_q4_mlx_simd`. A fused residual for `M>1` is a separate add: the
+/// cooperative kernel has none. This flag stays `false` because the host
+/// `MTLTensor` descriptor path still has no Int4 constructor. The routed
+/// kernel was timed on `(M, 4096, 4096)` for M in {1, 16, 64, 128, 256, 512,
+/// 1024, 2048}. No speedup is claimed. It does not mean the Qwen route is unwired.
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
@@ -645,7 +649,7 @@ mod tests {
         assert!(r.note.contains("host-created MTLTensor"), "{}", r.note);
         assert!(r.note.contains("int4b_format"), "{}", r.note);
         assert!(r.note.contains("gemm_q4_mlx_tensorops"), "{}", r.note);
-        assert!(r.note.contains("M>8"), "{}", r.note);
+        assert!(r.note.contains("M>1"), "{}", r.note);
         assert!(!r.note.contains("TensorOps Q4 not shipped"), "{}", r.note);
         assert!(
             !r.note.contains("no quantized TensorOps prefill GEMM is wired"),

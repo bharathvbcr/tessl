@@ -139,6 +139,10 @@ name = "bench_gemm_sweep"
 path = "src/bin/bench_gemm_sweep.rs"
 
 [[bin]]
+name = "bench_gemm_i8"
+path = "src/bin/bench_gemm_i8.rs"
+
+[[bin]]
 name = "bench_gemm_tnnt_tune"
 path = "src/bin/bench_gemm_tnnt_tune.rs"
 

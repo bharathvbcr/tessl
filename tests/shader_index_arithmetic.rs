@@ -12,6 +12,7 @@ const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
 const GEMM_Q4_MLX: &str = include_str!("../kernels/gemm_q4_mlx.metal");
 const GEMM_Q4_MLX_TENSOROPS: &str = include_str!("../kernels/gemm_q4_mlx_tensorops.metal");
+const GEMM_Q8_TENSOROPS: &str = include_str!("../kernels/gemm_q8_tensorops.metal");
 /// The simdgroup GEMV / GEMM bodies the `*_simd*` entries of the two files above delegate to.
 const GEMV_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemv_q4_mlx_simd.h");
 const GEMM_Q4_MLX_SIMD_H: &str = include_str!("../kernels/gemm_q4_mlx_simd.h");
@@ -75,6 +76,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "gdn_train.metal",
     "gemm_q4_mlx.metal",
     "gemm_q4_mlx_tensorops.metal",
+    "gemm_q8_tensorops.metal",
     "gemv_q4.metal",
     "gemv_q4_mlx.metal",
     "gemv_q8.metal",
@@ -130,6 +132,13 @@ const EXEMPT_KERNELS: &[(&str, &str)] = &[
          representability is the `dispatch.rs` guard already required below.",
     ),
     ("mlp_silu.metal", "Elementwise over a 1D grid, as mlp_gelu_tanh.metal."),
+    (
+        "matmul_fixed_order.metal",
+        "One output per thread. Every address is a ulong product of the \
+         uint extents. The only host entry points are gemm_fixed_order_nn, \
+         gemm_fixed_order_tn and gemm_fixed_order_nt, and each refuses an \
+         operand over i32::MAX elements through validate_gemm.",
+    ),
 ];
 
 fn require(source: &str, fragment: &str, label: &str) {
@@ -1233,6 +1242,52 @@ fn gemm_q4_mlx_tensorops_ints_are_bounded_by_the_host_extent_guard() {
     );
     assert!(
         entry.find("require_i32_extent").unwrap() < entry.find("bank.validate").unwrap(),
+        "the extent guard must run before the buffer-length checks"
+    );
+}
+
+/// `gemm_q8_tensorops_g*` indexes in `int` (extents, strides, the scale and
+/// zero tables at `n * groups + g`) and widens the activation row base. The
+/// entry refuses every product it forms over `i32::MAX` before any buffer
+/// length or encode.
+#[test]
+fn gemm_q8_tensorops_ints_are_bounded_by_the_host_extent_guard() {
+    require(
+        GEMM_Q8_TENSOROPS,
+        "A + (long)row * K",
+        "Q8 TensorOps activation row base",
+    );
+    require(GEMM_Q8_TENSOROPS, "scales[n * groups + g]", "Q8 TensorOps scale table");
+    require(GEMM_Q8_TENSOROPS, "zeros[n * groups + g]", "Q8 TensorOps zero table");
+    require(
+        GEMM_Q8_TENSOROPS,
+        "dextents<int32_t, 2>{K, N}",
+        "Q8 TensorOps weight extents",
+    );
+    let entry = NN_RS
+        .split("pub fn gemm_q8_tensorops(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("gemm_q8_tensorops body");
+    let guard = entry
+        .split("require::<i8>")
+        .next()
+        .expect("guard precedes the buffer-length checks");
+    for products in [
+        "elems(m, k, WHAT)?",
+        "elems(n, k, WHAT)?",
+        "elems(m, n, WHAT)?",
+        "elems(n, groups, WHAT)?",
+    ] {
+        require(guard, products, "gemm_q8_tensorops extent guard");
+    }
+    require(
+        entry,
+        "crate::gemm::require_i32_extent(numel, what)?",
+        "gemm_q8_tensorops extent guard",
+    );
+    assert!(
+        entry.find("require_i32_extent").unwrap() < entry.find("require::<i8>").unwrap(),
         "the extent guard must run before the buffer-length checks"
     );
 }

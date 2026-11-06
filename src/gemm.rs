@@ -2204,6 +2204,44 @@ fn dispatch_k_partitions(
     Ok(())
 }
 
+/// Fixed-order f32 GEMM. Each output is `acc = +0`, then `acc = acc + (a * b)`
+/// for `k` ascending. The kernel is compiled with contraction off, so the
+/// multiply and the add are two roundings and not an FMA. One thread writes
+/// one output, so the reduction is not split and the bits do not depend on
+/// the grid. This is not [`GemmBackend::TensorOps`] and not
+/// [`GemmBackend::Simdgroup`]: those match this fold on short K and disagree
+/// on order-sensitive products whose K fills a hardware chunk.
+fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: &str) -> Result<(), String> {
+    let (m, n, _k) = validate_gemm(a, b, c, layout, false, kernel)?;
+    let rt = a.runtime();
+    let pipeline = rt.pipeline(kernel)?;
+    let (m_u, n_u, k_u) = (m as u32, n as u32, _k as u32);
+    // Columns along x, rows along y: one thread per output.
+    crate::dispatch::dispatch_2d(rt, &pipeline, n, m, |bnd| {
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
+        bnd.bind_u32(m_u, 3);
+        bnd.bind_u32(n_u, 4);
+        bnd.bind_u32(k_u, 5);
+    })
+}
+
+/// `C[M,N] = A[M,K] @ B[K,N]`, fixed order. See [`gemm_fixed_order`].
+pub fn gemm_fixed_order_nn(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
+    gemm_fixed_order(a, b, c, Layout::NN, "matmul_fixed_order_nn_f32")
+}
+
+/// `C[M,N] = A[K,M]^T @ B[K,N]`, fixed order. See [`gemm_fixed_order`].
+pub fn gemm_fixed_order_tn(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
+    gemm_fixed_order(a_km, b_kn, c, Layout::TN, "matmul_fixed_order_tn_f32")
+}
+
+/// `C[M,N] = A[M,K] @ B[N,K]^T`, fixed order. See [`gemm_fixed_order`].
+pub fn gemm_fixed_order_nt(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
+    gemm_fixed_order(a_mk, b_nk, c, Layout::NT, "matmul_fixed_order_nt_f32")
+}
+
 /// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
 pub fn gemm_nt_f32(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<(), String> {
     let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false, "gemm_nt_f32")?;

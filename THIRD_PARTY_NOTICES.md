@@ -73,3 +73,27 @@ We specifically permit and encourage the use of this software as the basis of
 commercial products, provided that all warranty or liability claims are
 assumed by the product vendor.
 ```
+
+## Design references (not copied sources)
+
+The int8 and int4 TensorOps path (`kernels/i8_w8a8.metal`,
+`kernels/w4a8_tensorops.metal`, `kernels/i8_tile_walk.h`, `src/i8_pipeline.rs`)
+and decode-only GQA (`kernels/gqa_decode.metal`) were written in this
+repository. No Cider, MLX, or llama.cpp `.metal` source is copied into
+`kernels/`.
+
+- **Cider** — MIT License, Mininglamp Technology,
+  <https://github.com/Mininglamp-AI/cider>. Design reference for the W8A8
+  pipeline: per-row absmax int8 activation quantize (`scale = max/127`),
+  int32 `matmul2d` with a fused dequant epilogue, per-group scales flushed in
+  ascending group order, a small-M tile and an int8 GEMV, W4A8 zero-point-8
+  nibble unpack beside `int4b_format`, and decode-only GQA kept off the
+  prefill path.
+- **MLX** — <https://github.com/ml-explore/mlx>. Design reference for Steel
+  GEMM, `nax.h` on M5, the Q4 and Q8 layouts Tessl already mirrors, and SDPA.
+  MLX has no W8A8 TensorOps matmul; its quantized kernels dequantize to
+  floating point first.
+- **llama.cpp `ggml-metal`** — <https://github.com/ggml-org/llama.cpp>.
+  Design reference for instantiating every attention head dimension the
+  runtime accepts (here 32, 64, 128, 256, and 512) and refusing any other
+  dimension by name before dispatch, instead of aborting inside a kernel.

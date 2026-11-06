@@ -24,7 +24,10 @@ inline void gqa_decode_body(device float *Q, device float *K, device float *V, d
     device float *q = Q + ((ulong)b * q_heads + h) * D;
     device float *o = O + ((ulong)b * q_heads + h) * D;
 
-    float m = -INFINITY;
+    // -FLT_MAX, not -INFINITY: kernels compile with fast math, which may assume
+    // no value is infinite, so a compare against it is poison. For finite
+    // scores fmax(-FLT_MAX, x) == x, and kv_len == 0 skips every loop.
+    float m = -FLT_MAX;
     for (uint t = 0u; t < kv_len; ++t) {
         device float *k = K + (((ulong)b * kv_len + t) * kv_heads + kv_h) * D;
         float dot = 0.0f;

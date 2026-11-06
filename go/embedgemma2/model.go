@@ -68,7 +68,8 @@ type Options struct {
 	// against 1.7 GB), which refuses every image, audio and video call.
 	TextOnly bool
 	// Observer, if set, is called once after every call that reaches the
-	// engine, from the calling goroutine, with what the call cost. It must not
+	// engine, from the calling goroutine (for SetMaxTokens, from a goroutine it
+	// starts, which may outlive a caller whose context ended), with what the call cost. It must not
 	// call back into the Model.
 	Observer func(CallInfo)
 }
@@ -111,6 +112,9 @@ type CallInfo struct {
 //     deadline all the same, returning ctx.Err(); the result is discarded and
 //     the worker's permit returns only when the work stops, so abandoned work
 //     never exceeds one call in flight per Model.
+//   - SetMaxTokens is the exception to "the result is discarded": a limit it
+//     set is applied and cached whatever happens to the caller (see
+//     SetMaxTokens).
 //   - Request data stays valid for the abandoned work: gusset holds the buffer
 //     it travelled in until the job ends.
 type Model struct {
@@ -128,6 +132,13 @@ type Model struct {
 	prompts   *Prompts
 
 	maxTokens atomic.Int64
+
+	// setMu serialises SetMaxTokens: the engine applies limits in the order the
+	// calls take it, and the cache follows that same order.
+	setMu sync.Mutex
+
+	// send, when set, replaces the round trip to the worker. Only tests set it.
+	send func(ctx context.Context, op string, code uint32, f *wire.Frame) (wire.Reply, error)
 }
 
 // Load reads the snapshot directory snapshotDir (a Hugging Face snapshot of
@@ -242,13 +253,59 @@ func (m *Model) MaxTokens() int { return int(m.maxTokens.Load()) }
 
 // SetMaxTokens raises or lowers the per-sequence token limit, from 1 to 32768.
 // It bounds the image and audio sequences of the multimodal calls too.
+//
+// MaxTokens always reports the limit the engine enforces. SetMaxTokens calls are
+// serialised, the engine applies them in the order they take that turn, and the
+// cached value is updated in the same turn as the engine's reply, so it ends on
+// the limit applied last, not the one whose caller returned last.
+//
+// The caller is released when ctx ends, like any call (see Cancellation), but a
+// limit change is not abandoned with it: once the call has taken its turn, the
+// request runs to completion under the engine and the cache follows it. So a
+// SetMaxTokens that returns a context error may or may not have changed the
+// limit; MaxTokens shows which as soon as the worker has answered, and a request
+// that had not taken its turn when ctx ended is dropped and never changes it.
+// Only a nil return guarantees the new limit.
 func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 	const op = "SetMaxTokens"
 	if n < 1 || n > maxTokensLimit {
 		return argErr(op, "n", "%d is outside 1..=%d", n, maxTokensLimit)
 	}
+	if ctx == nil {
+		return argErr(op, "ctx", "is nil")
+	}
+	if ctx.Done() == nil {
+		return m.applyMaxTokens(ctx, n)
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.applyMaxTokens(ctx, n) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-done:
+			return err
+		default:
+		}
+		return fmt.Errorf("embedgemma2: %s: %w", op, ctx.Err())
+	}
+}
+
+// applyMaxTokens is SetMaxTokens's turn on the engine. It holds setMu from the
+// request until the cache is updated, and hands the engine a context that ends
+// only with the call: gusset drops the reply of a call whose context ended
+// after the worker began it, and the limit would then be applied with the
+// cache none the wiser.
+func (m *Model) applyMaxTokens(ctx context.Context, n int) error {
+	const op = "SetMaxTokens"
+	m.setMu.Lock()
+	defer m.setMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("embedgemma2: %s: %w", op, err)
+	}
 	f := new(wire.Frame).U32(uint32(n))
-	if _, err := m.call(ctx, op, wire.OpSetMaxTokens, f); err != nil {
+	if _, err := m.call(context.WithoutCancel(ctx), op, wire.OpSetMaxTokens, f); err != nil {
 		return err
 	}
 	m.maxTokens.Store(int64(n))
@@ -373,6 +430,9 @@ func (m *Model) call(ctx context.Context, op string, code uint32, f *wire.Frame)
 	}
 	if dead := m.dead.Load(); dead != nil {
 		return wire.Reply{}, fmt.Errorf("embedgemma2: %s: the model is unusable, Close it and Load again: %w", op, *dead)
+	}
+	if m.send != nil {
+		return m.send(ctx, op, code, f)
 	}
 	return m.roundTrip(ctx, op, code, f)
 }

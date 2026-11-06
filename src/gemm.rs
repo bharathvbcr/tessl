@@ -2227,17 +2227,17 @@ fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: 
     })
 }
 
-/// `C[M,N] = A[M,K] @ B[K,N]`, fixed order. See [`gemm_fixed_order`].
+/// `C[M,N] = A[M,K] @ B[K,N]`, fixed order. See `gemm_fixed_order`.
 pub fn gemm_fixed_order_nn(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a, b, c, Layout::NN, "matmul_fixed_order_nn_f32")
 }
 
-/// `C[M,N] = A[K,M]^T @ B[K,N]`, fixed order. See [`gemm_fixed_order`].
+/// `C[M,N] = A[K,M]^T @ B[K,N]`, fixed order. See `gemm_fixed_order`.
 pub fn gemm_fixed_order_tn(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a_km, b_kn, c, Layout::TN, "matmul_fixed_order_tn_f32")
 }
 
-/// `C[M,N] = A[M,K] @ B[N,K]^T`, fixed order. See [`gemm_fixed_order`].
+/// `C[M,N] = A[M,K] @ B[N,K]^T`, fixed order. See `gemm_fixed_order`.
 pub fn gemm_fixed_order_nt(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a_mk, b_nk, c, Layout::NT, "matmul_fixed_order_nt_f32")
 }

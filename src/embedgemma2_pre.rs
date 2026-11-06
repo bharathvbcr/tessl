@@ -1307,9 +1307,9 @@ pub fn sample_frame_indices(cfg: &VideoConfig, total_frames: usize, source_fps: 
 }
 
 /// [`sample_frame_indices`] with the video's `duration` given (the container's
-/// own figure is not always `total / fps` to the last bit). `total_frames` and
-/// `source_fps` are already checked by the caller to be nonzero and positive
-/// finite; the duration is checked here through the count it yields.
+/// own figure is not always `total / fps` to the last bit). Every input is
+/// checked here: nonzero frames, positive finite source fps, `max_frames`, target
+/// fps and duration, and a grid count that fits `usize`.
 pub(crate) fn sample_grid(
     cfg: &VideoConfig,
     total_frames: usize,
@@ -1325,6 +1325,14 @@ pub(crate) fn sample_grid(
     }
     if cfg.max_frames == 0 {
         return Err(format!("{WHAT}: max_frames is zero"));
+    }
+    if let Some(fps) = cfg.fps {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Err(format!("{WHAT}: fps must be positive, got {fps}"));
+        }
+    }
+    if !(duration.is_finite() && duration > 0.0) {
+        return Err(format!("{WHAT}: duration must be positive, got {duration}"));
     }
     // 2^64: the first float a `usize` cannot hold.
     const USIZE_LIMIT: f64 = 18_446_744_073_709_551_616.0;
@@ -2100,7 +2108,11 @@ mod tests {
                 rng.log(1.0, 10_000.0) as usize
             }
             .max(1);
-            let overflow = if rng.below(2) == 0 { Overflow::Uniform } else { Overflow::Truncate };
+            let overflow = if rng.below(2) == 0 {
+                Overflow::Uniform
+            } else {
+                Overflow::Truncate
+            };
             let cfg = cfg_with(fps, max_frames, overflow);
             let grid = fps.map_or(total as f64, |f| total as f64 / rate * f);
             if grid > 1e6 {
@@ -2137,7 +2149,7 @@ mod tests {
 
     #[test]
     fn adversarial_float_edges_never_panic_or_escape_the_video() {
-        let tiny = [f64::MIN_POSITIVE, 5e-324, 1e-300, 1e-9, 0.0, -0.0, -1.0, -1e300];
+        let tiny = [f64::MIN_POSITIVE, 5e-324, 1e-300, 1e-9];
         for overflow in [Overflow::Uniform, Overflow::Truncate] {
             for fps in tiny {
                 let cfg = cfg_with(Some(fps), 8, overflow);
@@ -2145,6 +2157,14 @@ mod tests {
                 let got = sample_frame_indices(&cfg, 100, 30.0).unwrap();
                 assert_eq!(got, old_sample_frame_indices(&cfg, 100, 30.0), "fps {fps}");
                 assert!(!got.is_empty() && got.len() <= 8 && got.iter().all(|&i| i < 100));
+            }
+            // A zero or negative target fps is no rate: refused (the contract
+            // changed from accepting it as a one-frame grid).
+            for fps in [0.0, -0.0, -1.0, -1e300] {
+                let cfg = cfg_with(Some(fps), 8, overflow);
+                let err = sample_frame_indices(&cfg, 100, 30.0).unwrap_err();
+                assert!(err.contains("fps must be positive"), "fps {fps}: {err}");
+                assert!(video_soft_tokens(&cfg, 64, 64, 100, 30.0).is_err(), "fps {fps}");
             }
             // A non-finite grid count is refused, never saturated.
             for fps in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
@@ -2158,11 +2178,16 @@ mod tests {
     #[test]
     fn adversarial_disagreeing_duration_is_bounded() {
         let cfg = cfg_with(Some(1.0), 8, Overflow::Uniform);
-        for duration in [0.0, -0.0, -5.0, 1e-300, 5e-324, 1e10, 1e18, 1e19] {
+        for duration in [1e-300, 5e-324, 1e10, 1e18, 1e19] {
             let got = sample_grid(&cfg, 100, 30.0, duration).unwrap();
-            assert!(!got.is_empty() && got.len() <= 8 && got.iter().all(|&i| i < 100), "{duration}: {got:?}");
+            assert!(
+                !got.is_empty() && got.len() <= 8 && got.iter().all(|&i| i < 100),
+                "{duration}: {got:?}"
+            );
         }
-        for duration in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY.abs(), 1e300, 2e19] {
+        // Zero and negative durations are refused too (the decoder only reports
+        // a positive finite one), as are non-finite and over-large ones.
+        for duration in [0.0, -0.0, -5.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300, 2e19] {
             assert!(sample_grid(&cfg, 100, 30.0, duration).is_err(), "{duration}");
         }
         // Zero/NaN/inf source fps and zero frames are refused here too.
@@ -2188,9 +2213,7 @@ mod tests {
                     grid = match overflow {
                         Overflow::Truncate => grid[..max_frames].to_vec(),
                         Overflow::Uniform if max_frames == 1 => vec![grid[0]],
-                        Overflow::Uniform => {
-                            linspace_indices(n, max_frames).into_iter().map(|i| grid[i]).collect()
-                        }
+                        Overflow::Uniform => linspace_indices(n, max_frames).into_iter().map(|i| grid[i]).collect(),
                     };
                 }
                 assert_eq!(sample_grid(&cfg, total, rate, duration).unwrap(), grid);
@@ -2222,7 +2245,10 @@ mod tests {
                         }
                     };
                     assert!(!got.is_empty() && got.len() <= max_frames, "{total} {rate} {fps}");
-                    assert!(got.iter().all(|&i| i < total), "{total} {rate} {fps} {max_frames}: {got:?}");
+                    assert!(
+                        got.iter().all(|&i| i < total),
+                        "{total} {rate} {fps} {max_frames}: {got:?}"
+                    );
                     assert!(got.windows(2).all(|w| w[0] <= w[1]), "{total} {rate} {fps}: {got:?}");
                     assert_eq!(got[0], 0);
                 }

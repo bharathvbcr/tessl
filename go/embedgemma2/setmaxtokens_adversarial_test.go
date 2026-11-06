@@ -5,8 +5,6 @@ package embedgemma2
 import (
 	"context"
 	"errors"
-	"os"
-	"os/exec"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -27,7 +25,7 @@ func waitFor(d time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// Attack 1: a Close that lands while helpers are queued on setMu. The helpers
+// Attack 1: a Close that lands while helpers are waiting for their turn. The callers
 // must leave with ErrClosed, never touch the engine, and not leak.
 func TestUnitAdversarialCloseWhileSetMaxTokensQueuedLeavesNoGoroutinesAndKeepsTheLimit(t *testing.T) {
 	e := &fakeEngine{started: make(chan struct{}), release: make(chan struct{})}
@@ -43,7 +41,7 @@ func TestUnitAdversarialCloseWhileSetMaxTokensQueuedLeavesNoGoroutinesAndKeepsTh
 			<-e.started
 		}
 	}
-	time.Sleep(20 * time.Millisecond) // 16 helpers now wait on setMu
+	time.Sleep(20 * time.Millisecond) // 16 callers now wait for the turn
 	m.closed.Store(true)              // what Close does first
 	close(e.release)                  // the running job finishes
 	var closedErrs int
@@ -202,10 +200,9 @@ func TestUnitAdversarialFailedDeadAndPanickingEngineLeaveTheCacheAndTheLock(t *t
 		defer func() { _ = recover() }()
 		_ = m.SetMaxTokens(context.Background(), 6)
 	}()
-	if !m.setMu.TryLock() {
-		t.Fatal("setMu still held after a panic on the inline path")
+	if len(m.setTurn) != 0 {
+		t.Fatal("the turn is still held after a panic on the inline path")
 	}
-	m.setMu.Unlock()
 	dead := errors.New("dead")
 	m.dead.Store(&dead)
 	m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) {
@@ -215,30 +212,6 @@ func TestUnitAdversarialFailedDeadAndPanickingEngineLeaveTheCacheAndTheLock(t *t
 	if err := m.SetMaxTokens(ctx, 6); !errors.Is(err, dead) || m.MaxTokens() != 8192 {
 		t.Fatalf("dead: %v limit %d", err, m.MaxTokens())
 	}
-}
-
-// A panic in the engine call (in practice: a user's Observer, which roundTrip
-// runs in a defer) on the helper path kills the process: the caller cannot
-// recover it, as it could when the call ran on its own goroutine.
-func TestUnitAdversarialPanicOnTheHelperPathIsNotRecoverableByTheCaller(t *testing.T) {
-	if os.Getenv("TESSL_ADV_PANIC") == "1" {
-		m := bare()
-		m.maxTokens.Store(8192)
-		m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) { panic("observer panic") }
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		defer func() { _ = recover(); os.Exit(0) }() // survived: the caller recovered it
-		_ = m.SetMaxTokens(ctx, 6)
-		os.Exit(0)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestUnitAdversarialPanicOnTheHelperPathIsNotRecoverableByTheCaller$")
-	cmd.Env = append(os.Environ(), "TESSL_ADV_PANIC=1")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Skip("panic was recoverable by the caller")
-	}
-	t.Logf("a caller-side recover does not catch a panic on the helper path (child exited: %v)", err)
-	_ = out
 }
 
 // Ordering: sequential calls from one goroutine, some cancelled while the

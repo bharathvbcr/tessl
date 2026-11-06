@@ -3,9 +3,14 @@
 package embedgemma2
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"math/rand/v2"
+	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +74,7 @@ func modelOver(e *fakeEngine) *Model {
 }
 
 // settle waits for every SetMaxTokens already issued to finish its cache update.
-func settle(m *Model) { m.setMu.Lock(); m.setMu.Unlock() }
+func settle(m *Model) { m.setTurn <- struct{}{}; <-m.setTurn }
 
 func TestUnitSetMaxTokensCancelledAfterTheWorkerStartedKeepsTheCacheOnTheEngine(t *testing.T) {
 	e := &fakeEngine{started: make(chan struct{}), release: make(chan struct{})}
@@ -145,3 +150,102 @@ func TestUnitConcurrentCancelledSetMaxTokensEndsOnTheEnginesLastLimit(t *testing
 		t.Fatalf("MaxTokens() = %d, the engine enforces %d", got, want)
 	}
 }
+
+func TestUnitSetMaxTokensCancelledBeforeTheirTurnLeaveNoGoroutinesAndNeverReachTheEngine(t *testing.T) {
+	e := &fakeEngine{started: make(chan struct{}), release: make(chan struct{})}
+	m := modelOver(e)
+	base := runtime.NumGoroutine()
+	go func() { _ = m.SetMaxTokens(context.Background(), 7) }()
+	<-e.started // the turn is held by a long call
+	var wg sync.WaitGroup
+	for i := 0; i < 2000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+			defer cancel()
+			if err := m.SetMaxTokens(ctx, 1000+i); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("got %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	// Only the long call's goroutine is left, and no helper was ever started.
+	if !waitFor(5*time.Second, func() bool { return runtime.NumGoroutine() <= base+1 }) {
+		t.Fatalf("%d goroutines over the baseline with the turn still held", runtime.NumGoroutine()-base)
+	}
+	close(e.release)
+	if !waitFor(5*time.Second, func() bool { return runtime.NumGoroutine() <= base }) {
+		t.Fatalf("%d goroutines over the baseline after the long call", runtime.NumGoroutine()-base)
+	}
+	if m.MaxTokens() != 7 || e.enforced() != 7 {
+		t.Fatalf("cache %d engine %d: a call cancelled before its turn changed the limit", m.MaxTokens(), e.enforced())
+	}
+}
+
+func panickingModel() *Model {
+	m := bare()
+	m.maxTokens.Store(8192)
+	m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) { panic("observer panic") }
+	return m
+}
+
+func TestUnitSetMaxTokensPanicOnTheHelperPathReachesTheWaitingCaller(t *testing.T) {
+	m := panickingModel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		_ = m.SetMaxTokens(ctx, 6)
+	}()
+	if got != "observer panic" {
+		t.Fatalf("recovered %v, want the original panic value", got)
+	}
+	if len(m.setTurn) != 0 {
+		t.Fatal("the turn is still held")
+	}
+	if err := m.SetMaxTokens(context.Background(), 6); !errors.Is(err, ErrPanic) {
+		t.Fatalf("after a panic the model is %v, want ErrPanic", err)
+	}
+	if m.MaxTokens() != 8192 {
+		t.Fatalf("MaxTokens() = %d", m.MaxTokens())
+	}
+}
+
+func TestUnitSetMaxTokensPanicAfterTheCallerLeftIsLoggedAndReleasesTheTurn(t *testing.T) {
+	var logs bytes.Buffer
+	var lmu sync.Mutex
+	log.SetOutput(writerFunc(func(b []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(b) }))
+	defer log.SetOutput(os.Stderr)
+	m := bare()
+	m.maxTokens.Store(8192)
+	started, release := make(chan struct{}), make(chan struct{})
+	m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) {
+		close(started)
+		<-release
+		panic("late panic")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- m.SetMaxTokens(ctx, 6) }()
+	<-started
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	close(release)
+	if !waitFor(5*time.Second, func() bool { return len(m.setTurn) == 0 }) {
+		t.Fatal("the turn was not released")
+	}
+	if !waitFor(5*time.Second, func() bool { lmu.Lock(); defer lmu.Unlock(); return strings.Contains(logs.String(), "late panic") }) {
+		t.Fatal("the panic was not logged")
+	}
+	if err := m.SetMaxTokens(context.Background(), 6); !errors.Is(err, ErrPanic) {
+		t.Fatalf("after a panic the model is %v, want ErrPanic", err)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (w writerFunc) Write(b []byte) (int, error) { return w(b) }

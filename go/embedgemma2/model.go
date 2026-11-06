@@ -270,7 +270,9 @@ func (m *Model) MaxTokens() int { return int(m.maxTokens.Load()) }
 // SetMaxTokens that returns a context error after its turn may or may not have
 // changed the limit; MaxTokens shows which once the worker has answered. A call
 // whose ctx ended before it had its turn leaves no goroutine behind and never
-// reaches the engine. Only a nil return guarantees the new limit.
+// reaches the engine. A nil return means the engine applied n and the cache
+// followed it; a later or concurrent SetMaxTokens may already have replaced it,
+// so MaxTokens reports the last call applied, not necessarily this one.
 //
 // A panic in the engine call (in practice a panicking Options.Observer)
 // propagates like any call's, re-raised in the caller's goroutine if the caller
@@ -312,9 +314,14 @@ func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 	done := make(chan outcome, 1)
 	go func() {
 		var out outcome
+		finished := false
 		defer func() {
 			if p := recover(); p != nil {
 				out = outcome{panicked: true, value: p}
+			} else if !finished {
+				// runtime.Goexit (a testing.T.FailNow in an Observer): neither
+				// a return nor a panic, and never a success.
+				out = outcome{err: fmt.Errorf("embedgemma2: %s: the engine call exited without returning", op)}
 			}
 			<-m.setTurn
 			if state.CompareAndSwap(waiting, delivered) {
@@ -324,6 +331,7 @@ func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 			}
 		}()
 		out.err = m.applyMaxTokens(ctx, n)
+		finished = true
 	}()
 	var out outcome
 	select {

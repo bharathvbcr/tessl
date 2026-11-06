@@ -445,3 +445,152 @@ fn a_poisoned_pool_still_trims_its_free_list() {
     assert_eq!(rt.trim_free_list(), key as usize);
     assert_eq!((ledger.live(), ledger.cached(), ledger.unmatched()), (0, 0, 0));
 }
+
+// ---- adversarial: a ledger that panics on its Nth call ----
+
+/// Delegates to a `Fake`, panicking on the Nth call (counted from `arm`) of
+/// any ledger method, before the inner ledger sees it.
+struct Flaky {
+    inner: Arc<Fake>,
+    countdown: std::sync::atomic::AtomicI64,
+    only_release: bool,
+}
+
+impl Flaky {
+    fn new(inner: &Arc<Fake>, only_release: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            countdown: std::sync::atomic::AtomicI64::new(i64::MAX),
+            only_release,
+        })
+    }
+    fn arm(&self, nth: i64) {
+        self.countdown.store(nth, Ordering::SeqCst);
+    }
+    fn disarm(&self) {
+        self.countdown.store(i64::MAX, Ordering::SeqCst);
+    }
+    fn tick(&self) {
+        if self.countdown.fetch_sub(1, Ordering::SeqCst) == 1 {
+            panic!("flaky ledger: injected panic");
+        }
+    }
+}
+
+impl PoolLedger for Flaky {
+    fn try_charge(&self, class: LedgerClass, bytes: u64) -> Result<(), LedgerRefused> {
+        if !self.only_release {
+            self.tick();
+        }
+        self.inner.try_charge(class, bytes)
+    }
+    fn release(&self, class: LedgerClass, bytes: u64) {
+        self.tick();
+        self.inner.release(class, bytes)
+    }
+}
+
+fn freelist_bytes(rt: &GpuRuntime) -> u64 {
+    let pool = rt.pool.lock().unwrap_or_else(PoisonError::into_inner);
+    pool.freelist.iter().map(|(k, v)| (*k * v.len()) as u64).sum()
+}
+
+/// After a ledger panic at call `nth` of `op`, the recovered pool must never
+/// release a charge twice (`unmatched`), and the ledger's Cached balance must
+/// cover what the free list holds (no under-charge a later trim would trip).
+fn flaky_run(nth: i64, only_release: bool, op: impl Fn(&GpuRuntime)) -> (u64, u64, u64) {
+    let fake = Fake::new(u64::MAX);
+    let flaky = Flaky::new(&fake, only_release);
+    let rt = GpuRuntime::new().unwrap();
+    let as_dyn: Arc<dyn PoolLedger> = flaky.clone();
+    rt.set_pool_ledger(Some(as_dyn)).unwrap();
+    rt.synchronize().unwrap();
+    // Three distinct cached buckets, then a few live buffers to drain in op.
+    drop((
+        rt.alloc_buffer(300_000).unwrap(),
+        rt.alloc_buffer(300_000).unwrap(),
+        rt.alloc_buffer(1 << 20).unwrap(),
+    ));
+    settle(&rt);
+    let live = vec![rt.alloc_buffer(5_000).unwrap(), rt.alloc_buffer_hot(3 << 20).unwrap()];
+    drop(live);
+    flaky.arm(nth);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&rt)));
+    flaky.disarm();
+    assert!(
+        fake.cached() >= freelist_bytes(&rt),
+        "nth={nth}: ledger cached {} below free list {}",
+        fake.cached(),
+        freelist_bytes(&rt)
+    );
+    // Recovery paths: trim, drain, resident, then Drop.
+    let _ = rt.trim_free_list();
+    settle(&rt);
+    let _ = rt.pool_resident();
+    assert_eq!(fake.unmatched(), 0, "nth={nth}: a charge was released twice after recovery");
+    drop(rt);
+    assert_eq!(fake.unmatched(), 0, "nth={nth}: Drop released a charge twice");
+    (fake.live(), fake.cached(), nth as u64)
+}
+
+#[test]
+fn adversarial_panic_in_trim_never_double_releases() {
+    for nth in 1..=4 {
+        let (live, cached, _) = flaky_run(nth, true, |rt| {
+            rt.trim_free_list();
+        });
+        eprintln!("trim nth={nth}: residual live={live} cached={cached}");
+    }
+}
+
+#[test]
+fn adversarial_panic_in_cache_cap_trim_never_double_releases() {
+    for nth in 1..=3 {
+        let (live, cached, _) = flaky_run(nth, true, |rt| rt.set_pool_cache_cap_bytes(256));
+        eprintln!("cap nth={nth}: residual live={live} cached={cached}");
+    }
+}
+
+#[test]
+fn adversarial_panic_in_drain_never_double_releases() {
+    for nth in 1..=8 {
+        let (live, cached, _) = flaky_run(nth, false, |rt| {
+            rt.set_pool_cache_cap_bytes(400_000);
+            settle(rt);
+        });
+        eprintln!("drain nth={nth}: residual live={live} cached={cached}");
+    }
+}
+
+/// `try_lock` on a lock this thread holds is WouldBlock even when poisoned
+/// earlier: the recursive call returns 0 rather than recovering or deadlocking.
+#[test]
+fn adversarial_trim_while_this_thread_holds_a_poisoned_pool_returns_zero() {
+    let ledger = Fake::new(u64::MAX);
+    let rt = runtime_with(&ledger);
+    rt.synchronize().unwrap();
+    drop(rt.alloc_buffer(300_000).unwrap());
+    settle(&rt);
+    poison_pool(&rt);
+    let guard = rt.pool_recovering();
+    assert_eq!(rt.trim_free_list(), 0);
+    drop(guard);
+    assert!(rt.trim_free_list() > 0);
+}
+
+/// Drop with a poisoned pool hands back every charge exactly once.
+#[test]
+fn adversarial_drop_with_poisoned_pool_releases_everything_once() {
+    let ledger = Fake::new(u64::MAX);
+    let rt = runtime_with(&ledger);
+    rt.synchronize().unwrap();
+    drop((rt.alloc_buffer(300_000).unwrap(), rt.alloc_buffer(1 << 20).unwrap()));
+    settle(&rt);
+    let held = rt.alloc_buffer(5_000).unwrap();
+    drop(held);
+    poison_pool(&rt);
+    // Alloc refuses a poisoned pool (unchanged behavior).
+    assert!(rt.alloc_buffer(5_000).is_err());
+    drop(rt);
+    assert_eq!((ledger.live(), ledger.cached(), ledger.unmatched()), (0, 0, 0));
+}

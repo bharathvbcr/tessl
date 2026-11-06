@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,10 @@ const fakeDim = 8
 type fakeModel struct {
 	maxTokens int
 	prompts   map[string]string
+	// defaultPrompt is the text "" selects, as the snapshot's default prompt
+	// does in the binding; noEOS makes the tokenizer append nothing.
+	defaultPrompt string
+	noEOS         bool
 
 	mu          sync.Mutex
 	lastPrompt  string
@@ -72,10 +77,17 @@ func (f *fakeModel) Tokenize(ctx context.Context, texts []string, prompt string)
 	out := make([][]uint32, len(texts))
 	for i, t := range texts {
 		ids := []uint32{2}
-		for _, b := range []byte(f.prompts[prompt] + t) {
+		text := f.prompts[prompt]
+		if prompt == "" {
+			text = f.defaultPrompt
+		}
+		for _, b := range []byte(text + t) {
 			ids = append(ids, uint32(b)+10)
 		}
-		out[i] = append(ids, 1)
+		if !f.noEOS {
+			ids = append(ids, 1)
+		}
+		out[i] = ids
 	}
 	return out, nil
 }
@@ -375,6 +387,49 @@ func TestUnitLongTextsAreTruncatedKeepingEOSOrRefused(t *testing.T) {
 	wantError(t, status, v, http.StatusBadRequest, "the input length exceeds the context length")
 	status, v = h.post("/api/embed", fmt.Sprintf(`{"model":%q,"input":%q,"truncate":false}`, baseName, long))
 	wantError(t, status, v, http.StatusBadRequest, "the input length exceeds the context length")
+}
+
+// The EOS probe must not assume that "" is <bos> <eos>: a snapshot may set a
+// default prompt, and a tokenizer may append nothing.
+func TestUnitEOSProbeHoldsForEverySnapshotShape(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		defaultPrompt string
+		noEOS         bool
+		wantEOS       bool
+	}{
+		{"null default prompt", "", false, true},
+		{"non-empty default prompt", "task: search result | query: ", false, true},
+		{"no eos appended", "", true, false},
+		{"no eos appended, non-empty default prompt", "task: x | ", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFake()
+			fake.defaultPrompt, fake.noEOS = tc.defaultPrompt, tc.noEOS
+			fake.maxTokens = 10
+			h := newHarness(t, fake, testLimits())
+			if h.srv.hasEOS != tc.wantEOS || (tc.wantEOS && h.srv.eosID != 1) {
+				t.Fatalf("hasEOS %v eosID %d, want %v and 1", h.srv.hasEOS, h.srv.eosID, tc.wantEOS)
+			}
+			// The untagged name uses the default prompt.
+			long := strings.Repeat("z", 40)
+			status, v := h.post("/api/embed", fmt.Sprintf(`{"model":%q,"input":%q}`, baseName, long))
+			if status != http.StatusOK {
+				t.Fatalf("%d %v", status, v)
+			}
+			cut := fake.lastIDs[0]
+			if len(cut) != 10 {
+				t.Fatalf("cut to %d ids", len(cut))
+			}
+			if tc.wantEOS && cut[9] != 1 {
+				t.Fatalf("truncated %v lost <eos>", cut)
+			}
+			full, _ := fake.Tokenize(context.Background(), []string{long}, "")
+			if !tc.wantEOS && !slices.Equal(cut, full[0][:10]) {
+				t.Fatalf("truncated %v: an id was invented", cut)
+			}
+		})
+	}
 }
 
 func TestUnitAFullQueueIsRefusedAndATimeoutAnswered(t *testing.T) {

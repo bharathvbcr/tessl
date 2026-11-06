@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -107,16 +108,50 @@ func newServer(ctx context.Context, m embedder, prompts embedgemma2.Prompts, lim
 			return nil, fmt.Errorf("the snapshot has no %q prompt (config_sentence_transformers.json): %s:%s cannot be served", tag, baseName, tag)
 		}
 	}
-	// "" is the two-token sequence <bos> <eos>: its last id is the one a
-	// truncated sequence must still end with.
-	ids, err := m.Tokenize(ctx, []string{""}, "")
+	eos, ok, err := probeEOS(ctx, m)
 	if err != nil {
-		return nil, fmt.Errorf("tokenizing the empty text: %w", err)
+		return nil, err
 	}
-	if len(ids) == 1 && len(ids[0]) == 2 {
-		s.eosID, s.hasEOS = ids[0][1], true
+	s.eosID, s.hasEOS = eos, ok
+	if !ok {
+		log.Printf("tessl-embed: no end-of-sequence id is shared by every probe text, so truncation keeps the plain first %d ids", m.MaxTokens())
 	}
 	return s, nil
+}
+
+// eosProbes are texts that tokenize to different ids under any prompt. Each
+// ends in a different character, so their last ids are shared only when the
+// tokenizer appends a suffix (<eos>) after the text.
+var eosProbes = []string{"", "a", "b", "the quick brown fox"}
+
+// probeEOS reads the end-of-sequence id the tokenizer appends. It does not
+// assume what "" tokenizes to: with the snapshot's default prompt (which the
+// binding applies when the prompt is "") that is <bos> <prompt> <eos>, not
+// <bos> <eos>. The id is the last id of every probe; it is reported only when
+// all of them agree and the sequences are longer than one id. If they differ
+// (no suffix is appended) or the answer is malformed, there is no EOS and
+// truncation must not invent one.
+func probeEOS(ctx context.Context, m embedder) (uint32, bool, error) {
+	ids, err := m.Tokenize(ctx, eosProbes, "")
+	if err != nil {
+		return 0, false, fmt.Errorf("tokenizing the end-of-sequence probes: %w", err)
+	}
+	if len(ids) != len(eosProbes) {
+		return 0, false, nil
+	}
+	var eos uint32
+	for i, seq := range ids {
+		if len(seq) < 2 {
+			return 0, false, nil
+		}
+		last := seq[len(seq)-1]
+		if i == 0 {
+			eos = last
+		} else if last != eos {
+			return 0, false, nil
+		}
+	}
+	return eos, true, nil
 }
 
 func (s *server) handler() http.Handler {

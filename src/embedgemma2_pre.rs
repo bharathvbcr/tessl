@@ -1289,6 +1289,12 @@ fn linspace_indices(n: usize, count: usize) -> Vec<usize> {
 /// `total_frames` frames at `source_fps`, whose duration is `total_frames /
 /// source_fps`: sample at the target fps (`min(total - 1, int(i * step))`),
 /// then cap at `max_frames` by the overflow strategy.
+///
+/// The grid is never built: element `i` of it is a pure function of `i`, so
+/// the capped result evaluates it only at the `max_frames` positions the cap
+/// keeps, and the work and memory are `O(max_frames)` whatever `fps` is. A grid
+/// whose size is not a finite count that fits `usize` is refused, not
+/// saturated; one that is merely huge (an fps of 1e20) is accepted and capped.
 pub fn sample_frame_indices(cfg: &VideoConfig, total_frames: usize, source_fps: f64) -> Result<Vec<usize>, String> {
     const WHAT: &str = "sample_frame_indices";
     if total_frames == 0 {
@@ -1297,34 +1303,57 @@ pub fn sample_frame_indices(cfg: &VideoConfig, total_frames: usize, source_fps: 
     if !(source_fps.is_finite() && source_fps > 0.0) {
         return Err(format!("{WHAT}: source fps must be positive, got {source_fps}"));
     }
-    let mut indices: Vec<usize> = match cfg.fps {
-        None => (0..total_frames).collect(),
+    sample_grid(cfg, total_frames, source_fps, total_frames as f64 / source_fps)
+}
+
+/// [`sample_frame_indices`] with the video's `duration` given (the container's
+/// own figure is not always `total / fps` to the last bit). `total_frames` and
+/// `source_fps` are already checked by the caller to be nonzero and positive
+/// finite; the duration is checked here through the count it yields.
+pub(crate) fn sample_grid(
+    cfg: &VideoConfig,
+    total_frames: usize,
+    source_fps: f64,
+    duration: f64,
+) -> Result<Vec<usize>, String> {
+    const WHAT: &str = "sample_frame_indices";
+    if total_frames == 0 {
+        return Err(format!("{WHAT}: the video has no frames"));
+    }
+    if !(source_fps.is_finite() && source_fps > 0.0) {
+        return Err(format!("{WHAT}: source fps must be positive, got {source_fps}"));
+    }
+    if cfg.max_frames == 0 {
+        return Err(format!("{WHAT}: max_frames is zero"));
+    }
+    // 2^64: the first float a `usize` cannot hold.
+    const USIZE_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+    // Frames in the uncapped grid, and the grid's element `i < n`.
+    let (n, step) = match cfg.fps {
+        None => (total_frames, 1.0),
         Some(fps) => {
-            let duration = total_frames as f64 / source_fps;
-            let step = source_fps / fps;
-            let sampled = ((duration * fps) as usize).max(1);
-            (0..sampled)
-                .map(|i| ((i as f64 * step) as usize).min(total_frames - 1))
-                .collect()
+            let count = duration * fps;
+            if !count.is_finite() || count >= USIZE_LIMIT {
+                return Err(format!(
+                    "{WHAT}: duration {duration} s at {fps} fps is {count} frames, not a count that fits"
+                ));
+            }
+            ((count as usize).max(1), source_fps / fps)
         }
     };
-    if indices.len() > cfg.max_frames {
+    let at = |i: usize| match cfg.fps {
+        None => i,
+        Some(_) => ((i as f64 * step) as usize).min(total_frames - 1),
+    };
+    Ok(if n <= cfg.max_frames {
+        (0..n).map(at).collect()
+    } else {
         match cfg.overflow {
-            Overflow::Truncate => indices.truncate(cfg.max_frames),
-            Overflow::Uniform => {
-                let n = indices.len();
-                indices = if cfg.max_frames == 1 {
-                    vec![indices[0]]
-                } else {
-                    linspace_indices(n, cfg.max_frames)
-                        .into_iter()
-                        .map(|i| indices[i])
-                        .collect()
-                };
-            }
+            Overflow::Truncate => (0..cfg.max_frames).map(at).collect(),
+            Overflow::Uniform if cfg.max_frames == 1 => vec![at(0)],
+            Overflow::Uniform => linspace_indices(n, cfg.max_frames).into_iter().map(at).collect(),
         }
-    }
-    Ok(indices)
+    })
 }
 
 /// `"mm:ss"` of a timestamp in seconds, as the processor formats it:
@@ -1844,6 +1873,123 @@ mod tests {
         assert!(sample_frame_indices(&cfg, 0, 30.0).is_err());
         assert!(sample_frame_indices(&cfg, 10, 0.0).is_err());
         assert!(sample_frame_indices(&cfg, 10, f64::NAN).is_err());
+    }
+
+    /// The sampler as it was before the grid was lazy: the whole fps grid
+    /// collected, then capped. Only for grids small enough to build.
+    fn old_sample_frame_indices(cfg: &VideoConfig, total_frames: usize, source_fps: f64) -> Vec<usize> {
+        let mut indices: Vec<usize> = match cfg.fps {
+            None => (0..total_frames).collect(),
+            Some(fps) => {
+                let duration = total_frames as f64 / source_fps;
+                let step = source_fps / fps;
+                let sampled = ((duration * fps) as usize).max(1);
+                (0..sampled)
+                    .map(|i| ((i as f64 * step) as usize).min(total_frames - 1))
+                    .collect()
+            }
+        };
+        if indices.len() > cfg.max_frames {
+            match cfg.overflow {
+                Overflow::Truncate => indices.truncate(cfg.max_frames),
+                Overflow::Uniform => {
+                    let n = indices.len();
+                    indices = if cfg.max_frames == 1 {
+                        vec![indices[0]]
+                    } else {
+                        linspace_indices(n, cfg.max_frames)
+                            .into_iter()
+                            .map(|i| indices[i])
+                            .collect()
+                    };
+                }
+            }
+        }
+        indices
+    }
+
+    #[test]
+    fn lazy_sampling_equals_the_collected_grid() {
+        let base = video_cfg();
+        let totals = [1usize, 2, 3, 7, 30, 31, 299, 300, 1000, 4097];
+        let rates = [0.5, 1.0, 24.0, 29.97, 30.0, 59.94, 1000.0];
+        let fpss = [
+            None,
+            Some(0.1),
+            Some(0.5),
+            Some(1.0),
+            Some(2.0),
+            Some(7.3),
+            Some(30.0),
+            Some(1000.0),
+        ];
+        let caps = [1usize, 2, 3, 8, 32, 100, 5000];
+        let mut compared = 0;
+        for &total in &totals {
+            for &rate in &rates {
+                for &fps in &fpss {
+                    for &max_frames in &caps {
+                        for overflow in [Overflow::Uniform, Overflow::Truncate] {
+                            let cfg = VideoConfig {
+                                fps,
+                                max_frames,
+                                overflow,
+                                ..base.clone()
+                            };
+                            assert_eq!(
+                                sample_frame_indices(&cfg, total, rate).unwrap(),
+                                old_sample_frame_indices(&cfg, total, rate),
+                                "total {total} rate {rate} fps {fps:?} max {max_frames} {overflow:?}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 10 * 7 * 8 * 7 * 2);
+    }
+
+    #[test]
+    fn a_huge_fps_is_capped_without_building_the_grid() {
+        for overflow in [Overflow::Uniform, Overflow::Truncate] {
+            let cfg = VideoConfig {
+                fps: Some(1e20),
+                max_frames: 2,
+                overflow,
+                ..video_cfg()
+            };
+            let started = std::time::Instant::now();
+            // 2 frames at 30 fps: duration * fps is about 6.7e18 grid frames.
+            let idx = sample_frame_indices(&cfg, 2, 30.0).unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(idx.len() <= 2 && !idx.is_empty(), "{overflow:?}: {idx:?}");
+            assert!(idx.iter().all(|&i| i < 2));
+            assert_eq!(idx[0], 0);
+            // The soft-token count takes the same path.
+            let (frames, _) = video_soft_tokens(&cfg, 64, 64, 2, 30.0).unwrap();
+            assert!(frames <= 2);
+        }
+    }
+
+    #[test]
+    fn a_grid_that_is_not_a_count_is_refused() {
+        let cfg = video_cfg();
+        // A tiny source rate makes the duration huge (1e200 s) or infinite; it
+        // saturated `as usize` before and is refused now.
+        for rate in [1e-200, 5e-324] {
+            let err = sample_frame_indices(&cfg, 2, rate).unwrap_err();
+            assert!(err.starts_with("sample_frame_indices:"), "{err}");
+            assert!(video_soft_tokens(&cfg, 64, 64, 2, rate).is_err());
+        }
+        let fast = VideoConfig {
+            fps: Some(1e300),
+            ..cfg.clone()
+        };
+        assert!(sample_frame_indices(&fast, 2, 1.0).is_err());
+        // Zero frames kept is no sample.
+        let none = VideoConfig { max_frames: 0, ..cfg };
+        assert!(sample_frame_indices(&none, 10, 30.0).is_err());
     }
 
     #[test]

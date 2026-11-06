@@ -212,11 +212,10 @@ pub fn gemm_i8(rt: &Arc<GpuRuntime>, spec: I8Gemm<'_>) -> Result<(), String> {
         require_finite(rows, m as usize, "gemm_i8 a_scale")?;
     }
     if let Some(sc) = b_buf {
-        let need = if group == 0 {
-            n as usize
-        } else {
-            (k / group) as usize * n as usize
-        };
+        // group == 0 is the per-column scale (n entries); otherwise k/group rows of n.
+        let need = k
+            .checked_div(group)
+            .map_or(n as usize, |rows| rows as usize * n as usize);
         require_bytes(rt, sc, need * 4, "gemm_i8 b_scale")?;
         require_finite(sc, need, "gemm_i8 b_scale")?;
     }
@@ -389,6 +388,7 @@ pub fn gemm_w4a8(rt: &Arc<GpuRuntime>, spec: W4Gemm<'_>) -> Result<(), String> {
 /// divisible by `kv_heads`. A head dimension outside [`ATTENTION_HEAD_DIMS`]
 /// returns an error that names it and does not dispatch. Prefill attention is
 /// not this function.
+#[allow(clippy::too_many_arguments)]
 pub fn gqa_decode(
     rt: &Arc<GpuRuntime>,
     q: &GpuBuffer,
@@ -409,7 +409,7 @@ pub fn gqa_decode(
     if batch == 0 || q_heads == 0 || kv_heads == 0 || kv_len == 0 {
         return Err("gqa_decode: batch, q_heads, kv_heads and kv_len must be non-zero".into());
     }
-    if q_heads % kv_heads != 0 {
+    if !q_heads.is_multiple_of(kv_heads) {
         return Err(format!(
             "gqa_decode: q_heads {q_heads} is not divisible by kv_heads {kv_heads}"
         ));
@@ -447,6 +447,7 @@ pub fn gqa_decode(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_w4(
     rt: &Arc<GpuRuntime>,
     a: &GpuBuffer,

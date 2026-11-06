@@ -914,7 +914,7 @@ mod tests {
         // M=1 stays on the GEMV, with and without the fused residual.
         let (x, xv) = activation(&rt, 1, 11);
         let y = rt.alloc_tensor_f32(&[1, N]).unwrap();
-        y.write_f32(&vec![SENTINEL; N]).unwrap();
+        y.write_f32(&[SENTINEL; N]).unwrap();
         let before = counts();
         bank.w.matmul(&rt, &x, &y, None).unwrap();
         rt.synchronize().unwrap();

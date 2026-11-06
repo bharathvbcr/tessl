@@ -110,7 +110,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 bins 227
 
 # Library tests.
-lib ab_flags::tests:: 10
+lib ab_flags::tests:: 15
 lib embedgemma2::tests:: 14
 lib embedgemma2_vision::tests:: 4
 lib embedgemma2_audio::tests:: 9

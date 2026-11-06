@@ -319,3 +319,87 @@ fn stress_budget_trim_handler_under_concurrent_contention() {
     assert!(completed_reservations.load(Ordering::Relaxed) > 0);
     assert_eq!(budget.live_bytes().unwrap(), 0, "Clean budget release");
 }
+
+/// Test 4: a ledger that starts panicking mid-run poisons the pool while other
+/// threads allocate, drop and trim. Nothing may hang, and once the runtime is
+/// dropped no charge may have been released twice.
+#[test]
+fn stress_pool_poisoned_mid_run_never_double_releases() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicI64;
+    use tessl::{LedgerClass, LedgerRefused, PoolLedger};
+
+    struct Books {
+        live: AtomicI64,
+        cached: AtomicI64,
+        negative: AtomicU64,
+        explode: AtomicBool,
+    }
+    impl Books {
+        fn slot(&self, class: LedgerClass) -> &AtomicI64 {
+            match class {
+                LedgerClass::Live => &self.live,
+                LedgerClass::Cached => &self.cached,
+            }
+        }
+    }
+    impl PoolLedger for Books {
+        fn try_charge(&self, class: LedgerClass, bytes: u64) -> Result<(), LedgerRefused> {
+            self.slot(class).fetch_add(bytes as i64, Ordering::SeqCst);
+            Ok(())
+        }
+        fn release(&self, class: LedgerClass, bytes: u64) {
+            if self.explode.load(Ordering::SeqCst) && bytes % 3 != 1 {
+                panic!("ledger exploded");
+            }
+            if self.slot(class).fetch_sub(bytes as i64, Ordering::SeqCst) < bytes as i64 {
+                self.negative.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let _guard = gpu_lock();
+    let books = Arc::new(Books {
+        live: AtomicI64::new(0),
+        cached: AtomicI64::new(0),
+        negative: AtomicU64::new(0),
+        explode: AtomicBool::new(false),
+    });
+    let rt = GpuRuntime::new().expect("runtime");
+    let as_dyn: Arc<dyn PoolLedger> = books.clone();
+    rt.set_pool_ledger(Some(as_dyn)).expect("ledger");
+    let running = Arc::new(AtomicBool::new(true));
+    let mut handles = Vec::new();
+    for t in 0..6usize {
+        let rt = Arc::clone(&rt);
+        let running = Arc::clone(&running);
+        handles.push(thread::spawn(move || {
+            let mut i = 0usize;
+            while running.load(Ordering::Relaxed) {
+                i += 1;
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    if let Ok(b) = rt.alloc_buffer(4096 << ((i + t) % 5)) {
+                        drop(b);
+                    }
+                    if (i + t) % 4 == 0 {
+                        rt.trim_free_list();
+                    }
+                    let _ = rt.pool_resident();
+                }));
+            }
+        }));
+    }
+    thread::sleep(Duration::from_millis(300));
+    books.explode.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(500));
+    books.explode.store(false, Ordering::SeqCst);
+    running.store(false, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("worker thread");
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        rt.trim_free_list();
+    }));
+    drop(rt);
+    assert_eq!(books.negative.load(Ordering::SeqCst), 0, "a charge was released twice");
+}

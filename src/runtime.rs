@@ -34,7 +34,7 @@ use objc2_metal::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 
 use crate::shared::{RuntimePoison, Shared, Timeline};
 
@@ -1383,9 +1383,7 @@ impl GpuRuntime {
         if let Ok(mut info) = self.memory_info.lock() {
             info.pool_cache_cap = bytes;
         }
-        if let Ok(mut pool) = self.pool.lock() {
-            BufferPool::set_max_cache_bytes(&mut pool, bytes);
-        }
+        BufferPool::set_max_cache_bytes(&mut self.pool_recovering(), bytes);
     }
 
     /// Destroy every cached buffer in the pool free list, releasing its ledger
@@ -1395,11 +1393,24 @@ impl GpuRuntime {
     /// Uses `try_lock` to avoid recursive deadlock if called while the pool
     /// lock is already held on the calling thread.
     pub fn trim_free_list(&self) -> usize {
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.trim_free_list()
-        } else {
-            0
+        match self.pool.try_lock() {
+            Ok(mut pool) => pool.trim_free_list(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().trim_free_list(),
+            Err(TryLockError::WouldBlock) => 0,
         }
+    }
+
+    /// The pool lock, taken through a poisoning panic. Every path that gives
+    /// ledger-charged bytes back (the drain, the trims, the cache cap) uses
+    /// this rather than skipping on `Err`: a skipped release leaves the Live
+    /// or Cached charge on the ledger for good. The pool is a freelist plus
+    /// byte counters and its ledger calls are all that can unwind under the
+    /// lock, so what a poisoned guard exposes is at worst a counter a step
+    /// ahead of the ledger, which the release saturates rather than trusts.
+    /// Allocation and `set_pool_ledger` still refuse a poisoned pool: they
+    /// would take on a new charge against books that may be torn.
+    fn pool_recovering(&self) -> MutexGuard<'_, BufferPool> {
+        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Store `wired_budget` as `fraction` times `recommendedMaxWorkingSetSize`.
@@ -1744,15 +1755,12 @@ impl GpuRuntime {
         }
         self.flush_residency();
         for (buf, _nbytes) in cold {
-            if let Ok(mut pool) = self.pool.lock() {
-                BufferPool::recycle(&mut pool, buf);
-            }
+            BufferPool::recycle(&mut self.pool_recovering(), buf);
         }
         if !retired.is_empty() {
-            if let Ok(mut pool) = self.pool.lock() {
-                for buf in &retired {
-                    pool.retire(buf.length());
-                }
+            let mut pool = self.pool_recovering();
+            for buf in &retired {
+                pool.retire(buf.length());
             }
         }
         drop(retired);
@@ -1781,7 +1789,7 @@ impl GpuRuntime {
     /// GPU, and bucket bytes parked on the free list. Counted with or without
     /// a ledger.
     pub fn pool_resident(&self) -> PoolResident {
-        let pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        let pool = self.pool_recovering();
         PoolResident {
             live_bytes: pool.live_bytes as u64,
             cached_bytes: pool.cached_bytes as u64,

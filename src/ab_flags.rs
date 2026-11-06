@@ -57,7 +57,9 @@ pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
 
 /// One process-global tri-state flag: unset (env not read yet), off, on. Every `*_enabled()` getter in
 /// the crate is this struct plus its env name list, so the latch and the
-/// override rules live once. A `set` always wins over the env.
+/// override rules live once. A `set` always wins over the env and over the
+/// default, including a `set` racing the first `get` (see [`Self::get`]); a
+/// later `set` replaces an earlier latched value.
 pub(crate) struct TriFlag(AtomicI8);
 
 impl TriFlag {
@@ -89,16 +91,37 @@ impl TriFlag {
     }
 
     /// The forced value, else the first parsing name in `names`, else
-    /// `default()`; the answer is latched on the first read, so `default` runs
-    /// at most once.
+    /// `default()`; the answer is latched on the first read.
+    ///
+    /// The latch is a compare-exchange from `UNSET`, not a load-then-store: a
+    /// [`Self::set`] (or another first reader) that lands between the env read
+    /// and the latch has already decided the flag, and this call returns that
+    /// decision instead of overwriting it. So the flag's value is unique and a
+    /// `set` that completes before or during the first `get` is never lost.
+    ///
+    /// `default` is not serialized: two threads racing the very first read may
+    /// each run it once (and each read the env), and only one result is
+    /// latched. It never runs once the flag is latched. Serializing it would
+    /// need a lock held across `default`, which for `coarse_barriers` calls
+    /// into another flag's `get`; the unique latched answer is the guarantee
+    /// callers need, and both closures are pure reads.
+    ///
+    /// Ordering is `Relaxed` throughout: the flag guards no other memory (a
+    /// reader acts on the bool alone), and the compare-exchange's atomicity on
+    /// this single location is what makes the latch unique.
     pub(crate) fn get(&self, names: &[&str], default: impl FnOnce() -> bool) -> bool {
         let v = self.0.load(Ordering::Relaxed);
         if v >= 0 {
             return v == 1;
         }
         let on = env_truthy(names).unwrap_or_else(default);
-        self.set(on);
-        on
+        match self
+            .0
+            .compare_exchange(Self::UNSET, i8::from(on), Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => on,
+            Err(actual) => actual == 1,
+        }
     }
 }
 
@@ -243,6 +266,204 @@ mod tests {
         assert!(f.get(NONE, || false), "and the first answer is latched");
         f.set(false);
         assert!(!f.get(NONE, || true), "a forced value beats the default");
+    }
+
+    const NO_ENV: &[&str] = &["TESSL_TRI_FLAG_TEST_UNSET_A"];
+
+    /// A `set` that lands between the first `get`'s env read and its latch must
+    /// win. The default closure runs in exactly that window, so it is the hook.
+    /// Unmodified code (load, then unconditional store) ends false here.
+    #[test]
+    fn tri_flag_set_during_first_get_wins() {
+        let f = TriFlag::new();
+        let got = f.get(NO_ENV, || {
+            f.set(true);
+            false
+        });
+        assert!(got, "get must return the concurrent set, not its own default");
+        assert!(f.get(NO_ENV, || false), "and the flag stays set");
+        assert!(f.is_latched());
+    }
+
+    /// Same window, set-to-false against a default of true.
+    #[test]
+    fn tri_flag_set_false_during_first_get_wins() {
+        let f = TriFlag::new();
+        assert!(!f.get(NO_ENV, || {
+            f.set(false);
+            true
+        }));
+        assert!(!f.get(NO_ENV, || true));
+    }
+
+    /// Threads race one `set(true)` against first `get`s whose default says
+    /// false. After join the flag must be true every iteration, and no `get`
+    /// may have observed a value that later flipped back.
+    #[test]
+    fn tri_flag_set_races_first_get_stress() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut iters = 0;
+        while iters < 2000 && start.elapsed() < Duration::from_millis(1200) {
+            iters += 1;
+            let f = Arc::new(TriFlag::new());
+            let go = Arc::new(Barrier::new(5));
+            let flipped = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let (f, go, flipped) = (f.clone(), go.clone(), flipped.clone());
+                handles.push(std::thread::spawn(move || {
+                    go.wait();
+                    let first = f.get(NO_ENV, || false);
+                    // Once true (set won), it must never read false again.
+                    if first && !f.get(NO_ENV, || false) {
+                        flipped.store(true, Ordering::Relaxed);
+                    }
+                }));
+            }
+            let setter = {
+                let (f, go) = (f.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    f.set(true);
+                })
+            };
+            setter.join().unwrap();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                f.raw(),
+                1,
+                "iteration {iters}: a set that happened-before join was lost"
+            );
+            assert!(
+                !flipped.load(Ordering::Relaxed),
+                "iteration {iters}: a true read flipped back"
+            );
+        }
+        assert!(iters > 0);
+    }
+
+    /// Exhaustive interleaving model. The `default` closure runs strictly between
+    /// the outer `get`'s load and its latch, so every operation placed inside it
+    /// is an interleaving of "other thread acts in the window"; operations before
+    /// and after it are the sequential cases. Every schedule is checked against
+    /// the sequential spec: one cell `Option<bool>`, `set` stores, `get` latches
+    /// its default only into an empty cell and otherwise returns the cell. The
+    /// outer `get` returns whatever the cell holds when it finishes, and the
+    /// closure runs iff the cell was empty at entry.
+    #[test]
+    fn tri_flag_window_interleavings_match_sequential_spec() {
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            Set(bool),
+            Get(bool),
+        }
+        let ops = [Op::Set(true), Op::Set(false), Op::Get(true), Op::Get(false)];
+        let mut sequences: Vec<Vec<Op>> = vec![vec![]];
+        for a in ops {
+            sequences.push(vec![a]);
+            for b in ops {
+                sequences.push(vec![a, b]);
+                for c in ops {
+                    sequences.push(vec![a, b, c]);
+                }
+            }
+        }
+        let pres: [Option<bool>; 3] = [None, Some(true), Some(false)];
+        let mut cases = 0;
+        for pre in pres {
+            for window in &sequences {
+                for outer_default in [true, false] {
+                    for post in pres {
+                        cases += 1;
+                        let f = TriFlag::new();
+                        let mut model: Option<bool> = None;
+                        if let Some(p) = pre {
+                            f.set(p);
+                            model = Some(p);
+                        }
+                        let ran = Cell::new(false);
+                        let inner_got = std::cell::RefCell::new(Vec::new());
+                        let got = f.get(NO_ENV, || {
+                            ran.set(true);
+                            for op in window {
+                                match *op {
+                                    Op::Set(v) => f.set(v),
+                                    Op::Get(d) => inner_got.borrow_mut().push(f.get(NO_ENV, || d)),
+                                }
+                            }
+                            outer_default
+                        });
+                        // Spec.
+                        let mut spec_inner = Vec::new();
+                        let spec_ran = model.is_none();
+                        if spec_ran {
+                            for op in window {
+                                match *op {
+                                    Op::Set(v) => model = Some(v),
+                                    Op::Get(d) => {
+                                        let v = *model.get_or_insert(d);
+                                        spec_inner.push(v);
+                                    }
+                                }
+                            }
+                        }
+                        let spec_got = *model.get_or_insert(outer_default);
+                        let ctx = format!("pre={pre:?} window={window:?} default={outer_default} post={post:?}");
+                        assert_eq!(ran.get(), spec_ran, "closure ran mismatch: {ctx}");
+                        assert_eq!(*inner_got.borrow(), spec_inner, "nested get mismatch: {ctx}");
+                        assert_eq!(got, spec_got, "outer get mismatch: {ctx}");
+                        assert_eq!(f.raw(), i8::from(spec_got), "cell mismatch: {ctx}");
+                        if let Some(p) = post {
+                            f.set(p);
+                            assert_eq!(f.get(NO_ENV, || !p), p, "post set must win: {ctx}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 1000);
+    }
+
+    /// The mirror of the stress test: a `set(false)` against first `get`s whose
+    /// default says true. Bounded well under a second.
+    #[test]
+    fn tri_flag_set_false_races_first_get_stress() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut iters = 0;
+        while iters < 1000 && start.elapsed() < Duration::from_millis(600) {
+            iters += 1;
+            let f = Arc::new(TriFlag::new());
+            let go = Arc::new(Barrier::new(4));
+            let mut hs = Vec::new();
+            for _ in 0..3 {
+                let (f, go) = (f.clone(), go.clone());
+                hs.push(std::thread::spawn(move || {
+                    go.wait();
+                    f.get(NO_ENV, || true);
+                }));
+            }
+            let s = {
+                let (f, go) = (f.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    f.set(false);
+                })
+            };
+            s.join().unwrap();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(f.raw(), 0, "iteration {iters}: set(false) was lost");
+        }
     }
 
     /// A `resolve` lookup over a fixed table, recording which names it was asked

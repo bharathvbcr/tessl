@@ -15,6 +15,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The TensorOps sources `build.rs` requires, as (file name, synthetic kernel
+/// name). `build.rs`'s `tensorops_sources` is the owner of this list: it panics
+/// with "required TensorOps source missing" when one is absent, so every
+/// fixture that synthesises a `kernels/` directory writes all of them through
+/// `write_tensorops_sources`. Keep the two in step when a source is added.
+const TENSOROPS_SOURCES: [(&str, &str); 2] = [
+    ("matmul_tensorops.metal", "synthetic_tensorops"),
+    ("conv2d_tensorops.metal", "synthetic_conv2d_tensorops"),
+];
+
+fn write_tensorops_sources(kernels: &Path) {
+    for (file, kernel) in TENSOROPS_SOURCES {
+        fs::write(kernels.join(file), format!("kernel void {kernel}() {{}}\n"))
+            .expect("write required synthetic shader");
+    }
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -123,11 +140,7 @@ fn concurrent_builds_never_mutate_dependency_source_and_publish_out_dir_metadata
     let manifest = scratch.0.join("registry-source/tessl-0.1.0");
     let kernels = manifest.join("kernels");
     fs::create_dir_all(&kernels).expect("create synthetic source");
-    fs::write(
-        kernels.join("matmul_tensorops.metal"),
-        b"kernel void synthetic_tensorops() {}\n",
-    )
-    .expect("write required synthetic shader");
+    write_tensorops_sources(&kernels);
 
     let build_script = if let Some(path) = std::env::var_os("TESSL_BUILD_SCRIPT_UNDER_TEST") {
         PathBuf::from(path)
@@ -174,7 +187,7 @@ case "$(basename "$0")" in
     ;;
   metal)
     # The math mode must be an argument, not the compiler's implicit default.
-    # Throughput kernels (this synthetic TensorOps source) keep contraction.
+    # Throughput kernels (these synthetic TensorOps sources) keep contraction.
     case " $* " in
       *" -fmetal-math-mode=fast "*) ;;
       *) echo "missing -fmetal-math-mode=fast: $*" >&2; exit 1 ;;
@@ -353,7 +366,7 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
     let kernels = manifest.join("kernels");
     fs::create_dir_all(kernels.join("tune")).expect("create synthetic kernels/tune");
     let write = |rel: &str, body: &str| fs::write(kernels.join(rel), body).expect("write synthetic kernel");
-    write("matmul_tensorops.metal", "kernel void synthetic_tensorops() {}\n");
+    write_tensorops_sources(&kernels);
     write("tune/matmul_tensorops_tune.metal", "kernel void synthetic_tune() {}\n");
     write("shared.h", "WARN\n");
     write("a.metal", "#include \"shared.h\"\nWARN_SELF\n");
@@ -475,13 +488,13 @@ fn metal_diagnostics_are_forwarded_cached_and_strict_on_request() {
     let clean = run(&[("TESSL_METAL_WERROR", "1"), ("TESSL_GEMM_TUNE", "1")]);
     assert!(clean.status.success(), "{}", String::from_utf8_lossy(&clean.stderr));
     let clean_log = log_lines(&log).split_off(before);
-    for src in [
-        "matmul_tensorops.metal",
+    let strict_sources = TENSOROPS_SOURCES.iter().map(|(file, _)| *file).chain([
         "matmul_tensorops_tune.metal",
         "a.metal",
         "b.metal",
         "c.metal",
-    ] {
+    ]);
+    for src in strict_sources {
         let line = clean_log
             .iter()
             .find(|l| l.starts_with(&format!("{src} ")))

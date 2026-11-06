@@ -45,15 +45,11 @@ const NEW: [&str; 4] = ["qwen35_gdn", "qwen35_attn", "qwen35_mlp", "qwen35_score
 
 /// Constructs the Qwen3.5 kernels introduce, each checked against the Metal
 /// Shading Language specification when it was added.
-const REVIEWED: [(&str, &str); 3] = [
+const REVIEWED: [(&str, &str); 2] = [
     ("log", "MSL math function (fast variant under the default fast math)"),
     (
         "mem_flags::mem_device",
         "threadgroup_barrier flag ordering device memory across the threadgroup",
-    ),
-    (
-        "uint3",
-        "vector type for the 3-D [[threadgroup_position_in_grid]] builtin",
     ),
 ];
 

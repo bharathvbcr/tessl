@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -183,15 +184,37 @@ func TestUnitSetMaxTokensCancelledBeforeTheirTurnLeaveNoGoroutinesAndNeverReachT
 	}
 }
 
-func panickingModel() *Model {
-	m := bare()
-	m.maxTokens.Store(8192)
-	m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) { panic("observer panic") }
-	return m
+// panickingModel is over an engine whose first call panics after applying its
+// limit (as an Observer does, after the reply) and whose later calls work.
+func panickingModel() (*Model, *fakeEngine) {
+	e := &fakeEngine{}
+	m := modelOver(e)
+	var first atomic.Bool
+	m.send = func(ctx context.Context, op string, code uint32, f *wire.Frame) (wire.Reply, error) {
+		reply, err := e.send(ctx, op, code, f)
+		if first.CompareAndSwap(false, true) {
+			panic("observer panic")
+		}
+		return reply, err
+	}
+	return m, e
+}
+
+func wantUsable(t *testing.T, m *Model, e *fakeEngine) {
+	t.Helper()
+	if len(m.setTurn) != 0 {
+		t.Fatal("the turn is still held")
+	}
+	if err := m.SetMaxTokens(context.Background(), 77); err != nil {
+		t.Fatalf("after a panic the model refuses SetMaxTokens: %v", err)
+	}
+	if m.MaxTokens() != 77 || e.enforced() != 77 {
+		t.Fatalf("cache %d engine %d, want 77", m.MaxTokens(), e.enforced())
+	}
 }
 
 func TestUnitSetMaxTokensPanicOnTheHelperPathReachesTheWaitingCaller(t *testing.T) {
-	m := panickingModel()
+	m, e := panickingModel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var got any
@@ -202,15 +225,7 @@ func TestUnitSetMaxTokensPanicOnTheHelperPathReachesTheWaitingCaller(t *testing.
 	if got != "observer panic" {
 		t.Fatalf("recovered %v, want the original panic value", got)
 	}
-	if len(m.setTurn) != 0 {
-		t.Fatal("the turn is still held")
-	}
-	if err := m.SetMaxTokens(context.Background(), 6); !errors.Is(err, ErrPanic) {
-		t.Fatalf("after a panic the model is %v, want ErrPanic", err)
-	}
-	if m.MaxTokens() != 8192 {
-		t.Fatalf("MaxTokens() = %d", m.MaxTokens())
-	}
+	wantUsable(t, m, e)
 }
 
 func TestUnitSetMaxTokensPanicAfterTheCallerLeftIsLoggedAndReleasesTheTurn(t *testing.T) {
@@ -218,13 +233,16 @@ func TestUnitSetMaxTokensPanicAfterTheCallerLeftIsLoggedAndReleasesTheTurn(t *te
 	var lmu sync.Mutex
 	log.SetOutput(writerFunc(func(b []byte) (int, error) { lmu.Lock(); defer lmu.Unlock(); return logs.Write(b) }))
 	defer log.SetOutput(os.Stderr)
-	m := bare()
-	m.maxTokens.Store(8192)
+	m, e := panickingModel()
 	started, release := make(chan struct{}), make(chan struct{})
-	m.send = func(context.Context, string, uint32, *wire.Frame) (wire.Reply, error) {
-		close(started)
-		<-release
-		panic("late panic")
+	inner := m.send
+	var held atomic.Bool
+	m.send = func(ctx context.Context, op string, code uint32, f *wire.Frame) (wire.Reply, error) {
+		if held.CompareAndSwap(false, true) {
+			close(started)
+			<-release
+		}
+		return inner(ctx, op, code, f)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
@@ -238,12 +256,10 @@ func TestUnitSetMaxTokensPanicAfterTheCallerLeftIsLoggedAndReleasesTheTurn(t *te
 	if !waitFor(5*time.Second, func() bool { return len(m.setTurn) == 0 }) {
 		t.Fatal("the turn was not released")
 	}
-	if !waitFor(5*time.Second, func() bool { lmu.Lock(); defer lmu.Unlock(); return strings.Contains(logs.String(), "late panic") }) {
+	if !waitFor(5*time.Second, func() bool { lmu.Lock(); defer lmu.Unlock(); return strings.Contains(logs.String(), "observer panic") }) {
 		t.Fatal("the panic was not logged")
 	}
-	if err := m.SetMaxTokens(context.Background(), 6); !errors.Is(err, ErrPanic) {
-		t.Fatalf("after a panic the model is %v, want ErrPanic", err)
-	}
+	wantUsable(t, m, e)
 }
 
 type writerFunc func([]byte) (int, error)

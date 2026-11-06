@@ -272,10 +272,10 @@ func (m *Model) MaxTokens() int { return int(m.maxTokens.Load()) }
 // whose ctx ended before it had its turn leaves no goroutine behind and never
 // reaches the engine. Only a nil return guarantees the new limit.
 //
-// A panic in the engine call (in practice a panicking Options.Observer) leaves
-// the outcome unknown, so the model is marked unusable, like one whose engine
-// panicked, and the panic is re-raised in the caller's goroutine if the caller
-// is still waiting. If the caller had already left, it is logged instead.
+// A panic in the engine call (in practice a panicking Options.Observer)
+// propagates like any call's, re-raised in the caller's goroutine if the caller
+// is still waiting (logged if it had left), and the model stays usable. The limit
+// may then have been applied without MaxTokens following it.
 func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 	const op = "SetMaxTokens"
 	if n < 1 || n > maxTokensLimit {
@@ -344,16 +344,9 @@ func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 // applyMaxTokens is the engine call of SetMaxTokens, run by the call that holds
 // the turn. It hands the engine a context that ends only with the call: gusset
 // drops the reply of a call whose context ended after the worker began it, and
-// the limit would then be applied with the cache none the wiser. A panic marks
-// the model dead (the reply's outcome is unknown) and continues up.
+// the limit would then be applied with the cache none the wiser.
 func (m *Model) applyMaxTokens(ctx context.Context, n int) error {
 	const op = "SetMaxTokens"
-	defer func() {
-		if p := recover(); p != nil {
-			m.markDead(&Error{Op: op, Status: StatusPanic, Message: fmt.Sprint("panic during the call: ", p)})
-			panic(p)
-		}
-	}()
 	f := new(wire.Frame).U32(uint32(n))
 	if _, err := m.call(context.WithoutCancel(ctx), op, wire.OpSetMaxTokens, f); err != nil {
 		return err

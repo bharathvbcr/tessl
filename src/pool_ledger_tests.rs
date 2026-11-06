@@ -527,7 +527,11 @@ fn flaky_run(nth: i64, only_release: bool, op: impl Fn(&GpuRuntime)) -> (u64, u6
     let _ = rt.trim_free_list();
     settle(&rt);
     let _ = rt.pool_resident();
-    assert_eq!(fake.unmatched(), 0, "nth={nth}: a charge was released twice after recovery");
+    assert_eq!(
+        fake.unmatched(),
+        0,
+        "nth={nth}: a charge was released twice after recovery"
+    );
     drop(rt);
     assert_eq!(fake.unmatched(), 0, "nth={nth}: Drop released a charge twice");
     (fake.live(), fake.cached(), nth as u64)

@@ -20,9 +20,11 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 /// with "required TensorOps source missing" when one is absent, so every
 /// fixture that synthesises a `kernels/` directory writes all of them through
 /// `write_tensorops_sources`. Keep the two in step when a source is added.
-const TENSOROPS_SOURCES: [(&str, &str); 2] = [
+const TENSOROPS_SOURCES: [(&str, &str); 4] = [
     ("matmul_tensorops.metal", "synthetic_tensorops"),
     ("conv2d_tensorops.metal", "synthetic_conv2d_tensorops"),
+    ("i8_w8a8.metal", "synthetic_i8_w8a8"),
+    ("w4a8_tensorops.metal", "synthetic_w4a8_tensorops"),
 ];
 
 fn write_tensorops_sources(kernels: &Path) {
@@ -187,12 +189,19 @@ case "$(basename "$0")" in
     ;;
   metal)
     # The math mode must be an argument, not the compiler's implicit default.
-    # Throughput kernels (these synthetic TensorOps sources) keep contraction.
+    # Throughput kernels keep contraction; the exact-numerics TensorOps sources
+    # (build.rs `disable_fp_contract`: i8_w8a8, w4a8_tensorops) must turn it off.
     case " $* " in
       *" -fmetal-math-mode=fast "*) ;;
       *) echo "missing -fmetal-math-mode=fast: $*" >&2; exit 1 ;;
     esac
     case " $* " in
+      *"/i8_w8a8.metal "*|*"/w4a8_tensorops.metal "*)
+        case " $* " in
+          *" -ffp-contract=off "*) ;;
+          *) echo "exact-numerics kernel must disable contraction: $*" >&2; exit 1 ;;
+        esac
+        ;;
       *" -ffp-contract=off "*)
         echo "throughput kernel must not disable contraction: $*" >&2
         exit 1

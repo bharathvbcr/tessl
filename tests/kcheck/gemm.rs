@@ -64,7 +64,6 @@ fn mats(rt: &Arc<GpuRuntime>, layout: Layout, m: usize, n: usize, k: usize, seed
         DType::F32 => (tensor_f32(rt, &a_shape, &a_host), tensor_f32(rt, &b_shape, &b_host)),
         DType::BF16 => (tensor_bf16(rt, &a_shape, &a_host), tensor_bf16(rt, &b_shape, &b_host)),
         DType::F16 => (tensor_f16(rt, &a_shape, &a_host), tensor_f16(rt, &b_shape, &b_host)),
-        _ => panic!("gemm sweep dtype {dtype:?}"),
     };
     let c = rt.alloc_tensor_f32(&[m, n]).expect("c");
     Mats { a, b, c, expect, k }

@@ -2046,4 +2046,188 @@ mod tests {
         };
         assert_eq!(preprocess_video(&every, &raw, 3.0).unwrap().frames.len(), 9);
     }
+
+    /// SplitMix64: a deterministic stream for the adversarial sweeps.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// Log-uniform in `[lo, hi]`.
+        fn log(&mut self, lo: f64, hi: f64) -> f64 {
+            let u = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
+            (lo.ln() + u * (hi.ln() - lo.ln())).exp()
+        }
+    }
+
+    fn cfg_with(fps: Option<f64>, max_frames: usize, overflow: Overflow) -> VideoConfig {
+        VideoConfig {
+            fps,
+            max_frames,
+            overflow,
+            ..video_cfg()
+        }
+    }
+
+    #[test]
+    fn adversarial_random_sweep_equals_the_collected_grid() {
+        let mut rng = Rng(0x7E55_1CAF);
+        let rates = [23.976, 29.97, 30.0, 0.001, 1e6, 1.0, 59.94, 0.5, 1e-3];
+        let fixed_fps = [1e-9, 1e-6, 1e-3, 0.1, 1.0, 29.97, 1e3, 1e5];
+        let (mut compared, mut skipped) = (0usize, 0usize);
+        for _ in 0..60_000 {
+            let total = 1 + rng.below(100_000) as usize;
+            let rate = if rng.below(2) == 0 {
+                rates[rng.below(rates.len() as u64) as usize]
+            } else {
+                rng.log(1e-3, 1e6)
+            };
+            let fps = match rng.below(4) {
+                0 => None,
+                1 => Some(fixed_fps[rng.below(fixed_fps.len() as u64) as usize]),
+                _ => Some(rng.log(1e-9, 1e6)),
+            };
+            let max_frames = if rng.below(4) == 0 {
+                1 + rng.below(4) as usize
+            } else {
+                rng.log(1.0, 10_000.0) as usize
+            }
+            .max(1);
+            let overflow = if rng.below(2) == 0 { Overflow::Uniform } else { Overflow::Truncate };
+            let cfg = cfg_with(fps, max_frames, overflow);
+            let grid = fps.map_or(total as f64, |f| total as f64 / rate * f);
+            if grid > 1e6 {
+                skipped += 1;
+                continue;
+            }
+            assert_eq!(
+                sample_frame_indices(&cfg, total, rate).unwrap(),
+                old_sample_frame_indices(&cfg, total, rate),
+                "total {total} rate {rate} fps {fps:?} max {max_frames} {overflow:?}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 20_000, "compared {compared}, skipped {skipped}");
+    }
+
+    #[test]
+    fn adversarial_count_and_cap_boundaries_equal_the_collected_grid() {
+        // 300 frames at 30 fps = 10 s. fps 0.1 -> count 1.0 exactly, 0.09999 -> 0.9999.
+        for fps in [0.1, 0.09999, 0.1000001, 1.0, 0.99999, 1.00001, 2.0] {
+            let count = ((300.0 / 30.0) * fps) as usize;
+            for n in [count.max(1), count.max(1) + 1, count.max(2) - 1, 1, 2] {
+                for overflow in [Overflow::Uniform, Overflow::Truncate] {
+                    let cfg = cfg_with(Some(fps), n.max(1), overflow);
+                    assert_eq!(
+                        sample_frame_indices(&cfg, 300, 30.0).unwrap(),
+                        old_sample_frame_indices(&cfg, 300, 30.0),
+                        "fps {fps} max {n} {overflow:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_float_edges_never_panic_or_escape_the_video() {
+        let tiny = [f64::MIN_POSITIVE, 5e-324, 1e-300, 1e-9, 0.0, -0.0, -1.0, -1e300];
+        for overflow in [Overflow::Uniform, Overflow::Truncate] {
+            for fps in tiny {
+                let cfg = cfg_with(Some(fps), 8, overflow);
+                // Old oracle is cheap here: duration * fps is at most 0 or tiny.
+                let got = sample_frame_indices(&cfg, 100, 30.0).unwrap();
+                assert_eq!(got, old_sample_frame_indices(&cfg, 100, 30.0), "fps {fps}");
+                assert!(!got.is_empty() && got.len() <= 8 && got.iter().all(|&i| i < 100));
+            }
+            // A non-finite grid count is refused, never saturated.
+            for fps in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+                let cfg = cfg_with(Some(fps), 8, overflow);
+                assert!(sample_frame_indices(&cfg, 100, 30.0).is_err(), "fps {fps}");
+                assert!(video_soft_tokens(&cfg, 64, 64, 100, 30.0).is_err(), "fps {fps}");
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_disagreeing_duration_is_bounded() {
+        let cfg = cfg_with(Some(1.0), 8, Overflow::Uniform);
+        for duration in [0.0, -0.0, -5.0, 1e-300, 5e-324, 1e10, 1e18, 1e19] {
+            let got = sample_grid(&cfg, 100, 30.0, duration).unwrap();
+            assert!(!got.is_empty() && got.len() <= 8 && got.iter().all(|&i| i < 100), "{duration}: {got:?}");
+        }
+        for duration in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY.abs(), 1e300, 2e19] {
+            assert!(sample_grid(&cfg, 100, 30.0, duration).is_err(), "{duration}");
+        }
+        // Zero/NaN/inf source fps and zero frames are refused here too.
+        for rate in [0.0, f64::NAN, f64::INFINITY, -1.0] {
+            assert!(sample_grid(&cfg, 100, rate, 3.0).is_err(), "{rate}");
+        }
+        assert!(sample_grid(&cfg, 0, 30.0, 3.0).is_err());
+        // A container duration that is not total / fps to the last bit: the
+        // lazy grid equals the collected one built from the same duration.
+        let mut rng = Rng(11);
+        for _ in 0..2_000 {
+            let total = 1 + rng.below(5_000) as usize;
+            let rate = rng.log(1.0, 120.0);
+            let duration = total as f64 / rate * (1.0 + (rng.below(2001) as f64 - 1000.0) * 1e-12);
+            let fps = rng.log(0.01, 50.0);
+            let max_frames = 1 + rng.below(64) as usize;
+            for overflow in [Overflow::Uniform, Overflow::Truncate] {
+                let cfg = cfg_with(Some(fps), max_frames, overflow);
+                let step = rate / fps;
+                let n = ((duration * fps) as usize).max(1);
+                let mut grid: Vec<usize> = (0..n).map(|i| ((i as f64 * step) as usize).min(total - 1)).collect();
+                if grid.len() > max_frames {
+                    grid = match overflow {
+                        Overflow::Truncate => grid[..max_frames].to_vec(),
+                        Overflow::Uniform if max_frames == 1 => vec![grid[0]],
+                        Overflow::Uniform => {
+                            linspace_indices(n, max_frames).into_iter().map(|i| grid[i]).collect()
+                        }
+                    };
+                }
+                assert_eq!(sample_grid(&cfg, total, rate, duration).unwrap(), grid);
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_huge_grids_stay_in_range_and_monotonic() {
+        let started = std::time::Instant::now();
+        for (total, rate, fps) in [
+            (2usize, 30.0, 1e20),
+            (1usize << 62, 1.0, 1.0),
+            ((1usize << 62) + 1, 1.0, 1.0),
+            (1usize << 40, 30.0, 1e7),
+            (usize::MAX / 2, 1.0, 1.0),
+            (usize::MAX, 1.0, 0.9),
+            (3, 1e-3, 1e12),
+            (7, 1e6, 1e12),
+        ] {
+            for max_frames in [1usize, 2, 3, 7, 1000, 10_000] {
+                for overflow in [Overflow::Uniform, Overflow::Truncate] {
+                    let cfg = cfg_with(Some(fps), max_frames, overflow);
+                    let got = match sample_frame_indices(&cfg, total, rate) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            assert!(e.starts_with("sample_frame_indices:"), "{e}");
+                            continue;
+                        }
+                    };
+                    assert!(!got.is_empty() && got.len() <= max_frames, "{total} {rate} {fps}");
+                    assert!(got.iter().all(|&i| i < total), "{total} {rate} {fps} {max_frames}: {got:?}");
+                    assert!(got.windows(2).all(|w| w[0] <= w[1]), "{total} {rate} {fps}: {got:?}");
+                    assert_eq!(got[0], 0);
+                }
+            }
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
 }

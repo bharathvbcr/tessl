@@ -388,3 +388,60 @@ fn reclaim_refuses_a_poisoned_runtime() {
     rt.poison.set("test");
     assert!(rt.reclaim(0).is_err());
 }
+
+/// Panic while holding the pool lock, as a ledger callback that panics would.
+fn poison_pool(rt: &GpuRuntime) {
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = rt.pool.lock().unwrap();
+        panic!("poisoning the pool on purpose");
+    }));
+    assert!(unwound.is_err());
+    assert!(rt.pool.is_poisoned());
+}
+
+/// A drop that is drained after the pool lock was poisoned still hands its
+/// live charge back: it is parked (Cold) or destroyed (Hot), never forgotten.
+#[test]
+fn a_poisoned_pool_still_releases_the_live_charge_of_a_drained_drop() {
+    let ledger = Fake::new(u64::MAX);
+    let rt = runtime_with(&ledger);
+    rt.synchronize().unwrap();
+    let cold = rt.alloc_buffer(300_000).unwrap();
+    let hot = rt.alloc_buffer_hot(3 << 20).unwrap();
+    let (cold_key, hot_key) = (bucket(300_000, BufferKind::Cold), bucket(3 << 20, BufferKind::Hot));
+    assert_eq!(ledger.live(), cold_key + hot_key);
+
+    poison_pool(&rt);
+    drop(cold);
+    drop(hot);
+    settle(&rt);
+
+    assert_eq!(ledger.live(), 0, "the Live charge of a drained drop was never released");
+    assert_eq!(
+        ledger.cached(),
+        cold_key,
+        "the Cold buffer was not parked on the free list"
+    );
+    assert_eq!(ledger.unmatched(), 0);
+    let held = rt.pool_resident();
+    assert_eq!((held.live_bytes, held.cached_bytes), (0, cold_key));
+}
+
+/// The pool's other release paths do not skip a poisoned lock either: the
+/// cache cap trims and `trim_free_list` frees, each releasing its Cached charge.
+#[test]
+fn a_poisoned_pool_still_trims_its_free_list() {
+    let ledger = Fake::new(u64::MAX);
+    let rt = runtime_with(&ledger);
+    rt.synchronize().unwrap();
+    let key = bucket(300_000, BufferKind::Cold);
+    drop((rt.alloc_buffer(300_000).unwrap(), rt.alloc_buffer(300_000).unwrap()));
+    settle(&rt);
+    assert_eq!(ledger.cached(), 2 * key);
+
+    poison_pool(&rt);
+    rt.set_pool_cache_cap_bytes(key as usize);
+    assert_eq!(ledger.cached(), key, "a poisoned lock skipped the cache cap");
+    assert_eq!(rt.trim_free_list(), key as usize);
+    assert_eq!((ledger.live(), ledger.cached(), ledger.unmatched()), (0, 0, 0));
+}

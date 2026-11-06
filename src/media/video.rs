@@ -72,7 +72,7 @@ use super::cf::{CFDataGetBytePtr, CFDataGetLength, CFDictionaryGetValue, CFGetTy
 use super::yuv::{self, Chroma, ChromaFilter, Flavor, Layout, Matrix, Params, Picture, Range, Threads};
 use super::{codec_config, containers, orient, vt, MediaError};
 use crate::embedgemma2_pre::{
-    preprocess_video, sample_frame_indices, PreparedVideo, RawImage, VideoConfig, MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES,
+    preprocess_video, sample_grid, PreparedVideo, RawImage, VideoConfig, MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -539,25 +539,7 @@ impl VideoSource {
     /// # Errors
     /// [`MediaError::Preprocess`] with the sampler's message.
     pub fn sample_indices(&self, cfg: &VideoConfig) -> Result<Vec<usize>, MediaError> {
-        let total = self.info.total_frames;
-        let mut indices: Vec<usize> = match cfg.fps {
-            None => (0..total).collect(),
-            Some(fps) => {
-                let step = self.info.fps / fps;
-                let sampled = ((self.info.duration * fps) as usize).max(1);
-                (0..sampled)
-                    .map(|i| ((i as f64 * step) as usize).min(total - 1))
-                    .collect()
-            }
-        };
-        if indices.len() > cfg.max_frames {
-            // The cap chooses positions in the list, as it would in `arange(n)`.
-            let mut cap = cfg.clone();
-            cap.fps = None;
-            let positions = sample_frame_indices(&cap, indices.len(), 1.0).map_err(MediaError::Preprocess)?;
-            indices = positions.into_iter().map(|p| indices[p]).collect();
-        }
-        Ok(indices)
+        sample_grid(cfg, self.info.total_frames, self.info.fps, self.info.duration).map_err(MediaError::Preprocess)
     }
 
     /// Decode the frames at `indices` to the decoder's own planes, without

@@ -26,6 +26,8 @@ const KV_STORE: &str = include_str!("../kernels/kv_store.metal");
 const QKV_ROPE: &str = include_str!("../kernels/rms_qkv_rope.metal");
 const ATTN_DECODE: &str = include_str!("../kernels/flash_attn_decode.metal");
 const ATTN_ROWS: &str = include_str!("../kernels/flash_attn_rows.metal");
+const GQA_DECODE: &str = include_str!("../kernels/gqa_decode.metal");
+const I8_PIPELINE_RS: &str = include_str!("../src/i8_pipeline.rs");
 const ATTN_SWA_128: &str = include_str!("../kernels/flash_attn_swa_h128.metal");
 const ATTN_SWA_256: &str = include_str!("../kernels/flash_attn_swa_h256.metal");
 const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal");
@@ -80,6 +82,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "gemv_q4.metal",
     "gemv_q4_mlx.metal",
     "gemv_q8.metal",
+    "gqa_decode.metal",
     "kv_store.metal",
     "matmul_simdgroup.metal",
     "mtl_tensor.metal",
@@ -398,13 +401,24 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
         require(source, "#include \"attn_fa2.h\"", label);
         require(source, "flash_attn_fa2_tiled<HEAD_DIM, BR, BC,", label);
     }
-    for (label, source) in [
-        ("decode attention", ATTN_DECODE),
-        ("rows attention", ATTN_ROWS),
-        ("tiled FA-2 body (attn_fa2.h)", ATTN_FA2_H),
-    ] {
-        require(source, "(ulong)b * kv_capacity * kv_pos_stride", label);
-        forbid(source, "b * kv_capacity * kv_pos_stride + hkv", label);
+    require(
+        ATTN_FA2_H,
+        "(ulong)b * kv_capacity * kv_pos_stride",
+        "tiled FA-2 body (attn_fa2.h)",
+    );
+    forbid(
+        ATTN_FA2_H,
+        "b * kv_capacity * kv_pos_stride + hkv",
+        "tiled FA-2 body (attn_fa2.h)",
+    );
+    // Decode and rows take separate K and V head dims (DK, DV), so each has a
+    // K and a V plane base; both are widened before the batch product.
+    for (label, source) in [("decode attention", ATTN_DECODE), ("rows attention", ATTN_ROWS)] {
+        for stride in ["k_pos_stride", "v_pos_stride"] {
+            require(source, &format!("(ulong)b * kv_capacity * {stride}"), label);
+            forbid(source, &format!("b * kv_capacity * {stride} + hkv"), label);
+            require(source, &format!("const ulong {stride} = (ulong)Hkv * "), label);
+        }
     }
     // The decode kernel holds one query position per dispatch, so it has no
     // `Tq`-strided query base to widen; the other four do.
@@ -463,6 +477,33 @@ fn attention_and_kv_cache_offsets_are_widened_before_multiplication() {
 /// The TensorOps prefill attention addresses one (batch, head) plane by a
 /// 64-bit base pointer offset; MPP then indexes inside the plane with i32
 /// extents and strides, which the host bounds (`qwen35::attn_prefill`).
+/// `gqa_decode_h*` runs one thread per (batch, query head). Its grid guard
+/// `uint total = batch * q_heads` is a 32-bit product, bounded because the
+/// host sizes the 1D grid as that same product in `usize` and `dispatch_1d`
+/// refuses a grid over `u32::MAX`. Every buffer address is widened first.
+#[test]
+fn gqa_decode_offsets_are_widened_and_its_grid_is_host_bounded() {
+    let label = "gqa_decode";
+    require(GQA_DECODE, "uint total = batch * q_heads;", label);
+    require(
+        I8_PIPELINE_RS,
+        "let threads = numel(&[batch, q_heads], \"gqa_decode\")?;",
+        label,
+    );
+    require(I8_PIPELINE_RS, "dispatch_1d(rt, &p, threads,", label);
+    require(
+        DISPATCH_RS,
+        "if n > u32::MAX as usize",
+        "1D grid representability guard",
+    );
+    require(GQA_DECODE, "Q + ((ulong)b * q_heads + h) * D", label);
+    require(GQA_DECODE, "O + ((ulong)b * q_heads + h) * D", label);
+    require(GQA_DECODE, "K + (((ulong)b * kv_len + t) * kv_heads + kv_h) * D", label);
+    require(GQA_DECODE, "V + (((ulong)b * kv_len + t) * kv_heads + kv_h) * D", label);
+    forbid(GQA_DECODE, "(b * kv_len + t) * kv_heads", label);
+    forbid(GQA_DECODE, "(b * q_heads + h) * D", label);
+}
+
 #[test]
 fn qwen35_tiled_attention_plane_bases_are_widened() {
     require(

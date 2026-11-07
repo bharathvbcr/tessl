@@ -25,6 +25,7 @@ fn wave(n: usize, seed: f32) -> Vec<f32> {
 
 /// Causal scaled dot-product attention in f64. Query `t` attends to keys whose
 /// absolute position is at most the query's. Scale is `1/sqrt(key_dim)`.
+#[allow(clippy::too_many_arguments)]
 fn causal_sdpa(
     q: &[f32],
     k: &[f32],
@@ -46,7 +47,7 @@ fn causal_sdpa(
             let qs = ((t * H) + h) * dk;
             let mut best = f64::NEG_INFINITY;
             let mut scores = vec![f64::NEG_INFINITY; tkv];
-            for tk in 0..tkv {
+            for (tk, score) in scores.iter_mut().enumerate() {
                 let k_abs = kv_pos_offset + tk;
                 if k_abs > q_abs {
                     continue;
@@ -57,17 +58,17 @@ fn causal_sdpa(
                     dot += f64::from(q[qs + x]) * f64::from(k[ks + x]);
                 }
                 let s = dot * scale;
-                scores[tk] = s;
+                *score = s;
                 best = best.max(s);
             }
             let mut denom = 0.0f64;
             let mut acc = vec![0.0f64; dv];
             if best.is_finite() {
-                for tk in 0..tkv {
-                    if !scores[tk].is_finite() {
+                for (tk, &s) in scores.iter().enumerate() {
+                    if !s.is_finite() {
                         continue;
                     }
-                    let p = (scores[tk] - best).exp();
+                    let p = (s - best).exp();
                     denom += p;
                     let vs = (tk * HKV + hk) * dv;
                     for x in 0..dv {
@@ -96,19 +97,19 @@ fn gqa_reference(q: &[f32], k: &[f32], v: &[f32], d: usize, kv_len: usize) -> Ve
         let qs = h * d;
         let mut best = f64::NEG_INFINITY;
         let mut scores = vec![0.0f64; kv_len];
-        for t in 0..kv_len {
+        for (t, score) in scores.iter_mut().enumerate() {
             let ks = (t * HKV + hk) * d;
             let mut dot = 0.0f64;
             for x in 0..d {
                 dot += f64::from(q[qs + x]) * f64::from(k[ks + x]);
             }
-            scores[t] = dot * scale;
-            best = best.max(scores[t]);
+            *score = dot * scale;
+            best = best.max(*score);
         }
         let mut denom = 0.0f64;
         let mut acc = vec![0.0f64; d];
-        for t in 0..kv_len {
-            let p = (scores[t] - best).exp();
+        for (t, &s) in scores.iter().enumerate() {
+            let p = (s - best).exp();
             denom += p;
             let vs = (t * HKV + hk) * d;
             for x in 0..d {

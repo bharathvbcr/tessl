@@ -1247,31 +1247,34 @@ fn random_rows(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
 
 /// Check one quantized row against the IEEE host reference.
 ///
-/// Tolerance, and why. The scale is `absmax / 127`, one correctly rounded
-/// divide on the host. The kernel is built with fast math, so its `x / scale`
-/// may be a reciprocal multiply, off by a few ulp of the quotient. The scale is
-/// compared bit for bit, because `red[0] / 127` is one operation on exact
-/// input (an `fmax` of absolute values). A quotient `r = x / scale` rounds to
-/// `rint(r)`. A few ulp of error can move `r` across a `.5` boundary and no
-/// other integer boundary, so `q` may differ from the reference by 1 and only
-/// when `|r - (floor(r) + 0.5)| <= 8 * EPSILON * |r|` (8 ulp, at most
-/// 1.2e-4 for |r| <= 127). Everywhere else `q` must be identical. Returns how
-/// many elements used that allowance.
+/// Tolerance, and why. The kernel is built with fast math. Measured on this
+/// device: `red[0] / 127.0f` is not the correctly rounded quotient for every
+/// absmax (a reciprocal multiply), so the scale may differ from the host
+/// `absmax / 127` by 1 ulp; it is checked as at most 1 ulp apart, never more.
+/// `q` is then checked against the reference built from the scale the kernel
+/// actually wrote, so the scale's own error is not double counted. The
+/// kernel's `x / scale` may likewise be off by a few ulp of the quotient
+/// `r = x / scale`. That can move `r` across a `.5` boundary and no other
+/// integer boundary, so `q` may differ from `rint(r)` by 1, and only when
+/// `|r - (floor(r) + 0.5)| <= 8 * EPSILON * |r|` (8 ulp, at most 1.2e-4 for
+/// |r| <= 127). Everywhere else `q` must be identical. Returns how many
+/// elements used that allowance.
 fn check_quant_row(row: &[f32], got_q: &[u8], got_scale: f32, tag: &str) -> usize {
-    let (want_q, want_s) = quant_row(row).expect("finite row");
-    assert_eq!(got_scale.to_bits(), want_s.to_bits(), "{tag} scale");
+    let (_, host_s) = quant_row(row).expect("finite row");
+    let ulps = (got_scale.to_bits() as i64 - host_s.to_bits() as i64).abs();
+    assert!(ulps <= 1, "{tag} scale {got_scale} vs host {host_s}: {ulps} ulp");
     let mut slack = 0usize;
     for (c, x) in row.iter().enumerate() {
         let got = got_q[c] as i8;
-        if got == want_q[c] {
+        let r = *x / got_scale;
+        let want = r.round_ties_even().clamp(-127.0, 127.0) as i8;
+        if got == want {
             continue;
         }
-        let r = *x / want_s;
         let dist = (r - (r.floor() + 0.5)).abs();
         assert!(
-            (got as i32 - want_q[c] as i32).abs() == 1 && dist <= 8.0 * f32::EPSILON * r.abs(),
-            "{tag} col {c}: x {x} scale {want_s} ratio {r} got {got} want {} (dist to .5 {dist})",
-            want_q[c]
+            (got as i32 - want as i32).abs() == 1 && dist <= 8.0 * f32::EPSILON * r.abs(),
+            "{tag} col {c}: x {x} scale {got_scale} ratio {r} got {got} want {want} (dist to .5 {dist})"
         );
         slack += 1;
     }

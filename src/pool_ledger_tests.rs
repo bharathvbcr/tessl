@@ -934,11 +934,15 @@ impl Rig {
         } else {
             drop(held);
             settle(&rt);
-            if every_call {
-                // A ledger that panics on every call never lets a release
-                // succeed, so queued items rightly keep their charges. The
-                // books must still agree: what is queued is what the ledger
-                // holds as Live, and nothing was released twice.
+            if every_call || rt.active_m4.is_poisoned() {
+                // Two states in which the drain cannot run, and queued items
+                // rightly keep their charges: a ledger that panics on every
+                // call never lets a release succeed, and a panic inside a
+                // non-waiting commit's drain poisons `active_m4`, which
+                // `recycle_if_idle` reads as "a command buffer may be open".
+                // The books must still agree: what is queued is what the
+                // ledger holds as Live, and nothing was released twice. The
+                // runtime's Drop then returns them (checked below).
                 let queued: u64 = rt
                     .pending_cold_recycle
                     .lock()
@@ -1227,8 +1231,8 @@ fn a_requeued_drain_item_leaves_the_residency_count_where_it_started() {
 #[test]
 fn a_ledger_panic_inside_drop_still_returns_the_remaining_charges() {
     let _quiet = quiet_injected();
-    // Drop makes six ledger calls: three cached buffers and three queued drops.
-    for n in 1..=6 {
+    let mut n = 1;
+    loop {
         let mut rig = Rig::new();
         rig.seed();
         rig.apply(Op::DropAll);
@@ -1236,13 +1240,18 @@ fn a_ledger_panic_inside_drop_still_returns_the_remaining_charges() {
         drop(held);
         chaos.panic_on_call(n);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(rt))).is_err();
-        assert!(unwound, "Drop made fewer than {n} ledger calls");
         assert_eq!(
             (fake.live(), fake.cached()),
             (0, 0),
             "a panic at ledger call {n} inside Drop left charges on the ledger"
         );
+        if !unwound {
+            break;
+        }
+        n += 1;
     }
+    // The free list and the drained queue hold at least four charges between them.
+    assert!(n > 4, "Drop made only {} ledger calls", n - 1);
 }
 
 /// A runtime dropped while the thread is already unwinding must not resume

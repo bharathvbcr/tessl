@@ -1263,6 +1263,20 @@ fn check_quant_row(row: &[f32], got_q: &[u8], got_scale: f32, tag: &str) -> usiz
     let (_, host_s) = quant_row(row).expect("finite row");
     let ulps = (got_scale.to_bits() as i64 - host_s.to_bits() as i64).abs();
     assert!(ulps <= 1, "{tag} scale {got_scale} vs host {host_s}: {ulps} ulp");
+    if ulps == 1 {
+        // Classification: the absmax is exact (an fmax of |x|), so the gap is
+        // the divide. `recip` is the reciprocal-multiply form fast math emits.
+        let absmax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let recip = absmax * (1.0f32 / 127.0);
+        println!(
+            "SCALE1ULP {tag}: absmax bits {:#010x} kernel scale {:#010x} host absmax/127 {:#010x} absmax*(1/127) {:#010x} kernel==recip {}",
+            absmax.to_bits(),
+            got_scale.to_bits(),
+            host_s.to_bits(),
+            recip.to_bits(),
+            got_scale.to_bits() == recip.to_bits()
+        );
+    }
     let mut slack = 0usize;
     for (c, x) in row.iter().enumerate() {
         let got = got_q[c] as i8;

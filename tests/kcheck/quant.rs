@@ -143,9 +143,7 @@ fn q8(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             128 => "gemm_q8_tensorops_g128",
             _ => unreachable!(),
         };
-        let q: Vec<i8> = (0..rows * cols)
-            .map(|i| ((i * 3 + group) % 17) as i8 - 8)
-            .collect();
+        let q: Vec<i8> = (0..rows * cols).map(|i| ((i * 3 + group) % 17) as i8 - 8).collect();
         let ng = rows * (cols / group);
         let scales: Vec<f32> = (0..ng).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
         let zeros: Vec<f32> = (0..ng).map(|i| (i % 3) as f32 - 1.0).collect();

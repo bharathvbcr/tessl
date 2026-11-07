@@ -1024,12 +1024,7 @@ fn text_fuse(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         close_peak("eg2t_resid_norm_bf16", &read_bf16(&out, 8), &want_o, 2e-2);
     });
     ledger.credit(rt, "eg2t_resid_add_bf16_copy", &["eg2t_resid_add_bf16_copy"], || {
-        let (yb, wp, rb, copy) = (
-            buf(rt, &y),
-            buf(rt, &w_post),
-            buf(rt, &resid),
-            buf_bf16(rt, &[0.0; 8]),
-        );
+        let (yb, wp, rb, copy) = (buf(rt, &y), buf(rt, &w_post), buf(rt, &resid), buf_bf16(rt, &[0.0; 8]));
         ok(
             "resid_copy",
             embedgemma2::resid_add_bf16_copy(rt, &yb, &wp, &rb, &copy, rows, dim, eps, 0.5),
@@ -1867,12 +1862,7 @@ fn kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     });
     ledger.credit(rt, "kv_ring_densify", &["kv_ring_densify"], || {
         let src: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
-        let (sb, db, filled, start) = (
-            buf(rt, &src),
-            buf(rt, &[-1.0; 8]),
-            buf_u32(rt, &[4]),
-            buf_u32(rt, &[1]),
-        );
+        let (sb, db, filled, start) = (buf(rt, &src), buf(rt, &[-1.0; 8]), buf_u32(rt, &[4]), buf_u32(rt, &[1]));
         ok("ring", nn::kv_ring_densify(rt, &sb, &db, &filled, &start, 2, 4));
         let mut want = vec![0.0; 8];
         for t in 0..4 {

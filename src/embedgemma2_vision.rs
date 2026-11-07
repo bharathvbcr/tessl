@@ -1840,8 +1840,6 @@ mod tests {
         assert!(pack_images(&many).iter().all(|r| r.len() <= MAX_IMAGES));
     }
 
-    use super::VisionConfig;
-
     /// The checkpoint's vision config with `patch_size` replaced.
     fn config_with_patch_size(patch_size: u64) -> String {
         format!(
@@ -1891,9 +1889,15 @@ mod tests {
         // `prepare` needs a loaded tower (a GPU runtime), so its check is the
         // function it calls.
         assert!(check_pixel_len("w", 4, 768, 0).is_err());
-        assert!(check_pixel_len("w", 4, 0, 0).is_err(), "a zero width must not match an empty buffer");
+        assert!(
+            check_pixel_len("w", 4, 0, 0).is_err(),
+            "a zero width must not match an empty buffer"
+        );
         assert!(check_pixel_len("w", 4, 768, 4 * 768 - 1).is_err());
-        assert!(check_pixel_len("w", usize::MAX, 2, 0).is_err(), "no multiplication overflow panic");
+        assert!(
+            check_pixel_len("w", usize::MAX, 2, 0).is_err(),
+            "no multiplication overflow panic"
+        );
         assert!(check_pixel_len("w", 4, 768, 4 * 768).is_ok());
     }
 }

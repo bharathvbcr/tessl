@@ -920,3 +920,39 @@ fn non_finite_scale_is_refused_without_a_dispatch() {
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
+
+/// The refusal wording is a contract other crates may match on. Pinned
+/// byte-for-byte, so moving the checks into a shared validator cannot reword it.
+#[test]
+fn refusal_messages_are_pinned_byte_for_byte() {
+    with_gpu(|rt| {
+        let big = rt.alloc_buffer(1 << 20).unwrap();
+        big.write_bytes(&vec![0u8; 1 << 20]);
+        let tiny = rt.alloc_buffer(64).unwrap();
+        tiny.write_bytes(&[0u8; 64]);
+        let spec = |a, b, c, m, n, k| nn::I8Gemm {
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            a_scale: nn::I8AScale::Scalar(1.0),
+            b_scale: nn::I8BScale::None,
+            bias: None,
+            b_layout: nn::I8BLayout::RowMajorKN,
+            out: nn::I8Out::F32,
+        };
+        rt.take_dispatch_count();
+        let e = nn::gemm_i8(rt, spec(&big, &big, &big, 2, 2, 131_072)).expect_err("k bound");
+        assert_eq!(
+            e,
+            "gemm_i8: k = 131072 exceeds 131071, past which an int32 accumulator can overflow at full int8 range"
+        );
+        let e = nn::gemm_i8(rt, spec(&big, &big, &big, 2, 2, 32)).expect_err("alias");
+        assert_eq!(e, "gemm_i8: writable buffer c overlaps read-only buffer a");
+        let e = nn::gemm_i8(rt, spec(&tiny, &tiny, &tiny, 65_536, 8, 32_768)).expect_err("extent");
+        assert_eq!(e, "gemm_i8 a exceeds signed 32-bit kernel indexing");
+        assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}

@@ -11,6 +11,8 @@ const EMBED: &str = include_str!("../kernels/embed_lookup.metal");
 const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
 const GEMM_Q4_MLX: &str = include_str!("../kernels/gemm_q4_mlx.metal");
+const CONV_RS: &str = include_str!("../src/conv.rs");
+const CONV2D_TENSOROPS: &str = include_str!("../kernels/conv2d_tensorops.metal");
 const GEMM_Q4_MLX_TENSOROPS: &str = include_str!("../kernels/gemm_q4_mlx_tensorops.metal");
 const GEMM_Q8_TENSOROPS: &str = include_str!("../kernels/gemm_q8_tensorops.metal");
 /// The simdgroup GEMV / GEMM bodies the `*_simd*` entries of the two files above delegate to.
@@ -63,6 +65,7 @@ const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage
 /// cannot join the build without someone deciding which list it belongs on.
 const INSPECTED_KERNELS: &[&str] = &[
     "bert.metal",
+    "conv2d_tensorops.metal",
     "cross_entropy.metal",
     "embed_lookup.metal",
     "embed_pool.metal",
@@ -1331,4 +1334,84 @@ fn gemm_q8_tensorops_ints_are_bounded_by_the_host_extent_guard() {
         entry.find("require_i32_extent").unwrap() < entry.find("require::<i8>").unwrap(),
         "the extent guard must run before the buffer-length checks"
     );
+}
+
+/// `conv2d_tensorops.metal` does its tensor-level arithmetic in `uint`/`int` (the pack's
+/// `n * C + c` and `n * Hp + hp`, the weights kernel's `CO * CI * K * K`, the op's extents and
+/// strides) and widens only the final element offsets. That is safe exactly because
+/// `conv::conv2d_nchw` refuses, before any pipeline lookup, allocation or encode, every tensor the
+/// kernels span (x, y, the padded NHWC scratch and the HWIO weights) over `i32::MAX` elements, and
+/// refuses a pad whose padded size wraps. Every uint product is a sub-product of one of those
+/// element counts (each factor is at least 1), so it is below `i32::MAX`, below `u32::MAX`.
+#[test]
+fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
+    // Kernel: the products that stay narrow, and the offsets that widen.
+    for (needle, what) in [
+        (
+            "x[((ulong)(n * C + c) * H + (uint)h) * W + (uint)w]",
+            "pack source offset",
+        ),
+        (
+            "xp[((ulong)(n * Hp + hp) * Wp + wp) * C + c]",
+            "pack destination offset",
+        ),
+        ("const uint total = CO * CI * K * K;", "weights element count"),
+        (
+            "device float *yn = y + (ulong)n * CO * OH * OW + (ulong)h0 * OW;",
+            "output image base",
+        ),
+        ("yn[(ulong)o * OH * OW + w]", "output channel plane"),
+        ("array<int, 4>{1, CI, CI * Wp, CI * Wp * Hp}", "padded input strides"),
+        ("array<int, 4>{1, CO, CO * CI, CO * CI * K}", "weights strides"),
+        ("dextents<int, 4>{CI, Wp, Hp, N}", "padded input extents"),
+        ("dextents<int, 4>{CO, CI, K, K}", "weights extents"),
+    ] {
+        require(CONV2D_TENSOROPS, needle, what);
+    }
+    // Host: the helper that names the bound, and the call that runs it before any work.
+    let int_scratch = CONV_RS
+        .split("fn int_scratch(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("int_scratch body");
+    for (needle, what) in [
+        ("e <= i32::MAX as usize", "i32 bound"),
+        ("int(xp).is_some()", "padded input scratch bound"),
+        ("int(wh).is_some()", "HWIO weights bound"),
+        ("int(&[n, c_out, oh, ow]).is_some()", "output bound"),
+        ("int(&[n, c_in, h, wd]).is_some()", "input bound"),
+        (
+            ".try_fold(1usize, |a, &d| a.checked_mul(d))",
+            "overflow-checked product",
+        ),
+    ] {
+        require(int_scratch, needle, what);
+    }
+    require(
+        CONV_RS,
+        "pad.checked_mul(2).and_then(|p| p.checked_add(d))",
+        "padded size is overflow-checked",
+    );
+    forbid(CONV_RS, "h + 2 * pad", "conv2d_nchw padded height");
+    let entry = CONV_RS
+        .split("pub fn conv2d_nchw(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("conv2d_nchw body");
+    let guard = entry
+        .find("int_scratch(n, c_in, c_out, oh, ow, h, wd)")
+        .expect("conv2d_nchw runs the int extent guard");
+    for later in ["rt.pipeline(", "alloc_tensor_unzeroed(", "with_binder("] {
+        assert!(
+            guard < entry.find(later).expect("conv2d_nchw body has this step"),
+            "the extent guard must run before {later}"
+        );
+    }
+    // Every dispatch of these kernels lives in conv.rs: a second host entry would need the guard.
+    assert_eq!(
+        CONV_RS.matches("rt.pipeline(").count(),
+        3,
+        "a new conv2d pipeline lookup must pass int_scratch"
+    );
+    assert!((i32::MAX as u64) < u64::from(u32::MAX));
 }

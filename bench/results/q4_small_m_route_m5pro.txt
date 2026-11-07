@@ -1,0 +1,44 @@
+Q4 small-M routing: gemm_q4_mlx (RowMajor, old) vs gemm_q4_mlx_tensorops_g64 (new), group size 64
+Device Apple M5 Pro. tessl ac18085 (gp/w12-integration). Two independent invocations of
+`cargo run --release --bin bench_gemm_variants -- --q4-small-m` with BENCH_ROUNDS=15 BENCH_CALLS=20 BENCH_WARMUP=3,
+under the machine-wide mac_heavy lock after a 60 s GPU-idle wait, 2026-11-07 21:34Z. Raw rounds: q4_small_m_route_m5pro_run{1,2}.json.
+
+Rule, stated in bench_gemm_variants::q4_small_m before the run: old wins if new/old > 1 + max(0.05, 2*spread) and new slower in >= 80% of rounds.
+'band' below is max(0.05, 2*spread) (bench_gemm_variants.rs:919). Every verdict was recomputed from the raw fields and matches the binary's.
+
+shape                     M  new/old r1   band slower  new/old r2   band slower  verdict r1 / r2
+2b_attn_2048x2048         2       1.212  0.408    93%       1.260  0.521   100%  no_difference_measured / no_difference_measured
+2b_attn_2048x2048         3       1.083  0.469    73%       1.114  0.189   100%  no_difference_measured / no_difference_measured
+2b_attn_2048x2048         4       0.887  0.401    27%       0.959  0.561    53%  no_difference_measured / no_difference_measured
+2b_attn_2048x2048         5       0.850  0.510     0%       0.864  0.492     7%  no_difference_measured / no_difference_measured
+2b_attn_2048x2048         6       0.723  0.364     0%       0.721  0.490     0%  no_difference_measured / no_difference_measured
+2b_attn_2048x2048         7       0.553  0.292     0%       0.540  0.248     0%  new_route_wins / new_route_wins
+2b_attn_2048x2048         8       0.479  0.265     0%       0.505  0.797     0%  new_route_wins / no_difference_measured
+2b_mlp_up_6144x2048       2       1.112  0.432    87%       1.135  0.310    87%  no_difference_measured / no_difference_measured
+2b_mlp_up_6144x2048       3       0.960  1.073    13%       0.879  1.115    27%  no_difference_measured / no_difference_measured
+2b_mlp_up_6144x2048       4       0.804  0.331     0%       0.777  0.421     0%  no_difference_measured / no_difference_measured
+2b_mlp_up_6144x2048       5       0.694  0.239     0%       0.689  0.801     0%  new_route_wins / no_difference_measured
+2b_mlp_up_6144x2048       6       0.567  0.491     0%       0.543  0.953     0%  no_difference_measured / no_difference_measured
+2b_mlp_up_6144x2048       7       0.313  0.220     0%       0.322  0.481     0%  new_route_wins / new_route_wins
+2b_mlp_up_6144x2048       8       0.240  0.395     0%       0.240  0.589     0%  new_route_wins / new_route_wins
+2b_mlp_down_2048x6144     2       1.265  0.286   100%       1.236  0.285   100%  no_difference_measured / no_difference_measured
+2b_mlp_down_2048x6144     3       1.061  0.246    73%       1.117  0.254   100%  no_difference_measured / no_difference_measured
+2b_mlp_down_2048x6144     4       0.991  0.256    53%       0.992  0.480    53%  no_difference_measured / no_difference_measured
+2b_mlp_down_2048x6144     5       0.868  0.285     0%       0.881  0.772    20%  no_difference_measured / no_difference_measured
+2b_mlp_down_2048x6144     6       0.668  0.357     0%       0.655  0.332     0%  no_difference_measured / new_route_wins
+2b_mlp_down_2048x6144     7       0.419  0.251     0%       0.417  0.291     0%  new_route_wins / new_route_wins
+2b_mlp_down_2048x6144     8       0.339  0.214     0%       0.336  0.325     0%  new_route_wins / new_route_wins
+sq_4096x4096              2       1.109  0.259    87%       1.078  0.275    93%  no_difference_measured / no_difference_measured
+sq_4096x4096              3       0.975  0.369    33%       0.952  0.308    33%  no_difference_measured / no_difference_measured
+sq_4096x4096              4       0.863  0.296     0%       0.853  0.199     0%  no_difference_measured / no_difference_measured
+sq_4096x4096              5       0.708  0.335     0%       0.693  0.634     0%  no_difference_measured / no_difference_measured
+sq_4096x4096              6       0.524  0.428     0%       0.549  0.561     0%  new_route_wins / no_difference_measured
+sq_4096x4096              7       0.280  0.374     0%       0.281  0.281     0%  new_route_wins / new_route_wins
+sq_4096x4096              8       0.215  0.264     0%       0.214  0.182     0%  new_route_wins / new_route_wins
+
+Parity: max |new - old| over every row and both runs = 1.335e-05.
+Verdict: no row is old_route_wins in either run, so the new route stays the small-M route. 24 of 28 rows
+agree across runs; the 4 that differ move between new_route_wins and no_difference_measured.
+Lead, not a verdict: at M=2-3 the new route is slower in 73-100% of rounds in both runs (new/old 1.06-1.27,
+inside the 0.25-0.47 band). The noise on a shared machine is wider than the gap; a quiet-GPU paired rerun at
+M=2-3 would settle it.

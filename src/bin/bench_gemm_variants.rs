@@ -57,7 +57,7 @@ use tessl::gemm::{
     gemm_nt_train, gemm_tn_accum_train, gemm_tn_f32, gemm_tn_train, Activation, BatchStrides, BatchedGemm, Epilogue,
     GemmBackend,
 };
-use tessl::nn::{gemm_q4_mlx_tensorops, gemm_q8_tensorops, Q4MlxBank, QuantShape};
+use tessl::nn::{gemm_q4_mlx, gemm_q4_mlx_tensorops, gemm_q8_tensorops, Q4MlxBank, Q4MlxLayout, QuantShape};
 use tessl::runtime::{GpuRuntime, PrecisionMode};
 use tessl::tensor::{f32_slice_to_bf16, GpuBuffer, Tensor};
 
@@ -758,6 +758,192 @@ fn quant_coop_grid() -> Result<(), String> {
     Ok(())
 }
 
+/// Q4 weights at M = 2..=8: the small-batch kernel `gemm_q4_mlx` (the route
+/// `Q4Weight::matmul` took for these M until the Nov 5 work) against
+/// `gemm_q4_mlx_tensorops` (the route it takes now), at the Qwen3.5-2B
+/// projection shapes and 4096x4096, group 64.
+///
+/// `cargo run --release --bin bench_gemm_variants -- --q4-small-m`
+///
+/// Method, fixed before any run: per (shape, M), first a parity check (the two
+/// arms' outputs agree within `1e-3` of the largest magnitude, f32 accumulation
+/// in different orders over bf16 inputs) and one dispatch per call for each
+/// arm; then `BENCH_ROUNDS` paired rounds, each timing `BENCH_CALLS`
+/// back-to-back calls of both arms (ms per call), alternating which arm goes
+/// first. Reported per (shape, M): each arm's median, the new/old median ratio,
+/// the share of rounds where the new arm was slower, and each arm's own spread
+/// `(p90 - p10) / median` as its noise floor.
+///
+/// Decision rule (stated before the run): the old route wins at (shape, M) when
+/// the new/old ratio exceeds `1 + max(0.05, 2 * spread)` (spread = the larger
+/// of the two arms') and the new arm was slower in at least 80% of rounds. A
+/// win on any 2B shape at any M is a routing regression worth a card; a ratio
+/// inside the band is "no difference measured"; a ratio below `1 - band` is a
+/// win for the new route.
+fn q4_small_m() -> Result<(), String> {
+    const GROUP: u32 = 64;
+    const SHAPES: [(&str, usize, usize); 4] = [
+        ("2b_attn_2048x2048", 2048, 2048),
+        ("2b_mlp_up_6144x2048", 6144, 2048),
+        ("2b_mlp_down_2048x6144", 2048, 6144),
+        ("sq_4096x4096", 4096, 4096),
+    ];
+    const MS: std::ops::RangeInclusive<usize> = 2..=8;
+
+    let rt = GpuRuntime::new()?;
+    if !rt.has_tensorops() {
+        return Err("TensorOps is unavailable; the new route has no device path".into());
+    }
+    let device = rt.device_name();
+    let rounds = env_usize("BENCH_ROUNDS", 15, 3)?;
+    let calls = env_usize("BENCH_CALLS", 20, 1)?;
+    let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
+
+    // A small LCG so both arms read the same varied data.
+    let mut seed = 0x9e37_79b9_u32;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    let mut rows_out: Vec<String> = Vec::new();
+    for (label, rows, cols) in SHAPES {
+        let packed = rt.alloc_buffer(rows * cols / 2)?;
+        packed.try_write_bytes(&(0..rows * cols / 2).map(|_| (next() >> 24) as u8).collect::<Vec<_>>())?;
+        let pairs = rows * (cols / GROUP as usize);
+        let sb: Vec<f32> = (0..pairs * 2)
+            .map(|i| {
+                let r = (next() >> 8) as f32 / (1u32 << 24) as f32;
+                if i.is_multiple_of(2) {
+                    0.01 + 0.02 * r
+                } else {
+                    -0.05 * r
+                }
+            })
+            .collect();
+        let sb_buf = rt.alloc_buffer(pairs * 2 * 2)?;
+        sb_buf.try_write_bf16_bits(&f32_slice_to_bf16(&sb))?;
+        let x: Vec<f32> = (0..8 * cols)
+            .map(|_| ((next() >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0)
+            .collect();
+        let x_buf = rt.alloc_buffer(8 * cols * 2)?;
+        x_buf.try_write_bf16_bits(&f32_slice_to_bf16(&x))?;
+        let y_old = rt.alloc_buffer(8 * rows * 4)?;
+        let y_new = rt.alloc_buffer(8 * rows * 4)?;
+        let shape = QuantShape {
+            rows: rows as u32,
+            cols: cols as u32,
+            group_size: GROUP,
+        };
+        let bank = || Q4MlxBank {
+            packed: &packed,
+            scales_biases: &sb_buf,
+        };
+        for m in MS {
+            let old = || {
+                gemm_q4_mlx(
+                    &rt,
+                    bank(),
+                    &x_buf,
+                    &y_old,
+                    shape,
+                    m as u32,
+                    Q4MlxLayout::RowMajor,
+                    None,
+                )
+            };
+            let new = || gemm_q4_mlx_tensorops(&rt, bank(), &x_buf, &y_new, shape, m as u32);
+
+            // Correctness and path before speed.
+            rt.synchronize()?;
+            rt.take_dispatch_count();
+            old()?;
+            let old_dispatches = rt.take_dispatch_count();
+            new()?;
+            let new_dispatches = rt.take_dispatch_count();
+            rt.synchronize()?;
+            if old_dispatches != 1 || new_dispatches != 1 {
+                return Err(format!(
+                    "{label} M={m}: expected one dispatch per call, old {old_dispatches}, new {new_dispatches}"
+                ));
+            }
+            let a = y_old.try_read_f32()?;
+            let b = y_new.try_read_f32()?;
+            let n = m * rows;
+            let scale = a[..n].iter().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-30);
+            let worst = a[..n]
+                .iter()
+                .zip(&b[..n])
+                .fold(0.0f32, |w, (p, q)| w.max((p - q).abs()));
+            if worst.is_nan() || worst > 1e-3 * scale {
+                return Err(format!(
+                    "{label} M={m}: arms disagree, max |old - new| {worst:e} against max |old| {scale:e}"
+                ));
+            }
+
+            let per_call = |f: &dyn Fn() -> Result<(), String>| -> Result<f64, String> {
+                let t0 = Instant::now();
+                for _ in 0..calls {
+                    f()?;
+                }
+                rt.synchronize()?;
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / calls as f64;
+                if !ms.is_finite() || ms <= 0.0 {
+                    return Err(format!("{label} M={m}: sample {ms} is not a positive finite time"));
+                }
+                Ok(ms)
+            };
+            for _ in 0..warmup {
+                per_call(&old)?;
+                per_call(&new)?;
+            }
+            let (mut ts_old, mut ts_new) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
+            for r in 0..rounds {
+                if r.is_multiple_of(2) {
+                    ts_old.push(per_call(&old)?);
+                    ts_new.push(per_call(&new)?);
+                } else {
+                    ts_new.push(per_call(&new)?);
+                    ts_old.push(per_call(&old)?);
+                }
+            }
+            let spread = |v: &[f64]| -> Result<f64, String> {
+                let mut s = v.to_vec();
+                s.sort_by(f64::total_cmp);
+                let at = |q: f64| s[((s.len() - 1) as f64 * q).round() as usize];
+                Ok((at(0.9) - at(0.1)) / median(v.to_vec())?)
+            };
+            let (med_old, med_new) = (median(ts_old.clone())?, median(ts_new.clone())?);
+            let ratio = med_new / med_old;
+            let slower = ts_old.iter().zip(&ts_new).filter(|(o, n)| n > o).count() as f64 / rounds as f64;
+            let noise = spread(&ts_old)?.max(spread(&ts_new)?);
+            let band = 0.05f64.max(2.0 * noise);
+            let verdict = if ratio > 1.0 + band && slower >= 0.8 {
+                "old_route_wins"
+            } else if ratio < 1.0 - band && slower <= 0.2 {
+                "new_route_wins"
+            } else {
+                "no_difference_measured"
+            };
+            eprintln!(
+                "{label:<24} M={m}  old {med_old:.4} ms  new {med_new:.4} ms  new/old {ratio:.3}  band {band:.3}  new slower {:.0}%  {verdict}",
+                slower * 100.0
+            );
+            let list = |v: &[f64]| v.iter().map(|t| format!("{t:.6}")).collect::<Vec<_>>().join(",");
+            rows_out.push(format!(
+                r#"{{"shape":"{label}","rows":{rows},"cols":{cols},"m":{m},"old_ms":[{}],"new_ms":[{}],"old_median_ms":{med_old:.6},"new_median_ms":{med_new:.6},"new_over_old":{ratio:.4},"new_slower_share":{slower:.3},"band":{band:.4},"max_abs_diff":{worst:e},"verdict":"{verdict}"}}"#,
+                list(&ts_old),
+                list(&ts_new)
+            ));
+        }
+    }
+    println!(
+        r#"{{"device":{},"old":"gemm_q4_mlx (RowMajor)","new":"gemm_q4_mlx_tensorops_g64","group_size":{GROUP},"rounds":{rounds},"calls_per_sample":{calls},"warmup":{warmup},"rule":"old wins if new/old > 1 + max(0.05, 2*spread) and new slower in >= 80% of rounds","rows":[{}]}}"#,
+        json_string(&device),
+        rows_out.join(",")
+    );
+    Ok(())
+}
+
 const NAX_ATTEMPT: &str = r#"
 import os, sys, time
 try:
@@ -834,6 +1020,8 @@ exit 0
 fn main() -> Result<(), String> {
     let outcome = if std::env::args().any(|a| a == "--quant-coop") {
         quant_coop_grid()
+    } else if std::env::args().any(|a| a == "--q4-small-m") {
+        q4_small_m()
     } else {
         run()
     };

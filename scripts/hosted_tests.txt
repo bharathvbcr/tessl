@@ -38,6 +38,7 @@ bin go_link_frameworks 2
 bin host_access_ban 6
 bin hosted_selection 10
 bin hosted_tests_script 9
+bin i8_tile_walk_pin 6
 bin kernel_fast_math 15
 bin media_decode 21
 bin media_jpeg 13

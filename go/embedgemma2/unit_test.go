@@ -17,7 +17,9 @@ import (
 // request is framed. A refusal that reached the (absent) handle would panic, so
 // each case also proves the check runs first.
 
-func bare() *Model { return &Model{dim: 8, multimodal: true} }
+func bare() *Model {
+	return &Model{dim: 8, multimodal: true, setTurn: make(chan struct{}, 1)}
+}
 
 func wantArg(t *testing.T, what string, err error, field string) {
 	t.Helper()

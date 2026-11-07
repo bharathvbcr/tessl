@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,7 +69,8 @@ type Options struct {
 	// against 1.7 GB), which refuses every image, audio and video call.
 	TextOnly bool
 	// Observer, if set, is called once after every call that reaches the
-	// engine, from the calling goroutine, with what the call cost. It must not
+	// engine, from the calling goroutine (for SetMaxTokens, from a goroutine it
+	// starts, which may outlive a caller whose context ended), with what the call cost. It must not
 	// call back into the Model.
 	Observer func(CallInfo)
 }
@@ -104,13 +106,17 @@ type CallInfo struct {
 //
 //   - A call still waiting for the worker is cancelled at once, and never
 //     reaches Rust. Its context's deadline is also handed to the engine, which
-//     refuses a job that expired in the queue before it starts.
+//     refuses a job that expired in the queue before it starts (SetMaxTokens
+//     is the exception: its engine call carries no deadline).
 //   - A call the worker has begun runs to completion. tessl's entries are one
 //     synchronous GPU wait with no cancellation point, so the work (and the
 //     worker, and Close) cannot be interrupted. The caller is released at its
 //     deadline all the same, returning ctx.Err(); the result is discarded and
 //     the worker's permit returns only when the work stops, so abandoned work
 //     never exceeds one call in flight per Model.
+//   - SetMaxTokens is the exception to "the result is discarded": a limit it
+//     set is applied and cached whatever happens to the caller (see
+//     SetMaxTokens).
 //   - Request data stays valid for the abandoned work: gusset holds the buffer
 //     it travelled in until the job ends.
 type Model struct {
@@ -128,6 +134,13 @@ type Model struct {
 	prompts   *Prompts
 
 	maxTokens atomic.Int64
+
+	// setTurn is SetMaxTokens's turn on the engine: a 1-buffered channel, so a
+	// caller waits for it in its own goroutine and can leave on ctx.
+	setTurn chan struct{}
+
+	// send, when set, replaces the round trip to the worker. Only tests set it.
+	send func(ctx context.Context, op string, code uint32, f *wire.Frame) (wire.Reply, error)
 }
 
 // Load reads the snapshot directory snapshotDir (a Hugging Face snapshot of
@@ -155,7 +168,7 @@ func LoadContext(ctx context.Context, snapshotDir string, opts Options) (*Model,
 	if err != nil {
 		return nil, fmt.Errorf("embedgemma2: %s: opening the engine handle: %w", op, err)
 	}
-	m := &Model{h: h, observer: opts.Observer}
+	m := &Model{h: h, observer: opts.Observer, setTurn: make(chan struct{}, 1)}
 	multimodal := uint32(1)
 	if opts.TextOnly {
 		multimodal = 0
@@ -242,13 +255,108 @@ func (m *Model) MaxTokens() int { return int(m.maxTokens.Load()) }
 
 // SetMaxTokens raises or lowers the per-sequence token limit, from 1 to 32768.
 // It bounds the image and audio sequences of the multimodal calls too.
+//
+// MaxTokens reports the last limit whose SetMaxTokens completed on the engine.
+// While a SetMaxTokens reply is in flight it can trail the engine by that one
+// call, and the engine is the authority. Calls are serialised on a turn: the
+// engine applies them in the order they take it, and the cache is updated before
+// the next call's turn, so it ends on the limit applied last, not the one whose
+// caller returned last.
+//
+// The caller is released when ctx ends, like any call (see Cancellation), but a
+// limit change is not abandoned with it: once the call has its turn, the engine
+// request runs to completion without the caller's deadline or cancellation (one
+// helper goroutine per Model at most) and the cache follows it. So a
+// SetMaxTokens that returns a context error after its turn may or may not have
+// changed the limit; MaxTokens shows which once the worker has answered. A call
+// whose ctx ended before it had its turn leaves no goroutine behind and never
+// reaches the engine. A nil return means the engine applied n and the cache
+// followed it; a later or concurrent SetMaxTokens may already have replaced it,
+// so MaxTokens reports the last call applied, not necessarily this one.
+//
+// A panic in the engine call (in practice a panicking Options.Observer)
+// propagates like any call's, re-raised in the caller's goroutine if the caller
+// is still waiting (logged if it had left), and the model stays usable. The limit
+// may then have been applied without MaxTokens following it.
 func (m *Model) SetMaxTokens(ctx context.Context, n int) error {
 	const op = "SetMaxTokens"
 	if n < 1 || n > maxTokensLimit {
 		return argErr(op, "n", "%d is outside 1..=%d", n, maxTokensLimit)
 	}
+	if ctx == nil {
+		return argErr(op, "ctx", "is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("embedgemma2: %s: %w", op, err)
+	}
+	select {
+	case m.setTurn <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("embedgemma2: %s: %w", op, ctx.Err())
+	}
+	if ctx.Done() == nil {
+		defer func() { <-m.setTurn }()
+		return m.applyMaxTokens(ctx, n)
+	}
+	// The turn is ours. The engine call outlives the caller if it must, in one
+	// helper that gives the turn back after the cache is updated.
+	const (
+		waiting = iota
+		abandoned
+		delivered
+	)
+	var state atomic.Int32
+	type outcome struct {
+		err      error
+		panicked bool
+		value    any
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var out outcome
+		finished := false
+		defer func() {
+			if p := recover(); p != nil {
+				out = outcome{panicked: true, value: p}
+			} else if !finished {
+				// runtime.Goexit (a testing.T.FailNow in an Observer): neither
+				// a return nor a panic, and never a success.
+				out = outcome{err: fmt.Errorf("embedgemma2: %s: the engine call exited without returning", op)}
+			}
+			<-m.setTurn
+			if state.CompareAndSwap(waiting, delivered) {
+				done <- out
+			} else if out.panicked {
+				log.Printf("embedgemma2: %s: panic after the caller left: %v", op, out.value)
+			}
+		}()
+		out.err = m.applyMaxTokens(ctx, n)
+		finished = true
+	}()
+	var out outcome
+	select {
+	case out = <-done:
+	case <-ctx.Done():
+		if !state.CompareAndSwap(waiting, abandoned) {
+			out = <-done // delivered in the same instant
+			break
+		}
+		return fmt.Errorf("embedgemma2: %s: %w", op, ctx.Err())
+	}
+	if out.panicked {
+		panic(out.value)
+	}
+	return out.err
+}
+
+// applyMaxTokens is the engine call of SetMaxTokens, run by the call that holds
+// the turn. It hands the engine a context that ends only with the call: gusset
+// drops the reply of a call whose context ended after the worker began it, and
+// the limit would then be applied with the cache none the wiser.
+func (m *Model) applyMaxTokens(ctx context.Context, n int) error {
+	const op = "SetMaxTokens"
 	f := new(wire.Frame).U32(uint32(n))
-	if _, err := m.call(ctx, op, wire.OpSetMaxTokens, f); err != nil {
+	if _, err := m.call(context.WithoutCancel(ctx), op, wire.OpSetMaxTokens, f); err != nil {
 		return err
 	}
 	m.maxTokens.Store(int64(n))
@@ -373,6 +481,9 @@ func (m *Model) call(ctx context.Context, op string, code uint32, f *wire.Frame)
 	}
 	if dead := m.dead.Load(); dead != nil {
 		return wire.Reply{}, fmt.Errorf("embedgemma2: %s: the model is unusable, Close it and Load again: %w", op, *dead)
+	}
+	if m.send != nil {
+		return m.send(ctx, op, code, f)
 	}
 	return m.roundTrip(ctx, op, code, f)
 }

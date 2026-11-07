@@ -1805,4 +1805,35 @@ mod tests {
         let many = vec![1usize; MAX_IMAGES * 2 + 1];
         assert!(pack_images(&many).iter().all(|r| r.len() <= MAX_IMAGES));
     }
+
+    use super::VisionConfig;
+
+    /// The checkpoint's vision config with `patch_size` replaced.
+    fn config_with_patch_size(patch_size: u64) -> String {
+        format!(
+            r#"{{"text_config":{{"hidden_size":512}},
+"vision_config":{{"attention_bias":false,"attention_dropout":0.0,"head_dim":64,
+"hidden_activation":"gelu_pytorch_tanh","hidden_size":768,"intermediate_size":3072,
+"model_type":"gemma4_vision","num_attention_heads":12,"num_hidden_layers":16,
+"num_key_value_heads":12,"patch_size":{patch_size},"pooling_kernel_size":3,"position_embedding_size":10240,
+"rms_norm_eps":1e-06,"rope_parameters":{{"rope_theta":100.0,"rope_type":"axial"}},"standardize":false,
+"use_clipped_linears":false}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_patch_size_whose_width_overflows_u32_is_refused_by_name() {
+        // 3 * 65536^2 = 3 * 2^32 wraps to 0; 3 * 37838^2 = 4295142732 wraps to 175437.
+        for ps in [65536u64, 37838, 1 << 31] {
+            let err = VisionConfig::from_config_json(&config_with_patch_size(ps))
+                .expect_err("an overflowing patch width must be refused");
+            assert!(err.contains("overflow"), "patch_size {ps}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_published_patch_size_still_yields_768() {
+        let c = VisionConfig::from_config_json(&config_with_patch_size(16)).unwrap();
+        assert_eq!(c.patch_dim(), 768);
+    }
 }

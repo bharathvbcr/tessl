@@ -72,6 +72,35 @@ fn scratch_shapes(n: usize, c_in: usize, c_out: usize, oh: usize, ow: usize) -> 
     ))
 }
 
+/// The output extent `(oh, ow)` of the 3x3, stride-1 convolution of an `h x w` image padded by `pad`
+/// on every side, or `None` when the padded image is smaller than the kernel or the sum overflows.
+fn output_extent(h: usize, wd: usize, pad: usize) -> Option<(usize, usize)> {
+    let reach = CONV2D_TOPS_KERNEL - 1;
+    let (hp, wp) = (h + 2 * pad, wd + 2 * pad);
+    (hp > reach && wp > reach).then(|| (hp - reach, wp - reach))
+}
+
+/// The scratch shapes `(xp, wh)` of a convolution the op can index, or `None` when any tensor it
+/// spans (or the scratch) holds more than `i32::MAX` elements.
+fn int_scratch(
+    n: usize,
+    c_in: usize,
+    c_out: usize,
+    oh: usize,
+    ow: usize,
+    h: usize,
+    wd: usize,
+) -> Option<([usize; 4], [usize; 4])> {
+    // The op indexes in int, and its slices span the whole tensors.
+    let int = |s: &[usize]| {
+        s.iter()
+            .try_fold(1usize, |a, &d| a.checked_mul(d))
+            .filter(|&e| e <= i32::MAX as usize)
+    };
+    scratch_shapes(n, c_in, c_out, oh, ow)
+        .filter(|(xp, _)| int(xp).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some())
+}
+
 /// Elements of [`conv2d_nchw`]'s scratch for this convolution, in the compute precision (so at most
 /// this many f32s), or `None` when the count overflows. Callers that budget memory charge this.
 pub fn conv2d_nchw_scratch_elems(n: usize, c_in: usize, c_out: usize, oh: usize, ow: usize) -> Option<usize> {
@@ -124,13 +153,12 @@ pub fn conv2d_nchw(
         ));
     }
     let k = CONV2D_TOPS_KERNEL;
-    if h + 2 * pad < k || wd + 2 * pad < k {
+    let Some((oh, ow)) = output_extent(h, wd, pad) else {
         return Err(format!(
-            "{what}: x {:?} padded by {pad} is smaller than the 3x3 kernel",
+            "{what}: x {:?} padded by {pad} is smaller than the 3x3 kernel, or the padded size overflows",
             x.shape()
         ));
-    }
-    let (oh, ow) = (h + 2 * pad - (k - 1), wd + 2 * pad - (k - 1));
+    };
     if y.shape() != [n, c_out, oh, ow] {
         return Err(format!(
             "{what}: y must be {:?}, got {:?}",
@@ -152,15 +180,7 @@ pub fn conv2d_nchw(
         return Ok(());
     }
 
-    // The op indexes in int, and its slices span the whole tensors.
-    let int = |s: &[usize]| {
-        s.iter()
-            .try_fold(1usize, |a, &d| a.checked_mul(d))
-            .filter(|&e| e <= i32::MAX as usize)
-    };
-    let shapes = scratch_shapes(n, c_in, c_out, oh, ow)
-        .filter(|(xp, _)| int(xp).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some());
-    let Some((xp_shape, wh_shape)) = shapes else {
+    let Some((xp_shape, wh_shape)) = int_scratch(n, c_in, c_out, oh, ow, h, wd) else {
         return Err(format!(
             "{what}: x {:?} -> y {:?} exceeds int indexing",
             x.shape(),
@@ -228,4 +248,25 @@ pub fn conv2d_nchw(
         bnd.dispatch(mtl_size(c_out / ot, ow_p / TILE_W, n * oh), mtl_size(128, 1, 1));
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    #[test]
+    fn output_extent_refuses_a_pad_whose_double_wraps() {
+        assert_eq!(output_extent(5, 7, 1), Some((5, 7)));
+        assert_eq!(output_extent(1, 1, 0), None);
+        assert_eq!(output_extent(5, 5, usize::MAX / 2 + 1), None);
+        assert_eq!(output_extent(5, 5, usize::MAX), None);
+    }
+
+    #[test]
+    fn weights_past_i32_are_refused_before_any_dispatch() {
+        // x [1, 65536, 1, 1] and y [1, 65536, 1, 1] are tiny; the weights are 9 * 2^32 elements,
+        // which the weights kernel's `uint total = CO * CI * K * K` would wrap.
+        assert!(int_scratch(1, 1 << 16, 1 << 16, 1, 1, 1, 1).is_none());
+        assert!(int_scratch(1, 1 << 12, 1 << 12, 1, 1, 1, 1).is_some());
+    }
 }

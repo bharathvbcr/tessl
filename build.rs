@@ -126,10 +126,8 @@ fn main() {
     // a compile). It lives in a subdirectory precisely so the directory glob
     // below cannot pick it up by accident.
     let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some() || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
-    let mut tensorops_sources: Vec<PathBuf> = vec![
-        kernels_dir.join("matmul_tensorops.metal"),
-        kernels_dir.join("conv2d_tensorops.metal"),
-    ];
+    let mut tensorops_sources: Vec<PathBuf> =
+        vec![kernels_dir.join("matmul_tensorops.metal"), kernels_dir.join("conv2d_tensorops.metal")];
     if want_tune {
         let mut tune = metal_sources(&kernels_dir.join("tune"));
         if tune.is_empty() {

@@ -356,3 +356,69 @@ fn a_callers_scratch_is_used_or_refused() {
         });
     });
 }
+
+/// One `gemm_small_m` call into a fresh C: its bits, and the parallel-lane and
+/// plain-kernel pipeline requests it made (the path that ran, not inferred).
+fn small_m_call(
+    rt: &Arc<GpuRuntime>,
+    (a, b): (&Tensor, &Tensor),
+    (m, n): (usize, usize),
+    scratch: Option<&Tensor>,
+) -> (Vec<u32>, u64, u64) {
+    let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+    let before = (count(PAR), count(PLAIN));
+    gemm_small_m(a, b, &c, GemmBackend::TensorOps, scratch).unwrap();
+    rt.synchronize().unwrap();
+    let bits = c.buffer.read_f32()[..m * n].iter().map(|x| x.to_bits()).collect();
+    (bits, count(PAR) - before.0, count(PLAIN) - before.1)
+}
+
+/// The scratch the lane needs is the padded one: each K partition's slice
+/// starts on a multiple of 4 floats, so M·N of 1 at 4 partitions needs 16
+/// floats, not 4. A scratch under that keeps the single dispatch (and
+/// `gemm`'s bits) rather than passing the gate and being refused by the
+/// binder.
+#[test]
+fn a_scratch_under_the_padded_length_keeps_the_single_dispatch() {
+    let _ = in_traced_child("a_scratch_under_the_padded_length_keeps_the_single_dispatch", || {
+        with_gpu(|rt| {
+            let (m, n, k) = (1usize, 1usize, 512usize); // k_tile 128, 4 partitions, 4 per padded slice
+            let (a, b, _, _) = operands(rt, m, n, k, 0x7a11);
+            let scratch = |len: usize| rt.alloc_tensor_f32(&[len]).unwrap();
+            let (pooled, par, _) = small_m_call(rt, (&a, &b), (m, n), None);
+            assert_eq!(par, 1, "no scratch runs the lane");
+            let (mine, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(16)));
+            assert_eq!((par, plain), (1, 0), "16 f32 is the padded length: the lane runs");
+            assert_eq!(mine, pooled, "and gives the pool scratch's bits");
+            let plain_c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            gemm(&a, &b, &plain_c, GemmBackend::TensorOps).unwrap();
+            rt.synchronize().unwrap();
+            let default: Vec<u32> = plain_c.buffer.read_f32()[..m * n].iter().map(|x| x.to_bits()).collect();
+            for len in [4usize, 15] {
+                let (bits, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(len)));
+                assert_eq!((par, plain), (0, 1), "{len} f32 is under the padded 16: the single dispatch");
+                assert_eq!(bits, default, "{len} f32: exactly what `gemm` computes");
+            }
+        });
+    });
+}
+
+/// The same boundary where M·N (511) is not a multiple of 4: 4 partitions of
+/// 512 padded floats, 2048, not 4 × 511 = 2044.
+#[test]
+fn the_padded_length_is_the_boundary_when_m_n_is_not_a_multiple_of_4() {
+    let _ = in_traced_child("the_padded_length_is_the_boundary_when_m_n_is_not_a_multiple_of_4", || {
+        with_gpu(|rt| {
+            let (m, n, k) = (1usize, 511usize, 512usize);
+            let (a, b, _, _) = operands(rt, m, n, k, 0x7a12);
+            let scratch = |len: usize| rt.alloc_tensor_f32(&[len]).unwrap();
+            let (pooled, par, _) = small_m_call(rt, (&a, &b), (m, n), None);
+            assert_eq!(par, 1, "no scratch runs the lane");
+            let (mine, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2048)));
+            assert_eq!((par, plain), (1, 0), "2048 f32 is the padded length: the lane runs");
+            assert_eq!(mine, pooled, "and gives the pool scratch's bits");
+            let (_, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2044)));
+            assert_eq!((par, plain), (0, 1), "2044 f32 is under the padded 2048: the single dispatch");
+        });
+    });
+}

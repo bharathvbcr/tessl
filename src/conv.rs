@@ -98,11 +98,10 @@ fn int_scratch(
             .try_fold(1usize, |a, &d| a.checked_mul(d))
             .filter(|&e| e <= i32::MAX as usize)
     };
-    scratch_shapes(n, c_in, c_out, oh, ow)
-        .filter(|(xp, wh)| {
-            // `wh` is the weights kernel's `uint total = CO * CI * K * K` and the op's HWIO strides.
-            int(xp).is_some() && int(wh).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some()
-        })
+    scratch_shapes(n, c_in, c_out, oh, ow).filter(|(xp, wh)| {
+        // `wh` is the weights kernel's `uint total = CO * CI * K * K` and the op's HWIO strides.
+        int(xp).is_some() && int(wh).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some()
+    })
 }
 
 /// Elements of [`conv2d_nchw`]'s scratch for this convolution, in the compute precision (so at most

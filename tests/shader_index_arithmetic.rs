@@ -1251,10 +1251,19 @@ fn gemm_q4_mlx_tensorops_ints_are_bounded_by_the_host_extent_guard() {
 fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
     // Kernel: the products that stay narrow, and the offsets that widen.
     for (needle, what) in [
-        ("x[((ulong)(n * C + c) * H + (uint)h) * W + (uint)w]", "pack source offset"),
-        ("xp[((ulong)(n * Hp + hp) * Wp + wp) * C + c]", "pack destination offset"),
+        (
+            "x[((ulong)(n * C + c) * H + (uint)h) * W + (uint)w]",
+            "pack source offset",
+        ),
+        (
+            "xp[((ulong)(n * Hp + hp) * Wp + wp) * C + c]",
+            "pack destination offset",
+        ),
         ("const uint total = CO * CI * K * K;", "weights element count"),
-        ("device float *yn = y + (ulong)n * CO * OH * OW + (ulong)h0 * OW;", "output image base"),
+        (
+            "device float *yn = y + (ulong)n * CO * OH * OW + (ulong)h0 * OW;",
+            "output image base",
+        ),
         ("yn[(ulong)o * OH * OW + w]", "output channel plane"),
         ("array<int, 4>{1, CI, CI * Wp, CI * Wp * Hp}", "padded input strides"),
         ("array<int, 4>{1, CO, CO * CI, CO * CI * K}", "weights strides"),
@@ -1275,7 +1284,10 @@ fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
         ("int(wh).is_some()", "HWIO weights bound"),
         ("int(&[n, c_out, oh, ow]).is_some()", "output bound"),
         ("int(&[n, c_in, h, wd]).is_some()", "input bound"),
-        (".try_fold(1usize, |a, &d| a.checked_mul(d))", "overflow-checked product"),
+        (
+            ".try_fold(1usize, |a, &d| a.checked_mul(d))",
+            "overflow-checked product",
+        ),
     ] {
         require(int_scratch, needle, what);
     }

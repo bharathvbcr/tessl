@@ -2,7 +2,8 @@
 //!
 //! Apple GEMM that needs `matmul2d` lives here. The legacy
 //! [`crate::nn::gemm_i8_dequant`] kernel is unchanged. Nothing in this module
-//! computes a refused call on the host.
+//! computes a refused call on the host, and a refused call never dispatches:
+//! `gemm_i8` and both `gemm_w4a8` arms validate through one function first.
 
 use std::sync::{Arc, OnceLock};
 
@@ -16,6 +17,10 @@ use crate::tensor::GpuBuffer;
 const MAX_INT8_PRODUCT: u32 = 128 * 128;
 /// Largest K whose full-range int8 dot still fits in int32.
 pub(crate) const MAX_K_EXACT: u32 = i32::MAX as u32 / MAX_INT8_PRODUCT;
+/// Largest |a*w| of an int8 activation (-128) and an int4 weight (-8).
+const MAX_INT4B_PRODUCT: u32 = 128 * 8;
+/// Largest K whose int8-by-int4 dot, accumulated in int32 from group 0, fits.
+pub(crate) const MAX_K_EXACT_INT4B: u32 = i32::MAX as u32 / MAX_INT4B_PRODUCT;
 
 /// Head dimensions [`gqa_decode`] accepts. Any other value is an error that
 /// names the rejected dimension and does not dispatch.
@@ -185,56 +190,50 @@ pub fn gemm_i8(rt: &Arc<GpuRuntime>, spec: I8Gemm<'_>) -> Result<(), String> {
         b_layout,
         out,
     } = spec;
-    check_mnk(m, n, k, "gemm_i8")?;
-    let group = scale_group(b_scale)?;
-    if group == 0 && k > MAX_K_EXACT {
-        return Err(format!(
-            "gemm_i8: k = {k} exceeds {MAX_K_EXACT}, past which an int32 accumulator can overflow \
-             at full int8 range"
-        ));
-    }
-    if group != 0 && k % group != 0 {
-        return Err(format!("gemm_i8: k = {k} is not divisible by group {group}"));
-    }
-    let (a_scalar, a_mode, a_rows) = split_a(a_scale)?;
-    let (b_mode, b_buf, group_k) = split_b(b_scale)?;
-    let b_elems = numel(&[k, n], "gemm_i8")?;
-    let a_elems = numel(&[m, k], "gemm_i8")?;
-    let c_elems = numel(&[m, n], "gemm_i8")?;
-    for (numel, what) in [(a_elems, "gemm_i8 a"), (b_elems, "gemm_i8 b"), (c_elems, "gemm_i8 c")] {
-        crate::gemm::require_i32_extent(numel, what)?;
-    }
-    require_bytes(rt, a, a_elems, "gemm_i8 a")?;
-    require_bytes(rt, b, b_elems, "gemm_i8 b")?;
-    require_bytes(rt, c, c_elems * out_bytes(out), "gemm_i8 c")?;
-    if let Some(rows) = a_rows {
-        require_bytes(rt, rows, m as usize * 4, "gemm_i8 a_scale")?;
-        require_finite(rows, m as usize, "gemm_i8 a_scale")?;
-    }
-    if let Some(sc) = b_buf {
-        // group == 0 is the per-column scale (n entries); otherwise k/group rows of n.
-        let need = k
-            .checked_div(group)
-            .map_or(n as usize, |rows| rows as usize * n as usize);
-        require_bytes(rt, sc, need * 4, "gemm_i8 b_scale")?;
-        require_finite(sc, need, "gemm_i8 b_scale")?;
-    }
-    if let Some(bias) = bias {
-        require_bytes(rt, bias, n as usize * 4, "gemm_i8 bias")?;
-        require_finite(bias, n as usize, "gemm_i8 bias")?;
-    }
-    let mut reads = vec![("a", a), ("b", b)];
-    if let Some(rows) = a_rows {
-        reads.push(("a_scale", rows));
-    }
-    if let Some(sc) = b_buf {
-        reads.push(("b_scale", sc));
-    }
-    if let Some(bias) = bias {
-        reads.push(("bias", bias));
-    }
-    reject_write_alias("gemm_i8", &[("c", c)], &reads)?;
+    let checked = validate(
+        rt,
+        Operands {
+            entry: "gemm_i8",
+            a,
+            b,
+            b_name: "b",
+            c,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale,
+            bias,
+            out,
+            w4: None,
+        },
+    )?;
+    dispatch_i8(rt, a, b, c, (m, n, k), &checked, bias, b_layout, out)
+}
 
+/// Encode a validated int8 GEMM. Nothing here refuses a call: every check is in
+/// [`validate`], which both public entries run first.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_i8(
+    rt: &Arc<GpuRuntime>,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    (m, n, k): (u32, u32, u32),
+    checked: &Checked<'_>,
+    bias: Option<&GpuBuffer>,
+    b_layout: I8BLayout,
+    out: I8Out,
+) -> Result<(), String> {
+    let Checked {
+        group,
+        a_scalar,
+        a_mode,
+        a_rows,
+        b_mode,
+        b_buf,
+        group_k,
+    } = *checked;
     let name = i8_gemm_pipeline_name(m, b_layout, group)?;
     let p = rt.pipeline(name)?;
     let a_bind = a_rows.unwrap_or(c);
@@ -292,9 +291,14 @@ pub fn gemm_i8(rt: &Arc<GpuRuntime>, spec: I8Gemm<'_>) -> Result<(), String> {
 
 /// W4A8 against one caller-supplied logical matrix, decoded by `arm`.
 ///
-/// `Int4b` requires `k % 32 == 0`. A failed device probe returns an error
-/// containing `unsupported` and does not fall back to the unpack arm or the host.
-/// `UnpackZp8` always uses the int8 GEMM after a GPU nibble unpack.
+/// `Int4b` requires `k % 32 == 0`. A device probe that shows int4b is
+/// unavailable or wrong returns an error containing `unsupported` and does not
+/// fall back to the unpack arm or the host; a probe that could not run (busy or
+/// poisoned runtime) returns its own error, without `unsupported`, uncached.
+/// `UnpackZp8` always uses the int8 GEMM after a GPU nibble unpack. Every
+/// refusal comes from `validate`, before any allocation, probe or dispatch.
+/// At group 0 `Int4b` refuses `k > 2097151` and `UnpackZp8` refuses
+/// `k > 131071`; see `validate` for why they differ.
 pub fn gemm_w4a8(rt: &Arc<GpuRuntime>, spec: W4Gemm<'_>) -> Result<(), String> {
     let W4Gemm {
         a,
@@ -309,73 +313,66 @@ pub fn gemm_w4a8(rt: &Arc<GpuRuntime>, spec: W4Gemm<'_>) -> Result<(), String> {
         out,
         arm,
     } = spec;
-    check_mnk(m, n, k, "gemm_w4a8")?;
-    if k % 2 != 0 {
-        return Err(format!("gemm_w4a8: k = {k} must be even"));
-    }
-    let group = scale_group(b_scale)?;
-    if matches!(b_scale, I8BScale::PerColumn(_)) {
-        return Err("gemm_w4a8: per-column scales are not a W4A8 mode".into());
-    }
-    if group != 0 && k % group != 0 {
-        return Err(format!("gemm_w4a8: k = {k} is not divisible by group {group}"));
-    }
-    if matches!(arm, W4Arm::Int4b) && k % 32 != 0 {
-        return Err(format!("gemm_w4a8: k = {k} must be a multiple of 32 for int4b"));
-    }
-    let a_elems = numel(&[m, k], "gemm_w4a8")?;
-    let c_elems = numel(&[m, n], "gemm_w4a8")?;
-    let packed_bytes = numel(&[n, k / 2], "gemm_w4a8")?;
-    require_bytes(rt, a, a_elems, "gemm_w4a8 a")?;
-    require_bytes(rt, packed, packed_bytes, "gemm_w4a8 packed")?;
-    require_bytes(rt, c, c_elems * out_bytes(out), "gemm_w4a8 c")?;
-    let (a_scalar, a_mode, a_rows) = split_a(a_scale)?;
-    let (_b_mode, b_buf, _) = split_b(b_scale)?;
-    if let Some(rows) = a_rows {
-        require_bytes(rt, rows, m as usize * 4, "gemm_w4a8 a_scale")?;
-        require_finite(rows, m as usize, "gemm_w4a8 a_scale")?;
-    }
-    if let Some(sc) = b_buf {
-        let need = (k / group) as usize * n as usize;
-        require_bytes(rt, sc, need * 4, "gemm_w4a8 b_scale")?;
-        require_finite(sc, need, "gemm_w4a8 b_scale")?;
-    }
-    if let Some(bias) = bias {
-        require_bytes(rt, bias, n as usize * 4, "gemm_w4a8 bias")?;
-        require_finite(bias, n as usize, "gemm_w4a8 bias")?;
-    }
+    let checked = validate(
+        rt,
+        Operands {
+            entry: "gemm_w4a8",
+            a,
+            b: packed,
+            b_name: "packed",
+            c,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale,
+            bias,
+            out,
+            w4: Some(arm),
+        },
+    )?;
     match arm {
         W4Arm::Int4b => {
             probe_int4b(rt)?;
             dispatch_w4(
-                rt, a, packed, c, m, n, k, a_scalar, a_mode, a_rows, b_buf, group, bias, out,
+                rt,
+                a,
+                packed,
+                c,
+                m,
+                n,
+                k,
+                checked.a_scalar,
+                checked.a_mode,
+                checked.a_rows,
+                checked.b_buf,
+                checked.group,
+                bias,
+                out,
             )
         }
         W4Arm::UnpackZp8 => {
-            let unpacked = rt.alloc_buffer(numel(&[n, k], "gemm_w4a8")?)?;
-            let p = rt.pipeline("w4a8_unpack_zp8")?;
+            // `validate` bounded n * k by the signed 32-bit extent, so this
+            // allocation and the kernel's 32-bit thread id are both in range.
             let count = numel(&[n, k], "gemm_w4a8")?;
+            let unpacked = rt.alloc_buffer(count)?;
+            let p = rt.pipeline("w4a8_unpack_zp8")?;
             dispatch_1d(rt, &p, count, |bnd| {
                 set_gpu_buf(bnd, packed, 0);
                 set_gpu_buf(bnd, &unpacked, 1);
                 set_u32(bnd, n, 2);
                 set_u32(bnd, k, 3);
             })?;
-            gemm_i8(
+            dispatch_i8(
                 rt,
-                I8Gemm {
-                    a,
-                    b: &unpacked,
-                    c,
-                    m,
-                    n,
-                    k,
-                    a_scale,
-                    b_scale,
-                    bias,
-                    b_layout: I8BLayout::TransposedNK,
-                    out,
-                },
+                a,
+                &unpacked,
+                c,
+                (m, n, k),
+                &checked,
+                bias,
+                I8BLayout::TransposedNK,
+                out,
             )
         }
     }
@@ -496,28 +493,213 @@ fn dispatch_w4(
     })
 }
 
+/// Whether this device runs `int4b_format` correctly, probed once per process.
+///
+/// Only a definitive outcome is cached: no TensorOps, a pipeline that will not
+/// build, or a result that differs from the exact expected one. A transient
+/// failure (a busy runtime, a poisoned one, an allocation or readback error)
+/// is returned to this caller and leaves the cache empty, so the next call
+/// probes again. The cache is process-wide rather than per device: tessl opens
+/// the system default Metal device, a Mac has one GPU, and every
+/// [`GpuRuntime`] therefore sees the same answer.
 fn probe_int4b(rt: &Arc<GpuRuntime>) -> Result<(), String> {
-    static CACHED: OnceLock<Result<(), String>> = OnceLock::new();
-    if let Some(hit) = CACHED.get() {
+    static DEFINITIVE: OnceLock<Result<(), String>> = OnceLock::new();
+    if let Some(hit) = DEFINITIVE.get() {
         return hit.clone();
     }
-    let probed = (|| -> Result<(), String> {
-        if !rt.has_tensorops() {
-            return Err("w4a8 int4b: unsupported (device has no TensorOps)".into());
+    let outcome = int4b_probe_outcome(rt)?;
+    DEFINITIVE.get_or_init(|| outcome).clone()
+}
+
+/// `Ok(definitive)` is cacheable. `Err` is transient and must not be cached.
+fn int4b_probe_outcome(rt: &Arc<GpuRuntime>) -> Result<Result<(), String>, String> {
+    if !rt.has_tensorops() {
+        return Ok(Err("w4a8 int4b: unsupported (device has no TensorOps)".into()));
+    }
+    if let Err(e) = rt.pipeline("w4a8_i4_32") {
+        return Ok(Err(format!("w4a8 int4b: unsupported ({e})")));
+    }
+    let transient = |what: &str| {
+        let what = what.to_owned();
+        move |e: String| format!("w4a8 int4b probe could not run ({what}): {e}")
+    };
+    // Full-range activations against every int4 value in both nibble
+    // positions, so a wrong nibble order or sign changes the answer.
+    const M: usize = 32;
+    let a_vals: Vec<i8> = (0..M * M)
+        .map(|i| (((i / M * 7 + i % M * 3) % 256) as i32 - 128) as i8)
+        .collect();
+    let w_vals: Vec<i8> = (0..M * M).map(|i| (((i / M * 5 + i % M * 3) % 16) as i8) - 8).collect();
+    let packed: Vec<u8> = w_vals
+        .chunks(2)
+        .map(|p| (p[0] as u8 & 0xF) | ((p[1] as u8 & 0xF) << 4))
+        .collect();
+    let want: Vec<f32> = (0..M * M)
+        .map(|idx| {
+            let (i, j) = (idx / M, idx % M);
+            (0..M)
+                .map(|p| i32::from(a_vals[i * M + p]) * i32::from(w_vals[j * M + p]))
+                .sum::<i32>() as f32
+        })
+        .collect();
+    let a = rt.alloc_buffer(M * M).map_err(transient("alloc a"))?;
+    a.try_write_bytes(&a_vals.iter().map(|v| *v as u8).collect::<Vec<_>>())
+        .map_err(transient("write a"))?;
+    let w = rt.alloc_buffer(M * M / 2).map_err(transient("alloc w"))?;
+    w.try_write_bytes(&packed).map_err(transient("write w"))?;
+    let c = rt.alloc_buffer(M * M * 4).map_err(transient("alloc c"))?;
+    c.try_write_bytes(&vec![0u8; M * M * 4]).map_err(transient("write c"))?;
+    let m = M as u32;
+    dispatch_w4(rt, &a, &w, &c, m, m, m, 1.0, 0, None, None, 0, None, I8Out::F32).map_err(transient("dispatch"))?;
+    let got = c.try_read_f32().map_err(transient("read c"))?;
+    if got.len() < M * M || got.iter().zip(&want).any(|(g, w)| g.to_bits() != w.to_bits()) {
+        return Ok(Err(
+            "w4a8 int4b: unsupported (the device decodes int4b differently from two's complement, low nibble first)"
+                .into(),
+        ));
+    }
+    Ok(Ok(()))
+}
+
+/// A call's operands, before any has been trusted.
+struct Operands<'a> {
+    entry: &'static str,
+    a: &'a GpuBuffer,
+    /// The int8 B for `gemm_i8`, the packed int4 weights for `gemm_w4a8`.
+    b: &'a GpuBuffer,
+    b_name: &'static str,
+    c: &'a GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_scale: I8AScale<'a>,
+    b_scale: I8BScale<'a>,
+    bias: Option<&'a GpuBuffer>,
+    out: I8Out,
+    /// `Some` for `gemm_w4a8`, with the arm that will decode the weights.
+    w4: Option<W4Arm>,
+}
+
+/// What a validated call hands the encoders.
+struct Checked<'a> {
+    group: u32,
+    a_scalar: f32,
+    a_mode: u32,
+    a_rows: Option<&'a GpuBuffer>,
+    b_mode: u32,
+    b_buf: Option<&'a GpuBuffer>,
+    group_k: u32,
+}
+
+/// The one place a GEMM call is refused. `gemm_i8` and both `gemm_w4a8` arms
+/// run it before any allocation, probe, unpack or dispatch, so a refused call
+/// costs no device work. It covers shape, K, scale and group structure, 32-bit
+/// extents, buffer sizes and runtime ownership, finite scales and bias, and
+/// write aliasing of `c` against every buffer the kernel reads.
+///
+/// The int32 K bound at group 0 is per arm. `gemm_i8` and `UnpackZp8` bound K
+/// by [`MAX_K_EXACT`] (131071), the full int8 range: the unpacked B goes
+/// through the int8 GEMM kernels, whose documented and tested bound that is, so
+/// the unpack arm refuses exactly the K the int8 GEMM refuses. `Int4b` bounds K
+/// by [`MAX_K_EXACT_INT4B`] (2097151) because its right operand is int4, so
+/// |a*w| <= 128*8. Grouped scales flush int32 per group (at most 256), so they
+/// need no K bound. One shared bound would have to be the looser one, which
+/// would assert the int8 kernels are exact at K values this module has not run
+/// them at; the unpack arm's tighter bound is a stated cost, not an accident.
+fn validate<'a>(rt: &GpuRuntime, op: Operands<'a>) -> Result<Checked<'a>, String> {
+    let Operands {
+        entry,
+        a,
+        b,
+        b_name,
+        c,
+        m,
+        n,
+        k,
+        a_scale,
+        b_scale,
+        bias,
+        out,
+        w4,
+    } = op;
+    check_mnk(m, n, k, entry)?;
+    if w4.is_some() && k % 2 != 0 {
+        return Err(format!("{entry}: k = {k} must be even"));
+    }
+    let group = scale_group(b_scale)?;
+    if w4.is_some() && matches!(b_scale, I8BScale::PerColumn(_)) {
+        return Err(format!("{entry}: per-column scales are not a W4A8 mode"));
+    }
+    if group == 0 {
+        let (bound, range) = match w4 {
+            Some(W4Arm::Int4b) => (MAX_K_EXACT_INT4B, "int8 activation by int4 weight"),
+            _ => (MAX_K_EXACT, "int8"),
+        };
+        if k > bound {
+            return Err(format!(
+                "{entry}: k = {k} exceeds {bound}, past which an int32 accumulator can overflow \
+                 at full {range} range"
+            ));
         }
-        let m = 32u32;
-        let a = rt.alloc_buffer((m * m) as usize)?;
-        a.try_write_bytes(&vec![0u8; (m * m) as usize])?;
-        let w = rt.alloc_buffer((m * m / 2) as usize)?;
-        w.try_write_bytes(&vec![0u8; (m * m / 2) as usize])?;
-        let c = rt.alloc_buffer((m * m * 4) as usize)?;
-        c.try_write_bytes(&vec![0u8; (m * m * 4) as usize])?;
-        dispatch_w4(rt, &a, &w, &c, m, m, m, 1.0, 0, None, None, 0, None, I8Out::F32)
-            .map_err(|e| format!("w4a8 int4b: unsupported ({e})"))?;
-        rt.synchronize().map_err(|e| format!("w4a8 int4b: unsupported ({e})"))
-    })();
-    let _ = CACHED.set(probed.clone());
-    CACHED.get().cloned().unwrap_or(probed)
+    }
+    if group != 0 && k % group != 0 {
+        return Err(format!("{entry}: k = {k} is not divisible by group {group}"));
+    }
+    if matches!(w4, Some(W4Arm::Int4b)) && k % 32 != 0 {
+        return Err(format!("{entry}: k = {k} must be a multiple of 32 for int4b"));
+    }
+    let (a_scalar, a_mode, a_rows) = split_a(entry, a_scale)?;
+    let (b_mode, b_buf, group_k) = split_b(b_scale)?;
+    let b_elems = numel(&[k, n], entry)?;
+    let a_elems = numel(&[m, k], entry)?;
+    let c_elems = numel(&[m, n], entry)?;
+    for (numel, what) in [(a_elems, "a"), (b_elems, "b"), (c_elems, "c")] {
+        crate::gemm::require_i32_extent(numel, &format!("{entry} {what}"))?;
+    }
+    let b_bytes = if w4.is_some() {
+        numel(&[n, k / 2], entry)?
+    } else {
+        b_elems
+    };
+    require_bytes(rt, a, a_elems, &format!("{entry} a"))?;
+    require_bytes(rt, b, b_bytes, &format!("{entry} {b_name}"))?;
+    require_bytes(rt, c, c_elems * out_bytes(out), &format!("{entry} c"))?;
+    if let Some(rows) = a_rows {
+        require_bytes(rt, rows, m as usize * 4, &format!("{entry} a_scale"))?;
+        require_finite(rows, m as usize, &format!("{entry} a_scale"))?;
+    }
+    if let Some(sc) = b_buf {
+        // group == 0 is the per-column scale (n entries); otherwise k/group rows of n.
+        let need = k
+            .checked_div(group)
+            .map_or(n as usize, |rows| rows as usize * n as usize);
+        require_bytes(rt, sc, need * 4, &format!("{entry} b_scale"))?;
+        require_finite(sc, need, &format!("{entry} b_scale"))?;
+    }
+    if let Some(bias) = bias {
+        require_bytes(rt, bias, n as usize * 4, &format!("{entry} bias"))?;
+        require_finite(bias, n as usize, &format!("{entry} bias"))?;
+    }
+    let mut reads = vec![("a", a), (b_name, b)];
+    if let Some(rows) = a_rows {
+        reads.push(("a_scale", rows));
+    }
+    if let Some(sc) = b_buf {
+        reads.push(("b_scale", sc));
+    }
+    if let Some(bias) = bias {
+        reads.push(("bias", bias));
+    }
+    reject_write_alias(entry, &[("c", c)], &reads)?;
+    Ok(Checked {
+        group,
+        a_scalar,
+        a_mode,
+        a_rows,
+        b_mode,
+        b_buf,
+        group_k,
+    })
 }
 
 fn check_mnk(m: u32, n: u32, k: u32, entry: &str) -> Result<(), String> {
@@ -544,11 +726,11 @@ fn scale_group(scale: I8BScale<'_>) -> Result<u32, String> {
     }
 }
 
-fn split_a(scale: I8AScale<'_>) -> Result<(f32, u32, Option<&GpuBuffer>), String> {
+fn split_a<'a>(entry: &str, scale: I8AScale<'a>) -> Result<(f32, u32, Option<&'a GpuBuffer>), String> {
     match scale {
         I8AScale::Scalar(v) => {
             if !v.is_finite() {
-                return Err(format!("gemm_i8: a_scale must be finite, got {v}"));
+                return Err(format!("{entry}: a_scale must be finite, got {v}"));
             }
             Ok((v, 0, None))
         }
@@ -556,7 +738,7 @@ fn split_a(scale: I8AScale<'_>) -> Result<(f32, u32, Option<&GpuBuffer>), String
     }
 }
 
-fn split_b(scale: I8BScale<'_>) -> Result<(u32, Option<&GpuBuffer>, u32), String> {
+fn split_b<'a>(scale: I8BScale<'a>) -> Result<(u32, Option<&'a GpuBuffer>, u32), String> {
     match scale {
         I8BScale::None => Ok((0, None, 1)),
         I8BScale::PerColumn(buf) => Ok((1, Some(buf), 1)),

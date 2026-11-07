@@ -30,6 +30,9 @@ const ATTN_DECODE: &str = include_str!("../kernels/flash_attn_decode.metal");
 const ATTN_ROWS: &str = include_str!("../kernels/flash_attn_rows.metal");
 const GQA_DECODE: &str = include_str!("../kernels/gqa_decode.metal");
 const I8_PIPELINE_RS: &str = include_str!("../src/i8_pipeline.rs");
+const I8_W8A8: &str = include_str!("../kernels/i8_w8a8.metal");
+const I8_TILE_WALK_H: &str = include_str!("../kernels/i8_tile_walk.h");
+const W4A8_TENSOROPS: &str = include_str!("../kernels/w4a8_tensorops.metal");
 const ATTN_SWA_128: &str = include_str!("../kernels/flash_attn_swa_h128.metal");
 const ATTN_SWA_256: &str = include_str!("../kernels/flash_attn_swa_h256.metal");
 const ATTN_GLOBAL: &str = include_str!("../kernels/flash_attn_global_h512.metal");
@@ -86,6 +89,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "gemv_q4_mlx.metal",
     "gemv_q8.metal",
     "gqa_decode.metal",
+    "i8_w8a8.metal",
     "kv_store.metal",
     "matmul_simdgroup.metal",
     "mtl_tensor.metal",
@@ -103,6 +107,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "rms_qkv_rope.metal",
     "softcap_sample.metal",
     "utils.metal",
+    "w4a8_tensorops.metal",
 ];
 
 /// Kernels deliberately not inspected here, each with the reason it is safe.
@@ -1132,6 +1137,105 @@ fn qwen35_train_storage_offsets_are_widened() {
     ] {
         require(QWEN35_TRAIN_STORAGE, needle, what);
     }
+}
+
+/// `i8_validate`'s host half, shared by the int8 and W4A8 tests: one validator
+/// bounds every operand extent the kernels cast to `int`, and both public
+/// entries run it before they encode (or, for W4A8, probe or unpack).
+fn require_shared_i8_validator(label: &str) {
+    require(GEMM_RS, "if numel > i32::MAX as usize", label);
+    require(I8_PIPELINE_RS, "fn validate<'a>(", label);
+    require(
+        I8_PIPELINE_RS,
+        "for (numel, what) in [(a_elems, \"a\"), (b_elems, \"b\"), (c_elems, \"c\")] {",
+        label,
+    );
+    require(
+        I8_PIPELINE_RS,
+        "crate::gemm::require_i32_extent(numel, &format!(\"{entry} {what}\"))?;",
+        label,
+    );
+    let validated = |entry: &str, first_work: &str| {
+        let call = I8_PIPELINE_RS
+            .find(&format!("entry: \"{entry}\","))
+            .unwrap_or_else(|| panic!("{label}: {entry} no longer calls validate"));
+        let work = I8_PIPELINE_RS[call..]
+            .find(first_work)
+            .unwrap_or_else(|| panic!("{label}: {entry} lost {first_work:?}"));
+        assert!(work > 0, "{label}: {entry} does work before validating");
+    };
+    validated("gemm_i8", "dispatch_i8(rt, a, b, c, (m, n, k), &checked");
+    validated("gemm_w4a8", "probe_int4b(rt)?;");
+    validated("gemm_w4a8", "let count = numel(&[n, k], \"gemm_w4a8\")?;");
+}
+
+/// The int8 GEMM, GEMV and row quantize. The tiled kernels build their tensors
+/// from `int` extents, so every operand is bounded by the host's
+/// `require_i32_extent`; every raw address is widened before the multiply.
+#[test]
+fn i8_w8a8_extents_are_host_bounded_and_addresses_are_widened() {
+    let label = "i8_w8a8";
+    require_shared_i8_validator(label);
+    require(I8_W8A8, "#include \"i8_tile_walk.h\"", label);
+    require(I8_W8A8, "dextents<int, 2>{(int)K, (int)M}", label);
+    require(I8_W8A8, "dextents<int, 2>{(int)N, (int)K}", label);
+    require(I8_W8A8, "dextents<int, 2>{(int)K, (int)N}", label);
+    require(I8_W8A8, "ulong i = (ulong)m * (ulong)N + (ulong)n;", label);
+    require(I8_W8A8, "b_scale[(ulong)g * N + (ulong)n]", label);
+    require(I8_W8A8, "b_scale[(ulong)g * N + n]", label);
+    require(I8_W8A8, "B[(ulong)n * K + k]", label);
+    require(I8_W8A8, "B[(ulong)k * N + n]", label);
+    require(I8_W8A8, "x[(ulong)row * cols + c]", label);
+    require(I8_W8A8, "q[(ulong)row * cols + c] = (int8_t)qi;", label);
+    forbid(I8_W8A8, "B[n * K + k]", label);
+    forbid(I8_W8A8, "B[k * N + n]", label);
+    forbid(I8_W8A8, "b_scale[g * N + n]", label);
+    forbid(I8_W8A8, "x[row * cols + c]", label);
+    forbid(I8_W8A8, "q[row * cols + c]", label);
+    forbid(I8_W8A8, "dextents<int64_t", label);
+    // The tile walk's panel gate multiplies N * K, and its tile counts are
+    // bounded by the m*n and n*k extents the validator caps.
+    require(
+        I8_TILE_WALK_H,
+        "(ulong)N * (ulong)K >= I8_PANEL_MIN_B_ELEMS",
+        "i8_tile_walk.h",
+    );
+    forbid(I8_TILE_WALK_H, "N * K >= I8_PANEL_MIN_B_ELEMS", "i8_tile_walk.h");
+    // Row quantize has no i32 extent guard: its addresses are all `ulong`, and
+    // its grid is one threadgroup per row (`rows` is a `u32`).
+    require(
+        I8_PIPELINE_RS,
+        "dispatch_groups(rt, &p, rows as usize, 256, |bnd| {",
+        "quantize_i8_rows grid",
+    );
+}
+
+/// The W4A8 int4b kernels and the zero-point-8 unpack. Both arms run the shared
+/// validator, so `a`, `n*k` and `c` are within `i32::MAX` before the `int`
+/// extents here, or the unpack's `uint` thread id, can wrap.
+#[test]
+fn w4a8_extents_are_host_bounded_and_addresses_are_widened() {
+    let label = "w4a8_tensorops";
+    require_shared_i8_validator(label);
+    require(W4A8_TENSOROPS, "#include \"i8_tile_walk.h\"", label);
+    require(W4A8_TENSOROPS, "dextents<int32_t, 2>{K, N}, array<int, 2>{1, K}", label);
+    require(
+        W4A8_TENSOROPS,
+        "dextents<int32_t, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K}",
+        label,
+    );
+    require(W4A8_TENSOROPS, "ulong i = (ulong)m * (ulong)N + (ulong)n;", label);
+    require(W4A8_TENSOROPS, "b_scale[(ulong)g * N + (ulong)n]", label);
+    require(W4A8_TENSOROPS, "ulong elems = (ulong)N * (ulong)K;", label);
+    require(W4A8_TENSOROPS, "if ((ulong)gid >= elems) return;", label);
+    require(W4A8_TENSOROPS, "packed[(ulong)n * (K / 2u) + (k >> 1u)]", label);
+    forbid(W4A8_TENSOROPS, "packed[n * (K / 2u)", label);
+    forbid(W4A8_TENSOROPS, "b_scale[g * N + n]", label);
+    forbid(W4A8_TENSOROPS, "dextents<int64_t", label);
+    // The unpack's `uint` thread id and its `out[gid]` store are in range
+    // because the validator caps n * k at i32::MAX before the allocation.
+    require(I8_PIPELINE_RS, "let count = numel(&[n, k], \"gemm_w4a8\")?;", label);
+    require(I8_PIPELINE_RS, "dispatch_1d(rt, &p, count, |bnd| {", label);
 }
 
 #[test]

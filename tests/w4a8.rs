@@ -2,7 +2,9 @@
 //!
 //! Both arms are checked against one integer oracle on the logical int8
 //! matrix. Neither arm is the other's reference. A failed int4b probe is an
-//! explicit unsupported error; the unpack arm still has to match.
+//! explicit unsupported error; the unpack arm still has to match. On a device
+//! with TensorOps the int4b arm is required to run, and the kernel trace must
+//! show it did.
 
 mod common;
 
@@ -41,6 +43,7 @@ fn pack(logical: &[i8], n: usize, k: usize, zp8: bool) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oracle(
     a: &[i8],
     b: &[i8],
@@ -55,16 +58,10 @@ fn oracle(
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
-            let v = if group == 0 {
-                let mut s: i32 = 0;
-                for p in 0..k {
-                    s += a[i * k + p] as i32 * b[j * k + p] as i32;
-                }
-                s as f32 * a_scalar
-            } else {
+            let v = if let Some(groups) = k.checked_div(group) {
                 let mut acc = 0.0f32;
                 let scales = b_scale.expect("group scales");
-                for g in 0..(k / group) {
+                for g in 0..groups {
                     let mut s: i32 = 0;
                     for p in 0..group {
                         let kk = g * group + p;
@@ -73,6 +70,12 @@ fn oracle(
                     acc += s as f32 * scales[g * n + j];
                 }
                 acc * a_scalar
+            } else {
+                let mut s: i32 = 0;
+                for p in 0..k {
+                    s += a[i * k + p] as i32 * b[j * k + p] as i32;
+                }
+                s as f32 * a_scalar
             };
             out[i * n + j] = v + bias.map(|b| b[j]).unwrap_or(0.0);
         }
@@ -87,6 +90,7 @@ fn assert_exact(got: &[f32], want: &[f32], what: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     rt: &Arc<GpuRuntime>,
     a: &[i8],
@@ -128,6 +132,26 @@ fn run(
     Ok(cb)
 }
 
+/// The int4b result of a call on a device that has TensorOps must be `Ok`: an
+/// `unsupported` error there is a failure, not a pass. On a device without
+/// TensorOps the explicit unsupported error is the contract, and the skip is
+/// printed so it cannot be mistaken for a run.
+fn int4b_or_skip(rt: &Arc<GpuRuntime>, r: Result<GpuBuffer, String>) -> Option<GpuBuffer> {
+    let has = rt.has_tensorops();
+    match r {
+        Ok(got) => {
+            assert!(has, "int4b returned Ok on a device without TensorOps");
+            Some(got)
+        }
+        Err(e) => {
+            assert!(!has, "int4b must run on a TensorOps device, got: {e}");
+            assert!(e.contains("unsupported") && !e.contains("host"), "{e}");
+            println!("SKIP int4b: no TensorOps on this device ({e})");
+            None
+        }
+    }
+}
+
 #[test]
 fn both_arms_match_one_integer_oracle() {
     with_gpu(|rt| {
@@ -150,12 +174,11 @@ fn both_arms_match_one_integer_oracle() {
             )
             .expect("unpack");
             assert_exact(&unpacked.read_f32(), &want, &format!("unpack {m}x{n}x{k}"));
-            match run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b) {
-                Ok(got) => assert_exact(&got.read_f32(), &want, &format!("int4b {m}x{n}x{k}")),
-                Err(e) => {
-                    assert!(e.contains("unsupported"), "{e}");
-                    assert!(!e.contains("host"), "{e}");
-                }
+            if let Some(got) = int4b_or_skip(
+                rt,
+                run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b),
+            ) {
+                assert_exact(&got.read_f32(), &want, &format!("int4b {m}x{n}x{k}"));
             }
         }
     });
@@ -193,9 +216,8 @@ fn group_scales_match_the_ordered_flush() {
                 let collapsed = (k as f32) * scales.iter().step_by(n as usize).take(groups).sum::<f32>();
                 assert_ne!(want[0].to_bits(), collapsed.to_bits());
             }
-            match run(rt, &a, &b, m, n, k, 1.0, scale, None, I8Out::F32, W4Arm::Int4b) {
-                Ok(got) => assert_exact(&got.read_f32(), &want, &format!("int4b group {group}")),
-                Err(e) => assert!(e.contains("unsupported"), "{e}"),
+            if let Some(got) = int4b_or_skip(rt, run(rt, &a, &b, m, n, k, 1.0, scale, None, I8Out::F32, W4Arm::Int4b)) {
+                assert_exact(&got.read_f32(), &want, &format!("int4b group {group}"));
             }
         }
     });
@@ -325,5 +347,386 @@ fn bad_k_and_per_column_scales_are_refused_before_dispatch() {
         .expect_err("odd");
         assert!(err.contains("even"), "{err}");
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// A raw zeroed buffer for the refusal cases, which never read it.
+fn zeros(rt: &Arc<GpuRuntime>, bytes: usize) -> GpuBuffer {
+    let b = rt.alloc_buffer(bytes).unwrap();
+    b.write_bytes(&vec![0u8; bytes]);
+    b
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call(
+    rt: &Arc<GpuRuntime>,
+    a: &GpuBuffer,
+    packed: &GpuBuffer,
+    c: &GpuBuffer,
+    (m, n, k): (u32, u32, u32),
+    a_scale: I8AScale<'_>,
+    b_scale: I8BScale<'_>,
+    bias: Option<&GpuBuffer>,
+    arm: W4Arm,
+) -> Result<(), String> {
+    nn::gemm_w4a8(
+        rt,
+        W4Gemm {
+            a,
+            packed,
+            c,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale,
+            bias,
+            out: I8Out::F32,
+            arm,
+        },
+    )
+}
+
+/// The refusal contract: an error naming `needle`, and not one dispatch.
+fn assert_refused(rt: &Arc<GpuRuntime>, what: &str, r: Result<(), String>, needle: &str) {
+    let e = r.expect_err(what);
+    assert!(e.contains(needle), "{what}: wanted {needle:?} in {e:?}");
+    assert!(
+        !e.contains("unsupported"),
+        "{what}: refused as a probe failure, not by validation: {e}"
+    );
+    assert_eq!(rt.take_dispatch_count(), 0, "{what}: dispatched before refusing ({e})");
+}
+
+const ARMS: [W4Arm; 2] = [W4Arm::Int4b, W4Arm::UnpackZp8];
+
+/// Group-0 int32 bound. Int4b: |a*b| <= 128*8, so K <= i32::MAX / 1024. The
+/// unpack arm keeps the int8 GEMM's 131071. Both refuse before any allocation
+/// or dispatch.
+#[test]
+fn group_zero_k_past_the_int32_bound_is_refused_before_dispatch() {
+    with_gpu(|rt| {
+        // 128 * 8 * 2^21 = 2^31: the int32 sum wraps to -2^31 without a bound.
+        let k = 1u32 << 21;
+        let a = vec![-128i8; k as usize];
+        let logical = vec![-8i8; k as usize];
+        for arm in ARMS {
+            rt.take_dispatch_count();
+            let e = run(rt, &a, &logical, 1, 1, k, 1.0, I8BScale::None, None, I8Out::F32, arm)
+                .expect_err(&format!("{arm:?} k=2^21 must be refused"));
+            assert!(e.contains("exceeds"), "{arm:?}: {e}");
+            assert!(!e.contains("unsupported"), "{arm:?}: {e}");
+            assert_eq!(rt.take_dispatch_count(), 0, "{arm:?} dispatched before refusing");
+        }
+        // The unpack arm's own, tighter bound.
+        let k = 131_072u32;
+        let a = vec![1i8; k as usize];
+        let logical = vec![1i8; k as usize];
+        rt.take_dispatch_count();
+        let e = run(
+            rt,
+            &a,
+            &logical,
+            1,
+            1,
+            k,
+            1.0,
+            I8BScale::None,
+            None,
+            I8Out::F32,
+            W4Arm::UnpackZp8,
+        )
+        .expect_err("unpack k=131072");
+        assert!(e.contains("131071"), "{e}");
+        assert_eq!(rt.take_dispatch_count(), 0, "unpack dispatched before refusing");
+    });
+}
+
+/// The largest legal K at full range is exact, not merely accepted.
+#[test]
+fn int4b_at_the_k_bound_is_exact() {
+    with_gpu(|rt| {
+        // Largest multiple of 32 not above i32::MAX / 1024 = 2097151.
+        let k = 2_097_120u32;
+        let a = vec![-128i8; k as usize];
+        let logical = vec![-8i8; k as usize];
+        let want = [(128i64 * 8 * k as i64) as f32];
+        assert_eq!(want[0], 2_147_450_880.0);
+        let r = run(
+            rt,
+            &a,
+            &logical,
+            1,
+            1,
+            k,
+            1.0,
+            I8BScale::None,
+            None,
+            I8Out::F32,
+            W4Arm::Int4b,
+        );
+        if let Some(got) = int4b_or_skip(rt, r) {
+            assert_exact(&got.read_f32()[..1], &want, "int4b k at bound");
+        }
+        // And the unpack arm at its own bound (131071 is odd; 131070 is the last even K).
+        let k = 131_070u32;
+        let a = vec![-128i8; k as usize];
+        let logical = vec![-8i8; k as usize];
+        let want = [(128i64 * 8 * k as i64) as f32];
+        let got = run(
+            rt,
+            &a,
+            &logical,
+            1,
+            1,
+            k,
+            1.0,
+            I8BScale::None,
+            None,
+            I8Out::F32,
+            W4Arm::UnpackZp8,
+        )
+        .expect("unpack at its bound");
+        assert_exact(&got.read_f32()[..1], &want, "unpack k at bound");
+    });
+}
+
+/// `c` may not be any buffer the kernel reads, on either arm, and the refusal
+/// comes before the unpack dispatch.
+#[test]
+fn a_writable_c_that_aliases_any_input_is_refused() {
+    with_gpu(|rt| {
+        let (m, n, k) = (2u32, 3u32, 64u32);
+        let shape = (m, n, k);
+        let a = zeros(rt, 128);
+        let packed = zeros(rt, 96);
+        // Finite floats, so scale and bias finiteness checks pass; large enough
+        // to be a (128 B), packed (96 B) and c (24 B).
+        let shared = buf(rt, &[1.0f32; 128]);
+        for arm in ARMS {
+            let tag = format!("{arm:?}");
+            let scalar = I8AScale::Scalar(1.0);
+            rt.take_dispatch_count();
+            let r = call(rt, &shared, &packed, &shared, shape, scalar, I8BScale::None, None, arm);
+            assert_refused(
+                rt,
+                &format!("{tag} c==a"),
+                r,
+                "writable buffer c overlaps read-only buffer a",
+            );
+            let r = call(rt, &a, &shared, &shared, shape, scalar, I8BScale::None, None, arm);
+            assert_refused(rt, &format!("{tag} c==packed"), r, "read-only buffer packed");
+            let r = call(
+                rt,
+                &a,
+                &packed,
+                &shared,
+                shape,
+                I8AScale::Rows(&shared),
+                I8BScale::None,
+                None,
+                arm,
+            );
+            assert_refused(rt, &format!("{tag} c==a_scale"), r, "read-only buffer a_scale");
+            let per_group = I8BScale::PerGroup {
+                scales: &shared,
+                group: 64,
+            };
+            let r = call(rt, &a, &packed, &shared, shape, scalar, per_group, None, arm);
+            assert_refused(rt, &format!("{tag} c==b_scale"), r, "read-only buffer b_scale");
+            let r = call(
+                rt,
+                &a,
+                &packed,
+                &shared,
+                shape,
+                scalar,
+                I8BScale::None,
+                Some(&shared),
+                arm,
+            );
+            assert_refused(rt, &format!("{tag} c==bias"), r, "read-only buffer bias");
+        }
+    });
+}
+
+/// m*k, n*k and m*n must each fit a signed 32-bit extent. Shape-only: the
+/// buffers are tiny because the extent check precedes the size check, so the
+/// refusal must name the extent, not the buffer size.
+#[test]
+fn extents_past_signed_32_bit_are_refused_before_allocation_or_dispatch() {
+    with_gpu(|rt| {
+        let a = zeros(rt, 64);
+        let packed = zeros(rt, 64);
+        let c = zeros(rt, 64);
+        let scalar = I8AScale::Scalar(1.0);
+        for arm in ARMS {
+            rt.take_dispatch_count();
+            // a: 65536 * 32768 = 2^31.
+            let r = call(
+                rt,
+                &a,
+                &packed,
+                &c,
+                (65_536, 8, 32_768),
+                scalar,
+                I8BScale::None,
+                None,
+                arm,
+            );
+            assert_refused(
+                rt,
+                &format!("{arm:?} a extent"),
+                r,
+                "exceeds signed 32-bit kernel indexing",
+            );
+            // b (n * k): 1 * 2^31 is past i32::MAX and k itself is not.
+            let r = call(
+                rt,
+                &a,
+                &packed,
+                &c,
+                (1, 65_536, 32_768),
+                scalar,
+                I8BScale::None,
+                None,
+                arm,
+            );
+            assert_refused(
+                rt,
+                &format!("{arm:?} b extent"),
+                r,
+                "exceeds signed 32-bit kernel indexing",
+            );
+            // c: 65536 * 65536 = 2^32.
+            let r = call(
+                rt,
+                &a,
+                &packed,
+                &c,
+                (65_536, 65_536, 32),
+                scalar,
+                I8BScale::None,
+                None,
+                arm,
+            );
+            assert_refused(
+                rt,
+                &format!("{arm:?} c extent"),
+                r,
+                "exceeds signed 32-bit kernel indexing",
+            );
+        }
+    });
+}
+
+/// A busy runtime on the first int4b call must not become "unsupported" for
+/// the rest of the process. The probe cache is process-wide, so this runs in a
+/// child with a fresh cache.
+#[test]
+fn a_busy_first_call_does_not_disable_int4b() {
+    let name = "a_busy_first_call_does_not_disable_int4b";
+    common::in_child(name, &[], || {
+        with_gpu(|rt| {
+            if !rt.has_tensorops() {
+                println!("SKIP busy-probe: no TensorOps on this device");
+                return;
+            }
+            let (m, n, k) = (3u32, 5u32, 64u32);
+            let a = seq_i8((m * k) as usize, 2, 16);
+            let b = seq_i8((n * k) as usize, 5, 16);
+            let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, 0, None, None);
+            let ab = rt.alloc_buffer(a.len()).unwrap();
+            ab.write_bytes(&a.iter().map(|v| *v as u8).collect::<Vec<_>>());
+            let pb = rt.alloc_buffer((n * k / 2) as usize).unwrap();
+            pb.write_bytes(&pack(&b, n as usize, k as usize, false));
+            let cb = zeros(rt, (m * n * 4) as usize);
+            let held_by = zeros(rt, 64);
+            let scalar = I8AScale::Scalar(1.0);
+
+            let mapping = held_by.try_contents_u8().expect("hold the runtime lease");
+            rt.take_dispatch_count();
+            let e = call(rt, &ab, &pb, &cb, (m, n, k), scalar, I8BScale::None, None, W4Arm::Int4b)
+                .expect_err("a held host mapping must make the first call busy");
+            assert!(e.contains("busy"), "{e}");
+            assert!(!e.contains("unsupported"), "busy was reported as unsupported: {e}");
+            drop(mapping);
+            assert!(!rt.is_poisoned());
+
+            call(rt, &ab, &pb, &cb, (m, n, k), scalar, I8BScale::None, None, W4Arm::Int4b)
+                .expect("int4b must work once the runtime is free; a busy probe must not stick");
+            assert_exact(&cb.read_f32(), &want, "int4b after a busy first call");
+        });
+    });
+}
+
+/// On a TensorOps device int4b runs, across the full int8 activation range
+/// (-128..127) against weights -8..7, with and without group scales, and the
+/// kernel trace shows the `w4a8_i4_*` kernel dispatched.
+#[test]
+fn int4b_runs_its_kernel_over_the_full_activation_range() {
+    let name = "int4b_runs_its_kernel_over_the_full_activation_range";
+    common::in_traced_child(name, || {
+        with_gpu(|rt| {
+            if !rt.has_tensorops() {
+                println!("SKIP int4b kernel trace: no TensorOps on this device");
+                return;
+            }
+            let count = tessl::runtime::traced_kernel_count;
+            for &(m, n, k) in &[(3u32, 5u32, 64u32), (33, 7, 64), (1, 8, 32)] {
+                let a = seq_i8((m * k) as usize, 3, 256);
+                assert!(a.contains(&-128) || m * k < 256, "activations must reach -128");
+                let b = seq_i8((n * k) as usize, 5, 16);
+                let want = oracle(&a, &b, m as usize, n as usize, k as usize, 1.0, 0, None, None);
+                // The first call may add the probe's own request; measure the second.
+                run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b).expect("warm");
+                let before = count("w4a8_i4_32");
+                let got = run(rt, &a, &b, m, n, k, 1.0, I8BScale::None, None, I8Out::F32, W4Arm::Int4b)
+                    .expect("int4b must run on a TensorOps device");
+                assert_eq!(
+                    count("w4a8_i4_32") - before,
+                    1,
+                    "w4a8_i4_32 not dispatched for {m}x{n}x{k}"
+                );
+                assert_exact(&got.read_f32(), &want, &format!("int4b full-range A {m}x{n}x{k}"));
+                let unpacked = run(
+                    rt,
+                    &a,
+                    &b,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    I8BScale::None,
+                    None,
+                    I8Out::F32,
+                    W4Arm::UnpackZp8,
+                )
+                .expect("unpack");
+                assert_exact(&unpacked.read_f32(), &want, &format!("unpack full-range A {m}x{n}x{k}"));
+            }
+            let (m, n, k, group) = (4u32, 2u32, 128u32, 64u32);
+            let a = seq_i8((m * k) as usize, 1, 256);
+            let b = seq_i8((n * k) as usize, 5, 16);
+            let scales: Vec<f32> = (0..(k / group * n)).map(|i| [1.0, 0.5, 0.25][i as usize % 3]).collect();
+            let sb = buf(rt, &scales);
+            let want = oracle(
+                &a,
+                &b,
+                m as usize,
+                n as usize,
+                k as usize,
+                1.0,
+                group as usize,
+                Some(&scales),
+                None,
+            );
+            let scale = I8BScale::PerGroup { scales: &sb, group };
+            run(rt, &a, &b, m, n, k, 1.0, scale, None, I8Out::F32, W4Arm::Int4b).expect("warm group");
+            let before = count("w4a8_i4_g64");
+            let got = run(rt, &a, &b, m, n, k, 1.0, scale, None, I8Out::F32, W4Arm::Int4b).expect("group");
+            assert_eq!(count("w4a8_i4_g64") - before, 1, "w4a8_i4_g64 not dispatched");
+            assert_exact(&got.read_f32(), &want, "int4b full-range A group 64");
+        });
     });
 }

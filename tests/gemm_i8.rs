@@ -1022,7 +1022,7 @@ fn run_domain_point(rt: &Arc<GpuRuntime>, m: u32, layout: nn::I8BLayout, group: 
         .map(|i| [0.25, 0.5, 0.75, 1.0, 1.5, 0.125, 2.0][i as usize % 7])
         .collect();
     let bias_v: Vec<f32> = (0..n).map(|j| (j as f32 - 35.0) * 0.375).collect();
-    let groups = if group == 0 { 1 } else { k / group };
+    let groups = k.checked_div(group).unwrap_or(1);
     // Distinct per column and per group, exactly representable.
     let scales: Vec<f32> = (0..groups * n)
         .map(|i| ((i * 7 + 3) % 251 + 1) as f32 / 2048.0)

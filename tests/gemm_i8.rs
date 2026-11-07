@@ -268,6 +268,7 @@ fn read_bits(buf: &GpuBuffer, n: usize) -> Vec<u16> {
 }
 
 /// Independent of the shader: int32 dots, then the kernel's f32 flush order.
+#[allow(clippy::too_many_arguments)]
 fn oracle_full(
     a: &[i8],
     b: &[i8],
@@ -300,6 +301,7 @@ fn oracle_full(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oracle_group(
     a: &[i8],
     b: &[i8],

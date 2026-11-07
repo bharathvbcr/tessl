@@ -43,6 +43,7 @@ fn pack(logical: &[i8], n: usize, k: usize, zp8: bool) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oracle(
     a: &[i8],
     b: &[i8],
@@ -57,16 +58,10 @@ fn oracle(
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
-            let v = if group == 0 {
-                let mut s: i32 = 0;
-                for p in 0..k {
-                    s += a[i * k + p] as i32 * b[j * k + p] as i32;
-                }
-                s as f32 * a_scalar
-            } else {
+            let v = if let Some(groups) = k.checked_div(group) {
                 let mut acc = 0.0f32;
                 let scales = b_scale.expect("group scales");
-                for g in 0..(k / group) {
+                for g in 0..groups {
                     let mut s: i32 = 0;
                     for p in 0..group {
                         let kk = g * group + p;
@@ -75,6 +70,12 @@ fn oracle(
                     acc += s as f32 * scales[g * n + j];
                 }
                 acc * a_scalar
+            } else {
+                let mut s: i32 = 0;
+                for p in 0..k {
+                    s += a[i * k + p] as i32 * b[j * k + p] as i32;
+                }
+                s as f32 * a_scalar
             };
             out[i * n + j] = v + bias.map(|b| b[j]).unwrap_or(0.0);
         }
@@ -89,6 +90,7 @@ fn assert_exact(got: &[f32], want: &[f32], what: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     rt: &Arc<GpuRuntime>,
     a: &[i8],

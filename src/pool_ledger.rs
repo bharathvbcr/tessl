@@ -107,6 +107,15 @@ impl LedgerRefused {
 /// ledger that matches releases exactly counts it as unmatched). The pool
 /// makes a Live to Cached move as a `release` and a `try_charge`, never one
 /// `transfer`, so it always knows which half ran when one unwinds.
+///
+/// A runtime that is dropped hands back every charge it still holds, and a
+/// ledger that panics in one of those releases does not stop the rest: the
+/// pool catches each panic, releases everything else, tries the failed
+/// releases once more, and then resumes the first panic, so it still reaches
+/// whoever dropped the runtime. When the runtime is dropped while the thread
+/// is already unwinding, resuming would abort the process, so the pool drops
+/// the panic instead and does not retry: the charges whose release panicked
+/// stay held.
 pub trait PoolLedger: Send + Sync {
     /// Charge `bytes` to `class`, or refuse. Charges nothing on refusal.
     fn try_charge(&self, class: LedgerClass, bytes: u64) -> Result<(), LedgerRefused>;

@@ -497,21 +497,23 @@ impl BufferPool {
     /// before that point unwinds with the buffer still in the slot and the
     /// books as they were, so the caller can queue it again and retry; the
     /// one after it (the Cached charge) unwinds with the Live charge already
-    /// released, where the right end is to destroy the buffer.
+    /// released, where the right end is to destroy the buffer. A buffer the
+    /// pool destroys is handed back for the caller to drop, after it has
+    /// taken the buffer out of the residency set.
     ///
     /// The Live -> Cached move is a `release` and a `try_charge` made here
     /// rather than one `PoolLedger::transfer` call, because a black box
     /// `transfer` that unwinds cannot say which half ran. This is what the
     /// trait's default `transfer` does, and no implementation overrides it.
-    fn recycle(&mut self, slot: &mut Option<Retained<ProtocolObject<dyn MTLBuffer>>>) {
+    fn recycle(
+        &mut self,
+        slot: &mut Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
         // Created at its bucket by `alloc`, so its length is its key.
-        let Some(key) = slot.as_ref().map(|b| b.length()) else {
-            return;
-        };
+        let key = slot.as_ref().map(|b| b.length())?;
         if key > self.max_cache_bytes {
             self.retire(key);
-            slot.take();
-            return;
+            return slot.take();
         }
         if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
             let larger = self
@@ -523,8 +525,7 @@ impl BufferPool {
             let Some(evict) = larger else {
                 // Drop buffer (let ARC release) — over cache cap.
                 self.retire(key);
-                slot.take();
-                return;
+                return slot.take();
             };
             self.release_one_cached(evict);
             // The evicted buffer was larger, so this one now fits.
@@ -536,7 +537,7 @@ impl BufferPool {
             self.live_bytes = self.live_bytes.saturating_sub(key);
             let buffer = slot.take();
             if ledger.try_charge(LedgerClass::Cached, key as u64).is_err() {
-                return;
+                return buffer;
             }
             self.cached_bytes += key;
             self.freelist.entry(key).or_default().extend(buffer);
@@ -545,6 +546,7 @@ impl BufferPool {
             self.cached_bytes += key;
             self.freelist.entry(key).or_default().extend(slot.take());
         }
+        None
     }
 
     fn set_max_cache_bytes(&mut self, max_cache_bytes: usize) {
@@ -835,6 +837,56 @@ fn take_completed_deferred<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -
     done
 }
 
+/// The releases of a runtime that is being dropped, which must all be tried
+/// even when one panics: nothing runs after Drop to release the rest.
+///
+/// A panicking release is caught and its payload kept (the first one only).
+/// [`Self::finish`] then tries each failed release once more (a release that
+/// unwinds has changed nothing, so the retry cannot double-release) and
+/// resumes the first payload, so the panic still reaches the caller. When the
+/// runtime is dropped while the thread is already unwinding, resuming would
+/// abort the process: the payload is dropped instead and the charges whose
+/// release panicked stay held.
+struct DropReleases {
+    ledger: Arc<dyn PoolLedger>,
+    first: Option<Box<dyn std::any::Any + Send>>,
+    failed: Vec<(LedgerClass, u64)>,
+}
+
+impl DropReleases {
+    fn new(ledger: Arc<dyn PoolLedger>) -> Self {
+        Self {
+            ledger,
+            first: None,
+            failed: Vec::new(),
+        }
+    }
+
+    fn try_release(&self, class: LedgerClass, bytes: u64) -> std::thread::Result<()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ledger.release(class, bytes)))
+    }
+
+    fn give_back(&mut self, class: LedgerClass, bytes: usize) {
+        let bytes = bytes as u64;
+        if let Err(payload) = self.try_release(class, bytes) {
+            self.first.get_or_insert(payload);
+            self.failed.push((class, bytes));
+        }
+    }
+
+    fn finish(mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        for (class, bytes) in std::mem::take(&mut self.failed) {
+            let _ = self.try_release(class, bytes);
+        }
+        if let Some(payload) = self.first.take() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 /// Items taken off `queue` whose handling may unwind (it calls the pool's
 /// ledger). Whatever is still in `items` when this drops goes back on the
 /// queue at its own release point, so a panic partway leaves the unhandled
@@ -858,19 +910,27 @@ impl<T> Drop for Requeue<'_, T> {
 }
 
 /// The cold buffer [`BufferPool::recycle`] is working on. The pool empties
-/// `buffer` at the point it can no longer give it back; until then a panic
-/// drops this and the buffer returns to the queue.
+/// `buffer` at the point it can no longer give it back. Dropping this with the
+/// buffer still there (a panic before that point) queues it again, still in
+/// the residency set. Dropping it with the slot empty (the pool took it,
+/// parked or destroyed, normally or by unwinding) removes the buffer from the
+/// residency set. A buffer is removed exactly once, and only after its ledger
+/// calls returned.
 struct InFlightRecycle<'a> {
-    queue: &'a Mutex<Vec<Deferred<PendingRecycle>>>,
+    rt: &'a GpuRuntime,
     after: u64,
     nbytes: usize,
+    /// A second owner of the buffer, kept to remove it from residency after
+    /// the pool has moved or destroyed the first.
+    handle: Retained<ProtocolObject<dyn MTLBuffer>>,
     buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl Drop for InFlightRecycle<'_> {
     fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            push_deferred(self.queue, self.after, (buffer, self.nbytes));
+        match self.buffer.take() {
+            Some(buffer) => push_deferred(&self.rt.pending_cold_recycle, self.after, (buffer, self.nbytes)),
+            None => self.rt.unregister_residency(&self.handle),
         }
     }
 }
@@ -1824,31 +1884,31 @@ impl GpuRuntime {
                 }
             }
         }
-        for (_, (buf, _nbytes)) in &cold.items {
-            self.unregister_residency(buf);
-        }
-        for (_, buf) in &retired.items {
-            self.unregister_residency(buf);
-        }
-        self.flush_residency();
         // One item at a time, each leaving its queue only once the pool has
-        // finished with its ledger calls. A ledger that panics partway leaves
-        // the rest queued ([`Requeue`]) rather than dropped with their
-        // charges held; a retried item's residency removal is a no-op.
+        // finished with its ledger calls, and leaving the residency set only
+        // then too. A ledger that panics partway leaves the rest queued
+        // ([`Requeue`]) and still resident, rather than dropped with their
+        // charges held or removed from residency twice by the retry. The
+        // buffers the pool destroys wait here until the removals are flushed.
+        let mut destroyed = Vec::new();
         while let Some((after, (buffer, nbytes))) = cold.items.pop() {
             let mut held = InFlightRecycle {
-                queue: &self.pending_cold_recycle,
+                rt: self,
                 after,
                 nbytes,
+                handle: buffer.clone(),
                 buffer: Some(buffer),
             };
-            BufferPool::recycle(&mut self.pool_recovering(), &mut held.buffer);
+            destroyed.extend(BufferPool::recycle(&mut self.pool_recovering(), &mut held.buffer));
         }
         while let Some((_, buf)) = retired.items.last() {
             let key = buf.length();
             self.pool_recovering().retire(key);
-            retired.items.pop();
+            self.unregister_residency(buf);
+            destroyed.extend(retired.items.pop().map(|(_, buf)| buf));
         }
+        self.flush_residency();
+        drop(destroyed);
         drop(other);
     }
 
@@ -1904,22 +1964,28 @@ impl GpuRuntime {
     /// free list and the dropped buffers waiting on the GPU. Called only when
     /// the runtime is being dropped with its GPU work finished; a runtime that
     /// leaks its in-flight buffers keeps their charges.
+    ///
+    /// There is no later pass after Drop, so a release that panics must not
+    /// stop the ones after it: each is caught, the first panic is kept, and it
+    /// is resumed once everything else is released (see [`DropReleases`]).
     fn release_pool_ledger(&mut self) {
-        if mutex_value_mut(&mut self.pool).ledger.is_none() {
-            return;
-        }
         let pool = mutex_value_mut(&mut self.pool);
-        let cold = mutex_value_mut(&mut self.pending_cold_recycle);
-        while let Some((_, (buffer, _))) = cold.last() {
-            pool.retire(buffer.length());
-            cold.pop();
+        let Some(ledger) = pool.ledger.clone() else {
+            return;
+        };
+        let mut releases = DropReleases::new(ledger);
+        for (&key, buffers) in &pool.freelist {
+            for _ in buffers {
+                releases.give_back(LedgerClass::Cached, key);
+            }
         }
-        let retired = mutex_value_mut(&mut self.pending_retirement);
-        while let Some((_, buffer)) = retired.last() {
-            pool.retire(buffer.length());
-            retired.pop();
+        for (_, (buffer, _)) in mutex_value_mut(&mut self.pending_cold_recycle).iter() {
+            releases.give_back(LedgerClass::Live, buffer.length());
         }
-        pool.trim_free_list();
+        for (_, buffer) in mutex_value_mut(&mut self.pending_retirement).iter() {
+            releases.give_back(LedgerClass::Live, buffer.length());
+        }
+        releases.finish();
     }
 
     /// Whether any deferred release is waiting on the GPU.

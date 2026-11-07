@@ -340,18 +340,31 @@ impl BufferPool {
         }
     }
 
-    /// Move `key` bytes from the free list's balance to the live one. `false`
-    /// when the ledger could not carry the move (it has released the cached
-    /// charge, so the caller destroys the buffer).
-    fn cached_to_live(&mut self, key: usize) -> bool {
+    /// Take a cached buffer of `key` bytes off the free list and move its
+    /// charge from the Cached balance to the Live one. `None` when none is
+    /// cached, or when the ledger could not carry the move (it has released
+    /// the cached charge and the buffer is destroyed).
+    ///
+    /// The Cached release comes first, with the buffer still listed, as in
+    /// [`Self::release_one_cached`]: a panic there leaves it cached and
+    /// counted, and a panic in the Live charge after it destroys a buffer
+    /// whose Cached charge is already given back.
+    fn take_cached_as_live(&mut self, key: usize) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        if self.freelist.get(&key).is_none_or(Vec::is_empty) {
+            return None;
+        }
+        self.ledger_release(LedgerClass::Cached, key);
+        let buffer = self.freelist.get_mut(&key).and_then(Vec::pop);
+        self.cached_bytes = self.cached_bytes.saturating_sub(key);
         let moved = self
             .ledger
             .as_ref()
-            .is_none_or(|l| l.transfer(key as u64, LedgerClass::Cached, LedgerClass::Live).is_ok());
-        if moved {
-            self.live_bytes = self.live_bytes.saturating_add(key);
+            .is_none_or(|l| l.try_charge(LedgerClass::Live, key as u64).is_ok());
+        if !moved {
+            return None;
         }
-        moved
+        self.live_bytes = self.live_bytes.saturating_add(key);
+        buffer
     }
 
     /// Charge `key` live bytes for a fresh buffer, running the ladder when the
@@ -377,44 +390,53 @@ impl BufferPool {
         }
     }
 
-    /// Destroy every cached buffer, releasing its ledger charge. Returns the
-    /// bytes freed. Free-listed buffers are idle: they were parked after the
-    /// GPU finished with them.
+    /// Give back one cached buffer of `key` bytes: release its Cached charge,
+    /// then take it off the list and destroy it. `false` when none is cached.
+    ///
+    /// The release comes first, with the buffer still on the list. The ledger
+    /// contract (see [`crate::pool_ledger::PoolLedger`]) is that a `release`
+    /// returns having given the charge back or unwinds having changed
+    /// nothing. So a panic here leaves the buffer listed with its charge
+    /// still held and the counters untouched, and a later trim, cap or Drop
+    /// releases it once. Popping first would drop the buffer during the
+    /// unwind with its charge held for good. Nothing between the release
+    /// returning and the pop can unwind, so a released buffer is never left
+    /// on the list.
+    fn release_one_cached(&mut self, key: usize) -> bool {
+        if self.freelist.get(&key).is_none_or(Vec::is_empty) {
+            return false;
+        }
+        self.ledger_release(LedgerClass::Cached, key);
+        self.freelist.get_mut(&key).and_then(Vec::pop);
+        self.cached_bytes = self.cached_bytes.saturating_sub(key);
+        true
+    }
+
+    /// Destroy every cached buffer, releasing its ledger charge, one buffer at
+    /// a time (see [`Self::release_one_cached`]). Returns the bytes freed.
+    /// Free-listed buffers are idle: they were parked after the GPU finished
+    /// with them. It also hands back what a runtime that is being dropped
+    /// still has cached.
     fn trim_free_list(&mut self) -> usize {
+        let keys: Vec<usize> = self.freelist.keys().copied().collect();
         let mut freed = 0;
-        for (key, buffers) in self.freelist.drain() {
-            for buffer in buffers {
-                drop(buffer);
+        for key in keys {
+            while self.release_one_cached(key) {
                 freed += key;
-                if let Some(ledger) = &self.ledger {
-                    ledger.release(LedgerClass::Cached, key as u64);
-                }
             }
         }
+        self.freelist.clear();
         self.cached_bytes = 0;
         freed
     }
 
     /// A pool buffer of `key` bytes was destroyed instead of parked (a retired
     /// Hot buffer, or one that does not fit the cache): it leaves the live
-    /// balance.
+    /// balance. The ledger is told first, so a `release` that unwinds leaves
+    /// the balance as it was and the caller still owns the buffer.
     fn retire(&mut self, key: usize) {
-        self.live_bytes = self.live_bytes.saturating_sub(key);
         self.ledger_release(LedgerClass::Live, key);
-    }
-
-    /// Release every charge the pool still holds for what it caches. For a
-    /// runtime that is being dropped after its GPU work finished.
-    fn release_cached(&mut self) {
-        if let Some(ledger) = &self.ledger {
-            for (&key, buffers) in &self.freelist {
-                for _ in buffers {
-                    ledger.release(LedgerClass::Cached, key as u64);
-                }
-            }
-        }
-        self.cached_bytes = 0;
-        self.freelist.clear();
+        self.live_bytes = self.live_bytes.saturating_sub(key);
     }
 
     /// The length a request of `nbytes` is allocated at: a power of two for a
@@ -444,17 +466,12 @@ impl BufferPool {
         let key = Self::bucket(nbytes, kind)
             .filter(|&key| key <= self.max_buffer_length)
             .ok_or_else(|| ROUNDED_LIMIT_MESSAGE.to_string())?;
-        if let Some(v) = self.freelist.get_mut(&key) {
-            if let Some(b) = v.pop() {
-                self.cached_bytes = self.cached_bytes.saturating_sub(key);
-                // A hit moves already-resident bytes from the cached balance
-                // to the live one and needs no new room. If the ledger cannot
-                // carry the move, `b` is destroyed and this is a fresh buffer.
-                if self.cached_to_live(key) {
-                    // true = came from freelist (already resided previously; re-add)
-                    return Ok((b, true));
-                }
-            }
+        // A hit moves already-resident bytes from the cached balance to the
+        // live one and needs no new room. If the ledger cannot carry the
+        // move, the buffer is destroyed and this is a fresh buffer.
+        if let Some(b) = self.take_cached_as_live(key) {
+            // true = came from freelist (already resided previously; re-add)
+            return Ok((b, true));
         }
         self.charge_fresh(key)?;
         let Some(b) = device.newBufferWithLength_options(key, MTLResourceOptions::StorageModeShared) else {
@@ -474,11 +491,26 @@ impl BufferPool {
     /// made again on its next use: 668 fresh buffers (6.8 GB) a Qwen3.5-2B
     /// bf16-bank step's backward. The largest buffer freed is still released
     /// when it does not fit, as before.
-    fn recycle(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
+    ///
+    /// The buffer comes in a slot, and the slot is emptied at exactly the
+    /// point the pool stops being able to give it back. Every ledger call
+    /// before that point unwinds with the buffer still in the slot and the
+    /// books as they were, so the caller can queue it again and retry; the
+    /// one after it (the Cached charge) unwinds with the Live charge already
+    /// released, where the right end is to destroy the buffer.
+    ///
+    /// The Live -> Cached move is a `release` and a `try_charge` made here
+    /// rather than one `PoolLedger::transfer` call, because a black box
+    /// `transfer` that unwinds cannot say which half ran. This is what the
+    /// trait's default `transfer` does, and no implementation overrides it.
+    fn recycle(&mut self, slot: &mut Option<Retained<ProtocolObject<dyn MTLBuffer>>>) {
         // Created at its bucket by `alloc`, so its length is its key.
-        let key = buffer.length();
+        let Some(key) = slot.as_ref().map(|b| b.length()) else {
+            return;
+        };
         if key > self.max_cache_bytes {
             self.retire(key);
+            slot.take();
             return;
         }
         if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
@@ -491,29 +523,28 @@ impl BufferPool {
             let Some(evict) = larger else {
                 // Drop buffer (let ARC release) — over cache cap.
                 self.retire(key);
+                slot.take();
                 return;
             };
-            if let Some(v) = self.freelist.get_mut(&evict) {
-                if v.pop().is_some() {
-                    self.ledger_release(LedgerClass::Cached, evict);
-                }
-                self.cached_bytes = self.cached_bytes.saturating_sub(evict);
-            }
+            self.release_one_cached(evict);
             // The evicted buffer was larger, so this one now fits.
         }
         // Live -> cached. If the ledger cannot carry the move it has released
         // the live charge, and the buffer is destroyed as if over the cap.
-        self.live_bytes = self.live_bytes.saturating_sub(key);
         if let Some(ledger) = &self.ledger {
-            if ledger
-                .transfer(key as u64, LedgerClass::Live, LedgerClass::Cached)
-                .is_err()
-            {
+            ledger.release(LedgerClass::Live, key as u64);
+            self.live_bytes = self.live_bytes.saturating_sub(key);
+            let buffer = slot.take();
+            if ledger.try_charge(LedgerClass::Cached, key as u64).is_err() {
                 return;
             }
+            self.cached_bytes += key;
+            self.freelist.entry(key).or_default().extend(buffer);
+        } else {
+            self.live_bytes = self.live_bytes.saturating_sub(key);
+            self.cached_bytes += key;
+            self.freelist.entry(key).or_default().extend(slot.take());
         }
-        self.cached_bytes += key;
-        self.freelist.entry(key).or_default().push(buffer);
     }
 
     fn set_max_cache_bytes(&mut self, max_cache_bytes: usize) {
@@ -525,16 +556,7 @@ impl BufferPool {
         let mut keys: Vec<usize> = self.freelist.keys().copied().collect();
         keys.sort_unstable_by(|a, b| b.cmp(a));
         for key in keys {
-            while self.cached_bytes > max_cache_bytes {
-                let Some(v) = self.freelist.get_mut(&key) else {
-                    break;
-                };
-                if v.pop().is_none() {
-                    break;
-                }
-                self.ledger_release(LedgerClass::Cached, key);
-                self.cached_bytes = self.cached_bytes.saturating_sub(key);
-            }
+            while self.cached_bytes > max_cache_bytes && self.release_one_cached(key) {}
         }
     }
 }
@@ -793,6 +815,15 @@ type Deferred<T> = (u64, T);
 /// A poisoned lock still holds the queue; skipping it would leave the items
 /// waiting forever, and dropping them early could free memory in flight.
 fn take_completed<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -> Vec<T> {
+    take_completed_deferred(queue, completed)
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect()
+}
+
+/// [`take_completed`] keeping each item's release point, for a caller that may
+/// have to queue some of them again ([`Requeue`]).
+fn take_completed_deferred<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -> Vec<Deferred<T>> {
     let mut q = queue.lock().unwrap_or_else(PoisonError::into_inner);
     if q.is_empty() {
         return Vec::new();
@@ -801,7 +832,47 @@ fn take_completed<T>(queue: &Mutex<Vec<Deferred<T>>>, completed: u64) -> Vec<T> 
         .into_iter()
         .partition(|(after, _)| *after <= completed);
     *q = waiting;
-    done.into_iter().map(|(_, item)| item).collect()
+    done
+}
+
+/// Items taken off `queue` whose handling may unwind (it calls the pool's
+/// ledger). Whatever is still in `items` when this drops goes back on the
+/// queue at its own release point, so a panic partway leaves the unhandled
+/// items queued for the next drain instead of destroying them with their
+/// charges held. The handler removes an item from `items` only once its
+/// ledger calls have returned.
+struct Requeue<'a, T> {
+    queue: &'a Mutex<Vec<Deferred<T>>>,
+    items: Vec<Deferred<T>>,
+}
+
+impl<T> Drop for Requeue<'_, T> {
+    fn drop(&mut self) {
+        if !self.items.is_empty() {
+            self.queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .append(&mut self.items);
+        }
+    }
+}
+
+/// The cold buffer [`BufferPool::recycle`] is working on. The pool empties
+/// `buffer` at the point it can no longer give it back; until then a panic
+/// drops this and the buffer returns to the queue.
+struct InFlightRecycle<'a> {
+    queue: &'a Mutex<Vec<Deferred<PendingRecycle>>>,
+    after: u64,
+    nbytes: usize,
+    buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+}
+
+impl Drop for InFlightRecycle<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            push_deferred(self.queue, self.after, (buffer, self.nbytes));
+        }
+    }
 }
 
 /// Queue `item` on `queue` until the GPU passes `after`.
@@ -1721,11 +1792,17 @@ impl GpuRuntime {
     /// ([`Self::recycle_if_idle`]), so what was dropped after a wait is
     /// reusable at once rather than at the next commit.
     fn drain_cold_recycles(&self, completed: u64) {
-        let cold = take_completed(&self.pending_cold_recycle, completed);
-        let retired = take_completed(&self.pending_retirement, completed);
+        let mut cold = Requeue {
+            queue: &self.pending_cold_recycle,
+            items: take_completed_deferred(&self.pending_cold_recycle, completed),
+        };
+        let mut retired = Requeue {
+            queue: &self.pending_retirement,
+            items: take_completed_deferred(&self.pending_retirement, completed),
+        };
         let released = take_completed(&self.pending_external_release, completed);
         let other = take_completed(&self.pending_release, completed);
-        if cold.is_empty() && retired.is_empty() && released.is_empty() && other.is_empty() {
+        if cold.items.is_empty() && retired.items.is_empty() && released.is_empty() && other.is_empty() {
             return;
         }
         for (alloc, _) in other.iter().filter(|(_, resident)| *resident) {
@@ -1747,23 +1824,31 @@ impl GpuRuntime {
                 }
             }
         }
-        for (buf, _nbytes) in &cold {
+        for (_, (buf, _nbytes)) in &cold.items {
             self.unregister_residency(buf);
         }
-        for buf in &retired {
+        for (_, buf) in &retired.items {
             self.unregister_residency(buf);
         }
         self.flush_residency();
-        for (buf, _nbytes) in cold {
-            BufferPool::recycle(&mut self.pool_recovering(), buf);
+        // One item at a time, each leaving its queue only once the pool has
+        // finished with its ledger calls. A ledger that panics partway leaves
+        // the rest queued ([`Requeue`]) rather than dropped with their
+        // charges held; a retried item's residency removal is a no-op.
+        while let Some((after, (buffer, nbytes))) = cold.items.pop() {
+            let mut held = InFlightRecycle {
+                queue: &self.pending_cold_recycle,
+                after,
+                nbytes,
+                buffer: Some(buffer),
+            };
+            BufferPool::recycle(&mut self.pool_recovering(), &mut held.buffer);
         }
-        if !retired.is_empty() {
-            let mut pool = self.pool_recovering();
-            for buf in &retired {
-                pool.retire(buf.length());
-            }
+        while let Some((_, buf)) = retired.items.last() {
+            let key = buf.length();
+            self.pool_recovering().retire(key);
+            retired.items.pop();
         }
-        drop(retired);
         drop(other);
     }
 
@@ -1823,20 +1908,18 @@ impl GpuRuntime {
         if mutex_value_mut(&mut self.pool).ledger.is_none() {
             return;
         }
-        let waiting: Vec<usize> = mutex_value_mut(&mut self.pending_cold_recycle)
-            .drain(..)
-            .map(|(_, (buffer, _))| buffer.length())
-            .chain(
-                mutex_value_mut(&mut self.pending_retirement)
-                    .drain(..)
-                    .map(|(_, buffer)| buffer.length()),
-            )
-            .collect();
         let pool = mutex_value_mut(&mut self.pool);
-        for key in waiting {
-            pool.retire(key);
+        let cold = mutex_value_mut(&mut self.pending_cold_recycle);
+        while let Some((_, (buffer, _))) = cold.last() {
+            pool.retire(buffer.length());
+            cold.pop();
         }
-        pool.release_cached();
+        let retired = mutex_value_mut(&mut self.pending_retirement);
+        while let Some((_, buffer)) = retired.last() {
+            pool.retire(buffer.length());
+            retired.pop();
+        }
+        pool.trim_free_list();
     }
 
     /// Whether any deferred release is waiting on the GPU.

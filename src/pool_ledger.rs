@@ -96,6 +96,17 @@ impl LedgerRefused {
 /// `release` and the `from` side of `transfer` are always for bytes the pool
 /// charged earlier with the same class and length; an implementation may
 /// match them exactly.
+///
+/// Unwinding: the pool assumes a call that panics has changed nothing. A
+/// `release` either gives the charge back and returns, or unwinds with the
+/// charge still held; `try_charge` unwinds with nothing charged. The pool
+/// relies on this to retry: a buffer whose release unwound stays on the free
+/// list (or its queue) and is released again by the next trim, drain or Drop.
+/// A `release` that panics after it has already decremented its balance is
+/// outside this contract and would be released twice by that retry (a
+/// ledger that matches releases exactly counts it as unmatched). The pool
+/// makes a Live to Cached move as a `release` and a `try_charge`, never one
+/// `transfer`, so it always knows which half ran when one unwinds.
 pub trait PoolLedger: Send + Sync {
     /// Charge `bytes` to `class`, or refuse. Charges nothing on refusal.
     fn try_charge(&self, class: LedgerClass, bytes: u64) -> Result<(), LedgerRefused>;

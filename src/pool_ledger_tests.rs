@@ -648,6 +648,8 @@ struct Chaos {
     refuse_at: std::sync::atomic::AtomicI64,
     refuse_all: AtomicBool,
     charges: std::sync::atomic::AtomicI64,
+    /// The byte count of the call the last injected panic came from.
+    panicked_bytes: AtomicU64,
     on_release: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -662,6 +664,7 @@ impl Chaos {
             refuse_at: Default::default(),
             refuse_all: AtomicBool::new(false),
             charges: Default::default(),
+            panicked_bytes: AtomicU64::new(0),
             on_release: Mutex::new(None),
         })
     }
@@ -688,7 +691,7 @@ impl Chaos {
         self.reset();
         self.refuse_at.store(nth, Ordering::SeqCst);
     }
-    fn tick(&self, kind: Kind, class: LedgerClass) {
+    fn tick(&self, kind: Kind, class: LedgerClass, bytes: u64) {
         let hit = self
             .filter
             .lock()
@@ -700,6 +703,7 @@ impl Chaos {
         let n = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
         let (at, every) = (self.panic_at.load(Ordering::SeqCst), self.every.load(Ordering::SeqCst));
         if (at != 0 && n == at) || (every > 0 && n % every == 0) {
+            self.panicked_bytes.store(bytes, Ordering::SeqCst);
             panic!("chaos ledger: injected panic at call {n}");
         }
     }
@@ -707,7 +711,7 @@ impl Chaos {
 
 impl PoolLedger for Chaos {
     fn try_charge(&self, class: LedgerClass, bytes: u64) -> Result<(), LedgerRefused> {
-        self.tick(Kind::Charge, class);
+        self.tick(Kind::Charge, class, bytes);
         let n = self.charges.fetch_add(1, Ordering::SeqCst) + 1;
         if self.refuse_all.load(Ordering::SeqCst) || n == self.refuse_at.load(Ordering::SeqCst) {
             return Err(LedgerRefused {
@@ -722,36 +726,33 @@ impl PoolLedger for Chaos {
         if let Some(f) = &*self.on_release.lock().unwrap_or_else(PoisonError::into_inner) {
             f();
         }
-        self.tick(Kind::Release, class);
+        self.tick(Kind::Release, class, bytes);
         self.fake.release(class, bytes)
     }
 }
 
-/// Swallows the injected panics' messages and passes every other panic on.
-struct QuietHook(Arc<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>>);
+/// Marks that the injected panics' messages are swallowed. The hook is set
+/// once for the process and never restored: a guard that restored it on Drop
+/// would call `set_hook` from a panicking thread, which aborts.
+struct QuietHook;
 
 fn quiet_injected() -> QuietHook {
-    let prev = Arc::new(std::panic::take_hook());
-    let passed = prev.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        let msg = info
-            .payload()
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| info.payload().downcast_ref::<&str>().copied())
-            .unwrap_or("");
-        if !msg.contains("injected panic") {
-            passed(info);
-        }
-    }));
-    QuietHook(prev)
-}
-
-impl Drop for QuietHook {
-    fn drop(&mut self) {
-        let prev = self.0.clone();
-        std::panic::set_hook(Box::new(move |info| prev(info)));
-    }
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| info.payload().downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            if !msg.contains("injected panic") {
+                prev(info);
+            }
+        }));
+    });
+    QuietHook
 }
 
 fn buf_addr(b: &ProtocolObject<dyn MTLBuffer>) -> usize {
@@ -921,6 +922,7 @@ impl Rig {
     /// Disarm, let everything drain, and drop in one of two orders. Every
     /// charge must be back.
     fn finish(mut self, runtime_first: bool, ctx: &str) {
+        let every_call = self.chaos.every.load(Ordering::SeqCst) == 1;
         self.chaos.reset();
         self.apply(Op::Settle);
         self.apply(Op::Reclaim);
@@ -932,7 +934,30 @@ impl Rig {
         } else {
             drop(held);
             settle(&rt);
-            assert!(!rt.deferred_pending(), "{ctx}: the drain left items queued");
+            if every_call {
+                // A ledger that panics on every call never lets a release
+                // succeed, so queued items rightly keep their charges. The
+                // books must still agree: what is queued is what the ledger
+                // holds as Live, and nothing was released twice.
+                let queued: u64 = rt
+                    .pending_cold_recycle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .map(|(_, (b, _))| b.length() as u64)
+                    .chain(
+                        rt.pending_retirement
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .map(|(_, b)| b.length() as u64),
+                    )
+                    .sum();
+                assert_eq!(queued, fake.live(), "{ctx}: queued bytes vs ledger Live");
+                assert_eq!(fake.unmatched(), 0, "{ctx}: an unmatched release");
+            } else {
+                assert!(!rt.deferred_pending(), "{ctx}: the drain left items queued");
+            }
             drop(rt);
         }
         drop(chaos);
@@ -1175,7 +1200,6 @@ fn a_release_that_calls_trim_free_list_from_inside_the_pool_lock_does_not_deadlo
 /// retry removes it again. The residency set tolerates that, but its count
 /// must too: one add, one remove.
 #[test]
-#[ignore = "BREAK: a requeued drain item is unregistered twice, so residency_count drifts below the set's size"]
 fn a_requeued_drain_item_leaves_the_residency_count_where_it_started() {
     let _quiet = quiet_injected();
     let mut rig = Rig::new();
@@ -1201,10 +1225,10 @@ fn a_requeued_drain_item_leaves_the_residency_count_where_it_started() {
 /// drain or Drop" has no next Drop when the panic is in Drop itself: the
 /// remaining free list and queues are destroyed with their charges held.
 #[test]
-#[ignore = "BREAK: a ledger panic inside GpuRuntime::drop leaks every charge after it"]
 fn a_ledger_panic_inside_drop_still_returns_the_remaining_charges() {
     let _quiet = quiet_injected();
-    for n in 1..=8 {
+    // Drop makes six ledger calls: three cached buffers and three queued drops.
+    for n in 1..=6 {
         let mut rig = Rig::new();
         rig.seed();
         rig.apply(Op::DropAll);
@@ -1218,6 +1242,33 @@ fn a_ledger_panic_inside_drop_still_returns_the_remaining_charges() {
             (0, 0),
             "a panic at ledger call {n} inside Drop left charges on the ledger"
         );
+    }
+}
+
+/// A runtime dropped while the thread is already unwinding must not resume
+/// the ledger's panic (a second panic aborts the process). Every other charge
+/// still comes back; the one whose release panicked stays held.
+#[test]
+fn a_runtime_dropped_during_an_unwind_returns_every_other_charge_and_does_not_abort() {
+    let _quiet = quiet_injected();
+    for n in 1..=6 {
+        let mut rig = Rig::new();
+        rig.seed();
+        rig.apply(Op::DropAll);
+        let Rig { rt, fake, chaos, held } = rig;
+        drop(held);
+        chaos.panic_on_call(n);
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _runtime = rt;
+            panic!("injected panic: the outer unwind");
+        }));
+        assert!(outer.is_err());
+        assert_eq!(
+            fake.live() + fake.cached(),
+            chaos.panicked_bytes.load(Ordering::SeqCst),
+            "a panic at ledger call {n} inside a Drop during an unwind"
+        );
+        assert_eq!(fake.unmatched(), 0, "call {n}: a charge was released twice");
     }
 }
 

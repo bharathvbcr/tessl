@@ -539,11 +539,11 @@ fn flaky_run(nth: i64, only_release: bool, op: impl Fn(&GpuRuntime)) -> (u64, u6
 
 #[test]
 fn adversarial_panic_in_trim_never_double_releases() {
-    for nth in 1..=4 {
+    for nth in 1..=6 {
         let (live, cached, _) = flaky_run(nth, true, |rt| {
             rt.trim_free_list();
         });
-        eprintln!("trim nth={nth}: residual live={live} cached={cached}");
+        assert_eq!((live, cached), (0, 0), "trim nth={nth}: charges left on the ledger after Drop");
     }
 }
 
@@ -551,18 +551,18 @@ fn adversarial_panic_in_trim_never_double_releases() {
 fn adversarial_panic_in_cache_cap_trim_never_double_releases() {
     for nth in 1..=3 {
         let (live, cached, _) = flaky_run(nth, true, |rt| rt.set_pool_cache_cap_bytes(256));
-        eprintln!("cap nth={nth}: residual live={live} cached={cached}");
+        assert_eq!((live, cached), (0, 0), "cap nth={nth}: charges left on the ledger after Drop");
     }
 }
 
 #[test]
 fn adversarial_panic_in_drain_never_double_releases() {
-    for nth in 1..=8 {
+    for nth in 1..=12 {
         let (live, cached, _) = flaky_run(nth, false, |rt| {
             rt.set_pool_cache_cap_bytes(400_000);
             settle(rt);
         });
-        eprintln!("drain nth={nth}: residual live={live} cached={cached}");
+        assert_eq!((live, cached), (0, 0), "drain nth={nth}: charges left on the ledger after Drop");
     }
 }
 

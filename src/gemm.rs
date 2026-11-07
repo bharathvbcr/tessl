@@ -462,15 +462,17 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
 /// exact f32 (bf16, f16, relaxed f32) and the simdgroup backend take the
 /// route [`gemm`] gives them.
 ///
-/// `scratch` is where the K-partitions' slices go: `None` takes a pool
-/// allocation of `ceil(K / k_tile) * M * N` f32 per call (not recycled until
-/// the next commit, so a forward of many such GEMMs holds them all); `Some`
-/// is a caller's f32 tensor that is idle at this point, of which the lane
-/// overwrites the first `ceil(K / k_tile) * M * N` elements (nothing in it is
-/// read first) and which must not be bound by the dispatches around it as
-/// anything the lane would race with. A scratch too small for the shape's
-/// partitions takes the single dispatch instead; one of another dtype or
-/// runtime is an error.
+/// `scratch` is where the K-partitions' slices go. Each of the
+/// `P = ceil(K / k_tile)` slices starts on a multiple of 4 f32, so the lane
+/// needs `P * ceil(M * N / 4) * 4` f32 (the padded length, which exceeds
+/// `P * M * N` when M * N is not a multiple of 4). `None` takes a pool
+/// allocation of that length per call (not recycled until the next commit, so
+/// a forward of many such GEMMs holds them all); `Some` is a caller's f32
+/// tensor that is idle at this point, of which the lane overwrites the first
+/// padded-length elements (nothing in it is read first) and which must not be
+/// bound by the dispatches around it as anything the lane would race with. A
+/// scratch shorter than the padded length takes the single dispatch instead;
+/// one of another dtype or runtime is an error.
 pub fn gemm_small_m(
     a: &Tensor,
     b: &Tensor,
@@ -554,11 +556,17 @@ fn gemm_dispatch(
         }
         GemmBackend::TensorOps => match nn_f32_route(m, n, k, route) {
             NnF32Route::SequentialSplit(k_tile) => gemm_nn_splitk_f32(a, b, c, (m, n, k), k_tile)?,
-            // A caller's scratch too small for the partitions keeps the
-            // single dispatch (a dtype or runtime mismatch is the binder's
-            // error to report).
+            // A caller's f32 scratch shorter than `par_shape`'s padded length
+            // keeps the single dispatch; the binder refuses exactly that
+            // length, so the two cannot disagree. A dtype or runtime mismatch
+            // is the binder's error to report, and so is a `par_shape` error
+            // (unreachable here: the route is only chosen when it is Ok).
             NnF32Route::SmallPar(k_tile)
-                if scratch.is_none_or(|s| s.dtype != DType::F32 || s.numel() >= k.div_ceil(k_tile) * m * n) =>
+                if scratch.is_none_or(|s| {
+                    let too_short = par_shape("gemm", (m, n, k), k_tile, SplitKPar::NnF32.kernel().1)
+                        .is_ok_and(|p| s.numel() < p.scratch_len);
+                    s.dtype != DType::F32 || !too_short
+                }) =>
             {
                 splitk_par_in(a, b, c, (m, n, k), k_tile, SplitKPar::NnF32, false, "gemm", scratch)?
             }
@@ -2008,8 +2016,9 @@ fn splitk_par(
 }
 
 /// [`splitk_par`] with the scratch the caller's own: `Some(scratch)` is used
-/// in place of a pool allocation (f32, at least `ceil(K / k_tile) * M * N`
-/// elements, none of it read before it is written), so a caller that holds a
+/// in place of a pool allocation (f32, at least `par_shape`'s padded
+/// `scratch_len` elements, `ceil(K / k_tile) * ceil(M * N / 4) * 4`, none of
+/// it read before it is written), so a caller that holds a
 /// buffer idle at that point (the text encoder's `qkv | gate_up`) adds no
 /// device memory for the lane.
 #[allow(clippy::too_many_arguments)]

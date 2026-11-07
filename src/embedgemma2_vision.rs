@@ -473,6 +473,23 @@ pub fn pool_by_members(
 // Config
 // ---------------------------------------------------------------------------
 
+/// `pixel_values` must hold exactly `total` patches of `pd` values, and a
+/// non-zero patch count needs a non-empty buffer: a zero width must not let an
+/// empty buffer satisfy `len == total * pd`.
+fn check_pixel_len(what: &str, total: usize, pd: usize, len: usize) -> Result<(), String> {
+    if total > 0 && (pd == 0 || len == 0) {
+        return Err(format!(
+            "{what}: pixel_values has {len} values; need [{total}, {pd}] for {total} patches and a non-empty buffer"
+        ));
+    }
+    if total.checked_mul(pd) != Some(len) {
+        return Err(format!(
+            "{what}: pixel_values has {len} values; need [{total}, {pd}] for {total} patches"
+        ));
+    }
+    Ok(())
+}
+
 /// The vision tower's shapes, read from `config.json` (`vision_config`), and
 /// the width of the text encoder it feeds (`text_config.hidden_size`).
 #[derive(Clone, Debug, PartialEq)]
@@ -494,9 +511,31 @@ pub struct VisionConfig {
 }
 
 impl VisionConfig {
-    /// Columns of one patch: `3 * patch_size²`.
+    /// Columns of one patch: `3 * patch_size²`, as a checked `u32` product.
+    ///
+    /// Zero, or a product past `u32::MAX`, is an error that names the
+    /// overflow. This owns the width: `from_config_json` calls it, so a parsed
+    /// config always fits, and `load_with`, `prepare` and `forward_io` call it
+    /// again because the fields are `pub` and a config built or edited by hand
+    /// is not validated by parsing.
+    pub fn checked_patch_dim(&self) -> Result<u32, String> {
+        let side = self.patch_size;
+        let width = side.checked_mul(side).and_then(|area| area.checked_mul(3));
+        match width {
+            Some(w) if w > 0 => Ok(w),
+            Some(_) => Err("vision_config.patch_size is zero: the patch width 3 * patch_size^2 is 0".to_string()),
+            None => Err(format!(
+                "vision_config.patch_size {side}: the patch width 3 * patch_size^2 overflows u32"
+            )),
+        }
+    }
+
+    /// Columns of one patch: `3 * patch_size²`. Exact for any config that
+    /// [`Self::checked_patch_dim`] accepts, which includes every parsed one;
+    /// saturates at `u32::MAX` rather than wrapping or panicking for one that
+    /// does not (the loaders refuse such a config before using the width).
     pub fn patch_dim(&self) -> u32 {
-        3 * self.patch_size * self.patch_size
+        self.checked_patch_dim().unwrap_or(u32::MAX)
     }
 
     /// Parse the checkpoint's `config.json` (the multimodal root with a
@@ -618,7 +657,7 @@ impl VisionConfig {
         if !(theta > 0.0 && theta.is_finite()) {
             return Err("config.json: vision_config.rope_parameters.rope_theta must be positive".into());
         }
-        Ok(Self {
+        let cfg = Self {
             hidden,
             layers,
             heads,
@@ -630,7 +669,9 @@ impl VisionConfig {
             rms_norm_eps: eps as f32,
             rope_theta: theta as f32,
             text_hidden,
-        })
+        };
+        cfg.checked_patch_dim().map_err(|e| format!("config.json: {e}"))?;
+        Ok(cfg)
     }
 
     pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
@@ -1114,12 +1155,10 @@ impl EmbedGemma2VisionModel {
         };
         let tower = Loader::new(rt, st, "vision_tower.");
         let embed = Loader::new(rt, st, "embed_vision.");
-        let (h, inter, patch_dim, text_h) = (
-            cfg.hidden as usize,
-            cfg.intermediate as usize,
-            cfg.patch_dim() as usize,
-            cfg.text_hidden as usize,
-        );
+        let patch_dim = cfg
+            .checked_patch_dim()
+            .map_err(|e| format!("EmbedGemma2VisionModel::load_with: {e}"))? as usize;
+        let (h, inter, text_h) = (cfg.hidden as usize, cfg.intermediate as usize, cfg.text_hidden as usize);
         let qw = (cfg.heads * cfg.head_dim) as usize;
         let d = cfg.head_dim as usize;
 
@@ -1224,7 +1263,7 @@ impl EmbedGemma2VisionModel {
     fn prepare(&self, i: usize, img: &ImageInput<'_>) -> Result<Prepared, String> {
         let what = format!("EmbedGemma2VisionModel::encode_images: image {i}");
         let cfg = &self.cfg;
-        let pd = cfg.patch_dim() as usize;
+        let pd = cfg.checked_patch_dim().map_err(|e| format!("{what}: {e}"))? as usize;
         if !img.position_ids.len().is_multiple_of(2) || img.position_ids.is_empty() {
             return Err(format!(
                 "{what}: position_ids has {} values; need [P, 2] with P > 0",
@@ -1232,12 +1271,7 @@ impl EmbedGemma2VisionModel {
             ));
         }
         let total = img.position_ids.len() / 2;
-        if img.pixel_values.len() != total * pd {
-            return Err(format!(
-                "{what}: pixel_values has {} values; need [{total}, {pd}] for {total} patches",
-                img.pixel_values.len()
-            ));
-        }
+        check_pixel_len(&what, total, pd, img.pixel_values.len())?;
         // Padding is (-1, -1) in both coordinates, and a suffix.
         let pad = |t: usize| img.position_ids[2 * t] == -1 && img.position_ids[2 * t + 1] == -1;
         let valid = (0..total).position(pad).unwrap_or(total);
@@ -1442,7 +1476,7 @@ impl EmbedGemma2VisionModel {
     ) -> Result<ForwardIo, String> {
         const WHAT: &str = "EmbedGemma2VisionModel::forward";
         let rt = &self.rt;
-        let pd = self.cfg.patch_dim() as usize;
+        let pd = self.cfg.checked_patch_dim().map_err(|e| format!("{WHAT}: {e}"))? as usize;
         let rows = chunk.len() * seq;
         if seq == 0 || rows > MAX_BATCH_PATCHES.max(seq) {
             return Err(format!(
@@ -1729,7 +1763,7 @@ impl EmbedGemma2VisionModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_images, plan_pooling, MAX_BATCH_PATCHES, MAX_IMAGES};
+    use super::{check_pixel_len, pack_images, plan_pooling, VisionConfig, MAX_BATCH_PATCHES, MAX_IMAGES};
 
     /// A `w x h` grid of patches in raster order, then `pad` padding patches.
     fn grid(w: i32, h: i32, pad: usize) -> Vec<i32> {
@@ -1835,5 +1869,31 @@ mod tests {
     fn the_published_patch_size_still_yields_768() {
         let c = VisionConfig::from_config_json(&config_with_patch_size(16)).unwrap();
         assert_eq!(c.patch_dim(), 768);
+    }
+
+    #[test]
+    fn a_hand_built_config_cannot_smuggle_an_overflowing_width() {
+        let mut c = VisionConfig::from_config_json(&config_with_patch_size(16)).unwrap();
+        assert_eq!(c.checked_patch_dim(), Ok(768));
+        for ps in [65536u32, 37838, u32::MAX] {
+            c.patch_size = ps;
+            let err = c.checked_patch_dim().unwrap_err();
+            assert!(err.contains("overflow"), "{err}");
+            // Neither build profile panics or wraps on the infallible accessor.
+            assert_eq!(c.patch_dim(), u32::MAX);
+        }
+        c.patch_size = 0;
+        assert!(c.checked_patch_dim().unwrap_err().contains("zero"));
+    }
+
+    #[test]
+    fn prepare_rejects_an_empty_pixel_buffer_for_a_non_zero_patch_count() {
+        // `prepare` needs a loaded tower (a GPU runtime), so its check is the
+        // function it calls.
+        assert!(check_pixel_len("w", 4, 768, 0).is_err());
+        assert!(check_pixel_len("w", 4, 0, 0).is_err(), "a zero width must not match an empty buffer");
+        assert!(check_pixel_len("w", 4, 768, 4 * 768 - 1).is_err());
+        assert!(check_pixel_len("w", usize::MAX, 2, 0).is_err(), "no multiplication overflow panic");
+        assert!(check_pixel_len("w", 4, 768, 4 * 768).is_ok());
     }
 }

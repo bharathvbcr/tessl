@@ -33,11 +33,11 @@ fn order_sensitive(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
 fn integers(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     let mut a = vec![0.0f32; m * k];
     let mut b = vec![0.0f32; k * n];
-    for i in 0..m * k {
-        a[i] = ((i % 7) as f32) - 3.0;
+    for (i, x) in a.iter_mut().enumerate() {
+        *x = ((i % 7) as f32) - 3.0;
     }
-    for i in 0..k * n {
-        b[i] = ((i % 5) as f32) - 2.0;
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = ((i % 5) as f32) - 2.0;
     }
     (a, b)
 }

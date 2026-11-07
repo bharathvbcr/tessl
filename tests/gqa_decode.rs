@@ -13,6 +13,7 @@ fn wave(n: usize, seed: f32) -> Vec<f32> {
     (0..n).map(|i| ((i as f32) * 0.017 + seed).sin() * 0.05).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gqa_oracle(
     q: &[f32],
     k: &[f32],
@@ -32,14 +33,14 @@ fn gqa_oracle(
             let qs = (b * q_heads + h) * d;
             let mut dots = vec![0.0f32; kv_len];
             let mut m = f32::NEG_INFINITY;
-            for t in 0..kv_len {
+            for (t, slot) in dots.iter_mut().enumerate() {
                 let ks = ((b * kv_len + t) * kv_heads + kv_h) * d;
                 let mut dot = 0.0f32;
                 for i in 0..d {
                     dot += q[qs + i] * k[ks + i];
                 }
-                dots[t] = dot * scale;
-                m = m.max(dots[t]);
+                *slot = dot * scale;
+                m = m.max(*slot);
             }
             let mut se = 0.0f32;
             let mut w = vec![0.0f32; kv_len];
@@ -49,9 +50,9 @@ fn gqa_oracle(
             }
             for i in 0..d {
                 let mut acc = 0.0f32;
-                for t in 0..kv_len {
+                for (t, &wt) in w.iter().enumerate() {
                     let vs = ((b * kv_len + t) * kv_heads + kv_h) * d;
-                    acc += (w[t] / se) * v[vs + i];
+                    acc += (wt / se) * v[vs + i];
                 }
                 o[qs + i] = acc;
             }

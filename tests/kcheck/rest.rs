@@ -272,7 +272,7 @@ fn elementwise(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     let gate = wave(8, 0.8, 0.1);
     let up = wave(8, 0.5, 0.4);
     ledger.credit(rt, "mlp_silu", &["mlp_silu"], || {
-        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf(rt, &vec![0.0; 8]));
+        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf(rt, &[0.0; 8]));
         ok("mlp_silu", nn::mlp_silu(rt, &g, &u, &out, 8));
         let want: Vec<f64> = gate
             .iter()
@@ -282,7 +282,7 @@ fn elementwise(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         close_peak("mlp_silu", &out.read_f32(), &want, 1e-5);
     });
     ledger.credit(rt, "mlp_gelu_tanh", &["mlp_gelu_tanh"], || {
-        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf(rt, &vec![0.0; 8]));
+        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf(rt, &[0.0; 8]));
         ok("mlp_gelu_tanh", nn::mlp_gelu_tanh(rt, &g, &u, &out, 8));
         let want: Vec<f64> = gate
             .iter()
@@ -292,7 +292,7 @@ fn elementwise(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         close_peak("mlp_gelu_tanh", &out.read_f32(), &want, 1e-5);
     });
     ledger.credit(rt, "mlp_gelu_tanh_bf16", &["mlp_gelu_tanh_bf16"], || {
-        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf_bf16(rt, &vec![0.0; 8]));
+        let (g, u, out) = (buf(rt, &gate), buf(rt, &up), buf_bf16(rt, &[0.0; 8]));
         ok("mlp_gelu_tanh_bf16", nn::mlp_gelu_tanh_bf16(rt, &g, &u, &out, 8));
         let want: Vec<f64> = gate
             .iter()
@@ -472,7 +472,7 @@ fn bert(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     );
 
     ledger.credit(rt, "bert_layer_norm_f32", &["bert_layer_norm_f32"], || {
-        let (xb, w, b, out) = (buf(rt, &y), buf(rt, &ln_w), buf(rt, &ln_b), buf(rt, &vec![0.0; 8]));
+        let (xb, w, b, out) = (buf(rt, &y), buf(rt, &ln_w), buf(rt, &ln_b), buf(rt, &[0.0; 8]));
         ok("layer_norm", bert::layer_norm(rt, &xb, &w, &b, &out, rows, dim, eps));
         let want: Vec<f64> = f64s(&y)
             .chunks(4)
@@ -510,12 +510,12 @@ fn bert(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             let bias = [0.1f32, -0.2, 0.3, 0.0];
             let segs = bert::upload_segments(rt, &[(0, 2)], 2).expect("segments");
             // Seed below every log1p(relu(.)) this input produces, so a no-op fails.
-            let pooled = buf(rt, &vec![-1.0; 4]);
+            let pooled = buf(rt, &[-1.0; 4]);
             ok(
                 "sparse_max",
                 bert::segment_sparse_max(rt, &buf(rt, &logits), &buf(rt, &bias), &segs, &pooled, 1, 2, 4),
             );
-            let mut col_max = vec![f64::NEG_INFINITY; 4];
+            let mut col_max = [f64::NEG_INFINITY; 4];
             for row in 0..2 {
                 for v in 0..4 {
                     col_max[v] = col_max[v].max(f64::from(logits[row * 4 + v] + bias[v]));
@@ -527,6 +527,7 @@ fn bert(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv_ref(
     x: &[f32],
     wt: &[f32],
@@ -958,7 +959,7 @@ fn text_fuse(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     ledger.credit(rt, "segment_mean_rows_f32", &["segment_mean_rows_f32"], || {
         let x = wave(8, 0.5, 0.2);
         let segs = embedgemma2::upload_segments(rt, &[(0, 2)], 2).expect("segs");
-        let out = buf(rt, &vec![f32::NAN; 4]);
+        let out = buf(rt, &[f32::NAN; 4]);
         ok(
             "segment_mean",
             embedgemma2::segment_mean_rows(rt, &buf(rt, &x), &segs, &out, 1, 2, 4),
@@ -997,7 +998,7 @@ fn text_fuse(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             buf(rt, &w_post),
             buf(rt, &resid),
             buf(rt, &w_next),
-            buf(rt, &vec![0.0; 8]),
+            buf(rt, &[0.0; 8]),
         );
         ok(
             "resid_f32",
@@ -1013,7 +1014,7 @@ fn text_fuse(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             buf(rt, &w_post),
             buf(rt, &resid),
             buf(rt, &w_next),
-            buf_bf16(rt, &vec![0.0; 8]),
+            buf_bf16(rt, &[0.0; 8]),
         );
         ok(
             "resid_bf16",
@@ -1027,7 +1028,7 @@ fn text_fuse(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             buf(rt, &y),
             buf(rt, &w_post),
             buf(rt, &resid),
-            buf_bf16(rt, &vec![0.0; 8]),
+            buf_bf16(rt, &[0.0; 8]),
         );
         ok(
             "resid_copy",
@@ -1179,7 +1180,7 @@ fn audio(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     ledger.credit(rt, "eg2a_rms_norm", &["eg2a_rms_norm"], || {
         let x = wave(8, 0.4, 0.2);
         let w = wave(4, 0.1, 0.5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
-        let (xb, wb, out) = (buf(rt, &x), buf(rt, &w), buf(rt, &vec![0.0; 8]));
+        let (xb, wb, out) = (buf(rt, &x), buf(rt, &w), buf(rt, &[0.0; 8]));
         let spec = RmsNorm::new(eps, Some(&wb));
         ok("audio rms", embedgemma2_audio::rms_norm(rt, &xb, &out, 2, 4, &spec));
         let want: Vec<f64> = f64s(&x)
@@ -1191,7 +1192,7 @@ fn audio(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
 
     ledger.credit(rt, "eg2a_ew", &["eg2a_ew"], || {
         let x = wave(8, 0.6, 0.3);
-        let (xb, out) = (buf(rt, &x), buf(rt, &vec![0.0; 8]));
+        let (xb, out) = (buf(rt, &x), buf(rt, &[0.0; 8]));
         let spec = Ew {
             pre: Clamp::NONE,
             silu: true,
@@ -1382,9 +1383,9 @@ fn vision(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let pb = buf(rt, &proj);
         let (qb, kb) = (buf(rt, &qw), buf(rt, &kw));
         let pos = buf_u32(rt, &pos_bits);
-        let q_out = buf(rt, &vec![3.0; 8]);
-        let k_cache = buf(rt, &vec![3.0; 8]);
-        let v_cache = buf(rt, &vec![3.0; 8]);
+        let q_out = buf(rt, &[3.0; 8]);
+        let k_cache = buf(rt, &[3.0; 8]);
+        let v_cache = buf(rt, &[3.0; 8]);
         ok(
             "vision rope",
             embedgemma2_vision::axial_qkv_norm_rope(
@@ -1423,9 +1424,9 @@ fn vision(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let pb = buf(rt, &proj);
         let (qb, kb) = (buf(rt, &qw), buf(rt, &kw));
         let pos = buf_u32(rt, &pos_bits);
-        let q_out = buf_bf16(rt, &vec![3.0; 8]);
-        let k_cache = buf_bf16(rt, &vec![3.0; 8]);
-        let v_cache = buf_bf16(rt, &vec![3.0; 8]);
+        let q_out = buf_bf16(rt, &[3.0; 8]);
+        let k_cache = buf_bf16(rt, &[3.0; 8]);
+        let v_cache = buf_bf16(rt, &[3.0; 8]);
         ok(
             "vision rope bf16",
             embedgemma2_vision::axial_qkv_norm_rope_bf16(
@@ -1481,9 +1482,7 @@ fn vision(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         for d in 0..dim {
             want[d] += widened[x * dim + d] + widened[(table_len + y) * dim + d];
         }
-        for d in dim..2 * dim {
-            want[d] = 0.0;
-        }
+        want[dim..2 * dim].fill(0.0);
         // Exact bf16 values, so the real row is a dyadic sum and the pad row is +0.
         bits_eq("vision_pos_embed_add_f32", &hb.read_f32(), &want);
     });
@@ -1516,7 +1515,10 @@ fn vision(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     });
 }
 
-fn gdn_case(seed: u64) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+/// The host-side GDN inputs, in kernel order: q, k, v, g, beta, d_o.
+type GdnInputs = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn gdn_case(seed: u64) -> GdnInputs {
     let n = 64usize;
     let q = random_f32(n * 128, seed);
     let k = random_f32(n * 128, seed + 1);
@@ -1801,7 +1803,7 @@ fn rope(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     });
     ledger.credit(rt, "rms_qkv_rope_kv_store", &["rms_qkv_rope_kv_store"], || {
         let pb = buf_u32(rt, &[pos]);
-        let n = (t * hkv * d) as u32;
+        let n = t * hkv * d;
         let off = 4u32;
         let cap = off + n;
         let (dk, dv, ob) = (
@@ -1839,7 +1841,7 @@ fn close_f32(what: &str, got: &[f32], want: &[f32]) {
 fn kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     ledger.credit(rt, "kv_store_timestep", &["kv_store_timestep"], || {
         let src = [1.0f32, 2.0, 3.0, 4.0];
-        let (sb, db, ob) = (buf(rt, &src), buf(rt, &vec![-1.0; 8]), buf_u32(rt, &[2]));
+        let (sb, db, ob) = (buf(rt, &src), buf(rt, &[-1.0; 8]), buf_u32(rt, &[2]));
         ok("kv", nn::kv_store_timestep(rt, &sb, &db, &ob, 4, 8));
         let mut want = vec![-1.0; 8];
         want[2..6].copy_from_slice(&src);
@@ -1851,8 +1853,8 @@ fn kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let (kb, vb, dk, dv, ob) = (
             buf(rt, &k),
             buf(rt, &v),
-            buf(rt, &vec![-1.0; 8]),
-            buf(rt, &vec![-1.0; 8]),
+            buf(rt, &[-1.0; 8]),
+            buf(rt, &[-1.0; 8]),
             buf_u32(rt, &[2]),
         );
         ok("kv pair", nn::kv_store_timestep_pair(rt, &kb, &vb, &dk, &dv, &ob, 4, 8));
@@ -1867,7 +1869,7 @@ fn kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let src: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
         let (sb, db, filled, start) = (
             buf(rt, &src),
-            buf(rt, &vec![-1.0; 8]),
+            buf(rt, &[-1.0; 8]),
             buf_u32(rt, &[4]),
             buf_u32(rt, &[1]),
         );

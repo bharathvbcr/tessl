@@ -102,7 +102,7 @@ fn bits_u16(label: &str, got: &[u16], want: &[u16]) {
 }
 
 fn q8m_encode(x: f32, s: f32) -> u8 {
-    if !(s > 0.0) {
+    if s.is_nan() || s <= 0.0 {
         return 0;
     }
     let r = ((x.abs() / s).min(1.0).sqrt() * 127.0).round_ties_even();
@@ -111,7 +111,7 @@ fn q8m_encode(x: f32, s: f32) -> u8 {
 }
 
 fn q8v_encode(u: f32, s: f32) -> u8 {
-    if !(s > 0.0) {
+    if s.is_nan() || s <= 0.0 {
         return 0;
     }
     let mut r = ((u / s).min(1.0).sqrt() * 255.0).round_ties_even();
@@ -130,10 +130,12 @@ fn sr_bits(i: u32) -> u32 {
         x ^= x >> 16;
         x
     }
-    let mut h = mix(1 ^ mix(2));
-    h = mix(h ^ 1);
-    h = mix(h ^ 0);
-    h = mix(h ^ 7);
+    // The key words the slot carries (raw offsets 112..132 in `stored`).
+    let (seed_lo, seed_hi, step_lo, step_hi, salt) = (1u32, 2u32, 1u32, 0u32, 7u32);
+    let mut h = mix(seed_lo ^ mix(seed_hi));
+    h = mix(h ^ step_lo);
+    h = mix(h ^ step_hi);
+    h = mix(h ^ salt);
     mix(h ^ i)
 }
 
@@ -214,8 +216,9 @@ fn stored(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, spec: Store) {
     let mut want_v = Vec::with_capacity(N);
     let mut want_delta = Vec::with_capacity(N);
     for i in 0..N {
-        let x = if spec.rule == Rule::Master { w[i] } else { w[i] };
-        let (updated, delta, mi, vi) = f32_step(&a, x, grad_f[i], 0.0, 0.0);
+        // Master and the other rules start from the same value: the master copy
+        // `aux_f` is seeded with `w`, and every `w` word is bf16-exact.
+        let (updated, delta, mi, vi) = f32_step(&a, w[i], grad_f[i], 0.0, 0.0);
         want_p.push(updated);
         want_delta.push(delta);
         want_m.push(mi);

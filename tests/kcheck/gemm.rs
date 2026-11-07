@@ -375,7 +375,7 @@ fn epi_force(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dtype: DType, tile: EpiT
     let mut expect = case.expect;
     for (c, mag) in expect.c.iter_mut().zip(expect.mag.iter_mut()) {
         *c = (alpha * *c).max(0.0);
-        *mag = alpha.abs() * *mag;
+        *mag *= alpha.abs();
     }
     let kk = case.k;
     let epi = Epilogue {
@@ -392,6 +392,7 @@ fn epi_force(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dtype: DType, tile: EpiT
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn batched(
     rt: &Arc<GpuRuntime>,
     ledger: &mut Ledger,
@@ -424,7 +425,6 @@ fn batched(
             let h = cat_f32(&one.a, &two.a);
             tensor_f16(rt, &[batch * m, k], &h)
         }
-        _ => unreachable!(),
     };
     let b = match dtype {
         DType::F32 => {
@@ -434,7 +434,6 @@ fn batched(
         }
         DType::BF16 => tensor_bf16(rt, &[batch * k, n], &cat_f32(&one.b, &two.b)),
         DType::F16 => tensor_f16(rt, &[batch * k, n], &cat_f32(&one.b, &two.b)),
-        _ => unreachable!(),
     };
     let c = rt.alloc_tensor_f32(&[batch * m, n]).unwrap();
     let spec = BatchedGemm {
@@ -525,6 +524,7 @@ fn par_nn(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn side(
     rt: &Arc<GpuRuntime>,
     ledger: &mut Ledger,
@@ -546,6 +546,7 @@ fn side(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accum_side(
     rt: &Arc<GpuRuntime>,
     ledger: &mut Ledger,
@@ -951,9 +952,9 @@ pub fn run(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     let bias = tensor_f32(rt, &[n], &bias_h);
     let mut expect = case.expect;
     for i in 0..m {
-        for j in 0..n {
-            expect.c[i * n + j] += f64::from(bias_h[j]);
-            expect.mag[i * n + j] += f64::from(bias_h[j].abs());
+        for (j, &bias_j) in bias_h.iter().enumerate() {
+            expect.c[i * n + j] += f64::from(bias_j);
+            expect.mag[i * n + j] += f64::from(bias_j.abs());
         }
     }
     ledger.credit(

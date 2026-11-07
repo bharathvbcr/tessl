@@ -176,11 +176,11 @@ fn attn_o(s: &AttnShapeHost, q: &[f32], k: &[f32], v: &[f32]) -> (Vec<f64>, Vec<
                 let mut denom = 0.0f64;
                 let mut acc = vec![0.0f64; s.d];
                 if best.is_finite() {
-                    for j in 0..s.tkv {
-                        if !scores[j].is_finite() {
+                    for (j, &sc) in scores.iter().enumerate() {
+                        if !sc.is_finite() {
                             continue;
                         }
-                        let p = (scores[j] - best).exp();
+                        let p = (sc - best).exp();
                         denom += p;
                         let vs = ((b * s.tkv + j) * s.hkv + hk) * s.d;
                         for c in 0..s.d {
@@ -213,16 +213,16 @@ fn attn_bwd_f64(q: &[f64], k: &[f64], v: &[f64], d_o: &[f64], s: &AttnShapeHost)
                 let qs = ((bi * t + ti) * hq + h) * d;
                 let mut scores = vec![0.0f64; ti + 1];
                 let mut best = f64::NEG_INFINITY;
-                for j in 0..=ti {
+                for (j, score) in scores.iter_mut().enumerate() {
                     let ks = ((bi * t + j) * hkv + hk) * d;
                     let dot: f64 = (0..d).map(|c| q[qs + c] * k[ks + c]).sum();
-                    scores[j] = dot * scale;
-                    best = best.max(scores[j]);
+                    *score = dot * scale;
+                    best = best.max(*score);
                 }
                 let z: f64 = scores.iter().map(|x| (x - best).exp()).sum();
                 lse64[(bi * hq + h) * t + ti] = best + z.ln();
-                for j in 0..=ti {
-                    let p = (scores[j] - best).exp() / z;
+                for (j, &sc) in scores.iter().enumerate() {
+                    let p = (sc - best).exp() / z;
                     let vs = ((bi * t + j) * hkv + hk) * d;
                     for c in 0..d {
                         o[qs + c] += p * v[vs + c];
@@ -366,7 +366,7 @@ fn norm_rope_bwd(
 }
 
 fn q8m_encode(x: f32, s: f32) -> u8 {
-    if !(s > 0.0) {
+    if s.is_nan() || s <= 0.0 {
         return 0;
     }
     let r = ((x.abs() / s).min(1.0).sqrt() * 127.0).round_ties_even();

@@ -87,6 +87,7 @@ fn q8_vec(q: &[i8], scales: &[f32], zeros: &[f32], x: &[f32], rows: usize, cols:
     q4_rows(q, scales, zeros, x, rows, cols, group)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn q8_mat(
     q: &[i8],
     scales: &[f32],
@@ -143,7 +144,7 @@ fn q8(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
             _ => unreachable!(),
         };
         let q: Vec<i8> = (0..rows * cols)
-            .map(|i| ((i * 3 + group as usize) % 17) as i8 - 8)
+            .map(|i| ((i * 3 + group) % 17) as i8 - 8)
             .collect();
         let ng = rows * (cols / group);
         let scales: Vec<f32> = (0..ng).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
@@ -315,6 +316,7 @@ fn mlx_rows(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mlx_simd_one(
     rt: &Arc<GpuRuntime>,
     ledger: &mut Ledger,
@@ -356,6 +358,7 @@ fn mlx_simd_one(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mlx_gemm_one(
     rt: &Arc<GpuRuntime>,
     ledger: &mut Ledger,
@@ -787,7 +790,9 @@ fn seq_nib(n: usize, seed: i32) -> Vec<i8> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn i8_oracle(a: &[i8], b: &[i8], m: usize, n: usize, k: usize, nt: bool, group: usize, scales: &[f32]) -> Vec<f32> {
+    let ngroups = k.checked_div(group).unwrap_or(0);
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -800,7 +805,7 @@ fn i8_oracle(a: &[i8], b: &[i8], m: usize, n: usize, k: usize, nt: bool, group: 
                 s as f32
             } else {
                 let mut acc = 0.0f32;
-                for g in 0..(k / group) {
+                for g in 0..ngroups {
                     let mut s: i32 = 0;
                     for p in 0..group {
                         let kk = g * group + p;
@@ -846,7 +851,7 @@ fn i8_all(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let nt = layout == I8BLayout::TransposedNK;
         let a = seq_i8((m * k) as usize, 2);
         let b = seq_i8((n * k) as usize, 5);
-        let groups = if group == 0 { 0 } else { (k / group) as usize };
+        let groups = k.checked_div(group).unwrap_or(0) as usize;
         let scales: Vec<f32> = (0..groups * n as usize)
             .map(|i| if i % 2 == 0 { 1.0 } else { 0.5 })
             .collect();
@@ -955,6 +960,7 @@ fn w4_pack(logical: &[i8], n: usize, k: usize, zp8: bool) -> Vec<u8> {
 }
 
 fn w4_oracle(a: &[i8], b: &[i8], m: usize, n: usize, k: usize, group: usize, scales: &[f32]) -> Vec<f32> {
+    let ngroups = k.checked_div(group).unwrap_or(0);
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -966,7 +972,7 @@ fn w4_oracle(a: &[i8], b: &[i8], m: usize, n: usize, k: usize, group: usize, sca
                 s as f32
             } else {
                 let mut acc = 0.0f32;
-                for g in 0..(k / group) {
+                for g in 0..ngroups {
                     let mut s: i32 = 0;
                     for p in 0..group {
                         let kk = g * group + p;
@@ -1026,7 +1032,7 @@ fn w4(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
         let (m, n) = (32u32, 32u32);
         let a = seq_nib((m * k) as usize, 2);
         let b = seq_nib((n * k) as usize, 5);
-        let groups = if group == 0 { 0 } else { (k / group) as usize };
+        let groups = k.checked_div(group).unwrap_or(0) as usize;
         let scales: Vec<f32> = vec![1.0; groups * n as usize];
         let want = w4_oracle(&a, &b, m as usize, n as usize, k as usize, group as usize, &scales);
         let packed = w4_pack(&b, n as usize, k as usize, false);

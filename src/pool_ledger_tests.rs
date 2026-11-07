@@ -934,12 +934,11 @@ impl Rig {
         } else {
             drop(held);
             settle(&rt);
-            if every_call || rt.active_m4.is_poisoned() {
-                // Two states in which the drain cannot run, and queued items
-                // rightly keep their charges: a ledger that panics on every
-                // call never lets a release succeed, and a panic inside a
-                // non-waiting commit's drain poisons `active_m4`, which
-                // `recycle_if_idle` reads as "a command buffer may be open".
+            if every_call {
+                // The one state in which the drain cannot run, and queued
+                // items rightly keep their charges: a ledger that panics on
+                // every call never lets a release succeed. A panic that
+                // poisoned `active_m4` is not one: the recycle recovers it.
                 // The books must still agree: what is queued is what the
                 // ledger holds as Live, and nothing was released twice. The
                 // runtime's Drop then returns them (checked below).

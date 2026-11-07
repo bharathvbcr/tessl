@@ -396,7 +396,11 @@ fn a_scratch_under_the_padded_length_keeps_the_single_dispatch() {
             let default: Vec<u32> = plain_c.buffer.read_f32()[..m * n].iter().map(|x| x.to_bits()).collect();
             for len in [4usize, 15] {
                 let (bits, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(len)));
-                assert_eq!((par, plain), (0, 1), "{len} f32 is under the padded 16: the single dispatch");
+                assert_eq!(
+                    (par, plain),
+                    (0, 1),
+                    "{len} f32 is under the padded 16: the single dispatch"
+                );
                 assert_eq!(bits, default, "{len} f32: exactly what `gemm` computes");
             }
         });
@@ -407,18 +411,25 @@ fn a_scratch_under_the_padded_length_keeps_the_single_dispatch() {
 /// 512 padded floats, 2048, not 4 × 511 = 2044.
 #[test]
 fn the_padded_length_is_the_boundary_when_m_n_is_not_a_multiple_of_4() {
-    let _ = in_traced_child("the_padded_length_is_the_boundary_when_m_n_is_not_a_multiple_of_4", || {
-        with_gpu(|rt| {
-            let (m, n, k) = (1usize, 511usize, 512usize);
-            let (a, b, _, _) = operands(rt, m, n, k, 0x7a12);
-            let scratch = |len: usize| rt.alloc_tensor_f32(&[len]).unwrap();
-            let (pooled, par, _) = small_m_call(rt, (&a, &b), (m, n), None);
-            assert_eq!(par, 1, "no scratch runs the lane");
-            let (mine, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2048)));
-            assert_eq!((par, plain), (1, 0), "2048 f32 is the padded length: the lane runs");
-            assert_eq!(mine, pooled, "and gives the pool scratch's bits");
-            let (_, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2044)));
-            assert_eq!((par, plain), (0, 1), "2044 f32 is under the padded 2048: the single dispatch");
-        });
-    });
+    let _ = in_traced_child(
+        "the_padded_length_is_the_boundary_when_m_n_is_not_a_multiple_of_4",
+        || {
+            with_gpu(|rt| {
+                let (m, n, k) = (1usize, 511usize, 512usize);
+                let (a, b, _, _) = operands(rt, m, n, k, 0x7a12);
+                let scratch = |len: usize| rt.alloc_tensor_f32(&[len]).unwrap();
+                let (pooled, par, _) = small_m_call(rt, (&a, &b), (m, n), None);
+                assert_eq!(par, 1, "no scratch runs the lane");
+                let (mine, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2048)));
+                assert_eq!((par, plain), (1, 0), "2048 f32 is the padded length: the lane runs");
+                assert_eq!(mine, pooled, "and gives the pool scratch's bits");
+                let (_, par, plain) = small_m_call(rt, (&a, &b), (m, n), Some(&scratch(2044)));
+                assert_eq!(
+                    (par, plain),
+                    (0, 1),
+                    "2044 f32 is under the padded 2048: the single dispatch"
+                );
+            });
+        },
+    );
 }

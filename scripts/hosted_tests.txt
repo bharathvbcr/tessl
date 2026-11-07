@@ -60,7 +60,7 @@ bin relaxed_predicate 1
 bin results_report 13
 bin release_check 14
 bin safetensors 12
-bin shader_index_arithmetic 24
+bin shader_index_arithmetic 25
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
@@ -129,6 +129,7 @@ exact lib gdn_train::tests::the_chunked_workspace_bytes_follow_the_key_heads
 lib runtime::alloc_failure_tests:: 3
 lib runtime::drop_wait_tests:: 1
 lib runtime::timestamp_decode_tests:: 3
+lib conv::extent_tests:: 2
 lib shared::tests:: 4
 # Only this one of shared_buf::tests:: 14 is device-free; the rest open a device,
 # so this is named rather than taken as a module.

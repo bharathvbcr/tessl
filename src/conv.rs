@@ -76,7 +76,8 @@ fn scratch_shapes(n: usize, c_in: usize, c_out: usize, oh: usize, ow: usize) -> 
 /// on every side, or `None` when the padded image is smaller than the kernel or the sum overflows.
 fn output_extent(h: usize, wd: usize, pad: usize) -> Option<(usize, usize)> {
     let reach = CONV2D_TOPS_KERNEL - 1;
-    let (hp, wp) = (h + 2 * pad, wd + 2 * pad);
+    let padded = |d: usize| pad.checked_mul(2).and_then(|p| p.checked_add(d));
+    let (hp, wp) = (padded(h)?, padded(wd)?);
     (hp > reach && wp > reach).then(|| (hp - reach, wp - reach))
 }
 
@@ -98,7 +99,10 @@ fn int_scratch(
             .filter(|&e| e <= i32::MAX as usize)
     };
     scratch_shapes(n, c_in, c_out, oh, ow)
-        .filter(|(xp, _)| int(xp).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some())
+        .filter(|(xp, wh)| {
+            // `wh` is the weights kernel's `uint total = CO * CI * K * K` and the op's HWIO strides.
+            int(xp).is_some() && int(wh).is_some() && int(&[n, c_out, oh, ow]).is_some() && int(&[n, c_in, h, wd]).is_some()
+        })
 }
 
 /// Elements of [`conv2d_nchw`]'s scratch for this convolution, in the compute precision (so at most

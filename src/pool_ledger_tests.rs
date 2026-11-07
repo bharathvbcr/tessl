@@ -543,7 +543,11 @@ fn adversarial_panic_in_trim_never_double_releases() {
         let (live, cached, _) = flaky_run(nth, true, |rt| {
             rt.trim_free_list();
         });
-        assert_eq!((live, cached), (0, 0), "trim nth={nth}: charges left on the ledger after Drop");
+        assert_eq!(
+            (live, cached),
+            (0, 0),
+            "trim nth={nth}: charges left on the ledger after Drop"
+        );
     }
 }
 
@@ -551,7 +555,11 @@ fn adversarial_panic_in_trim_never_double_releases() {
 fn adversarial_panic_in_cache_cap_trim_never_double_releases() {
     for nth in 1..=3 {
         let (live, cached, _) = flaky_run(nth, true, |rt| rt.set_pool_cache_cap_bytes(256));
-        assert_eq!((live, cached), (0, 0), "cap nth={nth}: charges left on the ledger after Drop");
+        assert_eq!(
+            (live, cached),
+            (0, 0),
+            "cap nth={nth}: charges left on the ledger after Drop"
+        );
     }
 }
 
@@ -562,7 +570,27 @@ fn adversarial_panic_in_drain_never_double_releases() {
             rt.set_pool_cache_cap_bytes(400_000);
             settle(rt);
         });
-        assert_eq!((live, cached), (0, 0), "drain nth={nth}: charges left on the ledger after Drop");
+        assert_eq!(
+            (live, cached),
+            (0, 0),
+            "drain nth={nth}: charges left on the ledger after Drop"
+        );
+    }
+}
+
+/// A free-list hit moves a buffer's charge from Cached to Live. A panic in
+/// either ledger call must leave the books balanced once the runtime is gone.
+#[test]
+fn adversarial_panic_in_free_list_hit_never_double_releases() {
+    for nth in 1..=4 {
+        let (live, cached, _) = flaky_run(nth, false, |rt| {
+            let _hit = rt.alloc_buffer(300_000);
+        });
+        assert_eq!(
+            (live, cached),
+            (0, 0),
+            "hit nth={nth}: charges left on the ledger after Drop"
+        );
     }
 }
 

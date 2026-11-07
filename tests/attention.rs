@@ -950,10 +950,19 @@ fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
             source.contains("min(*Tkv_ptr, kv_capacity)"),
             "{name}: mutable Tkv is not clamped"
         );
-        assert!(
-            source.contains("* kv_capacity * kv_pos_stride"),
-            "{name}: batch stride must use fixed capacity, not live Tkv"
-        );
+        // The rows kernel takes separate K and V head dims (DK, DV), so it has a
+        // K and a V position stride; the tiled body keeps one shared stride.
+        let strides: &[&str] = if name == "rows" {
+            &["k_pos_stride", "v_pos_stride"]
+        } else {
+            &["kv_pos_stride"]
+        };
+        for stride in strides {
+            assert!(
+                source.contains(&format!("* kv_capacity * {stride}")),
+                "{name}: batch stride ({stride}) must use fixed capacity, not live Tkv"
+            );
+        }
     }
 
     assert!(
@@ -969,10 +978,12 @@ fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
         2,
         "both decode passes must independently clamp the live value"
     );
-    assert!(
-        decode.contains("* kv_capacity * kv_pos_stride"),
-        "decode K/V batch stride must be fixed across tokens"
-    );
+    for stride in ["k_pos_stride", "v_pos_stride"] {
+        assert!(
+            decode.contains(&format!("* kv_capacity * {stride}")),
+            "decode {stride} batch stride must be fixed across tokens"
+        );
+    }
     assert_eq!(
         host.matches("set_u32(bnd, kv_capacity, 13)").count(),
         3,

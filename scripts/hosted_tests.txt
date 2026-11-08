@@ -38,6 +38,7 @@ bin go_link_frameworks 2
 bin host_access_ban 6
 bin hosted_selection 10
 bin hosted_tests_script 9
+bin i8_tile_walk_pin 6
 bin kernel_fast_math 15
 bin media_decode 21
 bin media_jpeg 13
@@ -108,7 +109,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 235
+bins 240
 
 # Library tests.
 lib ab_flags::tests:: 15

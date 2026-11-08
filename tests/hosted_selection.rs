@@ -215,22 +215,30 @@ fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// The file a manifest target lives in: `tests/BIN.rs`, or for `lib` the
-/// source file of a `module::path::name`.
-fn source_of(root: &Path, target: &str, name: &str) -> PathBuf {
+/// The file a manifest target lives in: `tests/BIN.rs`, or for `lib` the file
+/// the library's module tree (`lib`, from `lib_tests_in`) declares the test in.
+///
+/// A `lib` name is resolved through the module walk the `lib` filters use, not
+/// spelled from its path: a `#[path = "…"] mod` puts a test in a file its module
+/// path does not name (`runtime::pool_ledger_tests` lives in
+/// `src/pool_ledger_tests.rs`, not `src/runtime.rs`).
+fn source_of(root: &Path, lib: &[LibTest], target: &str, name: &str) -> PathBuf {
     if target != "lib" {
         return root.join("tests").join(format!("{target}.rs"));
     }
-    let mut parts: Vec<&str> = name.split("::").collect();
-    parts.pop();
-    parts.retain(|p| !p.ends_with("tests") && *p != "tests");
-    let rel = parts.join("/");
-    let flat = root.join("src").join(format!("{rel}.rs"));
-    if flat.exists() {
-        flat
-    } else {
-        root.join("src").join(&rel).join("mod.rs")
-    }
+    lib_test_named(lib, name).file.clone()
+}
+
+/// The library `#[test]` whose libtest path is exactly `name`. A name the walk
+/// does not reach (misspelled, `#[ignore]`d, or behind a feature the hosted job
+/// does not build) is refused: the hosted job would run nothing for it.
+fn lib_test_named<'a>(lib: &'a [LibTest], name: &str) -> &'a LibTest {
+    lib.iter().find(|t| t.path == name).unwrap_or_else(|| {
+        panic!(
+            "lib {name}: no #[test] at that path in the library's module tree \
+             (misspelled, #[ignore]d, or behind a feature the hosted job does not build)"
+        )
+    })
 }
 
 // --------------------------------------------- resolving a `lib FILTER` entry
@@ -686,9 +694,10 @@ fn the_manifest_is_not_empty_and_has_no_duplicate_names() {
 
 #[test]
 fn every_listed_name_is_a_real_test_where_it_is_listed() {
+    let lib = lib_tests_in(root());
     for (target, name, ignored) in every_name() {
         let leaf = name.rsplit("::").next().unwrap();
-        let path = source_of(root(), &target, &name);
+        let path = source_of(root(), &lib, &target, &name);
         let src = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{target} {name}: cannot read {}: {e}", path.display()));
         assert!(
@@ -732,12 +741,22 @@ fn every_whole_binary_and_lib_filter_names_something() {
 /// proves `device_marker` works, but it calls it on literal strings, so it would
 /// stay green if this loop stopped feeding it — the very shape this change is
 /// about, one path over.
+///
+/// An `exact lib` name is scanned through `scan_resolved`, the same as a test a
+/// `lib` filter selects, so both reach its file through the module walk and both
+/// refuse a leaf name that file defines twice.
 fn check_exact_device_free(manifest: &str, root: &Path) {
+    let lib = lib_tests_in(root);
+    let mut cache = HashMap::new();
     for e in parse(manifest) {
         let Entry::Exact { target, names } = e else { continue };
         for name in names {
+            if target == "lib" {
+                scan_resolved(lib_test_named(&lib, &name), &mut cache, "an `exact lib` entry");
+                continue;
+            }
             let leaf = name.rsplit("::").next().unwrap();
-            let path = source_of(root, &target, &name);
+            let path = source_of(root, &lib, &target, &name);
             let src = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{target} {name}: cannot read {}: {e}", path.display()));
             match device_marker(&src, leaf) {
@@ -821,7 +840,22 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(
         dir.join("src/lib.rs"),
-        "pub mod planted;\npub mod clean;\npub mod exempt_edge;\n",
+        "pub mod planted;\npub mod clean;\npub mod exempt_edge;\npub mod host;\n",
+    )
+    .unwrap();
+    // A `#[path]` test module, the shape of `runtime::pool_ledger_tests`: its
+    // tests live in a file the module path `host::host_tests` does not spell.
+    fs::write(
+        dir.join("src/host.rs"),
+        "#[cfg(test)]\n#[path = \"host_tests.rs\"]\nmod host_tests;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/host_tests.rs"),
+        concat!(
+            "#[test]\nfn sums() {\n    assert_eq!(3 + 3, 6);\n}\n",
+            "#[test]\nfn reaches_the_device() {\n    with_gpu(|rt| drop(rt));\n}\n",
+        ),
     )
     .unwrap();
     fs::write(
@@ -872,6 +906,8 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
             "clean::tests::adds_up",
             "clean::tests::calls_the_exempt_pure_function",
             "exempt_edge::tests::a_longer_name_sharing_the_prefix_is_not_exempt",
+            "host::host_tests::reaches_the_device",
+            "host::host_tests::sums",
             "planted::tests::is_clean",
             "planted::tests::opens_a_device",
         ],
@@ -941,6 +977,22 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
         "an `exact` entry naming a device-opening test was reported clean"
     );
     check_exact_device_free("exact planted_bin is_clean\n", &dir);
+
+    // The `exact lib` arm, into a `#[path]` module. Resolving the file by
+    // spelling the module path (`src/host.rs`) finds no `fn sums(` there and
+    // refuses a clean test; it has to come from the module walk.
+    check_exact_device_free("exact lib host::host_tests::sums\n", &dir);
+    assert!(
+        refused(
+            "exact lib host::host_tests::reaches_the_device\n",
+            check_exact_device_free
+        ),
+        "an `exact lib` entry naming a device-opening test in a #[path] module was reported clean"
+    );
+    assert!(
+        refused("exact lib host::host_tests::not_a_test\n", check_exact_device_free),
+        "an `exact lib` entry naming no test was accepted"
+    );
 
     fs::remove_dir_all(&dir).unwrap();
 }

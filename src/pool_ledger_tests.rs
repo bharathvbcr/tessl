@@ -1683,3 +1683,34 @@ fn adv_the_refusing_paths_still_refuse_a_poisoned_batch_lock() {
         rig.finish(true, "refusing commit");
     }
 }
+
+/// `cb_open == false` must imply that `event_value` covers every command
+/// buffer this batch submitted: `recycle_if_idle` recovers a poisoned
+/// `active_m4`, reads the flag, and then releases everything deferred against
+/// the event value. Clearing the flag before the store leaves a window in
+/// which a panic poisons the lock with the command buffer submitted and the
+/// event value stale, and the recycle frees buffers the GPU is still reading.
+/// A source-order pin: no test can make the panic land in that window without
+/// a production knob.
+#[test]
+fn commit_m4_clears_cb_open_only_after_event_value_covers_the_submit() {
+    let src = include_str!("runtime.rs");
+    let start = src.find("fn commit_m4(").expect("commit_m4 not found");
+    let body = &src[start..];
+    let end = body[1..]
+        .find("\n    fn ")
+        .or_else(|| body[1..].find("\n    pub fn "))
+        .expect("end of commit_m4 not found");
+    let body = &body[..=end];
+    let store = body
+        .find("event_value.store(next")
+        .expect("commit_m4 no longer stores the event value");
+    let clears: Vec<usize> = body.match_indices("cb_open = false").map(|(i, _)| i).collect();
+    assert!(!clears.is_empty(), "commit_m4 no longer clears cb_open");
+    for at in clears {
+        assert!(
+            store < at,
+            "commit_m4 clears cb_open (byte {at}) before it stores event_value (byte {store})"
+        );
+    }
+}

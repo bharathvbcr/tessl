@@ -1452,8 +1452,10 @@ fn adv_quantize_cols_sweep_holds_the_stated_tolerance_and_never_emits_minus_128(
 fn adv_quantize_rows_below_the_normal_scale_range_contribute_exactly_zero() {
     with_gpu(|rt| {
         let cols = 300usize;
-        let sub = f32::from_bits(0x0000_1234); // subnormal
-                                               // absmax < 127 * f32::MIN_POSITIVE: the documented flush-to-zero range.
+        // A subnormal f32.
+        let sub = f32::from_bits(0x0000_1234);
+
+        // absmax < 127 * f32::MIN_POSITIVE: the documented flush-to-zero range.
         let below: Vec<(&str, Vec<f32>)> = vec![
             ("all subnormal", (0..cols).map(|c| sub * (1 + c % 7) as f32).collect()),
             (

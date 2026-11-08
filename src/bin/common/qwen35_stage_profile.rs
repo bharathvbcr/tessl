@@ -9,7 +9,12 @@
 //! async encode, as `time_parts` does, so the submit floor is not counted per
 //! stage. The replica is cross-checked against the real model: the same run
 //! times `Staged::encode_part` for the layers' parts (real checkpoint, real
-//! ids) and the stage sums must reproduce them, or the table is not trusted.
+//! ids) and the stage sums must reproduce them: each of the gdn, attn and mlp
+//! rows must agree within `REPLICA_REL_TOL` (5%, `|replica - real| <= tol *
+//! real`), or `run` returns an error from `check_replica_against_parts` after
+//! printing the human-readable table and cross-check lines and before the
+//! `STAGE_PROFILE_JSON` line, so a failed run keeps the human evidence and emits no machine-readable
+//! result. A non-finite or non-positive time is an error, never a pass.
 //! The whole forward is then split on the host timeline (begin, the encode
 //! return of the 24 layers, the wait in score_answers) to expose what is not
 //! GPU kernel time.
@@ -32,6 +37,41 @@ use super::{bounded, buf, common, finite_nonzero, time_parts, weight, weight_bit
 
 /// Commands per command buffer for a stage: the same `REPS` as `time_parts`.
 const STAGE_REPS: usize = 8;
+
+/// Largest relative gap `|replica - real| / real` a cross-check row may have.
+const REPLICA_REL_TOL: f64 = 0.05;
+
+/// Fail unless every `(name, real, replica)` row agrees within `rel_tol`.
+/// Every failing row is named with its real, replica and relative gap. A row
+/// that cannot be compared (non-finite, or `real <= 0`) fails, and so does an
+/// empty table.
+fn check_replica_against_parts(rows: &[(&str, f64, f64)], rel_tol: f64) -> Res<()> {
+    if rows.is_empty() {
+        return Err("replica cross-check: no rows to compare".to_string());
+    }
+    let mut failures = Vec::new();
+    for &(name, real, replica) in rows {
+        if !real.is_finite() || !replica.is_finite() || real <= 0.0 {
+            failures.push(format!(
+                "{name}: real {real} ms vs replica {replica} ms is not comparable (need finite times and real > 0)"
+            ));
+        } else if (replica - real).abs() > rel_tol * real {
+            failures.push(format!(
+                "{name}: real {real} ms vs replica {replica} ms, gap {:.2}% > {:.2}%",
+                (replica - real).abs() / real * 100.0,
+                rel_tol * 100.0
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "replica stages do not reproduce the real model's parts, so the stage table is not trusted: {}",
+            failures.join("; ")
+        ))
+    }
+}
 
 /// One timed stage of the replica.
 struct Stage {
@@ -667,6 +707,14 @@ pub fn run(
             parts_total,
             best.total - parts_total
         );
+        check_replica_against_parts(
+            &[
+                ("gdn layer", parts.gdn_layer, gdn_stage),
+                ("attn layer", parts.attn_layer, attn_stage),
+                ("mlp", parts.mlp, mlp_stage),
+            ],
+            REPLICA_REL_TOL,
+        )?;
         let rows: Vec<String> = stages
             .iter()
             .map(|s| {
@@ -698,4 +746,78 @@ pub fn run(
     }
     rt.set_async_encode(false)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_within_tolerance_pass() {
+        // The committed 1k evidence: GDN is 3.19% off, the worst row.
+        let rows = [
+            ("gdn", 2.9409, 3.0348),
+            ("attn", 2.0793, 2.104),
+            ("mlp", 2.9416, 2.9735),
+        ];
+        assert!(check_replica_against_parts(&rows, REPLICA_REL_TOL).is_ok());
+    }
+
+    #[test]
+    fn the_tolerance_is_five_percent() {
+        assert_eq!(REPLICA_REL_TOL, 0.05);
+    }
+
+    #[test]
+    fn a_row_just_over_tolerance_fails_and_is_named() {
+        let rows = [("gdn", 100.0, 105.1), ("attn", 100.0, 100.0), ("mlp", 100.0, 100.0)];
+        let err = check_replica_against_parts(&rows, REPLICA_REL_TOL).unwrap_err();
+        assert!(err.contains("gdn"), "{err}");
+        assert!(!err.contains("attn") && !err.contains("mlp"), "{err}");
+        assert!(err.contains("100") && err.contains("105.1"), "{err}");
+    }
+
+    #[test]
+    fn exactly_at_the_boundary_passes_in_both_directions() {
+        let rows = [("hi", 100.0, 105.0), ("lo", 100.0, 95.0)];
+        assert!(check_replica_against_parts(&rows, REPLICA_REL_TOL).is_ok());
+    }
+
+    #[test]
+    fn a_replica_that_is_too_fast_fails_too() {
+        let rows = [("mlp", 100.0, 94.0)];
+        assert!(check_replica_against_parts(&rows, REPLICA_REL_TOL).is_err());
+    }
+
+    #[test]
+    fn uncomparable_rows_fail_closed() {
+        for (real, replica) in [
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+            (f64::INFINITY, 1.0),
+            (1.0, f64::INFINITY),
+            (f64::NEG_INFINITY, 1.0),
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (-1.0, -1.0),
+            (-2.0, 2.0),
+        ] {
+            let err = check_replica_against_parts(&[("row", real, replica)], REPLICA_REL_TOL)
+                .expect_err(&format!("real {real} replica {replica} must not pass"));
+            assert!(err.contains("row"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_empty_table_is_not_a_pass() {
+        assert!(check_replica_against_parts(&[], REPLICA_REL_TOL).is_err());
+    }
+
+    #[test]
+    fn every_failing_row_is_named() {
+        let rows = [("gdn", 10.0, 12.0), ("attn", 10.0, 10.1), ("mlp", 10.0, f64::NAN)];
+        let err = check_replica_against_parts(&rows, REPLICA_REL_TOL).unwrap_err();
+        assert!(err.contains("gdn") && err.contains("mlp"), "{err}");
+        assert!(!err.contains("attn"), "{err}");
+    }
 }

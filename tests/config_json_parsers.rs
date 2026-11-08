@@ -2,10 +2,10 @@
 //! `Qwen35Config`: the shared shape (non-object root, missing keys, wrong
 //! types, out-of-range u32, unknown keys) must read the same in both.
 
-use tessl::bert::BertConfig;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
+use tessl::bert::BertConfig;
 
 use tessl::embedgemma2::EmbedGemma2Config;
 use tessl::embedgemma2_audio::AudioConfig;
@@ -244,7 +244,11 @@ fn every_file_reader_refuses_a_config_past_the_cap_by_its_length() {
     for (name, read) in READERS {
         let e = read(&f).unwrap_err();
         assert!(
-            e.contains(&format!("{}: {} bytes, above the {CAP}-byte config cap", f.display(), CAP + 1)),
+            e.contains(&format!(
+                "{}: {} bytes, above the {CAP}-byte config cap",
+                f.display(),
+                CAP + 1
+            )),
             "{name}: {e}"
         );
     }
@@ -267,7 +271,7 @@ fn every_file_reader_refuses_invalid_utf8() {
     for (name, read) in READERS {
         let e = read(&f).unwrap_err();
         assert!(e.starts_with(&format!("{}: ", f.display())), "{name}: {e}");
-        assert!(!e.contains("config.json:"), "{name} reached the parser: {e}");
+        assert!(e.ends_with("stream did not contain valid UTF-8"), "{name}: {e}");
     }
 }
 

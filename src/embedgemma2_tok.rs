@@ -1335,16 +1335,25 @@ mod tests {
     fn read_bounded_refuses_a_file_past_the_cap_and_reads_one_at_it() {
         let dir = scratch("cap");
         let f = dir.join("tokenizer_config.json");
-        std::fs::File::create(&f).unwrap().set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        std::fs::File::create(&f)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
         let e = read_bounded(&f, MAX_CONFIG_BYTES).unwrap_err();
         assert!(
-            e.contains(&format!("{}: {} bytes, above the {MAX_CONFIG_BYTES}-byte cap", f.display(), MAX_CONFIG_BYTES + 1)),
+            e.contains(&format!(
+                "{}: {} bytes, above the {MAX_CONFIG_BYTES}-byte cap",
+                f.display(),
+                MAX_CONFIG_BYTES + 1
+            )),
             "{e}"
         );
         std::fs::write(&f, "x".repeat(64)).unwrap();
         assert_eq!(read_bounded(&f, 64).unwrap().len(), 64);
         std::fs::write(&f, "x".repeat(65)).unwrap();
-        assert!(read_bounded(&f, 64).unwrap_err().contains("65 bytes, above the 64-byte cap"));
+        assert!(read_bounded(&f, 64)
+            .unwrap_err()
+            .contains("65 bytes, above the 64-byte cap"));
         std::fs::write(&f, [0xffu8]).unwrap();
         assert!(read_bounded(&f, 64).is_err());
         assert!(read_bounded(&dir, 64).unwrap_err().contains("not a regular file"));

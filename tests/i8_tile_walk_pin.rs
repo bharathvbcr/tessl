@@ -587,3 +587,74 @@ fn equivalent_rewrites_are_refused_conservatively() {
     let pragma = mutate(I8_TILE_WALK_H, "#pragma unroll", "#pragma clang loop unroll(full)");
     assert!(walks_match(GEMM_COOP_H, &pragma).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Second adversarial pass (card ft-c68232d9), written against the pin before
+// e056730 and re-run after it. A `false_accept` test names an edit that changes
+// what the int8 kernel computes while `walks_match` returns Ok; a
+// `false_reject` test names an edit that computes the same thing and is refused.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn adv_false_accept_define_outside_the_items_redefines_min() {
+    // `i8_min` is stripped to `min` and matches; the macro makes it `max`.
+    let edited = mutate(I8_TILE_WALK_H, "uint local_h = min(ph,", "uint local_h = i8_min(ph,");
+    let edited = mutate(&edited, "using namespace metal;", "using namespace metal;\n#define i8_min max");
+    assert!(
+        walks_match(GEMM_COOP_H, &edited).is_err(),
+        "walks_match accepted a header whose panel height is max(ph, ..) instead of min(ph, ..)"
+    );
+}
+
+#[test]
+fn adv_false_accept_define_outside_the_items_retypes_a_parameter() {
+    // `i8_uint` strips to `uint`; the macro makes it `ushort`, which wraps `linear` at 65536.
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "static inline uint2 i8_tile_from_linear(uint linear,",
+        "static inline uint2 i8_tile_from_linear(i8_uint linear,",
+    );
+    let edited = mutate(&edited, "using namespace metal;", "using namespace metal;\n#define i8_uint ushort");
+    assert!(
+        walks_match(GEMM_COOP_H, &edited).is_err(),
+        "walks_match accepted a header whose `linear` is a ushort"
+    );
+}
+
+#[test]
+fn adv_false_accept_backslash_continued_comment_hides_the_morton_branch() {
+    // `clang -E` on this text drops the `return i8_morton_decode_2d(linear);`
+    // line (checked), so a Morton grid takes the row-major path. strip_comments
+    // ends a `//` comment at the first newline and keeps the line as code.
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "if (i8_tile_grid_is_morton(tiles_n, tiles_m)) {\n        return i8_morton_decode_2d(linear);",
+        "if (i8_tile_grid_is_morton(tiles_n, tiles_m)) { // hidden \\\n        return i8_morton_decode_2d(linear);",
+    );
+    assert!(
+        walks_match(GEMM_COOP_H, &edited).is_err(),
+        "walks_match accepted a header whose Morton return is inside a comment"
+    );
+}
+
+#[test]
+fn adv_false_reject_renaming_a_parameter_consistently() {
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "static inline uint2 i8_tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {\n    if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);\n    uint band = linear / (ph * tiles_n);\n    uint rem = linear - band * ph * tiles_n;",
+        "static inline uint2 i8_tile_from_linear_panel(uint lin, uint tiles_n, uint tiles_m, uint ph) {\n    if (lin >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);\n    uint band = lin / (ph * tiles_n);\n    uint rem = lin - band * ph * tiles_n;",
+    );
+    walks_match(GEMM_COOP_H, &edited).unwrap_or_else(|e| panic!("harmless rename refused: {e}"));
+}
+
+#[test]
+fn adv_false_reject_parenthesised_constant() {
+    let edited = mutate(I8_TILE_WALK_H, "= 1ul << 23;", "= (1ul << 23);");
+    walks_match(GEMM_COOP_H, &edited).unwrap_or_else(|e| panic!("harmless parentheses refused: {e}"));
+}
+
+#[test]
+fn adv_false_reject_equivalent_unroll_pragma() {
+    let edited = mutate(I8_TILE_WALK_H, "#pragma unroll", "#pragma clang loop unroll(full)");
+    walks_match(GEMM_COOP_H, &edited).unwrap_or_else(|e| panic!("equivalent pragma refused: {e}"));
+}

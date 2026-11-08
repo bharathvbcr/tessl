@@ -1369,3 +1369,282 @@ fn quantize_rows_under_many_threadgroups_repeats_clean() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial review (card ft-70f2141f): quantize edges, non-finite rows, a
+// race hunt, and the f16 rounding boundary.
+// ---------------------------------------------------------------------------
+
+/// Quantize `flat` (`rows x cols`) with `q` pre-filled 0x55 and `scales`
+/// pre-filled NaN, so an unwritten element is recognisable.
+fn quantize_poisoned(
+    rt: &Arc<GpuRuntime>,
+    flat: &[f32],
+    rows: usize,
+    cols: usize,
+) -> (Result<(), String>, Vec<u8>, Vec<f32>) {
+    let x = f32_buf(rt, flat);
+    let q = rt.alloc_buffer(flat.len()).unwrap();
+    q.write_bytes(&vec![0x55u8; flat.len()]);
+    let scales = f32_buf(rt, &vec![f32::NAN; rows]);
+    let res = nn::quantize_i8_rows(rt, &x, &q, &scales, rows as u32, cols as u32);
+    let got_q = q.contents_u8()[..flat.len()].to_vec();
+    (res, got_q, scales.read_f32())
+}
+
+/// Rows built to hit the quantize corner cases at width `cols`.
+fn edge_rows(cols: usize) -> Vec<(&'static str, Vec<f32>)> {
+    let mut rows: Vec<(&'static str, Vec<f32>)> = Vec::new();
+    rows.push(("zeros", vec![0.0; cols]));
+    rows.push(("negative zeros", vec![-0.0; cols]));
+    let mut huge_tiny = vec![1e-30f32; cols];
+    huge_tiny[cols / 2] = 1e30;
+    rows.push(("one huge, rest tiny", huge_tiny));
+    let mut single = vec![0.0f32; cols];
+    single[cols - 1] = -3.25;
+    rows.push(("single nonzero in the last column", single));
+    let ties = [127.0f32, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, -126.5, 63.5, -64.5];
+    rows.push(("half-way values at scale 1", (0..cols).map(|c| ties[c % ties.len()]).collect()));
+    rows.push((
+        "alternating +-max",
+        (0..cols).map(|c| if c % 2 == 0 { 1000.0 } else { -1000.0 }).collect(),
+    ));
+    rows.push(("ramp", (0..cols).map(|c| c as f32 - cols as f32 / 2.0).collect()));
+    rows
+}
+
+#[test]
+fn adv_quantize_cols_sweep_holds_the_stated_tolerance_and_never_emits_minus_128() {
+    with_gpu(|rt| {
+        for cols in [1usize, 2, 3, 17, 255, 256, 257, 300, 511, 512, 513, 1000, 4097] {
+            let rows = edge_rows(cols);
+            let flat: Vec<f32> = rows.iter().flat_map(|(_, r)| r.iter().copied()).collect();
+            let (res, got_q, got_s) = quantize_poisoned(rt, &flat, rows.len(), cols);
+            res.unwrap_or_else(|e| panic!("cols {cols}: {e}"));
+            for (i, (name, row)) in rows.iter().enumerate() {
+                let qrow = &got_q[i * cols..(i + 1) * cols];
+                println!(
+                    "cols {cols} row `{name}`: scale {:#010x} ({}), q[0..4] {:?}",
+                    got_s[i].to_bits(),
+                    got_s[i],
+                    &qrow[..qrow.len().min(4)]
+                );
+                assert!(qrow.iter().all(|&v| v != 0x80), "cols {cols} `{name}`: q holds -128");
+                check_quant_row(row, qrow, got_s[i], &format!("cols {cols} `{name}`"));
+            }
+        }
+    });
+}
+
+#[test]
+fn adv_quantize_subnormal_rows_match_the_host_reference() {
+    with_gpu(|rt| {
+        let cols = 300usize;
+        let sub = f32::from_bits(0x0000_1234); // subnormal
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("all subnormal", (0..cols).map(|c| sub * (1 + c % 7) as f32).collect()),
+            (
+                "subnormal with one normal 1e-3",
+                (0..cols).map(|c| if c == 5 { 1e-3 } else { sub }).collect(),
+            ),
+            ("absmax is f32::MIN_POSITIVE", (0..cols).map(|c| f32::MIN_POSITIVE * (1 + c % 3) as f32 / 3.0).collect()),
+            ("absmax 1e-37 (scale is subnormal)", (0..cols).map(|c| 1e-37 * ((c % 9) as f32 - 4.0)).collect()),
+            ("absmax 1e-36 (scale is normal)", (0..cols).map(|c| 1e-36 * ((c % 9) as f32 - 4.0)).collect()),
+        ];
+        let mut failures = Vec::new();
+        for (name, row) in &cases {
+            let (res, got_q, got_s) = quantize_poisoned(rt, row, 1, cols);
+            res.unwrap_or_else(|e| panic!("`{name}`: {e}"));
+            let (host_q, host_s) = quant_row(row).unwrap();
+            println!(
+                "`{name}`: kernel scale {:#010x} host scale {:#010x}; kernel q[0..6] {:?} host q[0..6] {:?}",
+                got_s[0].to_bits(),
+                host_s.to_bits(),
+                &got_q[..6].iter().map(|v| *v as i8).collect::<Vec<_>>(),
+                &host_q[..6]
+            );
+            let outcome = std::panic::catch_unwind(|| check_quant_row(row, &got_q, got_s[0], name));
+            if outcome.is_err() {
+                failures.push(*name);
+            }
+        }
+        assert!(failures.is_empty(), "subnormal cases outside the stated tolerance: {failures:?}");
+    });
+}
+
+#[test]
+fn adv_quantize_absmax_at_f32_max_is_finite_and_in_range() {
+    with_gpu(|rt| {
+        let cols = 260usize;
+        let row: Vec<f32> = (0..cols)
+            .map(|c| match c % 4 {
+                0 => f32::MAX,
+                1 => -f32::MAX,
+                2 => f32::MAX / 2.0,
+                _ => 1.0,
+            })
+            .collect();
+        let (res, got_q, got_s) = quantize_poisoned(rt, &row, 1, cols);
+        res.expect("finite row");
+        println!("f32::MAX row: scale {:#010x} q[0..4] {:?}", got_s[0].to_bits(), &got_q[..4]);
+        assert!(got_s[0].is_finite() && got_s[0] > 0.0, "scale {}", got_s[0]);
+        assert!(got_q.iter().all(|&v| v != 0x80));
+        check_quant_row(&row, &got_q, got_s[0], "f32::MAX row");
+    });
+}
+
+/// One non-finite element at the first, last or middle column, in a row of a
+/// later threadgroup, at several widths. The error is returned; every clean
+/// row is fully written and correct; a refused row's `q` is untouched; its
+/// scale is the one of its finite elements (written, not poison).
+#[test]
+fn adv_quantize_single_non_finite_element_is_refused_and_isolated() {
+    with_gpu(|rt| {
+        for cols in [1usize, 2, 255, 256, 257, 777] {
+            let rows = 3001usize;
+            let clean = random_rows(rows, cols, 0xbad + cols as u64);
+            let mut dirty = clean.clone();
+            let mut bad: Vec<usize> = Vec::new();
+            for (r, c, v) in [
+                (0usize, 0usize, f32::NAN),
+                (1, cols - 1, f32::INFINITY),
+                (2, cols / 2, f32::NEG_INFINITY),
+                (1500, cols - 1, f32::NAN),
+                (2999, 0, f32::NEG_INFINITY),
+                (3000, cols / 2, f32::INFINITY),
+            ]
+            .into_iter()
+            {
+                dirty[r * cols + c] = v;
+                bad.push(r);
+            }
+            let (res, got_q, got_s) = quantize_poisoned(rt, &dirty, rows, cols);
+            let err = res.expect_err("non-finite input must return an error");
+            assert!(err.contains("non-finite"), "{err}");
+            for r in 0..rows {
+                let qrow = &got_q[r * cols..(r + 1) * cols];
+                let row = &dirty[r * cols..(r + 1) * cols];
+                if bad.contains(&r) {
+                    assert!(qrow.iter().all(|&v| v == 0x55), "cols {cols} row {r}: a refused row was written");
+                    let finite: Vec<f32> = row.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
+                    let (_, want) = quant_row(&finite).unwrap();
+                    let ulps = (got_s[r].to_bits() as i64 - want.to_bits() as i64).abs();
+                    assert!(
+                        ulps <= 1,
+                        "cols {cols} row {r}: refused row's scale {} vs finite-elements scale {want}",
+                        got_s[r]
+                    );
+                } else {
+                    check_quant_row(row, qrow, got_s[r], &format!("cols {cols} row {r}"));
+                }
+            }
+        }
+    });
+}
+
+/// A row of only non-finite values: refused, not written, scale 1 (no finite
+/// element, so absmax stays 0).
+#[test]
+fn adv_quantize_row_of_only_non_finite_values_is_refused_with_scale_one() {
+    with_gpu(|rt| {
+        let cols = 300usize;
+        let flat: Vec<f32> = (0..cols)
+            .map(|c| [f32::NAN, f32::INFINITY, f32::NEG_INFINITY][c % 3])
+            .collect();
+        let (res, got_q, got_s) = quantize_poisoned(rt, &flat, 1, cols);
+        assert!(res.expect_err("refused").contains("non-finite"));
+        assert!(got_q.iter().all(|&v| v == 0x55));
+        assert_eq!(got_s[0], 1.0);
+    });
+}
+
+/// Race hunt. 8192 rows (one threadgroup each), cols just over one 256-wide
+/// stride, many iterations, outputs poisoned each time, clean and dirty
+/// matrices alternating. Run against the pre-fix kernel (d8174da reverted)
+/// and the current one; the result of the pre-fix run is in the review report.
+#[test]
+fn adv_quantize_race_hunt_many_rows_cols_just_over_one_stride() {
+    with_gpu(|rt| {
+        for cols in [257usize, 513, 300] {
+            let rows = 8192usize;
+            let clean = random_rows(rows, cols, 0x5eed ^ cols as u64);
+            let mut dirty = clean.clone();
+            let bad_rows: Vec<usize> = (0..rows).filter(|r| r % 13 == 4).collect();
+            for &r in &bad_rows {
+                dirty[r * cols + (r * 7) % cols] = if r % 2 == 0 { f32::NAN } else { f32::NEG_INFINITY };
+            }
+            let is_bad: Vec<bool> = (0..rows).map(|r| r % 13 == 4).collect();
+            for iter in 0..24 {
+                let with_bad = iter % 2 == 1;
+                let data = if with_bad { &dirty } else { &clean };
+                let (res, got_q, got_s) = quantize_poisoned(rt, data, rows, cols);
+                assert_eq!(res.is_err(), with_bad, "cols {cols} iter {iter}");
+                for r in 0..rows {
+                    let qrow = &got_q[r * cols..(r + 1) * cols];
+                    if with_bad && is_bad[r] {
+                        assert!(
+                            qrow.iter().all(|&v| v == 0x55),
+                            "cols {cols} iter {iter} row {r}: a refused row was written"
+                        );
+                    } else {
+                        check_quant_row(
+                            &data[r * cols..(r + 1) * cols],
+                            qrow,
+                            got_s[r],
+                            &format!("cols {cols} iter {iter} row {r}"),
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// f16 rounding at the top of the range, through the real kernels: 65504 is
+/// the largest finite half, 65519 (and the f32 just below 65520) rounds to
+/// 65504, 65520 is the tie that rounds to even = infinity.
+#[test]
+fn adv_f16_store_boundary_is_exactly_65520() {
+    with_gpu(|rt| {
+        let below = f32::from_bits(65520.0f32.to_bits() - 1);
+        let above = f32::from_bits(65520.0f32.to_bits() + 1);
+        let values: [(f32, u16); 7] = [
+            (65504.0, 0x7bff),
+            (65505.0, 0x7bff),
+            (65519.0, 0x7bff),
+            (below, 0x7bff),
+            (65520.0, 0x7c00),
+            (above, 0x7c00),
+            (70000.0, 0x7c00),
+        ];
+        for m in [1u32, 2, 65] {
+            for (v, want) in values {
+                for sign in [1.0f32, -1.0] {
+                    let want = if sign < 0.0 { want | 0x8000 } else { want };
+                    let n = 2u32;
+                    let got = run_case(
+                        rt,
+                        Case {
+                            a: &vec![1i8; m as usize],
+                            b: &vec![1i8; n as usize],
+                            m,
+                            n,
+                            k: 1,
+                            layout: nn::I8BLayout::RowMajorKN,
+                            a_scale: nn::I8AScale::Scalar(sign * v),
+                            b_scale: nn::I8BScale::None,
+                            bias: None,
+                            out: nn::I8Out::F16,
+                        },
+                    );
+                    rt.synchronize().unwrap();
+                    let bits = read_bits(&got, (m * n) as usize);
+                    println!("m={m} scalar scale {:+} -> {:#06x} (want {want:#06x})", sign * v, bits[0]);
+                    assert!(bits.iter().all(|&b| b == want), "m={m} scale {}: {bits:#06x?} want {want:#06x}", sign * v);
+                    // The host conversion agrees with the claim.
+                    assert_eq!(tessl::tensor::f32_to_f16_bits(sign * v), want, "host cast of {}", sign * v);
+                }
+            }
+        }
+    });
+}

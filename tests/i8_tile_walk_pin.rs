@@ -17,8 +17,24 @@
 //!      removed (the documented rename that avoids a symbol clash). The coop
 //!      side must carry no such prefix, so the rename cannot hide a difference.
 //!
+//!   5. Line splicing (backslash-newline) happens before comment removal, as in
+//!      translation phase 2 of the C preprocessor, so a `//` comment ending in a
+//!      backslash swallows the next line here exactly as it does in the compiler.
+//!
+//! Preprocessor directives outside the seven items could rename or retype what
+//! they use (`#define i8_min max`), so every directive in the int8 header must
+//! have an identical counterpart in gemm_coop.h after the same normalisation.
+//! The one exemption is the include guard (`#ifndef G`, `#define G` with no
+//! body, `G` used nowhere else, and the final `#endif`).
+//!
 //! Anything else (an operator, a literal, a type, a parameter, an item
-//! present on one side only) fails. The negative self-tests below mutate a
+//! present on one side only) fails.
+//!
+//! The comparison is deliberately conservative: it also refuses edits that
+//! compute the same thing (a consistently renamed parameter, added
+//! parentheses, `#pragma clang loop unroll(full)` for `#pragma unroll`). Those
+//! stay refused so that no semantic judgement is made by this test; a
+//! legitimate change is made to both headers, or to this test's rules. The negative self-tests below mutate a
 //! copy of the text in memory, never the headers, and require the comparison
 //! to reject every one-token change in either copy.
 
@@ -90,6 +106,10 @@ const ITEMS: [Item; 7] = [
 
 /// Remove `//` and `/* */` comments, keeping newlines so nothing fuses.
 fn strip_comments(src: &str) -> String {
+    // Phase 2 before phase 3: a backslash-newline joins lines first, so a `//`
+    // comment ending in a backslash continues onto the next line.
+    let spliced = src.replace("\\\r\n", "").replace("\\\n", "");
+    let src = spliced.as_str();
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
@@ -240,9 +260,60 @@ fn normalised(coop_src: &str, i8_src: &str) -> Result<Vec<Pair>, String> {
     Ok(out)
 }
 
+/// Normalised text of each preprocessor directive of `src` (comments and
+/// splices already removed), in order.
+fn directives(src: &str) -> Vec<Vec<String>> {
+    src.lines()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .map(tokens)
+        .collect()
+}
+
+/// Refuse a directive of the int8 header that gemm_coop.h does not have,
+/// naming it. The int8 include guard is exempt; the coop guard is dropped
+/// from the reference set the same way.
+fn check_directives(coop_src: &str, i8_src: &str) -> Result<(), String> {
+    let coop = strip_comments(coop_src);
+    let i8 = strip_comments(i8_src);
+    let reference: Vec<String> = without_guard(directives(&coop), &coop)?
+        .into_iter()
+        .map(|d| drop_linkage(d).join(" "))
+        .collect();
+    for d in without_guard(directives(&i8), &i8)? {
+        let text = strip_i8_prefix(drop_linkage(d.clone())).join(" ");
+        if !reference.contains(&text) {
+            return Err(format!(
+                "directive `{}` in i8_tile_walk.h has no identical counterpart in gemm_coop.h",
+                d.join(" ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `dirs` without its include guard: `#ifndef G`, `#define G` (no body, `G`
+/// occurring exactly twice in the file) first, `#endif` last.
+fn without_guard(mut dirs: Vec<Vec<String>>, src: &str) -> Result<Vec<Vec<String>>, String> {
+    let guard = |d: &Vec<String>, kw: &str| d.len() == 3 && d[0] == "#" && d[1] == kw;
+    if dirs.len() < 3 || !guard(&dirs[0], "ifndef") || !guard(&dirs[1], "define") || dirs[0][2] != dirs[1][2] {
+        return Err("no include guard (`#ifndef G` / `#define G` first)".into());
+    }
+    let name = dirs[0][2].clone();
+    if tokens(src).iter().filter(|t| **t == name).count() != 2 {
+        return Err(format!("include guard `{name}` is used outside its two directives"));
+    }
+    if dirs.last().map(|d| d.join(" ")) != Some("# endif".to_string()) {
+        return Err("the last directive is not the guard's `#endif`".into());
+    }
+    dirs.pop();
+    dirs.drain(..2);
+    Ok(dirs)
+}
+
 /// `Ok` when every item matches; otherwise the first difference, with the
 /// item and the token index.
 fn walks_match(coop_src: &str, i8_src: &str) -> Result<(), String> {
+    check_directives(coop_src, i8_src)?;
     for Pair { name, coop: c, i8: i } in normalised(coop_src, i8_src)? {
         if c != i {
             let at = c
@@ -420,4 +491,99 @@ fn a_missing_duplicated_or_prefixed_item_is_refused() {
     // The template head of `tile_walk` is compared too.
     let head = mutate(I8_TILE_WALK_H, "template <int SM>", "template <int SN>");
     assert!(walks_match(GEMM_COOP_H, &head).unwrap_err().starts_with("tile_walk"));
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial review (card ft-70f2141f): edits the first version of the pin
+// accepted, and edits it refuses although they compute the same thing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_define_outside_the_items_that_redefines_a_called_name_is_refused() {
+    // `i8_min` strips to `min` and matches the item; the macro makes it `max`.
+    let edited = mutate(I8_TILE_WALK_H, "uint local_h = min(ph,", "uint local_h = i8_min(ph,");
+    let edited = mutate(
+        &edited,
+        "using namespace metal;",
+        "using namespace metal;\n#define i8_min max",
+    );
+    let err = walks_match(GEMM_COOP_H, &edited).unwrap_err();
+    assert!(err.contains("#") && err.contains("define i8_min max"), "{err}");
+}
+
+#[test]
+fn a_define_that_retypes_a_parameter_is_refused() {
+    // `i8_uint` strips to `uint`; the macro makes it `ushort`, which wraps `linear` at 65536.
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "static inline uint2 i8_tile_from_linear(uint linear,",
+        "static inline uint2 i8_tile_from_linear(i8_uint linear,",
+    );
+    let edited = mutate(
+        &edited,
+        "using namespace metal;",
+        "using namespace metal;\n#define i8_uint ushort",
+    );
+    let err = walks_match(GEMM_COOP_H, &edited).unwrap_err();
+    assert!(err.contains("define i8_uint ushort"), "{err}");
+}
+
+#[test]
+fn a_conditional_or_stray_directive_is_refused() {
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "using namespace metal;",
+        "using namespace metal;\n#if 0\n#endif",
+    );
+    assert!(walks_match(GEMM_COOP_H, &edited).unwrap_err().contains("directive"));
+    // A guard macro that is also used in the code is not a guard.
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "uint x = 0, y = 0;",
+        "uint x = TESSL_I8_TILE_WALK_H, y = 0;",
+    );
+    assert!(walks_match(GEMM_COOP_H, &edited).unwrap_err().contains("include guard"));
+}
+
+#[test]
+fn a_directive_continued_with_a_backslash_is_one_directive() {
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "using namespace metal;",
+        "using namespace metal;\n#define i8_min \\\n    max",
+    );
+    assert!(walks_match(GEMM_COOP_H, &edited)
+        .unwrap_err()
+        .contains("define i8_min max"));
+}
+
+#[test]
+fn a_backslash_continued_comment_hides_the_next_line_as_in_the_compiler() {
+    // `clang -E` drops the `return i8_morton_decode_2d(linear);` line of this text.
+    let edited = mutate(
+        I8_TILE_WALK_H,
+        "if (i8_tile_grid_is_morton(tiles_n, tiles_m)) {\n        return i8_morton_decode_2d(linear);",
+        "if (i8_tile_grid_is_morton(tiles_n, tiles_m)) { // hidden \\\n        return i8_morton_decode_2d(linear);",
+    );
+    let err = walks_match(GEMM_COOP_H, &edited).unwrap_err();
+    assert!(err.starts_with("tile_from_linear"), "{err}");
+    // CRLF line endings splice the same way.
+    let crlf = edited.replace('\n', "\r\n");
+    assert!(walks_match(GEMM_COOP_H, &crlf).is_err());
+}
+
+/// Conservative refusals, documented in the file header: these compute the
+/// same thing and are refused anyway.
+#[test]
+fn equivalent_rewrites_are_refused_conservatively() {
+    let renamed = mutate(
+        I8_TILE_WALK_H,
+        "static inline uint2 i8_tile_from_linear_panel(uint linear, uint tiles_n, uint tiles_m, uint ph) {\n    if (linear >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);\n    uint band = linear / (ph * tiles_n);\n    uint rem = linear - band * ph * tiles_n;",
+        "static inline uint2 i8_tile_from_linear_panel(uint lin, uint tiles_n, uint tiles_m, uint ph) {\n    if (lin >= tiles_n * tiles_m) return uint2(tiles_n, tiles_m);\n    uint band = lin / (ph * tiles_n);\n    uint rem = lin - band * ph * tiles_n;",
+    );
+    assert!(walks_match(GEMM_COOP_H, &renamed).is_err());
+    let parens = mutate(I8_TILE_WALK_H, "= 1ul << 23;", "= (1ul << 23);");
+    assert!(walks_match(GEMM_COOP_H, &parens).is_err());
+    let pragma = mutate(I8_TILE_WALK_H, "#pragma unroll", "#pragma clang loop unroll(full)");
+    assert!(walks_match(GEMM_COOP_H, &pragma).is_err());
 }

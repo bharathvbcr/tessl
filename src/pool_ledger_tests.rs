@@ -1462,7 +1462,11 @@ fn adv_poison_with_an_open_batch_skips_then_drains_after_the_abort() {
     poison_batch_lock(&rig.rt);
     settle(&rig.rt);
     assert!(rig.rt.deferred_pending(), "recycled under an open command buffer");
-    assert_eq!(rig.rt.reclaim(u64::MAX).unwrap(), 0, "reclaim released under an open buffer");
+    assert_eq!(
+        rig.rt.reclaim(u64::MAX).unwrap(),
+        0,
+        "reclaim released under an open buffer"
+    );
     assert!(rig.fake.live() > 0);
     // An allocation does not drain it either.
     drop(rig.rt.alloc_buffer(2 << 20).unwrap());
@@ -1485,7 +1489,10 @@ fn adv_poison_with_an_open_batch_parks_the_queue_until_drop_and_drop_releases_on
     let rig = rig_with_open_batch_and_a_queued_drop();
     poison_batch_lock(&rig.rt);
     let err = rig.rt.synchronize().unwrap_err();
-    assert!(err.contains("poison"), "synchronize did not report the poisoned lock: {err}");
+    assert!(
+        err.contains("poison"),
+        "synchronize did not report the poisoned lock: {err}"
+    );
     assert!(rig.rt.is_poisoned());
     assert!(rig.rt.reclaim(u64::MAX).is_err());
     settle(&rig.rt);
@@ -1512,7 +1519,10 @@ fn adv_poisoned_recycle_never_releases_under_an_unfinished_commit() {
     }
     rig.rt.metal4.lifetime_event.setSignaledValue(first);
     settle(&rig.rt);
-    assert!(rig.rt.deferred_pending(), "released with the second commit still running");
+    assert!(
+        rig.rt.deferred_pending(),
+        "released with the second commit still running"
+    );
     assert_eq!(rig.rt.reclaim(u64::MAX).unwrap(), 0);
     rig.rt.metal4.lifetime_event.setSignaledValue(second);
     settle(&rig.rt);
@@ -1529,7 +1539,10 @@ fn adv_poisoned_recycle_still_refuses_a_dishonest_lifetime_event() {
     poison_batch_lock(&rig.rt);
     let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
     rig.rt.metal4.lifetime_event.setSignaledValue(submitted + 1000);
-    assert!(rig.rt.recycle_if_idle().is_err(), "a dishonest event counted as completion");
+    assert!(
+        rig.rt.recycle_if_idle().is_err(),
+        "a dishonest event counted as completion"
+    );
     assert!(rig.rt.deferred_pending());
     assert_eq!(rig.fake.live(), bucket(300_000, BufferKind::Cold));
     // Restore an honest value so the books can close.
@@ -1587,11 +1600,17 @@ fn adv_a_batch_lock_held_across_the_recycle_skips_even_when_poisoned() {
         {
             let _held = rig.rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
             settle(&rig.rt);
-            assert!(rig.rt.deferred_pending(), "poisoned={poisoned}: recycled under a held guard");
+            assert!(
+                rig.rt.deferred_pending(),
+                "poisoned={poisoned}: recycled under a held guard"
+            );
             assert_eq!(rig.rt.reclaim(u64::MAX).map(|_| ()), Ok(()));
         }
         settle(&rig.rt);
-        assert!(!rig.rt.deferred_pending(), "poisoned={poisoned}: not recycled once the guard was gone");
+        assert!(
+            !rig.rt.deferred_pending(),
+            "poisoned={poisoned}: not recycled once the guard was gone"
+        );
         rig.finish(false, "lock held across the recycle");
     }
 }
@@ -1646,7 +1665,10 @@ fn adv_the_refusing_paths_still_refuse_a_poisoned_batch_lock() {
                 })
                 .unwrap_err();
             assert!(err.contains("poison"), "{ctx}: with_binder error was {err}");
-            assert!(!ran.load(Ordering::SeqCst), "{ctx}: the closure ran on a poisoned batch");
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "{ctx}: the closure ran on a poisoned batch"
+            );
             assert!(rig.rt.active_m4.is_poisoned(), "{ctx}: a refusal cleared the poison");
             rig.finish(true, "refusing paths");
         }

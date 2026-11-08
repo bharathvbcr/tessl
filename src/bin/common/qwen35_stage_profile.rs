@@ -820,4 +820,77 @@ mod tests {
         assert!(err.contains("gdn") && err.contains("mlp"), "{err}");
         assert!(!err.contains("attn"), "{err}");
     }
+
+    #[test]
+    fn a_zero_or_negative_replica_against_a_positive_real_fails() {
+        for replica in [0.0, -0.0, -1.0, -100.0, f64::MIN_POSITIVE / 2.0 * -1.0] {
+            let err = check_replica_against_parts(&[("row", 100.0, replica)], REPLICA_REL_TOL)
+                .expect_err(&format!("replica {replica} must not pass"));
+            assert!(err.contains("row"), "{err}");
+        }
+    }
+
+    #[test]
+    fn negative_zero_real_is_not_comparable() {
+        let err = check_replica_against_parts(&[("row", -0.0, 0.0)], REPLICA_REL_TOL).unwrap_err();
+        assert!(err.contains("not comparable"), "{err}");
+    }
+
+    #[test]
+    fn huge_times_do_not_overflow_into_a_pass() {
+        let big = f64::MAX;
+        // The gap |replica - real| is infinity here; it must still fail.
+        assert!(check_replica_against_parts(&[("row", big, -big)], REPLICA_REL_TOL).is_err());
+        assert!(check_replica_against_parts(&[("row", big, 0.0)], REPLICA_REL_TOL).is_err());
+        assert!(check_replica_against_parts(&[("row", big, big * 0.9)], REPLICA_REL_TOL).is_err());
+        assert!(check_replica_against_parts(&[("row", big, big)], REPLICA_REL_TOL).is_ok());
+        assert!(check_replica_against_parts(&[("row", big, big * 0.97)], REPLICA_REL_TOL).is_ok());
+        // tol * real stays finite for every finite real, and the replica may not exceed it by 5%.
+        assert!(check_replica_against_parts(&[("row", big * 0.5, big)], REPLICA_REL_TOL).is_err());
+    }
+
+    #[test]
+    fn subnormal_times_compare_exactly() {
+        let tiny = 5e-324_f64;
+        assert!(tiny > 0.0 && tiny < f64::MIN_POSITIVE);
+        // tol * tiny underflows to 0, so only an identical replica passes.
+        assert!(check_replica_against_parts(&[("row", tiny, tiny)], REPLICA_REL_TOL).is_ok());
+        assert!(check_replica_against_parts(&[("row", tiny, 2.0 * tiny)], REPLICA_REL_TOL).is_err());
+        assert!(check_replica_against_parts(&[("row", tiny, 0.0)], REPLICA_REL_TOL).is_err());
+    }
+
+    #[test]
+    fn floating_point_boundary_rows_follow_the_computed_comparison() {
+        // 3.15 - 3.0 = 0.1499999999999999 <= 0.05 * 3.0 = 0.15000000000000002: inclusive, passes.
+        assert!(check_replica_against_parts(&[("a", 3.0, 3.15)], REPLICA_REL_TOL).is_ok());
+        assert!(check_replica_against_parts(&[("b", 7.0, 7.35)], REPLICA_REL_TOL).is_ok());
+        assert!(check_replica_against_parts(&[("c", 20.0, 21.0)], REPLICA_REL_TOL).is_ok());
+        // The literal 1.05 is a hair over 1.05 in binary (gap 0.050000000000000044 > 0.05): fails.
+        assert!(check_replica_against_parts(&[("d", 1.0, 1.05)], REPLICA_REL_TOL).is_err());
+    }
+
+    #[test]
+    fn a_zero_tolerance_demands_identical_times() {
+        assert!(check_replica_against_parts(&[("row", 2.5, 2.5)], 0.0).is_ok());
+        assert!(check_replica_against_parts(&[("row", 2.5, 2.5000000000000004)], 0.0).is_err());
+    }
+
+    #[test]
+    fn a_negative_tolerance_fails_closed_even_for_equal_rows() {
+        assert!(check_replica_against_parts(&[("row", 2.5, 2.5)], -0.05).is_err());
+    }
+
+    #[test]
+    fn defect_a_nan_tolerance_must_not_pass_any_row() {
+        // `gap > NaN` is false, so a NaN tolerance accepts a replica that is 10x off.
+        // Only the const reaches this fn today; the fn does not validate rel_tol itself.
+        let r = check_replica_against_parts(&[("row", 1.0, 10.0)], f64::NAN);
+        assert!(r.is_err(), "NaN tolerance passed a 900% gap");
+    }
+
+    #[test]
+    fn defect_an_infinite_tolerance_must_not_pass_any_row() {
+        let r = check_replica_against_parts(&[("row", 1.0, 10.0)], f64::INFINITY);
+        assert!(r.is_err(), "infinite tolerance passed a 900% gap");
+    }
 }

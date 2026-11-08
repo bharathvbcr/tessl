@@ -131,6 +131,8 @@ exact lib gdn_train::tests::the_chunked_workspace_bytes_follow_the_key_heads
 lib runtime::alloc_failure_tests:: 3
 lib runtime::drop_wait_tests:: 1
 lib runtime::timestamp_decode_tests:: 3
+# Only this source-order pin of runtime::pool_ledger_tests:: is device-free; the rest open a device.
+exact lib runtime::pool_ledger_tests::commit_m4_clears_cb_open_only_after_event_value_covers_the_submit
 lib conv::extent_tests:: 2
 lib shared::tests:: 4
 # Only this one of shared_buf::tests:: 14 is device-free; the rest open a device,

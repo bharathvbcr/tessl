@@ -1572,80 +1572,28 @@ fn adv_poison_then_drop_without_a_recycle_releases_each_queued_charge_once() {
     assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
 }
 
-/// Attack 4. A lock another thread holds (clean, then poisoned) reads as "may
-/// be open" and skips; once that thread lets go the recycle drains.
+/// Attack 4. Another thread cannot hold the lock while this one recycles:
+/// `GpuRuntime` is `!Send + !Sync` (E0277 on sharing it into `thread::scope`).
+/// The same `WouldBlock` is reached on one thread by holding the guard, clean
+/// or poisoned, across the recycle; poison then goes with the guard's drop.
 #[test]
-fn adv_a_batch_lock_held_by_another_thread_skips_even_when_poisoned() {
+fn adv_a_batch_lock_held_across_the_recycle_skips_even_when_poisoned() {
     for poisoned in [false, true] {
         let rig = Rig::new();
         drop(rig.rt.alloc_buffer(300_000).unwrap());
-        let rt = &*rig.rt;
         if poisoned {
-            let joined = std::thread::scope(|s| {
-                s.spawn(|| {
-                    let _held = rt.active_m4.lock().unwrap();
-                    panic!("injected panic: thread A poisons active_m4");
-                })
-                .join()
-            });
-            assert!(joined.is_err());
-            assert!(rt.active_m4.is_poisoned());
+            poison_batch_lock(&rig.rt);
         }
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _held = rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
-                held_tx.send(()).unwrap();
-                go_rx.recv().unwrap();
-            });
-            held_rx.recv().unwrap();
-            settle(rt);
-            assert!(rt.deferred_pending(), "poisoned={poisoned}: recycled under another thread's guard");
-            go_tx.send(()).unwrap();
-        });
-        settle(rt);
-        assert!(!rt.deferred_pending(), "poisoned={poisoned}: not recycled once the guard was gone");
-        rig.finish(false, "lock held by another thread");
+        {
+            let _held = rig.rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+            settle(&rig.rt);
+            assert!(rig.rt.deferred_pending(), "poisoned={poisoned}: recycled under a held guard");
+            assert_eq!(rig.rt.reclaim(u64::MAX).map(|_| ()), Ok(()));
+        }
+        settle(&rig.rt);
+        assert!(!rig.rt.deferred_pending(), "poisoned={poisoned}: not recycled once the guard was gone");
+        rig.finish(false, "lock held across the recycle");
     }
-}
-
-/// Attack 4. Thread A poisons repeatedly (sometimes clearing it) while threads
-/// B..E allocate, drop and recycle. Whatever the interleaving, the books agree
-/// at the end and nothing was released twice.
-#[test]
-fn adv_poisoning_while_other_threads_allocate_and_recycle_keeps_the_books() {
-    let rig = Rig::new();
-    let rt = &*rig.rt;
-    let _quiet = quiet_injected();
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            for i in 0..150 {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _held = rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
-                    panic!("injected panic: poisoner round {i}");
-                }));
-                if i % 2 == 0 {
-                    rt.active_m4.clear_poison();
-                }
-                std::thread::yield_now();
-            }
-        });
-        for _ in 0..4 {
-            s.spawn(|| {
-                for _ in 0..300 {
-                    if let Ok(b) = rt.alloc_buffer(300_000) {
-                        drop(b);
-                    }
-                    let _ = rt.recycle_if_idle();
-                }
-            });
-        }
-    });
-    settle(rt);
-    assert!(!rt.deferred_pending());
-    rig.audit("after the poison race");
-    rig.finish(false, "poison race");
 }
 
 /// Attack 5. Poison, recycle, poison again (cleared in between, and not): each

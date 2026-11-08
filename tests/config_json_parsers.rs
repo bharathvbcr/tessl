@@ -408,7 +408,7 @@ fn edge_an_empty_file_is_an_error_for_every_reader() {
     let f = s.path("config.json");
     std::fs::write(&f, b"").unwrap();
     for (name, e) in refusals_without_blocking(&f) {
-        assert!(e.starts_with("config.json:"), "{name}: {e}");
+        assert!(e.starts_with(&format!("{}: config.json: JSON:", f.display())), "{name}: {e}");
     }
 }
 
@@ -446,7 +446,7 @@ fn edge_a_utf8_bom_is_refused_as_a_config_error() {
     bytes.extend_from_slice(MINI.as_bytes());
     std::fs::write(&f, bytes).unwrap();
     for (name, e) in refusals_without_blocking(&f) {
-        assert!(e.starts_with("config.json:"), "{name}: {e}");
+        assert!(e.starts_with(&format!("{}: config.json: JSON:", f.display())), "{name}: {e}");
     }
 }
 

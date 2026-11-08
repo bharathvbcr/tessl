@@ -5,7 +5,21 @@
 //! A key that is present with the wrong type is always an error, `null`
 //! included: a reader never takes a wrong-typed value for an absent one.
 
+use std::path::Path;
+
 use ojas_io::json::{self, JsonLimits, JsonNumber, JsonValue};
+
+/// Largest `config.json` any reader here takes, in bytes (a checkpoint's is a
+/// few KiB). Also the cap on the tokenizer sidecars.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1 << 20;
+
+/// `config.json` as text: a regular file (a symlink is followed, a FIFO or
+/// directory is refused without blocking) of at most [`MAX_CONFIG_BYTES`],
+/// valid UTF-8. A file past the cap, or that grows past it during the read, is
+/// refused, never truncated. Every message names `path`.
+pub(crate) fn read_file(path: &Path) -> Result<String, String> {
+    Ok(ojas_io::read_regular_text(path, MAX_CONFIG_BYTES, "config cap")?)
+}
 
 /// Parse `text`; the root must be an object.
 pub(crate) fn parse_object(text: &str) -> Result<JsonValue, String> {

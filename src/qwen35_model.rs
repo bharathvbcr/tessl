@@ -374,7 +374,7 @@ impl Qwen35Config {
 
     /// [`Self::from_config_json`] on a file.
     pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = config_json::read_file(path)?;
         Self::from_config_json(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 

@@ -118,7 +118,6 @@
 //! runs a model refuses it.
 
 use std::borrow::Cow;
-use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -140,24 +139,13 @@ pub const TEXT_PREFIX: &str = "language_model.";
 
 /// Largest `config.json` [`read_config_text`] reads, in bytes (the
 /// checkpoint's is a few KiB).
-pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
+pub const MAX_CONFIG_BYTES: u64 = crate::config_json::MAX_CONFIG_BYTES;
 
 /// `config.json` as text, after a bounded read of a regular file (not a FIFO,
 /// not a directory); a file past [`MAX_CONFIG_BYTES`] is refused rather than
 /// read whole.
 pub fn read_config_text(path: &Path) -> Result<String, String> {
-    let (file, len) = crate::loader::open_regular_file(path)?;
-    if len > MAX_CONFIG_BYTES {
-        return Err(format!(
-            "{}: {len} bytes, above the {MAX_CONFIG_BYTES}-byte config cap",
-            path.display()
-        ));
-    }
-    let mut text = String::new();
-    file.take(MAX_CONFIG_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(text)
+    crate::config_json::read_file(path)
 }
 
 /// One item of an [`EmbedGemma2Multimodal::encode`] call: one output row.

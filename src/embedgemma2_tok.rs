@@ -60,7 +60,6 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::io::Read;
 use std::path::Path;
 
 use ojas_io::json::{self, JsonLimits, JsonNumber, JsonValue};
@@ -71,7 +70,7 @@ type Json = JsonValue;
 pub const MAX_TOKENIZER_BYTES: u64 = 256 << 20;
 /// Largest sidecar config (`tokenizer_config.json`,
 /// `config_sentence_transformers.json`) read, in bytes.
-pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
+pub const MAX_CONFIG_BYTES: u64 = crate::config_json::MAX_CONFIG_BYTES;
 /// Texts of this many bytes or more are refused ([`Tokenizer::encode_with_prompt`])
 /// or panic ([`Tokenizer::encode_raw`]): the model's context is 8192 tokens.
 pub const MAX_TEXT_BYTES: usize = 1 << 28;
@@ -1318,20 +1317,68 @@ fn parse_decoder(j: Option<&Json>) -> Result<Vec<DecodeStep>, String> {
 }
 
 fn read_bounded(path: &Path, cap: u64) -> Result<String, String> {
-    let (file, len) = crate::loader::open_regular_file(path)?;
-    if len > cap {
-        return Err(format!("{}: {len} bytes, above the {cap}-byte cap", path.display()));
-    }
-    let mut text = String::with_capacity(len as usize);
-    file.take(cap)
-        .read_to_string(&mut text)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(text)
+    Ok(ojas_io::read_regular_text(path, cap, "cap")?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tessl-tok-bounded-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_bounded_refuses_a_file_past_the_cap_and_reads_one_at_it() {
+        let dir = scratch("cap");
+        let f = dir.join("tokenizer_config.json");
+        std::fs::File::create(&f)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        let e = read_bounded(&f, MAX_CONFIG_BYTES).unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "{}: {} bytes, above the {MAX_CONFIG_BYTES}-byte cap",
+                f.display(),
+                MAX_CONFIG_BYTES + 1
+            )),
+            "{e}"
+        );
+        std::fs::write(&f, "x".repeat(64)).unwrap();
+        assert_eq!(read_bounded(&f, 64).unwrap().len(), 64);
+        std::fs::write(&f, "x".repeat(65)).unwrap();
+        assert!(read_bounded(&f, 64)
+            .unwrap_err()
+            .contains("65 bytes, above the 64-byte cap"));
+        std::fs::write(&f, [0xffu8]).unwrap();
+        assert!(read_bounded(&f, 64).is_err());
+        assert!(read_bounded(&dir, 64).unwrap_err().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_bounded_refuses_a_fifo_without_blocking() {
+        let dir = scratch("fifo");
+        let f = dir.join("tokenizer_config.json");
+        assert!(std::process::Command::new("mkfifo").arg(&f).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_bounded(&p, 64));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+        if got.is_err() {
+            // Release the reader blocked in open(2) so its thread ends.
+            let _ = std::fs::OpenOptions::new().write(true).open(&f);
+        }
+        let e = got.expect("read_bounded blocked on a FIFO").unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_merge_table_finds_every_pair_across_collisions_and_overwrites_a_repeat() {

@@ -23,7 +23,7 @@ bin check_kernel_ir_planted 6
 # than its neighbours (~2 min): one case runs the real script over the real
 # checkout, which resolves two lockfiles with `cargo metadata`.
 bin check_siblings_script 7
-bin config_json_parsers 10
+bin config_json_parsers 16
 bin dialect_lint_script 12
 bin docs_name_real_tools 7
 bin embedgemma2_audio_fixtures 2
@@ -117,7 +117,7 @@ lib embedgemma2::tests:: 14
 lib embedgemma2_vision::tests:: 8
 lib embedgemma2_audio::tests:: 9
 lib embedgemma2_pre::tests:: 24
-lib embedgemma2_tok::tests:: 4
+lib embedgemma2_tok::tests:: 6
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib par_batch::tests:: 6

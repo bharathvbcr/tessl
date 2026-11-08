@@ -746,6 +746,12 @@ struct ActiveMetal4Batch {
     /// every command buffer: the mid-commit threshold and the
     /// [`METAL4_MAX_DISPATCHES_PER_CB`] cap are both per command buffer.
     dispatches: usize,
+    /// A command buffer is being recorded and has not been submitted.
+    /// Invariant: `false` implies `event_value` covers every command buffer
+    /// this batch submitted. `commit_m4` clears it after the store, never
+    /// before, and `abort_open_batch` clears it for a buffer that was never
+    /// submitted. [`GpuRuntime::recycle_if_idle`] frees against the event
+    /// value once the flag reads false, even through a poisoned lock.
     cb_open: bool,
     stamped_t0: bool,
     encoder: Option<Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>>,
@@ -1044,9 +1050,13 @@ pub struct GpuRuntime {
     /// The open batch, if any. Poison policy, one rule per kind of caller:
     ///
     /// - Callers that only ask "is a command buffer open?" recover a poisoned
-    ///   lock ([`Self::recycle_if_idle`], `abort_open_batch`, the `cb_open`
-    ///   read at ~2668): the panic is over and releasing deferred work is safe.
-    ///   A lock held by this thread (`WouldBlock`) still means "may be open".
+    ///   lock ([`Self::recycle_if_idle`], `abort_open_batch`,
+    ///   `pending_commit_value`): the panic is over and releasing deferred
+    ///   work is safe, because `cb_open == false` implies `event_value`
+    ///   covers every submitted command buffer (the invariant on
+    ///   `ActiveMetal4Batch::cb_open`: `commit_m4` clears the flag only after
+    ///   the store). A lock held by this thread (`WouldBlock`) still means
+    ///   "may be open".
     /// - Callers that would encode or commit new work (`with_binder*`, the
     ///   encode steps, `commit_m4`) keep refusing with the poison error: a new
     ///   encode on a batch whose owner panicked mid-commit is new work on torn
@@ -2990,7 +3000,6 @@ impl GpuRuntime {
         }
         m4.command_buffer.endCommandBuffer();
         let watch = self.commit_with_feedback()?;
-        batch.cb_open = false;
 
         // Drawn from the commit clock of the `Shared` this runtime was made
         // under. A runtime with a `Shared` of its own draws 1, 2, 3, ... as it
@@ -3003,6 +3012,13 @@ impl GpuRuntime {
             "the commit clock fell behind this runtime's event value"
         );
         m4.event_value.store(next, Ordering::Release);
+        // Only now is the flag cleared: `cb_open == false` must imply that
+        // `event_value` covers every command buffer submitted, because
+        // `recycle_if_idle` reads the flag under a recovered (possibly
+        // poisoned) lock and then frees against the event value. A panic
+        // between the submit and this store leaves the flag set, and a set
+        // flag skips the recycle.
+        batch.cb_open = false;
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
         // Queue order puts this after the lifetime signal, so the handoff
@@ -3043,7 +3059,6 @@ impl GpuRuntime {
         } else {
             // Keep const_cursor; do not reuse offsets until a waiting commit.
             // Next encode opens on the other allocator.
-            batch.cb_open = false;
             // Without waiting, release what earlier command buffers finished.
             let reached = self.checked_lifetime_value()?;
             self.drain_cold_recycles(reached);

@@ -1424,3 +1424,293 @@ fn a_poisoned_batch_lock_this_thread_holds_still_blocks_the_idle_recycle() {
     assert_eq!(rig.fake.live(), 0);
     rig.finish(false, "held poisoned active_m4");
 }
+
+// ---- adversarial pins for the poisoned `active_m4` recovery (ft-f68409c6) ----
+
+/// Panic while holding the batch lock, as a panicking commit drain would,
+/// without needing a ledger to do it.
+fn poison_batch_lock(rt: &GpuRuntime) {
+    let _quiet = quiet_injected();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+        panic!("injected panic: poisoning active_m4 on purpose");
+    }));
+    assert!(unwound.is_err());
+    assert!(rt.active_m4.is_poisoned());
+}
+
+/// A rig with a command buffer open (async encode, one empty scope) and one
+/// dropped buffer queued behind it.
+fn rig_with_open_batch_and_a_queued_drop() -> Rig {
+    let rig = Rig::new();
+    rig.rt.set_async_encode(true).unwrap();
+    let buf = rig.rt.alloc_buffer(300_000).unwrap();
+    rig.rt.with_binder(|_| Ok(())).unwrap();
+    assert!(rig.rt.active_m4.lock().unwrap().as_ref().is_some_and(|b| b.cb_open));
+    drop(buf);
+    assert!(rig.rt.deferred_pending());
+    rig
+}
+
+/// Attack 1. A lock poisoned while a command buffer is open: the recycle must
+/// skip (the open buffer may bind the drop), and the queue is drainable once
+/// `abort_open_batch` has ended the batch. Before the fix it stayed parked
+/// even then.
+#[test]
+fn adv_poison_with_an_open_batch_skips_then_drains_after_the_abort() {
+    let rig = rig_with_open_batch_and_a_queued_drop();
+    poison_batch_lock(&rig.rt);
+    settle(&rig.rt);
+    assert!(rig.rt.deferred_pending(), "recycled under an open command buffer");
+    assert_eq!(
+        rig.rt.reclaim(u64::MAX).unwrap(),
+        0,
+        "reclaim released under an open buffer"
+    );
+    assert!(rig.fake.live() > 0);
+    // An allocation does not drain it either.
+    drop(rig.rt.alloc_buffer(2 << 20).unwrap());
+    assert!(rig.rt.deferred_pending());
+
+    rig.rt.abort_open_batch();
+    assert!(rig.rt.active_m4.is_poisoned(), "the abort is not a clear_poison");
+    settle(&rig.rt);
+    assert!(!rig.rt.deferred_pending(), "still parked after the batch was aborted");
+    rig.audit("after abort and recycle");
+    rig.finish(false, "poisoned with an open batch, then aborted");
+}
+
+/// Attack 1, second half. With the batch open and the lock poisoned, nothing
+/// but the abort drains the queue: a synchronize refuses (and poisons the
+/// runtime), a reclaim refuses, a recycle skips. The runtime's Drop returns the
+/// charge exactly once.
+#[test]
+fn adv_poison_with_an_open_batch_parks_the_queue_until_drop_and_drop_releases_once() {
+    let rig = rig_with_open_batch_and_a_queued_drop();
+    poison_batch_lock(&rig.rt);
+    let err = rig.rt.synchronize().unwrap_err();
+    assert!(
+        err.contains("poison"),
+        "synchronize did not report the poisoned lock: {err}"
+    );
+    assert!(rig.rt.is_poisoned());
+    assert!(rig.rt.reclaim(u64::MAX).is_err());
+    settle(&rig.rt);
+    assert!(rig.rt.deferred_pending(), "the queue drained without the abort");
+    rig.audit("parked");
+    rig.finish(true, "poisoned with an open batch, dropped");
+}
+
+/// Attack 2. The recovery must still wait for the lifetime event: a commit
+/// submitted and not finished keeps a dropped buffer queued, whether the lock
+/// is poisoned before or after the drop, and a partial completion is not
+/// enough.
+#[test]
+fn adv_poisoned_recycle_never_releases_under_an_unfinished_commit() {
+    let rig = Rig::new();
+    let buf = rig.rt.alloc_buffer(300_000).unwrap();
+    let first = rig.rt.stage_submitted_commit_for_test();
+    let second = rig.rt.stage_submitted_commit_for_test();
+    drop(buf);
+    poison_batch_lock(&rig.rt);
+    for _ in 0..3 {
+        settle(&rig.rt);
+        assert!(rig.rt.deferred_pending(), "released while nothing had completed");
+    }
+    rig.rt.metal4.lifetime_event.setSignaledValue(first);
+    settle(&rig.rt);
+    assert!(
+        rig.rt.deferred_pending(),
+        "released with the second commit still running"
+    );
+    assert_eq!(rig.rt.reclaim(u64::MAX).unwrap(), 0);
+    rig.rt.metal4.lifetime_event.setSignaledValue(second);
+    settle(&rig.rt);
+    assert!(!rig.rt.deferred_pending());
+    rig.finish(false, "poisoned recycle under an unfinished commit");
+}
+
+/// Attack 2, with a dishonest event: a signal above anything submitted must
+/// poison and refuse, not count as completion, even on the recovered path.
+#[test]
+fn adv_poisoned_recycle_still_refuses_a_dishonest_lifetime_event() {
+    let rig = Rig::new();
+    drop(rig.rt.alloc_buffer(300_000).unwrap());
+    poison_batch_lock(&rig.rt);
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    rig.rt.metal4.lifetime_event.setSignaledValue(submitted + 1000);
+    assert!(
+        rig.rt.recycle_if_idle().is_err(),
+        "a dishonest event counted as completion"
+    );
+    assert!(rig.rt.deferred_pending());
+    assert_eq!(rig.fake.live(), bucket(300_000, BufferKind::Cold));
+    // Restore an honest value so the books can close.
+    rig.rt.metal4.lifetime_event.setSignaledValue(submitted);
+    rig.finish(true, "dishonest event after poison");
+}
+
+/// Attack 3. Poison, recycle with buffers still held, then both Drop orders:
+/// every charge comes back exactly once and nothing is unmatched.
+#[test]
+fn adv_poison_recycle_then_drop_balances_the_books_in_both_orders() {
+    for runtime_first in [false, true] {
+        let mut rig = Rig::new();
+        rig.seed();
+        poison_batch_lock(&rig.rt);
+        rig.apply(Op::DropAll);
+        settle(&rig.rt);
+        assert!(!rig.rt.deferred_pending());
+        rig.audit("after the poisoned recycle");
+        // A buffer taken after the recovery is live across the Drop.
+        rig.apply(Op::Hit);
+        rig.apply(Op::Miss);
+        rig.audit("with buffers live again");
+        rig.finish(runtime_first, "poison, recycle, drop");
+    }
+}
+
+/// Attack 3. A queue the recycle never ran on is returned by Drop, once.
+#[test]
+fn adv_poison_then_drop_without_a_recycle_releases_each_queued_charge_once() {
+    let mut rig = Rig::new();
+    rig.seed();
+    rig.apply(Op::DropAll);
+    assert!(rig.rt.deferred_pending());
+    poison_batch_lock(&rig.rt);
+    let Rig { held, rt, fake, chaos } = rig;
+    drop(held);
+    drop(rt);
+    drop(chaos);
+    assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
+}
+
+/// Attack 4. Another thread cannot hold the lock while this one recycles:
+/// `GpuRuntime` is `!Send + !Sync` (E0277 on sharing it into `thread::scope`).
+/// The same `WouldBlock` is reached on one thread by holding the guard, clean
+/// or poisoned, across the recycle; poison then goes with the guard's drop.
+#[test]
+fn adv_a_batch_lock_held_across_the_recycle_skips_even_when_poisoned() {
+    for poisoned in [false, true] {
+        let rig = Rig::new();
+        drop(rig.rt.alloc_buffer(300_000).unwrap());
+        if poisoned {
+            poison_batch_lock(&rig.rt);
+        }
+        {
+            let _held = rig.rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+            settle(&rig.rt);
+            assert!(
+                rig.rt.deferred_pending(),
+                "poisoned={poisoned}: recycled under a held guard"
+            );
+            assert_eq!(rig.rt.reclaim(u64::MAX).map(|_| ()), Ok(()));
+        }
+        settle(&rig.rt);
+        assert!(
+            !rig.rt.deferred_pending(),
+            "poisoned={poisoned}: not recycled once the guard was gone"
+        );
+        rig.finish(false, "lock held across the recycle");
+    }
+}
+
+/// Attack 5. Poison, recycle, poison again (cleared in between, and not): each
+/// recycle still drains.
+#[test]
+fn adv_repeated_poison_still_recycles_each_time() {
+    for clear_between in [false, true] {
+        let rig = Rig::new();
+        for round in 0..5 {
+            drop(rig.rt.alloc_buffer(300_000).unwrap());
+            if clear_between {
+                rig.rt.active_m4.clear_poison();
+            }
+            poison_batch_lock(&rig.rt);
+            settle(&rig.rt);
+            assert!(
+                !rig.rt.deferred_pending(),
+                "clear_between={clear_between} round {round}: parked"
+            );
+            rig.audit("repeated poison");
+        }
+        rig.finish(false, "repeated poison");
+    }
+}
+
+/// Attack 6. After the lock is poisoned (and after a recycle recovered it), the
+/// callers that encode or commit still refuse with the poison error, and the
+/// closure never runs.
+#[test]
+fn adv_the_refusing_paths_still_refuse_a_poisoned_batch_lock() {
+    for recycled_first in [false, true] {
+        for async_encode in [false, true] {
+            let ran = AtomicBool::new(false);
+            let rig = Rig::new();
+            rig.rt.set_async_encode(async_encode).unwrap();
+            drop(rig.rt.alloc_buffer(300_000).unwrap());
+            poison_batch_lock(&rig.rt);
+            if recycled_first {
+                settle(&rig.rt);
+                assert!(!rig.rt.deferred_pending());
+            }
+            let ctx = format!("recycled_first={recycled_first} async={async_encode}");
+            // The read-only reader recovers.
+            let _ = rig.rt.pending_commit_value();
+            let err = rig
+                .rt
+                .with_binder(|_| {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(err.contains("poison"), "{ctx}: with_binder error was {err}");
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "{ctx}: the closure ran on a poisoned batch"
+            );
+            assert!(rig.rt.active_m4.is_poisoned(), "{ctx}: a refusal cleared the poison");
+            rig.finish(true, "refusing paths");
+        }
+    }
+    for wait in [false, true] {
+        let rig = Rig::new();
+        poison_batch_lock(&rig.rt);
+        settle(&rig.rt);
+        let err = rig.rt.commit(wait).unwrap_err();
+        assert!(err.contains("poison"), "commit({wait}) error was {err}");
+        assert!(rig.rt.synchronize().is_err());
+        rig.finish(true, "refusing commit");
+    }
+}
+
+/// `cb_open == false` must imply that `event_value` covers every command
+/// buffer this batch submitted: `recycle_if_idle` recovers a poisoned
+/// `active_m4`, reads the flag, and then releases everything deferred against
+/// the event value. Clearing the flag before the store leaves a window in
+/// which a panic poisons the lock with the command buffer submitted and the
+/// event value stale, and the recycle frees buffers the GPU is still reading.
+/// A source-order pin: no test can make the panic land in that window without
+/// a production knob.
+#[test]
+fn commit_m4_clears_cb_open_only_after_event_value_covers_the_submit() {
+    let src = include_str!("runtime.rs");
+    let start = src.find("fn commit_m4(").expect("commit_m4 not found");
+    let body = &src[start..];
+    let end = body[1..]
+        .find("\n    fn ")
+        .or_else(|| body[1..].find("\n    pub fn "))
+        .expect("end of commit_m4 not found");
+    let body = &body[..=end];
+    let store = body
+        .find("event_value.store(next")
+        .expect("commit_m4 no longer stores the event value");
+    let clears: Vec<usize> = body.match_indices("cb_open = false").map(|(i, _)| i).collect();
+    assert!(!clears.is_empty(), "commit_m4 no longer clears cb_open");
+    for at in clears {
+        assert!(
+            store < at,
+            "commit_m4 clears cb_open (byte {at}) before it stores event_value (byte {store})"
+        );
+    }
+}

@@ -934,12 +934,11 @@ impl Rig {
         } else {
             drop(held);
             settle(&rt);
-            if every_call || rt.active_m4.is_poisoned() {
-                // Two states in which the drain cannot run, and queued items
-                // rightly keep their charges: a ledger that panics on every
-                // call never lets a release succeed, and a panic inside a
-                // non-waiting commit's drain poisons `active_m4`, which
-                // `recycle_if_idle` reads as "a command buffer may be open".
+            if every_call {
+                // The one state in which the drain cannot run, and queued
+                // items rightly keep their charges: a ledger that panics on
+                // every call never lets a release succeed. A panic that
+                // poisoned `active_m4` is not one: the recycle recovers it.
                 // The books must still agree: what is queued is what the
                 // ledger holds as Live, and nothing was released twice. The
                 // runtime's Drop then returns them (checked below).
@@ -1355,4 +1354,73 @@ fn differential_balance_trace() {
         drop(rt);
         assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
     }
+}
+
+/// A ledger panic inside a non-waiting commit's drain, with a command buffer
+/// open and a dropped buffer queued behind it. The panic unwinds with
+/// `active_m4` held, so the lock is left poisoned; the queued drop is
+/// requeued by the drain's unwind guard, charge intact. The GPU has finished
+/// everything submitted when this returns, so only the lock stands between
+/// the queue and [`GpuRuntime::recycle_if_idle`].
+fn poison_active_m4_in_a_commit_drain() -> Rig {
+    let _quiet = quiet_injected();
+    let rig = Rig::new();
+    rig.rt.set_async_encode(true).unwrap();
+    let buf = rig.rt.alloc_buffer(300_000).unwrap();
+    rig.rt.with_binder(|_| Ok(())).unwrap();
+    drop(buf);
+    rig.chaos.panic_on_kind(Kind::Release, LedgerClass::Live, 1);
+    let commit = |rig: &Rig| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.rt.commit(false))).is_err();
+    let mut unwound = commit(&rig);
+    if !unwound {
+        // The GPU had not reached the commit's value when it checked, so the
+        // drain found nothing to release. Wait, then commit again: the drain
+        // now sees the queued drop as finished.
+        rig.rt
+            .wait_lifetime_event(rig.rt.metal4.event_value.load(Ordering::Acquire))
+            .unwrap();
+        rig.rt.with_binder(|_| Ok(())).unwrap();
+        unwound = commit(&rig);
+    }
+    assert!(unwound, "the injected panic never reached a commit's drain");
+    assert!(rig.rt.active_m4.is_poisoned(), "the unwind did not poison active_m4");
+    rig.rt
+        .wait_lifetime_event(rig.rt.metal4.event_value.load(Ordering::Acquire))
+        .unwrap();
+    rig.chaos.reset();
+    assert!(rig.rt.deferred_pending(), "the panicked drain did not requeue the drop");
+    rig.audit("after the panic");
+    rig
+}
+
+/// A panic that poisoned `active_m4` must not park the deferred queues for
+/// good: recycling at an idle moment gives the charge back, as it does when
+/// the lock is clean.
+#[test]
+fn a_poisoned_batch_lock_does_not_stop_the_idle_recycle() {
+    let rig = poison_active_m4_in_a_commit_drain();
+    settle(&rig.rt);
+    assert!(
+        !rig.rt.deferred_pending(),
+        "a poisoned active_m4 left the deferred queue undrained"
+    );
+    assert_eq!(rig.fake.live(), 0, "the drop's Live charge was never released");
+    rig.audit("after the idle recycle");
+    rig.finish(false, "poisoned active_m4");
+}
+
+/// A lock this thread holds is "a command buffer may be open" whether or not
+/// it is poisoned: the recycle waits for the guard to go.
+#[test]
+fn a_poisoned_batch_lock_this_thread_holds_still_blocks_the_idle_recycle() {
+    let rig = poison_active_m4_in_a_commit_drain();
+    {
+        let _batch = rig.rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+        settle(&rig.rt);
+        assert!(rig.rt.deferred_pending(), "recycled under a held batch lock");
+    }
+    settle(&rig.rt);
+    assert!(!rig.rt.deferred_pending(), "not recycled once the lock was released");
+    assert_eq!(rig.fake.live(), 0);
+    rig.finish(false, "held poisoned active_m4");
 }

@@ -1041,6 +1041,19 @@ pub struct GpuRuntime {
     /// When true, every dispatch commits and waits, whatever `async_encode`
     /// and the open scopes say ([`Self::set_serialized_dispatch`]).
     serialized: AtomicBool,
+    /// The open batch, if any. Poison policy, one rule per kind of caller:
+    ///
+    /// - Callers that only ask "is a command buffer open?" recover a poisoned
+    ///   lock ([`Self::recycle_if_idle`], `abort_open_batch`, the `cb_open`
+    ///   read at ~2668): the panic is over and releasing deferred work is safe.
+    ///   A lock held by this thread (`WouldBlock`) still means "may be open".
+    /// - Callers that would encode or commit new work (`with_binder*`, the
+    ///   encode steps, `commit_m4`) keep refusing with the poison error: a new
+    ///   encode on a batch whose owner panicked mid-commit is new work on torn
+    ///   state. Same split as the pool lock: releases recover, new charges
+    ///   refuse.
+    /// - [`Self::flush_residency`] skips on poison; nothing will submit that
+    ///   command buffer, so the residency request is moot.
     active_m4: Mutex<Option<ActiveMetal4Batch>>,
     /// Last CounterHeap (t0, t1) resolved at synchronize.
     last_m4_stamps: Mutex<Option<(u64, u64)>>,
@@ -2014,7 +2027,8 @@ impl GpuRuntime {
     ///
     /// - no command buffer is open. A held `active_m4` lock (this call is
     ///   inside a commit or an encode step on this thread) is read as "may be
-    ///   open" and skips, as [`Self::flush_residency`] skips under it;
+    ///   open" and skips, as [`Self::flush_residency`] skips under it. A
+    ///   poisoned lock nobody holds is recovered, not skipped;
     /// - the lifetime event, read through [`Self::checked_lifetime_value`] so
     ///   a signal the queue never made poisons instead of counting, has
     ///   reached everything submitted.
@@ -2027,8 +2041,14 @@ impl GpuRuntime {
             return Ok(());
         }
         {
-            let Ok(batch) = self.active_m4.try_lock() else {
-                return Ok(());
+            // A poisoned lock is not a held one: the panic that poisoned it
+            // is over, and what the queues wait for is "no command buffer
+            // open", which the recovered guard answers. Skipping on it would
+            // park every deferred recycle behind one past panic for good.
+            let batch = match self.active_m4.try_lock() {
+                Ok(batch) => batch,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return Ok(()),
             };
             if batch.as_ref().is_some_and(|b| b.cb_open) {
                 return Ok(());
@@ -2072,7 +2092,13 @@ impl GpuRuntime {
         let m4 = &self.metal4;
         m4.residency.commit();
         m4.residency.requestResidency();
-        // try_lock: avoid re-entrancy when called under `active_m4`.
+        // try_lock: avoid re-entrancy when called under `active_m4`. A
+        // poisoned lock skips on purpose, unlike `recycle_if_idle`: the only
+        // way to a poisoned lock with `cb_open` is a panic inside
+        // `commit_m4`'s open-batch path, and after it every commit and encode
+        // refuses the lock, so nothing ever submits that command buffer
+        // (`abort_open_batch` ends it unsubmitted). A residency request for
+        // work that will never run is not needed.
         if let Ok(guard) = self.active_m4.try_lock() {
             if guard.as_ref().map(|b| b.cb_open).unwrap_or(false) {
                 m4.command_buffer.useResidencySet(&m4.residency);

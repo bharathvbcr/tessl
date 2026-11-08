@@ -958,3 +958,414 @@ fn refusal_messages_are_pinned_byte_for_byte() {
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Coverage of every pipeline `i8_gemm_pipeline_name` can return.
+// ---------------------------------------------------------------------------
+
+const GROUP_DOMAIN: [u32; 4] = [0, 64, 128, 256];
+const LAYOUT_DOMAIN: [nn::I8BLayout; 2] = [nn::I8BLayout::RowMajorKN, nn::I8BLayout::TransposedNK];
+/// Upper bound of the M scan. Large enough to hold a tile row past the first
+/// (200 > 128) so a wide kernel runs with `tiles_m > 1`.
+const M_SCAN_MAX: u32 = 200;
+
+/// Every `(m, layout, group)` the host can send to each pipeline name, derived
+/// from `i8_gemm_pipeline_name` itself. For each `(layout, group)` the M scan
+/// `1..=M_SCAN_MAX` is cut into runs of constant name; the first and last M of
+/// every run are kept, so each threshold is crossed on both sides. No name is
+/// written here: a pipeline the function gains tomorrow is covered by it.
+fn pipeline_domain() -> std::collections::BTreeMap<&'static str, Vec<(u32, nn::I8BLayout, u32)>> {
+    let mut by_name: std::collections::BTreeMap<&'static str, Vec<(u32, nn::I8BLayout, u32)>> = Default::default();
+    for &layout in &LAYOUT_DOMAIN {
+        for &group in &GROUP_DOMAIN {
+            let names: Vec<&'static str> = (1..=M_SCAN_MAX)
+                .map(|m| nn::i8_gemm_pipeline_name(m, layout, group).expect("domain call"))
+                .collect();
+            for (idx, name) in names.iter().enumerate() {
+                let first = idx == 0 || names[idx - 1] != *name;
+                let last = idx + 1 == names.len() || names[idx + 1] != *name;
+                if first || last {
+                    by_name.entry(name).or_default().push((idx as u32 + 1, layout, group));
+                }
+            }
+        }
+    }
+    by_name
+}
+
+fn nk_to_kn(logical: &[i8], n: usize, k: usize) -> Vec<i8> {
+    let mut kn = vec![0i8; k * n];
+    for p in 0..k {
+        for j in 0..n {
+            kn[p * n + j] = logical[j * k + p];
+        }
+    }
+    kn
+}
+
+/// Run one `(m, layout, group)` with seeded full-range A and B, per-column
+/// (or per-group-per-column) distinct scales, per-row A scales, a bias, and
+/// every output type; compare each to the CPU oracle bit for bit.
+fn run_domain_point(rt: &Arc<GpuRuntime>, m: u32, layout: nn::I8BLayout, group: u32) {
+    // 70 columns: two 64-wide tile columns with a ragged second one.
+    let (n, k) = (70u32, 512u32);
+    let nt = layout == nn::I8BLayout::TransposedNK;
+    let seed = 0x5eed ^ ((m as u64) << 8) ^ ((group as u64) << 20) ^ nt as u64;
+    let a = i8_data((m * k) as usize, seed);
+    let logical = i8_data((n * k) as usize, seed ^ 0xb0b);
+    let b = if nt {
+        logical
+    } else {
+        nk_to_kn(&logical, n as usize, k as usize)
+    };
+    let rows: Vec<f32> = (0..m)
+        .map(|i| [0.25, 0.5, 0.75, 1.0, 1.5, 0.125, 2.0][i as usize % 7])
+        .collect();
+    let bias_v: Vec<f32> = (0..n).map(|j| (j as f32 - 35.0) * 0.375).collect();
+    let groups = k.checked_div(group).unwrap_or(1);
+    // Distinct per column and per group, exactly representable.
+    let scales: Vec<f32> = (0..groups * n)
+        .map(|i| ((i * 7 + 3) % 251 + 1) as f32 / 2048.0)
+        .collect();
+    let row_buf = f32_buf(rt, &rows);
+    let bias = f32_buf(rt, &bias_v);
+    let sb = f32_buf(rt, &scales);
+    let tag = format!("m={m} {layout:?} group={group}");
+
+    for out in [nn::I8Out::F32, nn::I8Out::F16, nn::I8Out::Bf16] {
+        let b_scale = if group == 0 {
+            nn::I8BScale::PerColumn(&sb)
+        } else {
+            nn::I8BScale::PerGroup { scales: &sb, group }
+        };
+        let got = run_case(
+            rt,
+            Case {
+                a: &a,
+                b: &b,
+                m,
+                n,
+                k,
+                layout,
+                a_scale: nn::I8AScale::Rows(&row_buf),
+                b_scale,
+                bias: Some(&bias),
+                out,
+            },
+        );
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let want = if group == 0 {
+            oracle_full(&a, &b, mu, nu, ku, nt, Some(&rows), 1.0, Some(&scales), Some(&bias_v))
+        } else {
+            oracle_group(
+                &a,
+                &b,
+                mu,
+                nu,
+                ku,
+                group as usize,
+                nt,
+                Some(&rows),
+                1.0,
+                &scales,
+                Some(&bias_v),
+            )
+        };
+        rt.synchronize().unwrap();
+        match out {
+            nn::I8Out::F32 => assert_exact(&got.read_f32(), &want, &format!("{tag} f32")),
+            nn::I8Out::F16 | nn::I8Out::Bf16 => {
+                let bits = read_bits(&got, want.len());
+                for (i, w) in want.iter().enumerate() {
+                    let expect = if out == nn::I8Out::F16 {
+                        tessl::tensor::f32_to_f16_bits(*w)
+                    } else {
+                        tessl::tensor::f32_to_bf16_bits_gpu(*w)
+                    };
+                    assert_eq!(bits[i], expect, "{tag} {out:?} [{i}]: f32 {w}");
+                }
+            }
+        }
+    }
+
+    // Scalar activation scale, no bias, f32: the other arm of each enum.
+    let b_scale = if group == 0 {
+        nn::I8BScale::None
+    } else {
+        nn::I8BScale::PerGroup { scales: &sb, group }
+    };
+    let got = run_case(
+        rt,
+        Case {
+            a: &a,
+            b: &b,
+            m,
+            n,
+            k,
+            layout,
+            a_scale: nn::I8AScale::Scalar(0.75),
+            b_scale,
+            bias: None,
+            out: nn::I8Out::F32,
+        },
+    );
+    let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+    let want = if group == 0 {
+        oracle_full(&a, &b, mu, nu, ku, nt, None, 0.75, None, None)
+    } else {
+        oracle_group(&a, &b, mu, nu, ku, group as usize, nt, None, 0.75, &scales, None)
+    };
+    assert_exact(&got.read_f32(), &want, &format!("{tag} scalar scale"));
+}
+
+/// Every pipeline name the host can pick dispatches, and matches the oracle.
+/// The names come from [`pipeline_domain`], not a list written here. The child
+/// runs with `TESSL_KERNEL_TRACE=1` and prints one `COVERED <name>` line per
+/// name whose dispatch count rose; the parent compares those lines to the
+/// domain it derives itself. Wide kernels run with `tiles_m > 1` and
+/// `tiles_n > 1` together (M = 200, N = 70).
+#[test]
+fn every_int8_pipeline_name_dispatches_and_matches_the_oracle() {
+    let domain = pipeline_domain();
+    // 1 GEMV + {64, 128} tile x {NN, NT} x groups {0, 64, 128, 256}.
+    assert_eq!(domain.len(), 17, "pipeline names: {:?}", domain.keys());
+    assert!(
+        domain
+            .values()
+            .flatten()
+            .any(|&(m, _, _)| m.div_ceil(128) > 1 && m > 64),
+        "no wide case with tiles_m > 1"
+    );
+    let Some(out) = common::in_traced_child("every_int8_pipeline_name_dispatches_and_matches_the_oracle", || {
+        with_gpu(|rt| {
+            assert!(tessl::runtime::kernel_trace_enabled());
+            for (name, points) in &domain {
+                let before = tessl::runtime::traced_kernel_count(name);
+                for &(m, layout, group) in points {
+                    assert_eq!(nn::i8_gemm_pipeline_name(m, layout, group).unwrap(), *name);
+                    run_domain_point(rt, m, layout, group);
+                }
+                let after = tessl::runtime::traced_kernel_count(name);
+                assert!(
+                    after - before >= points.len() as u64,
+                    "{name}: {} points but {} dispatches traced",
+                    points.len(),
+                    after - before
+                );
+                println!("COVERED {name}");
+            }
+        });
+    }) else {
+        return;
+    };
+    for name in domain.keys() {
+        assert!(out.contains(&format!("COVERED {name}\n")), "{name} not covered:\n{out}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f16 output overflows; documented on `I8Out::F16`, pinned here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn f16_output_overflows_to_infinity_for_finite_inputs() {
+    with_gpu(|rt| {
+        let n = 2u32;
+        for m in [1u32, 2, 65] {
+            for (fill, label) in [(1i8, "+"), (-1i8, "-")] {
+                let run = |k_use: u32, out: nn::I8Out| {
+                    let a_k = vec![fill; (m * k_use) as usize];
+                    let b_k = vec![1i8; (k_use * n) as usize];
+                    let got = run_case(
+                        rt,
+                        Case {
+                            a: &a_k,
+                            b: &b_k,
+                            m,
+                            n,
+                            k: k_use,
+                            layout: nn::I8BLayout::RowMajorKN,
+                            a_scale: nn::I8AScale::Scalar(1.0),
+                            b_scale: nn::I8BScale::None,
+                            bias: None,
+                            out,
+                        },
+                    );
+                    rt.synchronize().unwrap();
+                    got
+                };
+                let sign: f32 = if fill > 0 { 1.0 } else { -1.0 };
+                // 65504 is the largest finite half and is exact.
+                let at_max = read_bits(&run(65_504, nn::I8Out::F16), (m * n) as usize);
+                let want_max = tessl::tensor::f32_to_f16_bits(sign * 65_504.0);
+                assert!(
+                    at_max.iter().all(|&v| v == want_max),
+                    "{label} m={m} k=65504: {at_max:?}"
+                );
+                assert_eq!(want_max & 0x7fff, 0x7bff);
+                // Past it the finite f32 sum 70000 stores as +-inf. No flag, no error.
+                let over = read_bits(&run(70_000, nn::I8Out::F16), (m * n) as usize);
+                let inf_bits: u16 = if fill > 0 { 0x7c00 } else { 0xfc00 };
+                assert!(
+                    over.iter().all(|&v| v == inf_bits),
+                    "{label} m={m} k=70000 f16: {over:?}"
+                );
+                // The same sum is finite and exact in f32, and finite in bf16.
+                let f32_out = run(70_000, nn::I8Out::F32).read_f32();
+                assert!(
+                    f32_out.iter().take((m * n) as usize).all(|&v| v == sign * 70_000.0),
+                    "{f32_out:?}"
+                );
+                let bf = read_bits(&run(70_000, nn::I8Out::Bf16), (m * n) as usize);
+                let want_bf = tessl::tensor::f32_to_bf16_bits_gpu(sign * 70_000.0);
+                assert!(bf.iter().all(|&v| v == want_bf), "{label} m={m} bf16: {bf:?}");
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// i8_quantize_rows on general data, and under many threadgroups.
+// ---------------------------------------------------------------------------
+
+/// Seeded rows spanning magnitudes and signs; every 11th row all zeros.
+fn random_rows(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    let mut next = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let mut out = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        let mag = [0.001f32, 0.37, 1.0, 13.0, 4096.0][r % 5];
+        for _ in 0..cols {
+            out.push(if r % 11 == 0 { 0.0 } else { next() * mag });
+        }
+    }
+    out
+}
+
+/// Check one quantized row against the IEEE host reference.
+///
+/// Tolerance, and why. The kernel is built with fast math. Measured on this
+/// device: `red[0] / 127.0f` is not the correctly rounded quotient for every
+/// absmax (a reciprocal multiply), so the scale may differ from the host
+/// `absmax / 127` by 1 ulp; it is checked as at most 1 ulp apart, never more.
+/// `q` is then checked against the reference built from the scale the kernel
+/// actually wrote, so the scale's own error is not double counted. The
+/// kernel's `x / scale` may likewise be off by a few ulp of the quotient
+/// `r = x / scale`. That can move `r` across a `.5` boundary and no other
+/// integer boundary, so `q` may differ from `rint(r)` by 1, and only when
+/// `|r - (floor(r) + 0.5)| <= 8 * EPSILON * |r|` (8 ulp, at most 1.2e-4 for
+/// |r| <= 127). Everywhere else `q` must be identical. Returns how many
+/// elements used that allowance.
+fn check_quant_row(row: &[f32], got_q: &[u8], got_scale: f32, tag: &str) -> usize {
+    let (_, host_s) = quant_row(row).expect("finite row");
+    let ulps = (got_scale.to_bits() as i64 - host_s.to_bits() as i64).abs();
+    assert!(ulps <= 1, "{tag} scale {got_scale} vs host {host_s}: {ulps} ulp");
+    if ulps == 1 {
+        // Classification: the absmax is exact (an fmax of |x|), so the gap is
+        // the divide. `recip` is the reciprocal-multiply form fast math emits.
+        let absmax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let recip = absmax * (1.0f32 / 127.0);
+        println!(
+            "SCALE1ULP {tag}: absmax bits {:#010x} kernel scale {:#010x} host absmax/127 {:#010x} absmax*(1/127) {:#010x} kernel==recip {}",
+            absmax.to_bits(),
+            got_scale.to_bits(),
+            host_s.to_bits(),
+            recip.to_bits(),
+            got_scale.to_bits() == recip.to_bits()
+        );
+    }
+    let mut slack = 0usize;
+    for (c, x) in row.iter().enumerate() {
+        let got = got_q[c] as i8;
+        let r = *x / got_scale;
+        let want = r.round_ties_even().clamp(-127.0, 127.0) as i8;
+        if got == want {
+            continue;
+        }
+        let dist = (r - (r.floor() + 0.5)).abs();
+        assert!(
+            (got as i32 - want as i32).abs() == 1 && dist <= 8.0 * f32::EPSILON * r.abs(),
+            "{tag} col {c}: x {x} scale {got_scale} ratio {r} got {got} want {want} (dist to .5 {dist})"
+        );
+        slack += 1;
+    }
+    slack
+}
+
+#[test]
+fn per_row_quantize_on_random_rows_is_within_the_stated_tolerance() {
+    with_gpu(|rt| {
+        let (rows, cols) = (64usize, 777usize);
+        let flat = random_rows(rows, cols, 0xfeed);
+        let x = f32_buf(rt, &flat);
+        let q = rt.alloc_buffer(flat.len()).unwrap();
+        let scales = f32_buf(rt, &vec![f32::NAN; rows]);
+        nn::quantize_i8_rows(rt, &x, &q, &scales, rows as u32, cols as u32).expect("quantize");
+        let got_q = q.contents_u8()[..flat.len()].to_vec();
+        let got_s = scales.read_f32();
+        let mut slack = 0;
+        for r in 0..rows {
+            slack += check_quant_row(
+                &flat[r * cols..(r + 1) * cols],
+                &got_q[r * cols..(r + 1) * cols],
+                got_s[r],
+                &format!("row {r}"),
+            );
+        }
+        println!("elements using the 1-step allowance: {slack} of {}", rows * cols);
+    });
+}
+
+/// Many threadgroups, repeated, with the outputs pre-filled with poison. The
+/// kernel's second phase must see the scale and the bad flag from the
+/// reduction of its own row. A stale scale (poison NaN) or a stale bad flag
+/// (the host zero-fills `bad`, so a not-yet-visible flag reads 0 and a bad row
+/// would be quantized) shows as a wrong q, scale or a written bad row.
+///
+/// Honest limit: the read-back-from-device-memory ordering gap this guards is
+/// a memory-model hazard, not something Apple GPUs are known to expose in
+/// practice; on a device where thread 0's device write is visible to its
+/// threadgroup in time this test passes against the old kernel too. It checks
+/// the contract at volume; the fix stands on the memory model. `bad` is
+/// allocated inside `quantize_i8_rows`, so the poison goes into `q` and
+/// `scales` only.
+#[test]
+fn quantize_rows_under_many_threadgroups_repeats_clean() {
+    with_gpu(|rt| {
+        let (rows, cols) = (4096usize, 515usize);
+        let clean = random_rows(rows, cols, 0xc0ffee);
+        let mut dirty = clean.clone();
+        let bad_rows: Vec<usize> = (0..rows).filter(|r| r % 97 == 5).collect();
+        for &r in &bad_rows {
+            dirty[r * cols + (r * 31) % cols] = if r % 2 == 0 { f32::NAN } else { f32::INFINITY };
+        }
+        for iter in 0..6 {
+            let with_bad = iter % 2 == 1;
+            let data = if with_bad { &dirty } else { &clean };
+            let x = f32_buf(rt, data);
+            let q = rt.alloc_buffer(data.len()).unwrap();
+            q.write_bytes(&vec![0x7fu8; data.len()]);
+            let scales = f32_buf(rt, &vec![f32::NAN; rows]);
+            let res = nn::quantize_i8_rows(rt, &x, &q, &scales, rows as u32, cols as u32);
+            if with_bad {
+                assert!(res.expect_err("bad rows").contains("non-finite"));
+            } else {
+                res.expect("clean");
+            }
+            let got_q = q.contents_u8()[..data.len()].to_vec();
+            let got_s = scales.read_f32();
+            for r in 0..rows {
+                let tag = format!("iter {iter} row {r}");
+                let qrow = &got_q[r * cols..(r + 1) * cols];
+                if with_bad && bad_rows.contains(&r) {
+                    assert!(qrow.iter().all(|&v| v == 0x7f), "{tag}: a non-finite row was written");
+                } else {
+                    check_quant_row(&data[r * cols..(r + 1) * cols], qrow, got_s[r], &tag);
+                }
+            }
+        }
+    });
+}

@@ -300,14 +300,17 @@ kernel void i8_quantize_rows(device float *x [[buffer(0)]], device int8_t *q [[b
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // red[0] and bred[0] are final after the reduce loop's last barrier and are
+    // never written again, so every thread reads them from threadgroup memory
+    // and computes the same scale. Reading them back from the device writes
+    // below would not be ordered: threadgroup_barrier(mem_threadgroup) orders
+    // threadgroup memory only.
+    const float scale = (red[0] == 0.0f) ? 1.0f : red[0] / 127.0f;
     if (tid == 0u) {
-        float scale = (red[0] == 0.0f) ? 1.0f : red[0] / 127.0f;
         scales[row] = scale;
         bad[row] = bred[0];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (bad[row] != 0u) return;
-    float scale = scales[row];
+    if (bred[0] != 0u) return;
     for (uint c = tid; c < cols; c += 256u) {
         float v = x[(ulong)row * cols + c] / scale;
         int qi = (int)rint(v);

@@ -27,6 +27,14 @@ pub(crate) const MAX_K_EXACT_INT4B: u32 = i32::MAX as u32 / MAX_INT4B_PRODUCT;
 pub const ATTENTION_HEAD_DIMS: [u32; 5] = [32, 64, 128, 256, 512];
 
 /// Store type of a quantized GEMM. The int32 product is scaled in f32 first.
+///
+/// `F16` overflows: a finite result past 65504 (the largest finite half,
+/// rounding to nearest even, so 65520 and above) is stored as +-infinity. For
+/// example `k = 70000` with all-ones A and B and unit scales stores `+inf`,
+/// although the f32 sum is exactly 70000. There is no flag and no error; the
+/// call succeeds. Use `F32` or `Bf16` (f32's exponent range) when the scaled
+/// accumulator can exceed 65504. `tests/gemm_i8.rs`
+/// `f16_output_overflows_to_infinity_for_finite_inputs` pins this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum I8Out {
     F32,
@@ -138,7 +146,9 @@ pub fn i8_gemm_pipeline_name(m: u32, layout: I8BLayout, group: u32) -> Result<&'
 }
 
 /// Per-row symmetric int8 quantize. `scale = absmax / 127`, or 1 for an
-/// all-zero row. `q = clamp(rint(x / scale), -127, 127)`. A non-finite input
+/// all-zero row. The kernel is fast-math: the scale can differ from the host's
+/// correctly rounded `absmax / 127` by 1 ulp (it is `absmax * (1/127)`), and
+/// `q` by 1 within a few ulp of a `.5` rounding boundary. `q = clamp(rint(x / scale), -127, 127)`. A non-finite input
 /// returns an error and does not run a matmul.
 pub fn quantize_i8_rows(
     rt: &Arc<GpuRuntime>,
@@ -176,6 +186,9 @@ pub fn quantize_i8_rows(
 /// `C = dequant(A @ B)` on the GPU. M == 1 runs the int8 GEMV. `2 <= M <= 64`
 /// runs the 64×64 tile. Larger M runs 128×64. A malformed call returns before
 /// dispatch.
+///
+/// With `out: I8Out::F16` a result whose magnitude exceeds 65504 is stored as
+/// +-infinity, with no flag or error; see [`I8Out`].
 pub fn gemm_i8(rt: &Arc<GpuRuntime>, spec: I8Gemm<'_>) -> Result<(), String> {
     let I8Gemm {
         a,

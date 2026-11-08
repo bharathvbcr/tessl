@@ -3,6 +3,13 @@
 //! types, out-of-range u32, unknown keys) must read the same in both.
 
 use tessl::bert::BertConfig;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use tessl::embedgemma2::EmbedGemma2Config;
+use tessl::embedgemma2_audio::AudioConfig;
+use tessl::embedgemma2_vision::VisionConfig;
 use tessl::qwen35_model::Qwen35Config;
 
 const MINI: &str = r#"{"hidden_act":"gelu","hidden_size":384,
@@ -187,4 +194,131 @@ fn bert_null_string_is_a_wrong_type_not_absent() {
     );
     let q = qwen_err(&edit(QWEN, "\"hidden_act\": \"silu\"", "\"hidden_act\": null"));
     assert!(q.starts_with("config.json: hidden_act must be a string, got "), "{q}");
+}
+
+// Card ft-16a434be: every `from_config_file` reads through one bounded reader.
+
+const CAP: u64 = 1 << 20;
+
+type FileReader = fn(&Path) -> Result<(), String>;
+
+/// The five `from_config_file` readers. A refusal test over all five is what
+/// shows each one goes through the bounded reader.
+const READERS: [(&str, FileReader); 5] = [
+    ("bert", |p| BertConfig::from_config_file(p).map(|_| ())),
+    ("qwen35", |p| Qwen35Config::from_config_file(p).map(|_| ())),
+    ("embedgemma2", |p| EmbedGemma2Config::from_config_file(p).map(|_| ())),
+    ("vision", |p| VisionConfig::from_config_file(p).map(|_| ())),
+    ("audio", |p| AudioConfig::from_config_file(p).map(|_| ())),
+];
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("tessl-config-cap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn sparse(path: &Path, len: u64) {
+    std::fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+#[test]
+fn every_file_reader_refuses_a_config_past_the_cap_by_its_length() {
+    let s = Scratch::new("over");
+    let f = s.path("config.json");
+    sparse(&f, CAP + 1);
+    for (name, read) in READERS {
+        let e = read(&f).unwrap_err();
+        assert!(
+            e.contains(&format!("{}: {} bytes, above the {CAP}-byte config cap", f.display(), CAP + 1)),
+            "{name}: {e}"
+        );
+    }
+}
+
+#[test]
+fn every_file_reader_refuses_a_directory() {
+    let s = Scratch::new("dir");
+    for (name, read) in READERS {
+        let e = read(&s.0).unwrap_err();
+        assert!(e.contains("not a regular file"), "{name}: {e}");
+    }
+}
+
+#[test]
+fn every_file_reader_refuses_invalid_utf8() {
+    let s = Scratch::new("utf8");
+    let f = s.path("config.json");
+    std::fs::write(&f, [b'{', 0xff, 0xfe, b'}']).unwrap();
+    for (name, read) in READERS {
+        let e = read(&f).unwrap_err();
+        assert!(e.starts_with(&format!("{}: ", f.display())), "{name}: {e}");
+        assert!(!e.contains("config.json:"), "{name} reached the parser: {e}");
+    }
+}
+
+#[test]
+fn every_file_reader_refuses_a_fifo_without_blocking() {
+    let s = Scratch::new("fifo");
+    let f = s.path("config.json");
+    let made = std::process::Command::new("mkfifo").arg(&f).status().unwrap();
+    assert!(made.success(), "mkfifo failed");
+    for (name, read) in READERS {
+        let (tx, rx) = mpsc::channel();
+        let p = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&p));
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(r) => {
+                let e = r.unwrap_err();
+                assert!(e.contains("not a regular file"), "{name}: {e}");
+            }
+            Err(_) => {
+                // The reader is blocked in open(2); a writer releases it so
+                // the thread ends, then the test fails.
+                let _ = std::fs::OpenOptions::new().write(true).open(&f);
+                panic!("{name}: from_config_file blocked on a FIFO");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_config_symlink_is_followed() {
+    let s = Scratch::new("link");
+    let blob = s.path("blob");
+    std::fs::write(&blob, MINI).unwrap();
+    let link = s.path("config.json");
+    std::os::unix::fs::symlink(&blob, &link).unwrap();
+    BertConfig::from_config_file(&link).unwrap();
+}
+
+#[test]
+fn a_config_of_exactly_the_cap_is_read() {
+    let s = Scratch::new("exact");
+    let f = s.path("config.json");
+    let mut text = MINI.to_string();
+    text.push_str(&" ".repeat(CAP as usize - text.len()));
+    assert_eq!(text.len() as u64, CAP);
+    std::fs::write(&f, &text).unwrap();
+    BertConfig::from_config_file(&f).unwrap();
+    text.push(' ');
+    std::fs::write(&f, &text).unwrap();
+    let e = BertConfig::from_config_file(&f).unwrap_err();
+    assert!(e.contains("above the 1048576-byte config cap"), "{e}");
 }

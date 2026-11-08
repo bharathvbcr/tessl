@@ -342,25 +342,30 @@ fn fill_x(m_max: usize) -> Vec<f32> {
     x
 }
 
-/// Check one quantized row against a host quantize with the kernel's
-/// arithmetic: `scale = absmax / 127` (1 for a zero row; 1e-6 relative slack
-/// covers a reciprocal multiply), then `q = clamp(rint(x / scale), -127, 127)`
-/// with the GPU's own `scale`. A value within 1e-3 of a rounding tie may
-/// differ by one (a fast divide can fall either side of the tie); anything
-/// else, such as `floor` for `rint`, fails.
+/// Check one quantized row against the host's IEEE quantize, within exactly the
+/// tolerance `src/i8_pipeline.rs` `quantize_i8_rows` documents (da0bd11) and
+/// `tests/gemm_i8.rs` asserts: the kernel is fast-math, so
+/// - the scale is within 1 ulp of the host's `absmax / 127` (1 for a zero row);
+/// - `q` is compared with `clamp(rint(r), -127, 127)` for `r = x / scale`, using
+///   the scale the kernel wrote, and may differ by 1 only where
+///   `|r - (floor(r) + 0.5)| <= 8 * f32::EPSILON * |r|`; everywhere else it
+///   must be exact. `floor` for `rint`, or a wrong scale, fails.
 fn check_quantized(label: &str, x: &[f32], q: &[u8], scale: f32) -> Result<(), String> {
     let want_scale = row_scale(x);
-    if (f64::from(scale) - f64::from(want_scale)).abs() > 1e-6 * f64::from(want_scale) {
-        return Err(format!("{label}: scale {scale} against oracle {want_scale}"));
+    let ulps = (i64::from(scale.to_bits()) - i64::from(want_scale.to_bits())).abs();
+    if ulps > 1 {
+        return Err(format!(
+            "{label}: scale {scale} against host {want_scale}: {ulps} ulp apart (at most 1 allowed)"
+        ));
     }
     for (i, (&xv, &qb)) in x.iter().zip(q).enumerate() {
-        let v = xv / scale;
-        let want = v.round_ties_even().clamp(-127.0, 127.0) as i32;
+        let r = xv / scale;
+        let want = r.round_ties_even().clamp(-127.0, 127.0) as i32;
         let got = i32::from(qb as i8);
-        let near_tie = (v - v.floor() - 0.5).abs() < 1e-3;
-        if got != want && !(near_tie && (got - want).abs() <= 1) {
+        let near_tie = (r - (r.floor() + 0.5)).abs() <= 8.0 * f32::EPSILON * r.abs();
+        if got != want && !(near_tie && (got - want).abs() == 1) {
             return Err(format!(
-                "{label}: q[{i}] = {got}, host quantize of {xv} / {scale} = {v} gives {want}"
+                "{label}: q[{i}] = {got}, host quantize of {xv} / {scale} = {r} gives {want}"
             ));
         }
     }

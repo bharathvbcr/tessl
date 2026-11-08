@@ -350,7 +350,10 @@ fn refusals_without_blocking(f: &Path) -> Vec<(&'static str, String)> {
 
 fn assert_every_refusal_names(f: &Path, needle: &str) {
     for (name, e) in refusals_without_blocking(f) {
-        assert!(e.contains(&f.display().to_string()), "{name}: the refusal omits the path: {e}");
+        assert!(
+            e.contains(&f.display().to_string()),
+            "{name}: the refusal omits the path: {e}"
+        );
         assert!(e.contains(needle), "{name}: expected {needle:?}: {e}");
     }
 }
@@ -368,7 +371,11 @@ fn edge_a_symlink_loop_is_refused_naming_the_path() {
 fn edge_a_symlink_to_a_fifo_is_refused_without_blocking() {
     let s = Scratch::new("linkfifo");
     let fifo = s.path("fifo");
-    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
     let link = s.path("config.json");
     std::os::unix::fs::symlink(&fifo, &link).unwrap();
     assert_every_refusal_names(&link, "not a regular file");
@@ -408,7 +415,10 @@ fn edge_an_empty_file_is_an_error_for_every_reader() {
     let f = s.path("config.json");
     std::fs::write(&f, b"").unwrap();
     for (name, e) in refusals_without_blocking(&f) {
-        assert!(e.starts_with(&format!("{}: config.json: JSON:", f.display())), "{name}: {e}");
+        assert!(
+            e.starts_with(&format!("{}: config.json: JSON:", f.display())),
+            "{name}: {e}"
+        );
     }
 }
 
@@ -446,7 +456,10 @@ fn edge_a_utf8_bom_is_refused_as_a_config_error() {
     bytes.extend_from_slice(MINI.as_bytes());
     std::fs::write(&f, bytes).unwrap();
     for (name, e) in refusals_without_blocking(&f) {
-        assert!(e.starts_with(&format!("{}: config.json: JSON:", f.display())), "{name}: {e}");
+        assert!(
+            e.starts_with(&format!("{}: config.json: JSON:", f.display())),
+            "{name}: {e}"
+        );
     }
 }
 
@@ -460,7 +473,7 @@ fn edge_a_config_without_read_permission_is_refused_naming_the_path() {
     let s = Scratch::new("noperm");
     let f = s.path("config.json");
     std::fs::write(&f, MINI).unwrap();
-    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
     assert_every_refusal_names(&f, "ermission denied");
 }
 

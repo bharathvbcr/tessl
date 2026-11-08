@@ -326,3 +326,152 @@ fn a_config_of_exactly_the_cap_is_read() {
     let e = BertConfig::from_config_file(&f).unwrap_err();
     assert!(e.contains("above the 1048576-byte config cap"), "{e}");
 }
+
+// Card ft-16a434be, adversarial review (B-1): edge cases on the seam.
+
+/// Run every reader on `f` on its own thread; a reader that has not returned
+/// in 10 s is blocked or reading forever. Returns each reader's refusal.
+fn refusals_without_blocking(f: &Path) -> Vec<(&'static str, String)> {
+    READERS
+        .iter()
+        .map(|&(name, read)| {
+            let (tx, rx) = mpsc::channel();
+            let p = f.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(read(&p));
+            });
+            let r = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{name}: from_config_file did not return on {}", f.display()));
+            (name, r.expect_err(name))
+        })
+        .collect()
+}
+
+fn assert_every_refusal_names(f: &Path, needle: &str) {
+    for (name, e) in refusals_without_blocking(f) {
+        assert!(e.contains(&f.display().to_string()), "{name}: the refusal omits the path: {e}");
+        assert!(e.contains(needle), "{name}: expected {needle:?}: {e}");
+    }
+}
+
+#[test]
+fn edge_a_symlink_loop_is_refused_naming_the_path() {
+    let s = Scratch::new("loop");
+    let (a, b) = (s.path("a.json"), s.path("b.json"));
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    assert_every_refusal_names(&a, "");
+}
+
+#[test]
+fn edge_a_symlink_to_a_fifo_is_refused_without_blocking() {
+    let s = Scratch::new("linkfifo");
+    let fifo = s.path("fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let link = s.path("config.json");
+    std::os::unix::fs::symlink(&fifo, &link).unwrap();
+    assert_every_refusal_names(&link, "not a regular file");
+}
+
+#[test]
+fn edge_a_symlink_to_a_char_device_is_refused_not_read_forever() {
+    let s = Scratch::new("chardev");
+    for dev in ["/dev/zero", "/dev/urandom"] {
+        let link = s.path("config.json");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(dev, &link).unwrap();
+        assert_every_refusal_names(&link, "not a regular file");
+        assert_every_refusal_names(Path::new(dev), "not a regular file");
+    }
+}
+
+#[test]
+fn edge_a_unix_socket_is_refused() {
+    let s = Scratch::new("sock");
+    let sock = s.path("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    assert_every_refusal_names(&sock, "not a regular file");
+}
+
+#[test]
+fn edge_a_dangling_symlink_is_refused_naming_the_path() {
+    let s = Scratch::new("dangling");
+    let link = s.path("config.json");
+    std::os::unix::fs::symlink(s.path("nowhere"), &link).unwrap();
+    assert_every_refusal_names(&link, "");
+}
+
+#[test]
+fn edge_an_empty_file_is_an_error_for_every_reader() {
+    let s = Scratch::new("empty");
+    let f = s.path("config.json");
+    std::fs::write(&f, b"").unwrap();
+    for (name, e) in refusals_without_blocking(&f) {
+        assert!(e.starts_with("config.json:"), "{name}: {e}");
+    }
+}
+
+#[test]
+fn edge_exactly_the_cap_plus_one_behind_a_symlink_is_refused_naming_the_link() {
+    let s = Scratch::new("linkover");
+    let blob = s.path("blob");
+    sparse(&blob, CAP + 1);
+    let link = s.path("config.json");
+    std::os::unix::fs::symlink(&blob, &link).unwrap();
+    assert_every_refusal_names(&link, &format!("{} bytes, above the {CAP}-byte config cap", CAP + 1));
+}
+
+#[test]
+fn edge_a_non_utf8_path_does_not_panic_and_reads_when_it_exists() {
+    use std::os::unix::ffi::OsStrExt;
+    let s = Scratch::new("badname");
+    let name = std::ffi::OsStr::from_bytes(b"conf\xffig.json");
+    let f = s.0.join(name);
+    for (rname, e) in refusals_without_blocking(&f) {
+        assert!(e.contains("conf"), "{rname}: {e}");
+    }
+    // APFS refuses non-UTF-8 names (EILSEQ); where the name can be created the
+    // config must read.
+    if std::fs::write(&f, MINI).is_ok() {
+        BertConfig::from_config_file(&f).unwrap();
+    }
+}
+
+#[test]
+fn edge_a_utf8_bom_is_refused_as_a_config_error() {
+    let s = Scratch::new("bom");
+    let f = s.path("config.json");
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(MINI.as_bytes());
+    std::fs::write(&f, bytes).unwrap();
+    for (name, e) in refusals_without_blocking(&f) {
+        assert!(e.starts_with("config.json:"), "{name}: {e}");
+    }
+}
+
+#[test]
+fn edge_a_config_without_read_permission_is_refused_naming_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&root.stdout).trim() == "0" {
+        return; // root reads a mode-000 file
+    }
+    let s = Scratch::new("noperm");
+    let f = s.path("config.json");
+    std::fs::write(&f, MINI).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0)).unwrap();
+    assert_every_refusal_names(&f, "ermission denied");
+}
+
+#[test]
+fn edge_a_path_past_path_max_is_refused_naming_the_path() {
+    let s = Scratch::new("long");
+    let mut f = s.0.clone();
+    for _ in 0..8 {
+        f.push("a".repeat(200));
+    }
+    f.push("config.json");
+    assert!(f.as_os_str().len() > 1024);
+    assert_every_refusal_names(&f, "");
+}

@@ -150,6 +150,17 @@ pub fn i8_gemm_pipeline_name(m: u32, layout: I8BLayout, group: u32) -> Result<&'
 /// correctly rounded `absmax / 127` by 1 ulp (it is `absmax * (1/127)`), and
 /// `q` by 1 within a few ulp of a `.5` rounding boundary. `q = clamp(rint(x / scale), -127, 127)`. A non-finite input
 /// returns an error and does not run a matmul.
+///
+/// The 1 ulp scale bound holds only for `absmax >= 127 * f32::MIN_POSITIVE`
+/// (about 1.5e-36), where `absmax / 127` is a normal f32. Below that the scale
+/// would be subnormal and the GPU flushes f32 subnormals to zero under both
+/// fast and safe math (hardware behaviour, GitPulse card ft-02eec315), so the
+/// kernel does not write the host's subnormal scale. Such a row is written with
+/// scale 0 (`q` saturated to +-127 or 0) or, for an all-subnormal row that reads
+/// as absmax 0, scale 1 with `q` all 0. Either way the scale is finite and the
+/// dequantised row `q * scale` is exactly 0, so it contributes exactly 0 to a
+/// GEMM and never a NaN or inf; the host quantizer is unchanged and differs
+/// from the kernel there (GitPulse card ft-c68232d9).
 pub fn quantize_i8_rows(
     rt: &Arc<GpuRuntime>,
     x: &GpuBuffer,

@@ -44,8 +44,15 @@ const REPLICA_REL_TOL: f64 = 0.05;
 /// Fail unless every `(name, real, replica)` row agrees within `rel_tol`.
 /// Every failing row is named with its real, replica and relative gap. A row
 /// that cannot be compared (non-finite, or `real <= 0`) fails, and so does an
-/// empty table.
+/// empty table or a `rel_tol` outside `[0, 1)` (including NaN and infinity).
 fn check_replica_against_parts(rows: &[(&str, f64, f64)], rel_tol: f64) -> Res<()> {
+    // A NaN or infinite tolerance makes `gap > tol * real` false for every row, and
+    // a tolerance of 1 or more lets a zero replica pass: neither may disable the check.
+    if !rel_tol.is_finite() || !(0.0..1.0).contains(&rel_tol) {
+        return Err(format!(
+            "replica cross-check: tolerance {rel_tol} is invalid (need a finite value in [0, 1))"
+        ));
+    }
     if rows.is_empty() {
         return Err("replica cross-check: no rows to compare".to_string());
     }
@@ -823,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_zero_or_negative_replica_against_a_positive_real_fails() {
-        for replica in [0.0, -0.0, -1.0, -100.0, f64::MIN_POSITIVE / 2.0 * -1.0] {
+        for replica in [0.0, -0.0, -1.0, -100.0, -(f64::MIN_POSITIVE / 2.0)] {
             let err = check_replica_against_parts(&[("row", 100.0, replica)], REPLICA_REL_TOL)
                 .expect_err(&format!("replica {replica} must not pass"));
             assert!(err.contains("row"), "{err}");

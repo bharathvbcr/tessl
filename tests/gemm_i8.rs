@@ -1404,7 +1404,10 @@ fn edge_rows(cols: usize) -> Vec<(&'static str, Vec<f32>)> {
     single[cols - 1] = -3.25;
     rows.push(("single nonzero in the last column", single));
     let ties = [127.0f32, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, -126.5, 63.5, -64.5];
-    rows.push(("half-way values at scale 1", (0..cols).map(|c| ties[c % ties.len()]).collect()));
+    rows.push((
+        "half-way values at scale 1",
+        (0..cols).map(|c| ties[c % ties.len()]).collect(),
+    ));
     rows.push((
         "alternating +-max",
         (0..cols).map(|c| if c % 2 == 0 { 1000.0 } else { -1000.0 }).collect(),
@@ -1436,39 +1439,76 @@ fn adv_quantize_cols_sweep_holds_the_stated_tolerance_and_never_emits_minus_128(
     });
 }
 
+/// Rows whose `absmax` is below `127 * f32::MIN_POSITIVE` have a scale
+/// (`absmax / 127`) below the smallest normal f32. Metal flushes f32 subnormals
+/// to zero under fast and safe math alike (hardware; GitPulse card
+/// ft-02eec315), so the kernel cannot produce that scale. Documented contract
+/// (`quantize_i8_rows`, card ft-c68232d9): the written scale is a finite 0.0 (the
+/// row's `q` saturate to +-127 or are 0) or 1.0 (an all-subnormal row read as
+/// absmax 0, `q` all 0), and either way the dequantised row `q * scale` is
+/// exactly 0, so the row contributes exactly 0 to a GEMM and never NaN or inf.
+/// Rows at or above the threshold still match the host reference.
 #[test]
-fn adv_quantize_subnormal_rows_match_the_host_reference() {
+fn adv_quantize_rows_below_the_normal_scale_range_contribute_exactly_zero() {
     with_gpu(|rt| {
         let cols = 300usize;
         let sub = f32::from_bits(0x0000_1234); // subnormal
-        let cases: Vec<(&str, Vec<f32>)> = vec![
+                                               // absmax < 127 * f32::MIN_POSITIVE: the documented flush-to-zero range.
+        let below: Vec<(&str, Vec<f32>)> = vec![
             ("all subnormal", (0..cols).map(|c| sub * (1 + c % 7) as f32).collect()),
+            (
+                "absmax is f32::MIN_POSITIVE",
+                (0..cols)
+                    .map(|c| f32::MIN_POSITIVE * (1 + c % 3) as f32 / 3.0)
+                    .collect(),
+            ),
+            (
+                "absmax 4e-37 (scale is subnormal)",
+                (0..cols).map(|c| 1e-37 * ((c % 9) as f32 - 4.0)).collect(),
+            ),
+        ];
+        // absmax >= 127 * f32::MIN_POSITIVE: host parity holds.
+        let at_or_above: Vec<(&str, Vec<f32>)> = vec![
             (
                 "subnormal with one normal 1e-3",
                 (0..cols).map(|c| if c == 5 { 1e-3 } else { sub }).collect(),
             ),
-            ("absmax is f32::MIN_POSITIVE", (0..cols).map(|c| f32::MIN_POSITIVE * (1 + c % 3) as f32 / 3.0).collect()),
-            ("absmax 1e-37 (scale is subnormal)", (0..cols).map(|c| 1e-37 * ((c % 9) as f32 - 4.0)).collect()),
-            ("absmax 1e-36 (scale is normal)", (0..cols).map(|c| 1e-36 * ((c % 9) as f32 - 4.0)).collect()),
+            (
+                "absmax 4e-36 (scale is normal)",
+                (0..cols).map(|c| 1e-36 * ((c % 9) as f32 - 4.0)).collect(),
+            ),
         ];
-        let mut failures = Vec::new();
-        for (name, row) in &cases {
+        let threshold = 127.0 * f32::MIN_POSITIVE;
+        for (name, row) in &below {
+            let absmax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(absmax < threshold, "`{name}` is not below the threshold");
             let (res, got_q, got_s) = quantize_poisoned(rt, row, 1, cols);
             res.unwrap_or_else(|e| panic!("`{name}`: {e}"));
-            let (host_q, host_s) = quant_row(row).unwrap();
-            println!(
-                "`{name}`: kernel scale {:#010x} host scale {:#010x}; kernel q[0..6] {:?} host q[0..6] {:?}",
-                got_s[0].to_bits(),
-                host_s.to_bits(),
-                &got_q[..6].iter().map(|v| *v as i8).collect::<Vec<_>>(),
-                &host_q[..6]
+            let scale = got_s[0];
+            let head = &got_q[..6];
+            println!("`{name}`: kernel scale {:#010x}; q[0..6] {head:?}", scale.to_bits());
+            assert!(scale.is_finite(), "`{name}`: scale {scale} is not finite");
+            assert!(
+                scale == 0.0 || scale == 1.0,
+                "`{name}`: scale {scale} is neither 0 nor 1"
             );
-            let outcome = std::panic::catch_unwind(|| check_quant_row(row, &got_q, got_s[0], name));
-            if outcome.is_err() {
-                failures.push(*name);
+            assert!(got_q.iter().all(|&v| v != 0x80), "`{name}`: q holds -128 (or poison)");
+            for (c, &q) in got_q.iter().enumerate() {
+                let dq = f32::from(q as i8) * scale;
+                assert!(
+                    dq == 0.0,
+                    "`{name}`: dequantised element {c} is {dq} (q {}, scale {scale})",
+                    q as i8
+                );
             }
         }
-        assert!(failures.is_empty(), "subnormal cases outside the stated tolerance: {failures:?}");
+        for (name, row) in &at_or_above {
+            let absmax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(absmax >= threshold, "`{name}` is not at or above the threshold");
+            let (res, got_q, got_s) = quantize_poisoned(rt, row, 1, cols);
+            res.unwrap_or_else(|e| panic!("`{name}`: {e}"));
+            check_quant_row(row, &got_q, got_s[0], name);
+        }
     });
 }
 
@@ -1486,7 +1526,8 @@ fn adv_quantize_absmax_at_f32_max_is_finite_and_in_range() {
             .collect();
         let (res, got_q, got_s) = quantize_poisoned(rt, &row, 1, cols);
         res.expect("finite row");
-        println!("f32::MAX row: scale {:#010x} q[0..4] {:?}", got_s[0].to_bits(), &got_q[..4]);
+        let head = &got_q[..4];
+        println!("f32::MAX row: scale {:#010x} q[0..4] {head:?}", got_s[0].to_bits());
         assert!(got_s[0].is_finite() && got_s[0] > 0.0, "scale {}", got_s[0]);
         assert!(got_q.iter().all(|&v| v != 0x80));
         check_quant_row(&row, &got_q, got_s[0], "f32::MAX row");
@@ -1525,7 +1566,10 @@ fn adv_quantize_single_non_finite_element_is_refused_and_isolated() {
                 let qrow = &got_q[r * cols..(r + 1) * cols];
                 let row = &dirty[r * cols..(r + 1) * cols];
                 if bad.contains(&r) {
-                    assert!(qrow.iter().all(|&v| v == 0x55), "cols {cols} row {r}: a refused row was written");
+                    assert!(
+                        qrow.iter().all(|&v| v == 0x55),
+                        "cols {cols} row {r}: a refused row was written"
+                    );
                     let finite: Vec<f32> = row.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
                     let (_, want) = quant_row(&finite).unwrap();
                     let ulps = (got_s[r].to_bits() as i64 - want.to_bits() as i64).abs();
@@ -1639,10 +1683,23 @@ fn adv_f16_store_boundary_is_exactly_65520() {
                     );
                     rt.synchronize().unwrap();
                     let bits = read_bits(&got, (m * n) as usize);
-                    println!("m={m} scalar scale {:+} -> {:#06x} (want {want:#06x})", sign * v, bits[0]);
-                    assert!(bits.iter().all(|&b| b == want), "m={m} scale {}: {bits:#06x?} want {want:#06x}", sign * v);
+                    println!(
+                        "m={m} scalar scale {:+} -> {:#06x} (want {want:#06x})",
+                        sign * v,
+                        bits[0]
+                    );
+                    assert!(
+                        bits.iter().all(|&b| b == want),
+                        "m={m} scale {}: {bits:#06x?} want {want:#06x}",
+                        sign * v
+                    );
                     // The host conversion agrees with the claim.
-                    assert_eq!(tessl::tensor::f32_to_f16_bits(sign * v), want, "host cast of {}", sign * v);
+                    assert_eq!(
+                        tessl::tensor::f32_to_f16_bits(sign * v),
+                        want,
+                        "host cast of {}",
+                        sign * v
+                    );
                 }
             }
         }

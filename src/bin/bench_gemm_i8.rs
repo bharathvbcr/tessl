@@ -674,7 +674,9 @@ mod tests {
     }
 
     /// The corpus the rejection tests share: M = 4, K = 2, N = 4, 2x2 tiles.
-    fn grid() -> (Vec<u8>, Vec<u8>, Vec<f32>, Vec<(usize, usize)>) {
+    type Grid = (Vec<u8>, Vec<u8>, Vec<f32>, Vec<(usize, usize)>);
+
+    fn grid() -> Grid {
         let a = vec![1u8, 255, 3, 4, 5, 6, 7, 250];
         let b = vec![2u8, 3, 9, 1, 255, 4, 250, 8];
         let scale = |r: usize| 0.5 + r as f32;

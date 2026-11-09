@@ -18,7 +18,7 @@ def load(path):
     out = {}
     for line in open(path):
         if line.startswith("STAGE_PROFILE_INCOMPLETE "):
-            raise SystemExit(f"{path}: the run failed its replica cross-check for some T ({line.strip()}); "
+            raise SystemExit(f"{path}: the run was incomplete: a T failed its replica cross-check or the run aborted ({line.strip()}); "
                              "a partial table is not merged")
         if line.startswith("STAGE_PROFILE_JSON "):
             rec = json.loads(line[len("STAGE_PROFILE_JSON "):])

@@ -18,7 +18,7 @@
 //! Every requested T is measured even when an earlier one fails the cross-check
 //! (`profile_every_t`): a passing T prints its `STAGE_PROFILE_JSON`, a failing T
 //! prints none, and the run then prints one `STAGE_PROFILE_INCOMPLETE` line (the
-//! requested and failed T values) and returns one error naming every failing T,
+//! requested and failed T values, plus `aborted_at` and `unmeasured` after a hard error) and returns one error naming every failing T,
 //! so the exit is nonzero and a partial log is never read as a full table.
 //! The async-encode flag is restored to what the caller had on every path.
 //! The whole forward is then split on the host timeline (begin, the encode
@@ -520,7 +520,9 @@ const INCOMPLETE_PREFIX: &str = "STAGE_PROFILE_INCOMPLETE ";
 /// failed T is recorded and the loop goes on, so one bad T does not hide whether
 /// the others pass. If any T failed, `emit` also gets one `STAGE_PROFILE_INCOMPLETE`
 /// line (the requested and failed T values) and the returned error names every
-/// failing T with its reason, in the order requested.
+/// failing T with its reason, in the order requested. A hard error at T=x also
+/// emits the marker, with `aborted_at` x and `unmeasured` (the requested T values
+/// after it), then returns an error naming x, its cause and every earlier failure.
 fn profile_every_t(
     ts: &[usize],
     iters: usize,
@@ -528,28 +530,49 @@ fn profile_every_t(
     mut measure: impl FnMut(usize) -> Res<Result<String, String>>,
 ) -> Res<()> {
     let mut failed: Vec<(usize, String)> = Vec::new();
-    for &t in ts {
-        match measure(t)? {
-            Ok(json) => emit(&json),
-            Err(reason) => failed.push((t, reason)),
+    let mut aborted: Option<(usize, usize, String)> = None;
+    for (i, &t) in ts.iter().enumerate() {
+        match measure(t) {
+            Ok(Ok(json)) => emit(&json),
+            Ok(Err(reason)) => failed.push((t, reason)),
+            Err(hard) => {
+                aborted = Some((i, t, hard));
+                break;
+            }
         }
     }
-    if failed.is_empty() {
+    if failed.is_empty() && aborted.is_none() {
         return Ok(());
     }
     let list = |v: &mut dyn Iterator<Item = usize>| v.map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+    let abort_keys = match &aborted {
+        Some((i, t, _)) => format!(
+            ",\"aborted_at\":{t},\"unmeasured\":[{}]",
+            list(&mut ts[i + 1..].iter().copied())
+        ),
+        None => String::new(),
+    };
     emit(&format!(
-        "{INCOMPLETE_PREFIX}{{\"requested\":[{}],\"failed\":[{}],\"iters\":{iters}}}",
+        "{INCOMPLETE_PREFIX}{{\"requested\":[{}],\"failed\":[{}],\"iters\":{iters}{abort_keys}}}",
         list(&mut ts.iter().copied()),
         list(&mut failed.iter().map(|&(t, _)| t))
     ));
     let named: Vec<String> = failed.iter().map(|(t, r)| format!("T={t}: {r}")).collect();
-    Err(format!(
-        "{} of {} requested T values failed the replica cross-check (JSON emitted only for the others): {}",
-        failed.len(),
-        ts.len(),
-        named.join(" | ")
-    ))
+    match aborted {
+        None => Err(format!(
+            "{} of {} requested T values failed the replica cross-check (JSON emitted only for the others): {}",
+            failed.len(),
+            ts.len(),
+            named.join(" | ")
+        )),
+        Some((i, t, hard)) => Err(format!(
+            "run aborted at T={t}: {hard}; {} requested T values after it were not measured; {} earlier T values failed the replica cross-check{}{}",
+            ts.len() - i - 1,
+            failed.len(),
+            if named.is_empty() { "" } else { ": " },
+            named.join(" | ")
+        )),
+    }
 }
 
 pub fn run(
@@ -1028,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hard_error_stops_the_run_without_a_marker_or_later_ts() {
+    fn a_hard_error_stops_the_run_with_a_marker_and_no_later_ts() {
         let (mut measured, mut emitted) = (Vec::new(), Vec::new());
         let r = profile_every_t(
             &[1, 2, 3],
@@ -1044,8 +1067,60 @@ mod tests {
             },
         );
         assert_eq!(measured, [1, 2]);
-        assert_eq!(emitted, ["json 1"]);
-        assert_eq!(r.unwrap_err(), "device lost");
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        assert_eq!(emitted[0], "json 1");
+        assert_eq!(
+            emitted[1],
+            "STAGE_PROFILE_INCOMPLETE {\"requested\":[1,2,3],\"failed\":[],\"iters\":3,\"aborted_at\":2,\"unmeasured\":[3]}"
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("T=2: device lost") && err.contains("1 requested"), "{err}");
+    }
+
+    #[test]
+    fn a_hard_error_after_a_soft_failure_names_both_and_marks_both() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| match t {
+                1 => Ok(Err("gap at 1".into())),
+                2 => Err("device lost".into()),
+                _ => Ok(Ok("json 3".into())),
+            },
+        );
+        assert_eq!(
+            emitted,
+            ["STAGE_PROFILE_INCOMPLETE {\"requested\":[1,2,3],\"failed\":[1],\"iters\":3,\"aborted_at\":2,\"unmeasured\":[3]}"]
+        );
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("T=2: device lost") && err.contains("T=1: gap at 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_hard_error_at_the_last_t_has_an_empty_unmeasured_list() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[4, 5],
+            1,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                if t == 5 {
+                    Err("x".into())
+                } else {
+                    Ok(Ok("json 4".into()))
+                }
+            },
+        );
+        assert!(r.is_err());
+        assert!(
+            emitted[1].ends_with("\"aborted_at\":5,\"unmeasured\":[]}"),
+            "{emitted:?}"
+        );
     }
 
     /// Strict reader for the marker payload `{"requested":[..],"failed":[..],"iters":N}`:
@@ -1061,7 +1136,11 @@ mod tests {
                 return Some(Vec::new());
             }
             s.split(',')
-                .map(|n| (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse().ok()).flatten())
+                .map(|n| {
+                    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| n.parse().ok())
+                        .flatten()
+                })
                 .collect()
         };
         if iters.is_empty() || !iters.bytes().all(|b| b.is_ascii_digit()) {
@@ -1092,7 +1171,11 @@ mod tests {
             |l| emitted.push(l.to_string()),
             |_| {
                 calls += 1;
-                Ok(if calls == 1 { Ok("json 7".into()) } else { Err("flaky".into()) })
+                Ok(if calls == 1 {
+                    Ok("json 7".into())
+                } else {
+                    Err("flaky".into())
+                })
             },
         );
         assert!(r.is_err());
@@ -1115,7 +1198,13 @@ mod tests {
                 &[5, 6],
                 2,
                 |l| emitted.push(l.to_string()),
-                |t| Ok(if t == 5 { Err(reason.to_string()) } else { Ok("json 6".into()) }),
+                |t| {
+                    Ok(if t == 5 {
+                        Err(reason.to_string())
+                    } else {
+                        Ok("json 6".into())
+                    })
+                },
             );
             assert_eq!(emitted.len(), 2, "{reason:?}: {emitted:?}");
             assert!(emitted.iter().all(|l| !l.contains('\n') && !l.contains('\r')));
@@ -1147,8 +1236,8 @@ mod tests {
 
     /// A hard error after at least one T was emitted leaves a stdout with passing
     /// JSON and no marker: `bench/qwen35_stage_profile_report.py` accepts that as a
-    /// full table, though the run is partial. The existing test
-    /// `a_hard_error_stops_the_run_without_a_marker_or_later_ts` pins the opposite.
+    /// full table, though the run is partial. The old expectation
+    /// (`a_hard_error_stops_the_run_without_a_marker_or_later_ts`) encoded this defect.
     #[test]
     fn defect_a_hard_error_after_a_pass_leaves_a_partial_log_without_a_marker() {
         let mut emitted = Vec::new();
@@ -1156,7 +1245,13 @@ mod tests {
             &[1, 2, 3],
             3,
             |l| emitted.push(l.to_string()),
-            |t| if t == 2 { Err("device lost".into()) } else { Ok(Ok(format!("json {t}"))) },
+            |t| {
+                if t == 2 {
+                    Err("device lost".into())
+                } else {
+                    Ok(Ok(format!("json {t}")))
+                }
+            },
         );
         assert!(r.is_err());
         assert_eq!(emitted[0], "json 1");
@@ -1183,7 +1278,13 @@ mod tests {
         );
         let err = r.unwrap_err();
         assert!(err.contains("device lost"), "{err}");
-        assert!(err.contains("T=1"), "the earlier cross-check failure is not named: {err}");
-        assert!(emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)), "no marker: {emitted:?}");
+        assert!(
+            err.contains("T=1"),
+            "the earlier cross-check failure is not named: {err}"
+        );
+        assert!(
+            emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)),
+            "no marker: {emitted:?}"
+        );
     }
 }

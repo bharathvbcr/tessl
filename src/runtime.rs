@@ -3949,6 +3949,33 @@ mod metallib_read_tests {
     }
 
     #[test]
+    #[ignore = "defect: a path through a non-directory (ENOTDIR) was \"metallib missing\" before the fix (exists() is false) and is now \"read metallib\""]
+    fn defect_a_path_under_a_regular_file_is_still_reported_missing() {
+        let dir = scratch("mlib-enotdir");
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let under = file.join("child.metallib");
+        let err = read(&under, "read metallib", "").unwrap_err();
+        assert!(err.starts_with("metallib missing at "), "{err}");
+    }
+
+    #[test]
+    #[ignore = "defect: an unreadable metallib repeats its path in the error text (open_regular wraps ojas's text, which already names it)"]
+    fn defect_an_unreadable_metallib_names_its_path_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mlib-eacces");
+        let file = dir.join("locked.metallib");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            return;
+        }
+        let err = read(&file, "read metallib", "").unwrap_err();
+        let shown = file.to_str().unwrap();
+        assert_eq!(err.matches(shown).count(), 1, "{err}");
+    }
+
+    #[test]
     fn an_empty_file_is_returned_empty_for_the_caller_to_judge() {
         let dir = scratch("mlib-empty");
         let empty = dir.join("e.metallib");

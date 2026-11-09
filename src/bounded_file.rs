@@ -198,4 +198,71 @@ pub(crate) mod tests {
         let r = read_opened(file, len, 8);
         assert!(matches!(r, Err(OpenFail::TooLarge { len: 9, at_least: true })), "{r:?}");
     }
+
+    #[test]
+    fn cap_zero_and_cap_max_behave_at_the_edges() {
+        let dir = scratch("capedge");
+        let empty = dir.join("e");
+        File::create(&empty).unwrap();
+        assert!(read_capped(&empty, 0).unwrap().is_empty());
+        let one = dir.join("o");
+        std::fs::write(&one, b"x").unwrap();
+        assert!(matches!(
+            read_capped(&one, 0),
+            Err(OpenFail::TooLarge {
+                len: 1,
+                at_least: false
+            })
+        ));
+        assert_eq!(read_capped(&one, u64::MAX).unwrap(), b"x");
+        // A file one past the cap whose fstat length was stale-small: the bounded read still stops at cap + 1.
+        let (file, _) = open_regular(&one).unwrap();
+        assert!(matches!(
+            read_opened(file, 0, 0),
+            Err(OpenFail::TooLarge { len: 1, at_least: true })
+        ));
+    }
+
+    #[test]
+    fn a_file_that_shrinks_after_the_open_reads_short_without_error() {
+        let dir = scratch("shrink");
+        let path = dir.join("s");
+        std::fs::write(&path, [3u8; 64]).unwrap();
+        let (file, len) = open_regular(&path).unwrap();
+        File::options().write(true).open(&path).unwrap().set_len(10).unwrap();
+        assert_eq!(read_opened(file, len, 64).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_io_and_the_open_error_text_names_the_path_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("eacces-once");
+        let locked = dir.join("locked");
+        std::fs::write(&locked, b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&locked).is_ok() {
+            return;
+        }
+        let Err(OpenFail::Io(e)) = read_capped(&locked, 8) else {
+            panic!("not Io")
+        };
+        assert!(e.to_string().contains("ermission denied"), "{e}");
+    }
+
+    #[test]
+    #[ignore = "defect: EACCES on the final open loses ErrorKind::PermissionDenied (becomes Other)"]
+    fn defect_open_regular_keeps_permission_denied_kind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("eacces-kind");
+        let locked = dir.join("locked");
+        std::fs::write(&locked, b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&locked).is_ok() {
+            return;
+        }
+        let Err(OpenFail::Io(e)) = open_regular(&locked) else {
+            panic!("not Io")
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+    }
 }

@@ -43,6 +43,7 @@ bin kernel_fast_math 15
 bin media_decode 21
 bin media_jpeg 13
 bin media_leaks 1
+bin adv_readers_attack 3
 bin media_open_regular 5
 bin media_resample 17
 bin media_yuv_exact 5
@@ -123,7 +124,7 @@ lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib par_batch::tests:: 6
 lib media:: 19
-lib bounded_file::tests:: 6
+lib bounded_file::tests:: 9
 lib runtime::metallib_read_tests:: 4
 lib parser_mutation:: 16
 lib pool_ledger::tests:: 3

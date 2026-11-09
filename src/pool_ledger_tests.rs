@@ -1501,6 +1501,25 @@ fn adv_poison_with_an_open_batch_parks_the_queue_until_drop_and_drop_releases_on
     rig.finish(true, "poisoned with an open batch, dropped");
 }
 
+/// The refusal tells the caller the contract (ft-8f7aabe6): poisoned mid-batch
+/// by a panic, not recoverable, drop it, and dropping releases the parked queue
+/// once. `synchronize` returns the lock refusal itself; `reclaim` then returns
+/// the runtime latch, which carries that text as its first cause.
+#[test]
+fn a_mid_batch_poison_refusal_states_the_drop_contract() {
+    let rig = rig_with_open_batch_and_a_queued_drop();
+    poison_batch_lock(&rig.rt);
+    let sync_err = rig.rt.synchronize().unwrap_err();
+    let reclaim_err = rig.rt.reclaim(u64::MAX).unwrap_err();
+    for (what, err) in [("synchronize", &sync_err), ("reclaim", &reclaim_err)] {
+        for needle in ["poisoned mid-batch", "panic", "drop it", "releases", "exactly once"] {
+            assert!(err.contains(needle), "{what} refusal lacks {needle:?}: {err}");
+        }
+    }
+    assert!(rig.rt.deferred_pending(), "the queue drained without the abort");
+    rig.finish(true, "mid-batch poison text, dropped");
+}
+
 /// Attack 2. The recovery must still wait for the lifetime event: a commit
 /// submitted and not finished keeps a dropped buffer queued, whether the lock
 /// is poisoned before or after the drop, and a partial completion is not

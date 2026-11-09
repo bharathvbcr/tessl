@@ -1014,6 +1014,41 @@ impl ParamsBuffer {
     }
 }
 
+/// The refusal text for a poisoned `active_m4` batch lock. Built in one place
+/// ([`GpuRuntime::lock_active_m4`]) so the contract is stated once. It keeps the
+/// word "poison", which the existing tests and callers' substring checks use.
+const ACTIVE_M4_POISONED: &str = "runtime's batch lock was poisoned by a panic: it cannot be \
+     recovered, drop it (dropping releases any parked deferred queue and its ledger \
+     charges exactly once)";
+
+/// The Metal runtime: one device, queue, pool and command batch.
+///
+/// # A runtime whose batch lock is poisoned is not recoverable
+///
+/// A panic while the batch lock (`active_m4`) is held poisons that lock, and
+/// nothing clears it. Every encode and commit then refuses with the text of
+/// `ACTIVE_M4_POISONED`: the runtime cannot be recovered, so drop it. There is
+/// deliberately no recover call.
+///
+/// Whether the deferred release queue (and its ledger charges) parks depends on
+/// whether a command buffer was open when the panic hit:
+///
+/// - **A batch was open** (a panic inside a commit's open-batch path, or in a
+///   closure after it had encoded). Nothing can submit that buffer, and the idle
+///   recycle skips because it may still bind a dropped buffer, so the queue stays
+///   parked for the rest of the runtime's lifetime. Drop ends a batch that was
+///   never submitted without submitting it, then releases each parked charge
+///   exactly once: the hold is bounded by the lifetime, with no leak past Drop and
+///   no use-after-free.
+/// - **No batch was open** (for example a panic in a waiting commit's drain). The
+///   refusals are the same, but the idle recycle still drains the queue.
+///
+/// The refusal arrives in two phases. `synchronize` and the encode and commit
+/// paths take the lock, so the first one to reach it returns the text and
+/// latches the runtime (`is_poisoned` is false until then). `reclaim` and
+/// `is_poisoned` do not take the lock: before any refusal has latched,
+/// `reclaim` returns `Ok(0)` and releases nothing that is parked; after it,
+/// every call answers from the latch, with that text as its cause.
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
     /// What this runtime shares with others made from the same [`Shared`]:
@@ -2006,6 +2041,11 @@ impl GpuRuntime {
     ///
     /// Errors on a poisoned runtime, or when the lifetime event reads above
     /// anything this runtime submitted (which poisons it).
+    /// `reclaim` does not take the batch lock. On a runtime whose batch lock a
+    /// panic poisoned, it returns `Ok(0)` (releasing nothing parked) until a
+    /// refusal latches the runtime, and errors from then on. Such a runtime is
+    /// not recoverable: drop it, which releases its parked queue (see
+    /// [`GpuRuntime`]).
     pub fn reclaim(&self, timeline_value: u64) -> Result<u64, String> {
         if self.poison.is_set() {
             return Err(self.poison.error());
@@ -2838,7 +2878,7 @@ impl GpuRuntime {
         // Clone Retained encoder so we do not hold `active_m4` across `f`
         // (nested with_binder / flush would otherwise deadlock the Mutex).
         let (enc, pending_edge) = {
-            let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
+            let mut guard = self.lock_active_m4()?;
             self.ensure_m4_cb_open(&mut guard)?;
             let batch = guard.as_mut().ok_or_else(|| "M4 batch missing".to_string())?;
             if batch.encoder.is_none() {
@@ -2903,7 +2943,7 @@ impl GpuRuntime {
             pending
         };
         let hit_mid = {
-            let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
+            let mut guard = self.lock_active_m4()?;
             let batch = guard.as_mut().ok_or_else(|| "M4 batch missing".to_string())?;
             batch.hazard_pending = hazard_pending;
             batch.dispatches += 1;
@@ -2967,7 +3007,7 @@ impl GpuRuntime {
     }
 
     fn commit_m4(&self, wait: bool) -> Result<(), String> {
-        let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.lock_active_m4()?;
         let Some(batch) = guard.as_mut() else {
             if wait {
                 self.checked_lifetime_value()?;
@@ -3228,6 +3268,9 @@ impl GpuRuntime {
 
     /// Commit + wait. Required before host readbacks. SharedEvent covers the
     /// training compute CB on the Metal 4 path (not a stamp-only CB).
+    ///
+    /// Errors on a poisoned runtime. A runtime whose batch lock a panic poisoned
+    /// is not recoverable: drop it (see [`GpuRuntime`]).
     pub fn synchronize(&self) -> Result<(), String> {
         self.commit(true)
     }
@@ -3235,6 +3278,14 @@ impl GpuRuntime {
     /// True when a timestamp `MTL4CounterHeap` was created with the M4 package.
     pub fn metal4_counter_heap_available(&self) -> bool {
         self.metal4.counter_heap.is_some()
+    }
+
+    /// Lock the batch, or refuse with the mid-batch-poison contract text
+    /// ([`ACTIVE_M4_POISONED`]). The one site that maps a poisoned `active_m4`
+    /// to an error; paths that must run through poison (drop, abort, recycle)
+    /// take the guard with `PoisonError::into_inner` instead.
+    fn lock_active_m4(&self) -> Result<MutexGuard<'_, Option<ActiveMetal4Batch>>, String> {
+        self.active_m4.lock().map_err(|_| ACTIVE_M4_POISONED.to_string())
     }
 
     /// End an open, uncommitted batch without submitting it.

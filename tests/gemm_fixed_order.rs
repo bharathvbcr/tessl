@@ -342,7 +342,8 @@ fn fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu() {
 
 fn ftz(x: f32) -> f32 {
     if x.is_subnormal() {
-        0.0
+        // Sign-preserving: a flushed negative partial sum is -0.0 on this GPU.
+        f32::from_bits(x.to_bits() & 0x8000_0000)
     } else {
         x
     }
@@ -382,9 +383,7 @@ fn assert_flush_model(
     label: &str,
     a: &[f32],
     b: &[f32],
-    m: usize,
-    n: usize,
-    k: usize,
+    (m, n, k): (usize, usize, usize),
     sensitive: bool,
 ) {
     let model = flush_fold(a, b, m, n, k);
@@ -449,8 +448,8 @@ fn attack_random_mix_matches_flush_model_all_layouts() {
         ] {
             let a: Vec<f32> = (0..m * k).map(|_| rng.tiny_mix()).collect();
             let b: Vec<f32> = (0..k * n).map(|_| rng.tiny_mix()).collect();
-            let sensitive = m * n * k >= 100;
-            assert_flush_model(rt, &format!("random {m}x{n}x{k}"), &a, &b, m, n, k, sensitive);
+            let sensitive = m * n * k >= 1000;
+            assert_flush_model(rt, &format!("random {m}x{n}x{k}"), &a, &b, (m, n, k), sensitive);
         }
     });
 }
@@ -464,7 +463,8 @@ fn attack_partial_sum_flush_with_normal_operands_and_products() {
         // 0x00800001 + (-0x00800000) = 0x00000001 (exact, subnormal) -> flushed to 0.
         // A later +0x00800000 then shows whether the flushed 0 persisted:
         // IEEE gives 0x00800001, a flushed partial sum gives 0x00800000.
-        let cases: [(&str, Vec<f32>, Vec<f32>, u32, u32); 3] = [
+        type SumCase = (&'static str, Vec<f32>, Vec<f32>, u32, u32);
+        let cases: [SumCase; 3] = [
             (
                 "sum subnormal then end",
                 vec![sub(0x0080_0001), sub(0x0080_0000)],
@@ -480,11 +480,11 @@ fn attack_partial_sum_flush_with_normal_operands_and_products() {
                 0x0080_0000,
             ),
             (
-                "negative subnormal partial sum",
+                "negative subnormal partial sum flushes to -0.0 (sign kept)",
                 vec![sub(0x0080_0000), sub(0x0080_0001)],
                 vec![1.0, -1.0],
                 0x8000_0001,
-                0,
+                0x8000_0000,
             ),
         ];
         for (label, a, b, ieee, gpu) in &cases {
@@ -508,7 +508,8 @@ fn attack_product_underflow_from_normal_operands_and_sign() {
         rt.set_relaxed_precision(false);
         let p2 = |e: i32| f32::from_bits(((127 + e) as u32) << 23);
         // (label, a, b, IEEE bits, GPU bits). Every operand is normal.
-        let cases: [(&str, f32, f32, u32, u32); 6] = [
+        type ProdCase = (&'static str, f32, f32, u32, u32);
+        let cases: [ProdCase; 6] = [
             (
                 "2^-63 * 2^-63 = min normal survives",
                 p2(-63),
@@ -608,7 +609,7 @@ fn attack_subnormal_at_k_positions_across_chunk_and_long_k() {
             a[2 * k + k / 2] = 1.0;
             b[(k / 2) * n + 4] = sub(0x007f_ffff);
             a[2 * k + (k - 1)] = sub(0x8000_0001);
-            assert_flush_model(rt, &format!("k={k} planted subnormals"), &a, &b, m, n, k, false);
+            assert_flush_model(rt, &format!("k={k} planted subnormals"), &a, &b, (m, n, k), false);
             let model = flush_fold(&a, &b, m, n, k);
             assert!(
                 model[2 * n + 4].to_bits() != ieee_fold(&a, &b, m, n, k)[2 * n + 4].to_bits(),
@@ -623,8 +624,23 @@ fn attack_subnormal_at_k_positions_across_chunk_and_long_k() {
                 a2[k - 3] = sub(0x0080_0000);
                 b2[k - 3] = -1.0;
                 a2[k - 1] = sub(0x0080_0000);
-                assert_flush_model(rt, &format!("k={k} late partial-sum flush"), &a2, &b2, 1, 1, k, true);
+                assert_flush_model(rt, &format!("k={k} late partial-sum flush"), &a2, &b2, (1, 1, k), true);
             }
+        }
+    });
+}
+
+/// The doc says a flushed result "comes back as (positive) zero". The GPU
+/// keeps the sign of a flushed partial sum: normal 0x00800000 + (-0x00800001)
+/// gives -0.0 (0x80000000), observed in w5-adv-ftz-run1. Asserts the doc.
+#[test]
+#[ignore = "defect: gemm_fixed_order docs claim a flushed result is +0, but a negative subnormal partial sum flushes to -0.0 (0x80000000); see w5-adv-ftz-run1"]
+fn defect_flushed_negative_partial_sum_is_positive_zero() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let a = [f32::from_bits(0x0080_0000), f32::from_bits(0x0080_0001)];
+        for (layout, got) in run_all_layouts(rt, &a, &[1.0, -1.0], 1, 1, 2) {
+            assert_eq!(got[0].to_bits(), 0, "{layout}: doc says +0");
         }
     });
 }

@@ -2248,24 +2248,27 @@ fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: 
 ///
 /// # Subnormals
 ///
-/// The GPU flushes f32 subnormals to zero in these kernels, whatever the
-/// compiler's math mode. Every subnormal operand, every product that is
+/// The GPU flushes f32 subnormals to zero in these kernels, and did so under
+/// both math modes measured (`fast` and `safe`; `relaxed` was not measured).
+/// Every subnormal operand, every product that is
 /// subnormal, and every partial sum that is subnormal reads and writes as
 /// zero, so a result that the IEEE fold would leave subnormal, or that
 /// depends on a subnormal operand or product, comes back as (positive) zero.
 /// Bit-identity with an IEEE CPU fold ([`gemm_f32_cpu`]) therefore holds only
-/// when no operand, product or partial sum is subnormal. Normal-range inputs
-/// are bit-identical to the fold, and the minimum normal (`0x00800000`)
-/// survives.
+/// when no operand, product or partial sum is subnormal. That is a condition
+/// on the products and partial sums as well as the inputs: normal operands can
+/// still produce a subnormal product or partial sum (2^-100 * 2^-30, or
+/// `0x00800001 - 0x00800000`), and that result is flushed too. The minimum
+/// normal (`0x00800000`) survives.
 ///
 /// Evidence and scope: measured on an Apple M5 Pro on 2026-11-08, with the
-/// kernel compiled `-fmetal-math-mode=fast` and again with `safe`; both gave
-/// the same result on 108 of 108 comparisons, so the flush is not the
-/// compiler flag. The cause is inferred, not shown: the GPU ALU or the
-/// driver's AIR-to-GPU compile. Other GPUs, drivers and OS releases are
-/// unmeasured. `tests/gemm_fixed_order.rs`
-/// (`fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu`) pins the
-/// observed behaviour for all three layouts, and a failure there means the
+/// kernel compiled `-fmetal-math-mode=fast` and again with `safe`, with the
+/// same result in both, so the flush is not that compiler flag. The cause is
+/// inferred, not shown: the GPU ALU or the driver's AIR-to-GPU compile. Other
+/// GPUs, drivers, OS releases and math modes are unmeasured. The reproducible
+/// evidence is `tests/gemm_fixed_order.rs`
+/// (`fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu`), which pins the
+/// observed behaviour for all three layouts; a failure there means the
 /// hardware or driver changed and this section needs revisiting (GitPulse
 /// card ft-02eec315).
 pub fn gemm_fixed_order_nn(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {

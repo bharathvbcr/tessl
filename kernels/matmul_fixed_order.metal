@@ -4,6 +4,10 @@
 // compiles this file with -ffp-contract=off, and the pragma below keeps a
 // later edit from contracting the pair. The reduction is never split.
 //
+// f32 subnormal operands, products and partial sums are flushed to zero on
+// the GPU, so the fold is bit-identical to an IEEE CPU fold only when none
+// occurs: see the "# Subnormals" section of gemm_fixed_order_nn in src/gemm.rs.
+//
 // This is the Metal Numerics::Exact product. It is not matmul2d and not
 // simdgroup_matrix: those tiles match this fold on short K and on integer
 // products, and they differ on order-sensitive K that fills a hardware

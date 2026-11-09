@@ -55,7 +55,10 @@ All notable changes to `tessl` are recorded here. The format follows
 - **Fixed-order f32 GEMM** (`gemm_fixed_order_nn`, `gemm_fixed_order_tn`,
   `gemm_fixed_order_nt`, `kernels/matmul_fixed_order.metal`). Each output is an
   ascending-k left fold with contraction off and one thread per output, matching
-  `gemm_f32_cpu` bit for bit. TensorOps and the simdgroup tile are not this path.
+  `gemm_f32_cpu` bit for bit when no operand, product or partial sum is an f32
+  subnormal; the GPU flushes those to zero (measured on an M5 Pro, 2026-11-08,
+  `fast` and `safe` math modes; see the `# Subnormals` section of
+  `gemm_fixed_order_nn`). TensorOps and the simdgroup tile are not this path.
   The 32×32 `matmul2d` tile is unchanged.
 - **`gemm_nt_bf16_bias`: the bf16 NT GEMM with a bias and an optional bf16 round in its register epilogue**
   (`src/gemm.rs`, `kernels/gemm_coop.h`, `kernels/matmul_tensorops.metal`,

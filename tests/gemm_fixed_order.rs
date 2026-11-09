@@ -4,6 +4,11 @@
 //! and on integer products. They do not match it on order-sensitive products
 //! whose K fills a hardware chunk (8×16×16). These kernels are the ones
 //! `Numerics::Exact` dispatches, and the comparison is `to_bits`.
+//!
+//! The fold is bit-identical only while no operand, product or partial sum is an
+//! f32 subnormal: the GPU flushes those to zero. See the `# Subnormals` section of
+//! `gemm_fixed_order_nn`; `fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu`
+//! pins it.
 
 mod common;
 

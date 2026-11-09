@@ -1,0 +1,74 @@
+# bench_gemm_i8 oracle vs four kernel mutations (card ft-f57aee0bb949864719beec8ceca848ca)
+tessl sha: e5b4f4bf7031d7cb9617d40c516156430d739432
+device: M5 Pro; run 2026-11-09T16:08:20Z..16:13:30Z; load at start 8.69 9.93 15.12, at end 30.36 24.33 20.42
+bench env: BENCH_WARMUP=0 BENCH_ITERS=1 BENCH_ROUNDS=1 BENCH_CALLS=1 (MS 1..2048, N=K=4096)
+script: target-gp/w6-i8oracle-run1.sh (main checkout, gitignored); logs target-gp/w6-i8oracle-run1/
+unmutated: rc=0
+result: all four mutations rc=1 (CAUGHT), failures=0
+
+unmutated_run rc=0 1s
+--- mutation m1_scale: perl -0pi -e 's{red\[0\] / 127\.0f}{red[0] / 126.0f}' kernels/i8_w8a8.metal
+m1_scale diff applied: yes
+diff --git a/kernels/i8_w8a8.metal b/kernels/i8_w8a8.metal
+index fcc0118..683f449 100644
+--- a/kernels/i8_w8a8.metal
++++ b/kernels/i8_w8a8.metal
+@@ -308 +308 @@ kernel void i8_quantize_rows(device float *x [[buffer(0)]], device int8_t *q [[b
+-    const float scale = (red[0] == 0.0f) ? 1.0f : red[0] / 127.0f;
++    const float scale = (red[0] == 0.0f) ? 1.0f : red[0] / 126.0f;
+m1_scale_build rc=0 62s
+m1_scale_run rc=1 0s
+m1_scale oracle message:
+bench_gemm_i8: quantize_i8_rows i8_gemv_dequant M=1 row 0: scale 0.001984127 against host 0.001968504: 67101 ulp apart (at most 1 allowed)
+m1_scale CAUGHT rc=1
+restored: tree clean
+--- mutation m2_rowidx: perl -0pi -e 's{a_rows\[m\]}{a_rows[m ^ 1]}g' kernels/i8_w8a8.metal
+m2_rowidx diff applied: yes
+diff --git a/kernels/i8_w8a8.metal b/kernels/i8_w8a8.metal
+index fcc0118..0ff2ab0 100644
+--- a/kernels/i8_w8a8.metal
++++ b/kernels/i8_w8a8.metal
+@@ -47 +47 @@ inline void i8_epilogue_i32(thread Acc &acc, int tx, int ty, int M, int N,
+-        float ascl = (a_mode != 0u) ? a_rows[m] : a_scalar;
++        float ascl = (a_mode != 0u) ? a_rows[m ^ 1] : a_scalar;
+@@ -65 +65 @@ inline void i8_epilogue_f32(thread Acc &acc, int tx, int ty, int M, int N, devic
+-        float ascl = (a_mode != 0u) ? a_rows[m] : a_scalar;
++        float ascl = (a_mode != 0u) ? a_rows[m ^ 1] : a_scalar;
+m2_rowidx_build rc=0 44s
+m2_rowidx_run rc=1 1s
+m2_rowidx oracle message:
+bench_gemm_i8: quantize+gemm_i8 i8_w8a8_64 M=16: C[0,0] = 339.8638610839844 against oracle 338.5098412586376 (tolerance 3.334845263167284e-2)
+m2_rowidx CAUGHT rc=1
+restored: tree clean
+--- mutation m3_skiptile: perl -0pi -e 's{(inline void i8_epilogue_i32\(.*?\{\n)}{$1    if (M >= 512 \&\& tx == 64 \&\& ty == 0) return;\n}s' kernels/i8_w8a8.metal
+m3_skiptile diff applied: yes
+diff --git a/kernels/i8_w8a8.metal b/kernels/i8_w8a8.metal
+index fcc0118..2382369 100644
+--- a/kernels/i8_w8a8.metal
++++ b/kernels/i8_w8a8.metal
+@@ -40,0 +41 @@ inline void i8_epilogue_i32(thread Acc &acc, int tx, int ty, int M, int N,
++    if (M >= 512 && tx == 64 && ty == 0) return;
+m3_skiptile_build rc=0 49s
+m3_skiptile_run rc=1 0s
+m3_skiptile oracle message:
+bench_gemm_i8: gemm_i8 i8_w8a8_128 M=512: C[127,64] = -1357.3662109375 against oracle 80056 (tolerance 1.7102159999999998e1)
+m3_skiptile CAUGHT rc=1
+restored: tree clean
+--- mutation m4_floor: perl -0pi -e 's{\(int\)rint\(v\)}{(int)floor(v)}' kernels/i8_w8a8.metal
+m4_floor diff applied: yes
+diff --git a/kernels/i8_w8a8.metal b/kernels/i8_w8a8.metal
+index fcc0118..c4b9f3e 100644
+--- a/kernels/i8_w8a8.metal
++++ b/kernels/i8_w8a8.metal
+@@ -316 +316 @@ kernel void i8_quantize_rows(device float *x [[buffer(0)]], device int8_t *q [[b
+-        int qi = (int)rint(v);
++        int qi = (int)floor(v);
+m4_floor_build rc=0 61s
+m4_floor_run rc=1 1s
+m4_floor oracle message:
+bench_gemm_i8: quantize_i8_rows i8_gemv_dequant M=1 row 0: q[3] = -52, host quantize of -0.101 / 0.001968504 = -51.308002 gives -51
+m4_floor CAUGHT rc=1
+restored: tree clean
+final_rebuild rc=0 50s
+end 2026-11-09T16:13:30Z load 30.36 24.33 20.42 failures=0
+done

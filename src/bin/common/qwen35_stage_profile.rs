@@ -1047,4 +1047,143 @@ mod tests {
         assert_eq!(emitted, ["json 1"]);
         assert_eq!(r.unwrap_err(), "device lost");
     }
+
+    /// Strict reader for the marker payload `{"requested":[..],"failed":[..],"iters":N}`:
+    /// ASCII digits only, exact key order, no whitespace. Anything else is `None`.
+    fn parse_marker(line: &str) -> Option<(Vec<usize>, Vec<usize>, usize)> {
+        let body = line.strip_prefix(INCOMPLETE_PREFIX)?;
+        let body = body.strip_prefix("{\"requested\":[")?;
+        let (req, rest) = body.split_once("],\"failed\":[")?;
+        let (fail, rest) = rest.split_once("],\"iters\":")?;
+        let iters = rest.strip_suffix('}')?;
+        let nums = |s: &str| -> Option<Vec<usize>> {
+            if s.is_empty() {
+                return Some(Vec::new());
+            }
+            s.split(',')
+                .map(|n| (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse().ok()).flatten())
+                .collect()
+        };
+        if iters.is_empty() || !iters.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((nums(req)?, nums(fail)?, iters.parse().ok()?))
+    }
+
+    #[test]
+    fn attack_duplicate_unsorted_and_zero_ts_keep_request_order() {
+        let (measured, emitted, r) = drive(&[8192, 0, 1024, 1024, 0], &[0, 1024]);
+        assert_eq!(measured, [8192, 0, 1024, 1024, 0]);
+        assert_eq!(emitted[0], "json 8192");
+        let (req, failed, iters) = parse_marker(emitted.last().unwrap()).expect("marker parses");
+        assert_eq!(req, [8192, 0, 1024, 1024, 0]);
+        assert_eq!(failed, [0, 1024, 1024, 0]);
+        assert_eq!(iters, 3);
+        assert!(r.unwrap_err().contains("4 of 5"));
+    }
+
+    #[test]
+    fn attack_a_duplicate_t_that_passes_once_and_fails_once_still_marks_incomplete() {
+        let mut calls = 0;
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[7, 7],
+            1,
+            |l| emitted.push(l.to_string()),
+            |_| {
+                calls += 1;
+                Ok(if calls == 1 { Ok("json 7".into()) } else { Err("flaky".into()) })
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(emitted[0], "json 7");
+        assert_eq!(parse_marker(&emitted[1]).unwrap().1, [7]);
+    }
+
+    #[test]
+    fn attack_hostile_reasons_cannot_reach_the_marker() {
+        let hostile = [
+            "",
+            "a | T=9: forged",
+            "line1\nSTAGE_PROFILE_INCOMPLETE {\"requested\":[],\"failed\":[],\"iters\":0}",
+            "quote\" and \\ and \r\n",
+            "STAGE_PROFILE_JSON {}",
+        ];
+        for reason in hostile {
+            let mut emitted = Vec::new();
+            let r = profile_every_t(
+                &[5, 6],
+                2,
+                |l| emitted.push(l.to_string()),
+                |t| Ok(if t == 5 { Err(reason.to_string()) } else { Ok("json 6".into()) }),
+            );
+            assert_eq!(emitted.len(), 2, "{reason:?}: {emitted:?}");
+            assert!(emitted.iter().all(|l| !l.contains('\n') && !l.contains('\r')));
+            assert_eq!(parse_marker(&emitted[1]), Some((vec![5, 6], vec![5], 2)), "{reason:?}");
+            let err = r.unwrap_err();
+            assert!(err.contains("T=5: "), "{err}");
+            assert!(err.contains("1 of 2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn attack_a_huge_t_list_keeps_a_valid_marker() {
+        let ts: Vec<usize> = (0..200_000).collect();
+        let fail: Vec<usize> = ts.iter().copied().filter(|t| t % 3 == 0).collect();
+        let (measured, emitted, r) = drive(&ts, &fail);
+        assert_eq!(measured.len(), ts.len());
+        let (req, failed, _) = parse_marker(emitted.last().unwrap()).expect("marker parses");
+        assert_eq!((req.len(), failed), (ts.len(), fail));
+        assert!(r.unwrap_err().contains(&format!("{} of 200000", 66_667)));
+    }
+
+    #[test]
+    fn attack_the_marker_is_emitted_after_every_json_line() {
+        let (_, emitted, _) = drive(&[1, 2, 3, 4], &[1, 3]);
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted[2].starts_with(INCOMPLETE_PREFIX));
+        assert!(emitted[..2].iter().all(|l| !l.starts_with(INCOMPLETE_PREFIX)));
+    }
+
+    /// A hard error after at least one T was emitted leaves a stdout with passing
+    /// JSON and no marker: `bench/qwen35_stage_profile_report.py` accepts that as a
+    /// full table, though the run is partial. The existing test
+    /// `a_hard_error_stops_the_run_without_a_marker_or_later_ts` pins the opposite.
+    #[test]
+    fn defect_a_hard_error_after_a_pass_leaves_a_partial_log_without_a_marker() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| if t == 2 { Err("device lost".into()) } else { Ok(Ok(format!("json {t}"))) },
+        );
+        assert!(r.is_err());
+        assert_eq!(emitted[0], "json 1");
+        assert!(
+            emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)),
+            "stdout holds a passing T and no INCOMPLETE marker, so a log-only consumer reads it as complete: {emitted:?}"
+        );
+    }
+
+    /// A hard error after a cross-check failure drops the failed T from both the
+    /// marker and the error text.
+    #[test]
+    fn defect_a_hard_error_after_a_soft_failure_forgets_the_failed_t() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| match t {
+                1 => Ok(Err("gap at 1".into())),
+                2 => Err("device lost".into()),
+                _ => Ok(Ok("json 3".into())),
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("device lost"), "{err}");
+        assert!(err.contains("T=1"), "the earlier cross-check failure is not named: {err}");
+        assert!(emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)), "no marker: {emitted:?}");
+    }
 }

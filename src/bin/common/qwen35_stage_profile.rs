@@ -15,6 +15,12 @@
 //! printing the human-readable table and cross-check lines and before the
 //! `STAGE_PROFILE_JSON` line, so a failed run keeps the human evidence and emits no machine-readable
 //! result. A non-finite or non-positive time is an error, never a pass.
+//! Every requested T is measured even when an earlier one fails the cross-check
+//! (`profile_every_t`): a passing T prints its `STAGE_PROFILE_JSON`, a failing T
+//! prints none, and the run then prints one `STAGE_PROFILE_INCOMPLETE` line (the
+//! requested and failed T values, plus `aborted_at` and `unmeasured` after a hard error) and returns one error naming every failing T,
+//! so the exit is nonzero and a partial log is never read as a full table.
+//! The async-encode flag is restored to what the caller had on every path.
 //! The whole forward is then split on the host timeline (begin, the encode
 //! return of the 24 layers, the wait in score_answers) to expose what is not
 //! GPU kernel time.
@@ -502,6 +508,73 @@ fn timeline(model: &Qwen35Model, ids: &[u32], answers: &[u32]) -> Res<Timeline> 
     })
 }
 
+/// What `run` prints after the per-T lines when some T failed its cross-check:
+/// the requested and failed T values, so a log with only the passing T's JSON is
+/// never read as a full table (`bench/qwen35_stage_profile_report.py` refuses it).
+const INCOMPLETE_PREFIX: &str = "STAGE_PROFILE_INCOMPLETE ";
+
+/// Measure every `t` in `ts`, in order. `measure(t)` returns `Err` for a hard
+/// failure (a device or input error: the run stops there), or `Ok(Err(reason))`
+/// for a T whose replica did not reproduce the real parts, or `Ok(Ok(json))` for
+/// a trusted T. A trusted T's JSON line goes to `emit` as soon as it is known; a
+/// failed T is recorded and the loop goes on, so one bad T does not hide whether
+/// the others pass. If any T failed, `emit` also gets one `STAGE_PROFILE_INCOMPLETE`
+/// line (the requested and failed T values) and the returned error names every
+/// failing T with its reason, in the order requested. A hard error at T=x also
+/// emits the marker, with `aborted_at` x and `unmeasured` (the requested T values
+/// after it), then returns an error naming x, its cause and every earlier failure.
+fn profile_every_t(
+    ts: &[usize],
+    iters: usize,
+    mut emit: impl FnMut(&str),
+    mut measure: impl FnMut(usize) -> Res<Result<String, String>>,
+) -> Res<()> {
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut aborted: Option<(usize, usize, String)> = None;
+    for (i, &t) in ts.iter().enumerate() {
+        match measure(t) {
+            Ok(Ok(json)) => emit(&json),
+            Ok(Err(reason)) => failed.push((t, reason)),
+            Err(hard) => {
+                aborted = Some((i, t, hard));
+                break;
+            }
+        }
+    }
+    if failed.is_empty() && aborted.is_none() {
+        return Ok(());
+    }
+    let list = |v: &mut dyn Iterator<Item = usize>| v.map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+    let abort_keys = match &aborted {
+        Some((i, t, _)) => format!(
+            ",\"aborted_at\":{t},\"unmeasured\":[{}]",
+            list(&mut ts[i + 1..].iter().copied())
+        ),
+        None => String::new(),
+    };
+    emit(&format!(
+        "{INCOMPLETE_PREFIX}{{\"requested\":[{}],\"failed\":[{}],\"iters\":{iters}{abort_keys}}}",
+        list(&mut ts.iter().copied()),
+        list(&mut failed.iter().map(|&(t, _)| t))
+    ));
+    let named: Vec<String> = failed.iter().map(|(t, r)| format!("T={t}: {r}")).collect();
+    match aborted {
+        None => Err(format!(
+            "{} of {} requested T values failed the replica cross-check (JSON emitted only for the others): {}",
+            failed.len(),
+            ts.len(),
+            named.join(" | ")
+        )),
+        Some((i, t, hard)) => Err(format!(
+            "run aborted at T={t}: {hard}; {} requested T values after it were not measured; {} earlier T values failed the replica cross-check{}{}",
+            ts.len() - i - 1,
+            failed.len(),
+            if named.is_empty() { "" } else { ": " },
+            named.join(" | ")
+        )),
+    }
+}
+
 pub fn run(
     rt: &Arc<GpuRuntime>,
     model: &Qwen35Model,
@@ -527,202 +600,208 @@ pub fn run(
         "host: load/GPU at start: GPU utilization {}%",
         common::gpu_utilization()
     );
+    // Restore the flag the caller had on every path, including a failed T.
+    let prior_async = rt.async_encode_enabled();
     rt.set_async_encode(true)?;
-    for &t in ts {
-        let ids = file.prefix(t).map_err(|e| format!("T={t}: {e}"))?;
-        println!();
-        println!(
-            "=== T = {t} (ids {}, fnv1a32 {}) ===",
-            ids_path.display(),
-            super::prefill_ids::fnv1a32(ids)
-        );
-        println!("GPU utilization at start of T: {}%", common::gpu_utilization());
-        let r = Replica::new(rt, model, t)?;
-        let ops = Ops { rt, m: model, r: &r };
-        // One pass in forward order so every stage's input is what the stage
-        // before it wrote; then each stage alone.
-        ops.embed()?;
-        ops.norm(&r.input_norm)?;
-        ops.g_in_proj()?;
-        ops.g_conv()?;
-        ops.g_scan(None)?;
-        ops.g_gated_norm()?;
-        ops.g_out()?;
-        ops.a_in_proj()?;
-        ops.a_qk_rope()?;
-        ops.a_sdpa()?;
-        ops.a_gate()?;
-        ops.a_out()?;
-        ops.mlp_gate_up()?;
-        ops.mlp_swiglu()?;
-        ops.mlp_down()?;
-        rt.synchronize()?;
+    let profiled = profile_every_t(
+        ts,
+        iters,
+        |line| println!("{line}"),
+        |t| {
+            let ids = file.prefix(t).map_err(|e| format!("T={t}: {e}"))?;
+            println!();
+            println!(
+                "=== T = {t} (ids {}, fnv1a32 {}) ===",
+                ids_path.display(),
+                super::prefill_ids::fnv1a32(ids)
+            );
+            println!("GPU utilization at start of T: {}%", common::gpu_utilization());
+            let r = Replica::new(rt, model, t)?;
+            let ops = Ops { rt, m: model, r: &r };
+            // One pass in forward order so every stage's input is what the stage
+            // before it wrote; then each stage alone.
+            ops.embed()?;
+            ops.norm(&r.input_norm)?;
+            ops.g_in_proj()?;
+            ops.g_conv()?;
+            ops.g_scan(None)?;
+            ops.g_gated_norm()?;
+            ops.g_out()?;
+            ops.a_in_proj()?;
+            ops.a_qk_rope()?;
+            ops.a_sdpa()?;
+            ops.a_gate()?;
+            ops.a_out()?;
+            ops.mlp_gate_up()?;
+            ops.mlp_swiglu()?;
+            ops.mlp_down()?;
+            rt.synchronize()?;
 
-        let mut stages: Vec<Stage> = Vec::new();
-        let mut add =
-            |group: &'static str, name: &'static str, count: usize, f: &mut dyn FnMut() -> Res<()>| -> Res<()> {
-                let (ms, min_ms, dispatches, enc_us) = time_stage(rt, iters, &mut *f)?;
-                stages.push(Stage {
-                    group,
-                    name,
-                    ms,
-                    min_ms,
-                    dispatches,
-                    enc_us,
-                    count,
-                });
-                Ok(())
-            };
-        add("embed", "gather", 1, &mut || ops.embed())?;
-        add("gdn", "input_norm", n_gdn, &mut || ops.norm(&r.input_norm))?;
-        add("gdn", "in_proj_gemm", n_gdn, &mut || ops.g_in_proj())?;
-        add("gdn", "conv1d_silu", n_gdn, &mut || ops.g_conv())?;
-        add("gdn", "gdn_core_prep", n_gdn, &mut || {
-            ops.g_scan(Some(GdnChunkPhase::Prep))
-        })?;
-        add("gdn", "gdn_core_scan", n_gdn, &mut || {
-            ops.g_scan(Some(GdnChunkPhase::Scan))
-        })?;
-        add("gdn", "gdn_core", n_gdn, &mut || ops.g_scan(None))?;
-        add("gdn", "gated_norm", n_gdn, &mut || ops.g_gated_norm())?;
-        add("gdn", "out_proj_resid", n_gdn, &mut || ops.g_out())?;
-        add("attn", "input_norm", n_attn, &mut || ops.norm(&r.input_norm))?;
-        add("attn", "in_proj_gemm", n_attn, &mut || ops.a_in_proj())?;
-        add("attn", "qk_norm_rope", n_attn, &mut || ops.a_qk_rope())?;
-        add("attn", "sdpa", n_attn, &mut || ops.a_sdpa())?;
-        add("attn", "out_gate", n_attn, &mut || ops.a_gate())?;
-        add("attn", "out_proj_resid", n_attn, &mut || ops.a_out())?;
-        add("mlp", "post_norm", kinds.len(), &mut || ops.norm(&r.input_norm))?;
-        add("mlp", "gate_up_gemm", kinds.len(), &mut || ops.mlp_gate_up())?;
-        add("mlp", "swiglu", kinds.len(), &mut || ops.mlp_swiglu())?;
-        add("mlp", "down_proj_resid", kinds.len(), &mut || ops.mlp_down())?;
-        finite_nonzero(
-            "replica residual after the stage loops",
-            &r.resid,
-            t * model.config().hidden as usize,
-        )?;
+            let mut stages: Vec<Stage> = Vec::new();
+            let mut add =
+                |group: &'static str, name: &'static str, count: usize, f: &mut dyn FnMut() -> Res<()>| -> Res<()> {
+                    let (ms, min_ms, dispatches, enc_us) = time_stage(rt, iters, &mut *f)?;
+                    stages.push(Stage {
+                        group,
+                        name,
+                        ms,
+                        min_ms,
+                        dispatches,
+                        enc_us,
+                        count,
+                    });
+                    Ok(())
+                };
+            add("embed", "gather", 1, &mut || ops.embed())?;
+            add("gdn", "input_norm", n_gdn, &mut || ops.norm(&r.input_norm))?;
+            add("gdn", "in_proj_gemm", n_gdn, &mut || ops.g_in_proj())?;
+            add("gdn", "conv1d_silu", n_gdn, &mut || ops.g_conv())?;
+            add("gdn", "gdn_core_prep", n_gdn, &mut || {
+                ops.g_scan(Some(GdnChunkPhase::Prep))
+            })?;
+            add("gdn", "gdn_core_scan", n_gdn, &mut || {
+                ops.g_scan(Some(GdnChunkPhase::Scan))
+            })?;
+            add("gdn", "gdn_core", n_gdn, &mut || ops.g_scan(None))?;
+            add("gdn", "gated_norm", n_gdn, &mut || ops.g_gated_norm())?;
+            add("gdn", "out_proj_resid", n_gdn, &mut || ops.g_out())?;
+            add("attn", "input_norm", n_attn, &mut || ops.norm(&r.input_norm))?;
+            add("attn", "in_proj_gemm", n_attn, &mut || ops.a_in_proj())?;
+            add("attn", "qk_norm_rope", n_attn, &mut || ops.a_qk_rope())?;
+            add("attn", "sdpa", n_attn, &mut || ops.a_sdpa())?;
+            add("attn", "out_gate", n_attn, &mut || ops.a_gate())?;
+            add("attn", "out_proj_resid", n_attn, &mut || ops.a_out())?;
+            add("mlp", "post_norm", kinds.len(), &mut || ops.norm(&r.input_norm))?;
+            add("mlp", "gate_up_gemm", kinds.len(), &mut || ops.mlp_gate_up())?;
+            add("mlp", "swiglu", kinds.len(), &mut || ops.mlp_swiglu())?;
+            add("mlp", "down_proj_resid", kinds.len(), &mut || ops.mlp_down())?;
+            finite_nonzero(
+                "replica residual after the stage loops",
+                &r.resid,
+                t * model.config().hidden as usize,
+            )?;
 
-        // The real model's parts, for the cross-check.
-        let parts = time_parts(rt, model, ids, iters)?;
+            // The real model's parts, for the cross-check.
+            let parts = time_parts(rt, model, ids, iters)?;
 
-        // The forward on the host timeline, and the submit floor.
-        let answers = &file.answers;
-        for _ in 0..WARMUP {
-            timeline(model, ids, answers)?;
-        }
-        let mut tl: Vec<Timeline> = (0..iters).map(|_| timeline(model, ids, answers)).collect::<Res<_>>()?;
-        tl.sort_by(|a, b| a.total.total_cmp(&b.total));
-        let best = &tl[0];
-        let med = &tl[tl.len() / 2];
-        // An empty submit-and-wait: the cost every command buffer pays.
-        let floor = {
-            let mut v = Vec::new();
-            for _ in 0..iters.max(9) {
-                let t0 = Instant::now();
-                rt.synchronize()?;
-                v.push(t0.elapsed().as_secs_f64() * 1e3);
+            // The forward on the host timeline, and the submit floor.
+            let answers = &file.answers;
+            for _ in 0..WARMUP {
+                timeline(model, ids, answers)?;
             }
-            common::median(v)?
-        };
+            let mut tl: Vec<Timeline> = (0..iters).map(|_| timeline(model, ids, answers)).collect::<Res<_>>()?;
+            tl.sort_by(|a, b| a.total.total_cmp(&b.total));
+            let best = &tl[0];
+            let med = &tl[tl.len() / 2];
+            // An empty submit-and-wait: the cost every command buffer pays.
+            let floor = {
+                let mut v = Vec::new();
+                for _ in 0..iters.max(9) {
+                    let t0 = Instant::now();
+                    rt.synchronize()?;
+                    v.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                common::median(v)?
+            };
 
-        // Report.
-        let sum = |g: &str| -> f64 {
-            stages
-                .iter()
-                .filter(|s| s.group == g && s.name != "gdn_core_prep" && s.name != "gdn_core_scan")
-                .map(|s| s.ms * s.count as f64)
-                .sum()
-        };
-        println!(
-            "{:<6} {:<16} {:>10} {:>6} {:>5} {:>10} {:>9}",
-            "group", "stage", "ms/call", "count", "disp", "total ms", "enc us"
-        );
-        for s in &stages {
-            let note = if s.name == "gdn_core_prep" || s.name == "gdn_core_scan" {
-                " (split of gdn_core)"
-            } else {
-                ""
+            // Report.
+            let sum = |g: &str| -> f64 {
+                stages
+                    .iter()
+                    .filter(|s| s.group == g && s.name != "gdn_core_prep" && s.name != "gdn_core_scan")
+                    .map(|s| s.ms * s.count as f64)
+                    .sum()
             };
             println!(
-                "{:<6} {:<16} {:>10.4} {:>6} {:>5} {:>10.3} {:>9.1}{note}",
-                s.group,
-                s.name,
-                s.ms,
-                s.count,
-                s.dispatches,
-                s.ms * s.count as f64,
-                s.enc_us
+                "{:<6} {:<16} {:>10} {:>6} {:>5} {:>10} {:>9}",
+                "group", "stage", "ms/call", "count", "disp", "total ms", "enc us"
             );
-        }
-        let stage_total = sum("embed") + sum("gdn") + sum("attn") + sum("mlp");
-        println!("sum of stages x counts (no final norm / score / sync): {stage_total:.3} ms");
-        let gdn_stage_part = |names: &[&str]| -> f64 {
-            stages
-                .iter()
-                .filter(|s| s.group == "gdn" && names.contains(&s.name))
-                .map(|s| s.ms)
-                .sum()
-        };
-        let attn_stage_part = |names: &[&str]| -> f64 {
-            stages
-                .iter()
-                .filter(|s| s.group == "attn" && names.contains(&s.name))
-                .map(|s| s.ms)
-                .sum()
-        };
-        let mlp_stage: f64 = stages.iter().filter(|s| s.group == "mlp").map(|s| s.ms).sum();
-        let gdn_stage = gdn_stage_part(&[
-            "input_norm",
-            "in_proj_gemm",
-            "conv1d_silu",
-            "gdn_core",
-            "gated_norm",
-            "out_proj_resid",
-        ]);
-        let attn_stage = attn_stage_part(&[
-            "input_norm",
-            "in_proj_gemm",
-            "qk_norm_rope",
-            "sdpa",
-            "out_gate",
-            "out_proj_resid",
-        ]);
-        println!("cross-check against the real model's parts (encode_part, real weights), ms per layer:");
-        println!(
-            "  gdn layer  (norm+mixer) real {:.4} vs replica stages {:.4}",
-            parts.gdn_layer, gdn_stage
-        );
-        println!(
-            "  attn layer (norm+mixer) real {:.4} vs replica stages {:.4}",
-            parts.attn_layer, attn_stage
-        );
-        println!(
-            "  mlp        (norm+mlp)   real {:.4} vs replica stages {:.4}",
-            parts.mlp, mlp_stage
-        );
-        let parts_total =
-            parts.gdn_layer * n_gdn as f64 + parts.attn_layer * n_attn as f64 + parts.mlp * kinds.len() as f64;
-        println!("  real parts x layers {parts_total:.3} ms");
-        println!(
+            for s in &stages {
+                let note = if s.name == "gdn_core_prep" || s.name == "gdn_core_scan" {
+                    " (split of gdn_core)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{:<6} {:<16} {:>10.4} {:>6} {:>5} {:>10.3} {:>9.1}{note}",
+                    s.group,
+                    s.name,
+                    s.ms,
+                    s.count,
+                    s.dispatches,
+                    s.ms * s.count as f64,
+                    s.enc_us
+                );
+            }
+            let stage_total = sum("embed") + sum("gdn") + sum("attn") + sum("mlp");
+            println!("sum of stages x counts (no final norm / score / sync): {stage_total:.3} ms");
+            let gdn_stage_part = |names: &[&str]| -> f64 {
+                stages
+                    .iter()
+                    .filter(|s| s.group == "gdn" && names.contains(&s.name))
+                    .map(|s| s.ms)
+                    .sum()
+            };
+            let attn_stage_part = |names: &[&str]| -> f64 {
+                stages
+                    .iter()
+                    .filter(|s| s.group == "attn" && names.contains(&s.name))
+                    .map(|s| s.ms)
+                    .sum()
+            };
+            let mlp_stage: f64 = stages.iter().filter(|s| s.group == "mlp").map(|s| s.ms).sum();
+            let gdn_stage = gdn_stage_part(&[
+                "input_norm",
+                "in_proj_gemm",
+                "conv1d_silu",
+                "gdn_core",
+                "gated_norm",
+                "out_proj_resid",
+            ]);
+            let attn_stage = attn_stage_part(&[
+                "input_norm",
+                "in_proj_gemm",
+                "qk_norm_rope",
+                "sdpa",
+                "out_gate",
+                "out_proj_resid",
+            ]);
+            println!("cross-check against the real model's parts (encode_part, real weights), ms per layer:");
+            println!(
+                "  gdn layer  (norm+mixer) real {:.4} vs replica stages {:.4}",
+                parts.gdn_layer, gdn_stage
+            );
+            println!(
+                "  attn layer (norm+mixer) real {:.4} vs replica stages {:.4}",
+                parts.attn_layer, attn_stage
+            );
+            println!(
+                "  mlp        (norm+mlp)   real {:.4} vs replica stages {:.4}",
+                parts.mlp, mlp_stage
+            );
+            let parts_total =
+                parts.gdn_layer * n_gdn as f64 + parts.attn_layer * n_attn as f64 + parts.mlp * kinds.len() as f64;
+            println!("  real parts x layers {parts_total:.3} ms");
+            println!(
             "host timeline of the real forward (min-total sample / median-total sample): begin {:.3}/{:.3} ms, advance_to(24) returns {:.3}/{:.3} ms, score_answers waits {:.3}/{:.3} ms, total {:.3}/{:.3} ms",
             best.begin, med.begin, best.advance_return, med.advance_return, best.score_wait, med.score_wait, best.total, med.total
         );
-        println!("empty submit-and-wait floor (synchronize with nothing encoded): {floor:.4} ms");
-        println!(
+            println!("empty submit-and-wait floor (synchronize with nothing encoded): {floor:.4} ms");
+            println!(
             "unaccounted = total {:.3} - real parts x layers {:.3} = {:.3} ms (begin allocs + gather, final norm + score, submit)",
             best.total,
             parts_total,
             best.total - parts_total
         );
-        check_replica_against_parts(
-            &[
-                ("gdn layer", parts.gdn_layer, gdn_stage),
-                ("attn layer", parts.attn_layer, attn_stage),
-                ("mlp", parts.mlp, mlp_stage),
-            ],
-            REPLICA_REL_TOL,
-        )?;
-        let rows: Vec<String> = stages
+            let verdict = check_replica_against_parts(
+                &[
+                    ("gdn layer", parts.gdn_layer, gdn_stage),
+                    ("attn layer", parts.attn_layer, attn_stage),
+                    ("mlp", parts.mlp, mlp_stage),
+                ],
+                REPLICA_REL_TOL,
+            );
+            let rows: Vec<String> = stages
             .iter()
             .map(|s| {
                 format!(
@@ -737,7 +816,7 @@ pub fn run(
                 )
             })
             .collect();
-        println!(
+            let line = format!(
             "STAGE_PROFILE_JSON {{\"backend\":\"tessl\",\"tokens\":{t},\"iters\":{iters},\"reps\":{STAGE_REPS},\"stages\":[{}],\"parts_ms\":{{\"gdn_layer\":{},\"attn_layer\":{},\"mlp\":{}}},\"timeline_ms\":{{\"begin\":{},\"advance_return\":{},\"score_wait\":{},\"total\":{},\"total_median\":{}}},\"submit_floor_ms\":{}}}",
             rows.join(","),
             common::jnum(parts.gdn_layer),
@@ -750,9 +829,15 @@ pub fn run(
             common::jnum(med.total),
             common::jnum(floor)
         );
+            Ok(verdict.map(|()| line))
+        },
+    );
+    let restored = rt.set_async_encode(prior_async);
+    match (profiled, restored) {
+        (Ok(()), restored) => restored,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(r)) => Err(format!("{e}; restoring async encode also failed: {r}")),
     }
-    rt.set_async_encode(false)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -899,5 +984,307 @@ mod tests {
     fn defect_an_infinite_tolerance_must_not_pass_any_row() {
         let r = check_replica_against_parts(&[("row", 1.0, 10.0)], f64::INFINITY);
         assert!(r.is_err(), "infinite tolerance passed a 900% gap");
+    }
+
+    /// Drives `profile_every_t` with a fake measurer; returns (measured T's, emitted lines, result).
+    fn drive(ts: &[usize], fail: &[usize]) -> (Vec<usize>, Vec<String>, Res<()>) {
+        let (mut measured, mut emitted) = (Vec::new(), Vec::new());
+        let r = profile_every_t(
+            ts,
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                measured.push(t);
+                Ok(if fail.contains(&t) {
+                    Err(format!("gap at {t}"))
+                } else {
+                    Ok(format!("json {t}"))
+                })
+            },
+        );
+        (measured, emitted, r)
+    }
+
+    #[test]
+    fn a_failing_middle_t_does_not_hide_the_later_one() {
+        let (measured, emitted, r) = drive(&[1024, 2048, 8192], &[2048]);
+        assert_eq!(measured, [1024, 2048, 8192], "every T must be measured");
+        assert_eq!(emitted[..2], ["json 1024", "json 8192"]);
+        assert_eq!(
+            emitted.len(),
+            3,
+            "two JSON lines and one incomplete marker: {emitted:?}"
+        );
+        assert_eq!(
+            emitted[2],
+            "STAGE_PROFILE_INCOMPLETE {\"requested\":[1024,2048,8192],\"failed\":[2048],\"iters\":3}"
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("T=2048: gap at 2048"), "{err}");
+        assert!(!err.contains("T=1024") && !err.contains("T=8192"), "{err}");
+    }
+
+    #[test]
+    fn every_failing_t_is_named_in_order_and_no_json_is_emitted() {
+        let (measured, emitted, r) = drive(&[1024, 8192], &[1024, 8192]);
+        assert_eq!(measured, [1024, 8192]);
+        assert_eq!(emitted.len(), 1, "only the incomplete marker: {emitted:?}");
+        assert!(emitted[0].starts_with(INCOMPLETE_PREFIX), "{emitted:?}");
+        let err = r.unwrap_err();
+        let (a, b) = (err.find("T=1024: gap at 1024"), err.find("T=8192: gap at 8192"));
+        assert!(a.is_some() && b.is_some() && a < b, "{err}");
+        assert!(err.contains("2 of 2"), "{err}");
+    }
+
+    #[test]
+    fn all_passing_ts_emit_each_json_and_no_marker() {
+        let (measured, emitted, r) = drive(&[1024, 8192], &[]);
+        assert_eq!(measured, [1024, 8192]);
+        assert_eq!(emitted, ["json 1024", "json 8192"]);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn an_empty_t_list_is_a_silent_ok() {
+        let (measured, emitted, r) = drive(&[], &[]);
+        assert!(measured.is_empty() && emitted.is_empty() && r.is_ok());
+    }
+
+    #[test]
+    fn a_hard_error_stops_the_run_with_a_marker_and_no_later_ts() {
+        let (mut measured, mut emitted) = (Vec::new(), Vec::new());
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                measured.push(t);
+                if t == 2 {
+                    Err("device lost".to_string())
+                } else {
+                    Ok(Ok(format!("json {t}")))
+                }
+            },
+        );
+        assert_eq!(measured, [1, 2]);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        assert_eq!(emitted[0], "json 1");
+        assert_eq!(
+            emitted[1],
+            "STAGE_PROFILE_INCOMPLETE {\"requested\":[1,2,3],\"failed\":[],\"iters\":3,\"aborted_at\":2,\"unmeasured\":[3]}"
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("T=2: device lost") && err.contains("1 requested"), "{err}");
+    }
+
+    #[test]
+    fn a_hard_error_after_a_soft_failure_names_both_and_marks_both() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| match t {
+                1 => Ok(Err("gap at 1".into())),
+                2 => Err("device lost".into()),
+                _ => Ok(Ok("json 3".into())),
+            },
+        );
+        assert_eq!(
+            emitted,
+            ["STAGE_PROFILE_INCOMPLETE {\"requested\":[1,2,3],\"failed\":[1],\"iters\":3,\"aborted_at\":2,\"unmeasured\":[3]}"]
+        );
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("T=2: device lost") && err.contains("T=1: gap at 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_hard_error_at_the_last_t_has_an_empty_unmeasured_list() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[4, 5],
+            1,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                if t == 5 {
+                    Err("x".into())
+                } else {
+                    Ok(Ok("json 4".into()))
+                }
+            },
+        );
+        assert!(r.is_err());
+        assert!(
+            emitted[1].ends_with("\"aborted_at\":5,\"unmeasured\":[]}"),
+            "{emitted:?}"
+        );
+    }
+
+    /// Strict reader for the marker payload `{"requested":[..],"failed":[..],"iters":N}`:
+    /// ASCII digits only, exact key order, no whitespace. Anything else is `None`.
+    fn parse_marker(line: &str) -> Option<(Vec<usize>, Vec<usize>, usize)> {
+        let body = line.strip_prefix(INCOMPLETE_PREFIX)?;
+        let body = body.strip_prefix("{\"requested\":[")?;
+        let (req, rest) = body.split_once("],\"failed\":[")?;
+        let (fail, rest) = rest.split_once("],\"iters\":")?;
+        let iters = rest.strip_suffix('}')?;
+        let nums = |s: &str| -> Option<Vec<usize>> {
+            if s.is_empty() {
+                return Some(Vec::new());
+            }
+            s.split(',')
+                .map(|n| {
+                    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| n.parse().ok())
+                        .flatten()
+                })
+                .collect()
+        };
+        if iters.is_empty() || !iters.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((nums(req)?, nums(fail)?, iters.parse().ok()?))
+    }
+
+    #[test]
+    fn attack_duplicate_unsorted_and_zero_ts_keep_request_order() {
+        let (measured, emitted, r) = drive(&[8192, 0, 1024, 1024, 0], &[0, 1024]);
+        assert_eq!(measured, [8192, 0, 1024, 1024, 0]);
+        assert_eq!(emitted[0], "json 8192");
+        let (req, failed, iters) = parse_marker(emitted.last().unwrap()).expect("marker parses");
+        assert_eq!(req, [8192, 0, 1024, 1024, 0]);
+        assert_eq!(failed, [0, 1024, 1024, 0]);
+        assert_eq!(iters, 3);
+        assert!(r.unwrap_err().contains("4 of 5"));
+    }
+
+    #[test]
+    fn attack_a_duplicate_t_that_passes_once_and_fails_once_still_marks_incomplete() {
+        let mut calls = 0;
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[7, 7],
+            1,
+            |l| emitted.push(l.to_string()),
+            |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    Ok("json 7".into())
+                } else {
+                    Err("flaky".into())
+                })
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(emitted[0], "json 7");
+        assert_eq!(parse_marker(&emitted[1]).unwrap().1, [7]);
+    }
+
+    #[test]
+    fn attack_hostile_reasons_cannot_reach_the_marker() {
+        let hostile = [
+            "",
+            "a | T=9: forged",
+            "line1\nSTAGE_PROFILE_INCOMPLETE {\"requested\":[],\"failed\":[],\"iters\":0}",
+            "quote\" and \\ and \r\n",
+            "STAGE_PROFILE_JSON {}",
+        ];
+        for reason in hostile {
+            let mut emitted = Vec::new();
+            let r = profile_every_t(
+                &[5, 6],
+                2,
+                |l| emitted.push(l.to_string()),
+                |t| {
+                    Ok(if t == 5 {
+                        Err(reason.to_string())
+                    } else {
+                        Ok("json 6".into())
+                    })
+                },
+            );
+            assert_eq!(emitted.len(), 2, "{reason:?}: {emitted:?}");
+            assert!(emitted.iter().all(|l| !l.contains('\n') && !l.contains('\r')));
+            assert_eq!(parse_marker(&emitted[1]), Some((vec![5, 6], vec![5], 2)), "{reason:?}");
+            let err = r.unwrap_err();
+            assert!(err.contains("T=5: "), "{err}");
+            assert!(err.contains("1 of 2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn attack_a_huge_t_list_keeps_a_valid_marker() {
+        let ts: Vec<usize> = (0..200_000).collect();
+        let fail: Vec<usize> = ts.iter().copied().filter(|t| t % 3 == 0).collect();
+        let (measured, emitted, r) = drive(&ts, &fail);
+        assert_eq!(measured.len(), ts.len());
+        let (req, failed, _) = parse_marker(emitted.last().unwrap()).expect("marker parses");
+        assert_eq!((req.len(), failed), (ts.len(), fail));
+        assert!(r.unwrap_err().contains(&format!("{} of 200000", 66_667)));
+    }
+
+    #[test]
+    fn attack_the_marker_is_emitted_after_every_json_line() {
+        let (_, emitted, _) = drive(&[1, 2, 3, 4], &[1, 3]);
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted[2].starts_with(INCOMPLETE_PREFIX));
+        assert!(emitted[..2].iter().all(|l| !l.starts_with(INCOMPLETE_PREFIX)));
+    }
+
+    /// A hard error after at least one T was emitted leaves a stdout with passing
+    /// JSON and no marker: `bench/qwen35_stage_profile_report.py` accepts that as a
+    /// full table, though the run is partial. The old expectation
+    /// (`a_hard_error_stops_the_run_without_a_marker_or_later_ts`) encoded this defect.
+    #[test]
+    fn defect_a_hard_error_after_a_pass_leaves_a_partial_log_without_a_marker() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                if t == 2 {
+                    Err("device lost".into())
+                } else {
+                    Ok(Ok(format!("json {t}")))
+                }
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(emitted[0], "json 1");
+        assert!(
+            emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)),
+            "stdout holds a passing T and no INCOMPLETE marker, so a log-only consumer reads it as complete: {emitted:?}"
+        );
+    }
+
+    /// A hard error after a cross-check failure drops the failed T from both the
+    /// marker and the error text.
+    #[test]
+    fn defect_a_hard_error_after_a_soft_failure_forgets_the_failed_t() {
+        let mut emitted = Vec::new();
+        let r = profile_every_t(
+            &[1, 2, 3],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| match t {
+                1 => Ok(Err("gap at 1".into())),
+                2 => Err("device lost".into()),
+                _ => Ok(Ok("json 3".into())),
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("device lost"), "{err}");
+        assert!(
+            err.contains("T=1"),
+            "the earlier cross-check failure is not named: {err}"
+        );
+        assert!(
+            emitted.iter().any(|l| l.starts_with(INCOMPLETE_PREFIX)),
+            "no marker: {emitted:?}"
+        );
     }
 }

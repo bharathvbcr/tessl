@@ -2219,7 +2219,9 @@ fn dispatch_k_partitions(
 /// one output, so the reduction is not split and the bits do not depend on
 /// the grid. This is not [`GemmBackend::TensorOps`] and not
 /// [`GemmBackend::Simdgroup`]: those match this fold on short K and disagree
-/// on order-sensitive products whose K fills a hardware chunk.
+/// on order-sensitive products whose K fills a hardware chunk. f32 subnormals
+/// are flushed to zero on the GPU; the public contract is on
+/// [`gemm_fixed_order_nn`].
 fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: &str) -> Result<(), String> {
     let (m, n, _k) = validate_gemm(a, b, c, layout, false, kernel)?;
     let rt = a.runtime();
@@ -2236,17 +2238,48 @@ fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: 
     })
 }
 
-/// `C[M,N] = A[M,K] @ B[K,N]`, fixed order. See `gemm_fixed_order`.
+/// `C[M,N] = A[M,K] @ B[K,N]`, fixed order: each output is `acc = +0`, then
+/// `acc = acc + (a * b)` for `k` ascending, as two f32 roundings (contraction
+/// off), computed by one thread, so the bits do not depend on the grid. This
+/// is not [`GemmBackend::TensorOps`] and not [`GemmBackend::Simdgroup`]: those
+/// match this fold on short K and disagree on order-sensitive products whose K
+/// fills a hardware chunk. [`gemm_fixed_order_tn`] and [`gemm_fixed_order_nt`]
+/// are the same kernel family over the other layouts and share this contract.
+///
+/// # Subnormals
+///
+/// The GPU flushes f32 subnormals to zero in these kernels, whatever the
+/// compiler's math mode. Every subnormal operand, every product that is
+/// subnormal, and every partial sum that is subnormal reads and writes as
+/// zero, so a result that the IEEE fold would leave subnormal, or that
+/// depends on a subnormal operand or product, comes back as (positive) zero.
+/// Bit-identity with an IEEE CPU fold ([`gemm_f32_cpu`]) therefore holds only
+/// when no operand, product or partial sum is subnormal. Normal-range inputs
+/// are bit-identical to the fold, and the minimum normal (`0x00800000`)
+/// survives.
+///
+/// Evidence and scope: measured on an Apple M5 Pro on 2026-11-08, with the
+/// kernel compiled `-fmetal-math-mode=fast` and again with `safe`; both gave
+/// the same result on 108 of 108 comparisons, so the flush is not the
+/// compiler flag. The cause is inferred, not shown: the GPU ALU or the
+/// driver's AIR-to-GPU compile. Other GPUs, drivers and OS releases are
+/// unmeasured. `tests/gemm_fixed_order.rs`
+/// (`fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu`) pins the
+/// observed behaviour for all three layouts, and a failure there means the
+/// hardware or driver changed and this section needs revisiting (GitPulse
+/// card ft-02eec315).
 pub fn gemm_fixed_order_nn(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a, b, c, Layout::NN, "matmul_fixed_order_nn_f32")
 }
 
-/// `C[M,N] = A[K,M]^T @ B[K,N]`, fixed order. See `gemm_fixed_order`.
+/// `C[M,N] = A[K,M]^T @ B[K,N]`, fixed order. Same fold and the same f32 subnormal
+/// flush-to-zero contract as [`gemm_fixed_order_nn`] (see its `# Subnormals`).
 pub fn gemm_fixed_order_tn(a_km: &Tensor, b_kn: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a_km, b_kn, c, Layout::TN, "matmul_fixed_order_tn_f32")
 }
 
-/// `C[M,N] = A[M,K] @ B[N,K]^T`, fixed order. See `gemm_fixed_order`.
+/// `C[M,N] = A[M,K] @ B[N,K]^T`, fixed order. Same fold and the same f32 subnormal
+/// flush-to-zero contract as [`gemm_fixed_order_nn`] (see its `# Subnormals`).
 pub fn gemm_fixed_order_nt(a_mk: &Tensor, b_nk: &Tensor, c: &Tensor) -> Result<(), String> {
     gemm_fixed_order(a_mk, b_nk, c, Layout::NT, "matmul_fixed_order_nt_f32")
 }

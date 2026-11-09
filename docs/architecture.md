@@ -519,8 +519,18 @@ Contraction is off, so the multiply and the add are two roundings, and one
 thread writes one output. TensorOps and the simdgroup tile match
 `gemm_f32_cpu` on short `K` and on integer products. They disagree on
 order-sensitive products whose `K` fills a hardware chunk. These three kernels
-match that CPU fold bit for bit (`tests/gemm_fixed_order.rs`). They do not
-replace the 32×32 `matmul2d` tile.
+match that CPU fold bit for bit (`tests/gemm_fixed_order.rs`) when no operand,
+product, or partial sum is an f32 subnormal. They do not replace the 32×32
+`matmul2d` tile.
+
+The GPU flushes f32 subnormal operands, products, and partial sums to zero in
+these kernels, under both `-fmetal-math-mode=fast` and `safe`, so a result the
+IEEE fold leaves subnormal (or builds from a subnormal) comes back as zero.
+This was measured on an M5 Pro on 2026-11-08; the cause (GPU ALU or the
+driver's AIR-to-GPU compile) is inferred, and other GPUs are unmeasured.
+`fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu` pins it, and the
+contract is the `# Subnormals` section of `gemm::gemm_fixed_order_nn`
+(GitPulse card ft-02eec315).
 
 ---
 

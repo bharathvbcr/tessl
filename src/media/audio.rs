@@ -287,7 +287,7 @@ pub const MAX_AUDIO_FILE_BYTES: u64 = 1 << 32;
 /// data, [`MediaError::Limit`] for a clip longer than `options.max_seconds`
 /// (unless it truncates).
 ///
-/// The file is opened once ([`super::open_media_file`]), so a FIFO, device or
+/// The file is opened once (by the crate-private `media::open_media_file`), so a FIFO, device or
 /// directory is refused without blocking, and the length judged is the opened
 /// handle's. Residual window: AudioToolbox re-opens the path by name
 /// (`cf::file_url`, then `ExtAudioFileOpenURL`) after the container check, so a

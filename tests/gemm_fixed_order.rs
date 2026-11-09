@@ -329,3 +329,302 @@ fn fixed_order_flushes_f32_subnormals_to_zero_on_this_gpu() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial extension (card ft-02eec315, lane w5-adv-ftz). The model under
+// test is the one the `# Subnormals` doc states: the GPU flushes every f32
+// subnormal operand, every subnormal product and every subnormal partial sum
+// to zero, and is IEEE otherwise. These tests assert the model's exact bits
+// over randomized and structured inputs on every layout, and assert on the
+// host that the model differs from both the IEEE fold and an operand-only
+// flush on the same inputs, so the pin would notice either change.
+// ---------------------------------------------------------------------------
+
+fn ftz(x: f32) -> f32 {
+    if x.is_subnormal() {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Flush operands, every product and every partial sum (the documented model).
+fn flush_fold(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                let prod = ftz(ftz(a[i * k + p]) * ftz(b[p * n + j]));
+                acc = ftz(acc + prod);
+            }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
+/// IEEE arithmetic on operands that were flushed first (flush "only operands").
+fn operand_flush_fold(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let fa: Vec<f32> = a.iter().map(|x| ftz(*x)).collect();
+    let fb: Vec<f32> = b.iter().map(|x| ftz(*x)).collect();
+    ieee_fold(&fa, &fb, m, n, k)
+}
+
+fn differing(x: &[f32], y: &[f32]) -> usize {
+    x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()
+}
+
+/// Asserts the GPU equals the documented flush model on every layout, and (when
+/// `sensitive`) that the host models distinguish it from IEEE and operand-only.
+fn assert_flush_model(
+    rt: &std::sync::Arc<tessl::GpuRuntime>,
+    label: &str,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    sensitive: bool,
+) {
+    let model = flush_fold(a, b, m, n, k);
+    if sensitive {
+        let d_ieee = differing(&model, &ieee_fold(a, b, m, n, k));
+        let d_op = differing(&model, &operand_flush_fold(a, b, m, n, k));
+        assert!(d_ieee > 0, "{label}: construction does not separate flush from IEEE");
+        assert!(
+            d_op > 0,
+            "{label}: construction does not separate full flush from operand-only flush"
+        );
+    }
+    for (layout, got) in run_all_layouts(rt, a, b, m, n, k) {
+        let bad = differing(&got, &model);
+        if bad != 0 {
+            let first = got
+                .iter()
+                .zip(&model)
+                .position(|(g, w)| g.to_bits() != w.to_bits())
+                .unwrap();
+            panic!(
+                "{label}: {layout}: {bad} of {} outputs differ from the flush model; first at {first}: gpu {:#010x} model {:#010x}",
+                m * n,
+                got[first].to_bits(),
+                model[first].to_bits()
+            );
+        }
+    }
+}
+
+impl Xorshift {
+    /// Operand mix chosen so products and partial sums underflow often: normals in
+    /// 2^-80 .. 2^-40 (products 2^-160 .. 2^-80), 15% subnormal (either sign),
+    /// 5% signed zero, so subnormal operands, products and sums all occur.
+    fn tiny_mix(&mut self) -> f32 {
+        let sel = self.next() % 100;
+        let r = self.next();
+        let sign = (((r >> 40) & 1) as u32) << 31;
+        match sel {
+            0..=14 => f32::from_bits(sign | ((r & 0x7f_ffff) as u32).max(1)),
+            15..=19 => f32::from_bits(sign),
+            _ => {
+                let exp = 127 - 80 + ((r >> 24) % 41) as u32;
+                f32::from_bits(sign | exp << 23 | (r & 0x7f_ffff) as u32)
+            }
+        }
+    }
+}
+
+#[test]
+fn attack_random_mix_matches_flush_model_all_layouts() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let mut rng = Xorshift(0xdead_beef_cafe_f00d);
+        // (m, n, k): odd extents that straddle 8/16/32 tiles and a 130-long K.
+        for (m, n, k) in [
+            (1usize, 1usize, 1usize),
+            (3, 5, 7),
+            (19, 37, 130),
+            (33, 65, 33),
+            (2, 3, 1025),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|_| rng.tiny_mix()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.tiny_mix()).collect();
+            let sensitive = m * n * k >= 100;
+            assert_flush_model(rt, &format!("random {m}x{n}x{k}"), &a, &b, m, n, k, sensitive);
+        }
+    });
+}
+
+#[test]
+fn attack_partial_sum_flush_with_normal_operands_and_products() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let sub = f32::from_bits;
+        // Every operand and product is normal; only the running sum goes subnormal.
+        // 0x00800001 + (-0x00800000) = 0x00000001 (exact, subnormal) -> flushed to 0.
+        // A later +0x00800000 then shows whether the flushed 0 persisted:
+        // IEEE gives 0x00800001, a flushed partial sum gives 0x00800000.
+        let cases: [(&str, Vec<f32>, Vec<f32>, u32, u32); 3] = [
+            (
+                "sum subnormal then end",
+                vec![sub(0x0080_0001), sub(0x0080_0000)],
+                vec![1.0, -1.0],
+                0x0000_0001,
+                0,
+            ),
+            (
+                "flushed partial persists into a later add",
+                vec![sub(0x0080_0001), sub(0x0080_0000), sub(0x0080_0000)],
+                vec![1.0, -1.0, 1.0],
+                0x0080_0001,
+                0x0080_0000,
+            ),
+            (
+                "negative subnormal partial sum",
+                vec![sub(0x0080_0000), sub(0x0080_0001)],
+                vec![1.0, -1.0],
+                0x8000_0001,
+                0,
+            ),
+        ];
+        for (label, a, b, ieee, gpu) in &cases {
+            assert!(
+                a.iter().chain(b.iter()).all(|x| x.is_normal()),
+                "{label}: operands must be normal"
+            );
+            let k = a.len();
+            let want = ieee_fold(a, b, 1, 1, k);
+            assert_eq!(want[0].to_bits(), *ieee, "{label}: host fold");
+            for (layout, got) in run_all_layouts(rt, a, b, 1, 1, k) {
+                assert_eq!(got[0].to_bits(), *gpu, "{label}: {layout}");
+            }
+        }
+    });
+}
+
+#[test]
+fn attack_product_underflow_from_normal_operands_and_sign() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let p2 = |e: i32| f32::from_bits(((127 + e) as u32) << 23);
+        // (label, a, b, IEEE bits, GPU bits). Every operand is normal.
+        let cases: [(&str, f32, f32, u32, u32); 6] = [
+            (
+                "2^-63 * 2^-63 = min normal survives",
+                p2(-63),
+                p2(-63),
+                0x0080_0000,
+                0x0080_0000,
+            ),
+            ("2^-63 * 2^-64 = 2^-127 flushes", p2(-63), p2(-64), 0x0040_0000, 0),
+            (
+                "2^-100 * 2^-49 = 2^-149 (smallest subnormal) flushes",
+                p2(-100),
+                p2(-49),
+                0x0000_0001,
+                0,
+            ),
+            (
+                "negative product -2^-100 * 2^-30 flushes to +0",
+                -p2(-100),
+                p2(-30),
+                0x8008_0000,
+                0,
+            ),
+            (
+                "both negative 2^-100 * 2^-30 flushes",
+                -p2(-100),
+                -p2(-30),
+                0x0008_0000,
+                0,
+            ),
+            (
+                "product below the smallest subnormal rounds to 0 either way",
+                p2(-100),
+                p2(-60),
+                0,
+                0,
+            ),
+        ];
+        for (label, a, b, ieee, gpu) in &cases {
+            assert!(a.is_normal() && b.is_normal(), "{label}");
+            let want = ieee_fold(&[*a], &[*b], 1, 1, 1);
+            assert_eq!(want[0].to_bits(), *ieee, "{label}: host fold");
+            for (layout, got) in run_all_layouts(rt, &[*a], &[*b], 1, 1, 1) {
+                assert_eq!(got[0].to_bits(), *gpu, "{label}: {layout}");
+            }
+        }
+    });
+}
+
+#[test]
+fn attack_signed_zero_and_subnormal_operand_extremes_every_layout() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let sub = f32::from_bits;
+        // Both operand slots, both signs, smallest / largest subnormal and -0.0.
+        // No output can be -0.0 (the accumulator starts at +0 and +0 + -0 = +0),
+        // so the documented "(positive) zero" is asserted over all of these.
+        let vals = [
+            0x0000_0001u32,
+            0x007f_ffff,
+            0x8000_0001,
+            0x807f_ffff,
+            0x8000_0000,
+            0x0000_0000,
+        ];
+        for &v in &vals {
+            for (label, a, b) in [("a", sub(v), 1.0f32), ("b", 1.0f32, sub(v)), ("neg-b", -1.0f32, sub(v))] {
+                let want_gpu = 0u32; // flushed or zero: +0 in every case
+                let want = ieee_fold(&[a], &[b], 1, 1, 1);
+                // IEEE keeps the subnormal except for true zeros, where the fold gives +0 too.
+                assert!(want[0].is_subnormal() || want[0].to_bits() == 0, "{label} {v:#010x}");
+                for (layout, got) in run_all_layouts(rt, &[a], &[b], 1, 1, 1) {
+                    assert_eq!(got[0].to_bits(), want_gpu, "{label} {v:#010x}: {layout}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn attack_subnormal_at_k_positions_across_chunk_and_long_k() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(false);
+        let sub = f32::from_bits;
+        // One output at (row i, col j) inside a grid, so a layout that mis-indexes
+        // the subnormal's operand moves the flush to a different output.
+        let (m, n) = (3usize, 5usize);
+        for k in [15usize, 16, 17, 31, 32, 33, 127, 128, 129, 4095, 4096, 4097, 70_000] {
+            // Row 2 of A is zero except the planted entries; column 4 of B is 1.0
+            // except the planted one; every other row and column is zero. Only
+            // output (2, 4) is non-zero: sub(1) + sub(0x7fffff) - sub(1) in IEEE.
+            let mut a = vec![0.0f32; m * k];
+            let mut b = vec![0.0f32; k * n];
+            for p in 0..k {
+                b[p * n + 4] = 1.0;
+            }
+            a[2 * k] = sub(1);
+            a[2 * k + k / 2] = 1.0;
+            b[(k / 2) * n + 4] = sub(0x007f_ffff);
+            a[2 * k + (k - 1)] = sub(0x8000_0001);
+            assert_flush_model(rt, &format!("k={k} planted subnormals"), &a, &b, m, n, k, false);
+            let model = flush_fold(&a, &b, m, n, k);
+            assert!(
+                model[2 * n + 4].to_bits() != ieee_fold(&a, &b, m, n, k)[2 * n + 4].to_bits(),
+                "k={k}: planted subnormals must change the IEEE result"
+            );
+
+            // Late cancellation: sum goes subnormal at p = k-3 and a normal add follows.
+            if k >= 8 {
+                let mut a2 = vec![0.0f32; k];
+                let mut b2 = vec![1.0f32; k];
+                a2[1] = sub(0x0080_0001);
+                a2[k - 3] = sub(0x0080_0000);
+                b2[k - 3] = -1.0;
+                a2[k - 1] = sub(0x0080_0000);
+                assert_flush_model(rt, &format!("k={k} late partial-sum flush"), &a2, &b2, 1, 1, k, true);
+            }
+        }
+    });
+}

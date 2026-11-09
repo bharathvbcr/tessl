@@ -998,30 +998,28 @@ fn class(name: &'static std::ffi::CStr) -> Result<&'static AnyClass, MediaError>
     AnyClass::get(name).ok_or_else(|| framework("objc_getClass", format!("{name:?} is not available")))
 }
 
+/// Open `path` once through [`super::open_media_file`] (a directory, FIFO or
+/// device is refused without blocking), check the container's declared sizes
+/// against that handle, then hand the path to AVFoundation.
+///
+/// There is no input byte cap here, on purpose. Nothing reads the whole input
+/// into memory: `containers::check_video` reads only 8- and 16-byte box headers
+/// at offsets (`read_at`), and AVFoundation is given the path and streams the
+/// file. What is bounded is the decoded output (`VideoOptions::max_bytes`, 4 GiB,
+/// `max_frames` and the pixel limit), which is what costs memory.
+///
+/// Residual window: AVFoundation re-opens the path by name after the check, so a
+/// file swapped for a FIFO or other file in that gap is not covered by the
+/// handle that was checked. The check guards the declared-size comparison, not
+/// the decoder's own open.
 fn open_inner(path: &Path, options: &VideoOptions, temp: Option<TempFile>) -> Result<VideoSource, MediaError> {
     autoreleasepool(|_| {
-        let meta = std::fs::metadata(path).map_err(|source| MediaError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if !meta.is_file() {
-            return Err(MediaError::Invalid {
-                what: "video",
-                detail: format!("{} is not a file", path.display()),
-            });
-        }
-        if meta.len() == 0 {
-            return Err(MediaError::Empty { what: "video" });
-        }
+        // Opened once, and judged by the opened handle (not a prior `metadata`
+        // by name), so a FIFO or `/dev/zero` is refused here without blocking.
         // AVFoundation reads the frames a cut-short file still holds without
         // complaint, so the boxes' declared sizes are compared with the file.
-        let source = containers::FileSource {
-            file: std::fs::File::open(path).map_err(|source| MediaError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?,
-            len: meta.len(),
-        };
+        let (file, len) = super::open_media_file(path, "video")?;
+        let source = containers::FileSource { file, len };
         containers::check_video(&source).map_err(|detail| MediaError::Decode { what: "video", detail })?;
         let path_str = path.to_str().ok_or_else(|| MediaError::Invalid {
             what: "video",

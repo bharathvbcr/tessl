@@ -288,32 +288,14 @@ pub const MAX_AUDIO_FILE_BYTES: u64 = 1 << 32;
 /// (unless it truncates).
 pub fn decode_audio_file(path: &Path, options: &AudioOptions) -> Result<DecodedAudio, MediaError> {
     validate_options(options)?;
-    let meta = std::fs::metadata(path).map_err(|source| MediaError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !meta.is_file() {
-        return Err(MediaError::Invalid {
-            what: "audio",
-            detail: format!("{} is not a file", path.display()),
-        });
-    }
-    if meta.len() == 0 {
-        return Err(MediaError::Empty { what: "audio" });
-    }
-    if meta.len() > MAX_AUDIO_FILE_BYTES {
+    let (file, len) = super::open_media_file(path, "audio")?;
+    if len > MAX_AUDIO_FILE_BYTES {
         return Err(MediaError::Limit {
             what: "audio",
-            detail: format!("{} bytes exceeds {MAX_AUDIO_FILE_BYTES}", meta.len()),
+            detail: format!("{len} bytes exceeds {MAX_AUDIO_FILE_BYTES}"),
         });
     }
-    let source = FileSource {
-        file: std::fs::File::open(path).map_err(|source| MediaError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        len: meta.len(),
-    };
+    let source = FileSource { file, len };
     containers::check_audio(&source).map_err(|detail| MediaError::Decode { what: "audio", detail })?;
     let url = cf::file_url(path).ok_or_else(|| MediaError::Framework {
         api: "CFURLCreateFromFileSystemRepresentation",

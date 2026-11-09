@@ -117,43 +117,51 @@ impl From<MediaError> for String {
     }
 }
 
-/// Read a whole file, refusing an empty one and one over `limit` bytes.
-pub(crate) fn read_file_bounded(path: &Path, limit: u64, what: &'static str) -> Result<Vec<u8>, MediaError> {
-    let io = |source| MediaError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let meta = std::fs::metadata(path).map_err(io)?;
-    if !meta.is_file() {
-        return Err(MediaError::Invalid {
+/// A failed open or capped read as the [`MediaError`] callers and tests pin: a
+/// directory, FIFO or device is `Invalid` ("is not a file"), an unopenable path
+/// is `Io`, and a file past `limit` is `Limit`.
+fn media_error(fail: crate::bounded_file::OpenFail, path: &Path, what: &'static str, limit: u64) -> MediaError {
+    use crate::bounded_file::OpenFail;
+    match fail {
+        OpenFail::NotRegular => MediaError::Invalid {
             what,
             detail: format!("{} is not a file", path.display()),
-        });
-    }
-    if meta.len() == 0 {
-        return Err(MediaError::Empty { what });
-    }
-    if meta.len() > limit {
-        return Err(MediaError::Limit {
+        },
+        OpenFail::Io(source) => MediaError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+        OpenFail::TooLarge { len, at_least: false } => MediaError::Limit {
             what,
-            detail: format!("{} bytes exceeds {limit}", meta.len()),
-        });
-    }
-    // Read through a bounded reader so a file that grows after the check cannot
-    // exceed the limit.
-    use std::io::Read;
-    let mut out = Vec::with_capacity(meta.len() as usize);
-    std::fs::File::open(path)
-        .map_err(io)?
-        .take(limit + 1)
-        .read_to_end(&mut out)
-        .map_err(io)?;
-    if out.len() as u64 > limit {
-        return Err(MediaError::Limit {
+            detail: format!("{len} bytes exceeds {limit}"),
+        },
+        OpenFail::TooLarge { at_least: true, .. } => MediaError::Limit {
             what,
             detail: format!("more than {limit} bytes"),
-        });
+        },
     }
+}
+
+/// Open the media file at `path` once ([`crate::bounded_file::open_regular`]) and
+/// return the handle with the length `fstat` gave for that handle, so a caller
+/// never judges the path by name and then opens it by name. A directory, FIFO or
+/// device is [`MediaError::Invalid`], refused without blocking or reading; an
+/// unopenable path is [`MediaError::Io`]; an empty file is [`MediaError::Empty`].
+pub(crate) fn open_media_file(path: &Path, what: &'static str) -> Result<(std::fs::File, u64), MediaError> {
+    let (file, len) =
+        crate::bounded_file::open_regular(path).map_err(|fail| media_error(fail, path, what, u64::MAX))?;
+    if len == 0 {
+        return Err(MediaError::Empty { what });
+    }
+    Ok((file, len))
+}
+
+/// Read a whole file, refusing an empty one and one over `limit` bytes. The file
+/// is opened once and the length judged is the opened handle's; the read is then
+/// bounded at `limit + 1`, so a file that grows afterwards is refused, not
+/// truncated.
+pub(crate) fn read_file_bounded(path: &Path, limit: u64, what: &'static str) -> Result<Vec<u8>, MediaError> {
+    let out = crate::bounded_file::read_capped(path, limit).map_err(|fail| media_error(fail, path, what, limit))?;
     if out.is_empty() {
         return Err(MediaError::Empty { what });
     }

@@ -356,6 +356,59 @@ fn missing_kernels_and_metallibs_are_named_in_the_error() {
     });
 }
 
+/// A FIFO, a symlink to `/dev/zero` and a directory named as a metallib are
+/// refused as not regular, promptly: before the fix `exists()` passed them and
+/// `std::fs::read` blocked on the FIFO and read `/dev/zero` without end. Each
+/// call runs on a thread behind a five second guard so a regression fails
+/// instead of hanging the suite.
+#[test]
+fn a_metallib_path_that_is_not_a_regular_file_is_refused_promptly() {
+    use std::time::Duration;
+    let dir = std::env::temp_dir().join(format!("tessl-metallib-nonreg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("fifo.metallib");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let fifo_link = dir.join("fifo_link.metallib");
+    std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+    let zero = dir.join("zero.metallib");
+    std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+
+    /// `GpuRuntime` is not `Send`, so the call runs here and a watchdog thread
+    /// ends the process (exit 101, with the call's name) if it has not returned
+    /// in five seconds: a blocked `open` fails the run rather than hanging it.
+    fn guarded(what: &str, f: impl FnOnce() -> Result<(), String>) -> String {
+        let (done, rx) = std::sync::mpsc::channel::<()>();
+        let name = what.to_owned();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(5)) {
+                eprintln!("{name} did not return within 5 s (blocked on a non-regular file?)");
+                std::process::exit(101);
+            }
+        });
+        let result = f();
+        let _ = done.send(());
+        match result {
+            Ok(()) => panic!("{what}: expected a refusal, but the call succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    with_gpu(|rt| {
+        for p in [fifo, fifo_link, zero, dir.clone()] {
+            let want = format!("metallib at {} is not a regular file", p.display());
+            let e = guarded("from_metallib_path", || GpuRuntime::from_metallib_path(&p).map(|_| ()));
+            assert!(e.starts_with(&want), "from_metallib_path {}: {e:?}", p.display());
+            let e = guarded("add_metallib", || rt.add_metallib(&p));
+            assert!(e.starts_with(&want), "add_metallib {}: {e:?}", p.display());
+        }
+    });
+}
+
 /// A one-kernel metallib built with the toolchain's `xcrun metal`, in a fresh
 /// directory under the system temp dir; returns its bytes.
 fn tiny_metallib(tag: &str, kernel: &str) -> Vec<u8> {

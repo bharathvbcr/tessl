@@ -40,7 +40,7 @@ gqa_decode_h64: test-only: tests/gqa_decode.rs decode GQA head dim 64
 gqa_decode_h128: test-only: tests/gqa_decode.rs decode GQA head dim 128
 gqa_decode_h256: test-only: tests/gqa_decode.rs decode GQA head dim 256
 gqa_decode_h512: test-only: tests/gqa_decode.rs decode GQA head dim 512
-matmul_fixed_order_nn_f32: test-only: tests/gemm_fixed_order.rs ascending-k NN, bit-identical to gemm_f32_cpu
+matmul_fixed_order_nn_f32: test-only: tests/gemm_fixed_order.rs ascending-k NN, bit-identical to gemm_f32_cpu unless an operand, product or partial sum is an f32 subnormal (flushed to zero on the GPU, see gemm_fixed_order_nn # Subnormals)
 matmul_fixed_order_nt_f32: test-only: tests/gemm_fixed_order.rs ascending-k NT, the linear forward layout
 matmul_fixed_order_tn_f32: test-only: tests/gemm_fixed_order.rs ascending-k TN, the linear weight gradient
 gemm_q8_tensorops_g32: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 32

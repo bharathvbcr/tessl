@@ -1501,8 +1501,8 @@ fn adv_poison_with_an_open_batch_parks_the_queue_until_drop_and_drop_releases_on
     rig.finish(true, "poisoned with an open batch, dropped");
 }
 
-/// The refusal tells the caller the contract (ft-8f7aabe6): poisoned mid-batch
-/// by a panic, not recoverable, drop it, and dropping releases the parked queue
+/// The refusal tells the caller the contract (ft-8f7aabe6): the batch lock was
+/// poisoned by a panic, not recoverable, drop it, and dropping releases the parked queue
 /// once. `synchronize` returns the lock refusal itself; `reclaim` then returns
 /// the runtime latch, which carries that text as its first cause.
 #[test]
@@ -1512,7 +1512,7 @@ fn a_mid_batch_poison_refusal_states_the_drop_contract() {
     let sync_err = rig.rt.synchronize().unwrap_err();
     let reclaim_err = rig.rt.reclaim(u64::MAX).unwrap_err();
     for (what, err) in [("synchronize", &sync_err), ("reclaim", &reclaim_err)] {
-        for needle in ["poisoned mid-batch", "panic", "drop it", "releases", "exactly once"] {
+        for needle in ["poisoned", "batch lock", "panic", "drop it", "releases", "exactly once"] {
             assert!(err.contains(needle), "{what} refusal lacks {needle:?}: {err}");
         }
     }
@@ -1531,7 +1531,7 @@ type Entry = (
 /// command buffer open, each tried on its own fresh rig (the first refusal
 /// latches the runtime, so a shared rig would answer later entries from the
 /// latch). `reclaim` is not here: it does not take the lock (see the
-/// `defect_` test below).
+/// `reclaim_is_ok_zero_...` test below).
 fn poisoned_batch_entries() -> Vec<Entry> {
     vec![
         ("synchronize", Box::new(|r, _| r.rt.synchronize())),
@@ -1571,7 +1571,7 @@ fn adv_every_public_entry_refuses_a_mid_batch_poison_with_the_contract_text() {
         println!("{row}");
         rows.push(row);
         let err = got.unwrap_err();
-        for needle in ["poisoned", "mid-batch", "drop it", "exactly once"] {
+        for needle in ["poisoned", "batch lock", "drop it", "exactly once"] {
             assert!(err.contains(needle), "{name} refusal lacks {needle:?}: {err}");
         }
         assert!(rig.rt.deferred_pending(), "{name}: the queue drained without the abort");
@@ -1595,20 +1595,28 @@ fn adv_the_lock_free_accessors_still_answer_after_a_mid_batch_poison() {
     rig.finish(true, "lock-free accessors");
 }
 
-/// Attack (a). The doc on `GpuRuntime` and on `reclaim` says `reclaim` returns
-/// an error on a runtime poisoned mid-batch. On a lock poisoned by a panic that
-/// no refusal has latched yet (a panic unwinds through `commit`, skipping its
-/// `poison_on_failure`), `reclaim` never touches `active_m4` and returns Ok(0)
-/// with the queue still parked.
+/// Attack (a), pinned as the docs on `GpuRuntime` and `reclaim` state it: on a
+/// lock poisoned by a panic that no refusal has latched yet (a panic unwinds
+/// through `commit`, skipping its `poison_on_failure`), `reclaim` never touches
+/// `active_m4` and returns Ok(0) with the queue still parked; once a refusal
+/// latches the runtime it errors with the contract text as the cause.
 #[test]
-#[ignore = "defect: reclaim returns Ok(0), not the documented error, on a freshly poisoned active_m4 until a refusal latches the runtime"]
-fn defect_reclaim_on_a_fresh_mid_batch_poison_returns_the_documented_error() {
+fn reclaim_is_ok_zero_on_a_fresh_mid_batch_poison_then_errors_once_a_refusal_latches() {
     let rig = rig_with_open_batch_and_a_queued_drop();
     poison_batch_lock(&rig.rt);
+    // Phase 1, as the docs state: no refusal has latched, reclaim does not take
+    // the lock, so it releases nothing parked.
+    assert!(!rig.rt.is_poisoned());
+    assert_eq!(rig.rt.reclaim(u64::MAX), Ok(0), "reclaim before any refusal");
+    assert!(rig.rt.deferred_pending(), "reclaim released under an open buffer");
+    // Phase 2: the first refusal latches, and reclaim answers from the latch with
+    // the contract text as its cause.
+    assert!(rig.rt.synchronize().is_err());
+    assert!(rig.rt.is_poisoned());
     let got = rig.rt.reclaim(u64::MAX);
     assert!(
         got.as_ref().is_err_and(|e| e.contains("drop it")),
-        "reclaim before any refusal answered {got:?}"
+        "reclaim after the latch answered {got:?}"
     );
     rig.finish(true, "reclaim fresh poison");
 }
@@ -1633,17 +1641,17 @@ fn adv_a_poison_with_no_batch_open_refuses_the_same_and_still_recycles() {
     rig.finish(true, "closed poison");
 }
 
-/// Attack (b). The refusal text says the runtime was poisoned "mid-batch ...
-/// while a command buffer may be open". With no batch at all it names a state
-/// that never existed.
+/// Attack (b). With no batch at all the refusal must not name a mid-batch state
+/// or an open command buffer that never existed (the text covers both cases).
 #[test]
-#[ignore = "defect: the contract text claims a mid-batch poison when no command buffer was ever open"]
-fn defect_the_refusal_does_not_claim_mid_batch_when_no_batch_exists() {
+fn the_refusal_does_not_claim_mid_batch_when_no_batch_exists() {
     let rig = Rig::new();
     assert!(rig.rt.active_m4.lock().unwrap().is_none());
     poison_batch_lock(&rig.rt);
     let err = rig.rt.synchronize().unwrap_err();
     assert!(!err.contains("mid-batch"), "no batch was open, yet: {err}");
+    assert!(!err.contains("command buffer"), "no batch was open, yet: {err}");
+    assert!(err.contains("poisoned") && err.contains("drop it"), "{err}");
     rig.finish(true, "closed poison text");
 }
 

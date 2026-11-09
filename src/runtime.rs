@@ -1017,23 +1017,38 @@ impl ParamsBuffer {
 /// The refusal text for a poisoned `active_m4` batch lock. Built in one place
 /// ([`GpuRuntime::lock_active_m4`]) so the contract is stated once. It keeps the
 /// word "poison", which the existing tests and callers' substring checks use.
-const ACTIVE_M4_POISONED: &str = "runtime poisoned mid-batch by a panic while a command buffer \
-     may be open: it cannot be recovered, drop it (dropping releases the parked \
-     deferred queue and its ledger charges exactly once)";
+const ACTIVE_M4_POISONED: &str = "runtime's batch lock was poisoned by a panic: it cannot be \
+     recovered, drop it (dropping releases any parked deferred queue and its ledger \
+     charges exactly once)";
 
 /// The Metal runtime: one device, queue, pool and command batch.
 ///
-/// # A runtime poisoned mid-batch is not recoverable
+/// # A runtime whose batch lock is poisoned is not recoverable
 ///
-/// A panic while the batch lock (`active_m4`) is held poisons that lock. If a
-/// command buffer was open at that moment, nothing can submit it: every encode
-/// and commit refuses the lock, `synchronize` and `reclaim` return an error, and
-/// the idle recycle skips because the open buffer may still bind a dropped
-/// buffer. The deferred release queue and its ledger charges therefore stay
-/// parked. The caller must drop the runtime. Drop ends the open batch without
-/// submitting it and releases each parked charge exactly once, so the hold is
-/// bounded by the runtime's lifetime: no leak past Drop and no use-after-free.
-/// There is deliberately no recover call.
+/// A panic while the batch lock (`active_m4`) is held poisons that lock, and
+/// nothing clears it. Every encode and commit then refuses with the text of
+/// `ACTIVE_M4_POISONED`: the runtime cannot be recovered, so drop it. There is
+/// deliberately no recover call.
+///
+/// Whether the deferred release queue (and its ledger charges) parks depends on
+/// whether a command buffer was open when the panic hit:
+///
+/// - **A batch was open** (a panic inside a commit's open-batch path, or in a
+///   closure after it had encoded). Nothing can submit that buffer, and the idle
+///   recycle skips because it may still bind a dropped buffer, so the queue stays
+///   parked for the rest of the runtime's lifetime. Drop ends a batch that was
+///   never submitted without submitting it, then releases each parked charge
+///   exactly once: the hold is bounded by the lifetime, with no leak past Drop and
+///   no use-after-free.
+/// - **No batch was open** (for example a panic in a waiting commit's drain). The
+///   refusals are the same, but the idle recycle still drains the queue.
+///
+/// The refusal arrives in two phases. `synchronize` and the encode and commit
+/// paths take the lock, so the first one to reach it returns the text and
+/// latches the runtime (`is_poisoned` is false until then). `reclaim` and
+/// `is_poisoned` do not take the lock: before any refusal has latched,
+/// `reclaim` returns `Ok(0)` and releases nothing that is parked; after it,
+/// every call answers from the latch, with that text as its cause.
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
     /// What this runtime shares with others made from the same [`Shared`]:
@@ -2026,8 +2041,11 @@ impl GpuRuntime {
     ///
     /// Errors on a poisoned runtime, or when the lifetime event reads above
     /// anything this runtime submitted (which poisons it).
-    /// A runtime poisoned mid-batch by a panic is not recoverable: its parked
-    /// queue is released by dropping it (see [`GpuRuntime`]).
+    /// `reclaim` does not take the batch lock. On a runtime whose batch lock a
+    /// panic poisoned, it returns `Ok(0)` (releasing nothing parked) until a
+    /// refusal latches the runtime, and errors from then on. Such a runtime is
+    /// not recoverable: drop it, which releases its parked queue (see
+    /// [`GpuRuntime`]).
     pub fn reclaim(&self, timeline_value: u64) -> Result<u64, String> {
         if self.poison.is_set() {
             return Err(self.poison.error());
@@ -3251,8 +3269,8 @@ impl GpuRuntime {
     /// Commit + wait. Required before host readbacks. SharedEvent covers the
     /// training compute CB on the Metal 4 path (not a stamp-only CB).
     ///
-    /// Errors on a poisoned runtime. A runtime poisoned mid-batch by a panic is
-    /// not recoverable: drop it (see [`GpuRuntime`]).
+    /// Errors on a poisoned runtime. A runtime whose batch lock a panic poisoned
+    /// is not recoverable: drop it (see [`GpuRuntime`]).
     pub fn synchronize(&self) -> Result<(), String> {
         self.commit(true)
     }

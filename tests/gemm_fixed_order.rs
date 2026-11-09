@@ -630,17 +630,18 @@ fn attack_subnormal_at_k_positions_across_chunk_and_long_k() {
     });
 }
 
-/// The doc says a flushed result "comes back as (positive) zero". The GPU
-/// keeps the sign of a flushed partial sum: normal 0x00800000 + (-0x00800001)
-/// gives -0.0 (0x80000000), observed in w5-adv-ftz-run1. Asserts the doc.
+/// The `# Subnormals` doc on `gemm_fixed_order_nn` says the flush keeps the
+/// sign: normal 0x00800000 + (-0x00800001) is a -1 ulp subnormal partial sum
+/// and comes back as -0.0 (0x80000000) on every layout. The adversary pass
+/// found this (w5-adv-ftz-run1) when the doc still said "(positive) zero"; that
+/// wording was wrong and was corrected, so this pins the corrected claim.
 #[test]
-#[ignore = "defect: gemm_fixed_order docs claim a flushed result is +0, but a negative subnormal partial sum flushes to -0.0 (0x80000000); see w5-adv-ftz-run1"]
-fn defect_flushed_negative_partial_sum_is_positive_zero() {
+fn flushed_negative_partial_sum_keeps_its_sign() {
     with_gpu(|rt| {
         rt.set_relaxed_precision(false);
         let a = [f32::from_bits(0x0080_0000), f32::from_bits(0x0080_0001)];
         for (layout, got) in run_all_layouts(rt, &a, &[1.0, -1.0], 1, 1, 2) {
-            assert_eq!(got[0].to_bits(), 0, "{layout}: doc says +0");
+            assert_eq!(got[0].to_bits(), 0x8000_0000, "{layout}: flushed -1 ulp partial sum");
         }
     });
 }

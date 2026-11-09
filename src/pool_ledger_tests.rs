@@ -1520,6 +1520,164 @@ fn a_mid_batch_poison_refusal_states_the_drop_contract() {
     rig.finish(true, "mid-batch poison text, dropped");
 }
 
+// ---- adversarial pins for the drop-it contract text (ft-8f7aabe6, w6-adv-poison) ----
+
+type Entry = (
+    &'static str,
+    Box<dyn Fn(&Rig, &crate::tensor::GpuBuffer) -> Result<(), String>>,
+);
+
+/// Every public way into a runtime whose `active_m4` was poisoned with a
+/// command buffer open, each tried on its own fresh rig (the first refusal
+/// latches the runtime, so a shared rig would answer later entries from the
+/// latch). `reclaim` is not here: it does not take the lock (see the
+/// `defect_` test below).
+fn poisoned_batch_entries() -> Vec<Entry> {
+    vec![
+        ("synchronize", Box::new(|r, _| r.rt.synchronize())),
+        ("commit(false)", Box::new(|r, _| r.rt.commit(false))),
+        ("commit(true)", Box::new(|r, _| r.rt.commit(true))),
+        ("with_binder", Box::new(|r, _| r.rt.with_binder(|_| Ok(())))),
+        (
+            "with_binder_barriers",
+            Box::new(|r, _| r.rt.with_binder_barriers(Some(true), |_| Ok(()))),
+        ),
+        ("set_async_encode(false)", Box::new(|r, _| r.rt.set_async_encode(false))),
+        (
+            "upload_u32",
+            Box::new(|r, b| r.rt.upload_u32(b, &vec![1u32; b.nbytes() / 4])),
+        ),
+        ("GpuBuffer::try_read_f32", Box::new(|_, b| b.try_read_f32().map(|_| ()))),
+        ("GpuBuffer::try_zero", Box::new(|_, b| b.try_zero())),
+        ("bump_reset", Box::new(|r, _| r.rt.bump_reset())),
+    ]
+}
+
+/// Attack (a). After a mid-batch poison, every entry that reaches the batch
+/// lock answers with the contract text (directly, or as the latch's cause).
+/// The table prints what each returns.
+#[test]
+fn adv_every_public_entry_refuses_a_mid_batch_poison_with_the_contract_text() {
+    let mut rows = Vec::new();
+    for (name, call) in poisoned_batch_entries() {
+        let rig = rig_with_open_batch_and_a_queued_drop();
+        let buf = rig.rt.alloc_buffer(4096).unwrap();
+        poison_batch_lock(&rig.rt);
+        let got = call(&rig, &buf);
+        let row = match &got {
+            Ok(()) => format!("{name}: Ok"),
+            Err(e) => format!("{name}: Err({e})"),
+        };
+        println!("{row}");
+        rows.push(row);
+        let err = got.unwrap_err();
+        for needle in ["poisoned", "mid-batch", "drop it", "exactly once"] {
+            assert!(err.contains(needle), "{name} refusal lacks {needle:?}: {err}");
+        }
+        assert!(rig.rt.deferred_pending(), "{name}: the queue drained without the abort");
+        drop(buf);
+        rig.finish(true, "entry table");
+    }
+    assert_eq!(rows.len(), 10);
+}
+
+/// The accessors that do not take the lock keep answering after the poison.
+#[test]
+fn adv_the_lock_free_accessors_still_answer_after_a_mid_batch_poison() {
+    let rig = rig_with_open_batch_and_a_queued_drop();
+    poison_batch_lock(&rig.rt);
+    assert!(!rig.rt.is_poisoned(), "a bare lock poison latches nothing");
+    let _ = rig.rt.pool_resident();
+    let _ = rig.rt.pending_commit_value();
+    rig.rt.set_async_encode(true).unwrap();
+    drop(rig.rt.alloc_buffer(4096).unwrap());
+    assert!(rig.rt.deferred_pending());
+    rig.finish(true, "lock-free accessors");
+}
+
+/// Attack (a). The doc on `GpuRuntime` and on `reclaim` says `reclaim` returns
+/// an error on a runtime poisoned mid-batch. On a lock poisoned by a panic that
+/// no refusal has latched yet (a panic unwinds through `commit`, skipping its
+/// `poison_on_failure`), `reclaim` never touches `active_m4` and returns Ok(0)
+/// with the queue still parked.
+#[test]
+#[ignore = "defect: reclaim returns Ok(0), not the documented error, on a freshly poisoned active_m4 until a refusal latches the runtime"]
+fn defect_reclaim_on_a_fresh_mid_batch_poison_returns_the_documented_error() {
+    let rig = rig_with_open_batch_and_a_queued_drop();
+    poison_batch_lock(&rig.rt);
+    let got = rig.rt.reclaim(u64::MAX);
+    assert!(
+        got.as_ref().is_err_and(|e| e.contains("drop it")),
+        "reclaim before any refusal answered {got:?}"
+    );
+    rig.finish(true, "reclaim fresh poison");
+}
+
+/// Attack (b). A poison with no command buffer open (a panic in a waiting
+/// commit's drain with no batch, as `poison_active_m4_in_a_commit_drain`
+/// stages): the refusals are the same and the runtime still cannot encode or
+/// commit, but the parked queue is NOT parked: the idle recycle drains it, and
+/// Drop returns the charges once.
+#[test]
+fn adv_a_poison_with_no_batch_open_refuses_the_same_and_still_recycles() {
+    let rig = Rig::new();
+    drop(rig.rt.alloc_buffer(300_000).unwrap());
+    assert!(rig.rt.active_m4.lock().unwrap().is_none());
+    poison_batch_lock(&rig.rt);
+    let err = rig.rt.synchronize().unwrap_err();
+    println!("closed-case synchronize: {err}");
+    assert!(err.contains("poisoned") && err.contains("drop it"), "{err}");
+    assert!(rig.rt.with_binder(|_| Ok(())).is_err());
+    settle(&rig.rt);
+    assert!(!rig.rt.deferred_pending(), "closed-case poison parked the queue");
+    rig.finish(true, "closed poison");
+}
+
+/// Attack (b). The refusal text says the runtime was poisoned "mid-batch ...
+/// while a command buffer may be open". With no batch at all it names a state
+/// that never existed.
+#[test]
+#[ignore = "defect: the contract text claims a mid-batch poison when no command buffer was ever open"]
+fn defect_the_refusal_does_not_claim_mid_batch_when_no_batch_exists() {
+    let rig = Rig::new();
+    assert!(rig.rt.active_m4.lock().unwrap().is_none());
+    poison_batch_lock(&rig.rt);
+    let err = rig.rt.synchronize().unwrap_err();
+    assert!(!err.contains("mid-batch"), "no batch was open, yet: {err}");
+    rig.finish(true, "closed poison text");
+}
+
+/// Attack (b). Poison, refuse, clear, poison again, refuse, abort twice, then
+/// Drop in both orders: the charges come back once each, none twice.
+#[test]
+fn adv_a_second_poison_then_drop_releases_exactly_once() {
+    for runtime_first in [true, false] {
+        let rig = rig_with_open_batch_and_a_queued_drop();
+        poison_batch_lock(&rig.rt);
+        assert!(rig.rt.with_binder(|_| Ok(())).is_err());
+        rig.rt.active_m4.clear_poison();
+        poison_batch_lock(&rig.rt);
+        assert!(rig.rt.synchronize().is_err());
+        rig.rt.abort_open_batch();
+        rig.rt.abort_open_batch();
+        assert!(rig.rt.deferred_pending());
+        let Rig { held, rt, fake, chaos } = rig;
+        if runtime_first {
+            drop(rt);
+            drop(held);
+        } else {
+            drop(held);
+            drop(rt);
+        }
+        drop(chaos);
+        assert_eq!(
+            (fake.live(), fake.cached(), fake.unmatched()),
+            (0, 0, 0),
+            "runtime_first={runtime_first}"
+        );
+    }
+}
+
 /// Attack 2. The recovery must still wait for the lifetime event: a commit
 /// submitted and not finished keeps a dropped buffer queued, whether the lock
 /// is poisoned before or after the drop, and a partial completion is not

@@ -1,0 +1,50 @@
+bf16 GEMM vs PyTorch 2.15 MPS, this tree, M5 Pro: NO VERDICT AT THE 1.25x BOUND (card ft-a412b150, 2026-11-09)
+
+No ratio is reported. Every paired series set was refused by bench_paired, so no tessl/torch ratio, median or
+geomean from these runs is a result, and none is quoted anywhere. The README numbers are unchanged.
+
+Setup
+  tessl sha        e5b4f4b (tree clean at start; tensorops-bf16 row of target/release/bench_gemm_sweep, release build of this worktree)
+  torch            2.15.0, MPS available (~/.venvs/torch/bin/python bench/gemm_sweep_mlx.py --lanes torch --dtypes bf16)
+  macOS            27.2, Apple M5 Pro
+  lock             every bench ran under the mac_heavy lock via target-gp/locked.sh (scripts target-gp/w5-bf16mps-run1.sh, -run2.sh)
+  harness          bench_paired --format rows:shape,backend,gflops --evidence --clean-env --rounds 10 --max-spread 1.25
+                   (bound NOT loosened), 8-shape ladder of gemm_speed_ladder_m5pro.json, ratio = tessl GFLOP/s / torch GFLOP/s,
+                   both lanes sync every iteration (bench_gemm_sweep.rs time_backend; torch.mps.synchronize in the torch lane)
+  rule (pre-stated) a shape is "below 0.95x" only if median < 0.95 in both runs and the [lo,hi] band lies below 0.95;
+                   otherwise parity. A/A wider than the bound means the shape cannot resolve it.
+
+Attempt 1 (iters 30, warmup 10; logs target-gp/w5-bf16mps-run1/, started 13:22Z, load 7.7 at start, 0 other GPU-ish processes)
+  A/B run1 and run2: rc=3, refused series (paired spread): 512^3 1.732x, 1024^3 2.168x, 2048^3 1.637x, 2048x768x768 1.327x
+  A/A torch vs torch: rc=3: 512^3 1.542x, 1024^3 1.355x, 2048x768x768 1.347x, 8192x768x3072 1.291x
+  A/A tessl vs tessl: rc=1, harness bug (variant "simdgroup-f32" reported by both lanes); fixed in attempt 2 by suffixing every variant.
+  (the first launch of the script failed earlier with a usage error: BENCH_SHAPES was not quoted. Nothing measured.)
+
+Attempt 2 (iters 100, warmup 30 on every arm; logs target-gp/w5-bf16mps-run2/, started 14:15Z, load 6.9 at start, 28-38 at end)
+  Idle check at start (idle_check_ps.txt): 7 matching processes, six of them clippy-driver (CPU 62%, 43%, 18% at the sample) from
+  concurrent builds on this machine, plus a shell. The machine was NOT quiet.
+  Series refused (paired spread; series under 1.25x are not listed by bench_paired and have no printed number):
+    A/B run1  512^3 2.585x, 1024^3 1.913x, 2048^3 1.521x, 8192x3072x768 1.323x, 4096x4096x1024 1.270x, geomean 1.259x
+    A/B run2  512^3 6.167x, 1024^3 1.879x, 2048^3 1.762x, 4096^3 1.294x, 2048x768x768 4.329x, 8192x3072x768 1.685x,
+              8192x768x3072 1.391x, 4096x4096x1024 1.876x, geomean 1.429x
+    A/A tessl 512^3 4.063x, 1024^3 1.939x, 2048^3 1.665x, 2048x768x768 2.267x, 8192x3072x768 1.474x, 4096x4096x1024 1.296x, geomean 1.339x
+    A/A torch 512^3 2.497x, 1024^3 2.000x, 2048^3 1.881x, 2048x768x768 2.832x, 8192x768x3072 1.462x, 4096x4096x1024 1.757x, geomean 1.327x
+  All four invocations rc=3. The A/A controls (same lane against itself) exceed the bound on both runtimes, so the A/B spreads are
+  not attributable to the comparison.
+
+Method change attempt 1 -> 2: BENCH_ITERS 30 -> 100 and BENCH_WARMUP 10 -> 30 on tessl and torch alike. It did not help; the larger
+shapes also went out of bound in attempt 2, when load rose.
+
+Cause (INFERRED, not proven): the sub-0.3 ms shapes (512^3, 1024^3, 2048^3, 2048x768x768) are dominated by sync-per-iteration host
+latency and per-process clock state (attempt 1 per-round times: tessl 512^3 0.191 ms cold in round 1 vs 0.112-0.146 later; torch
+1024^3 one round 0.435 ms vs about 0.21 otherwise), and in attempt 2 concurrent CPU builds (clippy-driver) added contention, which also
+pushed the large shapes out. Not tested: a quiet machine, a longer timed section per process, CPU pinning.
+
+Verdict: no verdict at the 1.25x bound on this machine. The torch 2.13 figures in README stay the only bf16-vs-MPS evidence, and they
+remain the imported MLSystemsLab measurements, not this tree's kernels. No shape is declared below or at parity.
+
+A re-measure needs a machine where both cargo slots are held for the timed section (no concurrent builds) and where the A/A control
+is within the bound first. The scripts are reusable as they stand.
+
+Raw material (untracked scratch, not committed): bench/results/gemm_speed_bf16_vs_torch215_m5pro*.json.attempt.json and *.lanes/ in
+the worktree, and the step logs under /Users/bharath/Code/research/tessl/target-gp/w5-bf16mps-run1/ and -run2/.

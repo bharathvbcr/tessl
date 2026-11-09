@@ -2253,7 +2253,13 @@ fn gemm_fixed_order(a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, kernel: 
 /// Every subnormal operand, every product that is
 /// subnormal, and every partial sum that is subnormal reads and writes as
 /// zero, so a result that the IEEE fold would leave subnormal, or that
-/// depends on a subnormal operand or product, comes back as (positive) zero.
+/// depends on a subnormal operand or product, comes back as zero. The flush
+/// keeps the sign: a negative subnormal product or partial sum becomes
+/// `-0.0` (`0x80000000`), not `+0.0`. Measured: the -1 ulp partial sum of
+/// `[0x00800000, 0x00800001] . [1.0, -1.0]` came back as `0x80000000` on the
+/// M5 Pro. The sign of a flushed value is observed only for that case (and the
+/// negative-operand case, which read back as `+0.0` in the pin test), so do not
+/// rely on a particular zero sign elsewhere.
 /// Bit-identity with an IEEE CPU fold ([`gemm_f32_cpu`]) therefore holds only
 /// when no operand, product or partial sum is subnormal. That is a condition
 /// on the products and partial sums as well as the inputs: normal operands can

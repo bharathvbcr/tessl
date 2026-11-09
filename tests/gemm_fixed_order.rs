@@ -416,7 +416,7 @@ fn assert_flush_model(
 
 impl Xorshift {
     /// Operand mix chosen so products and partial sums underflow often: normals in
-    /// 2^-80 .. 2^-40 (products 2^-160 .. 2^-80), 15% subnormal (either sign),
+    /// 2^-68 .. 2^-58 (products 2^-136 .. 2^-116), 15% subnormal (either sign),
     /// 5% signed zero, so subnormal operands, products and sums all occur.
     fn tiny_mix(&mut self) -> f32 {
         let sel = self.next() % 100;
@@ -426,7 +426,7 @@ impl Xorshift {
             0..=14 => f32::from_bits(sign | ((r & 0x7f_ffff) as u32).max(1)),
             15..=19 => f32::from_bits(sign),
             _ => {
-                let exp = 127 - 80 + ((r >> 24) % 41) as u32;
+                let exp = 127 - 68 + ((r >> 24) % 11) as u32;
                 f32::from_bits(sign | exp << 23 | (r & 0x7f_ffff) as u32)
             }
         }

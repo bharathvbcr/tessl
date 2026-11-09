@@ -1226,13 +1226,20 @@ pub(crate) const METALLIB_MAX_BYTES: u64 = 256 << 20;
 fn read_metallib_bytes(path: &Path, path_str: &str, io_prefix: &str, missing_hint: &str) -> Result<Vec<u8>, String> {
     use crate::bounded_file::{read_capped, OpenFail};
     read_capped(path, METALLIB_MAX_BYTES).map_err(|fail| match fail {
-        OpenFail::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // ENOTDIR (a path under a regular file) is as missing as ENOENT: both
+        // were `exists() == false` before the single-open reader.
+        OpenFail::Io(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             format!("metallib missing at {path_str}{missing_hint}")
         }
         OpenFail::Io(e) => format!("{io_prefix} {path_str}: {e}"),
-        OpenFail::NotRegular => format!(
-            "metallib at {path_str} is not a regular file (a directory, FIFO or device is refused; the cap is {METALLIB_MAX_BYTES} bytes)"
-        ),
+        OpenFail::NotRegular => {
+            format!("metallib at {path_str} is not a regular file (a directory, FIFO or device is refused)")
+        }
         OpenFail::TooLarge { len, at_least } => format!(
             "metallib at {path_str} is {}{len} bytes, over the {METALLIB_MAX_BYTES}-byte cap",
             if at_least { "at least " } else { "" }
@@ -3915,12 +3922,12 @@ mod metallib_read_tests {
         symlink(&fifo, &fifo_link).unwrap();
         let zero = dir.join("z");
         symlink("/dev/zero", &zero).unwrap();
-        for p in [fifo, fifo_link, zero, dir.clone()] {
+        for p in [fifo, fifo_link, zero, dir.to_path_buf()] {
             let err = read(&p, "read metallib", "").unwrap_err();
             assert_eq!(
                 err,
                 format!(
-                    "metallib at {} is not a regular file (a directory, FIFO or device is refused; the cap is {METALLIB_MAX_BYTES} bytes)",
+                    "metallib at {} is not a regular file (a directory, FIFO or device is refused)",
                     p.display()
                 )
             );
@@ -3949,8 +3956,7 @@ mod metallib_read_tests {
     }
 
     #[test]
-    #[ignore = "defect: a path through a non-directory (ENOTDIR) was \"metallib missing\" before the fix (exists() is false) and is now \"read metallib\""]
-    fn defect_a_path_under_a_regular_file_is_still_reported_missing() {
+    fn a_path_under_a_regular_file_is_still_reported_missing() {
         let dir = scratch("mlib-enotdir");
         let file = dir.join("f");
         std::fs::write(&file, b"x").unwrap();
@@ -3960,8 +3966,7 @@ mod metallib_read_tests {
     }
 
     #[test]
-    #[ignore = "defect: an unreadable metallib repeats its path in the error text (open_regular wraps ojas's text, which already names it)"]
-    fn defect_an_unreadable_metallib_names_its_path_once() {
+    fn an_unreadable_metallib_names_its_path_once() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("mlib-eacces");
         let file = dir.join("locked.metallib");

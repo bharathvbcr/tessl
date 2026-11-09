@@ -30,18 +30,40 @@ pub(crate) enum OpenFail {
 /// handle. A symlink is followed; a FIFO, directory or device is refused without
 /// blocking or reading.
 ///
-/// `ojas_io` reports its failures as text, so a failed open is classified here
-/// by one more `metadata` call. That call only chooses the error variant (and
-/// carries the OS error for a missing path); it never decides whether to read.
+/// `ojas_io` reports its failures as text only (`IoError` keeps no
+/// `ErrorKind`; an ojas-side fix is pending), so a failed open is classified
+/// here, and the classification only chooses the error variant: it never decides
+/// whether to read.
+///
+/// * `metadata` fails: that error is the variant's (it carries `NotFound`,
+///   `NotADirectory`, and so on).
+/// * `metadata` succeeds on something that is not a regular file: `NotRegular`.
+/// * `metadata` says regular file, so the refusal was the open itself (EACCES,
+///   EMFILE, ...). A second open, with `O_NONBLOCK` so it cannot block on a path
+///   swapped for a FIFO, recovers the real `io::Error` (and its kind). If that
+///   probe unexpectedly succeeds (the path was swapped back), its handle is
+///   dropped unread and the error is `io::Error::other` over ojas's text.
 pub(crate) fn open_regular(path: &Path) -> Result<(File, u64), OpenFail> {
     match ojas_io::open_regular_file(path) {
         Ok(opened) => Ok(opened),
         Err(e) => Err(match std::fs::metadata(path) {
             Err(source) => OpenFail::Io(source),
             Ok(meta) if !meta.is_file() => OpenFail::NotRegular,
-            Ok(_) => OpenFail::Io(std::io::Error::other(e.detail().to_owned())),
+            Ok(_) => {
+                OpenFail::Io(probe_open_error(path).unwrap_or_else(|| std::io::Error::other(e.detail().to_owned())))
+            }
         }),
     }
+}
+
+/// The `io::Error` a plain read-only open of `path` gives, or `None` if it opens.
+fn probe_open_error(path: &Path) -> Option<std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .err()
 }
 
 /// Read the regular file at `path`, refusing one longer than `cap` bytes before
@@ -81,12 +103,28 @@ pub(crate) mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// A fresh directory under the system temp dir.
-    pub(crate) fn scratch(tag: &str) -> PathBuf {
+    /// A fresh directory under the system temp dir, removed when dropped (a
+    /// test's sparse files and FIFOs must not outlive it). Derefs to its path.
+    pub(crate) struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn scratch(tag: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("tessl-bounded-file-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Scratch(dir)
     }
 
     pub(crate) fn mkfifo(path: &Path) {
@@ -250,8 +288,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "defect: EACCES on the final open loses ErrorKind::PermissionDenied (becomes Other)"]
-    fn defect_open_regular_keeps_permission_denied_kind() {
+    fn open_regular_keeps_permission_denied_kind() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("eacces-kind");
         let locked = dir.join("locked");

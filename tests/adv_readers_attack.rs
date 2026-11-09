@@ -1,7 +1,6 @@
 //! Wave-5 adversary attacks on the media file readers' open path (card
-//! ft-2f75f232). Device-free. Tests named `defect_*` are `#[ignore]`d because they
-//! fail against the current implementation; each reason names the defect. Run them
-//! with `cargo test --release --test adv_readers_attack -- --ignored`.
+//! ft-2f75f232). Device-free. The former `defect_*` pins (error kind, ENOTDIR text) are
+//! ordinary tests now that the readers keep the OS error.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -12,11 +11,28 @@ use std::path::{Path, PathBuf};
 use tessl::media::image::{decode_image_file, ImageOptions};
 use tessl::media::MediaError;
 
-fn scratch(tag: &str) -> PathBuf {
+/// A fresh directory under the system temp dir, removed when dropped (a test's
+/// sparse files and FIFOs must not outlive it). Derefs to the directory's path.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("tessl-adv-readers-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    Scratch(dir)
 }
 
 fn decode(p: &Path) -> Result<(), MediaError> {
@@ -106,8 +122,7 @@ fn an_unreadable_file_is_an_io_error_naming_the_path() {
 /// therefore arrives as `ErrorKind::Other`, where `std::fs::File::open` (the
 /// pre-fix code) gave `PermissionDenied`, and the source text repeats the path.
 #[test]
-#[ignore = "defect: EACCES on the final open loses ErrorKind::PermissionDenied (becomes Other)"]
-fn defect_permission_denied_keeps_its_error_kind() {
+fn permission_denied_keeps_its_error_kind() {
     if running_as_root() {
         return;
     }

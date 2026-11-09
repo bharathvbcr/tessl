@@ -176,6 +176,8 @@ A separate 9-round bf16-only run (`bench/results/gemm_speed_bf16_confirm_m5pro.j
 read 1.02× against PyTorch MPS bf16, worst shape 0.85× (8192×3072×768), best 1.34×,
 4 of 8 below 1.0.
 
+A re-measure of bf16 against torch 2.15.0 MPS with this tree's kernels was attempted twice on 2026-11-09 and was inconclusive: bench_paired refused every series at its 1.25× bound, and the A/A controls (tessl against tessl, torch against torch) already spread up to 4.1× (tessl) and 2.8× (torch) on the small shapes. No ratio is reported; see `bench/results/gemm_speed_bf16_vs_torch215_m5pro_verdict.txt`.
+
 > [!IMPORTANT]
 > **bf16 against MPS is parity, not a win.** An earlier version of this table
 > claimed 1.11× with a worst shape of 1.01×, which reads as "never loses". Re-run

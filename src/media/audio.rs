@@ -286,34 +286,24 @@ pub const MAX_AUDIO_FILE_BYTES: u64 = 1 << 32;
 /// the format, [`MediaError::Decode`] for damaged, cut-short or sample-less
 /// data, [`MediaError::Limit`] for a clip longer than `options.max_seconds`
 /// (unless it truncates).
+///
+/// The file is opened once ([`super::open_media_file`]), so a FIFO, device or
+/// directory is refused without blocking, and the length judged is the opened
+/// handle's. Residual window: AudioToolbox re-opens the path by name
+/// (`cf::file_url`, then `ExtAudioFileOpenURL`) after the container check, so a
+/// file swapped for another one in that gap is not covered by the handle that was
+/// checked. No input cap beyond [`MAX_AUDIO_FILE_BYTES`] is needed: nothing reads
+/// the whole input, and the decoded length is bounded by `options.max_seconds`.
 pub fn decode_audio_file(path: &Path, options: &AudioOptions) -> Result<DecodedAudio, MediaError> {
     validate_options(options)?;
-    let meta = std::fs::metadata(path).map_err(|source| MediaError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !meta.is_file() {
-        return Err(MediaError::Invalid {
-            what: "audio",
-            detail: format!("{} is not a file", path.display()),
-        });
-    }
-    if meta.len() == 0 {
-        return Err(MediaError::Empty { what: "audio" });
-    }
-    if meta.len() > MAX_AUDIO_FILE_BYTES {
+    let (file, len) = super::open_media_file(path, "audio")?;
+    if len > MAX_AUDIO_FILE_BYTES {
         return Err(MediaError::Limit {
             what: "audio",
-            detail: format!("{} bytes exceeds {MAX_AUDIO_FILE_BYTES}", meta.len()),
+            detail: format!("{len} bytes exceeds {MAX_AUDIO_FILE_BYTES}"),
         });
     }
-    let source = FileSource {
-        file: std::fs::File::open(path).map_err(|source| MediaError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        len: meta.len(),
-    };
+    let source = FileSource { file, len };
     containers::check_audio(&source).map_err(|detail| MediaError::Decode { what: "audio", detail })?;
     let url = cf::file_url(path).ok_or_else(|| MediaError::Framework {
         api: "CFURLCreateFromFileSystemRepresentation",

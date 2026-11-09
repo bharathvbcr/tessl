@@ -1211,6 +1211,42 @@ fn library_function_names(library: &ProtocolObject<dyn MTLLibrary>) -> std::coll
     library.functionNames().iter().map(|n| n.to_string()).collect()
 }
 
+/// Largest metallib file [`GpuRuntime::from_metallib_path`] and
+/// [`GpuRuntime::add_metallib`] read, in bytes. The shipped library is about
+/// 3.4 MB; the cap only stops a wrong path (a device, a runaway file) from being
+/// read into memory.
+pub(crate) const METALLIB_MAX_BYTES: u64 = 256 << 20;
+
+/// The bytes of the metallib at `path` (`path_str` is the same path as text).
+/// The file is opened once as a regular file and read through
+/// [`METALLIB_MAX_BYTES`] (see [`crate::bounded_file`]). A missing path (a
+/// dangling symlink included) keeps the text `metallib missing at {path}` plus
+/// `missing_hint`; `io_prefix` leads any other I/O failure. An empty file returns
+/// an empty `Vec` for the caller to judge.
+fn read_metallib_bytes(path: &Path, path_str: &str, io_prefix: &str, missing_hint: &str) -> Result<Vec<u8>, String> {
+    use crate::bounded_file::{read_capped, OpenFail};
+    read_capped(path, METALLIB_MAX_BYTES).map_err(|fail| match fail {
+        // ENOTDIR (a path under a regular file) is as missing as ENOENT: both
+        // were `exists() == false` before the single-open reader.
+        OpenFail::Io(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            format!("metallib missing at {path_str}{missing_hint}")
+        }
+        OpenFail::Io(e) => format!("{io_prefix} {path_str}: {e}"),
+        OpenFail::NotRegular => {
+            format!("metallib at {path_str} is not a regular file (a directory, FIFO or device is refused)")
+        }
+        OpenFail::TooLarge { len, at_least } => format!(
+            "metallib at {path_str} is {}{len} bytes, over the {METALLIB_MAX_BYTES}-byte cap",
+            if at_least { "at least " } else { "" }
+        ),
+    })
+}
+
 impl GpuRuntime {
     pub(crate) fn acquire_access(&self) -> Result<RuntimeAccess, String> {
         if self.poison.is_set() {
@@ -1314,10 +1350,7 @@ impl GpuRuntime {
         let path_str = path
             .to_str()
             .ok_or_else(|| format!("non-utf8 metallib path: {path:?}"))?;
-        if !path.exists() {
-            return Err(format!("metallib missing at {path_str} (build.rs AOT failed?)"));
-        }
-        let bytes = std::fs::read(path).map_err(|e| format!("read metallib {path_str}: {e}"))?;
+        let bytes = read_metallib_bytes(path, path_str, "read metallib", " (build.rs AOT failed?)")?;
         if bytes.is_empty() {
             return Err(format!("load metallib: {path_str} is empty"));
         }
@@ -2227,10 +2260,7 @@ impl GpuRuntime {
         let path_str = path
             .to_str()
             .ok_or_else(|| format!("non-utf8 metallib path: {path:?}"))?;
-        if !path.exists() {
-            return Err(format!("metallib missing at {path_str}"));
-        }
-        let bytes = std::fs::read(path).map_err(|e| format!("read overlay metallib {path_str}: {e}"))?;
+        let bytes = read_metallib_bytes(path, path_str, "read overlay metallib", "")?;
         self.add_overlay(&bytes, path_str)
     }
 
@@ -3847,6 +3877,115 @@ mod tests {
         assert!(cursor > 0, "const arena cursor should advance");
         rt.synchronize().unwrap();
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+    }
+}
+
+/// `read_metallib_bytes`, the file half of both metallib entry points. No device.
+#[cfg(test)]
+mod metallib_read_tests {
+    use super::*;
+    use crate::bounded_file::tests::{mkfifo, scratch, within_5s};
+    use std::os::unix::fs::symlink;
+
+    fn read(path: &Path, prefix: &'static str, hint: &'static str) -> Result<Vec<u8>, String> {
+        let owned = path.to_path_buf();
+        within_5s("read_metallib_bytes", move || {
+            let shown = owned.to_str().unwrap().to_owned();
+            read_metallib_bytes(&owned, &shown, prefix, hint)
+        })
+    }
+
+    #[test]
+    fn missing_and_dangling_paths_keep_the_missing_text_and_each_hint() {
+        let dir = scratch("mlib-missing");
+        let dangling = dir.join("d");
+        symlink(dir.join("nowhere"), &dangling).unwrap();
+        for p in [dir.join("absent.metallib"), dangling] {
+            let shown = p.display();
+            assert_eq!(
+                read(&p, "read metallib", " (build.rs AOT failed?)").unwrap_err(),
+                format!("metallib missing at {shown} (build.rs AOT failed?)")
+            );
+            assert_eq!(
+                read(&p, "read overlay metallib", "").unwrap_err(),
+                format!("metallib missing at {shown}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_fifo_a_dev_zero_link_and_a_directory_are_refused_as_not_regular() {
+        let dir = scratch("mlib-nonreg");
+        let fifo = dir.join("f");
+        mkfifo(&fifo);
+        let fifo_link = dir.join("fl");
+        symlink(&fifo, &fifo_link).unwrap();
+        let zero = dir.join("z");
+        symlink("/dev/zero", &zero).unwrap();
+        for p in [fifo, fifo_link, zero, dir.to_path_buf()] {
+            let err = read(&p, "read metallib", "").unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "metallib at {} is not a regular file (a directory, FIFO or device is refused)",
+                    p.display()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_refused_from_its_length_and_one_at_the_cap_is_not() {
+        let dir = scratch("mlib-cap");
+        let big = dir.join("big.metallib");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(METALLIB_MAX_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read(&big, "read metallib", "").unwrap_err(),
+            format!(
+                "metallib at {} is {} bytes, over the {METALLIB_MAX_BYTES}-byte cap",
+                big.display(),
+                METALLIB_MAX_BYTES + 1
+            )
+        );
+        let at = dir.join("at.metallib");
+        std::fs::File::create(&at).unwrap().set_len(METALLIB_MAX_BYTES).unwrap();
+        assert_eq!(read(&at, "read metallib", "").unwrap().len() as u64, METALLIB_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_path_under_a_regular_file_is_still_reported_missing() {
+        let dir = scratch("mlib-enotdir");
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let under = file.join("child.metallib");
+        let err = read(&under, "read metallib", "").unwrap_err();
+        assert!(err.starts_with("metallib missing at "), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_metallib_names_its_path_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mlib-eacces");
+        let file = dir.join("locked.metallib");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            return;
+        }
+        let err = read(&file, "read metallib", "").unwrap_err();
+        let shown = file.to_str().unwrap();
+        assert_eq!(err.matches(shown).count(), 1, "{err}");
+    }
+
+    #[test]
+    fn an_empty_file_is_returned_empty_for_the_caller_to_judge() {
+        let dir = scratch("mlib-empty");
+        let empty = dir.join("e.metallib");
+        std::fs::File::create(&empty).unwrap();
+        assert!(read(&empty, "read metallib", "").unwrap().is_empty());
     }
 }
 

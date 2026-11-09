@@ -239,6 +239,7 @@ pub mod ab_flags;
 pub mod attn_prefill_bf16;
 pub mod attn_train;
 pub mod bert;
+mod bounded_file;
 pub mod capi;
 pub mod capi_embedgemma2;
 pub mod cb_replay;

@@ -7,20 +7,17 @@
 //! parsed as 2.0, `fortran_order` found by substring, and trailing bytes
 //! ignored. Each is now an error.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod scratch_support;
+use scratch_support::Scratch;
 
 use tessl::npy::{read_npy, transpose_last2, write_npy_f32, MAX_NPY_HEADER_BYTES};
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn tmp(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tessl-npy-h-{}-{tag}-{n}.npy", std::process::id()))
+fn tmp(tag: &str) -> Scratch {
+    Scratch::file(&format!("tessl-npy-h-{tag}"), ".npy")
 }
 
 /// A v1.0 file with `header` (padded as NumPy pads it) and `payload`.
-fn v1(tag: &str, header: &str, payload: &[u8]) -> PathBuf {
+fn v1(tag: &str, header: &str, payload: &[u8]) -> Scratch {
     let mut h = header.to_string();
     let pad = (64 - (10 + h.len() + 1) % 64) % 64;
     h.push_str(&" ".repeat(pad));
@@ -34,9 +31,8 @@ fn v1(tag: &str, header: &str, payload: &[u8]) -> PathBuf {
     p
 }
 
-fn err(p: PathBuf) -> String {
+fn err(p: Scratch) -> String {
     let r = read_npy(&p);
-    let _ = std::fs::remove_file(&p);
     match r {
         Ok(a) => panic!("{} read as shape {:?}, expected an error", p.display(), a.shape),
         Err(e) => e,
@@ -55,7 +51,6 @@ fn well_formed_files_still_read() {
         &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     );
     let a = read_npy(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     assert_eq!(a.shape, vec![2, 3]);
     assert_eq!(a.f32_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     // A scalar and an empty array.
@@ -65,19 +60,16 @@ fn well_formed_files_still_read() {
         &f32_bytes(&[7.0]),
     );
     assert_eq!(read_npy(&p).unwrap().f32_slice().unwrap(), &[7.0]);
-    std::fs::remove_file(&p).unwrap();
     let p = v1(
         "empty",
         "{'descr': '<f4', 'fortran_order': False, 'shape': (0, 5), }",
         &[],
     );
     assert!(read_npy(&p).unwrap().f32_slice().unwrap().is_empty());
-    std::fs::remove_file(&p).unwrap();
     // The writer's own output round-trips.
     let p = tmp("rt");
     write_npy_f32(&p, &[3], &[1.5, -2.0, 0.25]).unwrap();
     assert_eq!(read_npy(&p).unwrap().f32_slice().unwrap(), &[1.5, -2.0, 0.25]);
-    std::fs::remove_file(&p).unwrap();
 }
 
 #[test]

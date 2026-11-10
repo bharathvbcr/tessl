@@ -12,16 +12,14 @@
 mod common;
 
 use common::with_gpu;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod scratch_support;
+use scratch_support::Scratch;
 use tessl::qwen35_adamw::{adamw_step, AdamWHyper};
 use tessl::{npy, safetensors};
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn tmp_file(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tessl-challenger-m2-{}-{tag}-{n}.npy", std::process::id()))
+fn tmp_file(tag: &str) -> Scratch {
+    Scratch::file(&format!("tessl-challenger-m2-{tag}"), ".npy")
 }
 
 /// The legacy (pre-M2) host-side scalar computation in tessl/src/qwen35_adamw.rs.
@@ -386,7 +384,6 @@ fn challenge_npy_parser_bounds_and_framing_rejection() {
         let p = tmp_file(tag);
         std::fs::write(&p, bytes).unwrap();
         let r = npy::read_npy(&p);
-        let _ = std::fs::remove_file(&p);
         r.expect_err(&format!("expected failure for {tag}"))
     };
 

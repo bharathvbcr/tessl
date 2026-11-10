@@ -6,6 +6,9 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 fn sweep() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bench_gemm_sweep"));
     // Were the flag ignored, a tiny sweep rather than the default ladder runs.
@@ -17,8 +20,7 @@ fn sweep() -> Command {
 
 #[test]
 fn dump_metallib_writes_the_embedded_library_bytes() {
-    let dir = std::env::temp_dir().join(format!("tessl-dump-metallib-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("metallib");
     let out = dir.join("embedded.metallib");
     let status = sweep().arg("--dump-metallib").arg(&out).output().unwrap();
     assert!(
@@ -30,7 +32,6 @@ fn dump_metallib_writes_the_embedded_library_bytes() {
     let artifact = std::fs::read(tessl::metallib_path()).expect("build artifact");
     assert!(!dumped.is_empty() && dumped.starts_with(b"MTLB"), "not a metallib");
     assert_eq!(dumped, artifact, "the dump is not the library build.rs produced");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -67,11 +68,8 @@ fn dump_with_deadline(target: &std::path::Path) -> std::process::Output {
     }
 }
 
-fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("tessl-dump-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-dump-{tag}"))
 }
 
 #[test]
@@ -83,7 +81,6 @@ fn dump_metallib_refuses_a_fifo_target_without_blocking() {
     let out = dump_with_deadline(&fifo);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -92,7 +89,6 @@ fn dump_metallib_refuses_a_directory_target() {
     let out = dump_with_deadline(&dir);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -111,5 +107,4 @@ fn dump_metallib_replaces_a_regular_file_atomically_and_leaves_no_staging_file()
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(names.len(), 1, "staging file left behind: {names:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

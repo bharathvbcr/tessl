@@ -25,6 +25,9 @@ use tessl::media::image::{
 use tessl::media::video::{VideoOptions, VideoSource};
 use tessl::media::MediaError;
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 /// The channel mean, taken before resampling: what the `ffmpeg_mean` goldens
 /// (`pan=mono|c0=0.5*c0+0.5*c1`, then `aresample`) are. The default
 /// [`AudioOptions`] mix like torchcodec instead (libswresample's matrix).
@@ -683,14 +686,9 @@ fn undecodable_audio_is_an_error_never_an_empty_result() {
             Err(e) => eprintln!("{what:22} -> {e}"),
         }
         // The same bytes as a file.
-        let path = std::env::temp_dir().join(format!(
-            "tessl-media-test-{}-{}.bin",
-            std::process::id(),
-            what.replace(' ', "_")
-        ));
+        let path = Scratch::file(&format!("tessl-media-test-{}", what.replace(' ', "_")), ".bin");
         std::fs::write(&path, &data).unwrap();
         let r = decode_audio_file(&path, &AudioOptions::default());
-        let _ = std::fs::remove_file(&path);
         assert!(
             r.is_err(),
             "{what}: the file path decoded {} samples",

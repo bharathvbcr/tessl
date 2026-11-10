@@ -29,6 +29,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 const FLASH_ATTN_SOURCE: &str = include_str!("../src/bin/bench_flash_attn.rs");
 
 /// The stand-in `bench_flash_attn`.
@@ -51,11 +54,8 @@ fi
 
 // ------------------------------------------------------------------ fixtures
 
-fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-attn-tune-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-attn-tune-{tag}"))
 }
 
 fn knob(name: &str) -> &'static tune::Knob {
@@ -101,7 +101,7 @@ const BASE: [[f64; 3]; 7] = [
 ];
 
 struct Fake {
-    dir: PathBuf,
+    dir: Scratch,
     bin: PathBuf,
 }
 
@@ -810,4 +810,23 @@ fn equals_form_is_accepted() {
     let o = fake.run(&["--knob=rows", "--rounds=1"], &[]);
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     assert_eq!(fake.calls().len(), 3);
+}
+
+/// The scratch guard removes its directory when a test body panics, not only
+/// when it returns, and a second scratch of the same tag is a different dir.
+#[test]
+fn a_scratch_dir_is_removed_when_the_test_body_panics() {
+    let kept = std::cell::RefCell::new(None::<PathBuf>);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let a = scratch("panics");
+        let b = scratch("panics");
+        assert_ne!(a.path(), b.path(), "two scratches of one tag collide");
+        std::fs::write(a.join("f"), "x").unwrap();
+        assert!(a.is_dir() && b.is_dir());
+        *kept.borrow_mut() = Some(a.path().to_path_buf());
+        panic!("the test body fails");
+    }));
+    assert!(r.is_err());
+    let dir = kept.into_inner().expect("the body ran");
+    assert!(!dir.exists(), "{} survived a panicking test body", dir.display());
 }

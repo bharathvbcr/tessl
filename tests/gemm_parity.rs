@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 const M: usize = 32;
 const N: usize = 24;
 const K: usize = 16;
@@ -32,11 +35,8 @@ const LANES: [&str; 4] = ["tensorops-f32", "simdgroup-f32", "tensorops-bf16", "t
 
 // ------------------------------------------------------------------ fixtures
 
-fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-gemm-parity-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-gemm-parity-{tag}"))
 }
 
 /// Deterministic uniform [-1, 1) stream.
@@ -267,9 +267,16 @@ fn stub_bf16() -> Vec<Ext> {
     ]
 }
 
+/// `build_dump` into a fresh scratch dir that the returned guard owns, so the
+/// dump is removed when the test ends however it ends.
+fn dump_in(root: Scratch, seeds: usize, lanes: &[&str], err_scale: Option<&[f64]>) -> Scratch {
+    build_dump(&root, seeds, lanes, err_scale);
+    root
+}
+
 /// A dump with `exts` written beside it.
-fn dump_with(tag: &str, seeds: usize, exts: Vec<Ext>) -> PathBuf {
-    let d = build_dump(&scratch(tag), seeds, &LANES, None);
+fn dump_with(tag: &str, seeds: usize, exts: Vec<Ext>) -> Scratch {
+    let d = dump_in(scratch(tag), seeds, &LANES, None);
     write_externals(&d, seeds, exts);
     d
 }
@@ -305,7 +312,7 @@ fn a_valid_dump_is_accepted_and_reported_once_per_lane() {
 fn the_aggregate_reports_the_worst_seed_not_the_last_or_the_mean() {
     // Seed 1 is perturbed hardest; a scorer that keeps the last seed or averages
     // would under-report it.
-    let d = build_dump(&scratch("worst"), 3, &LANES, Some(&[1e-8, 5e-7, 1e-8]));
+    let d = dump_in(scratch("worst"), 3, &LANES, Some(&[1e-8, 5e-7, 1e-8]));
     write_externals(&d, 3, stub_f32());
     let rows = accepts("worst-of-seeds", score(&d));
     let row = scored(&rows, "tensorops-f32");
@@ -414,7 +421,7 @@ fn a_manifest_cannot_name_a_path_outside_the_dump_or_a_lane_twice() {
 fn a_manifest_that_promises_more_than_the_dump_holds_is_refused() {
     // Exactly the pre-fix state: the two reduced-precision lanes absent while the
     // manifest still claims four.
-    let d = build_dump(&scratch("shortlanes"), 2, &LANES, None);
+    let d = dump_in(scratch("shortlanes"), 2, &LANES, None);
     for s in 0..2 {
         for lane in ["tensorops-bf16", "tensorops-tf32"] {
             std::fs::remove_file(d.join(seed_name(s)).join(format!("parity_c_{lane}.npy"))).unwrap();
@@ -422,7 +429,7 @@ fn a_manifest_that_promises_more_than_the_dump_holds_is_refused() {
     }
     refuses("lane in manifest, npy absent", score(&d), "missing");
 
-    let d = build_dump(&scratch("shortseed"), 3, &LANES, None);
+    let d = dump_in(scratch("shortseed"), 3, &LANES, None);
     std::fs::remove_dir_all(d.join("seed_02")).unwrap();
     refuses("seed in manifest, directory absent", score(&d), "absent");
 }
@@ -430,7 +437,7 @@ fn a_manifest_that_promises_more_than_the_dump_holds_is_refused() {
 #[test]
 fn non_finite_results_operands_and_degenerate_references_are_refused() {
     for (label, bad) in [("NaN", f32::NAN), ("+Inf", f32::INFINITY), ("-Inf", f32::NEG_INFINITY)] {
-        let d = build_dump(&scratch(&format!("nf{label}")), 2, &LANES, None);
+        let d = dump_in(scratch(&format!("nf{label}")), 2, &LANES, None);
         let fnm = d.join("seed_00").join("parity_c_tensorops-tf32.npy");
         let mut c = load(&fnm);
         c[3 * N + 4] = bad;
@@ -438,7 +445,7 @@ fn non_finite_results_operands_and_degenerate_references_are_refused() {
         refuses(&format!("{label} in a result"), score(&d), "non-finite");
     }
 
-    let d = build_dump(&scratch("wrongshape"), 2, &LANES, None);
+    let d = dump_in(scratch("wrongshape"), 2, &LANES, None);
     save(
         &d.join("seed_00/parity_c_tensorops-f32.npy"),
         &[M, N + 3],
@@ -446,17 +453,17 @@ fn non_finite_results_operands_and_degenerate_references_are_refused() {
     );
     refuses("result shape mismatch", score(&d), "shape");
 
-    let d = build_dump(&scratch("zeroops"), 2, &LANES, None);
+    let d = dump_in(scratch("zeroops"), 2, &LANES, None);
     save(&d.join("seed_00/parity_a.npy"), &[M, K], &vec![0.0; M * K]);
     refuses("all-zero operands (scale 0)", score(&d), "division by zero");
 
-    let d = build_dump(&scratch("nanops"), 2, &LANES, None);
+    let d = dump_in(scratch("nanops"), 2, &LANES, None);
     let mut a = load(&d.join("seed_00/parity_a.npy"));
     a[0] = f32::NAN;
     save(&d.join("seed_00/parity_a.npy"), &[M, K], &a);
     refuses("non-finite operands", score(&d), "non-finite");
 
-    let d = build_dump(&scratch("opshape"), 2, &LANES, None);
+    let d = dump_in(scratch("opshape"), 2, &LANES, None);
     save(&d.join("seed_00/parity_b.npy"), &[K + 2, N], &vec![1.0; (K + 2) * N]);
     refuses("operand shape contradicts manifest", score(&d), "contradict");
 }
@@ -495,7 +502,7 @@ fn a_lane_over_its_per_element_budget_is_refused() {
 fn a_lane_with_no_declared_roundoff_is_not_scored_against_a_default() {
     let mut lanes = LANES.to_vec();
     lanes.push("tensorops-fp8");
-    let d = build_dump(&scratch("unknownlane"), 2, &lanes, None);
+    let d = dump_in(scratch("unknownlane"), 2, &lanes, None);
     refuses("lane with no LANE_PRECISION entry", score(&d), "LANE_PRECISION");
 }
 
@@ -669,7 +676,7 @@ fn an_external_lane_file_that_is_not_the_contract_is_refused() {
             "no result for seed",
         ),
     ] {
-        let d = build_dump(&scratch(&format!("ext-file-{}", label.len())), 2, &LANES, None);
+        let d = dump_in(scratch(&format!("ext-file-{}", label.len())), 2, &LANES, None);
         write_externals_raw(&d, &text);
         refuses(label, score(&d), needle);
     }
@@ -684,7 +691,7 @@ fn a_scored_external_whose_output_file_is_missing_is_refused() {
 
 #[test]
 fn no_external_file_means_no_comparison_runtimes_and_says_so() {
-    let d = build_dump(&scratch("ext-none"), 2, &LANES, None);
+    let d = dump_in(scratch("ext-none"), 2, &LANES, None);
     let rows = accepts("empty external lanes", score(&d));
     assert_eq!(rows.len(), 4);
     for r in &rows {
@@ -709,7 +716,7 @@ fn no_external_file_means_no_comparison_runtimes_and_says_so() {
 
 #[test]
 fn a_tessl_only_breach_with_no_externals_is_unconfirmed_not_a_kernel_defect() {
-    let d = build_dump(&scratch("ext-none-drift"), 2, &LANES, None);
+    let d = dump_in(scratch("ext-none-drift"), 2, &LANES, None);
     for s in 0..2 {
         let fnm = d.join(seed_name(s)).join("parity_c_tensorops-f32.npy");
         let c: Vec<f32> = load(&fnm).iter().map(|&v| (v as f64 * (1.0 + 1e-5)) as f32).collect();
@@ -1191,7 +1198,8 @@ fn usage_errors_exit_2() {
 
 #[test]
 fn ladder_refuses_bad_arguments_before_running_anything() {
-    let fake = scratch("ladder-args").join("not_a_binary");
+    let root = scratch("ladder-args");
+    let fake = root.join("not_a_binary");
     std::fs::write(&fake, "").unwrap();
     for (args, needle) in [
         (vec!["--seeds", "0"], "--seeds must be >= 1"),
@@ -1243,7 +1251,7 @@ fn fake_sweep(dir: &Path, template: &Path, shape: &str, dist: &str, exit: i32) -
 
 /// A conforming 512x512x512 single-seed dump: the only shape a stand-in can
 /// stand in for without the real ladder's dimensions being wrong.
-fn ladder_template(tag: &str) -> PathBuf {
+fn ladder_template(tag: &str) -> (Scratch, PathBuf) {
     let root = scratch(tag);
     let t = root.join("template");
     let sd = t.join("seed_00");
@@ -1262,13 +1270,13 @@ fn ladder_template(tag: &str) -> PathBuf {
         r#"{"shape":"square_512","dist":"uniform","m":512,"n":512,"k":512,"lanes":["tensorops-f32","simdgroup-f32"],"seeds":["seed_00"]}"#,
     )
     .unwrap();
-    t
+    (root, t)
 }
 
 #[test]
 fn ladder_scores_a_cell_merges_it_and_writes_the_grid_document() {
-    let t = ladder_template("ladder-ok");
-    let root = t.parent().unwrap().to_path_buf();
+    let (guard, t) = ladder_template("ladder-ok");
+    let root = guard.to_path_buf();
     let bin = fake_sweep(&root, &t, "square_512", "uniform", 0);
     let out_file = root.join("grid.json");
     let out = run_ok(
@@ -1323,8 +1331,8 @@ fn ladder_scores_a_cell_merges_it_and_writes_the_grid_document() {
 
 #[test]
 fn ladder_refuses_a_binary_that_dumped_a_different_shape_or_distribution_or_failed() {
-    let t = ladder_template("ladder-drift");
-    let root = t.parent().unwrap().to_path_buf();
+    let (guard, t) = ladder_template("ladder-drift");
+    let root = guard.to_path_buf();
     let run = |bin: &Path| {
         gemm_parity()
             .args([

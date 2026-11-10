@@ -23,8 +23,9 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod scratch_support;
+use scratch_support::Scratch;
 
 use tessl::npy::{read_npy, MAX_NPY_HEADER_BYTES};
 use tessl::safetensors::{SafeTensors, MAX_HEADER_BYTES};
@@ -279,11 +280,8 @@ fn check_st(label: &str, bytes: &[u8]) -> bool {
     }
 }
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn tmp(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tessl-mut-{}-{tag}-{n}", std::process::id()))
+fn tmp(tag: &str) -> Scratch {
+    Scratch::file(&format!("tessl-mut-{tag}"), "")
 }
 
 /// `open` and `from_bytes` must reach the same verdict on the same bytes.
@@ -291,7 +289,6 @@ fn check_st_file(label: &str, bytes: &[u8]) {
     let p = tmp("st");
     std::fs::write(&p, bytes).unwrap();
     let (res, largest) = measure(|| SafeTensors::open(&p));
-    let _ = std::fs::remove_file(&p);
     assert!(
         largest <= alloc_bound(bytes.len()),
         "{label}: open allocated {largest} for a {}-byte file",
@@ -589,7 +586,6 @@ fn check_npy(label: &str, bytes: &[u8]) -> bool {
     let p = tmp("npy");
     std::fs::write(&p, bytes).unwrap();
     let (res, largest) = measure(|| read_npy(&p));
-    let _ = std::fs::remove_file(&p);
     assert!(
         largest <= alloc_bound(bytes.len()),
         "{label}: one {largest}-byte allocation for a {}-byte file",

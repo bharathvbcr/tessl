@@ -6,6 +6,8 @@
 //! producing exactly what the Rust entry point produces.
 
 mod common;
+mod scratch_support;
+use scratch_support::Scratch;
 
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
@@ -550,9 +552,7 @@ fn a_model_loads_through_the_abi_from_a_directory_or_an_index() {
     let want = load_model(handle.0);
     let want_n = param_count(want);
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_train");
-    let dir = std::env::temp_dir().join(format!("tessl-capi-index-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::dir("tessl-capi-index");
     std::os::unix::fs::symlink(
         src.join("model.safetensors"),
         dir.join("model-00001-of-00001.safetensors"),
@@ -567,7 +567,7 @@ fn a_model_loads_through_the_abi_from_a_directory_or_an_index() {
     std::fs::write(&index, format!("{{\"weight_map\":{{{}}}}}", body.join(","))).unwrap();
 
     let (cfg, prefix) = (fixture("config.json"), std::ffi::CString::new("model.").unwrap());
-    for path in [src.clone(), dir.clone(), index.clone()] {
+    for path in [src.clone(), dir.to_path_buf(), index.clone()] {
         let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         let mut out = ptr::null_mut();
         let mut err = [0 as c_char; ERR_LEN];
@@ -588,7 +588,6 @@ fn a_model_loads_through_the_abi_from_a_directory_or_an_index() {
         assert_eq!(unsafe { tessl_qwen35_free(out) }, TESSL_OK);
     }
     assert_eq!(unsafe { tessl_qwen35_free(want) }, TESSL_OK);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

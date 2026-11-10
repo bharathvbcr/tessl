@@ -13,6 +13,8 @@
 //! every bad call, and `take_dispatch_count` is the public way to see it.
 
 mod common;
+mod scratch_support;
+use scratch_support::Scratch;
 
 use common::{with_gpu, with_two_gpus};
 use tessl::gemm::{gemm_nt_f32, gemm_tn_f32};
@@ -364,9 +366,7 @@ fn missing_kernels_and_metallibs_are_named_in_the_error() {
 #[test]
 fn a_metallib_path_that_is_not_a_regular_file_is_refused_promptly() {
     use std::time::Duration;
-    let dir = std::env::temp_dir().join(format!("tessl-metallib-nonreg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::dir("tessl-metallib-nonreg");
     let fifo = dir.join("fifo.metallib");
     assert!(std::process::Command::new("mkfifo")
         .arg(&fifo)
@@ -399,7 +399,7 @@ fn a_metallib_path_that_is_not_a_regular_file_is_refused_promptly() {
     }
 
     with_gpu(|rt| {
-        for p in [fifo, fifo_link, zero, dir.clone()] {
+        for p in [fifo, fifo_link, zero, dir.to_path_buf()] {
             let want = format!("metallib at {} is not a regular file", p.display());
             let e = guarded("from_metallib_path", || GpuRuntime::from_metallib_path(&p).map(|_| ()));
             assert!(e.starts_with(&want), "from_metallib_path {}: {e:?}", p.display());
@@ -412,8 +412,7 @@ fn a_metallib_path_that_is_not_a_regular_file_is_refused_promptly() {
 /// A one-kernel metallib built with the toolchain's `xcrun metal`, in a fresh
 /// directory under the system temp dir; returns its bytes.
 fn tiny_metallib(tag: &str, kernel: &str) -> Vec<u8> {
-    let dir = std::env::temp_dir().join(format!("tessl-overlay-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create overlay scratch dir");
+    let dir = Scratch::dir(&format!("tessl-overlay-{tag}"));
     let src = dir.join("k.metal");
     std::fs::write(&src, format!("kernel void {kernel}() {{}}\n")).unwrap();
     let air = dir.join("k.air");
@@ -439,9 +438,7 @@ fn tiny_metallib(tag: &str, kernel: &str) -> Vec<u8> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let bytes = std::fs::read(&lib).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    bytes
+    std::fs::read(&lib).unwrap()
 }
 
 #[test]

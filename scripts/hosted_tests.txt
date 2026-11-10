@@ -71,6 +71,7 @@ bin bench_gemm_sweep_cli 5
 bin gemm_parity 41
 bin kernel_coverage 55
 bin attn_tune 24
+bin scratch_guard 5
 bin bench_flash_attn_cli 6
 
 # Device-free tests inside mixed files (the rest of each file needs a device).

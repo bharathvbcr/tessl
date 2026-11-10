@@ -761,7 +761,9 @@ struct ActiveMetal4Batch {
     /// before, and `abort_open_batch` clears it for a buffer that was never
     /// submitted. A commit that fails or panics before it ends the buffer leaves
     /// it set (true: the buffer is open and unsubmitted); from the end to the
-    /// clear the commit has no failure point. [`GpuRuntime::recycle_if_idle`] frees against the event
+    /// clear the commit has no fallible Rust step (the two Objective-C sends,
+    /// end and submit, stay: an exception from one is not a recoverable panic).
+    /// [`GpuRuntime::recycle_if_idle`] frees against the event
     /// value once the flag reads false, even through a poisoned lock.
     cb_open: bool,
     stamped_t0: bool,
@@ -1046,7 +1048,7 @@ const ACTIVE_M4_POISONED: &str = "runtime's batch lock was poisoned by a panic: 
 ///
 /// - **A batch was open** (a panic inside a commit before it ended the command
 ///   buffer, or in a closure after it had encoded; a commit past that point has no
-///   panic site until it has cleared the open flag). Nothing can submit that
+///   fallible Rust step until it has cleared the open flag). Nothing can submit that
 ///   buffer, and the idle recycle skips because it may still bind a dropped
 ///   buffer, so the queue stays
 ///   parked for the rest of the runtime's lifetime. Drop ends that buffer, still
@@ -3069,12 +3071,12 @@ impl GpuRuntime {
         // is read at execution, which cannot start before the commit below.
         self.flush_residency_for_open_cb();
 
-        // Everything that can fail or panic runs here, while the command buffer
+        // Every fallible Rust step runs here, while the command buffer
         // is still open and unsubmitted: a failure leaves `cb_open == true`,
         // which is then true, and `abort_open_batch` ends the buffer once. From
         // `end_command_buffer` to the `cb_open` clear below there is no `?` and
-        // no panic site, so the flag never claims "unsubmitted" for a buffer
-        // that is ended or on the queue.
+        // no Rust panic site (only the end and submit sends), so the flag never
+        // claims "unsubmitted" for a buffer that is ended or on the queue.
         let prepared = self.prepare_commit()?;
         // The clock only rises, and only this runtime stores `event_value`
         // (from the clock), so the value drawn below stays above it.

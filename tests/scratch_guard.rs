@@ -15,7 +15,11 @@ fn a_stale_dir_at_the_scratch_path_is_not_inherited() {
     std::fs::write(stale.join("leftover"), "from a dead run").unwrap();
     let s = Scratch::dir_at(stale.clone());
     assert_eq!(s.path(), stale.as_path());
-    assert_eq!(std::fs::read_dir(&s).unwrap().count(), 0, "the old contents were inherited");
+    assert_eq!(
+        std::fs::read_dir(&s).unwrap().count(),
+        0,
+        "the old contents were inherited"
+    );
 }
 
 /// `Scratch::file` promises a path nothing is at.

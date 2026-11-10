@@ -30,40 +30,31 @@ pub(crate) enum OpenFail {
 /// handle. A symlink is followed; a FIFO, directory or device is refused without
 /// blocking or reading.
 ///
-/// `ojas_io` reports its failures as text only (`IoError` keeps no
-/// `ErrorKind`; an ojas-side fix is pending), so a failed open is classified
-/// here, and the classification only chooses the error variant: it never decides
-/// whether to read.
+/// The failure is classified from the [`ojas_io::IoError`] alone: the path is
+/// never stat-ed or opened a second time by name, so there is no window in which
+/// it can be swapped between the refusal and its classification.
 ///
-/// * `metadata` fails: that error is the variant's (it carries `NotFound`,
-///   `NotADirectory`, and so on).
-/// * `metadata` succeeds on something that is not a regular file: `NotRegular`.
-/// * `metadata` says regular file, so the refusal was the open itself (EACCES,
-///   EMFILE, ...). A second open, with `O_NONBLOCK` so it cannot block on a path
-///   swapped for a FIFO, recovers the real `io::Error` (and its kind). If that
-///   probe unexpectedly succeeds (the path was swapped back), its handle is
-///   dropped unread and the error is `io::Error::other` over ojas's text.
+/// * `ojas_io` kept the OS `std::io::Error` as the error's source (the `stat`,
+///   the open or the `fstat` failed: missing, ENOTDIR, EACCES, EMFILE, ...):
+///   `OpenFail::Io` carries an `io::Error` rebuilt from that error's raw OS code
+///   (`from_raw_os_error`), so the kind and the OS message text are exactly the
+///   original's. A source without a raw code keeps its kind and text.
+/// * `ojas_io` refused the file itself ("not a regular file": a directory,
+///   FIFO, socket or device, on the `stat` or on the opened handle) and has no
+///   source: `OpenFail::NotRegular`.
 pub(crate) fn open_regular(path: &Path) -> Result<(File, u64), OpenFail> {
-    match ojas_io::open_regular_file(path) {
-        Ok(opened) => Ok(opened),
-        Err(e) => Err(match std::fs::metadata(path) {
-            Err(source) => OpenFail::Io(source),
-            Ok(meta) if !meta.is_file() => OpenFail::NotRegular,
-            Ok(_) => {
-                OpenFail::Io(probe_open_error(path).unwrap_or_else(|| std::io::Error::other(e.detail().to_owned())))
-            }
-        }),
-    }
-}
-
-/// The `io::Error` a plain read-only open of `path` gives, or `None` if it opens.
-fn probe_open_error(path: &Path) -> Option<std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .err()
+    ojas_io::open_regular_file(path).map_err(|e| match std::error::Error::source(&e) {
+        Some(source) => OpenFail::Io(
+            match source
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+            {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(e.io_kind().unwrap_or(std::io::ErrorKind::Other), source.to_string()),
+            },
+        ),
+        None => OpenFail::NotRegular,
+    })
 }
 
 /// Read the regular file at `path`, refusing one longer than `cap` bytes before
@@ -301,5 +292,93 @@ pub(crate) mod tests {
             panic!("not Io")
         };
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+    }
+
+    /// The production half of this file (before its tests) classifies from the
+    /// ojas error alone: no second open or stat by name, no `O_NONBLOCK` probe.
+    #[test]
+    fn open_regular_never_re_probes_the_path() {
+        let src = include_str!("bounded_file.rs");
+        let prod = &src[..src
+            .find(concat!("#[cfg(test)]", "\npub(crate) mod tests"))
+            .expect("tests marker")];
+        for banned in [
+            "probe_open_error",
+            "O_NONBLOCK",
+            "OpenOptions",
+            "File::open(",
+            "fs::metadata(",
+            "libc::",
+        ] {
+            assert!(
+                !prod.contains(banned),
+                "bounded_file.rs production code mentions `{banned}`"
+            );
+        }
+        assert_eq!(prod.matches("ojas_io::open_regular_file(").count(), 1);
+    }
+
+    fn io_err(p: &Path) -> std::io::Error {
+        match open_regular(p) {
+            Err(OpenFail::Io(e)) => e,
+            other => panic!("{}: expected Io, got {other:?}", p.display()),
+        }
+    }
+
+    /// The kind and the exact OS text per failure, as `std` itself gives them.
+    #[test]
+    fn the_io_error_kind_and_text_are_the_operating_systems() {
+        use std::io::ErrorKind::{NotADirectory, NotFound};
+        let dir = scratch("kinds");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let dangling = dir.join("d");
+        symlink(dir.join("nowhere"), &dangling).unwrap();
+        let cases = [
+            (dir.join("absent"), NotFound),
+            (dir.join("no-parent").join("x"), NotFound),
+            (dangling, NotFound),
+            (file.join("x"), NotADirectory),
+        ];
+        for (p, kind) in cases {
+            let e = io_err(&p);
+            assert_eq!(e.kind(), kind, "{}: {e}", p.display());
+            let std_err = File::open(&p).unwrap_err();
+            assert_eq!(e.raw_os_error(), std_err.raw_os_error(), "{}", p.display());
+            assert_eq!(e.to_string(), std_err.to_string(), "{}", p.display());
+        }
+    }
+
+    #[test]
+    fn an_unsearchable_parent_is_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("eacces-parent");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let skip = File::open(&file).is_ok(); // root searches anything
+        let r = open_regular(&file);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if skip {
+            return;
+        }
+        let Err(OpenFail::Io(e)) = r else {
+            panic!("not Io: {r:?}")
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+    }
+
+    #[test]
+    fn a_non_utf8_name_and_an_over_long_name_keep_their_os_errors() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("names");
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"\xff\xfe-absent"));
+        assert_eq!(io_err(&odd).kind(), std::io::ErrorKind::NotFound);
+        let long = dir.join("n".repeat(300));
+        let e = io_err(&long);
+        assert_eq!(e.raw_os_error(), File::open(&long).unwrap_err().raw_os_error());
+        assert_eq!(e.to_string(), File::open(&long).unwrap_err().to_string());
     }
 }

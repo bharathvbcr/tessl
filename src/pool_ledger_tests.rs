@@ -1899,3 +1899,65 @@ fn commit_m4_clears_cb_open_only_after_event_value_covers_the_submit() {
         );
     }
 }
+
+// ---- a commit that fails before its submit (ft-2ea050a0) ----
+
+/// A rig with a command buffer open and nothing encoded, and the end counter
+/// at zero.
+fn rig_with_an_open_empty_batch() -> Rig {
+    let rig = Rig::new();
+    rig.rt.set_async_encode(true).unwrap();
+    rig.rt.with_binder(|_| Ok(())).unwrap();
+    assert!(rig.rt.active_m4.lock().unwrap().as_ref().is_some_and(|b| b.cb_open));
+    END_CALLS.with(|c| c.set(0));
+    rig
+}
+
+fn end_calls() -> u64 {
+    END_CALLS.with(Cell::get)
+}
+
+fn batch_is_open(rt: &GpuRuntime) -> bool {
+    let guard = rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().is_some_and(|b| b.cb_open)
+}
+
+/// A commit that returns `Err` before anything was submitted must leave the
+/// command buffer open: `cb_open` says "recording, not submitted", and the
+/// drop-time abort ends it once. Before the fix the buffer was ended first and
+/// the abort ended it again.
+#[test]
+fn a_commit_that_errs_before_the_submit_leaves_the_buffer_open_and_ends_it_once() {
+    let rig = rig_with_an_open_empty_batch();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    COMMIT_FAULT.with(|f| f.set(Some(CommitFault::Err)));
+    let err = rig.rt.commit(false).unwrap_err();
+    assert!(err.contains("injected commit fault"), "error was {err}");
+    assert!(batch_is_open(&rig.rt), "a failed commit cleared cb_open");
+    assert_eq!(end_calls(), 0, "the buffer was ended before the commit could fail");
+    assert_eq!(
+        rig.rt.metal4.event_value.load(Ordering::Acquire),
+        submitted,
+        "a commit that never submitted moved event_value"
+    );
+    drop(rig);
+    assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
+}
+
+/// The same for a panic: the unwind poisons the batch lock with `cb_open`
+/// true, which is the truth, and the drop-time abort ends the buffer once.
+#[test]
+fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_once() {
+    let _quiet = quiet_injected();
+    let rig = rig_with_an_open_empty_batch();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    COMMIT_FAULT.with(|f| f.set(Some(CommitFault::Panic)));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.rt.commit(false))).is_err();
+    assert!(unwound, "the injected panic never fired");
+    assert!(rig.rt.active_m4.is_poisoned());
+    assert!(batch_is_open(&rig.rt), "a panicked commit cleared cb_open");
+    assert_eq!(end_calls(), 0, "the buffer was ended before the commit could panic");
+    assert_eq!(rig.rt.metal4.event_value.load(Ordering::Acquire), submitted);
+    drop(rig);
+    assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
+}

@@ -3068,7 +3068,7 @@ impl GpuRuntime {
                 }
             }
         }
-        m4.command_buffer.endCommandBuffer();
+        self.end_command_buffer();
         let watch = self.commit_with_feedback()?;
 
         // Drawn from the commit clock of the `Shared` this runtime was made
@@ -3171,6 +3171,8 @@ impl GpuRuntime {
             options.addFeedbackHandler(raw);
         }
         let block = unsafe { RcBlock::from_raw(raw) }.ok_or_else(|| "commit feedback block was null".to_string())?;
+        #[cfg(test)]
+        self.inject_commit_fault()?;
         // SAFETY: `Retained::as_ptr` points at the command buffer this runtime
         // keeps in `metal4` for the duration of the send. The queue does not
         // retain the pointer past the call.
@@ -3288,6 +3290,24 @@ impl GpuRuntime {
         self.active_m4.lock().map_err(|_| ACTIVE_M4_POISONED.to_string())
     }
 
+    /// Every end of the command buffer goes through here, so a test can count
+    /// them: ending one twice is the defect a failed commit used to cause.
+    fn end_command_buffer(&self) {
+        #[cfg(test)]
+        END_CALLS.with(|c| c.set(c.get() + 1));
+        self.metal4.command_buffer.endCommandBuffer();
+    }
+
+    /// Test-only: fail or panic where the armed fault says, once.
+    #[cfg(test)]
+    fn inject_commit_fault(&self) -> Result<(), String> {
+        match COMMIT_FAULT.with(Cell::take) {
+            None => Ok(()),
+            Some(CommitFault::Err) => Err("injected commit fault".to_string()),
+            Some(CommitFault::Panic) => panic!("injected panic: commit fault"),
+        }
+    }
+
     /// End an open, uncommitted batch without submitting it.
     ///
     /// A closure that fails or panics after it has already encoded commands
@@ -3307,7 +3327,7 @@ impl GpuRuntime {
         if let Some(enc) = batch.encoder.take() {
             enc.endEncoding();
         }
-        self.metal4.command_buffer.endCommandBuffer();
+        self.end_command_buffer();
         batch.cb_open = false;
         *guard = None;
     }
@@ -4953,6 +4973,24 @@ mod alloc_recycle_tests {
         assert_eq!(rt.pending_cold_recycle.lock().unwrap().len(), 1);
     }
 }
+
+/// Test-only fault for the commit path, armed per thread and consumed once.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitFault {
+    Err,
+    Panic,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMMIT_FAULT: std::cell::Cell<Option<CommitFault>> = const { std::cell::Cell::new(None) };
+    /// `endCommandBuffer` calls this thread's runtimes have made.
+    static END_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+use std::cell::Cell;
 
 #[cfg(test)]
 #[path = "pool_ledger_tests.rs"]

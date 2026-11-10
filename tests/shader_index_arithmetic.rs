@@ -59,6 +59,8 @@ const EMBEDGEMMA2_AUDIO: &str = include_str!("../kernels/embedgemma2_audio.metal
 const EMBEDGEMMA2_TEXT: &str = include_str!("../kernels/embedgemma2_text.metal");
 const MTL_TENSOR: &str = include_str!("../kernels/mtl_tensor.metal");
 const BERT: &str = include_str!("../kernels/bert.metal");
+const EMEANS: &str = include_str!("../kernels/emeans.metal");
+const EMEANS_RS: &str = include_str!("../src/emeans.rs");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
 
 /// Every `.metal` file this suite inspects.
@@ -75,6 +77,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "embedgemma2_vision.metal",
     "embedgemma2_audio.metal",
     "embedgemma2_text.metal",
+    "emeans.metal",
     "encoder_attn.metal",
     "flash_attn_decode.metal",
     "flash_attn_global_h512.metal",
@@ -1518,4 +1521,46 @@ fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
         "a new conv2d pipeline lookup must pass int_scratch"
     );
     assert!((i32::MAX as u64) < u64::from(u32::MAX));
+}
+
+#[test]
+fn emeans_offsets_are_widened() {
+    let label = "emeans.metal";
+    for fragment in [
+        "const ulong base = (ulong)j * (ulong)d;",
+        "const ulong base = (ulong)row * (ulong)d;",
+        "ds_bf16_bits[(ulong)src_r * (ulong)d + (ulong)col]",
+        "ds_f32[(ulong)src_r * (ulong)d + (ulong)col]",
+        "device ElemT *C_part = C_eff + (ulong)c_start * (ulong)d;",
+        "const ulong p_off = (ulong)part_c * (ulong)M + (ulong)row;",
+        "X_bf16[(ulong)(row0 + r) * (ulong)d + k0 + (ulong)kk]",
+        "C_bf16[(ulong)(c_start + loc_c) * (ulong)d + k0 + (ulong)kk]",
+        "X_f32[(ulong)(row0 + r) * (ulong)d + k0 + (ulong)kk]",
+        "C_f32[(ulong)(c_start + loc_c) * (ulong)d + k0 + (ulong)kk]",
+        "const ulong off = (ulong)p * (ulong)M + (ulong)row;",
+        "radix_hist[(ulong)tid * (ulong)num_tiles + (ulong)tg]",
+        "slice_partials[(ulong)slice_id * (ulong)d + (ulong)col]",
+        "const ulong out_idx = (ulong)j * (ulong)d + (ulong)col;",
+        "const ulong donor_base = (ulong)donor * (ulong)d;",
+        "const ulong target_base = (ulong)target * (ulong)d;",
+    ] {
+        require(EMEANS, fragment, label);
+    }
+    for narrow in [
+        "const uint base = j * d;",
+        "const uint base = row * d;",
+        "const uint out_idx = j * d + col;",
+        "slice_partials[slice_id * d + col]",
+        "radix_hist[tid * num_tiles + tg]",
+    ] {
+        forbid(EMEANS, narrow, label);
+    }
+    for host_guard in [
+        "require_i32_extent(chunk_elems, \"emeans chunk matrix\")?;",
+        "require_i32_extent(part_elems, \"emeans cluster partition\")?;",
+        "require_i32_extent(x_elems, \"emeans assign X\")?;",
+        "require_i32_extent(c_elems, \"emeans assign C\")?;",
+    ] {
+        require(EMEANS_RS, host_guard, "src/emeans.rs");
+    }
 }

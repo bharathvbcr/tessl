@@ -46,3 +46,26 @@ matmul_fixed_order_tn_f32: test-only: tests/gemm_fixed_order.rs ascending-k TN, 
 gemm_q8_tensorops_g32: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 32
 gemm_q8_tensorops_g64: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 64
 gemm_q8_tensorops_g128: test-only: tests/gemm_q8_tensorops.rs per-group Q8 matmul2d, group 128
+emeans_prepare_centroids_bf16: test-only: tests/emeans_gpu.rs e-means bf16 centroid rounding, spherical prescale, and norm2
+emeans_prepare_centroids_f32: test-only: tests/emeans_gpu.rs e-means f32 centroid spherical prescale and norm2
+emeans_stage_rows_bf16: test-only: tests/emeans_gpu.rs e-means bf16 row upload validation and norm2
+emeans_stage_rows_f32: test-only: tests/emeans_gpu.rs e-means f32 row upload validation, bf16 cast, and norm2
+emeans_gather_rows_bf16: test-only: tests/emeans_gpu.rs e-means resident bf16 chunk gather
+emeans_gather_rows_f32: test-only: tests/emeans_gpu.rs e-means resident f32 chunk gather
+emeans_assign_bf16_tensorops: test-only: tests/emeans_gpu.rs 64x64 execution_simdgroups<4> bf16 TensorOps argmin
+emeans_assign_f32_tensorops: test-only: tests/emeans_gpu.rs 64x64 execution_simdgroups<4> exact f32 TensorOps argmin
+emeans_assign_bf16_simdgroup: test-only: tests/emeans_gpu.rs 32x32 bf16 simdgroup_float8x8 argmin fallback
+emeans_assign_f32_simdgroup: test-only: tests/emeans_gpu.rs 32x32 f32 simdgroup_float8x8 argmin fallback
+emeans_reduce_split_c: test-only: tests/emeans_gpu.rs split_c cluster-partition argmin reduction
+emeans_pack_label_keys: test-only: tests/emeans_gpu.rs 64-bit (label << 16 | local_row) CSR key packing
+emeans_radix_hist: test-only: tests/emeans_gpu.rs deterministic 8-bit GPU radix histogram
+emeans_radix_prefix: test-only: tests/emeans_gpu.rs deterministic 8-bit GPU radix prefix scan
+emeans_radix_scatter: test-only: tests/emeans_gpu.rs deterministic 8-bit GPU radix scatter
+emeans_find_bucket_bounds: test-only: tests/emeans_gpu.rs CSR bucket binary search and 256-row overflow slice allocation
+emeans_gather_slice_partials_bf16: test-only: tests/emeans_gpu.rs 256-row bf16 CSR overflow slice gather
+emeans_gather_slice_partials_f32: test-only: tests/emeans_gpu.rs 256-row f32 CSR overflow slice gather
+emeans_fold_slice_partials: test-only: tests/emeans_gpu.rs ascending slice-order CSR fold into batch_sums and pass_sums
+emeans_accum_chunk_obj: test-only: tests/emeans_gpu.rs pure-integer IEEE-754 binary64 chunk objective reduction
+emeans_apply_ema: test-only: tests/emeans_gpu.rs weight==1.0f exact override EMA centroid update
+emeans_revive_prepare: test-only: tests/emeans_gpu.rs SplitMix64 Gumbel dead-cluster donor preparation
+emeans_revive_splits: test-only: tests/emeans_gpu.rs dead-cluster split perturbation and ULP separation

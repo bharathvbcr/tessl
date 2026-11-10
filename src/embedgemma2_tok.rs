@@ -1320,18 +1320,15 @@ fn read_bounded(path: &Path, cap: u64) -> Result<String, String> {
     Ok(ojas_io::read_regular_text(path, cap, "cap")?)
 }
 
-// The test-scratch guard shared with the integration tests (`tests/scratch_support`).
-#[cfg(test)]
-#[path = "../tests/scratch_support/mod.rs"]
-mod scratch_support;
-
 #[cfg(test)]
 mod tests {
-    use super::scratch_support::Scratch;
     use super::*;
 
-    fn scratch(tag: &str) -> Scratch {
-        Scratch::dir(&format!("tessl-tok-bounded-{tag}"))
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tessl-tok-bounded-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -1360,6 +1357,7 @@ mod tests {
         std::fs::write(&f, [0xffu8]).unwrap();
         assert!(read_bounded(&f, 64).is_err());
         assert!(read_bounded(&dir, 64).unwrap_err().contains("not a regular file"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1379,6 +1377,7 @@ mod tests {
         }
         let e = got.expect("read_bounded blocked on a FIFO").unwrap_err();
         assert!(e.contains("not a regular file"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

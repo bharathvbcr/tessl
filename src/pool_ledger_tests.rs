@@ -1934,17 +1934,17 @@ fn a_commit_that_errs_before_the_submit_leaves_the_buffer_open_and_ends_it_once(
     let err = rig.rt.commit(false).unwrap_err();
     assert!(err.contains("injected commit fault"), "error was {err}");
     let (open, ended) = (batch_is_open(&rig.rt), end_calls());
-    eprintln!("after the failed commit: cb_open={open} end_calls={ended}");
+    let moved = rig.rt.metal4.event_value.load(Ordering::Acquire) != submitted;
+    drop(rig);
+    let ended_after_drop = end_calls();
+    eprintln!("failed commit: cb_open={open} ended_by_commit={ended} event_value_moved={moved} ended_after_drop={ended_after_drop}");
     assert!(open, "a failed commit cleared cb_open");
     assert_eq!(ended, 0, "the buffer was ended before the commit could fail");
+    assert!(!moved, "a commit that never submitted moved event_value");
     assert_eq!(
-        rig.rt.metal4.event_value.load(Ordering::Acquire),
-        submitted,
-        "a commit that never submitted moved event_value"
+        ended_after_drop, 1,
+        "the buffer must be ended exactly once, by the abort"
     );
-    drop(rig);
-    eprintln!("after the drop: end_calls={}", end_calls());
-    assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
 }
 
 /// The same for a panic: the unwind poisons the batch lock with `cb_open`
@@ -1959,13 +1959,17 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     assert!(unwound, "the injected panic never fired");
     assert!(rig.rt.active_m4.is_poisoned());
     let (open, ended) = (batch_is_open(&rig.rt), end_calls());
-    eprintln!("after the panicked commit: cb_open={open} end_calls={ended}");
+    let moved = rig.rt.metal4.event_value.load(Ordering::Acquire) != submitted;
+    drop(rig);
+    let ended_after_drop = end_calls();
+    eprintln!("panicked commit: cb_open={open} ended_by_commit={ended} event_value_moved={moved} ended_after_drop={ended_after_drop}");
     assert!(open, "a panicked commit cleared cb_open");
     assert_eq!(ended, 0, "the buffer was ended before the commit could panic");
-    assert_eq!(rig.rt.metal4.event_value.load(Ordering::Acquire), submitted);
-    drop(rig);
-    eprintln!("after the drop: end_calls={}", end_calls());
-    assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
+    assert!(!moved, "a commit that never submitted moved event_value");
+    assert_eq!(
+        ended_after_drop, 1,
+        "the buffer must be ended exactly once, by the abort"
+    );
 }
 
 /// Code lines of `src` from `header` to the first line that closes the

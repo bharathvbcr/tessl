@@ -3111,9 +3111,10 @@ impl GpuRuntime {
         // Only now is the flag cleared: `cb_open == false` must imply that
         // `event_value` covers every command buffer submitted, because
         // `recycle_if_idle` reads the flag under a recovered (possibly
-        // poisoned) lock and then frees against the event value. A panic
-        // between the submit and this store leaves the flag set, and a set
-        // flag skips the recycle.
+        // poisoned) lock and then frees against the event value. Nothing
+        // between the end and this clear has a Rust failure point (the
+        // source-order pin lists the statements), so the flag stays set only
+        // for a buffer that is still open.
         batch.cb_open = false;
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
@@ -3168,7 +3169,8 @@ impl GpuRuntime {
     /// Runs before `end_command_buffer`. A failure here (an `Err`, or a panic
     /// from `MTL4CommitOptions::new` when Objective-C returns nil) leaves the
     /// command buffer open and unsubmitted, which is what `cb_open == true`
-    /// says. [`Self::submit_prepared`] then cannot fail.
+    /// says. [`Self::submit_prepared`] has no Rust failure point of its own:
+    /// only the Objective-C submit send remains.
     ///
     /// `MTL4CommandBuffer` (Apple header and objc2-metal 0.3.2) has begin, end,
     /// and encoders, and no `status` or `error`. A GPU fault is reported later
@@ -3217,9 +3219,11 @@ impl GpuRuntime {
         })
     }
 
-    /// Submit the prepared command buffer with its feedback options. Neither
-    /// returns an error nor panics: [`Self::commit_m4`] relies on that between
-    /// the end of the buffer and the `cb_open` clear.
+    /// Submit the prepared command buffer with its feedback options. It has no
+    /// Rust failure point (no `?`, no unwrap, no indexing): [`Self::commit_m4`]
+    /// relies on that between the end of the buffer and the `cb_open` clear. The
+    /// Objective-C submit send itself remains, and an exception from it is not
+    /// recoverable.
     fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
         let PreparedCommit {
             state,

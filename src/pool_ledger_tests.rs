@@ -1972,9 +1972,10 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     );
 }
 
-/// Code lines of `src` from `header` to the first line that closes the
-/// function (a lone four-space `}`), comments removed.
-fn code_of_fn(src: &str, header: &str) -> String {
+/// Code of `src` from `header` to the first line that closes the function (a
+/// lone four-space `}`, which is not included), comments removed, with every
+/// whitespace character dropped so that formatting cannot matter.
+fn compact_fn(src: &str, header: &str) -> String {
     let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
     let rest = &src[start..];
     let end = rest
@@ -1983,62 +1984,81 @@ fn code_of_fn(src: &str, header: &str) -> String {
     rest[..end]
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
-const FAILURE_POINTS: [&str; 8] = [
-    "?",
-    "unwrap",
-    "expect(",
-    "panic!",
-    "assert",
-    "unreachable!",
-    "todo!",
-    "ok_or",
-];
+fn compact(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
 
-/// A source-order pin (no test can fire a panic inside the window without a
-/// production knob): between ending the command buffer and clearing `cb_open`,
-/// `commit_m4` has no `?` and no panic site, and `submit_prepared`, which it
-/// calls there, has none either. All fallible work, and the clock check, runs in
-/// `prepare_commit` before the end, while a failure still leaves `cb_open` true.
+/// An allow-list source-order pin (no test can fire a panic inside the window
+/// without a production knob). Between ending the command buffer and clearing
+/// `cb_open`, `commit_m4` runs exactly four statements, and each callee that is
+/// Rust code is pinned to its exact body, so a new statement, a new helper call,
+/// an index or an `expect` anywhere on the path fails here. What stays are the
+/// two Objective-C sends (end, submit). All fallible work runs in
+/// `prepare_commit` before the end, where a failure still leaves `cb_open` true.
 #[test]
 fn commit_m4_has_no_failure_point_between_ending_the_buffer_and_clearing_cb_open() {
     let src = include_str!("runtime.rs");
-    let body = code_of_fn(src, "fn commit_m4(");
+    let body = compact_fn(src, "fn commit_m4(");
     let prepare = body
-        .find("self.prepare_commit()?")
+        .find(&compact("self.prepare_commit()?"))
         .expect("commit_m4 no longer prepares the commit");
     let guard = body
         .find("debug_assert!(")
         .expect("commit_m4 lost the clock check before the end");
     let end = body
-        .find("self.end_command_buffer();")
+        .find(&compact("self.end_command_buffer();"))
         .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
-    let clear_rel = body[end..]
-        .find("cb_open = false")
-        .expect("no cb_open clear after the end");
-    let window = &body[end..end + clear_rel];
     assert!(
         prepare < end && guard < end,
         "the fallible prepare step and the clock check must run before the end"
     );
-    assert!(
-        window.contains("self.submit_prepared(") && window.contains("event_value.store(next"),
-        "the window lost the submit or the event_value store"
+    let clear = body[end..]
+        .find("batch.cb_open=false;")
+        .expect("no cb_open clear after the end");
+    let window = &body[end..end + clear + "batch.cb_open=false;".len()];
+    let expected = compact(
+        "self.end_command_buffer();
+         let watch = self.submit_prepared(prepared);
+         let next = self.shared.issue();
+         m4.event_value.store(next, Ordering::Release);
+         batch.cb_open = false;",
     );
-    for point in FAILURE_POINTS {
-        assert!(
-            !window.contains(point),
-            "commit_m4 has a failure point ({point}) between end_command_buffer and the cb_open clear:\n{window}"
-        );
-    }
-    let submit = code_of_fn(src, "fn submit_prepared(");
-    for point in FAILURE_POINTS {
-        assert!(
-            !submit.contains(point),
-            "submit_prepared has a failure point ({point}):\n{submit}"
-        );
-    }
+    assert_eq!(
+        window, expected,
+        "the statements between end_command_buffer and the cb_open clear changed"
+    );
+
+    let submit = compact_fn(src, "fn submit_prepared(");
+    let expected_submit = compact(
+        "fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
+            let PreparedCommit { state, options, block, mut command_buffer } = prepared;
+            unsafe {
+                self.metal4.queue.commit_count_options(
+                    NonNull::new_unchecked(&mut command_buffer as *mut _), 1, &options);
+            }
+            FeedbackWatch { state, _options: options, block: Some(block) }",
+    );
+    // `rustfmt` adds a trailing comma inside the struct literals.
+    assert_eq!(submit.replace(",}", "}"), expected_submit, "submit_prepared changed");
+
+    let counter = compact("#[cfg(test)] END_CALLS.with(|c| c.set(c.get() + 1));");
+    let ender = compact_fn(src, "fn end_command_buffer(");
+    assert!(ender.contains(&counter), "the test-only end counter moved");
+    assert_eq!(
+        ender.replace(&counter, ""),
+        compact("fn end_command_buffer(&self) { self.metal4.command_buffer.endCommandBuffer();"),
+        "end_command_buffer changed"
+    );
+
+    let issue = compact_fn(include_str!("shared.rs"), "pub(crate) fn issue(");
+    assert_eq!(
+        issue,
+        compact("pub(crate) fn issue(&self) -> u64 { self.issued.fetch_add(1, Ordering::AcqRel) + 1"),
+        "Shared::issue changed"
+    );
 }

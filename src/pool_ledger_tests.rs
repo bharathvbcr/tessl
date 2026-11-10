@@ -1961,3 +1961,74 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     drop(rig);
     assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
 }
+
+/// Code lines of `src` from `header` to the first line that closes the
+/// function (a lone four-space `}`), comments removed.
+fn code_of_fn(src: &str, header: &str) -> String {
+    let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("end of {header} not found"));
+    rest[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const FAILURE_POINTS: [&str; 8] = [
+    "?",
+    "unwrap",
+    "expect(",
+    "panic!",
+    "assert",
+    "unreachable!",
+    "todo!",
+    "ok_or",
+];
+
+/// A source-order pin (no test can fire a panic inside the window without a
+/// production knob): between ending the command buffer and clearing `cb_open`,
+/// `commit_m4` has no `?` and no panic site, and `submit_prepared`, which it
+/// calls there, has none either. All fallible work, and the clock check, runs in
+/// `prepare_commit` before the end, while a failure still leaves `cb_open` true.
+#[test]
+fn commit_m4_has_no_failure_point_between_ending_the_buffer_and_clearing_cb_open() {
+    let src = include_str!("runtime.rs");
+    let body = code_of_fn(src, "fn commit_m4(");
+    let prepare = body
+        .find("self.prepare_commit()?")
+        .expect("commit_m4 no longer prepares the commit");
+    let guard = body
+        .find("debug_assert!(")
+        .expect("commit_m4 lost the clock check before the end");
+    let end = body
+        .find("self.end_command_buffer();")
+        .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
+    let clear_rel = body[end..]
+        .find("cb_open = false")
+        .expect("no cb_open clear after the end");
+    let window = &body[end..end + clear_rel];
+    assert!(
+        prepare < end && guard < end,
+        "the fallible prepare step and the clock check must run before the end"
+    );
+    assert!(
+        window.contains("self.submit_prepared(") && window.contains("event_value.store(next"),
+        "the window lost the submit or the event_value store"
+    );
+    for point in FAILURE_POINTS {
+        assert!(
+            !window.contains(point),
+            "commit_m4 has a failure point ({point}) between end_command_buffer and the cb_open clear:\n{window}"
+        );
+    }
+    let submit = code_of_fn(src, "fn submit_prepared(");
+    for point in FAILURE_POINTS {
+        assert!(
+            !submit.contains(point),
+            "submit_prepared has a failure point ({point}):\n{submit}"
+        );
+    }
+}

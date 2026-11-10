@@ -703,6 +703,15 @@ impl FeedbackState {
 /// The block Metal calls with a commit's feedback.
 type FeedbackBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>;
 
+/// What [`GpuRuntime::prepare_commit`] built for the submit: the feedback
+/// state, the options that carry the block, the block, and the buffer pointer.
+struct PreparedCommit {
+    state: Arc<FeedbackState>,
+    options: Retained<MTL4CommitOptions>,
+    block: FeedbackBlock,
+    command_buffer: NonNull<ProtocolObject<dyn MTL4CommandBuffer>>,
+}
+
 /// Keeps the commit-options object and the feedback block alive until Metal
 /// has called the block, or leaks the block if we have to drop earlier.
 struct FeedbackWatch {
@@ -750,7 +759,9 @@ struct ActiveMetal4Batch {
     /// Invariant: `false` implies `event_value` covers every command buffer
     /// this batch submitted. `commit_m4` clears it after the store, never
     /// before, and `abort_open_batch` clears it for a buffer that was never
-    /// submitted. [`GpuRuntime::recycle_if_idle`] frees against the event
+    /// submitted. A commit that fails or panics before it ends the buffer leaves
+    /// it set (true: the buffer is open and unsubmitted); from the end to the
+    /// clear the commit has no failure point. [`GpuRuntime::recycle_if_idle`] frees against the event
     /// value once the flag reads false, even through a poisoned lock.
     cb_open: bool,
     stamped_t0: bool,
@@ -1033,11 +1044,14 @@ const ACTIVE_M4_POISONED: &str = "runtime's batch lock was poisoned by a panic: 
 /// Whether the deferred release queue (and its ledger charges) parks depends on
 /// whether a command buffer was open when the panic hit:
 ///
-/// - **A batch was open** (a panic inside a commit's open-batch path, or in a
-///   closure after it had encoded). Nothing can submit that buffer, and the idle
-///   recycle skips because it may still bind a dropped buffer, so the queue stays
-///   parked for the rest of the runtime's lifetime. Drop ends a batch that was
-///   never submitted without submitting it, then releases each parked charge
+/// - **A batch was open** (a panic inside a commit before it ended the command
+///   buffer, or in a closure after it had encoded; a commit past that point has no
+///   panic site until it has cleared the open flag). Nothing can submit that
+///   buffer, and the idle recycle skips because it may still bind a dropped
+///   buffer, so the queue stays
+///   parked for the rest of the runtime's lifetime. Drop ends that buffer, still
+///   open and never submitted, without submitting it (once: a commit that fails
+///   before the end leaves it open), then releases each parked charge
 ///   exactly once: the hold is bounded by the lifetime, with no leak past Drop and
 ///   no use-after-free.
 /// - **No batch was open** (for example a panic in a waiting commit's drain). The
@@ -3055,6 +3069,20 @@ impl GpuRuntime {
         // is read at execution, which cannot start before the commit below.
         self.flush_residency_for_open_cb();
 
+        // Everything that can fail or panic runs here, while the command buffer
+        // is still open and unsubmitted: a failure leaves `cb_open == true`,
+        // which is then true, and `abort_open_batch` ends the buffer once. From
+        // `end_command_buffer` to the `cb_open` clear below there is no `?` and
+        // no panic site, so the flag never claims "unsubmitted" for a buffer
+        // that is ended or on the queue.
+        let prepared = self.prepare_commit()?;
+        // The clock only rises, and only this runtime stores `event_value`
+        // (from the clock), so the value drawn below stays above it.
+        debug_assert!(
+            self.shared.issued() >= m4.event_value.load(Ordering::Acquire),
+            "the commit clock fell behind this runtime's event value"
+        );
+
         // Close packed compute encoder before ending the CB.
         if let Some(enc) = batch.encoder.take() {
             enc.endEncoding();
@@ -3069,7 +3097,7 @@ impl GpuRuntime {
             }
         }
         self.end_command_buffer();
-        let watch = self.commit_with_feedback()?;
+        let watch = self.submit_prepared(prepared);
 
         // Drawn from the commit clock of the `Shared` this runtime was made
         // under. A runtime with a `Shared` of its own draws 1, 2, 3, ... as it
@@ -3077,10 +3105,6 @@ impl GpuRuntime {
         // Either way this runtime's own values only increase, and the store
         // lands before the queue signals, as the `fetch_add` it replaces did.
         let next = self.shared.issue();
-        debug_assert!(
-            next > m4.event_value.load(Ordering::Acquire),
-            "the commit clock fell behind this runtime's event value"
-        );
         m4.event_value.store(next, Ordering::Release);
         // Only now is the flag cleared: `cb_open == false` must imply that
         // `event_value` covers every command buffer submitted, because
@@ -3136,13 +3160,19 @@ impl GpuRuntime {
         Ok(())
     }
 
-    /// Commit one Metal 4 command buffer and register commit feedback.
+    /// Build everything a commit needs that can fail or panic: the feedback
+    /// state and block, the commit options, and the command buffer pointer.
+    ///
+    /// Runs before `end_command_buffer`. A failure here (an `Err`, or a panic
+    /// from `MTL4CommitOptions::new` when Objective-C returns nil) leaves the
+    /// command buffer open and unsubmitted, which is what `cb_open == true`
+    /// says. [`Self::submit_prepared`] then cannot fail.
     ///
     /// `MTL4CommandBuffer` (Apple header and objc2-metal 0.3.2) has begin, end,
     /// and encoders, and no `status` or `error`. A GPU fault is reported later
     /// on `MTL4CommitFeedback::error`, which this registers through
     /// `MTL4CommandQueue::commit:count:options:`.
-    fn commit_with_feedback(&self) -> Result<FeedbackWatch, String> {
+    fn prepare_commit(&self) -> Result<PreparedCommit, String> {
         let state = Arc::new(FeedbackState::new());
         let state_cb = Arc::clone(&state);
         let poison = Arc::clone(&self.poison);
@@ -3165,7 +3195,7 @@ impl GpuRuntime {
         // `into_raw` keeps the +1 this RcBlock owns. `addFeedbackHandler`
         // copies the block into the options object (Apple: the options instance
         // references the handler). `from_raw` takes the original +1 back so the
-        // block stays alive until this watch is dropped after the callback.
+        // block stays alive until the watch is dropped after the callback.
         let raw = RcBlock::into_raw(block);
         unsafe {
             options.addFeedbackHandler(raw);
@@ -3173,23 +3203,41 @@ impl GpuRuntime {
         let block = unsafe { RcBlock::from_raw(raw) }.ok_or_else(|| "commit feedback block was null".to_string())?;
         #[cfg(test)]
         self.inject_commit_fault()?;
-        // SAFETY: `Retained::as_ptr` points at the command buffer this runtime
+        // `Retained` is non-null, so this needs no null check. The pointer is
+        // only read by the submit, while this runtime keeps the buffer in
+        // `metal4`.
+        let command_buffer = NonNull::from(&*self.metal4.command_buffer);
+        Ok(PreparedCommit {
+            state,
+            options,
+            block,
+            command_buffer,
+        })
+    }
+
+    /// Submit the prepared command buffer with its feedback options. Neither
+    /// returns an error nor panics: [`Self::commit_m4`] relies on that between
+    /// the end of the buffer and the `cb_open` clear.
+    fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
+        let PreparedCommit {
+            state,
+            options,
+            block,
+            mut command_buffer,
+        } = prepared;
+        // SAFETY: `command_buffer` points at the command buffer this runtime
         // keeps in `metal4` for the duration of the send. The queue does not
         // retain the pointer past the call.
         unsafe {
-            let mut cb = NonNull::new(
-                Retained::as_ptr(&self.metal4.command_buffer) as *mut ProtocolObject<dyn MTL4CommandBuffer>
-            )
-            .ok_or_else(|| "null MTL4 command buffer".to_string())?;
             self.metal4
                 .queue
-                .commit_count_options(NonNull::new_unchecked(&mut cb as *mut _), 1, &options);
+                .commit_count_options(NonNull::new_unchecked(&mut command_buffer as *mut _), 1, &options);
         }
-        Ok(FeedbackWatch {
+        FeedbackWatch {
             state,
             _options: options,
             block: Some(block),
-        })
+        }
     }
 
     /// After a GPU wait, fold commit-feedback errors into the poison latch.

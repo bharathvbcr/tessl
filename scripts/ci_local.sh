@@ -119,28 +119,27 @@ echo "==> torch binding GPU tests (python/tests: test_clip_coef, test_cross_entr
 # These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal
 # runtime, so they belong under the machine-wide heavy-job lock, which exports MAC_HEAVY_LABEL.
 # Outside the lock they are not run, and that is printed rather than left to read as a pass.
-FIXTURE_SKIPS_FAILED=0
+# [python-stage:begin] (tests/ci_local_python_stage.rs runs this text, so keep it self-contained)
+PY_STAGE_RC=0
 if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
-  py_log="$ROOT/target/python_gpu_unittest.log"
-  mkdir -p "$ROOT/target"
-  py_rc=0
-  "$ORACLE_PY" -m unittest discover -s python/tests -v 2>&1 | tee "$py_log" || py_rc=${PIPESTATUS[0]}
-  if [[ "$py_rc" -ne 0 ]]; then
-    [[ "$TEST_FAILED" -eq 0 ]] || echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
-    exit "$py_rc"
-  fi
-  # A skip for a missing tiny fixture or library is a failure here, whatever unittest says; the
-  # real-checkpoint skips are expected without EMBEDGEMMA2_SNAPSHOT and stay allowed.
-  fixture_rc=0
-  scripts/unittest_fixture_skips.sh < "$py_log" || fixture_rc=$?
-  if [[ "$fixture_rc" -ne 0 ]]; then
-    FIXTURE_SKIPS_FAILED=1
-    SKIPS+=("python/tests tests skipped for a missing tiny fixture or library")
-  fi
+  # scripts/ci_local_python_stage.sh runs python/tests, keeps the output and fails on any skip that
+  # is not an external-checkpoint one; its exit code says which way it failed.
+  ORACLE_PY="$ORACLE_PY" scripts/ci_local_python_stage.sh || PY_STAGE_RC=$?
+  case "$PY_STAGE_RC" in
+    0) ;;
+    1)
+      [[ "$TEST_FAILED" -eq 0 ]] || echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
+      exit 1
+      ;;
+    2) SKIPS+=("python/tests skip report (output log unwritable, stage exit 2)") ;;
+    3) SKIPS+=("python/tests skipped tests that need a fixture, library or package this run should have (stage exit 3)") ;;
+    *) SKIPS+=("python/tests skip report (not examined, stage exit $PY_STAGE_RC)") ;;
+  esac
 else
   echo "SKIPPED: python/tests GPU tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
   SKIPS+=("python/tests GPU tests")
 fi
+# [python-stage:end]
 
 echo "==> test mtl_tensor (quant-prep; the default suite does not compile it)"
 mtl_out=$(cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1 2>&1) || { echo "$mtl_out"; exit 1; }
@@ -160,12 +159,22 @@ else
   ./scripts/check_release_ready.sh
 fi
 
-if [[ "$TEST_FAILED" -ne 0 ]]; then
-  echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
-  exit 1
-fi
-if [[ "$FIXTURE_SKIPS_FAILED" -ne 0 ]]; then
-  echo "ci:local FAILED: python/tests skipped tests whose tiny fixtures or library were missing (listed above; exit 2 means the output was not examined)" >&2
+# [verdict:begin] (run by tests/ci_local_python_stage.rs; the SKIPS entries ride on the last line)
+FAILURES=()
+[[ "$TEST_FAILED" -eq 0 ]] || FAILURES+=("one or more cargo test binaries failed (see the full run above)")
+case "$PY_STAGE_RC" in
+  0) ;;
+  2) FAILURES+=("python/tests output could not be kept, so its skips were not examined (stage exit 2)") ;;
+  3) FAILURES+=("python/tests skipped tests that need a fixture, library or package this run should have (listed above; stage exit 3)") ;;
+  *) FAILURES+=("python/tests skip report was not examined (stage exit $PY_STAGE_RC; see above)") ;;
+esac
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+  failed=$(printf '%s; ' "${FAILURES[@]}")
+  skipped_note=""
+  if [[ ${#SKIPS[@]} -gt 0 ]]; then
+    skipped_note=" (not run: $(printf '%s; ' "${SKIPS[@]}" | sed 's/; $//'))"
+  fi
+  echo "ci:local FAILED: ${failed%; }${skipped_note}" >&2
   exit 1
 fi
 if [[ ${#SKIPS[@]} -gt 0 ]]; then
@@ -174,3 +183,4 @@ if [[ ${#SKIPS[@]} -gt 0 ]]; then
 else
   echo "ci:local OK"
 fi
+# [verdict:end]

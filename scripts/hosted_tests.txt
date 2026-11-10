@@ -24,7 +24,7 @@ bin check_kernel_ir_planted 6
 # checkout, which resolves two lockfiles with `cargo metadata`.
 bin check_siblings_script 7
 # Runs scripts/unittest_fixture_skips.sh on text and reads scripts/ci_local.sh as source.
-bin ci_local_python_stage 9
+bin ci_local_python_stage 19
 bin config_json_parsers 27
 bin dialect_lint_script 12
 bin docs_name_real_tools 7

@@ -1,7 +1,6 @@
 //! `tessl::safetensors` against hand-built files: every malformed shape the
 //! module documents as rejected, plus exact round trips. CPU only.
 
-
 mod scratch_support;
 use scratch_support::Scratch;
 

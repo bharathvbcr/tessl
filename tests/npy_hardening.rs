@@ -7,7 +7,6 @@
 //! parsed as 2.0, `fortran_order` found by substring, and trailing bytes
 //! ignored. Each is now an error.
 
-
 mod scratch_support;
 use scratch_support::Scratch;
 

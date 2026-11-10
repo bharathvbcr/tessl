@@ -28,8 +28,8 @@ use tessl::npy::{read_npy, write_npy_f32};
 
 mod common;
 mod scratch_support;
-use scratch_support::Scratch;
 use common::gdn::{case_names, fixture_dir, load_case, sequential_f64, GateClamp, Rule};
+use scratch_support::Scratch;
 
 /// f32 unit roundoff, 2^-24. Same value as `tests/common/mod.rs:161`, restated
 /// here because this file deliberately does not pull in the GPU test harness.
@@ -269,7 +269,6 @@ fn f32_and_i64_survive_a_round_trip_through_the_reader() {
     let back = read_npy(&i64_path).expect("read i64");
     assert_eq!(back.shape, vec![ints.len()]);
     assert_eq!(back.i64_slice().expect("i64 payload"), ints.as_slice());
-
 }
 
 /// An unsupported dtype is still refused by name rather than best-effort parsed.
@@ -295,7 +294,6 @@ fn an_unsupported_dtype_is_still_refused_and_named() {
 
     let err = read_npy(&path).expect_err("complex128 must be refused");
     assert!(err.contains("<c16"), "refusal must name the dtype, got: {err}");
-
 }
 
 /// The Rust f64 reference reproduces the Python-generated golden.

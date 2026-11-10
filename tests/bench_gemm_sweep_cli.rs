@@ -11,6 +11,9 @@
 
 use std::process::Command;
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 /// Variables a case may set; every other case must not inherit them from the
 /// caller's shell, or a stale value would silently change what it tests.
 const CONTROLLED: &[&str] = &[
@@ -22,11 +25,8 @@ const CONTROLLED: &[&str] = &[
     "BENCH_PARITY_DIST",
 ];
 
-fn scratch(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-sweep-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-sweep-cli-{tag}"))
 }
 
 /// Run one case and assert it fails cleanly (a plain non-zero exit, no panic)
@@ -172,7 +172,6 @@ fn parity_dump_knobs_are_validated() {
         &[("BENCH_PARITY_DIST", "")],
         "not a distribution",
     );
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -189,5 +188,4 @@ fn a_refused_dump_leaves_no_manifest() {
     assert!(!out.status.success());
     let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().collect();
     assert!(left.is_empty(), "a refused dump wrote {left:?}");
-    let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -25,6 +25,9 @@ use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 const MANIFEST: &str = include_str!("../scripts/hosted_tests.txt");
 
 /// Source text that means "this opens, or needs, a device".
@@ -835,8 +838,7 @@ fn every_lib_filter_selects_only_device_free_tests() {
 /// `tests/` binary for the `exact` arm.
 #[test]
 fn a_planted_manifest_entry_over_a_device_test_is_refused() {
-    let dir = std::env::temp_dir().join(format!("tessl-hosted-selection-planted-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = Scratch::dir("tessl-hosted-selection-planted");
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(
         dir.join("src/lib.rs"),
@@ -993,8 +995,6 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
         refused("exact lib host::host_tests::not_a_test\n", check_exact_device_free),
         "an `exact lib` entry naming no test was accepted"
     );
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Every `DEVICE_MARKER_EXEMPT` entry is exempt because its own body opens

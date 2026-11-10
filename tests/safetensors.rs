@@ -1,20 +1,18 @@
 //! `tessl::safetensors` against hand-built files: every malformed shape the
 //! module documents as rejected, plus exact round trips. CPU only.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod scratch_support;
+use scratch_support::Scratch;
 
 use tessl::safetensors::{Dtype, SafeTensors, TensorSource, MAX_HEADER_BYTES};
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn tmp(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tessl-st-{}-{tag}-{n}.safetensors", std::process::id()))
+fn tmp(tag: &str) -> Scratch {
+    Scratch::file(&format!("tessl-st-{tag}"), ".safetensors")
 }
 
 /// Write `len8 | header | data` and return the path.
-fn raw(tag: &str, len8: u64, header: &[u8], data: &[u8]) -> PathBuf {
+fn raw(tag: &str, len8: u64, header: &[u8], data: &[u8]) -> Scratch {
     let p = tmp(tag);
     let mut b = len8.to_le_bytes().to_vec();
     b.extend_from_slice(header);
@@ -24,7 +22,7 @@ fn raw(tag: &str, len8: u64, header: &[u8], data: &[u8]) -> PathBuf {
 }
 
 /// A well-formed file from a header string and data bytes.
-fn file(tag: &str, header: &str, data: &[u8]) -> PathBuf {
+fn file(tag: &str, header: &str, data: &[u8]) -> Scratch {
     raw(tag, header.len() as u64, header.as_bytes(), data)
 }
 
@@ -32,10 +30,9 @@ fn file(tag: &str, header: &str, data: &[u8]) -> PathBuf {
 /// label) must be refused too, with the same message: the two share one
 /// validation. A file shorter than the length field is refused by each
 /// reader in its own words.
-fn open_err(p: PathBuf) -> String {
+fn open_err(p: Scratch) -> String {
     let r = SafeTensors::open(&p);
     let bytes = std::fs::read(&p).unwrap();
-    let _ = std::fs::remove_file(&p);
     let label = p.display().to_string();
     let e = match r {
         Ok(_) => panic!("{label} opened, expected an error"),
@@ -61,7 +58,6 @@ fn from_bytes_reads_what_open_reads() {
     let (p, tensors) = integer_fixture();
     let opened = SafeTensors::open(&p).unwrap();
     let held = SafeTensors::from_bytes_named("in memory", std::fs::read(&p).unwrap()).unwrap();
-    std::fs::remove_file(&p).unwrap();
     assert_eq!(held.names().collect::<Vec<_>>(), opened.names().collect::<Vec<_>>());
     for (name, dtype, shape, bytes) in &tensors {
         let (info, raw) = held.read_raw(name).unwrap();
@@ -133,7 +129,6 @@ fn round_trips_f32_bf16_f16_scalars_empty_tensors_and_metadata() {
         .to_string()
         .contains("cannot read U8"));
     assert!(st.info("missing").unwrap_err().to_string().contains("no tensor"));
-    std::fs::remove_file(&p).unwrap();
 }
 
 /// A fixture tensor: name, dtype, shape, little-endian bytes.
@@ -141,7 +136,7 @@ type FixtureTensor = (&'static str, Dtype, Vec<usize>, Vec<u8>);
 
 /// One file holding every integer dtype; returns its path and each tensor's
 /// little-endian bytes, keyed by name.
-fn integer_fixture() -> (PathBuf, Vec<FixtureTensor>) {
+fn integer_fixture() -> (Scratch, Vec<FixtureTensor>) {
     let le = |vs: &[u64], w: usize| {
         vs.iter()
             .flat_map(|v| v.to_le_bytes()[..w].to_vec())
@@ -185,7 +180,6 @@ fn integer_fixture() -> (PathBuf, Vec<FixtureTensor>) {
 fn integer_tensors_read_back_typed_and_raw() {
     let (p, tensors) = integer_fixture();
     let st = SafeTensors::open(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     for (name, dtype, shape, bytes) in &tensors {
         let (info, raw) = st.read_raw(name).unwrap();
         assert_eq!(
@@ -238,7 +232,6 @@ fn fp8_and_complex_tensors_open_and_read_raw() {
     data.extend_from_slice(&(-2.0f32).to_le_bytes());
     let p = file("fp8", header, &data);
     let st = SafeTensors::open(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     let want: &[(&str, Dtype, &[u8])] = &[
         ("e4m3", Dtype::F8E4M3, &data[0..2]),
         ("e4m3fnuz", Dtype::F8E4M3Fnuz, &data[2..3]),
@@ -262,7 +255,6 @@ fn fp8_and_complex_tensors_open_and_read_raw() {
     let h = r#"{"a":{"dtype":"F4","shape":[2],"data_offsets":[0,1]}}"#;
     let p = file("F4", h, &[0]);
     let st = SafeTensors::open(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     assert_eq!(st.info("a").unwrap().dtype, Dtype::F4);
     for tag in ["F6_E2M3", "F6_E3M2"] {
         let h = format!(r#"{{"a":{{"dtype":"{tag}","shape":[2],"data_offsets":[0,1]}}}}"#);
@@ -290,7 +282,6 @@ fn sixteen_bit_tensors_widen_exactly_across_every_bit_pattern() {
     );
     let p = file("widen", &header, &data);
     let st = SafeTensors::open(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     let (shape, b) = TensorSource::read_f32(&st, "b").unwrap();
     assert_eq!(shape, vec![n]);
     let (shape, h) = TensorSource::read_f32(&st, "h").unwrap();
@@ -316,7 +307,6 @@ fn unicode_escapes_and_surrogate_pairs_decode() {
     assert!(header.contains("\\ud83d\\ude00"), "{header}");
     let p = file("esc", &header, &2.0f32.to_le_bytes());
     let st = SafeTensors::open(&p).unwrap();
-    std::fs::remove_file(&p).unwrap();
     assert_eq!(st.metadata()["n"], "\u{e9}\u{1f600}A\n\t");
     // "a" is the key "a".
     assert_eq!(st.read_f32("a").unwrap().1, vec![2.0]);
@@ -571,7 +561,6 @@ fn reads_come_from_the_opened_file_even_if_the_path_is_replaced() {
     let q = file("swap_new", other, &9.0f32.to_le_bytes());
     std::fs::rename(&q, &p).unwrap();
     let got = st.read_f32("a");
-    std::fs::remove_file(&p).unwrap();
     assert_eq!(got.unwrap().1, vec![3.0]);
 }
 
@@ -587,7 +576,6 @@ fn a_file_truncated_after_open_fails_the_read_not_silently() {
         .set_len(len - 2)
         .unwrap();
     let e = st.read_f32("a").unwrap_err();
-    std::fs::remove_file(&p).unwrap();
     // Caught by the identity re-check on the open handle (size changed), which
     // runs before the read that would have come up short.
     assert!(e.to_string().contains("file changed since it was opened"), "{e}");

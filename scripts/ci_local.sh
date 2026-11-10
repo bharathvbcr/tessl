@@ -92,17 +92,6 @@ echo "==> torch binding host tests (python/tests/test_binding_host.py; no GPU, n
 # cannot be skipped silently. The recording stand-in replaces libtessl; nothing is built.
 "$ORACLE_PY" -m unittest python/tests/test_binding_host.py python/tests/test_embedgemma2_host.py python/tests/test_embedgemma2_mm_host.py python/tests/test_embedgemma2_media_host.py -v
 
-echo "==> torch binding GPU tests (python/tests: test_clip_coef, test_cross_entropy, test_gdn, test_qwen35, test_embedgemma2, test_embedgemma2_mm, test_embedgemma2_raw, test_embedgemma2_media)"
-# These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal
-# runtime, so they belong under the machine-wide heavy-job lock, which exports MAC_HEAVY_LABEL.
-# Outside the lock they are not run, and that is printed rather than left to read as a pass.
-if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
-  "$ORACLE_PY" -m unittest discover -s python/tests -v
-else
-  echo "SKIPPED: python/tests GPU tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
-  SKIPS+=("python/tests GPU tests")
-fi
-
 echo "==> Go binding unit tests (go/Makefile: engine archive and its tests, gofmt, go vet, go test -run TestUnit; no GPU, no checkpoint)"
 make -C go unit
 
@@ -121,6 +110,37 @@ echo "==> test (release, serialized, every binary even after a failure)"
 # script then still ends non-zero (below) if any of them failed.
 TEST_FAILED=0
 cargo test --release --no-fail-fast -- --test-threads=1 || TEST_FAILED=1
+
+echo "==> torch binding GPU tests (python/tests: test_clip_coef, test_cross_entropy, test_gdn, test_qwen35, test_embedgemma2, test_embedgemma2_mm, test_embedgemma2_raw, test_embedgemma2_media)"
+# After the release tests, not before: the tiny EmbeddingGemma 2 snapshots and checkpoints these
+# tests load are written under target/ by `cargo test --test capi_embedgemma2{,_media,_raw,_multimodal}`,
+# which the step above runs. Run first, on a fresh target dir, 22 of them skipped and the stage
+# still printed OK. They run here once each, with no second copy of those GPU tests.
+# These load target/release/libtessl.dylib (built above) and run on MPS next to the Metal
+# runtime, so they belong under the machine-wide heavy-job lock, which exports MAC_HEAVY_LABEL.
+# Outside the lock they are not run, and that is printed rather than left to read as a pass.
+FIXTURE_SKIPS_FAILED=0
+if [[ -n "${MAC_HEAVY_LABEL:-}" ]]; then
+  py_log="$ROOT/target/python_gpu_unittest.log"
+  mkdir -p "$ROOT/target"
+  py_rc=0
+  "$ORACLE_PY" -m unittest discover -s python/tests -v 2>&1 | tee "$py_log" || py_rc=${PIPESTATUS[0]}
+  if [[ "$py_rc" -ne 0 ]]; then
+    [[ "$TEST_FAILED" -eq 0 ]] || echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
+    exit "$py_rc"
+  fi
+  # A skip for a missing tiny fixture or library is a failure here, whatever unittest says; the
+  # real-checkpoint skips are expected without EMBEDGEMMA2_SNAPSHOT and stay allowed.
+  fixture_rc=0
+  scripts/unittest_fixture_skips.sh < "$py_log" || fixture_rc=$?
+  if [[ "$fixture_rc" -ne 0 ]]; then
+    FIXTURE_SKIPS_FAILED=1
+    SKIPS+=("python/tests tests skipped for a missing tiny fixture or library")
+  fi
+else
+  echo "SKIPPED: python/tests GPU tests (MAC_HEAVY_LABEL unset; rerun under tools/mac_heavy.sh to run them)"
+  SKIPS+=("python/tests GPU tests")
+fi
 
 echo "==> test mtl_tensor (quant-prep; the default suite does not compile it)"
 mtl_out=$(cargo test --release --features quant-prep --lib mtl_tensor:: -- --test-threads=1 2>&1) || { echo "$mtl_out"; exit 1; }
@@ -142,6 +162,10 @@ fi
 
 if [[ "$TEST_FAILED" -ne 0 ]]; then
   echo "ci:local FAILED: one or more cargo test binaries failed (see the full run above)" >&2
+  exit 1
+fi
+if [[ "$FIXTURE_SKIPS_FAILED" -ne 0 ]]; then
+  echo "ci:local FAILED: python/tests skipped tests whose tiny fixtures or library were missing (listed above; exit 2 means the output was not examined)" >&2
   exit 1
 fi
 if [[ ${#SKIPS[@]} -gt 0 ]]; then

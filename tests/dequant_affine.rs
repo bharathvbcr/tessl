@@ -466,7 +466,7 @@ fn a_tie_at_bf16_max_rounds_up_to_infinity_and_a_value_below_it_does_not() {
 // ------------------------------------------------------ non-finite values ---
 
 #[test]
-fn finite_inputs_that_overflow_bf16_write_infinity_and_nothing_is_faulted() {
+fn finite_inputs_that_overflow_bf16_write_infinity_and_raise_the_fault_word() {
     with_gpu(|rt| {
         // scale = bf16 max, bias 0: code 0 -> 0, code 1 -> max, code >= 2 -> the
         // f32 product itself overflows. Negative scale mirrors it.
@@ -518,8 +518,9 @@ fn finite_inputs_that_overflow_bf16_write_infinity_and_nothing_is_faulted() {
 fn an_exact_fma_keeps_a_product_that_overflows_f32_when_the_bias_cancels_it() {
     with_gpu(|rt| {
         // 2^125 * 8 = 2^128 overflows an f32 product, but fma(2^125, 8, -max) is
-        // finite: the kernel fuses, as mx.dequantize does (the crafted mlx golden
-        // below contains exactly this corner).
+        // finite: the kernel fuses, as mx.dequantize does. The crafted q4 mlx golden
+        // below also holds this corner (group 168: fused and unfused differ on 34
+        // elements); the q8 one does not.
         let c = Case {
             bits: 8,
             rows: 1,

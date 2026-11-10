@@ -488,7 +488,6 @@ fn fake_release(tag: &str, trace: &str) -> kcov::TempDir {
         "bench_gemm_sweep",
         "bench_flash_attn",
         "bench_nn_kernels",
-        "bench_dequant_affine",
         "bench_encoder_attn",
         "bench_embedgemma2",
         "bench_embedgemma2_audio",
@@ -667,10 +666,10 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
 fn the_suite_list_reaches_the_breadth_it_claims() {
     let s = kcov::suites();
     // 2 sweep runs, 1 base + 9 decode (R x chunk) + 9 rows (R x SGT) + 1 tiled
-    // attention runs, nn kernels, variants, routes, the encoder attention, 3 EmbedGemma 2 kernel
+    // attention runs, nn kernels, dequant_affine, variants, routes, the encoder attention, 3 EmbedGemma 2 kernel
     // lanes (text, audio, vision), and 8 Qwen3.5 inference (one with the fused decode kernels on, one on
     // the other GDN scan slice, one on the simd GDN prefill).
-    assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3 + 4 + 8);
+    assert_eq!(s.len(), 2 + 1 + 9 + 9 + 1 + 3 + 5 + 8);
     // Every suite is a probe, not a measurement: bounded by its environment or,
     // for the Qwen3.5 benches, by its arguments.
     let bounded_by_args =

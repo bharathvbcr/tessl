@@ -32,8 +32,8 @@
 //! is `+-inf` (as in [`crate::gemm::cast_f32_to_bf16`]), and a non-finite scale
 //! or bias propagates by IEEE rules (a NaN is the GPU's canonical `0x7fc0`).
 //! It also reports: every thread whose output holds an infinity or a NaN stores
-//! `1` to the caller's `fault` word (one `u32`; the same shape as
-//! `i8_quantize_rows`' `bad` flag, the existing in-kernel flag convention).
+//! `1` to the caller's `fault` word (one `u32` shared by every thread; unlike
+//! `i8_quantize_rows`, whose `bad` flag is per row, it is sticky across dispatches).
 //! The kernel never clears it. A caller zeroes it once, lets any number of
 //! dequants OR into it, and reads it once after a [`GpuRuntime::synchronize`]:
 //! non-zero means some output matrix holds a non-finite value and must not be

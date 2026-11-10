@@ -294,28 +294,54 @@ pub(crate) mod tests {
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
     }
 
-    /// The production half of this file (before its tests) classifies from the
-    /// ojas error alone: no second open or stat by name, no `O_NONBLOCK` probe.
+    /// `open_regular` is exactly the one `ojas_io::open_regular_file` call with
+    /// its error mapped: its body (comments stripped, whitespace collapsed) is
+    /// compared to the expected text, so any added second open, stat or probe of
+    /// the path, however spelled, fails. A deny-list of spellings could not be
+    /// complete.
     #[test]
     fn open_regular_never_re_probes_the_path() {
+        fn collapse(text: &str) -> String {
+            let no_comments: Vec<&str> = text.lines().map(|l| l.split("//").next().unwrap_or("")).collect();
+            no_comments.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+        }
         let src = include_str!("bounded_file.rs");
         let prod = &src[..src
             .find(concat!("#[cfg(test)]", "\npub(crate) mod tests"))
             .expect("tests marker")];
-        for banned in [
-            "probe_open_error",
-            "O_NONBLOCK",
-            "OpenOptions",
-            "File::open(",
-            "fs::metadata(",
-            "libc::",
-        ] {
-            assert!(
-                !prod.contains(banned),
-                "bounded_file.rs production code mentions `{banned}`"
-            );
-        }
+        let start = prod.find("pub(crate) fn open_regular(").expect("open_regular");
+        let end = start + prod[start..].find("\n}\n").expect("end of open_regular") + 3;
+        let expected = r#"pub(crate) fn open_regular(path: &Path) -> Result<(File, u64), OpenFail> {
+            ojas_io::open_regular_file(path).map_err(|e| match std::error::Error::source(&e) {
+                Some(source) => OpenFail::Io(
+                    match source
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::raw_os_error)
+                    {
+                        Some(code) => std::io::Error::from_raw_os_error(code),
+                        None => std::io::Error::new(e.io_kind().unwrap_or(std::io::ErrorKind::Other), source.to_string()),
+                    },
+                ),
+                None => OpenFail::NotRegular,
+            })
+        }"#;
+        assert_eq!(collapse(&prod[start..end]), collapse(expected));
         assert_eq!(prod.matches("ojas_io::open_regular_file(").count(), 1);
+    }
+
+    /// A path with a NUL byte fails before any syscall with an `io::Error` that
+    /// has a kind and no raw OS code, so it takes `open_regular`'s no-raw-code
+    /// branch: kind and text survive unchanged.
+    #[test]
+    fn a_nul_in_the_path_keeps_its_invalid_input_kind_and_text() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("nul");
+        let bad = dir.join(std::ffi::OsStr::from_bytes(b"a\0b"));
+        let e = io_err(&bad);
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(e.raw_os_error(), None);
+        assert_eq!(e.to_string(), "file name contained an unexpected NUL byte");
+        assert_eq!(e.to_string(), File::open(&bad).unwrap_err().to_string());
     }
 
     fn io_err(p: &Path) -> std::io::Error {

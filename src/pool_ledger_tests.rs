@@ -1933,14 +1933,17 @@ fn a_commit_that_errs_before_the_submit_leaves_the_buffer_open_and_ends_it_once(
     COMMIT_FAULT.with(|f| f.set(Some(CommitFault::Err)));
     let err = rig.rt.commit(false).unwrap_err();
     assert!(err.contains("injected commit fault"), "error was {err}");
-    assert!(batch_is_open(&rig.rt), "a failed commit cleared cb_open");
-    assert_eq!(end_calls(), 0, "the buffer was ended before the commit could fail");
+    let (open, ended) = (batch_is_open(&rig.rt), end_calls());
+    eprintln!("after the failed commit: cb_open={open} end_calls={ended}");
+    assert!(open, "a failed commit cleared cb_open");
+    assert_eq!(ended, 0, "the buffer was ended before the commit could fail");
     assert_eq!(
         rig.rt.metal4.event_value.load(Ordering::Acquire),
         submitted,
         "a commit that never submitted moved event_value"
     );
     drop(rig);
+    eprintln!("after the drop: end_calls={}", end_calls());
     assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
 }
 
@@ -1955,10 +1958,13 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.rt.commit(false))).is_err();
     assert!(unwound, "the injected panic never fired");
     assert!(rig.rt.active_m4.is_poisoned());
-    assert!(batch_is_open(&rig.rt), "a panicked commit cleared cb_open");
-    assert_eq!(end_calls(), 0, "the buffer was ended before the commit could panic");
+    let (open, ended) = (batch_is_open(&rig.rt), end_calls());
+    eprintln!("after the panicked commit: cb_open={open} end_calls={ended}");
+    assert!(open, "a panicked commit cleared cb_open");
+    assert_eq!(ended, 0, "the buffer was ended before the commit could panic");
     assert_eq!(rig.rt.metal4.event_value.load(Ordering::Acquire), submitted);
     drop(rig);
+    eprintln!("after the drop: end_calls={}", end_calls());
     assert_eq!(end_calls(), 1, "the buffer must be ended exactly once, by the abort");
 }
 

@@ -742,6 +742,7 @@ pub fn suites() -> Vec<Suite> {
             ],
         ),
         suite("bench_nn_kernels", &[], &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")]),
+        suite("bench_dequant_affine", &[], &[("BENCH_ITERS", "1"), ("BENCH_WARMUP", "0")]),
         // The encoder attention at the head dims the models run (256 and 512 text,
         // 64 vision, 32 BERT): the rows, f32 tiled, bf16 tiled and bf16-output
         // tiled kernels of each. Two rounds is the bench's minimum.

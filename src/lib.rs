@@ -247,6 +247,7 @@ mod config_json;
 pub mod conv;
 pub mod cross_entropy;
 pub mod decode_icb;
+pub mod dequant;
 pub mod dispatch;
 pub mod dispatch_stamps;
 pub mod embedgemma2;

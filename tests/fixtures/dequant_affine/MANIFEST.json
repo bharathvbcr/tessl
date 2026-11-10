@@ -1,0 +1,97 @@
+{
+ "schema": 1,
+ "generator": "scripts/gen_dequant_affine_fixtures.py",
+ "generator_commit": "f933c4a0bb9ed6f4dc9367c1c6eb4768b9312cd1",
+ "versions": {
+  "torch": "not used",
+  "transformers": "not used",
+  "numpy": "2.5.0",
+  "mlx": "0.31.2",
+  "python": "3.14.10"
+ },
+ "versions_role": "produced",
+ "mlx_stream": "mx.gpu on every quantize and dequantize call that defines a golden (mx.cpu differs)",
+ "inputs_source": "weights and crafted scales/biases/codes are drawn from numpy default_rng(20261110) by this script; regenerating reproduces them for the same numpy, and the goldens for the same mlx on the same GPU family",
+ "files": {
+  "quant_q8_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q8_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q8_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q8_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q4_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q4_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q4_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+  },
+  "quant_q4_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)"
+  },
+  "crafted_q8_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q8_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q8_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q8_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q4_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q4_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q4_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+  },
+  "crafted_q4_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)"
+  }
+ }
+}

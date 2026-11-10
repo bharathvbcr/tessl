@@ -12,6 +12,7 @@
 //! - Pure-integer IEEE-754 `binary64` objective reduction, `weight == 1.0f`
 //!   exact EMA override, and deterministic `SplitMix64` Gumbel split revival.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
@@ -21,6 +22,7 @@ use objc2_metal::MTLComputePipelineState;
 use crate::dispatch::dispatch_1d;
 use crate::gemm::require_i32_extent;
 use crate::nn::validate_buffer_byte_range;
+use crate::pool_ledger::LedgerRefused;
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::GpuBuffer;
 
@@ -242,7 +244,8 @@ pub struct EmeansGpuRunner {
     revive_meta: GpuBuffer,
 
     streaming_final_epoch: bool,
-    in_flight_staging: Vec<GpuBuffer>,
+    in_flight_async_chunks: AtomicU32,
+    latched_fault: AtomicU32,
 }
 
 #[inline]
@@ -398,6 +401,8 @@ fn format_fault_error(flags: u32) -> String {
     }
 }
 
+const MAX_ASYNC_STAGING_CHUNKS: u32 = 2;
+
 fn stage_f32_unwaited(rt: &GpuRuntime, data: &[f32]) -> Result<GpuBuffer, String> {
     let words: Vec<u32> = data.iter().map(|&v| v.to_bits()).collect();
     rt.alloc_buffer_from_u32(&words)
@@ -413,6 +418,58 @@ fn stage_u16_unwaited(rt: &GpuRuntime, data: &[u16]) -> Result<GpuBuffer, String
         words.push(u32::from(tail));
     }
     rt.alloc_buffer_from_u32(&words)
+}
+
+fn stage_f32_bounded(
+    rt: &GpuRuntime,
+    in_flight: &AtomicU32,
+    mut on_sync: impl FnMut() -> Result<(), String>,
+    data: &[f32],
+) -> Result<GpuBuffer, String> {
+    rt.reclaim(u64::MAX)?;
+    let mut synced = false;
+    if in_flight.load(Ordering::Acquire) >= MAX_ASYNC_STAGING_CHUNKS {
+        rt.synchronize()?;
+        in_flight.store(0, Ordering::Release);
+        on_sync()?;
+        synced = true;
+    }
+    match stage_f32_unwaited(rt, data) {
+        Ok(buf) => Ok(buf),
+        Err(err) if !synced && in_flight.load(Ordering::Acquire) > 0 && LedgerRefused::parse(&err).is_some() => {
+            rt.synchronize()?;
+            in_flight.store(0, Ordering::Release);
+            on_sync()?;
+            stage_f32_unwaited(rt, data)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn stage_u16_bounded(
+    rt: &GpuRuntime,
+    in_flight: &AtomicU32,
+    mut on_sync: impl FnMut() -> Result<(), String>,
+    data: &[u16],
+) -> Result<GpuBuffer, String> {
+    rt.reclaim(u64::MAX)?;
+    let mut synced = false;
+    if in_flight.load(Ordering::Acquire) >= MAX_ASYNC_STAGING_CHUNKS {
+        rt.synchronize()?;
+        in_flight.store(0, Ordering::Release);
+        on_sync()?;
+        synced = true;
+    }
+    match stage_u16_unwaited(rt, data) {
+        Ok(buf) => Ok(buf),
+        Err(err) if !synced && in_flight.load(Ordering::Acquire) > 0 && LedgerRefused::parse(&err).is_some() => {
+            rt.synchronize()?;
+            in_flight.store(0, Ordering::Release);
+            on_sync()?;
+            stage_u16_unwaited(rt, data)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn try_read_u64_vec(buf: &GpuBuffer, count: usize) -> Result<Vec<u64>, String> {
@@ -860,7 +917,8 @@ impl EmeansGpuRunner {
             unused_ids,
             revive_meta,
             streaming_final_epoch: false,
-            in_flight_staging: Vec::new(),
+            in_flight_async_chunks: AtomicU32::new(0),
+            latched_fault: AtomicU32::new(0),
         };
 
         // Pre-compute effective centroids and validate norm/bf16 bounds immediately.
@@ -869,7 +927,7 @@ impl EmeansGpuRunner {
             runner.encode_prepare_centroids_self()?;
             runner.rt.synchronize()?;
         }
-        runner.check_and_clear_faults()?;
+        runner.observe_faults()?;
         Ok(runner)
     }
 
@@ -889,11 +947,26 @@ impl EmeansGpuRunner {
         )
     }
 
-    fn check_and_clear_faults(&self) -> Result<(), String> {
-        let flags = self.fault_flags.try_read_u32()?[0];
-        if flags != 0 {
-            self.fault_flags.try_write_u32(&[0])?;
-            return Err(format_fault_error(flags));
+    fn synchronize_runner(&self) -> Result<(), String> {
+        self.rt.synchronize()?;
+        self.in_flight_async_chunks.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    fn observe_faults(&self) -> Result<(), String> {
+        let gpu_flags = self.fault_flags.try_read_u32()?[0];
+        let prev = self.latched_fault.fetch_or(gpu_flags, Ordering::AcqRel);
+        let combined = prev | gpu_flags;
+        if combined != 0 {
+            return Err(format_fault_error(combined));
+        }
+        Ok(())
+    }
+
+    fn ensure_not_faulted(&self) -> Result<(), String> {
+        let latched = self.latched_fault.load(Ordering::Acquire);
+        if latched != 0 {
+            return Err(format_fault_error(latched));
         }
         Ok(())
     }
@@ -950,6 +1023,7 @@ impl EmeansGpuRunner {
             return self.empty_resident_dataset();
         }
 
+        let local_fault = self.rt.alloc_buffer_from_u32(&[0])?;
         let x_bf16 = if self.cfg.precision.assign_is_bf16() {
             Some(self.rt.alloc_buffer_hot((elems * 2).max(4))?)
         } else {
@@ -964,7 +1038,6 @@ impl EmeansGpuRunner {
 
         {
             let _scope = self.rt.async_scope();
-            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.fault_flags)?;
             encode_stage_rows_f32(
                 &self.rt,
                 &self.pipes,
@@ -972,14 +1045,17 @@ impl EmeansGpuRunner {
                 x_bf16.as_ref().unwrap_or(&self.dummy_buf),
                 x_f32.as_ref().unwrap_or(&self.dummy_buf),
                 &row_norm2,
-                &self.fault_flags,
+                &local_fault,
                 n,
                 self.cfg.d,
                 self.cfg.precision,
             )?;
-            self.rt.synchronize()?;
+            self.synchronize_runner()?;
         }
-        self.check_and_clear_faults()?;
+        let flags = local_fault.try_read_u32()?[0];
+        if flags != 0 {
+            return Err(format_fault_error(flags));
+        }
 
         Ok(ResidentDataset {
             runtime_addr: Arc::as_ptr(&self.rt) as usize,
@@ -1006,6 +1082,7 @@ impl EmeansGpuRunner {
             return self.empty_resident_dataset();
         }
 
+        let local_fault = self.rt.alloc_buffer_from_u32(&[0])?;
         let x_bf16 = if self.cfg.precision.assign_is_bf16() {
             Some(self.rt.alloc_buffer_hot((elems * 2).max(4))?)
         } else {
@@ -1020,7 +1097,6 @@ impl EmeansGpuRunner {
 
         {
             let _scope = self.rt.async_scope();
-            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.fault_flags)?;
             encode_stage_rows_bf16(
                 &self.rt,
                 &self.pipes,
@@ -1028,14 +1104,17 @@ impl EmeansGpuRunner {
                 x_bf16.as_ref().unwrap_or(&self.dummy_buf),
                 x_f32.as_ref().unwrap_or(&self.dummy_buf),
                 &row_norm2,
-                &self.fault_flags,
+                &local_fault,
                 n,
                 self.cfg.d,
                 self.cfg.precision,
             )?;
-            self.rt.synchronize()?;
+            self.synchronize_runner()?;
         }
-        self.check_and_clear_faults()?;
+        let flags = local_fault.try_read_u32()?[0];
+        if flags != 0 {
+            return Err(format_fault_error(flags));
+        }
 
         Ok(ResidentDataset {
             runtime_addr: Arc::as_ptr(&self.rt) as usize,
@@ -1288,13 +1367,7 @@ impl EmeansGpuRunner {
         })
     }
 
-    fn encode_ema_and_revive(
-        &self,
-        alpha: f32,
-        step: u64,
-        check_revive: bool,
-        prepare_after: bool,
-    ) -> Result<(), String> {
+    fn encode_ema_and_revive(&self, alpha: f32, step: u64, check_revive: bool) -> Result<(), String> {
         self.rt.with_binder(|bnd| {
             bnd.set_pipeline(&self.pipes.apply_ema);
             bnd.bind_gpu_buf(&self.centroids, 0);
@@ -1350,10 +1423,7 @@ impl EmeansGpuRunner {
             })?;
         }
 
-        if prepare_after {
-            self.encode_prepare_centroids_self()?;
-        }
-        Ok(())
+        self.encode_prepare_centroids_self()
     }
 
     /// Execute a full epoch over a GPU-resident dataset inside a single
@@ -1427,12 +1497,12 @@ impl EmeansGpuRunner {
                 "emeans::run_resident_epoch: total epoch rows {total_epoch_rows} exceed u32"
             ));
         }
-        if batches.is_empty() {
-            return Ok((0.0, 0, vec![0u64; self.cfg.k as usize]));
-        }
 
-        self.in_flight_staging.clear();
-        let order_buf = self.rt.alloc_buffer_from_u32(order)?;
+        let order_buf = if !batches.is_empty() && !order.is_empty() {
+            Some(self.rt.alloc_buffer_from_u32(order)?)
+        } else {
+            None
+        };
         let epoch_labels_buf = if labels_out.is_some() && total_epoch_rows > 0 {
             Some(self.rt.alloc_buffer(total_epoch_rows * 4)?)
         } else {
@@ -1447,34 +1517,37 @@ impl EmeansGpuRunner {
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.epoch_counts)?;
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.epoch_obj_bits)?;
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.revive_meta)?;
-            if final_epoch {
-                encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_sums)?;
-                encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_counts)?;
-            }
+            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_sums)?;
+            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_counts)?;
             self.encode_prepare_centroids_self()?;
 
             let mut epoch_cursor = 0u32;
-            for (bi, b) in batches.iter().enumerate() {
+            for b in batches {
                 let mut rem = b.row_count;
                 let mut cur_off = b.row_offset;
                 while rem > 0 {
                     let m = rem.min(self.chunk_cap);
-                    self.encode_gather_resident_chunk(ds, &order_buf, cur_off, m)?;
+                    let ord_ref = order_buf.as_ref().unwrap_or(&self.dummy_buf);
+                    self.encode_gather_resident_chunk(ds, ord_ref, cur_off, m)?;
                     self.encode_assign_csr_and_obj(m, final_epoch, epoch_labels_buf.as_ref(), epoch_cursor)?;
                     cur_off += m;
                     epoch_cursor += m;
                     rem -= m;
                 }
-                let is_last = bi + 1 == batches.len();
-                self.encode_ema_and_revive(b.alpha, b.step, b.check_revive, !is_last || final_epoch)?;
+                self.encode_ema_and_revive(b.alpha, b.step, b.check_revive)?;
             }
 
-            self.rt.synchronize()?;
+            drop(order_buf);
+            self.synchronize_runner()?;
         }
 
-        // Keep temporary buffers alive until after synchronize() (`order_buf`, `epoch_labels_buf`).
-        drop(order_buf);
-        self.check_and_clear_faults()?;
+        // All epoch accumulators and `fault_flags` were freshly reset in this epoch;
+        // clear any prior streaming latch and immediately observe this epoch's faults.
+        self.latched_fault.store(0, Ordering::Release);
+        self.observe_faults()?;
+        if batches.is_empty() {
+            return Ok((0.0, 0, vec![0u64; self.cfg.k as usize]));
+        }
 
         if let (Some(dst), Some(ep_buf)) = (labels_out, epoch_labels_buf.as_ref()) {
             let raw = ep_buf.try_contents_u32()?;
@@ -1497,8 +1570,8 @@ impl EmeansGpuRunner {
     }
 
     /// Reset streaming epoch accumulators (`epoch_counts`, `epoch_obj_bits`,
-    /// `revive_meta`, `batch_sums`, `batch_counts`, plus `pass_sums`/`pass_counts`
-    /// when `final_epoch == true`) and refresh effective centroids asynchronously.
+    /// `revive_meta`, `batch_sums`, `batch_counts`, `pass_sums`, and `pass_counts`),
+    /// clear any latched streaming fault, and refresh effective centroids asynchronously.
     pub fn reset_pass_accumulators(&mut self, final_epoch: bool) -> Result<(), String> {
         self.streaming_final_epoch = final_epoch;
         {
@@ -1509,21 +1582,21 @@ impl EmeansGpuRunner {
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.epoch_counts)?;
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.epoch_obj_bits)?;
             encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.revive_meta)?;
-            if final_epoch {
-                encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_sums)?;
-                encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_counts)?;
-            }
+            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_sums)?;
+            encode_zero_buf(&self.rt, &self.pipes.zero_f32, &self.pass_counts)?;
             self.encode_prepare_centroids_self()?;
             self.rt.commit(false)?;
+            self.in_flight_async_chunks.fetch_add(1, Ordering::AcqRel);
         }
+        self.latched_fault.store(0, Ordering::Release);
         Ok(())
     }
 
     /// Stage and accumulate a streaming `f32` chunk (`chunk_rows <= MAX_GPU_CHUNK_ROWS`).
     ///
     /// When `labels_out` is `None`, submits asynchronously (`commit(false)`) with
-    /// zero host wait. When `labels_out` is `Some(dst)`, synchronizes to copy
-    /// the chunk's assigned labels into `dst[..chunk_rows]`.
+    /// bounded double-buffered staging depth. When `labels_out` is `Some(dst)`,
+    /// synchronizes to copy the chunk's assigned labels into `dst[..chunk_rows]`.
     pub fn accumulate_f32_chunk(
         &mut self,
         rows_f32: &[f32],
@@ -1547,6 +1620,7 @@ impl EmeansGpuRunner {
                 ));
             }
         }
+        self.ensure_not_faulted()?;
         if chunk_rows == 0 {
             return Ok(());
         }
@@ -1583,7 +1657,13 @@ impl EmeansGpuRunner {
         m: u32,
         labels_out: Option<&mut [u32]>,
     ) -> Result<(), String> {
-        let staged = stage_f32_unwaited(&self.rt, rows_f32)?;
+        self.ensure_not_faulted()?;
+        let staged = stage_f32_bounded(
+            &self.rt,
+            &self.in_flight_async_chunks,
+            || self.observe_faults(),
+            rows_f32,
+        )?;
         {
             let _scope = self.rt.async_scope();
             encode_stage_rows_f32(
@@ -1598,25 +1678,19 @@ impl EmeansGpuRunner {
                 self.cfg.d,
                 self.cfg.precision,
             )?;
+            drop(staged);
             self.encode_assign_csr_and_obj(m, self.streaming_final_epoch, None, 0)?;
             if labels_out.is_some() {
-                self.rt.synchronize()?;
+                self.synchronize_runner()?;
             } else {
                 self.rt.commit(false)?;
+                self.in_flight_async_chunks.fetch_add(1, Ordering::AcqRel);
             }
         }
         if let Some(dst) = labels_out {
-            drop(staged);
-            self.in_flight_staging.clear();
-            if let Err(err) = self.check_and_clear_faults() {
-                self.batch_sums.try_zero()?;
-                self.batch_counts.try_zero()?;
-                return Err(err);
-            }
+            self.observe_faults()?;
             let raw = self.chunk_labels.try_contents_u32()?;
             dst.copy_from_slice(&raw[..m as usize]);
-        } else {
-            self.in_flight_staging.push(staged);
         }
         Ok(())
     }
@@ -1645,6 +1719,7 @@ impl EmeansGpuRunner {
                 ));
             }
         }
+        self.ensure_not_faulted()?;
         if chunk_rows == 0 {
             return Ok(());
         }
@@ -1679,7 +1754,13 @@ impl EmeansGpuRunner {
         m: u32,
         labels_out: Option<&mut [u32]>,
     ) -> Result<(), String> {
-        let staged = stage_u16_unwaited(&self.rt, rows_bf16_bits)?;
+        self.ensure_not_faulted()?;
+        let staged = stage_u16_bounded(
+            &self.rt,
+            &self.in_flight_async_chunks,
+            || self.observe_faults(),
+            rows_bf16_bits,
+        )?;
         {
             let _scope = self.rt.async_scope();
             encode_stage_rows_bf16(
@@ -1694,25 +1775,19 @@ impl EmeansGpuRunner {
                 self.cfg.d,
                 self.cfg.precision,
             )?;
+            drop(staged);
             self.encode_assign_csr_and_obj(m, self.streaming_final_epoch, None, 0)?;
             if labels_out.is_some() {
-                self.rt.synchronize()?;
+                self.synchronize_runner()?;
             } else {
                 self.rt.commit(false)?;
+                self.in_flight_async_chunks.fetch_add(1, Ordering::AcqRel);
             }
         }
         if let Some(dst) = labels_out {
-            drop(staged);
-            self.in_flight_staging.clear();
-            if let Err(err) = self.check_and_clear_faults() {
-                self.batch_sums.try_zero()?;
-                self.batch_counts.try_zero()?;
-                return Err(err);
-            }
+            self.observe_faults()?;
             let raw = self.chunk_labels.try_contents_u32()?;
             dst.copy_from_slice(&raw[..m as usize]);
-        } else {
-            self.in_flight_staging.push(staged);
         }
         Ok(())
     }
@@ -1728,21 +1803,16 @@ impl EmeansGpuRunner {
         }
 
         // Wait on queued chunk accumulations first so any non-finite / overflow fault
-        // refuses cleanly BEFORE modifying `centroids` or `usage`.
-        self.rt.synchronize()?;
-        self.in_flight_staging.clear();
-        if let Err(err) = self.check_and_clear_faults() {
-            self.batch_sums.try_zero()?;
-            self.batch_counts.try_zero()?;
-            return Err(err);
-        }
+        // latches and refuses cleanly BEFORE modifying `centroids` or `usage`.
+        self.synchronize_runner()?;
+        self.observe_faults()?;
 
         {
             let _scope = self.rt.async_scope();
-            self.encode_ema_and_revive(alpha, step, check_revive, true)?;
-            self.rt.synchronize()?;
+            self.encode_ema_and_revive(alpha, step, check_revive)?;
+            self.synchronize_runner()?;
         }
-        self.check_and_clear_faults()?;
+        self.observe_faults()?;
 
         if check_revive && self.cfg.unused_threshold > 0.0 {
             let meta = self.revive_meta.try_read_u32()?;
@@ -1755,9 +1825,8 @@ impl EmeansGpuRunner {
     /// Synchronize and read back `(epoch_objective, epoch_cluster_counts)` at the
     /// end of a streaming epoch.
     pub fn finish_streaming_epoch(&mut self) -> Result<(f64, Vec<u64>), String> {
-        self.rt.synchronize()?;
-        self.in_flight_staging.clear();
-        self.check_and_clear_faults()?;
+        self.synchronize_runner()?;
+        self.observe_faults()?;
         let obj_bits = try_read_u64_vec(&self.epoch_obj_bits, 1)?[0];
         let counts = try_read_u64_vec(&self.epoch_counts, self.cfg.k as usize)?;
         Ok((f64::from_bits(obj_bits), counts))
@@ -1765,15 +1834,15 @@ impl EmeansGpuRunner {
 
     /// Synchronize and read the current internal `[k * d]` `f32` centroids.
     pub fn read_centroids(&self) -> Result<Vec<f32>, String> {
-        self.rt.synchronize()?;
-        self.check_and_clear_faults()?;
+        self.synchronize_runner()?;
+        self.observe_faults()?;
         self.centroids.try_read_f32()
     }
 
     /// Synchronize and read the current `[k]` `f32` EMA usage vector.
     pub fn read_usage(&self) -> Result<Vec<f32>, String> {
-        self.rt.synchronize()?;
-        self.check_and_clear_faults()?;
+        self.synchronize_runner()?;
+        self.observe_faults()?;
         self.usage.try_read_f32()
     }
 
@@ -1782,9 +1851,8 @@ impl EmeansGpuRunner {
     /// applying `f64` `max_abs`-prescaled L2 normalization when `spherical == true`),
     /// writing the result back into `self.centroids` and returning `[k * d]`.
     pub fn finalize_closing_centroids(&mut self) -> Result<Vec<f32>, String> {
-        self.rt.synchronize()?;
-        self.in_flight_staging.clear();
-        self.check_and_clear_faults()?;
+        self.synchronize_runner()?;
+        self.observe_faults()?;
 
         let k = self.cfg.k as usize;
         let d = self.cfg.d as usize;
@@ -1839,9 +1907,9 @@ impl EmeansGpuRunner {
         {
             let _scope = self.rt.async_scope();
             self.encode_prepare_centroids_self()?;
-            self.rt.synchronize()?;
+            self.synchronize_runner()?;
         }
-        self.check_and_clear_faults()?;
+        self.observe_faults()?;
         Ok(out)
     }
 }
@@ -1967,8 +2035,7 @@ fn assign_gpu_impl(
     let pipes = EmeansPipelines::resolve(rt, resolved_backend)?;
 
     let dummy_buf = rt.alloc_buffer(16)?;
-    let fault_flags = rt.alloc_buffer(4)?;
-    fault_flags.try_write_u32(&[0])?;
+    let fault_flags = rt.alloc_buffer_from_u32(&[0])?;
 
     let c_buf = stage_f32_unwaited(rt, centroids_f32)?;
     let c_eff_bf16 = if precision.assign_is_bf16() {
@@ -1999,14 +2066,35 @@ fn assign_gpu_impl(
                 &norm2_c,
                 &fault_flags,
             )?;
+            drop(c_buf);
             rt.synchronize()?;
         }
-        drop(c_buf);
         let flags = fault_flags.try_read_u32()?[0];
         if flags != 0 {
             return Err(format_fault_error(flags));
         }
         return Ok((Vec::new(), 0.0));
+    }
+
+    let in_flight = AtomicU32::new(0);
+    {
+        let _scope = rt.async_scope();
+        encode_prepare_centroids(
+            rt,
+            &pipes,
+            precision,
+            spherical,
+            k,
+            d,
+            &c_buf,
+            c_eff_bf16.as_ref(),
+            c_eff_f32.as_ref(),
+            &norm2_c,
+            &fault_flags,
+        )?;
+        drop(c_buf);
+        rt.commit(false)?;
+        in_flight.store(1, Ordering::Release);
     }
 
     let chunk_usize = chunk_cap as usize;
@@ -2025,8 +2113,7 @@ fn assign_gpu_impl(
     let chunk_labels = rt.alloc_buffer(chunk_usize * 4)?;
     let chunk_dists = rt.alloc_buffer(chunk_usize * 4)?;
     let labels_buf = rt.alloc_buffer((n as usize) * 4)?;
-    let obj_bits_buf = rt.alloc_buffer(8)?;
-    obj_bits_buf.try_zero()?;
+    let obj_bits_buf = rt.alloc_buffer_from_u32(&[0, 0])?;
 
     let (part_scores, part_labels) = if split_c > 1 {
         let p_elems = (split_c as usize) * chunk_usize;
@@ -2035,34 +2122,36 @@ fn assign_gpu_impl(
         (None, None)
     };
 
-    let mut staged_chunks = Vec::new();
-    {
-        let _scope = rt.async_scope();
-        encode_prepare_centroids(
-            rt,
-            &pipes,
-            precision,
-            spherical,
-            k,
-            d,
-            &c_buf,
-            c_eff_bf16.as_ref(),
-            c_eff_f32.as_ref(),
-            &norm2_c,
-            &fault_flags,
-        )?;
+    let check_local_fault = || -> Result<(), String> {
+        let flags = fault_flags.try_read_u32()?[0];
+        if flags != 0 {
+            return Err(format_fault_error(flags));
+        }
+        Ok(())
+    };
 
-        let d_usize = d as usize;
-        let mut cursor = 0u32;
-        while cursor < n {
-            let m = (n - cursor).min(chunk_cap);
-            let start_elem = (cursor as usize) * d_usize;
-            let end_elem = start_elem + (m as usize) * d_usize;
+    let d_usize = d as usize;
+    let mut cursor = 0u32;
+    while cursor < n {
+        let m = (n - cursor).min(chunk_cap);
+        let is_last = cursor + m >= n;
+        let start_elem = (cursor as usize) * d_usize;
+        let end_elem = start_elem + (m as usize) * d_usize;
+        let staged = match input {
+            AssignInput::F32(rows) => {
+                stage_f32_bounded(rt, &in_flight, check_local_fault, &rows[start_elem..end_elem])?
+            }
+            AssignInput::Bf16(rows) => {
+                stage_u16_bounded(rt, &in_flight, check_local_fault, &rows[start_elem..end_elem])?
+            }
+        };
+
+        {
+            let _scope = rt.async_scope();
+            let write_bf16 = u32::from(precision.assign_is_bf16());
+            let write_f32 = u32::from(!precision.assign_is_bf16());
             match input {
-                AssignInput::F32(rows) => {
-                    let staged = stage_f32_unwaited(rt, &rows[start_elem..end_elem])?;
-                    let write_bf16 = u32::from(precision.assign_is_bf16());
-                    let write_f32 = u32::from(!precision.assign_is_bf16());
+                AssignInput::F32(_) => {
                     rt.with_binder(|bnd| {
                         bnd.set_pipeline(&pipes.stage_rows_f32);
                         bnd.bind_gpu_buf(&staged, 0);
@@ -2078,12 +2167,8 @@ fn assign_gpu_impl(
                         bnd.dispatch(mtl_size(m as usize, 1, 1), mtl_size(256, 1, 1));
                         Ok(())
                     })?;
-                    staged_chunks.push(staged);
                 }
-                AssignInput::Bf16(rows) => {
-                    let staged = stage_u16_unwaited(rt, &rows[start_elem..end_elem])?;
-                    let write_bf16 = u32::from(precision.assign_is_bf16());
-                    let write_f32 = u32::from(!precision.assign_is_bf16());
+                AssignInput::Bf16(_) => {
                     rt.with_binder(|bnd| {
                         bnd.set_pipeline(&pipes.stage_rows_bf16);
                         bnd.bind_gpu_buf(&staged, 0);
@@ -2098,9 +2183,9 @@ fn assign_gpu_impl(
                         bnd.dispatch(mtl_size(m as usize, 1, 1), mtl_size(256, 1, 1));
                         Ok(())
                     })?;
-                    staged_chunks.push(staged);
                 }
             }
+            drop(staged);
 
             let x_assign = if precision.assign_is_bf16() {
                 chunk_x_bf16.as_ref().unwrap_or(&dummy_buf)
@@ -2146,17 +2231,19 @@ fn assign_gpu_impl(
                 Ok(())
             })?;
 
-            cursor += m;
+            if is_last {
+                rt.synchronize()?;
+                in_flight.store(0, Ordering::Release);
+            } else {
+                rt.commit(false)?;
+                in_flight.fetch_add(1, Ordering::AcqRel);
+            }
         }
-        rt.synchronize()?;
-    }
-    drop(c_buf);
-    drop(staged_chunks);
 
-    let flags = fault_flags.try_read_u32()?[0];
-    if flags != 0 {
-        return Err(format_fault_error(flags));
+        cursor += m;
     }
+
+    check_local_fault()?;
     let labels = labels_buf.try_read_u32()?;
     let obj_bits = try_read_u64_vec(&obj_bits_buf, 1)?[0];
     Ok((labels, f64::from_bits(obj_bits)))

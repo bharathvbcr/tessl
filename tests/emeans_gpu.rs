@@ -972,3 +972,399 @@ fn test_gpu_refuses_norm_overflow_and_bf16_inf_without_poisoning() {
         assert_eq!(ledger.unmatched_releases(), 0);
     });
 }
+
+#[test]
+fn test_streaming_and_chunked_assign_bound_staging_under_tight_budget() {
+    common::with_gpu(|rt| {
+        let k = 16usize;
+        let d = 256usize;
+        let chunk_cap = 256u32;
+        let num_chunks = 16usize;
+        let n = num_chunks * (chunk_cap as usize); // 4096 rows -> 4 MiB f32 (strictly > 2.5 MiB cap)
+
+        let rows_f32 = common::random_f32(n * d, 9101);
+        let rows_bf16_n = n * 2; // 8192 rows -> 4 MiB bf16 (strictly > 2.5 MiB cap)
+        let rows_bf16 = f32_slice_to_bf16(&common::random_f32(rows_bf16_n * d, 9102));
+        let init_centroids = common::random_f32(k * d, 9103);
+
+        // Reference uncapped streaming & assign results
+        let ref_cfg = EmeansGpuConfig {
+            k: k as u32,
+            d: d as u32,
+            max_chunk_rows: chunk_cap,
+            precision: EmeansGpuPrecision::F32,
+            backend: EmeansGpuBackend::Auto,
+            spherical: false,
+            unused_threshold: 0.0,
+            split_epsilon: 1e-4,
+            init_usage: 1.0,
+            seed: 42,
+        };
+        let mut ref_runner = EmeansGpuRunner::new(rt, ref_cfg.clone(), &init_centroids).expect("ref_runner");
+        ref_runner.reset_pass_accumulators(true).unwrap();
+        for c in 0..num_chunks {
+            let off = c * (chunk_cap as usize) * d;
+            ref_runner
+                .accumulate_f32_chunk(&rows_f32[off..off + (chunk_cap as usize) * d], chunk_cap, None)
+                .unwrap();
+        }
+        ref_runner.apply_batch_update(0.5, 0, false).unwrap();
+        let (ref_obj, ref_counts) = ref_runner.finish_streaming_epoch().unwrap();
+        let ref_closing = ref_runner.finalize_closing_centroids().unwrap();
+        let (ref_assign_labels, ref_assign_obj) = assign_gpu_f32(
+            rt,
+            &rows_f32,
+            n as u32,
+            d as u32,
+            &init_centroids,
+            k as u32,
+            chunk_cap,
+            EmeansGpuPrecision::F32,
+            EmeansGpuBackend::Auto,
+            false,
+        )
+        .expect("ref assign_gpu_f32");
+
+        // Tight budget cap: 2.5 MiB (< 4 MiB dataset size), proving O(chunk_cap * d) live memory!
+        let cap_bytes: u64 = 2_500_000;
+        let budget = Budget::new(cap_bytes);
+        let ledger = OjasBudgetLedger::new(&budget, 512 * 1024);
+        let capped_rt = GpuRuntime::with_shared(Arc::clone(rt.shared())).expect("capped_rt");
+        capped_rt
+            .set_pool_ledger(Some(ledger.as_pool_ledger()))
+            .expect("set_pool_ledger");
+
+        // 1. Multi-chunk f32 streaming (16 separate chunks + single oversized 4096-row sub-windowed call)
+        {
+            let mut runner =
+                EmeansGpuRunner::new(&capped_rt, ref_cfg.clone(), &init_centroids).expect("capped f32 runner");
+            runner.reset_pass_accumulators(true).unwrap();
+            for c in 0..num_chunks {
+                let off = c * (chunk_cap as usize) * d;
+                runner
+                    .accumulate_f32_chunk(&rows_f32[off..off + (chunk_cap as usize) * d], chunk_cap, None)
+                    .expect("bounded f32 chunk under 2.5 MiB cap");
+                assert!(ledger.live_bytes() <= cap_bytes);
+            }
+            runner.apply_batch_update(0.5, 0, false).unwrap();
+            let (obj, counts) = runner.finish_streaming_epoch().unwrap();
+            let closing = runner.finalize_closing_centroids().unwrap();
+            assert_eq!(obj.to_bits(), ref_obj.to_bits());
+            assert_eq!(counts, ref_counts);
+            assert_eq!(closing, ref_closing);
+
+            // Single 4096-row call sub-windowed into 16 x 256-row windows must also stay bounded
+            let mut runner2 = EmeansGpuRunner::new(&capped_rt, ref_cfg, &init_centroids).expect("capped f32 runner2");
+            drop(runner);
+            capped_rt.synchronize().unwrap();
+            capped_rt.reclaim(u64::MAX).unwrap();
+            runner2.reset_pass_accumulators(false).unwrap();
+            runner2
+                .accumulate_f32_chunk(&rows_f32, n as u32, None)
+                .expect("oversized sub-windowed f32 chunk under 2.5 MiB cap");
+            runner2.apply_batch_update(0.5, 0, false).unwrap();
+            let (obj2, counts2) = runner2.finish_streaming_epoch().unwrap();
+            assert_eq!(obj2.to_bits(), ref_obj.to_bits());
+            assert_eq!(counts2, ref_counts);
+        }
+        capped_rt.synchronize().unwrap();
+        capped_rt.reclaim(u64::MAX).unwrap();
+        capped_rt.trim_free_list();
+
+        // 2. Multi-chunk bf16 streaming (32 chunks = 8192 rows = 4 MiB bf16 under 2.5 MiB cap)
+        {
+            let bf16_cfg = EmeansGpuConfig {
+                k: k as u32,
+                d: d as u32,
+                max_chunk_rows: chunk_cap,
+                precision: EmeansGpuPrecision::Bf16,
+                backend: EmeansGpuBackend::Auto,
+                spherical: false,
+                unused_threshold: 0.0,
+                split_epsilon: 1e-4,
+                init_usage: 1.0,
+                seed: 42,
+            };
+            let mut bf16_runner = EmeansGpuRunner::new(&capped_rt, bf16_cfg, &init_centroids).expect("bf16 runner");
+            bf16_runner.reset_pass_accumulators(false).unwrap();
+            bf16_runner
+                .accumulate_bf16_chunk(&rows_bf16, rows_bf16_n as u32, None)
+                .expect("oversized sub-windowed bf16 chunk under 2.5 MiB cap");
+            bf16_runner.apply_batch_update(0.5, 0, false).unwrap();
+            let (bf16_obj, bf16_counts) = bf16_runner.finish_streaming_epoch().unwrap();
+            assert!(bf16_obj.is_finite());
+            assert_eq!(bf16_counts.iter().sum::<u64>(), rows_bf16_n as u64);
+        }
+        capped_rt.synchronize().unwrap();
+        capped_rt.reclaim(u64::MAX).unwrap();
+        capped_rt.trim_free_list();
+
+        // 3. Standalone assign_gpu_f32 & assign_gpu_bf16 under the same 2.5 MiB cap
+        let (got_labels, got_obj) = assign_gpu_f32(
+            &capped_rt,
+            &rows_f32,
+            n as u32,
+            d as u32,
+            &init_centroids,
+            k as u32,
+            chunk_cap,
+            EmeansGpuPrecision::F32,
+            EmeansGpuBackend::Auto,
+            false,
+        )
+        .expect("assign_gpu_f32 must stay O(chunk_cap * d) under 2.5 MiB cap");
+        assert_eq!(got_labels, ref_assign_labels);
+        assert_eq!(got_obj.to_bits(), ref_assign_obj.to_bits());
+
+        capped_rt.synchronize().unwrap();
+        capped_rt.reclaim(u64::MAX).unwrap();
+        capped_rt.trim_free_list();
+
+        let (bf16_labels, bf16_assign_obj) = assign_gpu_bf16(
+            &capped_rt,
+            &rows_bf16,
+            rows_bf16_n as u32,
+            d as u32,
+            &init_centroids,
+            k as u32,
+            chunk_cap,
+            EmeansGpuPrecision::Bf16,
+            EmeansGpuBackend::Auto,
+            false,
+        )
+        .expect("assign_gpu_bf16 must stay O(chunk_cap * d) under 2.5 MiB cap");
+        assert_eq!(bf16_labels.len(), rows_bf16_n);
+        assert!(bf16_assign_obj.is_finite());
+
+        capped_rt.synchronize().unwrap();
+        capped_rt.reclaim(u64::MAX).unwrap();
+        capped_rt.trim_free_list();
+        assert_eq!(ledger.live_bytes(), 0);
+        assert_eq!(ledger.cached_bytes(), 0);
+        assert_eq!(ledger.unmatched_releases(), 0);
+    });
+}
+
+#[test]
+fn test_apply_ema_zero_usage_and_zero_alpha_produces_finite_centroids() {
+    common::with_gpu(|rt| {
+        let k = 4usize;
+        let d = 16usize;
+        let init_centroids: Vec<f32> = (0..k * d).map(|i| ((i % 7) as f32) * 0.5 - 1.0).collect();
+        let rows = common::random_f32(32 * d, 9201);
+
+        for precision in [
+            EmeansGpuPrecision::Bf16,
+            EmeansGpuPrecision::Bf16AssignF32Stats,
+            EmeansGpuPrecision::F32,
+        ] {
+            // Case 1: init_usage = 0.0 + alpha = 0.0 on both resident and streaming paths
+            let cfg = EmeansGpuConfig {
+                k: k as u32,
+                d: d as u32,
+                max_chunk_rows: 32,
+                precision,
+                backend: EmeansGpuBackend::Auto,
+                spherical: false,
+                unused_threshold: 0.5,
+                split_epsilon: 1e-4,
+                init_usage: 0.0,
+                seed: 77,
+            };
+            let mut runner = EmeansGpuRunner::new(rt, cfg, &init_centroids).expect("runner init_usage=0");
+            let ds = runner.upload_dataset_f32(&rows, 32).expect("upload");
+            let order: Vec<u32> = (0..32).collect();
+            let batches = [EpochBatchPlan {
+                row_offset: 0,
+                row_count: 32,
+                alpha: 0.0,
+                step: 0,
+                check_revive: true,
+            }];
+            let (obj, revivals, counts) = runner
+                .run_resident_epoch(&ds, &order, &batches, false, None)
+                .expect("resident alpha=0 with usage=0 must not produce NaN");
+            assert!(obj.is_finite());
+            assert_eq!(revivals, 0);
+            assert_eq!(counts.iter().sum::<u64>(), 32);
+            let cents = runner.read_centroids().expect("read_centroids");
+            let usage = runner.read_usage().expect("read_usage");
+            assert!(cents.iter().all(|v| v.is_finite()), "NaN/Inf in centroids: {cents:?}");
+            assert_eq!(cents, init_centroids, "alpha=0 must preserve c_old bit-for-bit");
+            assert_eq!(usage, vec![0.0f32; k]);
+
+            // Streaming alpha=0.0 and subnormal alpha (FTZs to 0.0 on GPU) after alpha=1.0 empties unoccupied clusters
+            runner.reset_pass_accumulators(false).unwrap();
+            let single_cluster_rows = init_centroids[..d].repeat(16);
+            runner.accumulate_f32_chunk(&single_cluster_rows, 16, None).unwrap();
+            runner
+                .apply_batch_update(1.0, 1, false)
+                .expect("alpha=1 empties k=1..3");
+            let u_after_replace = runner.read_usage().unwrap();
+            assert_eq!(u_after_replace[1], 0.0);
+
+            // Now send rows landing on cluster 1 with alpha = 0.0 and subnormal alpha
+            let c1_rows = init_centroids[d..2 * d].repeat(8);
+            for &tiny_alpha in &[0.0f32, f32::from_bits(1)] {
+                runner.accumulate_f32_chunk(&c1_rows, 8, None).unwrap();
+                runner
+                    .apply_batch_update(tiny_alpha, 2, false)
+                    .expect("zero/subnormal alpha on usage=0 cluster must succeed");
+                let cents_after = runner.read_centroids().unwrap();
+                assert!(
+                    cents_after.iter().all(|v| v.is_finite()),
+                    "NaN/Inf for tiny_alpha={tiny_alpha:e}: {cents_after:?}"
+                );
+                assert_eq!(&cents_after[d..2 * d], &init_centroids[d..2 * d]);
+            }
+        }
+    });
+}
+
+#[test]
+fn test_streaming_faults_latch_and_resident_last_batch_prep_catches_overflow() {
+    common::with_gpu(|rt| {
+        let k = 4usize;
+        let d = 16usize;
+        let good_centroids: Vec<f32> = (0..k * d).map(|i| ((i % 9) as f32) * 0.25).collect();
+        let good_rows = common::random_f32(32 * d, 9301);
+        let mut bad_rows = good_rows[..16 * d].to_vec();
+        bad_rows[5] = 2.0e19f32; // overflows row_norm2
+
+        let cfg = EmeansGpuConfig {
+            k: k as u32,
+            d: d as u32,
+            max_chunk_rows: 16,
+            precision: EmeansGpuPrecision::F32,
+            backend: EmeansGpuBackend::Auto,
+            spherical: false,
+            unused_threshold: 0.0,
+            split_epsilon: 1e-4,
+            init_usage: 1.0,
+            seed: 55,
+        };
+        let mut runner = EmeansGpuRunner::new(rt, cfg, &good_centroids).expect("runner");
+
+        // 1. Start a final streaming epoch, feed 1 good chunk + 1 bad chunk
+        runner.reset_pass_accumulators(true).unwrap();
+        runner.accumulate_f32_chunk(&good_rows[..16 * d], 16, None).unwrap();
+        runner.accumulate_f32_chunk(&bad_rows, 16, None).unwrap();
+
+        // read_centroids and read_usage must observe AND keep the fault latched!
+        let err_c = runner.read_centroids().expect_err("read_centroids must report fault");
+        assert!(err_c.starts_with(NONFINITE_ERR_PREFIX), "got: {err_c}");
+        let err_u = runner
+            .read_usage()
+            .expect_err("read_usage must still report latched fault");
+        assert!(err_u.starts_with(NONFINITE_ERR_PREFIX), "got: {err_u}");
+
+        // upload_dataset_f32 / upload_dataset_f32_buffer must use local fault_flags and NOT clear latched fault!
+        let valid_ds = runner
+            .upload_dataset_f32(&good_rows, 32)
+            .expect("upload_dataset_f32 on valid data must succeed independently");
+        assert_eq!(valid_ds.rows(), 32);
+
+        // apply_batch_update, accumulate_f32_chunk, finish_streaming_epoch, finalize_closing_centroids ALL fail closed!
+        let err_upd = runner
+            .apply_batch_update(1.0, 0, false)
+            .expect_err("apply_batch_update must refuse latched fault");
+        assert!(err_upd.starts_with(NONFINITE_ERR_PREFIX), "got: {err_upd}");
+        let err_acc = runner
+            .accumulate_f32_chunk(&good_rows[..16 * d], 16, None)
+            .expect_err("accumulate_f32_chunk must refuse while faulted");
+        assert!(err_acc.starts_with(NONFINITE_ERR_PREFIX), "got: {err_acc}");
+        let err_fin = runner
+            .finish_streaming_epoch()
+            .expect_err("finish_streaming_epoch must refuse dirty epoch accumulators");
+        assert!(err_fin.starts_with(NONFINITE_ERR_PREFIX), "got: {err_fin}");
+        let err_close = runner
+            .finalize_closing_centroids()
+            .expect_err("finalize_closing_centroids must refuse dirty pass_sums");
+        assert!(err_close.starts_with(NONFINITE_ERR_PREFIX), "got: {err_close}");
+
+        // 2. Also verify synchronous `labels_out = Some(...)` fault latches across epoch end & closing
+        runner.reset_pass_accumulators(true).unwrap();
+        assert_eq!(
+            runner.read_centroids().expect("reset_pass_accumulators clears fault"),
+            good_centroids
+        );
+        let mut lbl_out = vec![0u32; 16];
+        let err_sync = runner
+            .accumulate_f32_chunk(&bad_rows, 16, Some(&mut lbl_out))
+            .expect_err("sync chunk must report fault");
+        assert!(err_sync.starts_with(NONFINITE_ERR_PREFIX), "got: {err_sync}");
+        assert!(runner.finish_streaming_epoch().is_err());
+        assert!(runner.finalize_closing_centroids().is_err());
+
+        // Recover via reset_pass_accumulators(false) — dirty pass_sums from the aborted final_epoch=true
+        // must also have been wiped so finalize_closing_centroids falls back to untouched good_centroids!
+        runner.reset_pass_accumulators(false).unwrap();
+        runner.accumulate_f32_chunk(&good_rows[..16 * d], 16, None).unwrap();
+        let (clean_obj, clean_counts) = runner.finish_streaming_epoch().expect("clean epoch after reset");
+        assert!(clean_obj.is_finite());
+        assert_eq!(clean_counts.iter().sum::<u64>(), 16);
+        let closed_after_abort = runner
+            .finalize_closing_centroids()
+            .expect("dirty pass_counts from aborted final epoch must be zeroed");
+        assert_eq!(closed_after_abort, good_centroids);
+
+        // Also test recovery from latched fault via run_resident_epoch
+        runner.reset_pass_accumulators(false).unwrap();
+        runner.accumulate_f32_chunk(&bad_rows, 16, None).unwrap();
+        assert!(runner.apply_batch_update(0.5, 0, false).is_err());
+        let order: Vec<u32> = (0..32).collect();
+        let batches = [EpochBatchPlan {
+            row_offset: 0,
+            row_count: 32,
+            alpha: 0.5,
+            step: 0,
+            check_revive: false,
+        }];
+        let (res_obj, _, res_counts) = runner
+            .run_resident_epoch(&valid_ds, &order, &batches, false, None)
+            .expect("run_resident_epoch resets all epoch accumulators and recovers");
+        assert!(res_obj.is_finite());
+        assert_eq!(res_counts.iter().sum::<u64>(), 32);
+
+        // 3. Resident epoch last-batch revival overflow when final_epoch == false must fail closed!
+        // Row [4.0e18; 16] has ||x||_2^2 = 16 * 1.6e37 = 2.56e38 < FLT_MAX (valid!),
+        // but splitting with split_epsilon = 0.9 produces 8 cols at 7.6e18 -> ||c||_2^2 = 4.62e38 > FLT_MAX!
+        let mut init_large = vec![0.0f32; 2 * d];
+        for v in &mut init_large[..d] {
+            *v = 4.0e18f32;
+        }
+        let large_rows = vec![4.0e18f32; 16 * d];
+        let ovf_cfg = EmeansGpuConfig {
+            k: 2,
+            d: d as u32,
+            max_chunk_rows: 16,
+            precision: EmeansGpuPrecision::F32,
+            backend: EmeansGpuBackend::Auto,
+            spherical: false,
+            unused_threshold: 0.5,
+            split_epsilon: 0.9,
+            init_usage: 1.0e-5,
+            seed: 99,
+        };
+        let mut ovf_runner = EmeansGpuRunner::new(rt, ovf_cfg, &init_large).expect("ovf_runner init valid");
+        let ovf_ds = ovf_runner
+            .upload_dataset_f32(&large_rows, 16)
+            .expect("large_rows valid");
+        let ovf_order: Vec<u32> = (0..16).collect();
+        let ovf_batches = [EpochBatchPlan {
+            row_offset: 0,
+            row_count: 16,
+            alpha: 1.0,
+            step: 0,
+            check_revive: true,
+        }];
+        let err_res_ovf = ovf_runner
+            .run_resident_epoch(&ovf_ds, &ovf_order, &ovf_batches, false, None)
+            .expect_err("last-batch revival norm2 overflow with final_epoch=false must fail closed");
+        assert!(err_res_ovf.starts_with(NONFINITE_ERR_PREFIX), "got: {err_res_ovf}");
+        assert!(
+            ovf_runner.read_centroids().is_err(),
+            "read_centroids must stay latched after revival overflow"
+        );
+    });
+}

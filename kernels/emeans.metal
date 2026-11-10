@@ -1490,14 +1490,15 @@ kernel void emeans_apply_ema(
     if (n_j > 0ul) {
         const float nf = (float)n_j;
         const float n_new = replace ? (alpha * nf) : ((1.0f - alpha) * n_old + alpha * nf);
-        const float w = precise::divide(alpha * nf, n_new);
+        const float w = (n_new > 0.0f) ? precise::divide(alpha * nf, n_new) : 0.0f;
         const bool exact_mean = (w == 1.0f);
+        const bool keep_old = (w == 0.0f);
         for (ulong col = (ulong)tid; col < (ulong)d; col += 256ul) {
             const float s_j = batch_sums[base + col];
             batch_sums[base + col] = 0.0f;
             const float mean = precise::divide(s_j, nf);
             const float c_old = centroids[base + col];
-            centroids[base + col] = exact_mean ? mean : (c_old + w * (mean - c_old));
+            centroids[base + col] = exact_mean ? mean : (keep_old ? c_old : (c_old + w * (mean - c_old)));
         }
         if (tid == 0u) {
             usage[j] = n_new;

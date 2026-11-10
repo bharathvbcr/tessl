@@ -9,14 +9,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 fn run_on(name: &str, kernel_body: &str) -> Option<(i32, String)> {
-    let dir: PathBuf = std::env::temp_dir().join(format!("tessl_ir_planted_{}_{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::dir(&format!("tessl_ir_planted_{name}"));
     let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{kernel_body}\n");
     std::fs::write(dir.join(format!("{name}.metal")), src).unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/check_kernel_ir.sh");
     let out = Command::new("bash").arg(&script).arg(&dir).output().expect("bash runs");
-    std::fs::remove_dir_all(&dir).unwrap();
     let code = out.status.code().expect("script exited normally");
     let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
     if code == 77 {
@@ -73,7 +74,7 @@ fn signalling_nan_constant_is_rejected() {
 /// (`"none"`) or an empty file (`"empty"`).
 fn run_with_fake_metal(mode: &str) -> (i32, String) {
     use std::os::unix::fs::PermissionsExt;
-    let dir: PathBuf = std::env::temp_dir().join(format!("tessl_ir_fake_{}_{mode}", std::process::id()));
+    let dir = Scratch::dir(&format!("tessl_ir_fake_{mode}"));
     std::fs::create_dir_all(dir.join("kernels")).unwrap();
     std::fs::write(dir.join("kernels/k.metal"), "kernel void k() {}\n").unwrap();
     let write_exe = |name: &str, body: &str| {
@@ -102,7 +103,6 @@ fn run_with_fake_metal(mode: &str) -> (i32, String) {
         .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
         .output()
         .expect("bash runs");
-    std::fs::remove_dir_all(&dir).unwrap();
     let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
     (out.status.code().expect("script exited normally"), text)
 }

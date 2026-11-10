@@ -9,6 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 #[test]
 fn embedded_metallib_opens_after_the_build_artifact_is_renamed() {
     if std::env::var_os("TESSL_EMBED_PROBE").is_some() {
@@ -32,9 +35,7 @@ fn embedded_metallib_opens_after_the_build_artifact_is_renamed() {
     };
 
     let exe = std::env::current_exe().expect("current test binary");
-    let scratch = std::env::temp_dir().join(format!("tessl-embed-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&scratch);
-    fs::create_dir_all(&scratch).expect("scratch dir");
+    let scratch = Scratch::dir("tessl-embed-probe");
     let copied = scratch.join("probe");
     fs::copy(&exe, &copied).unwrap_or_else(|e| panic!("copy {} -> {}: {e}", exe.display(), copied.display()));
 
@@ -52,7 +53,6 @@ fn embedded_metallib_opens_after_the_build_artifact_is_renamed() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = fs::remove_dir_all(&scratch);
 }
 
 fn hidden_path(path: &Path) -> PathBuf {

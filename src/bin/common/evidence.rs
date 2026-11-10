@@ -886,15 +886,18 @@ impl EvidenceOutput {
     }
 }
 
+// The test-scratch guard shared with the integration tests (`tests/scratch_support`).
+#[cfg(test)]
+#[path = "../../../tests/scratch_support/mod.rs"]
+mod scratch_support;
+
 #[cfg(test)]
 mod tests {
+    use super::scratch_support::Scratch;
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tessl-evidence-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::dir(&format!("tessl-evidence-{tag}"))
     }
 
     fn args(a: &[&str]) -> Vec<String> {

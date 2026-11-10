@@ -15,6 +15,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -456,8 +459,7 @@ fn tune_entry_points() -> usize {
         String::from_utf8_lossy(&sdk.stderr)
     );
     let sdk = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
-    let dir = std::env::temp_dir().join(format!("tessl-tune-count-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = Scratch::dir("tessl-tune-count");
     let mut total = 0;
     let mut sources: Vec<_> = std::fs::read_dir(root.join("kernels/tune"))
         .expect("kernels/tune")
@@ -501,7 +503,6 @@ fn tune_entry_points() -> usize {
             .filter(|l| l.split_whitespace().nth(1) == Some("T"))
             .count();
     }
-    let _ = std::fs::remove_dir_all(&dir);
     total
 }
 

@@ -11,11 +11,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-bp-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
-    d
+mod scratch_support;
+use scratch_support::Scratch;
+
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-bp-{tag}"))
 }
 
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -493,7 +493,8 @@ fn a_spread_exactly_at_the_limit_passes_and_one_ulp_past_it_exits_3() {
 
 #[test]
 fn evidence_paths_with_spaces_and_unicode_publish_and_overwrite_atomically() {
-    let d = scratch("unicode").join("dir \u{fc} \u{65e5}\u{672c}");
+    let root = scratch("unicode");
+    let d = root.join("dir \u{fc} \u{65e5}\u{672c}");
     fs::create_dir_all(&d).unwrap();
     let (a, b) = (metric_bin(&d, "a", "1"), metric_bin(&d, "b", "2"));
     let out_path = d.join("e v.json");

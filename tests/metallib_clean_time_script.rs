@@ -10,15 +10,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod scratch_support;
+use scratch_support::Scratch;
+
 fn script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/metallib_clean_time.sh")
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-mct-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
-    d
+fn scratch(tag: &str) -> Scratch {
+    Scratch::dir(&format!("tessl-mct-{tag}"))
 }
 
 /// A fake build script: writes `airs` .air files, `keys` .air.key files and a

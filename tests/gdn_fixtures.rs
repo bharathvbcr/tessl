@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use tessl::npy::{read_npy, write_npy_f32};
 
 mod common;
+mod scratch_support;
 use common::gdn::{case_names, fixture_dir, load_case, sequential_f64, GateClamp, Rule};
+use scratch_support::Scratch;
 
 /// f32 unit roundoff, 2^-24. Same value as `tests/common/mod.rs:161`, restated
 /// here because this file deliberately does not pull in the GPU test harness.
@@ -232,8 +234,7 @@ fn published_rule_is_declared_by_every_fixture_and_the_manifest() {
 /// refactor would otherwise have been unverified.
 #[test]
 fn f32_and_i64_survive_a_round_trip_through_the_reader() {
-    let dir = std::env::temp_dir().join(format!("tessl-npy-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = Scratch::dir("tessl-npy");
 
     // f32, via the crate's own writer.
     let f32_path = dir.join("rt_f32.npy");
@@ -268,16 +269,13 @@ fn f32_and_i64_survive_a_round_trip_through_the_reader() {
     let back = read_npy(&i64_path).expect("read i64");
     assert_eq!(back.shape, vec![ints.len()]);
     assert_eq!(back.i64_slice().expect("i64 payload"), ints.as_slice());
-
-    std::fs::remove_dir_all(&dir).expect("clean temp dir");
 }
 
 /// An unsupported dtype is still refused by name rather than best-effort parsed.
 /// Adding `<f8` must not have turned the fallthrough into something lenient.
 #[test]
 fn an_unsupported_dtype_is_still_refused_and_named() {
-    let dir = std::env::temp_dir().join(format!("tessl-npy-bad-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = Scratch::dir("tessl-npy-bad");
     let path = dir.join("bad.npy");
 
     let header = "{'descr': '<c16', 'fortran_order': False, 'shape': (1,), }\n";
@@ -296,8 +294,6 @@ fn an_unsupported_dtype_is_still_refused_and_named() {
 
     let err = read_npy(&path).expect_err("complex128 must be refused");
     assert!(err.contains("<c16"), "refusal must name the dtype, got: {err}");
-
-    std::fs::remove_dir_all(&dir).expect("clean temp dir");
 }
 
 /// The Rust f64 reference reproduces the Python-generated golden.

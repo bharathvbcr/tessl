@@ -10,8 +10,10 @@
 //!
 //! Each case must exit nonzero (not by signal, not by panic), and say why.
 
-use std::path::PathBuf;
 use std::process::Command;
+
+mod scratch_support;
+use scratch_support::Scratch;
 
 /// The variables a case may set; every one a case does not set is removed, so
 /// the caller's own shell cannot change what is being tested.
@@ -30,10 +32,10 @@ const SCOPED: [&str; 12] = [
     "TESSL_ATTN_TILED",
 ];
 
-fn refused_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tessl-attn-refused-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
+/// A path the refused run must not create; the guard removes whatever a
+/// failing run did leave there.
+fn refused_dir(tag: &str) -> Scratch {
+    Scratch::file(&format!("tessl-attn-refused-{tag}"), "")
 }
 
 /// Run one case and check it was refused for the stated reason.

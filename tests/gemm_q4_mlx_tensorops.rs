@@ -21,6 +21,8 @@
 //! simd path has `t = K + 2 K/G`, as in `tests/int4b_tensorops.rs`.
 
 mod common;
+mod scratch_support;
+use scratch_support::Scratch;
 
 use common::{buf_bf16, pack_nibbles, round_trip_bf16, seeded, with_gpu, SplitMix};
 use std::sync::Arc;
@@ -497,8 +499,7 @@ fn operands_with(rt: &Arc<GpuRuntime>, edit: impl FnOnce(&mut Operands)) -> Oper
 #[test]
 fn hardware_without_tensorops_is_refused_before_encode() {
     with_gpu(|full| {
-        let dir = std::env::temp_dir().join(format!("tessl-q4to-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("tessl-q4to");
         let (src, air, lib) = (dir.join("k.metal"), dir.join("k.air"), dir.join("k.metallib"));
         std::fs::write(
             &src,
@@ -530,7 +531,6 @@ fn hardware_without_tensorops_is_refused_before_encode() {
             );
         }
         let rt = GpuRuntime::from_metallib_path(&lib).expect("runtime over a TensorOps-free metallib");
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(!rt.has_tensorops() && full.has_tensorops());
         let o = operands(&rt, 8, 32, 128, 32);
         rt.take_dispatch_count();

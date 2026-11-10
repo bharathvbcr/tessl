@@ -1899,3 +1899,166 @@ fn commit_m4_clears_cb_open_only_after_event_value_covers_the_submit() {
         );
     }
 }
+
+// ---- a commit that fails before its submit (ft-2ea050a0) ----
+
+/// A rig with a command buffer open and nothing encoded, and the end counter
+/// at zero.
+fn rig_with_an_open_empty_batch() -> Rig {
+    let rig = Rig::new();
+    rig.rt.set_async_encode(true).unwrap();
+    rig.rt.with_binder(|_| Ok(())).unwrap();
+    assert!(rig.rt.active_m4.lock().unwrap().as_ref().is_some_and(|b| b.cb_open));
+    END_CALLS.with(|c| c.set(0));
+    rig
+}
+
+fn end_calls() -> u64 {
+    END_CALLS.with(Cell::get)
+}
+
+fn batch_is_open(rt: &GpuRuntime) -> bool {
+    let guard = rt.active_m4.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.as_ref().is_some_and(|b| b.cb_open)
+}
+
+/// A commit that returns `Err` before anything was submitted must leave the
+/// command buffer open: `cb_open` says "recording, not submitted", and the
+/// drop-time abort ends it once. Before the fix the buffer was ended first and
+/// the abort ended it again.
+#[test]
+fn a_commit_that_errs_before_the_submit_leaves_the_buffer_open_and_ends_it_once() {
+    let rig = rig_with_an_open_empty_batch();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    COMMIT_FAULT.with(|f| f.set(Some(CommitFault::Err)));
+    let err = rig.rt.commit(false).unwrap_err();
+    assert!(err.contains("injected commit fault"), "error was {err}");
+    let (open, ended) = (batch_is_open(&rig.rt), end_calls());
+    let moved = rig.rt.metal4.event_value.load(Ordering::Acquire) != submitted;
+    drop(rig);
+    let ended_after_drop = end_calls();
+    eprintln!("failed commit: cb_open={open} ended_by_commit={ended} event_value_moved={moved} ended_after_drop={ended_after_drop}");
+    assert!(open, "a failed commit cleared cb_open");
+    assert_eq!(ended, 0, "the buffer was ended before the commit could fail");
+    assert!(!moved, "a commit that never submitted moved event_value");
+    assert_eq!(
+        ended_after_drop, 1,
+        "the buffer must be ended exactly once, by the abort"
+    );
+}
+
+/// The same for a panic: the unwind poisons the batch lock with `cb_open`
+/// true, which is the truth, and the drop-time abort ends the buffer once.
+#[test]
+fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_once() {
+    let _quiet = quiet_injected();
+    let rig = rig_with_an_open_empty_batch();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    COMMIT_FAULT.with(|f| f.set(Some(CommitFault::Panic)));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.rt.commit(false))).is_err();
+    assert!(unwound, "the injected panic never fired");
+    assert!(rig.rt.active_m4.is_poisoned());
+    let (open, ended) = (batch_is_open(&rig.rt), end_calls());
+    let moved = rig.rt.metal4.event_value.load(Ordering::Acquire) != submitted;
+    drop(rig);
+    let ended_after_drop = end_calls();
+    eprintln!("panicked commit: cb_open={open} ended_by_commit={ended} event_value_moved={moved} ended_after_drop={ended_after_drop}");
+    assert!(open, "a panicked commit cleared cb_open");
+    assert_eq!(ended, 0, "the buffer was ended before the commit could panic");
+    assert!(!moved, "a commit that never submitted moved event_value");
+    assert_eq!(
+        ended_after_drop, 1,
+        "the buffer must be ended exactly once, by the abort"
+    );
+}
+
+/// Code of `src` from `header` to the first line that closes the function (a
+/// lone four-space `}`, which is not included), comments removed, with every
+/// whitespace character dropped so that formatting cannot matter.
+fn compact_fn(src: &str, header: &str) -> String {
+    let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("end of {header} not found"));
+    rest[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+fn compact(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// An allow-list source-order pin (no test can fire a panic inside the window
+/// without a production knob). Between ending the command buffer and clearing
+/// `cb_open`, `commit_m4` runs exactly four statements, and each callee that is
+/// Rust code is pinned to its exact body, so a new statement, a new helper call,
+/// an index or an `expect` anywhere on the path fails here. What stays are the
+/// two Objective-C sends (end, submit). All fallible work runs in
+/// `prepare_commit` before the end, where a failure still leaves `cb_open` true.
+#[test]
+fn commit_m4_has_no_failure_point_between_ending_the_buffer_and_clearing_cb_open() {
+    let src = include_str!("runtime.rs");
+    let body = compact_fn(src, "fn commit_m4(");
+    let prepare = body
+        .find(&compact("self.prepare_commit()?"))
+        .expect("commit_m4 no longer prepares the commit");
+    let guard = body
+        .find("debug_assert!(")
+        .expect("commit_m4 lost the clock check before the end");
+    let end = body
+        .find(&compact("self.end_command_buffer();"))
+        .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
+    assert!(
+        prepare < end && guard < end,
+        "the fallible prepare step and the clock check must run before the end"
+    );
+    let clear = body[end..]
+        .find("batch.cb_open=false;")
+        .expect("no cb_open clear after the end");
+    let window = &body[end..end + clear + "batch.cb_open=false;".len()];
+    let expected = compact(
+        "self.end_command_buffer();
+         let watch = self.submit_prepared(prepared);
+         let next = self.shared.issue();
+         m4.event_value.store(next, Ordering::Release);
+         batch.cb_open = false;",
+    );
+    assert_eq!(
+        window, expected,
+        "the statements between end_command_buffer and the cb_open clear changed"
+    );
+
+    let submit = compact_fn(src, "fn submit_prepared(");
+    let expected_submit = compact(
+        "fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
+            let PreparedCommit { state, options, block, mut command_buffer } = prepared;
+            unsafe {
+                self.metal4.queue.commit_count_options(
+                    NonNull::new_unchecked(&mut command_buffer as *mut _), 1, &options);
+            }
+            FeedbackWatch { state, _options: options, block: Some(block) }",
+    );
+    // `rustfmt` adds a trailing comma inside the struct literals.
+    assert_eq!(submit.replace(",}", "}"), expected_submit, "submit_prepared changed");
+
+    let counter = compact("#[cfg(test)] END_CALLS.with(|c| c.set(c.get() + 1));");
+    let ender = compact_fn(src, "fn end_command_buffer(");
+    assert!(ender.contains(&counter), "the test-only end counter moved");
+    assert_eq!(
+        ender.replace(&counter, ""),
+        compact("fn end_command_buffer(&self) { self.metal4.command_buffer.endCommandBuffer();"),
+        "end_command_buffer changed"
+    );
+
+    let issue = compact_fn(include_str!("shared.rs"), "pub(crate) fn issue(");
+    assert_eq!(
+        issue,
+        compact("pub(crate) fn issue(&self) -> u64 { self.issued.fetch_add(1, Ordering::AcqRel) + 1"),
+        "Shared::issue changed"
+    );
+}

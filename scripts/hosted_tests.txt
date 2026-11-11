@@ -123,7 +123,7 @@ lib embedgemma2_vision::tests:: 8
 lib embedgemma2_audio::tests:: 9
 lib embedgemma2_pre::tests:: 24
 lib embedgemma2_tok::tests:: 6
-lib emeans::tests:: 5
+lib emeans::tests:: 6
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib par_batch::tests:: 6

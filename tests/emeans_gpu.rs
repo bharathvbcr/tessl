@@ -1850,3 +1850,230 @@ fn test_d512_split_c_repeat_bit_identity() {
         }
     });
 }
+
+#[test]
+fn test_near_flt_max_euclidean_overflow_and_recovery() {
+    common::with_gpu(|rt| {
+        let mut backends = vec![EmeansGpuBackend::Simdgroup];
+        if rt.has_tensorops() {
+            backends.insert(0, EmeansGpuBackend::TensorOps);
+        }
+
+        fn assert_nonfinite<T: std::fmt::Debug>(res: Result<T, String>, ctx: &str) {
+            match res {
+                Ok(val) => panic!("expected NONFINITE_ERR_PREFIX for {ctx}, got Ok({val:?})"),
+                Err(err) => assert!(
+                    err.starts_with(NONFINITE_ERR_PREFIX),
+                    "expected error starting with {NONFINITE_ERR_PREFIX:?} for {ctx}, got {err:?}"
+                ),
+            }
+        }
+
+        for backend in backends {
+            for precision in [
+                EmeansGpuPrecision::F32,
+                EmeansGpuPrecision::Bf16AssignF32Stats,
+                EmeansGpuPrecision::Bf16,
+            ] {
+                for d in [1usize, 32usize] {
+                    let pad = |lead: f32| -> Vec<f32> {
+                        let mut v = vec![0.0f32; d];
+                        v[0] = lead;
+                        v
+                    };
+
+                    // 1. Sub-case 1 (`rn + best_s` overflow to `+Inf`: `x = [-1.0e19]`, `c = [+1.0e19]`,
+                    //    plus `x = [-8.0e18]`, `c = [+1.05e19]` where `rn <= 7e37` and `sc < FLT_MAX`
+                    //    yet `rn + sc > FLT_MAX`) and Sub-case 2 (`2*dot` overflow to `-Inf`:
+                    //    `x = [-1.5e19]`, `c = [+1.5e19]`).
+                    for (case_name, x_lead, c_lead) in [
+                        ("opp_rn_plus_sc_ovf", -1.0e19f32, 1.0e19f32),
+                        ("opp_low_rn_sum_ovf", -8.0e18f32, 1.05e19f32),
+                        ("opp_two_dot_neg_inf", -1.5e19f32, 1.5e19f32),
+                    ] {
+                        let x_row = pad(x_lead);
+                        let x_bf16 = f32_slice_to_bf16(&x_row);
+                        for k in [1usize, 1_026usize] {
+                            let mut cents = Vec::with_capacity(k * d);
+                            for _ in 0..k {
+                                cents.extend_from_slice(&pad(c_lead));
+                            }
+                            let ctx = format!("{case_name} ({backend:?}, {precision:?}, d={d}, k={k})");
+
+                            assert_nonfinite(
+                                assign_gpu_f32(
+                                    rt, &x_row, 1, d as u32, &cents, k as u32, 64, precision, backend, false,
+                                ),
+                                &format!("assign_gpu_f32 {ctx}"),
+                            );
+                            assert_nonfinite(
+                                assign_gpu_bf16(
+                                    rt, &x_bf16, 1, d as u32, &cents, k as u32, 64, precision, backend, false,
+                                ),
+                                &format!("assign_gpu_bf16 {ctx}"),
+                            );
+
+                            // Resident epoch (`alpha = 0.5`, `check_revive = true`) must refuse with
+                            // non-finite WITHOUT mutating `centroids` or `usage`, then recover cleanly.
+                            let cfg = EmeansGpuConfig {
+                                k: k as u32,
+                                d: d as u32,
+                                max_chunk_rows: 64,
+                                precision,
+                                backend,
+                                spherical: false,
+                                unused_threshold: 0.1,
+                                split_epsilon: 1.0e-4,
+                                init_usage: 1.0,
+                                seed: 42,
+                            };
+                            let mut runner = EmeansGpuRunner::new(rt, cfg, &cents).expect("runner");
+                            let bad_ds = runner.upload_dataset_f32(&x_row, 1).expect("upload bad_ds");
+                            let plan = [EpochBatchPlan {
+                                row_offset: 0,
+                                row_count: 1,
+                                alpha: 0.5,
+                                step: 0,
+                                check_revive: true,
+                            }];
+                            let mut lbl_out = [0u32; 1];
+                            assert_nonfinite(
+                                runner.run_resident_epoch(&bad_ds, &[0], &plan, true, Some(&mut lbl_out)),
+                                &format!("resident {ctx}"),
+                            );
+                            assert_nonfinite(
+                                runner.read_centroids(),
+                                &format!("read_centroids while fault-latched {ctx}"),
+                            );
+
+                            // Recover on the same `runner` with valid in-range row (`+0.5 * c_lead`).
+                            let ok_row = pad(0.5 * c_lead);
+                            let ok_ds = runner.upload_dataset_f32(&ok_row, 1).expect("upload ok_ds");
+                            let ok_plan = [EpochBatchPlan {
+                                row_offset: 0,
+                                row_count: 1,
+                                alpha: 0.0,
+                                step: 0,
+                                check_revive: false,
+                            }];
+                            let (ok_obj, _, ok_counts) = runner
+                                .run_resident_epoch(&ok_ds, &[0], &ok_plan, true, Some(&mut lbl_out))
+                                .expect("resident recovery after non-finite");
+                            assert_eq!(lbl_out, [0]);
+                            assert!(ok_obj.is_finite() && ok_obj > 0.0);
+                            assert_eq!(ok_counts[0], 1);
+                            let after_recover_cents = runner.read_centroids().expect("read centroids after recovery");
+                            assert_eq!(
+                                after_recover_cents[0], cents[0],
+                                "faulted resident epoch (alpha=0.5) must not mutate centroids ({ctx})"
+                            );
+
+                            // Streaming sync (`Some(&mut lbls)`) + async (`None` -> `apply_batch_update`) + recovery.
+                            runner.reset_pass_accumulators(true).expect("reset sync");
+                            assert_nonfinite(
+                                runner.accumulate_f32_chunk(&x_row, 1, Some(&mut lbl_out)),
+                                &format!("stream_sync_f32 {ctx}"),
+                            );
+                            runner.reset_pass_accumulators(false).expect("reset async");
+                            runner.accumulate_bf16_chunk(&x_bf16, 1, None).expect("async enqueue");
+                            assert_nonfinite(
+                                runner.apply_batch_update(0.0, 0, false),
+                                &format!("stream_async_bf16 {ctx}"),
+                            );
+                            runner.reset_pass_accumulators(true).expect("reset recover");
+                            runner
+                                .accumulate_f32_chunk(&ok_row, 1, Some(&mut lbl_out))
+                                .expect("stream recovery accum");
+                            let (rec_obj, rec_counts) =
+                                runner.finish_streaming_epoch().expect("stream recovery finish");
+                            assert_eq!(lbl_out, [0]);
+                            assert!(rec_obj.is_finite() && rec_obj > 0.0);
+                            assert_eq!(rec_counts[0], 1);
+                        }
+                    }
+
+                    // 2. Partial overflow across clusters (including `split_c = 2` where ALL 1024 clusters
+                    //    in partition 0 overflow `f32` while cluster `k - 1` in partition 1 has finite
+                    //    distance `(-1.5e19 - 0.2e19)^2 = 2.89e38 < FLT_MAX` with `best_s > 0`!).
+                    let x_part = pad(-1.5e19f32);
+                    let x_part_eff = effective_vec(&x_part, precision)[0];
+                    for k in [2usize, 1_026usize] {
+                        let mut cents = Vec::with_capacity(k * d);
+                        for _ in 0..(k - 1) {
+                            cents.extend_from_slice(&pad(1.5e19f32));
+                        }
+                        cents.extend_from_slice(&pad(0.2e19f32));
+                        let c_win_eff = effective_vec(&pad(0.2e19f32), precision)[0];
+                        let want_d2 = f64::from((x_part_eff - c_win_eff) * (x_part_eff - c_win_eff));
+
+                        let (lbls, obj) = assign_gpu_f32(
+                            rt, &x_part, 1, d as u32, &cents, k as u32, 64, precision, backend, false,
+                        )
+                        .expect("partial overflow assign_gpu_f32");
+                        assert_eq!(
+                            lbls,
+                            vec![(k - 1) as u32],
+                            "partial overflow must select sole finite cluster ({backend:?}, {precision:?}, d={d}, k={k})"
+                        );
+                        let rel = (obj - want_d2).abs() / want_d2;
+                        assert!(
+                            rel <= 1.0e-5,
+                            "partial overflow obj {obj:e} != want {want_d2:e} (rel={rel:e})"
+                        );
+                    }
+
+                    // 3. Sub-case 3: Same-sign `2.0f * dot` overflow (`x = [0.93e19]`,
+                    //    `c_0 = [1.84e19]` vs `c_{k-1} = [0.5e19]` across `k = 2` and `k = 1026`).
+                    let x_same = pad(0.93e19f32);
+                    let x_same_bf16 = f32_slice_to_bf16(&x_same);
+                    let x_same_eff = effective_vec(&x_same, precision)[0];
+                    let c_win_eff = effective_vec(&pad(0.5e19f32), precision)[0];
+                    let want_same_d2 = f64::from((x_same_eff - c_win_eff) * (x_same_eff - c_win_eff));
+
+                    for k in [2usize, 1_026usize] {
+                        let mut cents = Vec::with_capacity(k * d);
+                        for _ in 0..(k - 1) {
+                            cents.extend_from_slice(&pad(1.84e19f32));
+                        }
+                        cents.extend_from_slice(&pad(0.5e19f32));
+
+                        let (lbl_f32, obj_f32) = assign_gpu_f32(
+                            rt, &x_same, 1, d as u32, &cents, k as u32, 64, precision, backend, false,
+                        )
+                        .expect("same-sign assign_gpu_f32");
+                        assert_eq!(
+                            lbl_f32,
+                            vec![(k - 1) as u32],
+                            "same-sign 2*dot overflow hijacked argmin ({backend:?}, {precision:?}, d={d}, k={k})"
+                        );
+                        assert!(
+                            ((obj_f32 - want_same_d2).abs() / want_same_d2) <= 1.0e-5,
+                            "same-sign f32 obj {obj_f32:e} != want {want_same_d2:e}"
+                        );
+
+                        if matches!(
+                            precision,
+                            EmeansGpuPrecision::Bf16 | EmeansGpuPrecision::Bf16AssignF32Stats
+                        ) {
+                            let (lbl_bf16, obj_bf16) = assign_gpu_bf16(
+                                rt,
+                                &x_same_bf16,
+                                1,
+                                d as u32,
+                                &cents,
+                                k as u32,
+                                64,
+                                precision,
+                                backend,
+                                false,
+                            )
+                            .expect("same-sign assign_gpu_bf16");
+                            assert_eq!(lbl_bf16, vec![(k - 1) as u32]);
+                            assert!(((obj_bf16 - want_same_d2).abs() / want_same_d2) <= 1.0e-5);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}

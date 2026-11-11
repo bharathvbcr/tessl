@@ -5,11 +5,12 @@ use std::sync::Arc;
 use crate::common::{
     buf, buf_bf16, buf_u32, close_rel, dense_gemv, gelu_pytorch_tanh, pack_nibbles, random_f32, round_trip_bf16, silu,
 };
+use tessl::dequant::{dequant_affine_bf16, AffineBits, DequantAffineBank};
 use tessl::nn::{
     self, GateUpDispatch, I8AScale, I8BLayout, I8BScale, I8Gemm, I8Out, Q4Bank, Q4MlxBank, Q4MlxLayout,
     Q4MlxRowVariant, QkvOutputs, QuantShape, W4Arm, W4Gemm,
 };
-use tessl::tensor::GpuBuffer;
+use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_bf16_bits_gpu, GpuBuffer};
 use tessl::GpuRuntime;
 
 use super::Ledger;
@@ -1070,6 +1071,64 @@ fn w4(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     }
 }
 
+/// MLX affine dequant (row-major codes, low bits first in each `u32`) versus the
+/// host formula `bf16(fma(s, q, b))`. Scales and biases are bf16-exact and every
+/// output is zero or normal, so the GPU's flush-to-zero never applies.
+fn dequant_affine(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
+    let (rows, cols, group) = (6usize, 128usize, 64usize);
+    for bits in [AffineBits::Q8, AffineBits::Q4] {
+        let name = bits.entry();
+        let width = bits.bits() as usize;
+        let mask = (1u32 << width) - 1;
+        let codes: Vec<u32> = (0..rows * cols).map(|i| (i as u32 * 37 + 11) & mask).collect();
+        let packed: Vec<u32> = codes
+            .chunks(32 / width)
+            .map(|word| word.iter().enumerate().fold(0u32, |w, (j, &q)| w | (q << (width * j))))
+            .collect();
+        let groups = rows * (cols / group);
+        let scales: Vec<u16> = (0..groups)
+            .map(|i| f32_to_bf16_bits(0.0125 * (1.0 + (i % 5) as f32)))
+            .collect();
+        let biases: Vec<u16> = (0..groups)
+            .map(|i| f32_to_bf16_bits(-1.5 + 0.375 * (i % 7) as f32))
+            .collect();
+        let want: Vec<u16> = (0..rows * cols)
+            .map(|i| {
+                let g = (i / cols) * (cols / group) + (i % cols) / group;
+                let s = bf16_bits_to_f32(scales[g]);
+                f32_to_bf16_bits_gpu(s.mul_add(codes[i] as f32, bf16_bits_to_f32(biases[g])))
+            })
+            .collect();
+        let pb = buf_u32(rt, &packed);
+        let sb = rt.alloc_buffer(groups * 2).unwrap();
+        sb.write_bf16_bits(&scales);
+        let bb = rt.alloc_buffer(groups * 2).unwrap();
+        bb.write_bf16_bits(&biases);
+        let out = rt.alloc_buffer(rows * cols * 2).unwrap();
+        out.write_bf16_bits(&vec![0xDEAD; rows * cols]);
+        let fault = rt.alloc_buffer(4).unwrap();
+        fault.write_u32(&[0]);
+        let bank = DequantAffineBank {
+            packed: &pb,
+            scales: &sb,
+            biases: &bb,
+        };
+        ledger.credit(rt, name, &[name], || {
+            dequant_affine_bf16(rt, bits, bank, &out, &fault, shape(rows, cols, group))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            rt.synchronize().unwrap();
+            let got = out.contents_u16()[..rows * cols].to_vec();
+            if let Some(i) = got.iter().zip(&want).position(|(g, w)| g != w) {
+                panic!(
+                    "{name}: element {i} is {:#06x}, the host formula gives {:#06x}",
+                    got[i], want[i]
+                );
+            }
+            assert_eq!(fault.read_u32()[0], 0, "{name}: fault word raised on finite output");
+        });
+    }
+}
+
 pub fn run(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     assert!(rt.has_tensorops(), "quant sweep needs TensorOps");
     classic(rt, ledger);
@@ -1083,4 +1142,5 @@ pub fn run(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     quantize(rt, ledger);
     i8_dequant(rt, ledger);
     w4(rt, ledger);
+    dequant_affine(rt, ledger);
 }

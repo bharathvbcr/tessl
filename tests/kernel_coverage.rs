@@ -488,6 +488,7 @@ fn fake_release(tag: &str, trace: &str) -> kcov::TempDir {
         "bench_gemm_sweep",
         "bench_flash_attn",
         "bench_nn_kernels",
+        "bench_dequant_affine",
         "bench_encoder_attn",
         "bench_embedgemma2",
         "bench_embedgemma2_audio",
@@ -967,7 +968,6 @@ fn a_failed_suite_quotes_the_tail_of_its_stderr_where_the_cause_is() {
     fake_bin(
         &bin,
         "bench_nn_kernels",
-        "bench_dequant_affine",
         "printf 'BEGIN%0700d\\n' 0 >&2\necho 'error: the real cause' >&2\nexit 3",
     );
     let t = run_one(&bin, one_suite("bench_nn_kernels", &[], &[]));

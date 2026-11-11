@@ -1482,15 +1482,37 @@ kernel void emeans_apply_ema(
 {
     if (j >= k) return;
 
-    const ulong n_j = batch_counts[j];
-    const float n_old = usage[j];
-    const bool replace = (alpha == 1.0f);
-    const ulong base = (ulong)j * (ulong)d;
+    // Single-lane (`tid == 0`) read-update-clear of `batch_counts[j]` and `usage[j]`,
+    // broadcast via threadgroup SRAM so simdgroups 1..7 never race against simdgroup 0's
+    // device writeback of `batch_counts[j] = 0` / `usage[j] = n_new`.
+    threadgroup uint tg_has_points[1];
+    threadgroup float tg_scalars[2];
+    if (tid == 0u) {
+        const ulong n_j = batch_counts[j];
+        const float n_old = usage[j];
+        const bool replace = (alpha == 1.0f);
+        if (n_j > 0ul) {
+            const float nf = (float)n_j;
+            const float n_new = replace ? (alpha * nf) : ((1.0f - alpha) * n_old + alpha * nf);
+            const float w = (n_new > 0.0f) ? precise::divide(alpha * nf, n_new) : 0.0f;
+            tg_has_points[0] = 1u;
+            tg_scalars[0] = nf;
+            tg_scalars[1] = w;
+            usage[j] = n_new;
+        } else {
+            tg_has_points[0] = 0u;
+            tg_scalars[0] = 0.0f;
+            tg_scalars[1] = 0.0f;
+            usage[j] = replace ? 0.0f : ((1.0f - alpha) * n_old);
+        }
+        batch_counts[j] = 0ul;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (n_j > 0ul) {
-        const float nf = (float)n_j;
-        const float n_new = replace ? (alpha * nf) : ((1.0f - alpha) * n_old + alpha * nf);
-        const float w = (n_new > 0.0f) ? precise::divide(alpha * nf, n_new) : 0.0f;
+    const ulong base = (ulong)j * (ulong)d;
+    if (tg_has_points[0] != 0u) {
+        const float nf = tg_scalars[0];
+        const float w = tg_scalars[1];
         const bool exact_mean = (w == 1.0f);
         const bool keep_old = (w == 0.0f);
         for (ulong col = (ulong)tid; col < (ulong)d; col += 256ul) {
@@ -1500,17 +1522,9 @@ kernel void emeans_apply_ema(
             const float c_old = centroids[base + col];
             centroids[base + col] = exact_mean ? mean : (keep_old ? c_old : (c_old + w * (mean - c_old)));
         }
-        if (tid == 0u) {
-            usage[j] = n_new;
-            batch_counts[j] = 0ul;
-        }
     } else {
         for (ulong col = (ulong)tid; col < (ulong)d; col += 256ul) {
             batch_sums[base + col] = 0.0f;
-        }
-        if (tid == 0u) {
-            usage[j] = replace ? 0.0f : ((1.0f - alpha) * n_old);
-            batch_counts[j] = 0ul;
         }
     }
 }
@@ -1627,6 +1641,7 @@ kernel void emeans_revive_splits(
     const ulong target_base = (ulong)target * (ulong)d;
 
     uint local_diff = 0u;
+    float child0_reg = 0.0f;
     for (ulong col = (ulong)tid; col < (ulong)d; col += 256ul) {
         const float c = centroids[donor_base + col];
         const float off = ((col & 1ul) == 0ul) ? split_epsilon : (-split_epsilon);
@@ -1634,6 +1649,9 @@ kernel void emeans_revive_splits(
         const float child_c = c * (1.0f + off);
         centroids[donor_base + col] = donor_c;
         centroids[target_base + col] = child_c;
+        if (col == 0ul) {
+            child0_reg = child_c;
+        }
 
         if (use_bf16_repr != 0u) {
             const float dq = bf16_bits_to_f32_clean(f32_bits_to_bf16_rte(as_type<uint>(donor_c)));
@@ -1658,7 +1676,7 @@ kernel void emeans_revive_splits(
 
     if (tid == 0u) {
         if (atomic_load_explicit(&any_diff, memory_order_relaxed) == 0u && d > 0u) {
-            float child0 = centroids[target_base];
+            float child0 = child0_reg;
             if (use_bf16_repr != 0u) {
                 const ushort b = f32_bits_to_bf16_rte(as_type<uint>(child0));
                 if ((b & 0x7fffu) < 0x0080u) {

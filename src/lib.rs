@@ -107,7 +107,7 @@
 //!
 //! # Kernels
 //!
-//! 45 Metal sources compile to 366 kernel entry points: RMSNorm, gated MLP
+//! 46 Metal sources compile to 389 kernel entry points: RMSNorm, gated MLP
 //! activations, flash attention (sliding-window and global), fused
 //! RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV and a per-group matmul2d
 //! GEMM, an exact int8×int8 GEMM, W4A8, decode-only GQA, a fixed-order f32
@@ -256,6 +256,7 @@ pub mod embedgemma2_mm;
 pub mod embedgemma2_pre;
 pub mod embedgemma2_tok;
 pub mod embedgemma2_vision;
+pub mod emeans;
 mod encode_batch;
 pub mod gdn_train;
 pub mod gemm;
@@ -304,7 +305,7 @@ pub use icb_smoke::{icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBin
 #[cfg(feature = "quant-prep")]
 pub use mtl_tensor::{nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED};
 pub use ops::softcap_f32;
-pub use pool_ledger::{LedgerClass, LedgerRefused, PoolLedger, PoolResident};
+pub use pool_ledger::{LedgerClass, LedgerRefused, OjasBudgetLedger, PoolLedger, PoolResident};
 pub use runtime::{
     is_allocation_failure, AllocFailure, BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode,
 };

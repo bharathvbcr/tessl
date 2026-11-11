@@ -65,7 +65,7 @@ bin relaxed_predicate 1
 bin results_report 13
 bin release_check 14
 bin safetensors 12
-bin shader_index_arithmetic 29
+bin shader_index_arithmetic 30
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
@@ -123,6 +123,7 @@ lib embedgemma2_vision::tests:: 8
 lib embedgemma2_audio::tests:: 9
 lib embedgemma2_pre::tests:: 24
 lib embedgemma2_tok::tests:: 6
+lib emeans::tests:: 5
 lib gemm::coop_tile_select:: 4
 lib gemm::small_m_select:: 4
 lib par_batch::tests:: 6
@@ -130,7 +131,7 @@ lib media:: 19
 lib bounded_file::tests:: 15
 lib runtime::metallib_read_tests:: 6
 lib parser_mutation:: 16
-lib pool_ledger::tests:: 3
+lib pool_ledger::tests:: 11
 lib qwen35::tests:: 6
 lib qwen35_bwd::layout_tests:: 2
 exact lib encode_batch::tests::batch_shape_refusals_in_order

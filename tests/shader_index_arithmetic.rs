@@ -62,6 +62,8 @@ const BERT: &str = include_str!("../kernels/bert.metal");
 const EMEANS: &str = include_str!("../kernels/emeans.metal");
 const EMEANS_RS: &str = include_str!("../src/emeans.rs");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
+const DEQUANT_AFFINE: &str = include_str!("../kernels/dequant_affine.metal");
+const DEQUANT_RS: &str = include_str!("../src/dequant.rs");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -72,6 +74,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "bert.metal",
     "conv2d_tensorops.metal",
     "cross_entropy.metal",
+    "dequant_affine.metal",
     "embed_lookup.metal",
     "embed_pool.metal",
     "embedgemma2_vision.metal",
@@ -912,6 +915,25 @@ fn encoder_attn_offsets_are_widened() {
 /// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced
 /// `ld` apart. Every element and row offset is formed in 64 bits, and the
 /// device ranges are clamped to `rows` before any address is formed.
+/// The affine dequant forms its first code index (up to 8 codes per word, so
+/// past `u32::MAX` for a `u32` grid) and its group index in 64 bits. The only
+/// `uint` index is the thread's own word, and the host refuses more packed
+/// words than `uint` holds before it dispatches.
+#[test]
+fn dequant_affine_offsets_are_widened() {
+    for (needle, what) in [
+        ("if (gid >= n_words) return;", "grid guard"),
+        ("const ulong first = (ulong)gid * CODES;", "first code index"),
+        ("const ulong group = first >> group_shift;", "group index"),
+        ("store_pairs(out + first, pairs);", "output base"),
+    ] {
+        require(DEQUANT_AFFINE, needle, what);
+    }
+    forbid(DEQUANT_AFFINE, "const uint first", "dequant_affine first code index");
+    forbid(DEQUANT_AFFINE, "const uint group", "dequant_affine group index");
+    require(DEQUANT_RS, "if words > u32::MAX as usize {", "dequant host word bound");
+}
+
 #[test]
 fn embed_pool_offsets_are_widened() {
     for (needle, what) in [

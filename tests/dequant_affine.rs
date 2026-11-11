@@ -568,8 +568,8 @@ fn non_finite_scales_and_biases_propagate_by_ieee_rules() {
         let got = run(rt, &c, 0);
         assert_bits("non-finite inputs", &got, &c.model(Model::Device));
         // inf * 0 and inf - inf are NaN, never a finite value in disguise.
-        assert!(got.iter().any(|&v| v == 0x7FC0), "no NaN produced from inf*0 / inf-inf");
-        assert!(got.iter().any(|&v| v == 0x7F80) && got.iter().any(|&v| v == 0xFF80));
+        assert!(got.contains(&0x7FC0), "no NaN produced from inf*0 / inf-inf");
+        assert!(got.contains(&0x7F80) && got.contains(&0xFF80));
     });
 }
 
@@ -645,17 +645,17 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn u16s(name: &str) -> Vec<u16> {
-    fixture(name)
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
+    let raw = fixture(name);
+    let (halves, rest) = raw.as_chunks::<2>();
+    assert!(rest.is_empty(), "{name}: not a whole number of u16");
+    halves.iter().map(|b| u16::from_le_bytes(*b)).collect()
 }
 
 fn u32s(name: &str) -> Vec<u32> {
-    fixture(name)
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    let raw = fixture(name);
+    let (words, rest) = raw.as_chunks::<4>();
+    assert!(rest.is_empty(), "{name}: not a whole number of u32");
+    words.iter().map(|b| u32::from_le_bytes(*b)).collect()
 }
 
 fn golden_case(case: &str, bits: u32) -> (Case, Vec<u16>) {

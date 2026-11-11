@@ -1368,3 +1368,485 @@ fn test_streaming_faults_latch_and_resident_last_batch_prep_catches_overflow() {
         );
     });
 }
+
+fn build_k1024_zipf_fixture(n: usize, d: usize, k: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mix(*state)
+    }
+    fn next_bounded_u64(state: &mut u64, bound: u64) -> u64 {
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let r = next_u64(state);
+            let m = u128::from(r) * u128::from(bound);
+            if (m as u64) >= threshold {
+                return (m >> 64) as u64;
+            }
+        }
+    }
+    fn normal_pair(state: &mut u64) -> (f64, f64) {
+        let u1 = ((next_u64(state) >> 11) | 1) as f64 * (1.0 / ((1_u64 << 53) as f64));
+        let u2 = (next_u64(state) >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64));
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        (r * theta.cos(), r * theta.sin())
+    }
+    fn fill_normal_f32(state: &mut u64, scale: f64, dst: &mut [f32]) {
+        let mut i = 0;
+        while i + 1 < dst.len() {
+            let (z0, z1) = normal_pair(state);
+            dst[i] = (z0 * scale) as f32;
+            dst[i + 1] = (z1 * scale) as f32;
+            i += 2;
+        }
+        if i < dst.len() {
+            let (z0, _) = normal_pair(state);
+            dst[i] = (z0 * scale) as f32;
+        }
+    }
+
+    let mut state = seed;
+    let inv_sqrt_d = 1.0 / (d as f64).sqrt();
+    let mut true_centers = vec![0.0_f32; k * d];
+    fill_normal_f32(&mut state, inv_sqrt_d, &mut true_centers);
+
+    // Power-law Zipf component weights w_j ~ (j + 16)^(-0.75) so uniform Forgy initialization
+    // seeds multiple centroids inside dense modes while leaving hundreds of tail clusters dead.
+    let mut cdf = Vec::with_capacity(k);
+    let mut weight_sum = 0.0_f64;
+    for j in 0..k {
+        weight_sum += ((j + 16) as f64).powf(-0.75);
+        cdf.push(weight_sum);
+    }
+    for val in &mut cdf {
+        *val /= weight_sum;
+    }
+    if let Some(last) = cdf.last_mut() {
+        *last = 1.0;
+    }
+
+    let mut x_rows = vec![0.0_f32; n * d];
+    let mut noise_buf = vec![0.0_f32; d];
+    for r in 0..n {
+        let u = (next_u64(&mut state) >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64));
+        let comp = cdf.partition_point(|&p| p < u).min(k - 1);
+        fill_normal_f32(&mut state, 0.25 * inv_sqrt_d, &mut noise_buf);
+        let c_row = &true_centers[comp * d..(comp + 1) * d];
+        let dst = &mut x_rows[r * d..(r + 1) * d];
+        for col in 0..d {
+            dst[col] = c_row[col] + noise_buf[col];
+        }
+    }
+
+    let mut indices: Vec<u32> = (0..(n as u32)).collect();
+    let mut init_state = mix(seed ^ 0x494e_4954_4345_4e54);
+    for i in 0..k {
+        let pick = i + (next_bounded_u64(&mut init_state, (n - i) as u64) as usize);
+        indices.swap(i, pick);
+    }
+    let mut init_centroids = vec![0.0_f32; k * d];
+    for (j, &row_idx) in indices[..k].iter().enumerate() {
+        let src = (row_idx as usize) * d;
+        init_centroids[j * d..(j + 1) * d].copy_from_slice(&x_rows[src..src + d]);
+    }
+    (x_rows, init_centroids)
+}
+
+fn shuffled_epoch_order(n: u32, seed: u64, epoch: u64) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..n).collect();
+    let mut state = seed ^ epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for i in (1..order.len()).rev() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let j = (z as usize) % (i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+#[test]
+fn test_k1024_multi_epoch_repeat_and_streaming_bit_identity() {
+    common::with_gpu(|rt| {
+        // Exercises multi-pass CSR radix (&[16, 24]), 4-tile donor radix, part_k=1024,
+        // 16 tiles of 64x64 TensorOps, partial tail batches, init_usage=1/65536, and pool reclaim.
+        let n = 36_000usize;
+        let d = 128usize;
+        let k = 1_024usize;
+        let batch_size = 4_096u32;
+        let alpha0 = 0.314537f32;
+        let seed = 0x2026_1110_0128_1024u64;
+        let repeats = 8usize;
+
+        let (rows, init_centroids) = build_k1024_zipf_fixture(n, d, k, seed);
+        let order_ep0 = shuffled_epoch_order(n as u32, seed, 0);
+        let order_ep1 = shuffled_epoch_order(n as u32, seed, 1);
+
+        let batches_per_epoch = (n as u32).div_ceil(batch_size);
+        let total_steps = (batches_per_epoch * 2) as usize;
+        let build_batches = |step_base: u64| -> Vec<EpochBatchPlan> {
+            (0..batches_per_epoch)
+                .map(|b| {
+                    let row_offset = b * batch_size;
+                    let row_count = (n as u32 - row_offset).min(batch_size);
+                    let step = step_base + u64::from(b);
+                    let frac = ((step as usize).min(total_steps) as f64) / (total_steps as f64);
+                    let cos = 0.5 * (1.0 + (std::f64::consts::PI * frac).cos());
+                    let alpha = ((alpha0 as f64) * (0.1 + 0.9 * cos)) as f32;
+                    EpochBatchPlan {
+                        row_offset,
+                        row_count,
+                        alpha,
+                        step,
+                        check_revive: (step + 1).is_multiple_of(5) || b + 1 == batches_per_epoch,
+                    }
+                })
+                .collect()
+        };
+        let batches_ep0 = build_batches(0);
+        let batches_ep1 = build_batches(batches_ep0.len() as u64);
+
+        let mut backends = vec![EmeansGpuBackend::Simdgroup];
+        if rt.has_tensorops() {
+            backends.insert(0, EmeansGpuBackend::TensorOps);
+        }
+
+        for backend in backends {
+            for precision in [
+                EmeansGpuPrecision::F32,
+                EmeansGpuPrecision::Bf16AssignF32Stats,
+                EmeansGpuPrecision::Bf16,
+            ] {
+                #[derive(Debug, PartialEq, Eq)]
+                struct FitBits {
+                    ep0_obj_bits: u64,
+                    ep0_revivals: usize,
+                    ep0_counts: Vec<u64>,
+                    ep1_obj_bits: u64,
+                    ep1_revivals: usize,
+                    ep1_counts: Vec<u64>,
+                    labels: Vec<u32>,
+                    usage_bits: Vec<u32>,
+                    closing_bits: Vec<u32>,
+                }
+
+                let mut ref_fit: Option<FitBits> = None;
+                for rep in 0..repeats {
+                    let cfg = EmeansGpuConfig {
+                        k: k as u32,
+                        d: d as u32,
+                        max_chunk_rows: batch_size,
+                        precision,
+                        backend,
+                        spherical: false,
+                        unused_threshold: 0.1,
+                        split_epsilon: 1.0e-4,
+                        init_usage: 1.0 / 65_536.0,
+                        seed,
+                    };
+                    let mut runner = EmeansGpuRunner::new(rt, cfg, &init_centroids).expect("runner");
+                    let ds = runner.upload_dataset_f32(&rows, n as u32).expect("upload");
+                    let (ep0_obj, ep0_rev, ep0_counts) = runner
+                        .run_resident_epoch(&ds, &order_ep0, &batches_ep0, false, None)
+                        .expect("ep0");
+                    let mut labels = vec![0u32; n];
+                    let (ep1_obj, ep1_rev, ep1_counts) = runner
+                        .run_resident_epoch(&ds, &order_ep1, &batches_ep1, true, Some(&mut labels))
+                        .expect("ep1");
+                    let closing = runner.finalize_closing_centroids().expect("closing");
+                    let usage = runner.read_usage().expect("usage");
+                    drop(ds);
+                    drop(runner);
+                    rt.synchronize().expect("sync");
+                    let _ = rt.reclaim(u64::MAX);
+
+                    assert!(
+                        ep0_rev + ep1_rev >= 100,
+                        "fixture must exercise heavy dead-cluster revival at k=1024 (got {} + {})",
+                        ep0_rev,
+                        ep1_rev
+                    );
+
+                    let cur = FitBits {
+                        ep0_obj_bits: ep0_obj.to_bits(),
+                        ep0_revivals: ep0_rev,
+                        ep0_counts,
+                        ep1_obj_bits: ep1_obj.to_bits(),
+                        ep1_revivals: ep1_rev,
+                        ep1_counts,
+                        labels,
+                        usage_bits: usage.iter().map(|v| v.to_bits()).collect(),
+                        closing_bits: closing.iter().map(|v| v.to_bits()).collect(),
+                    };
+
+                    if let Some(ref want) = ref_fit {
+                        assert_eq!(
+                            cur.ep0_obj_bits, want.ep0_obj_bits,
+                            "k=1024 repeat {rep} ep0_obj diverged ({backend:?}, {precision:?}): got {:#x} ({}) vs {:#x} ({}); rev {} vs {}",
+                            cur.ep0_obj_bits, ep0_obj, want.ep0_obj_bits, f64::from_bits(want.ep0_obj_bits),
+                            cur.ep0_revivals, want.ep0_revivals
+                        );
+                        assert_eq!(
+                            cur.ep0_revivals, want.ep0_revivals,
+                            "k=1024 repeat {rep} ep0_revivals diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.ep0_counts, want.ep0_counts,
+                            "k=1024 repeat {rep} ep0_counts diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.ep1_obj_bits, want.ep1_obj_bits,
+                            "k=1024 repeat {rep} ep1_obj diverged ({backend:?}, {precision:?}): got {:#x} ({}) vs {:#x} ({}); rev {} vs {}",
+                            cur.ep1_obj_bits, ep1_obj, want.ep1_obj_bits, f64::from_bits(want.ep1_obj_bits),
+                            cur.ep1_revivals, want.ep1_revivals
+                        );
+                        assert_eq!(
+                            cur.ep1_revivals, want.ep1_revivals,
+                            "k=1024 repeat {rep} ep1_revivals diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.ep1_counts, want.ep1_counts,
+                            "k=1024 repeat {rep} ep1_counts diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.labels, want.labels,
+                            "k=1024 repeat {rep} labels diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.usage_bits, want.usage_bits,
+                            "k=1024 repeat {rep} usage bits diverged ({backend:?}, {precision:?})"
+                        );
+                        assert_eq!(
+                            cur.closing_bits, want.closing_bits,
+                            "k=1024 repeat {rep} closing centroid bits diverged ({backend:?}, {precision:?})"
+                        );
+                    } else {
+                        ref_fit = Some(cur);
+                    }
+                }
+
+                // Streaming path with matching chunk boundaries must match `run_resident_epoch`
+                // bit-for-bit (0-ULP) at k = 1024, and sub-chunked streaming must also be
+                // bit-identical across repeats.
+                let want = ref_fit.expect("ref_fit");
+                let stream_cfg = EmeansGpuConfig {
+                    k: k as u32,
+                    d: d as u32,
+                    max_chunk_rows: batch_size,
+                    precision,
+                    backend,
+                    spherical: false,
+                    unused_threshold: 0.1,
+                    split_epsilon: 1.0e-4,
+                    init_usage: 1.0 / 65_536.0,
+                    seed,
+                };
+                let mut s_runner = EmeansGpuRunner::new(rt, stream_cfg, &init_centroids).expect("s_runner");
+
+                // Epoch 0 (streaming async chunks matching resident chunk size)
+                s_runner.reset_pass_accumulators(false).expect("reset ep0");
+                let mut s_rev0 = 0usize;
+                for b in &batches_ep0 {
+                    let start = b.row_offset as usize;
+                    let end = start + (b.row_count as usize);
+                    let mut batch_rows = Vec::with_capacity((b.row_count as usize) * d);
+                    for &rid in &order_ep0[start..end] {
+                        let r = rid as usize;
+                        batch_rows.extend_from_slice(&rows[r * d..(r + 1) * d]);
+                    }
+                    s_runner
+                        .accumulate_f32_chunk(&batch_rows, b.row_count, None)
+                        .expect("acc ep0");
+                    s_rev0 += s_runner
+                        .apply_batch_update(b.alpha, b.step, b.check_revive)
+                        .expect("upd ep0");
+                }
+                let (s_obj0, s_counts0) = s_runner.finish_streaming_epoch().expect("fin ep0");
+
+                // Epoch 1 (final epoch with label capture)
+                s_runner.reset_pass_accumulators(true).expect("reset ep1");
+                let mut s_rev1 = 0usize;
+                let mut s_labels = vec![0u32; n];
+                for b in &batches_ep1 {
+                    let start = b.row_offset as usize;
+                    let end = start + (b.row_count as usize);
+                    let mut batch_rows = Vec::with_capacity((b.row_count as usize) * d);
+                    for &rid in &order_ep1[start..end] {
+                        let r = rid as usize;
+                        batch_rows.extend_from_slice(&rows[r * d..(r + 1) * d]);
+                    }
+                    let mut batch_lbls = vec![0u32; b.row_count as usize];
+                    s_runner
+                        .accumulate_f32_chunk(&batch_rows, b.row_count, Some(&mut batch_lbls))
+                        .expect("acc ep1");
+                    for (local_i, &rid) in order_ep1[start..end].iter().enumerate() {
+                        s_labels[rid as usize] = batch_lbls[local_i];
+                    }
+                    s_rev1 += s_runner
+                        .apply_batch_update(b.alpha, b.step, b.check_revive)
+                        .expect("upd ep1");
+                }
+                let (s_obj1, s_counts1) = s_runner.finish_streaming_epoch().expect("fin ep1");
+                let s_closing = s_runner.finalize_closing_centroids().expect("s_closing");
+                let s_usage = s_runner.read_usage().expect("s_usage");
+                drop(s_runner);
+                rt.synchronize().expect("sync");
+                let _ = rt.reclaim(u64::MAX);
+
+                assert_eq!(
+                    s_obj0.to_bits(),
+                    want.ep0_obj_bits,
+                    "stream ep0_obj ({backend:?}, {precision:?})"
+                );
+                assert_eq!(s_rev0, want.ep0_revivals, "stream ep0_rev ({backend:?}, {precision:?})");
+                assert_eq!(
+                    s_counts0, want.ep0_counts,
+                    "stream ep0_counts ({backend:?}, {precision:?})"
+                );
+                assert_eq!(
+                    s_obj1.to_bits(),
+                    want.ep1_obj_bits,
+                    "stream ep1_obj ({backend:?}, {precision:?})"
+                );
+                assert_eq!(s_rev1, want.ep1_revivals, "stream ep1_rev ({backend:?}, {precision:?})");
+                assert_eq!(
+                    s_counts1, want.ep1_counts,
+                    "stream ep1_counts ({backend:?}, {precision:?})"
+                );
+                assert_eq!(s_labels, want.labels, "stream labels ({backend:?}, {precision:?})");
+                assert_eq!(
+                    s_usage.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.usage_bits,
+                    "stream usage ({backend:?}, {precision:?})"
+                );
+                assert_eq!(
+                    s_closing.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.closing_bits,
+                    "stream closing ({backend:?}, {precision:?})"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn test_d512_split_c_repeat_bit_identity() {
+    common::with_gpu(|rt| {
+        // Shape-B feature width (`d = 512`, multi-iteration `col += 256` loop) combined with
+        // prime `k = 1_031` (`part_k = 1_024, split_c = 2` partition reduction) and sub-batch
+        // chunking (`max_chunk_rows = 1_024` < `batch_size = 2_048`).
+        let n = 8_192usize;
+        let d = 512usize;
+        let k = 1_031usize;
+        let batch_size = 2_048u32;
+        let max_chunk_rows = 1_024u32;
+        let alpha0 = 0.203799f32;
+        let seed = 0x2026_1110_0512_1031u64;
+        let repeats = 8usize;
+
+        let (rows, init_centroids) = build_k1024_zipf_fixture(n, d, k, seed);
+        let order_ep0 = shuffled_epoch_order(n as u32, seed, 0);
+        let batches_per_epoch = (n as u32) / batch_size;
+        let batches_ep0: Vec<EpochBatchPlan> = (0..batches_per_epoch)
+            .map(|b| {
+                let step = u64::from(b);
+                let frac = (b as f64) / (batches_per_epoch as f64);
+                let cos = 0.5 * (1.0 + (std::f64::consts::PI * frac).cos());
+                let alpha = ((alpha0 as f64) * (0.1 + 0.9 * cos)) as f32;
+                EpochBatchPlan {
+                    row_offset: b * batch_size,
+                    row_count: batch_size,
+                    alpha,
+                    step,
+                    check_revive: (b + 1) % 2 == 0,
+                }
+            })
+            .collect();
+
+        let mut backends = vec![EmeansGpuBackend::Simdgroup];
+        if rt.has_tensorops() {
+            backends.insert(0, EmeansGpuBackend::TensorOps);
+        }
+
+        for backend in backends {
+            for precision in [
+                EmeansGpuPrecision::F32,
+                EmeansGpuPrecision::Bf16AssignF32Stats,
+                EmeansGpuPrecision::Bf16,
+            ] {
+                #[derive(Debug, PartialEq, Eq)]
+                struct SplitCFitBits {
+                    obj_bits: u64,
+                    rev: usize,
+                    counts: Vec<u64>,
+                    labels: Vec<u32>,
+                    usage_bits: Vec<u32>,
+                    closing_bits: Vec<u32>,
+                }
+
+                let mut ref_state: Option<SplitCFitBits> = None;
+                for rep in 0..repeats {
+                    let cfg = EmeansGpuConfig {
+                        k: k as u32,
+                        d: d as u32,
+                        max_chunk_rows,
+                        precision,
+                        backend,
+                        spherical: false,
+                        unused_threshold: 0.1,
+                        split_epsilon: 1.0e-4,
+                        init_usage: 1.0 / 65_536.0,
+                        seed,
+                    };
+                    let mut runner = EmeansGpuRunner::new(rt, cfg, &init_centroids).expect("runner");
+                    let ds = runner.upload_dataset_f32(&rows, n as u32).expect("upload");
+                    let mut labels = vec![0u32; n];
+                    let (obj, rev, counts) = runner
+                        .run_resident_epoch(&ds, &order_ep0, &batches_ep0, true, Some(&mut labels))
+                        .expect("epoch");
+                    let closing_bits: Vec<u32> = runner
+                        .finalize_closing_centroids()
+                        .expect("closing")
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect();
+                    let usage_bits: Vec<u32> = runner
+                        .read_usage()
+                        .expect("usage")
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect();
+                    drop(ds);
+                    drop(runner);
+                    rt.synchronize().expect("sync");
+                    let _ = rt.reclaim(u64::MAX);
+
+                    assert!(rev >= 50, "d=512 split_c=2 fixture must trigger revivals (got {rev})");
+                    let cur = SplitCFitBits {
+                        obj_bits: obj.to_bits(),
+                        rev,
+                        counts,
+                        labels,
+                        usage_bits,
+                        closing_bits,
+                    };
+                    if let Some(ref want) = ref_state {
+                        assert_eq!(
+                            &cur, want,
+                            "d=512 k=1031 split_c=2 repeat {rep} diverged ({backend:?}, {precision:?})"
+                        );
+                    } else {
+                        ref_state = Some(cur);
+                    }
+                }
+            }
+        }
+    });
+}

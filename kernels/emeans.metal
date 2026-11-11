@@ -20,17 +20,20 @@ using namespace mpp::tensor_ops;
 #pragma clang fp contract(off) reassociate(off)
 
 constant constexpr float EMEANS_MAX_SENTINEL = as_type<float>(0x7f7fffffu);
+constant constexpr float EMEANS_SAFE_RN_MAX  = 7.0e37f;
 constant constexpr uint EMEANS_INVALID_LABEL = 0xffffffffu;
 
 // Fault bitmask bits in `fault_flags[0]`:
-//   bit 0 (1u): non-finite input coordinate (row or centroid)
-//   bit 1 (2u): finite f32 overflowed bf16 range (|x| rounds to >= 2^128) or raw bf16 non-finite
-//   bit 2 (4u): squared L2 row norm overflowed f32
-//   bit 3 (8u): squared L2 centroid norm overflowed f32
+//   bit 0 (1u):  non-finite input coordinate (row or centroid)
+//   bit 1 (2u):  finite f32 overflowed bf16 range (|x| rounds to >= 2^128) or raw bf16 non-finite
+//   bit 2 (4u):  squared L2 row norm overflowed f32
+//   bit 3 (8u):  squared L2 centroid norm overflowed f32
+//   bit 4 (16u): squared Euclidean distance overflowed f32
 constant constexpr uint FAULT_INPUT_NONFINITE = 1u;
 constant constexpr uint FAULT_BF16_OVERFLOW   = 2u;
 constant constexpr uint FAULT_ROW_NORM_OVF    = 4u;
 constant constexpr uint FAULT_CENT_NORM_OVF   = 8u;
+constant constexpr uint FAULT_DIST_NONFINITE  = 16u;
 
 inline bool f32_bits_is_nonfinite(uint bits) {
     return (bits & 0x7fffffffu) >= 0x7f800000u;
@@ -87,9 +90,76 @@ inline float tg_reduce_max_256(float val, uint tid, threadgroup float (&scratch)
     return out;
 }
 
-// Exact L2 distance refinement when `||x||^2 + ||c||^2 - 2<x,c>` is near zero:
-// eliminates multi-ULP cancellation noise and guarantees exact `0.0f` self-distance
-// at `\tilde{x}_i == \tilde{c}_j` across all tile/reduction orders.
+// Exact coordinate-wise squared Euclidean distance over effective operands (`bf16` or `f32`).
+template <typename ElemT>
+inline float exact_pair_dist2(
+    device const ElemT *X,
+    device const ElemT *C,
+    uint row,
+    uint cid,
+    uint d)
+{
+    float exact_d = 0.0f;
+    const ulong x_base = (ulong)row * (ulong)d;
+    const ulong c_base = (ulong)cid * (ulong)d;
+    for (ulong col = 0ul; col < (ulong)d; ++col) {
+        const float diff = float(X[x_base + col]) - float(C[c_base + col]);
+        exact_d += diff * diff;
+    }
+    return exact_d;
+}
+
+// Evaluate assignment score for `(row, glob_c)`:
+// - Fast path (`rn <= EMEANS_SAFE_RN_MAX`, where Cauchy-Schwarz guarantees `|2 * dot| < FLT_MAX`):
+//   executes `cn - 2.0f * dot` with 0-ULP identical bits and zero extra global memory reads.
+// - Near-`FLT_MAX` slow path (`rn > EMEANS_SAFE_RN_MAX` or `cn - 2.0f * dot` overflow):
+//   evaluates exact coordinate-wise squared distance and rejects candidates that overflow `f32`.
+template <typename ElemT>
+inline bool eval_assign_score(
+    device const ElemT *X_assign,
+    device const ElemT *C_eff,
+    uint row,
+    uint glob_c,
+    uint d,
+    float rn,
+    float cn,
+    float dot,
+    uint spherical,
+    thread float &out_score)
+{
+    if (spherical != 0u) {
+        const float sc = -2.0f * dot;
+        if (f32_bits_is_nonfinite(as_type<uint>(sc))) {
+            return false;
+        }
+        out_score = sc;
+        return true;
+    }
+    if (rn > EMEANS_SAFE_RN_MAX) {
+        const float exact_d = exact_pair_dist2<ElemT>(X_assign, C_eff, row, glob_c, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            return false;
+        }
+        out_score = exact_d;
+        return true;
+    }
+    const float two_dot = 2.0f * dot;
+    const float sc = cn - two_dot;
+    if (f32_bits_is_nonfinite(as_type<uint>(two_dot)) || f32_bits_is_nonfinite(as_type<uint>(sc))) {
+        const float exact_d = exact_pair_dist2<ElemT>(X_assign, C_eff, row, glob_c, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            return false;
+        }
+        out_score = exact_d - rn;
+        return true;
+    }
+    out_score = sc;
+    return true;
+}
+
+// Exact L2 distance refinement when `||x||^2 + ||c||^2 - 2<x,c>` is near zero or overflows `f32`:
+// eliminates multi-ULP cancellation noise, guarantees exact `0.0f` self-distance at
+// `\tilde{x}_i == \tilde{c}_j`, and raises `FAULT_DIST_NONFINITE` if true distance overflows `f32`.
 inline float finalize_row_dist_bf16(
     device const bfloat *X_bf16,
     device const bfloat *C_bf16,
@@ -98,20 +168,40 @@ inline float finalize_row_dist_bf16(
     uint d,
     float rn,
     float best_s,
-    uint spherical)
+    uint spherical,
+    device atomic_uint *fault_flags)
 {
     if (spherical != 0u) {
-        return 2.0f + best_s;
+        const float sph_d = 2.0f + best_s;
+        if (f32_bits_is_nonfinite(as_type<uint>(sph_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return sph_d;
+    }
+    if (rn > EMEANS_SAFE_RN_MAX) {
+        const float exact_d = exact_pair_dist2<bfloat>(X_bf16, C_bf16, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return exact_d;
     }
     const float raw = rn + best_s;
+    if (f32_bits_is_nonfinite(as_type<uint>(raw))) {
+        const float exact_d = exact_pair_dist2<bfloat>(X_bf16, C_bf16, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return exact_d;
+    }
     const float scale = max(rn, 1.0e-30f);
     if (fabs(raw) <= 1024.0f * 1.1920929e-7f * scale) {
-        float exact_d = 0.0f;
-        const ulong x_base = (ulong)row * (ulong)d;
-        const ulong c_base = (ulong)best_l * (ulong)d;
-        for (ulong col = 0ul; col < (ulong)d; ++col) {
-            const float diff = float(X_bf16[x_base + col]) - float(C_bf16[c_base + col]);
-            exact_d += diff * diff;
+        const float exact_d = exact_pair_dist2<bfloat>(X_bf16, C_bf16, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
         }
         return exact_d;
     }
@@ -126,20 +216,40 @@ inline float finalize_row_dist_f32(
     uint d,
     float rn,
     float best_s,
-    uint spherical)
+    uint spherical,
+    device atomic_uint *fault_flags)
 {
     if (spherical != 0u) {
-        return 2.0f + best_s;
+        const float sph_d = 2.0f + best_s;
+        if (f32_bits_is_nonfinite(as_type<uint>(sph_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return sph_d;
+    }
+    if (rn > EMEANS_SAFE_RN_MAX) {
+        const float exact_d = exact_pair_dist2<float>(X_f32, C_f32, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return exact_d;
     }
     const float raw = rn + best_s;
+    if (f32_bits_is_nonfinite(as_type<uint>(raw))) {
+        const float exact_d = exact_pair_dist2<float>(X_f32, C_f32, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
+        }
+        return exact_d;
+    }
     const float scale = max(rn, 1.0e-30f);
     if (fabs(raw) <= 1024.0f * 1.1920929e-7f * scale) {
-        float exact_d = 0.0f;
-        const ulong x_base = (ulong)row * (ulong)d;
-        const ulong c_base = (ulong)best_l * (ulong)d;
-        for (ulong col = 0ul; col < (ulong)d; ++col) {
-            const float diff = X_f32[x_base + col] - C_f32[c_base + col];
-            exact_d += diff * diff;
+        const float exact_d = exact_pair_dist2<float>(X_f32, C_f32, row, best_l, d);
+        if (f32_bits_is_nonfinite(as_type<uint>(exact_d))) {
+            atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+            return 0.0f;
         }
         return exact_d;
     }
@@ -551,7 +661,12 @@ inline void emeans_assign_tensorops_body(
 
             const uint glob_c = c_start + loc_c;
             const float dot = cT[i];
-            const float sc = (spherical != 0u) ? (-2.0f * dot) : (norm2_c[glob_c] - 2.0f * dot);
+            const float rn = (spherical != 0u) ? 0.0f : row_norm2[row];
+            const float cn = (spherical != 0u) ? 0.0f : norm2_c[glob_c];
+            float sc = 0.0f;
+            if (!eval_assign_score<ElemT>(X_assign, C_eff, row, glob_c, d, rn, cn, dot, spherical, sc)) {
+                continue;
+            }
             const float cur_s = bestScoreT[i];
             const int cur_l = bestLabelT[i];
             if (cur_l < 0 || sc < cur_s || (sc == cur_s && glob_c < (uint)cur_l)) {
@@ -592,7 +707,7 @@ inline void emeans_assign_tensorops_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < 64u) {
+    if (split_c > 1u && tid < 64u) {
         const uint row = ty_u + tid;
         if (row < M) {
             float best_s = EMEANS_MAX_SENTINEL;
@@ -607,20 +722,9 @@ inline void emeans_assign_tensorops_body(
                     best_l = ul;
                 }
             }
-            if (best_l == EMEANS_INVALID_LABEL) {
-                best_l = c_start;
-                best_s = 0.0f;
-            }
-            if (split_c <= 1u) {
-                chunk_labels[row] = best_l;
-                if (has_epoch_labels != 0u) {
-                    epoch_labels[epoch_off + row] = best_l;
-                }
-            } else {
-                const ulong p_off = (ulong)part_c * (ulong)M + (ulong)row;
-                part_scores[p_off] = best_s;
-                part_labels[p_off] = best_l;
-            }
+            const ulong p_off = (ulong)part_c * (ulong)M + (ulong)row;
+            part_scores[p_off] = best_s;
+            part_labels[p_off] = best_l;
         }
     }
 }
@@ -644,6 +748,7 @@ kernel void emeans_assign_bf16_tensorops(
     constant uint &spherical [[buffer(15)]],
     constant uint &has_epoch_labels [[buffer(16)]],
     constant uint &epoch_off [[buffer(17)]],
+    device atomic_uint *fault_flags [[buffer(18)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sid [[simdgroup_index_in_threadgroup]],
@@ -671,11 +776,20 @@ kernel void emeans_assign_bf16_tensorops(
                 }
             }
             if (best_l == EMEANS_INVALID_LABEL) {
-                best_l = c_start;
-                best_s = 0.0f;
+                atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+                chunk_labels[row] = c_start;
+                chunk_dists[row] = 0.0f;
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = c_start;
+                }
+            } else {
+                chunk_labels[row] = best_l;
+                chunk_dists[row] = finalize_row_dist_bf16(
+                    X_bf16, C_bf16, row, best_l, d, row_norm2[row], best_s, spherical, fault_flags);
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = best_l;
+                }
             }
-            chunk_dists[row] = finalize_row_dist_bf16(
-                X_bf16, C_bf16, row, best_l, d, row_norm2[row], best_s, spherical);
         }
     }
 }
@@ -699,6 +813,7 @@ kernel void emeans_assign_f32_tensorops(
     constant uint &spherical [[buffer(15)]],
     constant uint &has_epoch_labels [[buffer(16)]],
     constant uint &epoch_off [[buffer(17)]],
+    device atomic_uint *fault_flags [[buffer(18)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sid [[simdgroup_index_in_threadgroup]],
@@ -726,11 +841,20 @@ kernel void emeans_assign_f32_tensorops(
                 }
             }
             if (best_l == EMEANS_INVALID_LABEL) {
-                best_l = c_start;
-                best_s = 0.0f;
+                atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+                chunk_labels[row] = c_start;
+                chunk_dists[row] = 0.0f;
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = c_start;
+                }
+            } else {
+                chunk_labels[row] = best_l;
+                chunk_dists[row] = finalize_row_dist_f32(
+                    X_f32, C_f32, row, best_l, d, row_norm2[row], best_s, spherical, fault_flags);
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = best_l;
+                }
             }
-            chunk_dists[row] = finalize_row_dist_f32(
-                X_f32, C_f32, row, best_l, d, row_norm2[row], best_s, spherical);
         }
     }
 }
@@ -758,6 +882,7 @@ kernel void emeans_assign_bf16_simdgroup(
     constant uint &spherical [[buffer(15)]],
     constant uint &has_epoch_labels [[buffer(16)]],
     constant uint &epoch_off [[buffer(17)]],
+    device atomic_uint *fault_flags [[buffer(18)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint sid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -772,6 +897,8 @@ kernel void emeans_assign_bf16_simdgroup(
     const uint c_len = c_end - c_start;
     const uint my_r = lane >> 2u;
     const uint my_part = lane & 3u;
+    const uint row = row0 + my_r;
+    const float my_rn = (spherical == 0u && row < M) ? row_norm2[row] : 0.0f;
     float best_s = EMEANS_MAX_SENTINEL;
     uint best_l = EMEANS_INVALID_LABEL;
 
@@ -818,17 +945,22 @@ kernel void emeans_assign_bf16_simdgroup(
         simdgroup_store(acc3, sg_c[sid] + 24, 32);
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row0 + my_r < M) {
+        if (row < M) {
             for (uint j = 0u; j < 8u; ++j) {
                 const uint cn = my_part * 8u + j;
                 const uint loc_c = tx + cn;
                 if (loc_c < c_len) {
                     const uint glob_c = c_start + loc_c;
                     const float dot = sg_c[sid][my_r * 32u + cn];
-                    const float sc = (spherical != 0u) ? (-2.0f * dot) : (norm2_c[glob_c] - 2.0f * dot);
-                    if (best_l == EMEANS_INVALID_LABEL || sc < best_s || (sc == best_s && glob_c < best_l)) {
-                        best_s = sc;
-                        best_l = glob_c;
+                    const float c_norm2 = (spherical != 0u) ? 0.0f : norm2_c[glob_c];
+                    float sc = 0.0f;
+                    if (eval_assign_score<bfloat>(
+                            X_bf16, C_bf16, row, glob_c, d, my_rn, c_norm2, dot, spherical, sc))
+                    {
+                        if (best_l == EMEANS_INVALID_LABEL || sc < best_s || (sc == best_s && glob_c < best_l)) {
+                            best_s = sc;
+                            best_l = glob_c;
+                        }
                     }
                 }
             }
@@ -847,18 +979,22 @@ kernel void emeans_assign_bf16_simdgroup(
         }
     }
 
-    const uint row = row0 + my_r;
     if (my_part == 0u && row < M) {
-        if (best_l == EMEANS_INVALID_LABEL) {
-            best_l = c_start;
-            best_s = 0.0f;
-        }
         if (split_c <= 1u) {
-            chunk_labels[row] = best_l;
-            chunk_dists[row] = finalize_row_dist_bf16(
-                X_bf16, C_bf16, row, best_l, d, row_norm2[row], best_s, spherical);
-            if (has_epoch_labels != 0u) {
-                epoch_labels[epoch_off + row] = best_l;
+            if (best_l == EMEANS_INVALID_LABEL) {
+                atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+                chunk_labels[row] = c_start;
+                chunk_dists[row] = 0.0f;
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = c_start;
+                }
+            } else {
+                chunk_labels[row] = best_l;
+                chunk_dists[row] = finalize_row_dist_bf16(
+                    X_bf16, C_bf16, row, best_l, d, my_rn, best_s, spherical, fault_flags);
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = best_l;
+                }
             }
         } else {
             const ulong p_off = (ulong)part_c * (ulong)M + (ulong)row;
@@ -887,6 +1023,7 @@ kernel void emeans_assign_f32_simdgroup(
     constant uint &spherical [[buffer(15)]],
     constant uint &has_epoch_labels [[buffer(16)]],
     constant uint &epoch_off [[buffer(17)]],
+    device atomic_uint *fault_flags [[buffer(18)]],
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint sid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -901,6 +1038,8 @@ kernel void emeans_assign_f32_simdgroup(
     const uint c_len = c_end - c_start;
     const uint my_r = lane >> 2u;
     const uint my_part = lane & 3u;
+    const uint row = row0 + my_r;
+    const float my_rn = (spherical == 0u && row < M) ? row_norm2[row] : 0.0f;
     float best_s = EMEANS_MAX_SENTINEL;
     uint best_l = EMEANS_INVALID_LABEL;
 
@@ -947,17 +1086,22 @@ kernel void emeans_assign_f32_simdgroup(
         simdgroup_store(acc3, sg_c[sid] + 24, 32);
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row0 + my_r < M) {
+        if (row < M) {
             for (uint j = 0u; j < 8u; ++j) {
                 const uint cn = my_part * 8u + j;
                 const uint loc_c = tx + cn;
                 if (loc_c < c_len) {
                     const uint glob_c = c_start + loc_c;
                     const float dot = sg_c[sid][my_r * 32u + cn];
-                    const float sc = (spherical != 0u) ? (-2.0f * dot) : (norm2_c[glob_c] - 2.0f * dot);
-                    if (best_l == EMEANS_INVALID_LABEL || sc < best_s || (sc == best_s && glob_c < best_l)) {
-                        best_s = sc;
-                        best_l = glob_c;
+                    const float c_norm2 = (spherical != 0u) ? 0.0f : norm2_c[glob_c];
+                    float sc = 0.0f;
+                    if (eval_assign_score<float>(
+                            X_f32, C_f32, row, glob_c, d, my_rn, c_norm2, dot, spherical, sc))
+                    {
+                        if (best_l == EMEANS_INVALID_LABEL || sc < best_s || (sc == best_s && glob_c < best_l)) {
+                            best_s = sc;
+                            best_l = glob_c;
+                        }
                     }
                 }
             }
@@ -976,18 +1120,22 @@ kernel void emeans_assign_f32_simdgroup(
         }
     }
 
-    const uint row = row0 + my_r;
     if (my_part == 0u && row < M) {
-        if (best_l == EMEANS_INVALID_LABEL) {
-            best_l = c_start;
-            best_s = 0.0f;
-        }
         if (split_c <= 1u) {
-            chunk_labels[row] = best_l;
-            chunk_dists[row] = finalize_row_dist_f32(
-                X_f32, C_f32, row, best_l, d, row_norm2[row], best_s, spherical);
-            if (has_epoch_labels != 0u) {
-                epoch_labels[epoch_off + row] = best_l;
+            if (best_l == EMEANS_INVALID_LABEL) {
+                atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+                chunk_labels[row] = c_start;
+                chunk_dists[row] = 0.0f;
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = c_start;
+                }
+            } else {
+                chunk_labels[row] = best_l;
+                chunk_dists[row] = finalize_row_dist_f32(
+                    X_f32, C_f32, row, best_l, d, my_rn, best_s, spherical, fault_flags);
+                if (has_epoch_labels != 0u) {
+                    epoch_labels[epoch_off + row] = best_l;
+                }
             }
         } else {
             const ulong p_off = (ulong)part_c * (ulong)M + (ulong)row;
@@ -1017,6 +1165,7 @@ kernel void emeans_reduce_split_c(
     constant uint &use_bf16_assign [[buffer(12)]],
     constant uint &has_epoch_labels [[buffer(13)]],
     constant uint &epoch_off [[buffer(14)]],
+    device atomic_uint *fault_flags [[buffer(15)]],
     uint row [[thread_position_in_grid]])
 {
     if (row >= M) return;
@@ -1028,6 +1177,7 @@ kernel void emeans_reduce_split_c(
         const ulong off = (ulong)p * (ulong)M + (ulong)row;
         const float sc = part_scores[off];
         const uint ul = part_labels[off];
+        if (ul == EMEANS_INVALID_LABEL) continue;
         if (!have || sc < best_s || (sc == best_s && ul < best_l)) {
             best_s = sc;
             best_l = ul;
@@ -1035,17 +1185,27 @@ kernel void emeans_reduce_split_c(
         }
     }
 
+    if (!have) {
+        atomic_fetch_or_explicit(fault_flags, FAULT_DIST_NONFINITE, memory_order_relaxed);
+        chunk_labels[row] = 0u;
+        chunk_dists[row] = 0.0f;
+        if (has_epoch_labels != 0u) {
+            epoch_labels[epoch_off + row] = 0u;
+        }
+        return;
+    }
+
     chunk_labels[row] = best_l;
     if (use_bf16_assign != 0u) {
         chunk_dists[row] = finalize_row_dist_bf16(
             (device const bfloat *)X_assign,
             (device const bfloat *)C_eff,
-            row, best_l, d, row_norm2[row], best_s, spherical);
+            row, best_l, d, row_norm2[row], best_s, spherical, fault_flags);
     } else {
         chunk_dists[row] = finalize_row_dist_f32(
             (device const float *)X_assign,
             (device const float *)C_eff,
-            row, best_l, d, row_norm2[row], best_s, spherical);
+            row, best_l, d, row_norm2[row], best_s, spherical, fault_flags);
     }
     if (has_epoch_labels != 0u) {
         epoch_labels[epoch_off + row] = best_l;
@@ -1442,13 +1602,23 @@ kernel void emeans_accum_chunk_obj(
     device const float *chunk_dists [[buffer(0)]],
     device ulong *epoch_obj_bits [[buffer(1)]],
     constant uint &M [[buffer(2)]],
+    device atomic_uint *fault_flags [[buffer(3)]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup ulong scratch[256];
 
     ulong acc = 0ul;
+    uint local_fault = 0u;
     for (uint r = tid; r < M; r += 256u) {
-        acc = f64_add_bits(acc, f32_to_f64_bits(chunk_dists[r]));
+        const float d_val = chunk_dists[r];
+        if (f32_bits_is_nonfinite(as_type<uint>(d_val))) {
+            local_fault |= FAULT_DIST_NONFINITE;
+        } else {
+            acc = f64_add_bits(acc, f32_to_f64_bits(d_val));
+        }
+    }
+    if (local_fault != 0u) {
+        atomic_fetch_or_explicit(fault_flags, local_fault, memory_order_relaxed);
     }
     scratch[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1477,6 +1647,7 @@ kernel void emeans_apply_ema(
     constant uint &k [[buffer(4)]],
     constant uint &d [[buffer(5)]],
     constant float &alpha [[buffer(6)]],
+    device atomic_uint *fault_flags [[buffer(7)]],
     uint j [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
@@ -1485,27 +1656,36 @@ kernel void emeans_apply_ema(
     // Single-lane (`tid == 0`) read-update-clear of `batch_counts[j]` and `usage[j]`,
     // broadcast via threadgroup SRAM so simdgroups 1..7 never race against simdgroup 0's
     // device writeback of `batch_counts[j] = 0` / `usage[j] = n_new`.
+    // When an upstream kernel in this epoch raised `fault_flags`, clear `batch_counts` /
+    // `batch_sums` without mutating `centroids` or `usage` so the runner recovers cleanly.
     threadgroup uint tg_has_points[1];
     threadgroup float tg_scalars[2];
     if (tid == 0u) {
-        const ulong n_j = batch_counts[j];
-        const float n_old = usage[j];
-        const bool replace = (alpha == 1.0f);
-        if (n_j > 0ul) {
-            const float nf = (float)n_j;
-            const float n_new = replace ? (alpha * nf) : ((1.0f - alpha) * n_old + alpha * nf);
-            const float w = (n_new > 0.0f) ? precise::divide(alpha * nf, n_new) : 0.0f;
-            tg_has_points[0] = 1u;
-            tg_scalars[0] = nf;
-            tg_scalars[1] = w;
-            usage[j] = n_new;
-        } else {
+        if (atomic_load_explicit(fault_flags, memory_order_relaxed) != 0u) {
             tg_has_points[0] = 0u;
             tg_scalars[0] = 0.0f;
             tg_scalars[1] = 0.0f;
-            usage[j] = replace ? 0.0f : ((1.0f - alpha) * n_old);
+            batch_counts[j] = 0ul;
+        } else {
+            const ulong n_j = batch_counts[j];
+            const float n_old = usage[j];
+            const bool replace = (alpha == 1.0f);
+            if (n_j > 0ul) {
+                const float nf = (float)n_j;
+                const float n_new = replace ? (alpha * nf) : ((1.0f - alpha) * n_old + alpha * nf);
+                const float w = (n_new > 0.0f) ? precise::divide(alpha * nf, n_new) : 0.0f;
+                tg_has_points[0] = 1u;
+                tg_scalars[0] = nf;
+                tg_scalars[1] = w;
+                usage[j] = n_new;
+            } else {
+                tg_has_points[0] = 0u;
+                tg_scalars[0] = 0.0f;
+                tg_scalars[1] = 0.0f;
+                usage[j] = replace ? 0.0f : ((1.0f - alpha) * n_old);
+            }
+            batch_counts[j] = 0ul;
         }
-        batch_counts[j] = 0ul;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1564,6 +1744,7 @@ kernel void emeans_revive_prepare(
     constant float &unused_threshold [[buffer(5)]],
     constant ulong &seed [[buffer(6)]],
     constant ulong &step [[buffer(7)]],
+    device atomic_uint *fault_flags [[buffer(8)]],
     uint tid [[thread_index_in_threadgroup]])
 {
     threadgroup float scratch[256];
@@ -1578,21 +1759,27 @@ kernel void emeans_revive_prepare(
     const float thresh = unused_threshold * mean_n;
 
     if (tid == 0u) {
-        uint n_unused = 0u;
-        uint n_donors = 0u;
-        for (uint j = 0u; j < k; ++j) {
-            const float nj = usage[j];
-            if (nj < thresh) {
-                unused_ids[n_unused] = j;
-                n_unused += 1u;
-            } else if (nj > 0.0f) {
-                n_donors += 1u;
+        if (atomic_load_explicit(fault_flags, memory_order_relaxed) != 0u) {
+            tg_counts[0] = 0u;
+            tg_counts[1] = 0u;
+            revive_meta[0] = uint2(0u, revive_meta[0].y);
+        } else {
+            uint n_unused = 0u;
+            uint n_donors = 0u;
+            for (uint j = 0u; j < k; ++j) {
+                const float nj = usage[j];
+                if (nj < thresh) {
+                    unused_ids[n_unused] = j;
+                    n_unused += 1u;
+                } else if (nj > 0.0f) {
+                    n_donors += 1u;
+                }
             }
+            const uint nsplit = min(n_unused, n_donors);
+            tg_counts[0] = nsplit;
+            tg_counts[1] = n_unused;
+            revive_meta[0] = uint2(nsplit, revive_meta[0].y + nsplit);
         }
-        const uint nsplit = min(n_unused, n_donors);
-        tg_counts[0] = nsplit;
-        tg_counts[1] = n_unused;
-        revive_meta[0] = uint2(nsplit, revive_meta[0].y + nsplit);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

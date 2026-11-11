@@ -39,6 +39,7 @@ const FAULT_INPUT_NONFINITE: u32 = 1;
 const FAULT_BF16_OVERFLOW: u32 = 2;
 const FAULT_ROW_NORM_OVF: u32 = 4;
 const FAULT_CENT_NORM_OVF: u32 = 8;
+const FAULT_DIST_NONFINITE: u32 = 16;
 
 const MAX_OVERFLOW_SLICES: usize = 512;
 
@@ -396,6 +397,8 @@ fn format_fault_error(flags: u32) -> String {
         format!("{NONFINITE_ERR_PREFIX}: squared row L2 norm overflows f32 (fault={flags:#x})")
     } else if (flags & FAULT_CENT_NORM_OVF) != 0 {
         format!("{NONFINITE_ERR_PREFIX}: squared centroid L2 norm overflows f32 (fault={flags:#x})")
+    } else if (flags & FAULT_DIST_NONFINITE) != 0 {
+        format!("{NONFINITE_ERR_PREFIX}: squared Euclidean distance overflows f32 (fault={flags:#x})")
     } else {
         format!("{NONFINITE_ERR_PREFIX}: GPU fault flag raised (fault={flags:#x})")
     }
@@ -649,6 +652,7 @@ fn encode_assign_chunk(
     epoch_off: u32,
     part_scores: &GpuBuffer,
     part_labels: &GpuBuffer,
+    fault_flags: &GpuBuffer,
 ) -> Result<(), String> {
     if m == 0 {
         return Ok(());
@@ -700,6 +704,7 @@ fn encode_assign_chunk(
             bnd.bind_u32(sph, 15);
             bnd.bind_u32(has_ep, 16);
             bnd.bind_u32(epoch_off, 17);
+            bnd.bind_gpu_buf(fault_flags, 18);
             bnd.dispatch(mtl_size(groups_x, 1, 1), mtl_size(128, 1, 1));
             Ok(())
         })?;
@@ -723,6 +728,7 @@ fn encode_assign_chunk(
             bnd.bind_u32(use_bf16, 12);
             bnd.bind_u32(has_ep, 13);
             bnd.bind_u32(epoch_off, 14);
+            bnd.bind_gpu_buf(fault_flags, 15);
         })?;
     }
     Ok(())
@@ -987,7 +993,10 @@ impl EmeansGpuRunner {
             return self.empty_resident_dataset();
         }
         let staged = stage_f32_unwaited(&self.rt, rows_f32)?;
-        self.upload_dataset_f32_buffer(&staged, n)
+        let res = self.upload_dataset_f32_buffer(&staged, n);
+        drop(staged);
+        let _ = self.rt.reclaim(u64::MAX);
+        res
     }
 
     /// Stage a `bf16`-bits host dataset `[n, d]` into GPU-resident storage (`X` + `row_norm2`).
@@ -1006,7 +1015,10 @@ impl EmeansGpuRunner {
             return self.empty_resident_dataset();
         }
         let staged = stage_u16_unwaited(&self.rt, rows_bf16)?;
-        self.upload_dataset_bf16_buffer(&staged, n)
+        let res = self.upload_dataset_bf16_buffer(&staged, n);
+        drop(staged);
+        let _ = self.rt.reclaim(u64::MAX);
+        res
     }
 
     /// Stage an already-resident `f32` [`GpuBuffer`] `[n, d]` on `self.rt` into a
@@ -1053,6 +1065,8 @@ impl EmeansGpuRunner {
             self.synchronize_runner()?;
         }
         let flags = local_fault.try_read_u32()?[0];
+        drop(local_fault);
+        let _ = self.rt.reclaim(u64::MAX);
         if flags != 0 {
             return Err(format_fault_error(flags));
         }
@@ -1112,6 +1126,8 @@ impl EmeansGpuRunner {
             self.synchronize_runner()?;
         }
         let flags = local_fault.try_read_u32()?[0];
+        drop(local_fault);
+        let _ = self.rt.reclaim(u64::MAX);
         if flags != 0 {
             return Err(format_fault_error(flags));
         }
@@ -1260,6 +1276,7 @@ impl EmeansGpuRunner {
             epoch_off,
             self.part_scores.as_ref().unwrap_or(&self.dummy_buf),
             self.part_labels.as_ref().unwrap_or(&self.dummy_buf),
+            &self.fault_flags,
         )?;
 
         // Pack 64-bit `(ulong(label) << 16) | ulong(local_row)` keys and clear overflow slice count.
@@ -1362,6 +1379,7 @@ impl EmeansGpuRunner {
             bnd.bind_gpu_buf(&self.chunk_dists, 0);
             bnd.bind_gpu_buf(&self.epoch_obj_bits, 1);
             bnd.bind_u32(m, 2);
+            bnd.bind_gpu_buf(&self.fault_flags, 3);
             bnd.dispatch(mtl_size(1, 1, 1), mtl_size(256, 1, 1));
             Ok(())
         })
@@ -1377,6 +1395,7 @@ impl EmeansGpuRunner {
             bnd.bind_u32(self.cfg.k, 4);
             bnd.bind_u32(self.cfg.d, 5);
             bnd.bind_f32(alpha, 6);
+            bnd.bind_gpu_buf(&self.fault_flags, 7);
             bnd.dispatch(mtl_size(self.cfg.k as usize, 1, 1), mtl_size(256, 1, 1));
             Ok(())
         })?;
@@ -1392,6 +1411,7 @@ impl EmeansGpuRunner {
                 bnd.bind_f32(self.cfg.unused_threshold, 5);
                 bnd.bind_bytes(&self.cfg.seed.to_ne_bytes(), 6);
                 bnd.bind_bytes(&step.to_ne_bytes(), 7);
+                bnd.bind_gpu_buf(&self.fault_flags, 8);
                 bnd.dispatch(mtl_size(1, 1, 1), mtl_size(256, 1, 1));
                 Ok(())
             })?;
@@ -2220,6 +2240,7 @@ fn assign_gpu_impl(
                 cursor,
                 part_scores.as_ref().unwrap_or(&dummy_buf),
                 part_labels.as_ref().unwrap_or(&dummy_buf),
+                &fault_flags,
             )?;
 
             rt.with_binder(|bnd| {
@@ -2227,6 +2248,7 @@ fn assign_gpu_impl(
                 bnd.bind_gpu_buf(&chunk_dists, 0);
                 bnd.bind_gpu_buf(&obj_bits_buf, 1);
                 bnd.bind_u32(m, 2);
+                bnd.bind_gpu_buf(&fault_flags, 3);
                 bnd.dispatch(mtl_size(1, 1, 1), mtl_size(256, 1, 1));
                 Ok(())
             })?;
@@ -2338,5 +2360,12 @@ mod tests {
         assert_eq!(csr_radix_shifts(257), &[16, 24]);
         assert_eq!(csr_radix_shifts(65_536), &[16, 24]);
         assert_eq!(csr_radix_shifts(65_537), &[16, 24, 32]);
+    }
+
+    #[test]
+    fn fault_dist_nonfinite_formats_with_nonfinite_prefix() {
+        let msg = format_fault_error(FAULT_DIST_NONFINITE);
+        assert!(msg.starts_with(NONFINITE_ERR_PREFIX), "got: {msg}");
+        assert!(msg.contains("squared Euclidean distance overflows f32"), "got: {msg}");
     }
 }

@@ -131,6 +131,7 @@ fn main() {
         kernels_dir.join("conv2d_tensorops.metal"),
         kernels_dir.join("i8_w8a8.metal"),
         kernels_dir.join("w4a8_tensorops.metal"),
+        kernels_dir.join("emeans.metal"),
     ];
     if want_tune {
         let mut tune = metal_sources(&kernels_dir.join("tune"));
@@ -154,6 +155,7 @@ fn main() {
         "conv2d_tensorops.metal",
         "i8_w8a8.metal",
         "w4a8_tensorops.metal",
+        "emeans.metal",
     ];
     let others: Vec<PathBuf> = metal_sources(&kernels_dir)
         .into_iter()
@@ -289,6 +291,8 @@ fn disable_fp_contract(src: &Path) -> bool {
         "gqa_decode.metal",
         // Numerics::Exact linear products: acc + (a * b), two roundings.
         "matmul_fixed_order.metal",
+        // Deterministic CSR 256-slice gather + EMA update without FMA contraction drift.
+        "emeans.metal",
     ];
     src.file_name()
         .and_then(|name| name.to_str())

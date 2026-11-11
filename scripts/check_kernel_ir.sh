@@ -69,7 +69,7 @@ inf_nan_constants() {
 compile() { # compile <src> <std> <out.ll>
   local src="$1" std="$2" ll="$3" extra=()
   case "$(basename "$src")" in
-    qwen35_adamw.metal|i8_w8a8.metal|w4a8_tensorops.metal|gqa_decode.metal|matmul_fixed_order.metal)
+    qwen35_adamw.metal|i8_w8a8.metal|w4a8_tensorops.metal|gqa_decode.metal|matmul_fixed_order.metal|emeans.metal)
       extra=(-ffp-contract=off) ;;
   esac
   "$METAL" "-std=$std" -O2 -fmetal-math-mode=fast -isysroot "$SDK" \
@@ -84,7 +84,7 @@ check_one() { # check_one <src>; prints violations, exit 1 if any
   # build.rs falls back to metal3.2 for non-TensorOps sources; mirror it.
   local stds=(metal4.0 metal3.2)
   # build.rs: the TensorOps sources hard-fail, no metal3.2 fallback.
-  [[ "$name" == matmul_tensorops || "$src" == */tune/* ]] && stds=(metal4.0)
+  [[ "$name" == matmul_tensorops || "$name" == emeans || "$src" == */tune/* ]] && stds=(metal4.0)
   for std in "${stds[@]}"; do
     rm -f "$ll"
     compile "$src" "$std" "$ll" && break

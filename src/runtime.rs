@@ -762,7 +762,8 @@ struct ActiveMetal4Batch {
     /// submitted. A commit that fails or panics before it ends the buffer leaves
     /// it set (true: the buffer is open and unsubmitted); from the end to the
     /// clear the commit has no fallible Rust step (the two Objective-C sends,
-    /// end and submit, stay: an exception from one is not a recoverable panic).
+    /// end and submit, stay: an exception from one is not a recoverable panic),
+    /// and the slot record after it is infallible too (a recovered guard).
     /// [`GpuRuntime::recycle_if_idle`] frees against the event
     /// value once the flag reads false, even through a poisoned lock.
     cb_open: bool,
@@ -1048,7 +1049,10 @@ const ACTIVE_M4_POISONED: &str = "runtime's batch lock was poisoned by a panic: 
 ///
 /// - **A batch was open** (a panic inside a commit before it ended the command
 ///   buffer, or in a closure after it had encoded; a commit past that point has no
-///   fallible Rust step until it has cleared the open flag). Nothing can submit that
+///   fallible Rust step until it has cleared the open flag, and the slot record
+///   after it cannot fail either: it goes through a recovered guard, and the
+///   final drop waits for `event_value`, which covers every submit whatever the
+///   slots hold). Nothing can submit that
 ///   buffer, and the idle recycle skips because it may still bind a dropped
 ///   buffer, so the queue stays
 ///   parked for the rest of the runtime's lifetime. Drop ends that buffer, still
@@ -3123,10 +3127,23 @@ impl GpuRuntime {
         m4.queue
             .signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.handoff_event), next);
         // Mark this allocator in-flight; the next begin picks a free slot.
-        {
-            let mut slots = m4.allocators.lock().map_err(|e| e.to_string())?;
-            slots[batch.alloc_idx].in_flight = next;
-            slots[batch.alloc_idx].feedback = Some(watch);
+        // The buffer is already on the queue, so the record is made through a
+        // recovered guard even when the lock is poisoned (a poisoned lock is
+        // never a reason to skip it), and the poison is still returned below
+        // once the record exists. Drop also covers this submit through
+        // `event_value`, so the slots are not its only record.
+        let (mut slots, poisoned) = match m4.allocators.lock() {
+            Ok(slots) => (slots, None),
+            Err(poison) => {
+                let error = poison.to_string();
+                (poison.into_inner(), Some(error))
+            }
+        };
+        slots[batch.alloc_idx].in_flight = next;
+        slots[batch.alloc_idx].feedback = Some(watch);
+        drop(slots);
+        if let Some(error) = poisoned {
+            return Err(error);
         }
 
         if wait {
@@ -3527,10 +3544,14 @@ impl Drop for GpuRuntime {
         // A batch that was never committed must not have its encoder and
         // command buffer released mid-recording.
         self.abort_open_batch();
+        // `event_value` is stored before any fallible step after a submit, so
+        // the last submit is waited for whatever the slots say: a lost or
+        // skipped slot record cannot hide it from this drop.
         let max_event = max_event_value(
             mutex_value_mut(&mut self.metal4.allocators)
                 .iter()
-                .map(|slot| slot.in_flight),
+                .map(|slot| slot.in_flight)
+                .chain(std::iter::once(self.metal4.event_value.load(Ordering::Acquire))),
         );
         #[cfg(test)]
         DROP_WAITED_FOR.with(|c| c.set(Some(max_event)));

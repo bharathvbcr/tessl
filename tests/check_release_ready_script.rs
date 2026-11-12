@@ -385,11 +385,15 @@ fn spawn_with(
     }
     // SAFETY: the closure runs in the forked child before exec and only calls
     // the async-signal-safe `signal`. A `cargo test` started in the background
-    // inherits SIGINT as ignored; the script's own INT trap needs it default.
+    // (`&` in a non-interactive shell, or nohup) inherits SIGINT, SIGQUIT and
+    // SIGHUP as ignored, and bash cannot trap a signal that was ignored on
+    // entry; the script's own traps need them all default.
     unsafe {
         cmd.pre_exec(move || {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
             libc::signal(
                 libc::SIGPIPE,
                 if ignore_sigpipe { libc::SIG_IGN } else { libc::SIG_DFL },

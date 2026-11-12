@@ -1990,97 +1990,6 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     );
 }
 
-/// Code of `src` from `header` to the first line that closes the function (a
-/// lone four-space `}`, which is not included), comments removed, with every
-/// whitespace character dropped so that formatting cannot matter.
-fn compact_fn(src: &str, header: &str) -> String {
-    let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
-    let rest = &src[start..];
-    let end = rest
-        .find("\n    }\n")
-        .unwrap_or_else(|| panic!("end of {header} not found"));
-    rest[..end]
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .flat_map(str::chars)
-        .filter(|c| !c.is_whitespace())
-        .collect()
-}
-
-fn compact(code: &str) -> String {
-    code.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-/// An allow-list source-order pin (no test can fire a panic inside the window
-/// without a production knob). Between ending the command buffer and clearing
-/// `cb_open`, `commit_m4` runs exactly four statements, and each callee that is
-/// Rust code is pinned to its exact body, so a new statement, a new helper call,
-/// an index or an `expect` anywhere on the path fails here. What stays are the
-/// two Objective-C sends (end, submit). All fallible work runs in
-/// `prepare_commit` before the end, where a failure still leaves `cb_open` true.
-#[test]
-fn commit_m4_has_no_failure_point_between_ending_the_buffer_and_clearing_cb_open() {
-    let src = include_str!("runtime.rs");
-    let body = compact_fn(src, "fn commit_m4(");
-    let prepare = body
-        .find(&compact("self.prepare_commit()?"))
-        .expect("commit_m4 no longer prepares the commit");
-    let guard = body
-        .find("debug_assert!(")
-        .expect("commit_m4 lost the clock check before the end");
-    let end = body
-        .find(&compact("self.end_command_buffer();"))
-        .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
-    assert!(
-        prepare < end && guard < end,
-        "the fallible prepare step and the clock check must run before the end"
-    );
-    let clear = body[end..]
-        .find("batch.cb_open=false;")
-        .expect("no cb_open clear after the end");
-    let window = &body[end..end + clear + "batch.cb_open=false;".len()];
-    let expected = compact(
-        "self.end_command_buffer();
-         let watch = self.submit_prepared(prepared);
-         let next = self.shared.issue();
-         m4.event_value.store(next, Ordering::Release);
-         batch.cb_open = false;",
-    );
-    assert_eq!(
-        window, expected,
-        "the statements between end_command_buffer and the cb_open clear changed"
-    );
-
-    let submit = compact_fn(src, "fn submit_prepared(");
-    let expected_submit = compact(
-        "fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
-            let PreparedCommit { state, options, block, mut command_buffer } = prepared;
-            unsafe {
-                self.metal4.queue.commit_count_options(
-                    NonNull::new_unchecked(&mut command_buffer as *mut _), 1, &options);
-            }
-            FeedbackWatch { state, _options: options, block: Some(block) }",
-    );
-    // `rustfmt` adds a trailing comma inside the struct literals.
-    assert_eq!(submit.replace(",}", "}"), expected_submit, "submit_prepared changed");
-
-    let counter = compact("#[cfg(test)] END_CALLS.with(|c| c.set(c.get() + 1));");
-    let ender = compact_fn(src, "fn end_command_buffer(");
-    assert!(ender.contains(&counter), "the test-only end counter moved");
-    assert_eq!(
-        ender.replace(&counter, ""),
-        compact("fn end_command_buffer(&self) { self.metal4.command_buffer.endCommandBuffer();"),
-        "end_command_buffer changed"
-    );
-
-    let issue = compact_fn(include_str!("shared.rs"), "pub(crate) fn issue(");
-    assert_eq!(
-        issue,
-        compact("pub(crate) fn issue(&self) -> u64 { self.issued.fetch_add(1, Ordering::AcqRel) + 1"),
-        "Shared::issue changed"
-    );
-}
-
 // ---- a commit that submits and then fails to record its slot (ft-ec125ae2) ----
 
 /// What a drop of this thread's runtime decided to wait for. Take it right
@@ -2344,5 +2253,96 @@ fn ensure_m4_cb_open_has_no_rust_failure_point_between_begin_and_install() {
     assert!(
         compact(include_str!("ab_flags.rs")).contains(&flag),
         "ab_flags::dispatch_stamps changed"
+    );
+}
+
+/// Code of `src` from `header` to the first line that closes the function (a
+/// lone four-space `}`, which is not included), comments removed, with every
+/// whitespace character dropped so that formatting cannot matter.
+fn compact_fn(src: &str, header: &str) -> String {
+    let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("end of {header} not found"));
+    rest[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+fn compact(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// An allow-list source-order pin (no test can fire a panic inside the window
+/// without a production knob). Between ending the command buffer and clearing
+/// `cb_open`, `commit_m4` runs exactly four statements, and each callee that is
+/// Rust code is pinned to its exact body, so a new statement, a new helper call,
+/// an index or an `expect` anywhere on the path fails here. What stays are the
+/// two Objective-C sends (end, submit). All fallible work runs in
+/// `prepare_commit` before the end, where a failure still leaves `cb_open` true.
+#[test]
+fn commit_m4_has_no_failure_point_between_ending_the_buffer_and_clearing_cb_open() {
+    let src = include_str!("runtime.rs");
+    let body = compact_fn(src, "fn commit_m4(");
+    let prepare = body
+        .find(&compact("self.prepare_commit()?"))
+        .expect("commit_m4 no longer prepares the commit");
+    let guard = body
+        .find("debug_assert!(")
+        .expect("commit_m4 lost the clock check before the end");
+    let end = body
+        .find(&compact("self.end_command_buffer();"))
+        .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
+    assert!(
+        prepare < end && guard < end,
+        "the fallible prepare step and the clock check must run before the end"
+    );
+    let clear = body[end..]
+        .find("batch.cb_open=false;")
+        .expect("no cb_open clear after the end");
+    let window = &body[end..end + clear + "batch.cb_open=false;".len()];
+    let expected = compact(
+        "self.end_command_buffer();
+         let watch = self.submit_prepared(prepared);
+         let next = self.shared.issue();
+         m4.event_value.store(next, Ordering::Release);
+         batch.cb_open = false;",
+    );
+    assert_eq!(
+        window, expected,
+        "the statements between end_command_buffer and the cb_open clear changed"
+    );
+
+    let submit = compact_fn(src, "fn submit_prepared(");
+    let expected_submit = compact(
+        "fn submit_prepared(&self, prepared: PreparedCommit) -> FeedbackWatch {
+            let PreparedCommit { state, options, block, mut command_buffer } = prepared;
+            unsafe {
+                self.metal4.queue.commit_count_options(
+                    NonNull::new_unchecked(&mut command_buffer as *mut _), 1, &options);
+            }
+            FeedbackWatch { state, _options: options, block: Some(block) }",
+    );
+    // `rustfmt` adds a trailing comma inside the struct literals.
+    assert_eq!(submit.replace(",}", "}"), expected_submit, "submit_prepared changed");
+
+    let counter = compact("#[cfg(test)] END_CALLS.with(|c| c.set(c.get() + 1));");
+    let ender = compact_fn(src, "fn end_command_buffer(");
+    assert!(ender.contains(&counter), "the test-only end counter moved");
+    assert_eq!(
+        ender.replace(&counter, ""),
+        compact("fn end_command_buffer(&self) { self.metal4.command_buffer.endCommandBuffer();"),
+        "end_command_buffer changed"
+    );
+
+    let issue = compact_fn(include_str!("shared.rs"), "pub(crate) fn issue(");
+    assert_eq!(
+        issue,
+        compact("pub(crate) fn issue(&self) -> u64 { self.issued.fetch_add(1, Ordering::AcqRel) + 1"),
+        "Shared::issue changed"
     );
 }

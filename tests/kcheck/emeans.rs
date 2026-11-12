@@ -11,9 +11,10 @@
 //! Mismatches are collected in a [`Report`] and fail the sweep once, after all
 //! 23 credits ran and before the ledger prints a single PASS line.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::common::{buf, buf_u32, random_f32, reduction_bound};
+use crate::common::{buf, buf_u32, random_f32};
 use tessl::dispatch::{dispatch_1d, Binder};
 use tessl::emeans::revival_gumbel_key;
 use tessl::runtime::mtl_size;
@@ -139,13 +140,23 @@ impl Report {
     }
 
     fn assert_clean(&self) {
-        const SHOWN: usize = 80;
+        // Group by kernel so a long list for one kernel cannot hide another kernel's mismatches.
+        const PER_KERNEL: usize = 4;
+        let mut by_kernel: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+        for f in &self.failures {
+            by_kernel.entry(f.split('[').next().unwrap_or(f)).or_default().push(f);
+        }
+        let mut lines = Vec::new();
+        for (kernel, list) in &by_kernel {
+            lines.push(format!("{kernel}: {} mismatches", list.len()));
+            lines.extend(list.iter().take(PER_KERNEL).map(|f| format!("  {f}")));
+        }
         assert!(
             self.failures.is_empty(),
-            "emeans kcheck: {} mismatches (first {}):\n{}",
+            "emeans kcheck: {} mismatches in {} kernels\n{}",
             self.failures.len(),
-            SHOWN.min(self.failures.len()),
-            self.failures.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("\n")
+            by_kernel.len(),
+            lines.join("\n")
         );
     }
 }
@@ -242,6 +253,12 @@ fn launch_1d(rt: &Arc<GpuRuntime>, name: &str, n: usize, bind: impl FnOnce(&mut 
     rt.synchronize().unwrap_or_else(|e| panic!("{name}: {e}"));
 }
 
+/// One threadgroup of `threads` threads: more threads than the kernel has items, so its bounds
+/// guard has to hold for the surplus.
+fn launch_threads(rt: &Arc<GpuRuntime>, name: &str, threads: usize, bind: impl FnOnce(&mut Binder<'_>)) {
+    launch(rt, name, (1, 1, 1), (threads, 1, 1), bind);
+}
+
 // ---------------------------------------------------------------------------
 // CPU mirrors shared by several kernels
 // ---------------------------------------------------------------------------
@@ -315,14 +332,16 @@ struct PrepCase {
     d: usize,
     sph: bool,
     data: Vec<f32>,
-    /// Fault word the case must raise (checked against the oracle and the kernel).
-    fault: u32,
+    /// Fault word the case must raise, for the bf16 and the f32 kernel.
+    fault: (u32, u32),
 }
 
 struct PrepWant {
     c_eff: Vec<u32>,
     norm2: Vec<f32>,
     fault: u32,
+    /// The scaled coordinate before it is rounded to bf16 (what `sph` rows are checked against).
+    y: Vec<f32>,
 }
 
 /// Norm of one effective row from its stored bits (`bf16` bits or `f32` bits).
@@ -346,6 +365,7 @@ fn prep_oracle(case: &PrepCase, bf16: bool) -> PrepWant {
     let (k, d) = (case.k, case.d);
     let mut c_eff = Vec::with_capacity(k * d);
     let mut norm2 = Vec::with_capacity(k);
+    let mut ys = Vec::with_capacity(k * d);
     let mut fault = 0u32;
     for j in 0..k {
         let row = &case.data[j * d..(j + 1) * d];
@@ -385,6 +405,7 @@ fn prep_oracle(case: &PrepCase, bf16: bool) -> PrepWant {
             if case.sph {
                 v = if ma > 0.0 { (v / ma) * inv_norm } else { 0.0 };
             }
+            ys.push(v);
             if bf16 {
                 let mut bf = f32_to_bf16_bits_gpu(v);
                 if nonfinite16(bf) {
@@ -396,6 +417,7 @@ fn prep_oracle(case: &PrepCase, bf16: bool) -> PrepWant {
                 stored.push(v.to_bits());
             }
         }
+        norm2.push(prep_norm(&stored, d, bf16));
         let cn = lane_sum(d, |c| {
             let q = if bf16 {
                 bf16f(stored[c] as u16)
@@ -406,25 +428,41 @@ fn prep_oracle(case: &PrepCase, bf16: bool) -> PrepWant {
         });
         if nonfinite32(cn.to_bits()) {
             fault |= FAULT_CENT_NORM;
-            norm2.push(0.0);
-        } else {
-            norm2.push(cn);
         }
         c_eff.extend(stored);
     }
-    PrepWant { c_eff, norm2, fault }
+    PrepWant {
+        c_eff,
+        norm2,
+        fault,
+        y: ys,
+    }
 }
 
 fn prep_cases() -> Vec<PrepCase> {
     let mut cases = Vec::new();
+    // Round-half-even ties (low 16 bits exactly 0x8000) sit at the front of the random rows: an even
+    // bf16 neighbour must stay, an odd one must go up.
+    let ties = [
+        0x3f80_8000u32,
+        0x3f81_8000,
+        0xbf80_8000,
+        0xbf81_8000,
+        0x4040_8000,
+        0x3e00_8000,
+    ];
     for (k, d) in [(1usize, 67usize), (3, 67), (1, 300), (3, 300)] {
+        let mut data = random_f32(k * d, 4100 + (k * 1000 + d) as u64);
+        for (slot, bits) in data.iter_mut().zip(ties) {
+            *slot = f32::from_bits(bits);
+        }
         cases.push(PrepCase {
             name: "random",
             k,
             d,
             sph: false,
-            data: random_f32(k * d, 4100 + (k * 1000 + d) as u64),
-            fault: 0,
+            data,
+            fault: (0, 0),
         });
     }
     // Power-of-4 rows: the scaled row is 1.0 on 4 or 16 coordinates, so rsqrt is 0.5 or 0.25.
@@ -443,24 +481,28 @@ fn prep_cases() -> Vec<PrepCase> {
         d,
         sph: true,
         data: pow4,
-        fault: 0,
+        fault: (0, 0),
     });
     for d in [67usize, 300] {
-        let mut data = random_f32(4 * d, 4200 + d as u64);
+        let mut data = random_f32(5 * d, 4200 + d as u64);
         for v in &mut data[d..2 * d] {
             *v *= 1000.0;
         }
         for v in &mut data[2 * d..3 * d] {
             *v *= 1.0e-3;
         }
-        data[3 * d..].fill(0.0);
+        data[3 * d..4 * d].fill(0.0);
+        // An all-negative row: a signed max-abs would read it as the zero row.
+        for v in &mut data[4 * d..] {
+            *v = -(v.abs() + 0.05);
+        }
         cases.push(PrepCase {
             name: "sph-random",
-            k: 4,
+            k: 5,
             d,
             sph: true,
             data,
-            fault: 0,
+            fault: (0, 0),
         });
     }
     let d = 67;
@@ -474,9 +516,56 @@ fn prep_cases() -> Vec<PrepCase> {
         d,
         sph: false,
         data: nonfinite,
-        fault: FAULT_INPUT,
+        fault: (FAULT_INPUT, FAULT_INPUT),
+    });
+    // f32::MAX rounds to bf16 infinity (fault 2, coordinate 0) and squares to f32 infinity (fault 8).
+    let mut max = random_f32(2 * d, 4400);
+    max[3] = f32::MAX;
+    cases.push(PrepCase {
+        name: "f32-max",
+        k: 2,
+        d,
+        sph: false,
+        data: max,
+        fault: (FAULT_BF16, FAULT_CENT_NORM),
+    });
+    // 3.0e38 is a finite bf16, so only the squared norm overflows.
+    let mut big = random_f32(2 * d, 4500);
+    big[d + 9] = 3.0e38;
+    cases.push(PrepCase {
+        name: "3e38",
+        k: 2,
+        d,
+        sph: false,
+        data: big,
+        fault: (FAULT_CENT_NORM, FAULT_CENT_NORM),
     });
     cases
+}
+
+/// bf16 spherical rows against the unrounded scaled value `y`. `precise::rsqrt` is not pinned to
+/// an ulp bound, so a coordinate may land on either bf16 neighbour only when `y` is within 1e-5
+/// (relative) of a rounding boundary; everywhere else the bits are exact. A 0.02% scale error moves
+/// about 5% of the coordinates across a boundary by more than that.
+fn sph_bf16_tight(rep: &mut Report, tag: &str, got: &[u32], y: &[f32]) {
+    let bad: Vec<String> = got
+        .iter()
+        .zip(y)
+        .enumerate()
+        .filter_map(|(i, (&g, &y))| {
+            let lo = f32_to_bf16_bits_gpu(y * (1.0 - 1.0e-5));
+            let hi = f32_to_bf16_bits_gpu(y * (1.0 + 1.0e-5));
+            (g as u16 != lo && g as u16 != hi).then(|| format!("[{i}] got {g:#x} accepted {lo:#x}/{hi:#x} (y {y})"))
+        })
+        .collect();
+    if !bad.is_empty() {
+        rep.fail(format!(
+            "{tag}: c_eff: {} of {} outside the 1e-5 rounding band: {}",
+            bad.len(),
+            got.len(),
+            bad.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+        ));
+    }
 }
 
 fn prepare_centroids(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
@@ -487,45 +576,32 @@ fn prepare_centroids(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report
             "emeans_prepare_centroids_f32"
         };
         ledger.credit(rt, name, &[name], || {
-            let mut cases = prep_cases();
-            // f32::MAX squares to infinity, and rounds to bf16 infinity.
-            let d = 67;
-            let mut ovf = random_f32(2 * d, 4400);
-            ovf[3] = f32::MAX;
-            ovf[d + 9] = 3.0e38;
-            cases.push(PrepCase {
-                name: "overflow",
-                k: 2,
-                d,
-                sph: false,
-                data: ovf,
-                fault: if bf16 {
-                    FAULT_BF16 | FAULT_CENT_NORM
-                } else {
-                    FAULT_CENT_NORM
-                },
-            });
-            for case in &cases {
-                let tag = format!("{name}[{} k={} d={} sph={}]", case.name, case.k, case.d, case.sph);
+            for case in &prep_cases() {
+                let (k, d) = (case.k, case.d);
+                let rows = k + 1; // one launched group past k: the `j >= k` guard must hold
+                let tag = format!("{name}[{} k={k} d={d} sph={}]", case.name, case.sph);
                 let want = prep_oracle(case, bf16);
-                if want.fault != case.fault {
+                let planned = if bf16 { case.fault.0 } else { case.fault.1 };
+                if want.fault != planned {
                     rep.fail(format!(
-                        "{tag}: ORACLE derived fault {} but the case plans {}",
-                        want.fault, case.fault
+                        "{tag}: ORACLE derived fault {} but the case plans {planned}",
+                        want.fault
                     ));
                 }
-                let n = case.k * case.d;
-                let cent = f32b(rt, &case.data);
+                let mut padded = case.data.clone();
+                padded.extend(random_f32(d, 4900 + d as u64));
+                let cent = f32b(rt, &padded);
+                let n = rows * d;
                 let c_eff = if bf16 { sent_u16(rt, n) } else { sent_f32(rt, n) };
-                let norm2 = sent_f32(rt, case.k);
+                let norm2 = sent_f32(rt, rows);
                 let fault = fault_buf(rt, 0);
-                launch(rt, name, (case.k, 1, 1), (256, 1, 1), |bnd| {
+                launch(rt, name, (rows, 1, 1), (256, 1, 1), |bnd| {
                     bnd.bind_gpu_buf(&cent, 0);
                     bnd.bind_gpu_buf(&c_eff, 1);
                     bnd.bind_gpu_buf(&norm2, 2);
                     bnd.bind_gpu_buf(&fault, 3);
-                    bnd.bind_u32(case.k as u32, 4);
-                    bnd.bind_u32(case.d as u32, 5);
+                    bnd.bind_u32(k as u32, 4);
+                    bnd.bind_u32(d as u32, 5);
                     bnd.bind_u32(u32::from(case.sph), 6);
                 });
                 let got: Vec<u32> = if bf16 {
@@ -533,21 +609,27 @@ fn prepare_centroids(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report
                 } else {
                     rd32(&c_eff, n)
                 };
-                let got_norm = rd32(&norm2, case.k);
+                let pad = if bf16 { u32::from(SENT_U16) } else { SENT_F32_BITS };
+                rep.cmp(&tag, "c_eff canary row", &got[k * d..], &vec![pad; d]);
+                let got_norm = rd32(&norm2, rows);
+                rep.cmp(&tag, "norm2 canary", &got_norm[k..], &[SENT_F32_BITS]);
                 rep.cmp(&tag, "fault", &rd32(&fault, 1), &[want.fault]);
+                let got = &got[..k * d];
                 if case.sph {
-                    // precise::rsqrt feeds only the scaled coordinate, so only that output carries
-                    // an ulp bound (1 bf16 ulp, 2 f32 ulp); every norm is recomputed exactly from
-                    // the coordinates the kernel stored, and the planted rows' bookkeeping is exact.
-                    let bound = if bf16 { (1, false) } else { (2, true) };
-                    rep.cmp_ulp(&tag, "c_eff", &got, &want.c_eff, bound, case.name == "pow4");
-                    let want_norm: Vec<u32> = (0..case.k)
-                        .map(|j| prep_norm(&got[j * case.d..(j + 1) * case.d], case.d, bf16).to_bits())
+                    if bf16 {
+                        sph_bf16_tight(rep, &tag, got, &want.y);
+                    } else {
+                        // precise::rsqrt feeds only the scaled coordinate: 2 f32 ulp.
+                        rep.cmp_ulp(&tag, "c_eff", got, &want.c_eff, (2, true), case.name == "pow4");
+                    }
+                    // Every norm is recomputed exactly from the coordinates the kernel stored.
+                    let want_norm: Vec<u32> = (0..k)
+                        .map(|j| prep_norm(&got[j * d..(j + 1) * d], d, bf16).to_bits())
                         .collect();
-                    rep.cmp(&tag, "norm2", &got_norm, &want_norm);
+                    rep.cmp(&tag, "norm2", &got_norm[..k], &want_norm);
                 } else {
-                    rep.cmp(&tag, "c_eff", &got, &want.c_eff);
-                    rep.cmp(&tag, "norm2", &got_norm, &bits(&want.norm2));
+                    rep.cmp(&tag, "c_eff", got, &want.c_eff);
+                    rep.cmp(&tag, "norm2", &got_norm[..k], &bits(&want.norm2));
                 }
             }
         });
@@ -662,6 +744,7 @@ fn stage_f32_oracle(src: &[f32], n: usize, d: usize, (wb, wf, nb): (bool, bool, 
     }
 }
 
+/// Compare the `n` staged rows and the canary row the launch had one group too many for.
 fn stage_compare(
     rep: &mut Report,
     tag: &str,
@@ -677,9 +760,13 @@ fn stage_compare(
             want.fault
         ));
     }
-    rep.cmp(tag, "dst_bf16", &rd16(outs.0, n * d), &want.bf16);
-    rep.cmp(tag, "dst_f32", &rd32(outs.1, n * d), &want.f32s);
-    rep.cmp(tag, "dst_norm2", &rd32(outs.2, n), &bits(&want.norm2));
+    let (mut wb, mut wf, mut wn) = (want.bf16.clone(), want.f32s.clone(), bits(&want.norm2));
+    wb.extend(vec![SENT_U16; d]);
+    wf.extend(vec![SENT_F32_BITS; d]);
+    wn.push(SENT_F32_BITS);
+    rep.cmp(tag, "dst_bf16 (+canary row)", &rd16(outs.0, (n + 1) * d), &wb);
+    rep.cmp(tag, "dst_f32 (+canary row)", &rd32(outs.1, (n + 1) * d), &wf);
+    rep.cmp(tag, "dst_norm2 (+canary)", &rd32(outs.2, n + 1), &wn);
     rep.cmp(tag, "fault", &rd32(outs.3, 1), &[planned_fault]);
 }
 
@@ -708,14 +795,17 @@ fn stage_rows_bf16(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) 
         for (case, d, src, (wb, wf), planned) in &cases {
             let tag = format!("{name}[{case} d={d} write_bf16={wb} write_f32={wf}]");
             let want = stage_bf16_oracle(src, n, *d, *wb, *wf);
-            let sb = u16b(rt, src);
+            // One launched group past n: the `row >= n` guard must hold.
+            let mut padded = src.clone();
+            padded.extend(bf16_bits_of(&random_f32(*d, 5900)));
+            let sb = u16b(rt, &padded);
             let (ob, of, on, fl) = (
-                sent_u16(rt, n * d),
-                sent_f32(rt, n * d),
-                sent_f32(rt, n),
+                sent_u16(rt, (n + 1) * d),
+                sent_f32(rt, (n + 1) * d),
+                sent_f32(rt, n + 1),
                 fault_buf(rt, 0),
             );
-            launch(rt, name, (n, 1, 1), (256, 1, 1), |bnd| {
+            launch(rt, name, (n + 1, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&sb, 0);
                 bnd.bind_gpu_buf(&ob, 1);
                 bnd.bind_gpu_buf(&of, 2);
@@ -731,46 +821,93 @@ fn stage_rows_bf16(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) 
     });
 }
 
+/// (label, d, data, planned fault per triple, triple enabled)
+type StageF32Case = (&'static str, usize, Vec<f32>, [u32; 5], [bool; 5]);
+
 fn stage_rows_f32(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_stage_rows_f32";
     ledger.credit(rt, name, &[name], || {
         let n = 5usize;
-        let triples = [(true, false, true), (true, true, true), (false, true, false)];
-        // (label, d, data, planned fault per triple)
-        let mut cases: Vec<(&str, usize, Vec<f32>, [u32; 3])> = Vec::new();
+        // (write_bf16, write_f32, norm_from_bf16): Bf16, Bf16AssignF32Stats and F32 as the host
+        // uses them, then norm_from_bf16 without write_bf16, which the kernel also defines.
+        let triples = [
+            (true, false, true),
+            (true, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, true, true),
+        ];
+        let all = [true; 5];
+        let mut cases: Vec<StageF32Case> = Vec::new();
+        // Ties (low 16 bits exactly 0x8000) and an f32 value just below the smallest normal, which
+        // rounds to bf16 0x0080 unless the subnormal flush is taken.
+        let ties = [
+            0x3f80_8000u32,
+            0x3f81_8000,
+            0xbf80_8000,
+            0xbf81_8000,
+            0x4040_8000,
+            0x3e00_8000,
+        ];
         for d in [67usize, 300] {
-            cases.push(("base", d, random_f32(n * d, 6100 + d as u64), [0, 0, 0]));
+            let mut data = random_f32(n * d, 6100 + d as u64);
+            for (slot, b) in data.iter_mut().zip(ties) {
+                *slot = f32::from_bits(b);
+            }
+            cases.push(("base", d, data, [0; 5], all));
         }
         let d = 67;
         let mut nonfinite = random_f32(n * d, 6200);
         nonfinite[0] = f32::INFINITY;
         nonfinite[d + 1] = f32::NEG_INFINITY;
         nonfinite[2 * d + 2] = f32::NAN;
-        cases.push(("nonfinite", d, nonfinite, [FAULT_INPUT; 3]));
-        // f32::MAX rounds to bf16 infinity (fault 2, coordinate 0) under a bf16 triple; under the
-        // f32 triple nothing converts and the squared norm overflows (fault 4).
+        cases.push(("nonfinite", d, nonfinite, [FAULT_INPUT; 5], all));
+        // f32::MAX rounds to bf16 infinity (fault 2, coordinate 0) wherever a bf16 conversion
+        // happens; under the f32 triple nothing converts and the squared norm overflows (fault 4).
         let mut max = random_f32(n * d, 6300);
         max[0] = f32::MAX;
-        cases.push(("f32-max", d, max, [FAULT_BF16, FAULT_BF16, FAULT_ROW_NORM]));
+        cases.push((
+            "f32-max",
+            d,
+            max,
+            [FAULT_BF16, FAULT_BF16, FAULT_ROW_NORM, FAULT_BF16, FAULT_BF16],
+            all,
+        ));
         // 3.0e38 is a finite bf16 (0x7f62..), so no triple raises fault 2; its square overflows.
         let mut big = random_f32(n * d, 6400);
         big[d + 1] = 3.0e38;
-        cases.push(("3e38", d, big, [FAULT_ROW_NORM; 3]));
-        for (case, d, src, planned) in &cases {
+        cases.push(("3e38", d, big, [FAULT_ROW_NORM; 5], all));
+        // Subnormal inputs, only under triples that never store the f32 copy, so nothing depends on
+        // how the device stores a subnormal: the flush to a signed zero decides the bf16 bits.
+        let mut sub = random_f32(n * d, 6500);
+        for (slot, b) in sub
+            .iter_mut()
+            .zip([0x007f_c000u32, 0x807f_c000, 0x0000_0001, 0x8000_0001])
+        {
+            *slot = f32::from_bits(b);
+        }
+        cases.push(("subnormal", d, sub, [0; 5], [true, false, false, true, false]));
+        for (case, d, src, planned, enabled) in &cases {
             for (t, &flags) in triples.iter().enumerate() {
+                if !enabled[t] {
+                    continue;
+                }
                 let tag = format!(
                     "{name}[{case} d={d} write_bf16={} write_f32={} norm_from_bf16={}]",
                     flags.0, flags.1, flags.2
                 );
                 let want = stage_f32_oracle(src, n, *d, flags);
-                let sb = f32b(rt, src);
+                // One launched group past n: the `row >= n` guard must hold.
+                let mut padded = src.clone();
+                padded.extend(random_f32(*d, 6900));
+                let sb = f32b(rt, &padded);
                 let (ob, of, on, fl) = (
-                    sent_u16(rt, n * d),
-                    sent_f32(rt, n * d),
-                    sent_f32(rt, n),
+                    sent_u16(rt, (n + 1) * d),
+                    sent_f32(rt, (n + 1) * d),
+                    sent_f32(rt, n + 1),
                     fault_buf(rt, 0),
                 );
-                launch(rt, name, (n, 1, 1), (256, 1, 1), |bnd| {
+                launch(rt, name, (n + 1, 1, 1), (256, 1, 1), |bnd| {
                     bnd.bind_gpu_buf(&sb, 0);
                     bnd.bind_gpu_buf(&ob, 1);
                     bnd.bind_gpu_buf(&of, 2);
@@ -807,7 +944,7 @@ fn gather_rows(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             order[row_offset + 5] = 1000; // past ds_n: clamps to ds_n - 1
             order[row_offset + 9] = 40; // exactly ds_n: clamps too
             let norm = random_f32(ds_n, 7001);
-            for d in [16usize, 67] {
+            for d in [1usize, 16, 67] {
                 let data = random_f32(ds_n * d, 7100 + d as u64);
                 for copy_norm2 in [1u32, 0] {
                     let tag = format!("{name}[d={d} copy_norm2={copy_norm2}]");
@@ -875,15 +1012,30 @@ fn gather_rows(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
 const EPOCH_OFF: usize = 5;
 const PAD: usize = 64;
 
-/// Small-integer operands (|v| <= 9) make every product and partial sum exact in f32, so any
-/// accumulation order the TensorOps or simdgroup matrix unit uses gives the same bits.
+// Centroid roles in the special fixture (k = 70, M = 70, d = 67).
+const SELF_C: usize = 40; // non-integer, but with 8 significant bits (see assign_fx)
+const HUGE_C: usize = 9; // shares a 9.0e18 coordinate with row 20
+const EDGE_C: usize = 68; // [90, 9, 3, 1]: |c|^2 = 8191, row 60 sits on it with rn = 8192
+const OVF_C: usize = 69; // [2.5e19, 0, ...]: 2 * dot overflows for row 55
+
+/// `x` and `c` are small integers (|v| <= 9), so every product and partial sum is exact in f32
+/// and the matrix unit's accumulation order cannot change a bit. Centroid 40 is the one
+/// non-integer: its 67 coordinates are bf16-representable (8 significant bits), which keeps every
+/// product (<= 12 bits) and every partial sum (< 2^10 over a 2^-16 grid) exact as well, in the f32
+/// arms too, so nothing here carries a tolerance.
 struct AssignFx {
     d: usize,
     x: Vec<f32>,
     c: Vec<f32>,
     rn: Vec<f32>,
     cn: Vec<f32>,
-    self_row: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct AssignOpts {
+    special: bool,
+    sph_huge: bool,
+    periodic: bool,
 }
 
 fn seq_norm(v: &[f32]) -> f32 {
@@ -932,20 +1084,25 @@ fn finalize_dist(x: &[f32], c: &[f32], rn: f32, best_s: f32, sph: bool) -> (f32,
     (raw.max(0.0), false)
 }
 
-fn assign_fx(m: usize, k: usize, d: usize, bf16: bool, special: bool) -> AssignFx {
-    let mut x: Vec<f32> = (0..m * d)
-        .map(|n| {
-            let (i, t) = (n / d, n % d);
-            (((i * 7 + t * 13 + i * t) % 17) as i32 - 8) as f32
-        })
-        .collect();
+fn int_x(i: usize, t: usize) -> f32 {
+    (((i * 7 + t * 13 + i * t) % 17) as i32 - 8) as f32
+}
+
+fn int_c(j: usize, t: usize) -> f32 {
+    (((j * 5 + t * 11 + (j * t) % 7) % 17) as i32 - 8) as f32
+}
+
+fn assign_fx(m: usize, k: usize, d: usize, bf16: bool, opts: AssignOpts, rep: &mut Report, tag: &str) -> AssignFx {
+    let mut x: Vec<f32> = (0..m * d).map(|n| int_x(n / d, n % d)).collect();
     let mut c: Vec<f32> = (0..k * d)
         .map(|n| {
-            let (j, t) = (n / d, n % d);
-            (((j * 5 + t * 11 + (j * t) % 7) % 17) as i32 - 8) as f32
+            // Periodic centroids repeat every 7 clusters, so every row ties across tile columns,
+            // lanes and simdgroups and the lower index has to win each merge.
+            let j = if opts.periodic { (n / d) % 7 } else { n / d };
+            int_c(j, n % d)
         })
         .collect();
-    if k > 67 {
+    if k > 67 && !opts.periodic {
         let row3 = c[3 * d..4 * d].to_vec();
         c[67 * d..68 * d].copy_from_slice(&row3);
     }
@@ -965,22 +1122,36 @@ fn assign_fx(m: usize, k: usize, d: usize, bf16: bool, special: bool) -> AssignF
             x[i * d..(i + 1) * d].copy_from_slice(&row3);
         }
     }
-    let mut self_row = None;
+    let special = opts.special && k == 70 && m == 70;
     let mut invalid_row = None;
-    if special && k > 50 && m > 50 {
-        // A non-integer row equal to its centroid: the refine path must give +0.0.
-        let s: Vec<f32> = random_f32(d, 8100 + d as u64).iter().map(|&v| eff(v, bf16)).collect();
-        c[40 * d..41 * d].copy_from_slice(&s);
+    if special {
+        let s: Vec<f32> = random_f32(d, 8100 + d as u64).iter().map(|&v| eff(v, true)).collect();
+        c[SELF_C * d..(SELF_C + 1) * d].copy_from_slice(&s);
         x[33 * d..34 * d].copy_from_slice(&s);
-        self_row = Some(33);
         // rn > 7.0e37 with a finite exact distance: row 20 and centroid 9 share a huge coordinate.
         let h = eff(9.0e18, bf16);
         x[20 * d] = h;
-        c[9 * d] = h;
+        c[HUGE_C * d] = h;
         // Every candidate overflows: all invalid.
         let g = eff(3.0e19, bf16);
         x[50 * d..51 * d].fill(g);
         invalid_row = Some(50);
+        // |c|^2 = 8191 = 8192 - 1: a row on this centroid with rn = 8192 has raw = 1 = the refine
+        // threshold exactly.
+        c[EDGE_C * d..(EDGE_C + 1) * d].fill(0.0);
+        c[EDGE_C * d..EDGE_C * d + 4].copy_from_slice(&[90.0, 9.0, 3.0, 1.0]);
+        let edge = c[EDGE_C * d..(EDGE_C + 1) * d].to_vec();
+        x[60 * d..61 * d].copy_from_slice(&edge);
+        // 2 * dot overflows (rn <= 7.0e37) while the exact distance stays finite.
+        c[OVF_C * d..(OVF_C + 1) * d].fill(0.0);
+        c[OVF_C * d] = eff(2.5e19, bf16);
+        x[55 * d..56 * d].fill(0.0);
+        x[55 * d] = eff(8.0e18, bf16);
+    }
+    if opts.sph_huge {
+        // -2 * dot overflows for every centroid whose coordinate 0 is not zero.
+        x[60 * d..61 * d].fill(0.0);
+        x[60 * d] = eff(3.0e38, bf16);
     }
     let rn: Vec<f32> = (0..m)
         .map(|i| {
@@ -992,14 +1163,44 @@ fn assign_fx(m: usize, k: usize, d: usize, bf16: bool, special: bool) -> AssignF
         })
         .collect();
     let cn: Vec<f32> = (0..k).map(|j| seq_norm(&c[j * d..(j + 1) * d])).collect();
-    AssignFx {
-        d,
-        x,
-        c,
-        rn,
-        cn,
-        self_row,
+    let mut fx = AssignFx { d, x, c, rn, cn };
+    if special {
+        // Supplied row norms that sit exactly on the guards of eval_assign_score / finalize.
+        fx.rn[11] = SAFE_RN_MAX; // rn == 7.0e37: still the fast path
+        fx.rn[60] = 8192.0;
+        // Rows on a centroid whose supplied norm puts raw at rho * threshold: inside the refine
+        // window, just outside, between 1x and 2x, far outside, and the negative mirror images.
+        for (row, rho) in [
+            (3usize, 0.5f64),
+            (9, 0.95),
+            (15, 1.05),
+            (21, 1.9),
+            (27, 2.5),
+            (39, -0.95),
+            (45, -1.05),
+        ] {
+            let Some((_, s)) = fx.best(row, false, 0, k) else {
+                rep.fail(format!("{tag}: ORACLE row {row} has no candidate"));
+                continue;
+            };
+            if s > -100.0 {
+                rep.fail(format!(
+                    "{tag}: ORACLE row {row} score {s} is too small for the window rows"
+                ));
+                continue;
+            }
+            // raw = rn + s = rho * rn / 8192  =>  rn = -s / (1 - rho / 8192)
+            let r = (-f64::from(s) / (1.0 - rho / 8192.0)) as f32;
+            fx.rn[row] = r;
+            let ratio = f64::from(r + s) / f64::from(1024.0f32 * 1.192_092_9e-7f32 * r);
+            if (ratio - rho).abs() > 0.1 * rho.abs() {
+                rep.fail(format!(
+                    "{tag}: ORACLE row {row} realised raw/threshold {ratio}, wanted {rho}"
+                ));
+            }
+        }
     }
+    fx
 }
 
 impl AssignFx {
@@ -1011,32 +1212,45 @@ impl AssignFx {
         &self.c[j * self.d..(j + 1) * self.d]
     }
 
+    /// `eval_assign_score`: the candidate's score, or `None` when it is rejected. The dot is the
+    /// correctly rounded exact dot product: the fixtures keep every product and partial sum exact,
+    /// or leave a single nonzero product, so the matrix unit's order cannot show.
+    fn cand(&self, i: usize, j: usize, sph: bool) -> Option<f32> {
+        let dot: f64 = self
+            .xr(i)
+            .iter()
+            .zip(self.cr(j))
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let dot = dot as f32;
+        if sph {
+            let sc = -2.0f32 * dot;
+            return (!nonfinite32(sc.to_bits())).then_some(sc);
+        }
+        let rn = self.rn[i];
+        if rn > SAFE_RN_MAX {
+            return exact_dist2(self.xr(i), self.cr(j));
+        }
+        let two_dot = 2.0f32 * dot;
+        let sc = self.cn[j] - two_dot;
+        if nonfinite32(two_dot.to_bits()) || nonfinite32(sc.to_bits()) {
+            return exact_dist2(self.xr(i), self.cr(j)).map(|e| e - rn);
+        }
+        Some(sc)
+    }
+
     /// First strict minimum of the score over `c0..c1` (lower index wins ties), or `None`
     /// when every candidate is rejected.
     fn best(&self, i: usize, sph: bool, c0: usize, c1: usize) -> Option<(u32, f32)> {
-        let mut best: Option<(u32, f64)> = None;
+        let mut best: Option<(u32, f32)> = None;
         for j in c0..c1 {
-            let dot: f64 = self
-                .xr(i)
-                .iter()
-                .zip(self.cr(j))
-                .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                .sum();
-            let sc = if sph {
-                -2.0 * dot
-            } else if self.rn[i] > SAFE_RN_MAX {
-                match exact_dist2(self.xr(i), self.cr(j)) {
-                    Some(e) => f64::from(e),
-                    None => continue,
+            if let Some(sc) = self.cand(i, j, sph) {
+                if best.is_none_or(|(_, b)| sc < b) {
+                    best = Some((j as u32, sc));
                 }
-            } else {
-                f64::from(self.cn[j]) - 2.0 * dot
-            };
-            if best.is_none_or(|(_, b)| sc < b) {
-                best = Some((j as u32, sc));
             }
         }
-        best.map(|(l, s)| (l, s as f32))
+        best
     }
 }
 
@@ -1045,8 +1259,62 @@ struct AssignCase {
     sph: bool,
     k: usize,
     split: usize,
+    /// (part_c, c_start, c_end) of every dispatch.
+    ranges: Vec<(usize, usize, usize)>,
     has_epoch: bool,
-    special: bool,
+    opts: AssignOpts,
+}
+
+fn assign_cases() -> Vec<AssignCase> {
+    let plain = AssignOpts {
+        special: false,
+        sph_huge: false,
+        periodic: false,
+    };
+    let special = AssignOpts { special: true, ..plain };
+    let periodic = AssignOpts {
+        periodic: true,
+        ..plain
+    };
+    let parts = vec![(0, 0, 64), (1, 64, 70)];
+    let case = |name, sph, k, split, ranges: Vec<(usize, usize, usize)>, has_epoch, opts| AssignCase {
+        name,
+        sph,
+        k,
+        split,
+        ranges,
+        has_epoch,
+        opts,
+    };
+    vec![
+        case("full", false, 70, 1, vec![(0, 0, 70)], true, special),
+        case("no-epoch", false, 70, 1, vec![(0, 0, 70)], false, plain),
+        case(
+            "spherical",
+            true,
+            70,
+            1,
+            vec![(0, 0, 70)],
+            true,
+            AssignOpts {
+                sph_huge: true,
+                ..plain
+            },
+        ),
+        case("k1", false, 1, 1, vec![(0, 0, 1)], false, plain),
+        case("split2", false, 70, 2, parts.clone(), false, special),
+        case("split2-spherical", true, 70, 2, parts.clone(), false, plain),
+        case("periodic", false, 70, 1, vec![(0, 0, 70)], false, periodic),
+        case("periodic-spherical", true, 70, 1, vec![(0, 0, 70)], false, periodic),
+        case("periodic-split2", false, 70, 2, parts, false, periodic),
+        // A nonzero c_start with split_c == 1: the all-invalid row takes c_start as its label.
+        case("c-window-3", false, 70, 1, vec![(0, 3, 70)], true, special),
+        // An empty range writes nothing at all.
+        case("empty-range", false, 70, 1, vec![(0, 5, 5)], true, plain),
+        // Only the last centroid, as the second part of a split: 2 * dot overflows for row 55,
+        // so its score is exact_d - rn, and every other row is rejected.
+        case("only-ovf-centroid", false, 70, 2, vec![(1, 69, 70)], false, special),
+    ]
 }
 
 fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf16: bool, tensorops: bool) {
@@ -1058,63 +1326,13 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
     };
     let tile_m = if tensorops { 64 } else { 32 };
     let (m, d) = (70usize, 67usize);
-    let cases = [
-        AssignCase {
-            name: "full",
-            sph: false,
-            k: 70,
-            split: 1,
-            has_epoch: true,
-            special: true,
-        },
-        AssignCase {
-            name: "no-epoch",
-            sph: false,
-            k: 70,
-            split: 1,
-            has_epoch: false,
-            special: false,
-        },
-        AssignCase {
-            name: "spherical",
-            sph: true,
-            k: 70,
-            split: 1,
-            has_epoch: true,
-            special: false,
-        },
-        AssignCase {
-            name: "k1",
-            sph: false,
-            k: 1,
-            split: 1,
-            has_epoch: false,
-            special: false,
-        },
-        AssignCase {
-            name: "split2",
-            sph: false,
-            k: 70,
-            split: 2,
-            has_epoch: false,
-            special: true,
-        },
-        AssignCase {
-            name: "split2-spherical",
-            sph: true,
-            k: 70,
-            split: 2,
-            has_epoch: false,
-            special: false,
-        },
-    ];
     ledger.credit(rt, name, &[name], || {
-        for case in &cases {
+        for case in &assign_cases() {
             let tag = format!(
-                "{name}[{} M={m} k={} d={d} sph={} split_c={} epoch={}]",
-                case.name, case.k, case.sph, case.split, case.has_epoch
+                "{name}[{} M={m} k={} d={d} sph={} split_c={} ranges={:?} epoch={}]",
+                case.name, case.k, case.sph, case.split, case.ranges, case.has_epoch
             );
-            let fx = assign_fx(m, case.k, d, bf16, case.special);
+            let fx = assign_fx(m, case.k, d, bf16, case.opts, rep, &tag);
             let (xb, cb) = if bf16 {
                 (u16b(rt, &bf16_bits_of(&fx.x)), u16b(rt, &bf16_bits_of(&fx.c)))
             } else {
@@ -1127,10 +1345,7 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
             let part_scores = sent_f32(rt, case.split * m + PAD);
             let part_labels = sent_u32(rt, case.split * m + PAD);
             let fault = fault_buf(rt, 0);
-            let part_k = if case.split == 1 { case.k } else { 64 };
-            for part_c in 0..case.split {
-                let c_start = part_c * part_k;
-                let c_end = (c_start + part_k).min(case.k);
+            for &(part_c, c_start, c_end) in &case.ranges {
                 launch(rt, name, (m.div_ceil(tile_m), 1, 1), (128, 1, 1), |bnd| {
                     bnd.bind_gpu_buf(&xb, 0);
                     bnd.bind_gpu_buf(&cb, 1);
@@ -1159,35 +1374,37 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
             let mut w_ps = vec![SENT_F32_BITS; case.split * m + PAD];
             let mut w_pl = vec![SENT_U32; case.split * m + PAD];
             let mut w_fault = 0u32;
-            for i in 0..m {
-                if case.split == 1 {
-                    match fx.best(i, case.sph, 0, case.k) {
-                        Some((l, s)) => {
-                            w_labels[i] = l;
-                            let (dist, f) = finalize_dist(fx.xr(i), fx.cr(l as usize), fx.rn[i], s, case.sph);
-                            w_dists[i] = dist.to_bits();
-                            if f {
+            for &(part_c, c_start, c_end) in &case.ranges {
+                if c_start >= c_end {
+                    continue;
+                }
+                for i in 0..m {
+                    let best = fx.best(i, case.sph, c_start, c_end);
+                    if case.split == 1 {
+                        match best {
+                            Some((l, s)) => {
+                                w_labels[i] = l;
+                                let (dist, f) = finalize_dist(fx.xr(i), fx.cr(l as usize), fx.rn[i], s, case.sph);
+                                w_dists[i] = dist.to_bits();
+                                if f {
+                                    w_fault |= FAULT_DIST;
+                                }
+                                if case.has_epoch {
+                                    w_epoch[EPOCH_OFF + i] = l;
+                                }
+                            }
+                            None => {
+                                w_labels[i] = c_start as u32;
+                                w_dists[i] = 0.0f32.to_bits();
                                 w_fault |= FAULT_DIST;
-                            }
-                            if case.has_epoch {
-                                w_epoch[EPOCH_OFF + i] = l;
-                            }
-                        }
-                        None => {
-                            w_labels[i] = 0;
-                            w_dists[i] = 0.0f32.to_bits();
-                            w_fault |= FAULT_DIST;
-                            if case.has_epoch {
-                                w_epoch[EPOCH_OFF + i] = 0;
+                                if case.has_epoch {
+                                    w_epoch[EPOCH_OFF + i] = c_start as u32;
+                                }
                             }
                         }
-                    }
-                } else {
-                    for part_c in 0..case.split {
-                        let c_start = part_c * part_k;
-                        let c_end = (c_start + part_k).min(case.k);
+                    } else {
                         let at = part_c * m + i;
-                        match fx.best(i, case.sph, c_start, c_end) {
+                        match best {
                             Some((l, s)) => {
                                 w_ps[at] = s.to_bits();
                                 w_pl[at] = l;
@@ -1200,42 +1417,6 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
                     }
                 }
             }
-            let got_ps = rd32(&part_scores, case.split * m + PAD);
-            if let Some(i) = fx.self_row {
-                // The self row's partition scores are matrix-unit noise around -|c|^2; its label
-                // and (via the refine path) its distance are exact and stay compared.
-                for part_c in 0..case.split {
-                    let at = part_c * m + i;
-                    w_ps[at] = got_ps[at];
-                }
-            }
-            if !bf16 && fx.self_row.is_some() {
-                // The non-integer centroid 40 wins part 0 for many ordinary rows, and in the f32
-                // arms its score `cn - 2 dot` carries the matrix unit's f32 accumulation order
-                // (first locked run: up to 13 ulp). Those scores are held to the documented
-                // reduction bound over the sum of absolute terms; every integer score stays
-                // bit-exact, and the label and finalized distance of these rows stay exact too.
-                for part_c in 0..case.split {
-                    for i in 0..m {
-                        let at = part_c * m + i;
-                        if w_pl[at] != 40 {
-                            continue;
-                        }
-                        let scale: f64 = fx
-                            .xr(i)
-                            .iter()
-                            .zip(fx.cr(40))
-                            .map(|(&a, &b)| (f64::from(a) * f64::from(b)).abs())
-                            .sum::<f64>()
-                            * 2.0
-                            + f64::from(fx.cn[40]);
-                        let diff = (f64::from(f32::from_bits(got_ps[at])) - f64::from(f32::from_bits(w_ps[at]))).abs();
-                        if diff <= reduction_bound(d, scale) {
-                            w_ps[at] = got_ps[at];
-                        }
-                    }
-                }
-            }
             rep.cmp(&tag, "chunk_labels", &rd32(&chunk_labels, m + PAD), &w_labels);
             rep.cmp(&tag, "chunk_dists", &rd32(&chunk_dists, m + PAD), &w_dists);
             rep.cmp(
@@ -1244,7 +1425,7 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
                 &rd32(&epoch_labels, EPOCH_OFF + m + PAD),
                 &w_epoch,
             );
-            rep.cmp(&tag, "part_scores", &got_ps, &w_ps);
+            rep.cmp(&tag, "part_scores", &rd32(&part_scores, case.split * m + PAD), &w_ps);
             rep.cmp(&tag, "part_labels", &rd32(&part_labels, case.split * m + PAD), &w_pl);
             rep.cmp(&tag, "fault", &rd32(&fault, 1), &[w_fault]);
         }
@@ -1255,31 +1436,56 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
 // reduce_split_c
 // ---------------------------------------------------------------------------
 
+/// The one fault cause a reduce_split_c case plants (or none).
+#[derive(Clone, Copy, PartialEq)]
+enum Bad {
+    Nothing,
+    /// A row whose parts are all INVALID.
+    AllInvalid,
+    /// A row with rn > 7.0e37 whose exact distance overflows.
+    ExactNonfinite,
+    /// A spherical row whose best score is -inf, so `2 + best` is not finite.
+    SphNonfinite,
+}
+
 fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_reduce_split_c";
     let (m, d, kc, split) = (40usize, 19usize, 12usize, 3usize);
+    // Rows 20..=26 sit at raw = 127, 128, 129, 200, -127, -128, -129 against rn = 2^20, whose
+    // refine threshold is 1024 * 2^-23 * 2^20 = 128 exactly.
+    let edge_targets = [127.0f32, 128.0, 129.0, 200.0, -127.0, -128.0, -129.0];
     ledger.credit(rt, name, &[name], || {
         for bf16 in [false, true] {
             for (sph, has_epoch, bad) in [
-                (false, true, false),
-                (false, true, true),
-                (false, false, false),
-                (true, true, false),
+                (false, true, Bad::Nothing),
+                (false, false, Bad::Nothing),
+                (true, true, Bad::Nothing),
+                (false, true, Bad::AllInvalid),
+                (false, true, Bad::ExactNonfinite),
+                (true, true, Bad::SphNonfinite),
             ] {
-                let tag = format!("{name}[bf16_assign={bf16} sph={sph} epoch={has_epoch} bad_rows={bad}]");
+                let tag = format!(
+                    "{name}[bf16_assign={bf16} sph={sph} epoch={has_epoch} bad={}]",
+                    match bad {
+                        Bad::Nothing => "none",
+                        Bad::AllInvalid => "all-invalid",
+                        Bad::ExactNonfinite => "exact-nonfinite",
+                        Bad::SphNonfinite => "sph-nonfinite",
+                    }
+                );
                 let mut x: Vec<f32> = (0..m * d)
                     .map(|n| (((n / d * 5 + n % d * 3 + (n / d) * (n % d)) % 9) as i32 - 4) as f32)
                     .collect();
                 let c: Vec<f32> = (0..kc * d)
                     .map(|n| (((n / d * 7 + n % d * 2 + (n / d) * (n % d) % 5) % 9) as i32 - 4) as f32)
                     .collect();
-                if bad {
+                if bad == Bad::ExactNonfinite {
                     x[7 * d..8 * d].fill(eff(3.0e19, bf16));
                 }
                 let mut rn: Vec<f32> = (0..m).map(|i| seq_norm(&x[i * d..(i + 1) * d])).collect();
                 rn[5] = 9.0e37;
                 rn[6] = 5.0e37;
-                if bad {
+                if bad == Bad::ExactNonfinite {
                     rn[7] = 9.0e37;
                 }
                 let mut ps = vec![0.0f32; split * m];
@@ -1295,6 +1501,13 @@ fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                         }
                     }
                 }
+                // Rows with one valid part and every other part INVALID.
+                let only = |i: usize, label: u32, score: f32, pl: &mut [u32], ps: &mut [f32]| {
+                    for p in 0..split {
+                        pl[p * m + i] = if p == 0 { label } else { INVALID };
+                        ps[p * m + i] = if p == 0 { score } else { 0.0 };
+                    }
+                };
                 let mut set = |i: usize, parts: [(u32, f32); 3]| {
                     for (p, (l, s)) in parts.into_iter().enumerate() {
                         pl[p * m + i] = l;
@@ -1303,18 +1516,38 @@ fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                 };
                 set(1, [(7, -5.0), (3, -5.0), (INVALID, -9.0)]);
                 set(2, [(3, -5.0), (7, -5.0), (5, -5.0)]);
-                if bad {
+                if bad == Bad::AllInvalid {
                     set(3, [(INVALID, -1.0), (INVALID, 2.0), (INVALID, -3.0)]);
                 }
                 set(4, [(4, 5.0), (2, -rn[4]), (9, 6.0)]);
                 set(5, [(6, 1.0), (INVALID, 0.0), (INVALID, 0.0)]);
                 set(6, [(1, 3.0e38), (INVALID, 0.0), (INVALID, 0.0)]);
-                if bad {
+                if bad == Bad::ExactNonfinite {
                     set(7, [(0, 1.0), (INVALID, 0.0), (INVALID, 0.0)]);
                 }
                 // raw = 2^-9 inside the refine band, and raw = -0.5 outside it (clamps to zero).
                 set(8, [(2, 0.001_953_125 - rn[8]), (INVALID, 0.0), (INVALID, 0.0)]);
                 set(9, [(5, -0.5 - rn[9]), (INVALID, 0.0), (INVALID, 0.0)]);
+                if bad == Bad::SphNonfinite {
+                    set(12, [(3, f32::NEG_INFINITY), (INVALID, 0.0), (INVALID, 0.0)]);
+                }
+                // The only valid part holds f32::MAX: the first part must be taken unconditionally.
+                only(28, 5, f32::MAX, &mut pl, &mut ps);
+                // rn = 0 and raw = 1e-35: inside the floored threshold (1e-30 * 2^-13), outside 0.
+                rn[27] = 0.0;
+                only(27, 1, 1.0e-35, &mut pl, &mut ps);
+                for (e, &target) in edge_targets.iter().enumerate() {
+                    let i = 20 + e;
+                    rn[i] = 1_048_576.0;
+                    let label = ((i * 5) % kc) as u32;
+                    only(i, label, target - 1_048_576.0, &mut pl, &mut ps);
+                    // The exact distance must differ from raw, or the window cannot be seen.
+                    while exact_dist2(&x[i * d..(i + 1) * d], &c[label as usize * d..(label as usize + 1) * d])
+                        == Some(target)
+                    {
+                        x[i * d] += 1.0;
+                    }
+                }
                 let mut w_labels = vec![SENT_U32; m + PAD];
                 let mut w_dists = vec![SENT_F32_BITS; m + PAD];
                 let mut w_epoch = vec![SENT_U32; EPOCH_OFF + m + PAD];
@@ -1359,7 +1592,7 @@ fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                         w_epoch[EPOCH_OFF + i] = best_l;
                     }
                 }
-                if w_fault != if bad { FAULT_DIST } else { 0 } {
+                if w_fault != if bad == Bad::Nothing { 0 } else { FAULT_DIST } {
                     rep.fail(format!("{tag}: ORACLE derived fault {w_fault} for the planned rows"));
                 }
                 let (xb, cb) = if bf16 {
@@ -1372,7 +1605,7 @@ fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                 let chunk_dists = sent_f32(rt, m + PAD);
                 let epoch_labels = sent_u32(rt, EPOCH_OFF + m + PAD);
                 let fault = fault_buf(rt, 0);
-                launch_1d(rt, name, m, |bnd| {
+                launch_threads(rt, name, m + 5, |bnd| {
                     bnd.bind_gpu_buf(&psb, 0);
                     bnd.bind_gpu_buf(&plb, 1);
                     bnd.bind_gpu_buf(&rnb, 2);
@@ -1411,25 +1644,29 @@ fn reduce_split_c(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
 fn pack_label_keys(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_pack_label_keys";
     ledger.credit(rt, name, &[name], || {
-        let m = 300usize;
-        let mut labels: Vec<u32> = (0..m).map(|r| ((r * 37 + 5) % 70) as u32).collect();
-        labels[17] = 0xffff_fff0; // needs the 64-bit shift
-        let tag = format!("{name}[M={m}]");
-        let lb = u32b(rt, &labels);
-        let keys = sent_u64(rt, m + 16);
-        let osc = u32b(rt, &[0xdead]);
-        launch_1d(rt, name, m, |bnd| {
-            bnd.bind_gpu_buf(&lb, 0);
-            bnd.bind_gpu_buf(&keys, 1);
-            bnd.bind_gpu_buf(&osc, 2);
-            bnd.bind_u32(m as u32, 3);
-        });
-        let mut want = vec![SENT_U64; m + 16];
-        for (r, &l) in labels.iter().enumerate() {
-            want[r] = (u64::from(l) << 16) | r as u64;
+        // M = 1: only thread 0 exists, so only `r == 0` can clear the overflow slice count.
+        for m in [300usize, 1] {
+            let mut labels: Vec<u32> = (0..m).map(|r| ((r * 37 + 5) % 70) as u32).collect();
+            if m > 17 {
+                labels[17] = 0xffff_fff0; // needs the 64-bit shift
+            }
+            let tag = format!("{name}[M={m}]");
+            let lb = u32b(rt, &labels);
+            let keys = sent_u64(rt, m + 16);
+            let osc = u32b(rt, &[0xdead]);
+            launch_1d(rt, name, m, |bnd| {
+                bnd.bind_gpu_buf(&lb, 0);
+                bnd.bind_gpu_buf(&keys, 1);
+                bnd.bind_gpu_buf(&osc, 2);
+                bnd.bind_u32(m as u32, 3);
+            });
+            let mut want = vec![SENT_U64; m + 16];
+            for (r, &l) in labels.iter().enumerate() {
+                want[r] = (u64::from(l) << 16) | r as u64;
+            }
+            rep.cmp(&tag, "keys", &rd64(&keys, m + 16), &want);
+            rep.cmp(&tag, "overflow_slice_count", &rd32(&osc, 1), &[0]);
         }
-        rep.cmp(&tag, "keys", &rd64(&keys, m + 16), &want);
-        rep.cmp(&tag, "overflow_slice_count", &rd32(&osc, 1), &[0]);
     });
 }
 
@@ -1453,20 +1690,33 @@ fn tile_hist(keys: &[u64], shift: u32, tiles: usize) -> Vec<u32> {
 fn radix_hist(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_radix_hist";
     ledger.credit(rt, name, &[name], || {
-        for (count, shift) in [(600usize, 16u32), (600, 24), (600, 32), (257, 24), (100, 16)] {
+        // 5000 keys: 20 tiles, so threadgroups reuse the threadgroup memory of earlier ones and a
+        // histogram that is not cleared shows.
+        for (count, shift) in [
+            (600usize, 16u32),
+            (600, 24),
+            (600, 32),
+            (257, 24),
+            (100, 16),
+            (5000, 24),
+        ] {
             let tiles = count.div_ceil(256);
             let tag = format!("{name}[count={count} shift={shift}]");
             let keys = rand_keys(count, 9000 + u64::from(shift) + count as u64);
             let kb = u64b(rt, &keys);
-            let hb = sent_u32(rt, 256 * tiles);
-            launch(rt, name, (tiles, 1, 1), (256, 1, 1), |bnd| {
+            // One launched group past num_tiles writes hist[tid * tiles + tiles] if the guard fails.
+            let len = 256 * tiles + 256;
+            let hb = sent_u32(rt, len);
+            launch(rt, name, (tiles + 1, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&kb, 0);
                 bnd.bind_gpu_buf(&hb, 1);
                 bnd.bind_u32(count as u32, 2);
                 bnd.bind_u32(tiles as u32, 3);
                 bnd.bind_u32(shift, 4);
             });
-            rep.cmp(&tag, "hist", &rd32(&hb, 256 * tiles), &tile_hist(&keys, shift, tiles));
+            let mut want = tile_hist(&keys, shift, tiles);
+            want.extend(vec![SENT_U32; 256]);
+            rep.cmp(&tag, "hist (+canary)", &rd32(&hb, len), &want);
         }
     });
 }
@@ -1523,7 +1773,11 @@ fn radix_scatter(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             let tag = format!("{name}[count={count} shift={shift}]");
             let keys = rand_keys(count, 9500 + u64::from(shift) + count as u64);
             let offsets = exclusive_scan(&tile_hist(&keys, shift, tiles));
-            let (kb, hb) = (u64b(rt, &keys), u32b(rt, &offsets));
+            // The slot after the last key holds digit 255: a thread that wrongly counts as valid
+            // (idx == count) would scatter it to keys_out[count], which must stay a sentinel.
+            let mut padded = keys.clone();
+            padded.push((0xffu64 << shift) | 0x1234);
+            let (kb, hb) = (u64b(rt, &padded), u32b(rt, &offsets));
             let out = sent_u64(rt, count + 16);
             launch(rt, name, (tiles, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&kb, 0);
@@ -1540,7 +1794,7 @@ fn radix_scatter(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             for (pos, &i) in idx.iter().enumerate() {
                 want[pos] = keys[i];
             }
-            rep.cmp(&tag, "keys_out", &rd64(&out, count + 16), &want);
+            rep.cmp(&tag, "keys_out (+canary)", &rd64(&out, count + 16), &want);
         }
     });
 }
@@ -1548,11 +1802,17 @@ fn radix_scatter(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
 fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_find_bucket_bounds";
     ledger.credit(rt, name, &[name], || {
-        let cases: [(&str, Vec<usize>, u32, bool); 4] = [
+        // (label, sizes, slice base before the kernel, final_epoch)
+        type Case = (&'static str, Vec<usize>, u32, bool);
+        let cases: [Case; 6] = [
             ("two-heavy", vec![300, 0, 270, 5, 25, 0], 0, true),
             ("two-heavy-base3", vec![300, 0, 270, 5, 25, 0], 3, false),
             ("k1-light", vec![100], 0, true),
             ("k1-heavy", vec![300], 0, false),
+            // The 256-row threshold (255 and 256 are light, 257 is heavy), slice rounding at an
+            // exact multiple (512 is 2 slices), a bucket of exactly 1 row, an empty one.
+            ("threshold", vec![255, 256, 257, 512, 1, 0, 2], 1, false),
+            ("threshold-final", vec![255, 256, 257, 512, 1, 0, 2], 0, true),
         ];
         for (case, sizes, b0, final_epoch) in cases {
             let k = sizes.len();
@@ -1569,11 +1829,13 @@ fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repor
             let heavy: Vec<usize> = (0..k).filter(|&j| sizes[j] > 256).collect();
             let total: usize = heavy.iter().map(|&j| sizes[j].div_ceil(256)).sum();
             let kb = u64b(rt, &keys);
-            let info = sent_u32(rt, k * 4);
-            let meta = sent_u32(rt, (b0 as usize + total + 4) * 2);
+            let extra = 5usize; // launched threads past k: the `j >= k` guard must hold
+            let info = sent_u32(rt, (k + extra) * 4);
+            let meta_len = (b0 as usize + total + 4) * 2;
+            let meta = sent_u32(rt, meta_len);
             let osc = u32b(rt, &[b0]);
             let (batch, epoch, pass) = (u64b(rt, &vec![7; k]), u64b(rt, &vec![11; k]), u64b(rt, &vec![13; k]));
-            launch_1d(rt, name, k, |bnd| {
+            launch_threads(rt, name, k + extra, |bnd| {
                 bnd.bind_gpu_buf(&kb, 0);
                 bnd.bind_gpu_buf(&info, 1);
                 bnd.bind_gpu_buf(&meta, 2);
@@ -1593,7 +1855,7 @@ fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repor
                     Some(st)
                 })
                 .collect();
-            let got_info = rd32(&info, k * 4);
+            let got_info = rd32(&info, (k + extra) * 4);
             let mut want_info = Vec::new();
             let mut bases: Vec<(u32, usize, usize)> = Vec::new();
             for j in 0..k {
@@ -1604,7 +1866,8 @@ fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repor
                 }
                 want_info.extend([starts[j] as u32, (starts[j] + sizes[j]) as u32, base, ns as u32]);
             }
-            rep.cmp(&tag, "bucket_info", &got_info, &want_info);
+            want_info.extend(vec![SENT_U32; extra * 4]);
+            rep.cmp(&tag, "bucket_info (+canary)", &got_info, &want_info);
             // The slice base comes from an atomic add, so only the tiling is order-free.
             bases.sort_unstable();
             let mut next = b0;
@@ -1616,7 +1879,7 @@ fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repor
                 }
                 next = base + ns as u32;
             }
-            let mut want_meta = vec![SENT_U32; (b0 as usize + total + 4) * 2];
+            let mut want_meta = vec![SENT_U32; meta_len];
             for &(base, ns, j) in &bases {
                 for s in 0..ns {
                     let at = (base as usize + s) * 2;
@@ -1627,7 +1890,7 @@ fn find_bucket_bounds(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repor
                     }
                 }
             }
-            rep.cmp(&tag, "slice_meta", &rd32(&meta, want_meta.len()), &want_meta);
+            rep.cmp(&tag, "slice_meta", &rd32(&meta, meta_len), &want_meta);
             rep.cmp(&tag, "overflow_slice_count", &rd32(&osc, 1), &[b0 + total as u32]);
             let plus = |base: u64, on: bool| -> Vec<u64> {
                 sizes
@@ -1714,7 +1977,7 @@ fn gather_slice_partials(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Re
 fn fold_slice_partials(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_fold_slice_partials";
     ledger.credit(rt, name, &[name], || {
-        let (k, d, rows, n_keys) = (5usize, 67usize, 64usize, 200usize);
+        let (k, d, rows, n_keys) = (5usize, 67usize, 320usize, 200usize);
         // (start, end, base, num_slices): direct, sliced at base 1, empty, direct single row,
         // sliced at base 3.
         let info: [[u32; 4]; 5] = [
@@ -1726,8 +1989,11 @@ fn fold_slice_partials(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repo
         ];
         let keys: Vec<u64> = (0..n_keys).map(|p| local_row(p, rows) as u64).collect();
         let partials: Vec<f32> = random_f32(6 * d, 9810).iter().map(|v| v * 10.0).collect();
-        let batch0: Vec<f32> = random_f32(k * d, 9811).iter().map(|v| v + 2.0).collect();
-        let pass0: Vec<f32> = random_f32(k * d, 9812).iter().map(|v| v * 3.0 + 5.0).collect();
+        let mut batch0: Vec<f32> = random_f32(k * d, 9811).iter().map(|v| v + 2.0).collect();
+        let mut pass0: Vec<f32> = random_f32(k * d, 9812).iter().map(|v| v * 3.0 + 5.0).collect();
+        // The empty bucket (start == end) must not be touched: -0.0 + 0.0 would flip the sign.
+        batch0[2 * d..3 * d].fill(-0.0);
+        pass0[2 * d..3 * d].fill(-0.0);
         for bf16 in [true, false] {
             for final_epoch in [true, false] {
                 let tag = format!("{name}[stats_bf16={bf16} final_epoch={final_epoch}]");
@@ -1794,23 +2060,70 @@ fn fold_slice_partials(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Repo
 fn accum_chunk_obj(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_accum_chunk_obj";
     ledger.credit(rt, name, &[name], || {
-        for (m, prior, planted) in [(600usize, 1.5f64, true), (100, 0.0, false)] {
-            let tag = format!("{name}[M={m} prior={prior} planted={planted}]");
-            let mut dists: Vec<f32> = random_f32(m, 9900 + m as u64)
+        // (label, dists, prior, planned fault). The expected objective is native f64 `+` in the
+        // kernel's order: lane sums, tree 128..1, then the prior.
+        let mut cases: Vec<(String, Vec<f32>, f64, u32)> = Vec::new();
+        let scaled = |m: usize, seed: u64, signed: bool| -> Vec<f32> {
+            random_f32(m, seed)
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| v * 10.0f32.powi((i * 7 % 11) as i32 - 5))
-                .collect();
-            if !planted {
-                for v in &mut dists {
-                    *v = v.abs();
-                }
-            } else {
-                dists[100] = 1.0e-40; // f32 subnormal: only reinterpreted, so it stays exact
-                dists[250] = f32::NAN;
-                dists[400] = f32::INFINITY;
-            }
-            // Native f64 `+` in the kernel's order: lane sums, tree 128..1, then the prior.
+                .map(|(i, &v)| {
+                    let v = if signed { v } else { v.abs() };
+                    v * 2.0f32.powi(((i * 7 + seed as usize) % 41) as i32 - 20)
+                })
+                .collect()
+        };
+        let mut planted = scaled(600, 9900, true);
+        planted[100] = 1.0e-40; // f32 subnormal: only reinterpreted, so it stays exact
+        planted[250] = f32::NAN;
+        planted[400] = f32::INFINITY;
+        cases.push(("planted".into(), planted, 1.5, FAULT_DIST));
+        cases.push(("positive".into(), scaled(100, 9901, false), 0.0, 0));
+        // +inf alone: it must raise the fault (and contribute nothing), with no NaN to do it.
+        let mut inf = scaled(300, 9902, true);
+        inf[77] = f32::INFINITY;
+        cases.push(("inf-alone".into(), inf, 0.25, FAULT_DIST));
+        // Negative values must be summed, not mistaken for non-finite: all of them, no NaN.
+        let negative: Vec<f32> = scaled(300, 9903, false).iter().map(|v| -v).collect();
+        cases.push(("all-negative".into(), negative, 0.0, 0));
+        // Subnormal dists only, one per lane, so none is swamped by a larger term: every f32
+        // subnormal is a multiple of 2^-149, so the f64 sums are exact.
+        let sub: Vec<f32> = (0..16u32)
+            .map(|i| {
+                let mant = [
+                    0x7f_ffff, 0x40_0001, 0x00_0001, 0x55_aaaa, 0x2a_5555, 0x7f_0000, 0x01_0000, 0x6d_b6db,
+                ][i as usize % 8];
+                f32::from_bits(((i / 8) << 31) | mant)
+            })
+            .collect();
+        cases.push(("subnormal-only".into(), sub, 0.0, 0));
+        // Exact cancellation inside a lane (dists[t] and dists[t + 256] are opposites), and near
+        // cancellation by 2^-20 and 2^-22 that renormalises the difference.
+        let mut cancel = scaled(512, 9904, true);
+        for t in 0..32 {
+            cancel[t + 256] = -cancel[t];
+        }
+        for t in 32..64 {
+            cancel[t + 256] = -cancel[t] * (1.0 - 2.0f32.powi(-20));
+        }
+        for t in 64..96 {
+            cancel[t + 256] = -cancel[t] * (1.0 - 2.0f32.powi(-22));
+        }
+        cases.push(("cancel".into(), cancel, 0.0, 0));
+        // Many random mixed-sign draws: sticky bits, rounding ties and renormalisation of the
+        // binary64 adder all need many different operand pairs to show.
+        for s in 0..160u64 {
+            let m = 256 + (s as usize * 13) % 400;
+            cases.push((
+                format!("random-{s}"),
+                scaled(m, 10_300 + s, true),
+                (s as f64) * 0.37 - 20.0,
+                0,
+            ));
+        }
+        for (label, dists, prior, planned) in &cases {
+            let m = dists.len();
+            let tag = format!("{name}[{label} M={m}]");
             let mut lanes = [0.0f64; 256];
             for (r, &v) in dists.iter().enumerate() {
                 if !nonfinite32(v.to_bits()) {
@@ -1825,15 +2138,24 @@ fn accum_chunk_obj(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) 
                 stride >>= 1;
             }
             let want = prior + lanes[0];
-            let (db, ob, fault) = (f32b(rt, &dists), u64b(rt, &[prior.to_bits()]), fault_buf(rt, 0));
+            let (db, ob, fault) = (
+                f32b(rt, dists),
+                u64b(rt, &[prior.to_bits(), SENT_U64]),
+                fault_buf(rt, 0),
+            );
             launch(rt, name, (1, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&db, 0);
                 bnd.bind_gpu_buf(&ob, 1);
                 bnd.bind_u32(m as u32, 2);
                 bnd.bind_gpu_buf(&fault, 3);
             });
-            rep.cmp(&tag, "epoch_obj_bits", &rd64(&ob, 1), &[want.to_bits()]);
-            rep.cmp(&tag, "fault", &rd32(&fault, 1), &[if planted { FAULT_DIST } else { 0 }]);
+            rep.cmp(
+                &tag,
+                "epoch_obj_bits (+canary)",
+                &rd64(&ob, 2),
+                &[want.to_bits(), SENT_U64],
+            );
+            rep.cmp(&tag, "fault", &rd32(&fault, 1), &[*planned]);
         }
     });
 }
@@ -1846,15 +2168,32 @@ fn apply_ema(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_apply_ema";
     ledger.credit(rt, name, &[name], || {
         let (k, d) = (4usize, 300usize);
-        let counts0: [u64; 4] = [7, 0, 1000, 13];
-        let usage0: [f32; 4] = [5.0, 9.0, 0.0, 2.5];
-        let cent0 = random_f32(k * d, 10_000);
-        let sums0: Vec<f32> = random_f32(k * d, 10_001).iter().map(|v| v * 50.0).collect();
-        for (alpha, preset) in [(1.0f32, 0u32), (0.25, 0), (0.0, 0), (0.25, 1)] {
+        let rows = k + 1; // one launched group past k, over canary rows
+        let counts0: [u64; 5] = [7, 0, 1000, 13, 5];
+        let usage0: [f32; 5] = [5.0, 9.0, 0.0, 2.5, 77.0];
+        let cent_base = random_f32(rows * d, 10_000);
+        let sums_base: Vec<f32> = random_f32(rows * d, 10_001).iter().map(|v| v * 50.0).collect();
+        for (alpha, preset) in [(1.0f32, 0u32), (0.25, 0), (0.0, 0), (1.5, 0), (0.25, 1)] {
             let tag = format!("{name}[alpha={alpha} fault_preset={preset}]");
+            let mut cent0 = cent_base.clone();
+            let mut sums0 = sums_base.clone();
+            if alpha == 0.0 {
+                // w == 0 keeps the old centroid bit for bit: a -0.0 stays -0.0 (adding +0.0 would
+                // flip it) and an infinite batch sum must not turn it into NaN.
+                for j in [0usize, 2, 3] {
+                    for col in 0..d {
+                        if col % 7 == 0 {
+                            cent0[j * d + col] = -0.0;
+                        }
+                        if col % 11 == 0 {
+                            sums0[j * d + col] = f32::INFINITY;
+                        }
+                    }
+                }
+            }
             let (cb, ub, sb) = (f32b(rt, &cent0), f32b(rt, &usage0), f32b(rt, &sums0));
             let (nb, fault) = (u64b(rt, &counts0), fault_buf(rt, preset));
-            launch(rt, name, (k, 1, 1), (256, 1, 1), |bnd| {
+            launch(rt, name, (rows, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&cb, 0);
                 bnd.bind_gpu_buf(&ub, 1);
                 bnd.bind_gpu_buf(&sb, 2);
@@ -1865,6 +2204,8 @@ fn apply_ema(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                 bnd.bind_gpu_buf(&fault, 7);
             });
             let (mut wc, mut wu) = (cent0.clone(), usage0.to_vec());
+            let mut ws = sums0.clone();
+            let mut wn = counts0.to_vec();
             let replace = alpha == 1.0;
             for j in 0..k {
                 if preset == 0 {
@@ -1894,11 +2235,14 @@ fn apply_ema(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                         wu[j] = if replace { 0.0 } else { (1.0 - alpha) * n_old };
                     }
                 }
+                ws[j * d..(j + 1) * d].fill(0.0);
+                wn[j] = 0;
             }
-            rep.cmp(&tag, "centroids", &rd32(&cb, k * d), &bits(&wc));
-            rep.cmp(&tag, "usage", &rd32(&ub, k), &bits(&wu));
-            rep.cmp(&tag, "batch_sums", &rd32(&sb, k * d), &vec![0u32; k * d]);
-            rep.cmp(&tag, "batch_counts", &rd64(&nb, k), &[0u64; 4]);
+            // Row k is a canary: counts 5, usage 77, sums and centroids untouched.
+            rep.cmp(&tag, "centroids (+canary row)", &rd32(&cb, rows * d), &bits(&wc));
+            rep.cmp(&tag, "usage (+canary)", &rd32(&ub, rows), &bits(&wu));
+            rep.cmp(&tag, "batch_sums (+canary row)", &rd32(&sb, rows * d), &bits(&ws));
+            rep.cmp(&tag, "batch_counts (+canary)", &rd64(&nb, rows), &wn);
             rep.cmp(&tag, "fault", &rd32(&fault, 1), &[preset]);
         }
     });
@@ -1918,26 +2262,159 @@ fn ordered_u32(f: f32) -> u32 {
     }
 }
 
+/// How close a decoded Gumbel key must be to the host's f32 logarithms.
+#[derive(Clone, Copy)]
+enum KeyBound {
+    /// Within 2 ordered ulps: donors with usage >= 20 have g >= 0.17, so no cancellation.
+    Ulp2,
+    /// Within 4e-6 absolute: small usages give negative and near-zero g, where the
+    /// logarithms' unspecified accuracy (not their relative size) sets the error.
+    Abs,
+}
+
+struct ReviveCase {
+    name: &'static str,
+    usage: Vec<f32>,
+    threshold: f32,
+    seed: u64,
+    step: u64,
+    preset: u32,
+    bound: KeyBound,
+}
+
+/// Integer usages whose classification flips if the mean or the threshold is off by 0.3%: the
+/// entries at `j % 20 == 3` sit 0.2% below the threshold, those at `j % 20 == 13` 0.2% above.
+fn near_threshold_usage(k: usize, threshold: f32) -> Vec<f32> {
+    let mut usage: Vec<f32> = (0..k).map(|j| 1000.0 + ((j * 37) % 1500) as f32).collect();
+    for _ in 0..12 {
+        let total = lane_sum(k, |j| usage[j]);
+        let thr = threshold * (total / k as f32);
+        for (j, u) in usage.iter_mut().enumerate() {
+            match j % 20 {
+                3 => *u = (thr * 0.998).floor(),
+                13 => *u = (thr * 1.002).ceil(),
+                _ => {}
+            }
+        }
+    }
+    usage
+}
+
+fn revive_cases() -> Vec<ReviveCase> {
+    let strong = |j: usize| -> f32 {
+        match j % 5 {
+            0 => 0.0,
+            1 => 3.0,
+            _ => 30.0 + ((j * 37) % 400) as f32,
+        }
+    };
+    let mut cases = vec![
+        ReviveCase {
+            name: "k6",
+            usage: (0..6).map(strong).collect(),
+            threshold: 0.1,
+            seed: 0x1234_5678_9abc_def0,
+            step: 3,
+            preset: 0,
+            bound: KeyBound::Ulp2,
+        },
+        ReviveCase {
+            name: "k300",
+            usage: (0..300).map(strong).collect(),
+            threshold: 0.1,
+            seed: 0x0fed_cba9_8765_4321,
+            step: 17,
+            preset: 0,
+            bound: KeyBound::Ulp2,
+        },
+        ReviveCase {
+            name: "k300-fault",
+            usage: (0..300).map(strong).collect(),
+            threshold: 0.1,
+            seed: 0x0fed_cba9_8765_4321,
+            step: 17,
+            preset: 1,
+            bound: KeyBound::Ulp2,
+        },
+        // More unused clusters than donors: nsplit = n_donors, and meta.y adds nsplit, not n_unused.
+        ReviveCase {
+            name: "unused>donors",
+            usage: vec![0.0, 0.0, 0.0, 0.0, 50.0, 60.0],
+            threshold: 0.1,
+            seed: 0x55aa_55aa_1234_4321,
+            step: 9,
+            preset: 0,
+            bound: KeyBound::Ulp2,
+        },
+    ];
+    cases.push(ReviveCase {
+        name: "near-threshold",
+        usage: near_threshold_usage(300, 0.5),
+        threshold: 0.5,
+        seed: 0x1111_2222_3333_4444,
+        step: 5,
+        preset: 0,
+        bound: KeyBound::Ulp2,
+    });
+    // usage == threshold exactly: entry 7 equals 0.25 * mean, so it is a donor (nj < thresh is
+    // false). The other 299 entries sum to 40 * (4 * 300 - 1), which makes mean 160 and thresh 40.
+    let mut at_thresh: Vec<f32> = (0..300)
+        .map(|j| {
+            if j % 4 == 0 {
+                5.0
+            } else {
+                120.0 + ((j * 37) % 80) as f32
+            }
+        })
+        .collect();
+    at_thresh[7] = 40.0;
+    let others: f32 = at_thresh
+        .iter()
+        .enumerate()
+        .filter(|&(j, _)| j != 7)
+        .map(|(_, &u)| u)
+        .sum();
+    at_thresh[299] += 40.0 * 1199.0 - others;
+    cases.push(ReviveCase {
+        name: "usage-at-threshold",
+        usage: at_thresh,
+        threshold: 0.25,
+        seed: 0x7777_8888_9999_aaaa,
+        step: 11,
+        preset: 0,
+        bound: KeyBound::Ulp2,
+    });
+    // threshold 0: unused are the negative usages; zeros are neither unused nor donors.
+    cases.push(ReviveCase {
+        name: "threshold-0",
+        usage: vec![-5.0, -3.0, -1.0, -2.0, -4.0, -6.0, 0.0, 0.0, 0.0, 0.0, 7.0, 9.0],
+        threshold: 0.0,
+        seed: 0xdead_beef_0bad_f00d,
+        step: 2,
+        preset: 0,
+        bound: KeyBound::Abs,
+    });
+    // Small usages: roughly a quarter of the donors get a negative Gumbel key.
+    cases.push(ReviveCase {
+        name: "small-usage-negative-keys",
+        usage: (0..96).map(|j| 1.0 + (j % 6) as f32).collect(),
+        threshold: 0.01,
+        seed: 0x0123_4567_89ab_cdef,
+        step: 4,
+        preset: 0,
+        bound: KeyBound::Abs,
+    });
+    cases
+}
+
 fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_revive_prepare";
     ledger.credit(rt, name, &[name], || {
-        let threshold = 0.1f32;
-        for (k, seed, step, preset) in [
-            (6usize, 0x1234_5678_9abc_def0u64, 3u64, 0u32),
-            (300, 0x0fed_cba9_8765_4321, 17, 0),
-            (300, 0x0fed_cba9_8765_4321, 17, 1),
-        ] {
-            let tag = format!("{name}[k={k} step={step} fault_preset={preset}]");
-            // Integer usages: the total is exact whatever the summation order, the unused
-            // ones sit below the threshold, and every donor is >= 30 so ln(usage) dominates
-            // the Gumbel term (no cancellation in the log difference).
-            let usage: Vec<f32> = (0..k)
-                .map(|j| match j % 5 {
-                    0 => 0.0,
-                    1 => 3.0,
-                    _ => 30.0 + ((j * 37) % 400) as f32,
-                })
-                .collect();
+        for case in &revive_cases() {
+            let (usage, threshold, seed, step, preset) =
+                (&case.usage, case.threshold, case.seed, case.step, case.preset);
+            let k = usage.len();
+            let tag = format!("{name}[{} k={k} step={step} fault_preset={preset}]", case.name);
             let total = lane_sum(k, |j| usage[j]);
             let thresh = threshold * (total / k as f32);
             let is_donor = |j: usize| {
@@ -1947,7 +2424,7 @@ fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             let unused: Vec<u32> = (0..k).filter(|&j| usage[j] < thresh).map(|j| j as u32).collect();
             let n_donors = (0..k).filter(|&j| is_donor(j)).count();
             let nsplit = unused.len().min(n_donors) as u32;
-            let (ub, kb) = (f32b(rt, &usage), sent_u64(rt, k));
+            let (ub, kb) = (f32b(rt, usage), sent_u64(rt, k));
             let (ib, mb, fault) = (sent_u32(rt, k), u32b(rt, &[9, 5]), fault_buf(rt, preset));
             launch(rt, name, (1, 1, 1), (256, 1, 1), |bnd| {
                 bnd.bind_gpu_buf(&ub, 0);
@@ -1971,7 +2448,8 @@ fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             rep.cmp(&tag, "revive_meta", &rd32(&mb, 2), &want_meta);
             rep.cmp(&tag, "fault", &rd32(&fault, 1), &[preset]);
             let got = rd64(&kb, k);
-            let mut donors: Vec<(i64, u32, u32)> = Vec::new(); // (host ordered g, gpu high, host high)
+            // (host g, gpu high word)
+            let mut donors: Vec<(f32, u32)> = Vec::new();
             for (j, &key) in got.iter().enumerate() {
                 if (key & 0xffff_ffff) as usize != j {
                     rep.fail(format!("{tag}: donor_keys[{j}] low word {:#x}", key & 0xffff_ffff));
@@ -1984,26 +2462,42 @@ fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                     continue;
                 }
                 let g = revival_gumbel_key(usage[j], seed, step, j as u32);
-                if g < 0.3 {
-                    rep.fail(format!("{tag}: ORACLE donor {j} has g {g}, cancellation not excluded"));
-                }
-                let host_ord = ordered_u32(g);
-                // precise::log is not pinned to an ulp bound here: the ordered-integer distance
-                // of the decoded key stays within 2 ulp of the host f32 logarithms.
-                let dist = (i64::from(!high) - i64::from(host_ord)).abs();
-                if dist > 2 {
+                // The high word is the bitwise complement of the ordered key of g.
+                let ordered = !high;
+                let gpu_g = f32::from_bits(if ordered & 0x8000_0000 != 0 {
+                    ordered ^ 0x8000_0000
+                } else {
+                    !ordered
+                });
+                let ok = match case.bound {
+                    KeyBound::Ulp2 => {
+                        if g < 0.3 {
+                            rep.fail(format!("{tag}: ORACLE donor {j} has g {g}, cancellation not excluded"));
+                        }
+                        // precise::log is not pinned to an ulp bound here: the decoded key stays
+                        // within 2 ordered ulps of the host f32 logarithms.
+                        (i64::from(ordered) - i64::from(ordered_u32(g))).abs() <= 2
+                    }
+                    // precise::log carries no stated bound; small usages put g near zero, where the
+                    // error of the two logarithms (each up to a few ulp of values up to ~17) is
+                    // absolute, so the bound is absolute: 4e-6, far below a wrong branch or a
+                    // wrong sign, far above the observed 2-ulp agreement for g >= 0.17.
+                    KeyBound::Abs => (gpu_g - g).abs() <= 4.0e-6,
+                };
+                if !ok {
                     rep.fail(format!(
-                        "{tag}: donor {j} key ordered {:#x} vs host {host_ord:#x} ({dist} ulp)",
-                        !high
+                        "{tag}: donor {j} key decodes to {gpu_g}, the host f32 logarithms give {g}"
                     ));
                 }
-                donors.push((i64::from(host_ord), high, !host_ord));
+                donors.push((g, high));
             }
-            // The donor rank order must agree wherever the host keys differ by more than 4 ulp.
+            // The donor rank order (ascending key = descending g) must agree wherever the host
+            // values differ by more than twice the bound.
+            let margin = 8.0e-6f32;
             for a in 0..donors.len() {
                 for b in a + 1..donors.len() {
-                    if (donors[a].0 - donors[b].0).abs() > 4
-                        && donors[a].1.cmp(&donors[b].1) != donors[a].2.cmp(&donors[b].2)
+                    if (donors[a].0 - donors[b].0).abs() > margin
+                        && (donors[a].1.cmp(&donors[b].1)) != donors[b].0.total_cmp(&donors[a].0)
                     {
                         rep.fail(format!("{tag}: donor rank order disagrees between donors {a} and {b}"));
                     }
@@ -2011,6 +2505,98 @@ fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
             }
         }
     });
+}
+
+/// One revive_splits dispatch: `pairs` are (donor key, target) in pair order, `nsplit` of them
+/// active; the centroid and usage buffers carry two canary rows past `k`.
+struct SplitCase {
+    label: String,
+    k: usize,
+    d: usize,
+    cent: Vec<f32>,
+    usage: Vec<f32>,
+    dkeys: Vec<u64>,
+    unused: Vec<u32>,
+    nsplit: u32,
+    eps: f32,
+    bf16: bool,
+}
+
+fn run_splits(rt: &Arc<GpuRuntime>, rep: &mut Report, case: &SplitCase) {
+    let name = "emeans_revive_splits";
+    let (k, d) = (case.k, case.d);
+    let tag = format!("{name}[{} bf16_repr={} eps={}]", case.label, case.bf16, case.eps);
+    let mut cent = case.cent.clone();
+    cent.extend(random_f32(2 * d, 10_700)); // canary rows k and k + 1
+    let mut usage = case.usage.clone();
+    usage.extend([77.0, 78.0]);
+    let (kb, ib, mb) = (
+        u64b(rt, &case.dkeys),
+        u32b(rt, &case.unused),
+        u32b(rt, &[case.nsplit, 0]),
+    );
+    let (cb, ub) = (f32b(rt, &cent), f32b(rt, &usage));
+    launch(rt, name, (k, 1, 1), (256, 1, 1), |bnd| {
+        bnd.bind_gpu_buf(&kb, 0);
+        bnd.bind_gpu_buf(&ib, 1);
+        bnd.bind_gpu_buf(&mb, 2);
+        bnd.bind_gpu_buf(&cb, 3);
+        bnd.bind_gpu_buf(&ub, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(d as u32, 6);
+        bnd.bind_f32(case.eps, 7);
+        bnd.bind_u32(u32::from(case.bf16), 8);
+    });
+    let (mut wc, mut wu) = (cent.clone(), usage.clone());
+    for pair in 0..case.nsplit as usize {
+        let dkey = case.dkeys[pair];
+        if (dkey >> 32) as u32 == 0xffff_ffff {
+            continue;
+        }
+        let donor = (dkey & 0xffff_ffff) as usize;
+        let target = case.unused[pair] as usize;
+        if donor >= k || target >= k || donor == target {
+            continue;
+        }
+        let mut any_diff = false;
+        let mut child0 = 0.0f32;
+        for col in 0..d {
+            let c = cent[donor * d + col];
+            let off = if col % 2 == 0 { case.eps } else { -case.eps };
+            let donor_c = c * (1.0f32 - off);
+            let child_c = c * (1.0f32 + off);
+            wc[donor * d + col] = donor_c;
+            wc[target * d + col] = child_c;
+            if col == 0 {
+                child0 = child_c;
+            }
+            if case.bf16 {
+                if bf16f(f32_to_bf16_bits_gpu(donor_c)) != bf16f(f32_to_bf16_bits_gpu(child_c)) {
+                    any_diff = true;
+                }
+            } else {
+                let flush = |v: f32| {
+                    if (v.to_bits() & 0x7fff_ffff) < 0x0080_0000 {
+                        0.0
+                    } else {
+                        v
+                    }
+                };
+                if flush(donor_c) != flush(child_c) {
+                    any_diff = true;
+                }
+            }
+        }
+        if !any_diff {
+            child0 = nudge_child0(child0, case.bf16);
+            wc[target * d] = child0;
+        }
+        let half = usage[donor] * 0.5;
+        wu[donor] = half;
+        wu[target] = half;
+    }
+    rep.cmp(&tag, "centroids (+canary rows)", &rd32(&cb, (k + 2) * d), &bits(&wc));
+    rep.cmp(&tag, "usage (+canary)", &rd32(&ub, k + 2), &bits(&wu));
 }
 
 fn revive_splits(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
@@ -2022,75 +2608,75 @@ fn revive_splits(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
         cent0[d..2 * d].fill(0.0); // zero donor
         cent0[2 * d..3 * d].fill(-1.0); // negative collapsing donor
         let usage0: Vec<f32> = (0..k).map(|j| 2.0 + j as f32 * 0.75).collect();
-        let mut dkeys: Vec<u64> = (0..8u64).map(|p| ((0x1234_0000 + p) << 32) | p).collect();
-        dkeys[4] = (0xffff_ffffu64 << 32) | 4; // sentinel: skipped
-        let unused: [u32; 8] = [8, 9, 10, 11, 12, 5, 14, 15]; // pair 5: donor == target
-        let nsplit = 6u32; // pairs 6 and 7 stay untouched
+        // Pairs 0..=3 are ordinary, 4 is a sentinel key, 5 has donor == target, 6 a donor past k,
+        // 7 a target past k; pairs 8 and 9 lie past nsplit and stay untouched.
+        let donors = [0u64, 1, 2, 3, 4, 5, 16, 6, 7, 13];
+        let mut dkeys: Vec<u64> = donors
+            .iter()
+            .enumerate()
+            .map(|(p, &dn)| ((0x1234_0000 + p as u64) << 32) | dn)
+            .collect();
+        dkeys[4] = (0xffff_ffffu64 << 32) | 4;
+        let unused: Vec<u32> = vec![8, 9, 10, 11, 12, 5, 14, 17, 15, 14];
         for (bf16, eps) in [(true, 1.0e-4f32), (true, 0.02), (false, 1.0e-8), (false, 1.0e-3)] {
-            let tag = format!("{name}[bf16_repr={bf16} eps={eps}]");
-            let (kb, ib, mb) = (u64b(rt, &dkeys), u32b(rt, &unused), u32b(rt, &[nsplit, 0]));
-            let (cb, ub) = (f32b(rt, &cent0), f32b(rt, &usage0));
-            launch(rt, name, (k, 1, 1), (256, 1, 1), |bnd| {
-                bnd.bind_gpu_buf(&kb, 0);
-                bnd.bind_gpu_buf(&ib, 1);
-                bnd.bind_gpu_buf(&mb, 2);
-                bnd.bind_gpu_buf(&cb, 3);
-                bnd.bind_gpu_buf(&ub, 4);
-                bnd.bind_u32(k as u32, 5);
-                bnd.bind_u32(d as u32, 6);
-                bnd.bind_f32(eps, 7);
-                bnd.bind_u32(u32::from(bf16), 8);
-            });
-            let (mut wc, mut wu) = (cent0.clone(), usage0.clone());
-            for pair in 0..nsplit as usize {
-                let dkey = dkeys[pair];
-                if (dkey >> 32) as u32 == 0xffff_ffff {
-                    continue;
-                }
-                let donor = (dkey & 0xffff_ffff) as usize;
-                let target = unused[pair] as usize;
-                if donor == target {
-                    continue;
-                }
-                let mut any_diff = false;
-                let mut child0 = 0.0f32;
-                for col in 0..d {
-                    let c = cent0[donor * d + col];
-                    let off = if col % 2 == 0 { eps } else { -eps };
-                    let donor_c = c * (1.0f32 - off);
-                    let child_c = c * (1.0f32 + off);
-                    wc[donor * d + col] = donor_c;
-                    wc[target * d + col] = child_c;
-                    if col == 0 {
-                        child0 = child_c;
-                    }
-                    if bf16 {
-                        if bf16f(f32_to_bf16_bits_gpu(donor_c)) != bf16f(f32_to_bf16_bits_gpu(child_c)) {
-                            any_diff = true;
-                        }
-                    } else {
-                        let flush = |v: f32| {
-                            if (v.to_bits() & 0x7fff_ffff) < 0x0080_0000 {
-                                0.0
-                            } else {
-                                v
-                            }
-                        };
-                        if flush(donor_c) != flush(child_c) {
-                            any_diff = true;
-                        }
-                    }
-                }
-                if !any_diff {
-                    child0 = nudge_child0(child0, bf16);
-                    wc[target * d] = child0;
-                }
-                let half = usage0[donor] * 0.5;
-                wu[donor] = half;
-                wu[target] = half;
+            run_splits(
+                rt,
+                rep,
+                &SplitCase {
+                    label: "pairs".into(),
+                    k,
+                    d,
+                    cent: cent0.clone(),
+                    usage: usage0.clone(),
+                    dkeys: dkeys.clone(),
+                    unused: unused.clone(),
+                    nsplit: 8,
+                    eps,
+                    bf16,
+                },
+            );
+        }
+        // Donors at the edges of the representable range, whose collapse nudge steps over a
+        // boundary: bf16 {smallest normal, -smallest normal, largest finite} with eps 1e-4,
+        // f32 {largest finite, -smallest normal} with eps 1e-8 (1 +- 1e-8 rounds to 1).
+        let value_rows: [(bool, f32, [f32; 3]); 2] = [
+            (
+                true,
+                1.0e-4,
+                [
+                    1.000_5 * f32::from_bits(0x0080_0000),
+                    -1.000_5 * f32::from_bits(0x0080_0000),
+                    f32::from_bits(0x7f7f_0000),
+                ],
+            ),
+            (
+                false,
+                1.0e-8,
+                [f32::MAX, f32::from_bits(0x8080_0000), f32::from_bits(0x0080_0000)],
+            ),
+        ];
+        for (bf16, eps, vals) in value_rows {
+            let (kk, dd) = (6usize, 40usize);
+            let mut cent = random_f32(kk * dd, 10_200);
+            for (r, v) in vals.iter().enumerate() {
+                cent[r * dd..(r + 1) * dd].fill(*v);
             }
-            rep.cmp(&tag, "centroids", &rd32(&cb, k * d), &bits(&wc));
-            rep.cmp(&tag, "usage", &rd32(&ub, k), &bits(&wu));
+            run_splits(
+                rt,
+                rep,
+                &SplitCase {
+                    label: "edge-values".into(),
+                    k: kk,
+                    d: dd,
+                    cent,
+                    usage: (0..kk).map(|j| 2.0 + j as f32).collect(),
+                    dkeys: (0..3u64).map(|p| ((0x2000 + p) << 32) | p).collect(),
+                    unused: vec![3, 4, 5],
+                    nsplit: 3,
+                    eps,
+                    bf16,
+                },
+            );
         }
     });
 }

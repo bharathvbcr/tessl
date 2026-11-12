@@ -93,9 +93,8 @@ impl Report {
         ));
     }
 
-    /// Comparison within `tol` ulps over an ordered-integer view; inexact-but-within-bound
-    /// entries are printed when `note` is set.
-    fn cmp_ulp(&mut self, tag: &str, what: &str, got: &[u32], want: &[u32], (tol, wide): (i64, bool), note: bool) {
+    /// Comparison within `tol` ulps over an ordered-integer view.
+    fn cmp_ulp(&mut self, tag: &str, what: &str, got: &[u32], want: &[u32], (tol, wide): (i64, bool)) {
         if got.len() != want.len() {
             self.fail(format!("{tag}: {what}: length {} != {}", got.len(), want.len()));
             return;
@@ -127,15 +126,6 @@ impl Report {
                 got.len(),
                 shown.join("; ")
             ));
-        } else if note {
-            for i in (0..got.len()).filter(|&i| got[i] != want[i]).take(3) {
-                println!(
-                    "NOTE {tag}: {what}[{i}] got {:#x} want {:#x} ({} ulp, within {tol})",
-                    got[i],
-                    want[i],
-                    dist(got[i], want[i])
-                );
-            }
         }
     }
 
@@ -545,8 +535,9 @@ fn prep_cases() -> Vec<PrepCase> {
 
 /// bf16 spherical rows against the unrounded scaled value `y`. `precise::rsqrt` is not pinned to
 /// an ulp bound, so a coordinate may land on either bf16 neighbour only when `y` is within 1e-5
-/// (relative) of a rounding boundary; everywhere else the bits are exact. A 0.02% scale error moves
-/// about 5% of the coordinates across a boundary by more than that.
+/// (relative) of a rounding boundary; everywhere else the bits are exact. Estimate, not measured: a
+/// 0.02% scale error moves a coordinate across a boundary with probability about 2e-4 divided by
+/// the relative bf16 spacing (2^-8 to 2^-7), i.e. roughly 2.5% to 5% of the coordinates.
 fn sph_bf16_tight(rep: &mut Report, tag: &str, got: &[u32], y: &[f32]) {
     let bad: Vec<String> = got
         .iter()
@@ -618,9 +609,12 @@ fn prepare_centroids(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report
                 if case.sph {
                     if bf16 {
                         sph_bf16_tight(rep, &tag, got, &want.y);
+                    } else if case.name == "pow4" {
+                        // rsqrt of 4 and 16 is exact: the power-of-4 rows are compared bit for bit.
+                        rep.cmp(&tag, "c_eff", got, &want.c_eff);
                     } else {
                         // precise::rsqrt feeds only the scaled coordinate: 2 f32 ulp.
-                        rep.cmp_ulp(&tag, "c_eff", got, &want.c_eff, (2, true), case.name == "pow4");
+                        rep.cmp_ulp(&tag, "c_eff", got, &want.c_eff, (2, true));
                     }
                     // Every norm is recomputed exactly from the coordinates the kernel stored.
                     let want_norm: Vec<u32> = (0..k)
@@ -1690,8 +1684,9 @@ fn tile_hist(keys: &[u64], shift: u32, tiles: usize) -> Vec<u32> {
 fn radix_hist(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
     let name = "emeans_radix_hist";
     ledger.credit(rt, name, &[name], || {
-        // 5000 keys: 20 tiles, so threadgroups reuse the threadgroup memory of earlier ones and a
-        // histogram that is not cleared shows.
+        // 5000 keys: 20 tiles, so the multi-tile path (many threadgroups, last one partial) is
+        // covered. It cannot force stale threadgroup memory, so it does not reliably kill a
+        // histogram that is never cleared (rh_local_hist_not_cleared survived).
         for (count, shift) in [
             (600usize, 16u32),
             (600, 24),
@@ -2283,7 +2278,8 @@ fn ordered_u32(f: f32) -> u32 {
 /// How close a decoded Gumbel key must be to the host's f32 logarithms.
 #[derive(Clone, Copy)]
 enum KeyBound {
-    /// Within 2 ordered ulps: donors with usage >= 20 have g >= 0.17, so no cancellation.
+    /// Within 2 ordered ulps: these cases only have donors with g >= 0.3 (enforced by the ORACLE
+    /// check below), so there is no cancellation in the log difference.
     Ulp2,
     /// Within 4e-6 absolute: small usages give negative and near-zero g, where the
     /// logarithms' unspecified accuracy (not their relative size) sets the error.
@@ -2499,7 +2495,7 @@ fn revive_prepare(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) {
                     // precise::log carries no stated bound; small usages put g near zero, where the
                     // error of the two logarithms (each up to a few ulp of values up to ~17) is
                     // absolute, so the bound is absolute: 4e-6, far below a wrong branch or a
-                    // wrong sign, far above the observed 2-ulp agreement for g >= 0.17.
+                    // wrong sign, far above the observed 2-ulp agreement for the g >= 0.3 cases.
                     KeyBound::Abs => (gpu_g - g).abs() <= 4.0e-6,
                 };
                 if !ok {

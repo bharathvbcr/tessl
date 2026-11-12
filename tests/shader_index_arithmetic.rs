@@ -172,6 +172,8 @@ fn forbid(source: &str, fragment: &str, label: &str) {
     );
 }
 
+/// Row-major quantized GEMV offsets (Q4, MLX Q4, Q8) are formed in 64 bits, and
+/// the simd entry files still include the shared bodies whose checks cover them.
 #[test]
 fn row_major_quantized_offsets_cross_u32_without_wrapping() {
     let row = 1u32 << 16;
@@ -216,6 +218,8 @@ fn row_major_quantized_offsets_cross_u32_without_wrapping() {
     forbid(GEMM_Q4_MLX_SIMD_H, "sb[row * gpr + g]", "MLX Q4 GEMM scale table");
 }
 
+/// The embedding lookup widens its token x hidden grid, packed-row and scale-table
+/// offsets before multiplying, and the 1D dispatch refuses a grid past `u32::MAX`.
 #[test]
 fn embedding_table_offsets_are_widened_before_multiplication() {
     let token = 1u32 << 16;
@@ -248,6 +252,8 @@ fn embedding_table_offsets_are_widened_before_multiplication() {
     );
 }
 
+/// A strided scan over a `uint` counter can wrap back to zero at the top of the
+/// range (shown here with a step of 1024); each listed kernel keeps its counter in `ulong`.
 #[test]
 fn strided_shader_scans_cannot_roll_over_to_zero() {
     let step = 1_024u32;
@@ -518,6 +524,8 @@ fn gqa_decode_offsets_are_widened_and_its_grid_is_host_bounded() {
     forbid(GQA_DECODE, "(b * q_heads + h) * D", label);
 }
 
+/// The tiled attention query and K/V plane bases are formed in 64 bits, and the
+/// live KV length is clamped to the cache capacity.
 #[test]
 fn qwen35_tiled_attention_plane_bases_are_widened() {
     require(
@@ -912,9 +920,6 @@ fn encoder_attn_offsets_are_widened() {
     );
 }
 
-/// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced
-/// `ld` apart. Every element and row offset is formed in 64 bits, and the
-/// device ranges are clamped to `rows` before any address is formed.
 /// The affine dequant forms its first code index (up to 8 codes per word, so
 /// past `u32::MAX` for a `u32` grid) and its group index in 64 bits. The only
 /// `uint` index is the thread's own word, and the host refuses more packed
@@ -934,6 +939,9 @@ fn dequant_affine_offsets_are_widened() {
     require(DEQUANT_RS, "if words > u32::MAX as usize {", "dequant host word bound");
 }
 
+/// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced
+/// `ld` apart. Every element and row offset is formed in 64 bits, and the
+/// device ranges are clamped to `rows` before any address is formed.
 #[test]
 fn embed_pool_offsets_are_widened() {
     for (needle, what) in [
@@ -1263,6 +1271,8 @@ fn w4a8_extents_are_host_bounded_and_addresses_are_widened() {
     require(I8_PIPELINE_RS, "dispatch_1d(rt, &p, count, |bnd| {", label);
 }
 
+/// Every `.metal` file under `kernels/` is either inspected by this file or listed
+/// in `EXEMPT_KERNELS` with a real reason, and neither list names a missing file.
 #[test]
 fn every_kernel_source_is_inspected_or_explicitly_exempt() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
@@ -1318,6 +1328,8 @@ fn every_kernel_source_is_inspected_or_explicitly_exempt() {
     }
 }
 
+/// The transpose and simdgroup GEMM address math is widened, and the TensorOps
+/// tiles that keep `uint` arithmetic are safe only behind the host's signed-32-bit guard.
 #[test]
 fn utility_and_simdgroup_pointer_math_is_explicitly_wide() {
     require(
@@ -1545,6 +1557,8 @@ fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
     assert!((i32::MAX as u64) < u64::from(u32::MAX));
 }
 
+/// The emeans kernel forms its row, partition and histogram offsets in 64 bits
+/// (no narrow form remains), and the host guards each extent against i32 overflow.
 #[test]
 fn emeans_offsets_are_widened() {
     let label = "emeans.metal";
@@ -1585,4 +1599,61 @@ fn emeans_offsets_are_widened() {
     ] {
         require(EMEANS_RS, host_guard, "src/emeans.rs");
     }
+}
+
+/// Every `#[test]` in this file carries its own `///` doc comment, directly above
+/// it, so an inserted test cannot steal a neighbour's doc (as the dequant test once
+/// did from the embed-pool one).
+#[test]
+fn every_test_carries_its_own_doc_comment() {
+    const SELF_SOURCE: &str = include_str!("shader_index_arithmetic.rs");
+    let lines: Vec<&str> = SELF_SOURCE.lines().collect();
+    // The doc block directly above `fn name`, skipping attribute lines.
+    let doc_above = |index: usize| -> Vec<&str> {
+        let mut at = index;
+        while at > 0 && lines[at - 1].trim_start().starts_with("#[") {
+            at -= 1;
+        }
+        let mut doc = Vec::new();
+        while at > 0 && lines[at - 1].trim_start().starts_with("///") {
+            at -= 1;
+            doc.push(lines[at]);
+        }
+        doc.reverse();
+        doc
+    };
+    let mut undocumented = Vec::new();
+    let mut tests = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != "#[test]" {
+            continue;
+        }
+        tests += 1;
+        if doc_above(i).is_empty() {
+            let name = lines[i + 1..]
+                .iter()
+                .find(|l| l.contains("fn "))
+                .copied()
+                .unwrap_or("?");
+            undocumented.push(name.trim().to_string());
+        }
+    }
+    assert!(tests > 30, "found only {tests} #[test] lines; the scan is broken");
+    assert!(undocumented.is_empty(), "tests without a doc comment: {undocumented:?}");
+
+    let doc_of = |name: &str| {
+        let index = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("fn {name}(")))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        doc_above(index).join("\n")
+    };
+    assert!(
+        doc_of("embed_pool_offsets_are_widened").contains("Segment means read [rows, D]"),
+        "the embed-pool doc comment must sit on the embed-pool test"
+    );
+    assert!(
+        !doc_of("dequant_affine_offsets_are_widened").contains("Segment means read"),
+        "the dequant test must not carry the embed-pool doc comment"
+    );
 }

@@ -9,14 +9,22 @@ golden and is passed on every mlx call that defines one):
 
 It must be run from a tree where this file is committed and unmodified: the
 manifest records the commit that last changed it. Writes
-tests/fixtures/dequant_affine/. Four cases, all rows=17, cols=1024,
-group_size=64:
+tests/fixtures/dequant_affine/. Cases, all rows=17, cols=1024, for group sizes
+32, 64 and 128 and for q8 and q4:
 
   quant_q8, quant_q4   weights -> mx.quantize(stream=mx.gpu) -> mx.dequantize(stream=mx.gpu)
   crafted_q8, crafted_q4
                        random packed codes with scales/biases drawn from the
                        corner values (zeros, subnormals, +-max, 2^125, a
                        subnormal-result pair) -> mx.dequantize(stream=mx.gpu)
+
+Group size 64 keeps the original file names ({case}_q{bits}_{part}.bin); 32 and
+128 are {case}_q{bits}_g{G}_{part}.bin. The weights and the G=64 crafted cases
+come from one numpy stream, drawn in a fixed order that must not change (it
+keeps the G=64 files byte-identical); each other group size's crafted case draws
+from its own stream, default_rng([20261110, G]). The script refuses to write a
+G=32/128 case whose crafted golden lacks an infinity or a zero of either sign,
+or whose device-model tally is not zero mismatches.
 
 The golden of every case is mx.dequantize's bf16 output as raw bits, so a test
 compares bit patterns (NaN payloads, signed zeros and infinities included).
@@ -33,7 +41,10 @@ import importlib.metadata
 import mlx.core as mx
 import numpy as np
 
-ROWS, COLS, GROUP = 17, 1024, 64
+ROWS, COLS = 17, 1024
+GROUP = 64  # the original group size: its files keep their legacy names
+OTHER_GROUPS = (32, 128)
+SEED = 20261110
 REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT = REPO / "tests" / "fixtures" / "dequant_affine"
 GENERATOR = "scripts/gen_dequant_affine_fixtures.py"
@@ -88,10 +99,10 @@ CORNERS = np.array(
 SUBNORMAL_RESULT_PAIRS = [(0x0080, 0x8081), (0x8080, 0x0081), (0x0100, 0x8101), (0x8100, 0x0101)]
 
 
-def crafted(rng, bits):
+def crafted(rng, bits, group):
     words = COLS * bits // 32
     packed = rng.integers(0, 2**32, size=(ROWS, words), dtype=np.uint64).astype(np.uint32)
-    n = ROWS * (COLS // GROUP)
+    n = ROWS * (COLS // group)
     pick = lambda: CORNERS[rng.integers(0, len(CORNERS), size=n)]
     sb, bb = pick(), pick()
     # Half of the groups draw an ordinary random scale/bias instead, so the
@@ -111,7 +122,7 @@ def flush_f32(x):
     return np.where((np.abs(x) < np.float32(2.0**-126)) & (x != 0), np.copysign(np.float32(0), x), x).astype(np.float32)
 
 
-def host_formula(packed, sbits, bbits, bits, ftz):
+def host_formula(packed, sbits, bbits, bits, group, ftz):
     """The dequant formula as an exact fused multiply-add rounded once to f32
     (the product is exact in f64), then once to bf16. With `ftz`, as the GPU
     runs it: subnormal scale, bias and f32 result flush to a zero of their sign.
@@ -119,8 +130,8 @@ def host_formula(packed, sbits, bbits, bits, ftz):
     per = 32 // bits
     shifts = (np.arange(per, dtype=np.uint32) * bits)[None, None, :]
     q = ((packed[:, :, None] >> shifts) & ((1 << bits) - 1)).reshape(ROWS, COLS).astype(np.float64)
-    s = np.repeat(bf16_bits_to_f32(sbits), GROUP, axis=1)
-    b = np.repeat(bf16_bits_to_f32(bbits), GROUP, axis=1)
+    s = np.repeat(bf16_bits_to_f32(sbits), group, axis=1)
+    b = np.repeat(bf16_bits_to_f32(bbits), group, axis=1)
     if ftz:
         s, b = flush_f32(s), flush_f32(b)
     with np.errstate(all="ignore"):
@@ -130,11 +141,18 @@ def host_formula(packed, sbits, bbits, bits, ftz):
     return f32_to_bf16_bits(r)
 
 
-def tally(packed, sbits, bbits, obits, bits):
+def tally(packed, sbits, bbits, obits, bits, group):
     return {
-        "ieee_fma_mismatches": int((host_formula(packed, sbits, bbits, bits, False) != obits).sum()),
-        "ftz_model_mismatches": int((host_formula(packed, sbits, bbits, bits, True) != obits).sum()),
+        "ieee_fma_mismatches": int((host_formula(packed, sbits, bbits, bits, group, False) != obits).sum()),
+        "ftz_model_mismatches": int((host_formula(packed, sbits, bbits, bits, group, True) != obits).sum()),
     }
+
+
+def fname(case, bits, group, part):
+    """Group size 64 keeps the original names."""
+    if group == GROUP:
+        return f"{case}_q{bits}_{part}.bin"
+    return f"{case}_q{bits}_g{group}_{part}.bin"
 
 
 def write(name, arr):
@@ -152,25 +170,30 @@ def generator_commit():
     return commit
 
 
-NOTES = {
-    "packed": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout",
-    "scales": "bf16 bits, uint16 little-endian, [17, 16]",
-    "biases": "bf16 bits, uint16 little-endian, [17, 16]",
-    "out": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]",
-}
+def notes(group):
+    return {
+        "packed": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout",
+        "scales": f"bf16 bits, uint16 little-endian, [17, {COLS // group}]",
+        "biases": f"bf16 bits, uint16 little-endian, [17, {COLS // group}]",
+        "out": f"mx.dequantize(..., group_size={group}, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]",
+    }
 
 
 def write_manifest(commit):
     files = {}
-    for case in ("quant", "crafted"):
-        for bits in (8, 4):
-            for part in ("packed", "scales", "biases", "out"):
-                name = f"{case}_q{bits}_{part}.bin"
-                role = "golden" if part == "out" else "input"
-                origin = (
-                    "from mx.quantize(stream=mx.gpu)" if case == "quant" else "crafted corner values, numpy default_rng(20261110)"
-                )
-                files[name] = {"role": role, "published": True, "note": f"{NOTES[part]}; {origin}"}
+    for group in (GROUP, *OTHER_GROUPS):
+        for case in ("quant", "crafted"):
+            for bits in (8, 4):
+                for part in ("packed", "scales", "biases", "out"):
+                    name = fname(case, bits, group, part)
+                    role = "golden" if part == "out" else "input"
+                    if case == "quant":
+                        origin = "from mx.quantize(stream=mx.gpu)"
+                    elif group == GROUP:
+                        origin = f"crafted corner values, numpy default_rng({SEED})"
+                    else:
+                        origin = f"crafted corner values, numpy default_rng([{SEED}, {group}])"
+                    files[name] = {"role": role, "published": True, "note": f"{notes(group)[part]}; {origin}"}
     manifest = {
         "schema": 1,
         "generator": GENERATOR,
@@ -184,36 +207,76 @@ def write_manifest(commit):
         },
         "versions_role": "produced",
         "mlx_stream": "mx.gpu on every quantize and dequantize call that defines a golden (mx.cpu differs)",
-        "inputs_source": "weights and crafted scales/biases/codes are drawn from numpy default_rng(20261110) by this script; "
+        "inputs_source": "weights and the group-size-64 crafted scales/biases/codes are drawn from numpy default_rng(20261110) "
+        "by this script, and the crafted ones of group sizes 32 and 128 from default_rng([20261110, group_size]); "
         "regenerating reproduces them for the same numpy, and the goldens for the same mlx on the same GPU family",
         "files": files,
     }
     (OUT / "MANIFEST.json").write_text(json.dumps(manifest, indent=1) + "\n")
 
 
+def check_crafted_golden(name, obits, tallies):
+    """A crafted golden must hold the corners it is there for, and the device model must reproduce it."""
+    if not ((obits & 0x7FFF) == 0x7F80).any():
+        sys.exit(f"{name}: the crafted golden holds no infinity; not writing it (do not reseed silently)")
+    if not ((obits == 0x0000).any() and (obits == 0x8000).any()):
+        sys.exit(f"{name}: the crafted golden lacks a zero of both signs; not writing it (do not reseed silently)")
+    if tallies["ftz_model_mismatches"] != 0:
+        sys.exit(f"{name}: the device model misses mlx {tallies['ftz_model_mismatches']} times; not writing it")
+
+
 def main():
     commit = generator_commit()
     OUT.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(20261110)
+    rng = np.random.default_rng(SEED)
     w = weights(rng)
+    wbf = from_bits(f32_to_bf16_bits(w))
     report = {}
+    # Group size 64 first, in the original draw order: the weights, then crafted(8) and crafted(4)
+    # from the one stream, so the original 16 files do not move.
     for bits in (8, 4):
-        wq, sc, bi = mx.quantize(from_bits(f32_to_bf16_bits(w)), group_size=GROUP, bits=bits, stream=GPU)
+        wq, sc, bi = mx.quantize(wbf, group_size=GROUP, bits=bits, stream=GPU)
         out = mx.dequantize(wq, sc, bi, group_size=GROUP, bits=bits, stream=GPU)
         mx.eval(out)
         packed, sbits, bbits = np.array(wq), bits_of(sc), bits_of(bi)
         obits = bits_of(out)
-        report[f"quant_q{bits}"] = tally(packed, sbits, bbits, obits, bits)
+        report[f"quant_q{bits}"] = tally(packed, sbits, bbits, obits, bits, GROUP)
         for suffix, a in (("packed", packed), ("scales", sbits), ("biases", bbits), ("out", obits)):
-            write(f"quant_q{bits}_{suffix}.bin", a)
+            write(fname("quant", bits, GROUP, suffix), a)
 
-        packed, sbits, bbits = crafted(rng, bits)
+        packed, sbits, bbits = crafted(rng, bits, GROUP)
         out = mx.dequantize(mx.array(packed), from_bits(sbits), from_bits(bbits), group_size=GROUP, bits=bits, stream=GPU)
         mx.eval(out)
         obits = bits_of(out)
-        report[f"crafted_q{bits}"] = tally(packed, sbits, bbits, obits, bits)
+        report[f"crafted_q{bits}"] = tally(packed, sbits, bbits, obits, bits, GROUP)
         for suffix, a in (("packed", packed), ("scales", sbits), ("biases", bbits), ("out", obits)):
-            write(f"crafted_q{bits}_{suffix}.bin", a)
+            write(fname("crafted", bits, GROUP, suffix), a)
+
+    # The other group sizes: quantize the same weights, and draw the crafted case from a stream of its own.
+    pending = []
+    for group in OTHER_GROUPS:
+        crng = np.random.default_rng([SEED, group])
+        for bits in (8, 4):
+            wq, sc, bi = mx.quantize(wbf, group_size=group, bits=bits, stream=GPU)
+            out = mx.dequantize(wq, sc, bi, group_size=group, bits=bits, stream=GPU)
+            mx.eval(out)
+            packed, sbits, bbits = np.array(wq), bits_of(sc), bits_of(bi)
+            obits = bits_of(out)
+            key = f"quant_q{bits}_g{group}"
+            report[key] = tally(packed, sbits, bbits, obits, bits, group)
+            pending.append(("quant", bits, group, packed, sbits, bbits, obits))
+
+            packed, sbits, bbits = crafted(crng, bits, group)
+            out = mx.dequantize(mx.array(packed), from_bits(sbits), from_bits(bbits), group_size=group, bits=bits, stream=GPU)
+            mx.eval(out)
+            obits = bits_of(out)
+            key = f"crafted_q{bits}_g{group}"
+            report[key] = tally(packed, sbits, bbits, obits, bits, group)
+            check_crafted_golden(key, obits, report[key])
+            pending.append(("crafted", bits, group, packed, sbits, bbits, obits))
+    for case, bits, group, packed, sbits, bbits, obits in pending:
+        for suffix, a in (("packed", packed), ("scales", sbits), ("biases", bbits), ("out", obits)):
+            write(fname(case, bits, group, suffix), a)
     write_manifest(commit)
     print(json.dumps({"host_formula_vs_mlx_gpu_bit_mismatches": report}, indent=1))
 

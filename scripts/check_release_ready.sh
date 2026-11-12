@@ -62,6 +62,9 @@ fi
 #  - SIGKILL cannot be trapped; the dir stays.
 #  - A signal sent to the script's pid alone (not its process group, as Ctrl-C
 #    does) is deferred by bash until the foreground child exits.
+#  - A signal ignored on entry (e.g. SIGINT/SIGQUIT under `&` from a
+#    non-interactive shell, or SIGHUP under nohup) cannot be trapped by bash:
+#    such a run is not stopped by that signal and cleans up normally at its end.
 #  - A process-group signal while mktemp itself is running kills mktemp (or a
 #    wrapper of it) between making the dir and printing its name: the name is
 #    lost, so nothing can remove it.

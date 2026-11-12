@@ -34,11 +34,16 @@
 //! It also reports: every thread whose output holds an infinity or a NaN stores
 //! `1` to the caller's `fault` word (one `u32` shared by every thread; unlike
 //! `i8_quantize_rows`, whose `bad` flag is per row, it is sticky across dispatches).
-//! The kernel never clears it. A caller zeroes it once, lets any number of
-//! dequants OR into it, and reads it once after a [`GpuRuntime::synchronize`]:
-//! non-zero means some output matrix holds a non-finite value and must not be
-//! used. The flag is sticky by design, so a clean dequant cannot hide an
-//! earlier bad one. Nothing here reads the word back: that is a host wait.
+//! The kernel never clears it, and it stores rather than ORs: a faulting
+//! thread overwrites the word with `1` (a caller's own non-zero code does not
+//! survive it), and a clean dequant leaves the word as it found it. So give
+//! the dequants of one run a word of their own. A caller zeroes it once, lets
+//! any number of dequants store into it, and reads it once after a
+//! [`GpuRuntime::synchronize`]: non-zero means some output matrix holds a
+//! non-finite value and must not be used. The flag is sticky by design, so a
+//! clean dequant cannot hide an earlier bad one. The dequant itself never
+//! reads the word back (that is a host wait); [`check_dequant_affine_fault`]
+//! is the checked read for the caller's own sync point.
 //!
 //! For finite inputs, a sufficient condition for a finite output is
 //! `|scale| * qmax + |bias| <= bf16::MAX` (qmax 255 or 15); a caller that
@@ -65,6 +70,18 @@ use crate::tensor::GpuBuffer;
 /// group by shift) and a multiple of the 8 codes of a q4 word, so one word
 /// never straddles two groups.
 pub const DEQUANT_AFFINE_GROUP_SIZES: [u32; 3] = [32, 64, 128];
+
+// `plan` relies on this: every group size is a power of two and a multiple of
+// 8, so `cols % group_size == 0` gives `8 | cols`, and `cols * 4` and
+// `cols * 8` are then whole numbers of 32-bit words.
+const _: () = {
+    let mut i = 0;
+    while i < DEQUANT_AFFINE_GROUP_SIZES.len() {
+        let g = DEQUANT_AFFINE_GROUP_SIZES[i];
+        assert!(g.is_power_of_two() && g % 8 == 0);
+        i += 1;
+    }
+};
 
 /// Code width of a packed matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,13 +158,8 @@ fn plan(
     }
     let (rows, cols) = (shape.rows as usize, shape.cols as usize);
     let bit_cols = product(&[cols, bits.bits() as usize], entry)?;
-    if !bit_cols.is_multiple_of(32) {
-        return Err(format!(
-            "{entry}: cols {} * {} bits is not a whole number of u32 words",
-            shape.cols,
-            bits.bits()
-        ));
-    }
+    // `bit_cols` is a multiple of 32: see the assertion on
+    // `DEQUANT_AFFINE_GROUP_SIZES`, so no whole-word check is needed here.
     let words_per_row = bit_cols / 32;
     let words = product(&[rows, words_per_row], entry)?;
     let groups = product(&[rows, cols / shape.group_size as usize], entry)?;
@@ -197,6 +209,19 @@ pub fn validate_dequant_affine_bf16(
 /// multiple of the group, size arithmetic that overflows, any buffer shorter
 /// than the shape needs (`fault` needs one `u32`) or from another runtime, and
 /// an `out` or `fault` that overlaps an input or each other. Zero rows or columns is a no-op once the shape is validated.
+///
+/// # Fault word protocol
+///
+/// This function never reads `fault`; reading it is the caller's job, and
+/// skipping it is the explicit opt-out. The protocol:
+///
+/// 1. Zero the word with [`GpuBuffer::try_zero`] (give this run its own word:
+///    a faulting thread stores `1` over whatever was there).
+/// 2. Dispatch any number of dequants into it.
+/// 3. [`GpuRuntime::synchronize`], and treat a sync error as "nothing is
+///    known". The synchronize is mandatory.
+/// 4. Read the word once with [`check_dequant_affine_fault`]. On `Err`, do not
+///    use any `out` written since the zero.
 pub fn dequant_affine_bf16(
     rt: &Arc<GpuRuntime>,
     bits: AffineBits,
@@ -219,6 +244,72 @@ pub fn dequant_affine_bf16(
         set_u32(bnd, p.words as u32, 5);
         set_u32(bnd, p.group_shift, 6);
     })
+}
+
+/// Why [`check_dequant_affine_fault`] did not return `Ok`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DequantAffineFault {
+    /// The word was read and is non-zero: some output written since the caller
+    /// zeroed it holds a non-finite value (or the caller left a non-zero word).
+    Raised {
+        /// The word as read. A faulting dequant stores `1`; any other value is
+        /// one the caller left there.
+        word: u32,
+    },
+    /// The word could not be read, so nothing is known about the outputs.
+    Unread {
+        /// What stopped the read.
+        why: String,
+    },
+}
+
+impl std::fmt::Display for DequantAffineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DequantAffineFault::Raised { word } => {
+                write!(
+                    f,
+                    "dequant_affine fault word is {word:#x}: an output holds a non-finite value"
+                )
+            }
+            DequantAffineFault::Unread { why } => {
+                write!(f, "dequant_affine fault word was not read: {why}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DequantAffineFault {}
+
+/// The checked read of the fault word `fault` passed to [`dequant_affine_bf16`]:
+/// `Ok(())` only when the word was read and is zero.
+///
+/// A word that is non-zero is [`DequantAffineFault::Raised`]; a buffer that is
+/// shorter than a `u32`, or one the host cannot map (a poisoned or busy
+/// runtime, private storage, a failed commit), is
+/// [`DequantAffineFault::Unread`], never `Ok`. Only the first four bytes are
+/// read, and the buffer's length need not be a multiple of four. The word is
+/// never written: the fault is sticky, and the caller resets it with
+/// [`GpuBuffer::try_zero`].
+///
+/// This is a host access: mapping the buffer commits the runtime's pending
+/// work. Call it at a point where the caller has already called
+/// [`GpuRuntime::synchronize`] (see the protocol on [`dequant_affine_bf16`]).
+pub fn check_dequant_affine_fault(fault: &GpuBuffer) -> Result<(), DequantAffineFault> {
+    if fault.nbytes() < 4 {
+        return Err(DequantAffineFault::Unread {
+            why: format!("the fault buffer is {} bytes, a u32 needs 4", fault.nbytes()),
+        });
+    }
+    let mapping = fault
+        .try_contents_u8()
+        .map_err(|why| DequantAffineFault::Unread { why })?;
+    let word = u32::from_ne_bytes([mapping[0], mapping[1], mapping[2], mapping[3]]);
+    if word == 0 {
+        Ok(())
+    } else {
+        Err(DequantAffineFault::Raised { word })
+    }
 }
 
 /// [`dequant_affine_bf16`] for 8-bit codes (`dequant_affine_q8_bf16`).

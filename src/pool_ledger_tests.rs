@@ -336,6 +336,12 @@ fn dropping_the_runtime_returns_every_charge() {
         bucket(2 << 20, BufferKind::Cold) + bucket(3 << 20, BufferKind::Hot) + bucket(5 << 20, BufferKind::Cold)
     );
 
+    // The commit finishes before the runtime goes: Drop waits for everything
+    // submitted, so an unsignalled commit would make it give up and leak
+    // instead of release (ft-ec125ae2). That state has its own test below.
+    rt.metal4
+        .lifetime_event
+        .setSignaledValue(rt.metal4.event_value.load(Ordering::Acquire));
     drop(rt);
     assert_eq!(ledger.cached(), 0);
     assert_eq!(
@@ -1439,6 +1445,18 @@ fn poison_batch_lock(rt: &GpuRuntime) {
     assert!(rt.active_m4.is_poisoned());
 }
 
+/// Panic while holding the allocator-slot lock, as a panic inside one of its
+/// critical sections would.
+fn poison_allocators(rt: &GpuRuntime) {
+    let _quiet = quiet_injected();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = rt.metal4.allocators.lock().unwrap_or_else(PoisonError::into_inner);
+        panic!("injected panic: poisoning the allocator slots on purpose");
+    }));
+    assert!(unwound.is_err());
+    assert!(rt.metal4.allocators.is_poisoned());
+}
+
 /// A rig with a command buffer open (async encode, one empty scope) and one
 /// dropped buffer queued behind it.
 fn rig_with_open_batch_and_a_queued_drop() -> Rig {
@@ -1969,6 +1987,272 @@ fn a_commit_that_panics_before_the_submit_leaves_the_buffer_open_and_ends_it_onc
     assert_eq!(
         ended_after_drop, 1,
         "the buffer must be ended exactly once, by the abort"
+    );
+}
+
+// ---- a commit that submits and then fails to record its slot (ft-ec125ae2) ----
+
+/// What a drop of this thread's runtime decided to wait for. Take it right
+/// after the drop.
+fn drop_waited_for() -> Option<u64> {
+    DROP_WAITED_FOR.with(Cell::take)
+}
+
+/// The largest `in_flight` over the slots and whether any slot holds a
+/// feedback watch, read through a recovered guard.
+fn slot_record(rt: &GpuRuntime) -> (u64, bool) {
+    let slots = rt.metal4.allocators.lock().unwrap_or_else(PoisonError::into_inner);
+    (
+        slots.iter().map(|s| s.in_flight).max().unwrap_or(0),
+        slots.iter().any(|s| s.feedback.is_some()),
+    )
+}
+
+/// Wait on the real submit directly, so the runtime is dropped after the
+/// buffer finished whatever the drop decides. `wait_lifetime_event` would
+/// refuse a poisoned runtime.
+fn wait_for_the_real_submit(rt: &GpuRuntime, submitted: u64) {
+    assert!(
+        rt.metal4
+            .lifetime_event
+            .waitUntilSignaledValue_timeoutMS(submitted, 10_000),
+        "the submitted command buffer never finished"
+    );
+}
+
+fn drop_rig(rig: Rig) -> (Option<u64>, Arc<Fake>) {
+    let Rig { held, rt, fake, chaos } = rig;
+    drop(held);
+    drop(rt);
+    drop(chaos);
+    (drop_waited_for(), fake)
+}
+
+/// A commit whose slot lock is poisoned after the buffer is on the queue:
+/// the slot is still recorded through a recovered guard, the poison is still
+/// returned, and the final drop waits for the submit.
+#[test]
+fn a_commit_through_a_poisoned_allocator_lock_records_in_flight_and_is_waited_for_at_drop() {
+    DROP_WAITED_FOR.with(|c| c.set(None));
+    let rig = rig_with_an_open_empty_batch();
+    poison_allocators(&rig.rt);
+    let err = rig.rt.commit(false).unwrap_err();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    let (recorded, has_watch) = slot_record(&rig.rt);
+    let (poisoned, open) = (rig.rt.is_poisoned(), batch_is_open(&rig.rt));
+    wait_for_the_real_submit(&rig.rt, submitted);
+    let (waited, fake) = drop_rig(rig);
+    eprintln!(
+        "poisoned record: err={err:?} submitted={submitted} recorded={recorded} has_watch={has_watch} \
+         poisoned={poisoned} open={open} drop_waited_for={waited:?} ledger={:?}",
+        (fake.live(), fake.cached(), fake.unmatched())
+    );
+    assert!(err.contains("poison"), "the poison was hidden: {err}");
+    assert!(poisoned);
+    assert!(!open, "the submitted batch is still marked open");
+    assert!(submitted > 0);
+    assert_eq!(recorded, submitted, "the submit was not recorded on its slot");
+    assert!(has_watch, "the feedback watch was not recorded");
+    assert!(waited.is_some_and(|v| v >= submitted), "drop waited for {waited:?}");
+    assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
+}
+
+/// A lost slot record (every `in_flight` back at zero) must not hide the last
+/// submit from the final drop: `event_value` is stored before any fallible
+/// post-submit step.
+#[test]
+fn the_final_drop_waits_for_the_last_submit_without_any_slot_record() {
+    DROP_WAITED_FOR.with(|c| c.set(None));
+    let rig = rig_with_an_open_empty_batch();
+    rig.rt.commit(false).unwrap();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    for slot in rig
+        .rt
+        .metal4
+        .allocators
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter_mut()
+    {
+        slot.in_flight = 0;
+    }
+    wait_for_the_real_submit(&rig.rt, submitted);
+    let (waited, fake) = drop_rig(rig);
+    eprintln!(
+        "lost record: submitted={submitted} drop_waited_for={waited:?} ledger={:?}",
+        (fake.live(), fake.cached(), fake.unmatched())
+    );
+    assert!(submitted > 0);
+    assert!(waited.is_some_and(|v| v >= submitted), "drop waited for {waited:?}");
+    assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
+}
+
+/// A submit whose event never signals: the final drop waits its budget, gives
+/// up and leaks, and releases nothing. Releasing under an unfinished submit is
+/// the use-after-free the wait exists to prevent. This test takes the leak
+/// path on purpose (one 1 MiB buffer and one runtime's objects), with the wait
+/// budget at its 1 ms minimum so it stays fast.
+#[test]
+fn the_final_drop_never_releases_under_an_unfinished_submit() {
+    DROP_WAITED_FOR.with(|c| c.set(None));
+    let ledger = Fake::new(u64::MAX);
+    let rt = runtime_with(&ledger);
+    rt.set_event_wait_ms(1).unwrap();
+    let staged = rt.stage_submitted_commit_for_test();
+    drop(rt.alloc_buffer(1 << 20).unwrap());
+    assert!(rt.deferred_pending());
+    drop(rt);
+    let waited = drop_waited_for();
+    let (live, cached, unmatched) = (ledger.live(), ledger.cached(), ledger.unmatched());
+    eprintln!("unfinished submit: staged={staged} drop_waited_for={waited:?} live={live} cached={cached} unmatched={unmatched}");
+    assert_eq!(waited, Some(staged));
+    assert_eq!(
+        live,
+        bucket(1 << 20, BufferKind::Cold),
+        "drop released under an unfinished submit"
+    );
+    assert_eq!((cached, unmatched), (0, 0));
+}
+
+/// A runtime that committed, synchronized and went idle: the drop's target is
+/// a value the event has already reached, so it returns at once and releases.
+#[test]
+fn dropping_an_idle_runtime_that_committed_returns_without_blocking() {
+    DROP_WAITED_FOR.with(|c| c.set(None));
+    let rig = rig_with_an_open_empty_batch();
+    rig.rt.commit(false).unwrap();
+    rig.rt.synchronize().unwrap();
+    let submitted = rig.rt.metal4.event_value.load(Ordering::Acquire);
+    let signaled = rig.rt.metal4.lifetime_event.signaledValue();
+    let started = std::time::Instant::now();
+    let (waited, fake) = drop_rig(rig);
+    let elapsed = started.elapsed();
+    eprintln!(
+        "idle drop: submitted={submitted} signaled={signaled} drop_waited_for={waited:?} elapsed={elapsed:?} ledger={:?}",
+        (fake.live(), fake.cached(), fake.unmatched())
+    );
+    assert!(submitted > 0 && signaled >= submitted);
+    assert!(
+        waited.is_some_and(|v| v <= signaled),
+        "drop targeted {waited:?}, above the signalled {signaled}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "an idle drop took {elapsed:?}"
+    );
+    assert_eq!((fake.live(), fake.cached(), fake.unmatched()), (0, 0, 0));
+}
+
+/// Source-order pin, like the two above it. From the end of the command
+/// buffer to the return, the only fallible step left after the submit is the
+/// slot lock, and it is taken through a recovered guard: the record is made,
+/// then a poisoned lock is returned. No `?`, `unwrap` or `expect` sits between
+/// the submit and the record.
+#[test]
+fn commit_m4_has_no_failure_point_between_the_submit_and_the_in_flight_record() {
+    let src = include_str!("runtime.rs");
+    let body = compact_fn(src, "fn commit_m4(");
+    let end = body
+        .find(&compact("self.end_command_buffer();"))
+        .expect("commit_m4 no longer ends the command buffer through end_command_buffer");
+    let tail = compact("if let Some(error) = poisoned { return Err(error); }");
+    let stop = body[end..]
+        .find(&tail)
+        .expect("commit_m4 no longer returns the recorded poison");
+    let window = &body[end..end + stop + tail.len()];
+    let expected = compact(
+        "self.end_command_buffer();
+         let watch = self.submit_prepared(prepared);
+         let next = self.shared.issue();
+         m4.event_value.store(next, Ordering::Release);
+         batch.cb_open = false;
+         m4.queue.signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.lifetime_event), next);
+         m4.queue.signalEvent_value(ProtocolObject::<dyn MTLEvent>::from_ref(&*m4.handoff_event), next);
+         let (mut slots, poisoned) = match m4.allocators.lock() {
+             Ok(slots) => (slots, None),
+             Err(poison) => {
+                 let error = poison.to_string();
+                 (poison.into_inner(), Some(error))
+             }
+         };
+         slots[batch.alloc_idx].in_flight = next;
+         slots[batch.alloc_idx].feedback = Some(watch);
+         drop(slots);
+         if let Some(error) = poisoned { return Err(error); }",
+    );
+    assert_eq!(
+        window, expected,
+        "the statements between end_command_buffer and the in_flight record changed"
+    );
+    let record = window.find("in_flight=next;").expect("no record");
+    let ret = window.find("returnErr(error)").expect("no return of the poison");
+    assert!(record < ret, "a poisoned lock must be recorded before it is returned");
+}
+
+/// The begin-to-install window of `ensure_m4_cb_open` has no Rust failure
+/// point in release: ObjC sends, then `arm_dispatch_stamps`, then the install.
+/// This pin records the audit and fixes nothing: it is green before and after
+/// ft-ec125ae2. One known gap is outside this window's file, and so outside
+/// the fix: `dropped_batches += 1` in `arm_dispatch_stamps` is a `u32` that
+/// panics on overflow in a debug build only (release wraps), after 2^32 armed,
+/// unresolved batches.
+#[test]
+fn ensure_m4_cb_open_has_no_rust_failure_point_between_begin_and_install() {
+    let src = include_str!("runtime.rs");
+    let body = compact_fn(src, "fn ensure_m4_cb_open(");
+    let begin = body
+        .find(&compact("m4.command_buffer.beginCommandBufferWithAllocator(&alloc);"))
+        .expect("ensure_m4_cb_open no longer begins the command buffer");
+    let install_end = compact("hazard_pending: false, });");
+    let stop = body[begin..].find(&install_end).expect("no install of the batch");
+    let window = &body[begin..begin + stop + install_end.len()];
+    let expected = compact(
+        "m4.command_buffer.beginCommandBufferWithAllocator(&alloc);
+         m4.command_buffer.useResidencySet(&m4.residency);
+         let mut stamped = false;
+         if let Some(heap) = m4.counter_heap.as_ref() {
+             unsafe {
+                 m4.command_buffer.writeTimestampIntoHeap_atIndex(heap, 0);
+             }
+             stamped = true;
+         }
+         self.arm_dispatch_stamps();
+         *batch = Some(ActiveMetal4Batch {
+             dispatches: 0,
+             cb_open: true,
+             stamped_t0: stamped,
+             encoder: None,
+             alloc_idx,
+             hazard_pending: false,
+         });",
+    );
+    assert_eq!(window, expected, "the begin-to-install window changed");
+
+    let arm = compact_fn(include_str!("dispatch_stamps.rs"), "pub(crate) fn arm_dispatch_stamps(");
+    let expected_arm = compact(
+        "pub(crate) fn arm_dispatch_stamps(&self) {
+             let Ok(mut log) = self.stamp_log.lock() else { return };
+             if log.armed && !log.meta.is_empty() {
+                 log.dropped_batches += 1;
+             }
+             log.meta.clear();
+             log.barrier_pending = false;
+             log.overflowed = false;
+             log.armed = false;
+             if !crate::ab_flags::dispatch_stamps() {
+                 return;
+             }
+             if self.metal4.stamp_heap.is_none() {
+                 return;
+             }
+             log.armed = true;",
+    );
+    assert_eq!(arm, expected_arm, "arm_dispatch_stamps changed");
+
+    let flag = compact("pub fn dispatch_stamps() -> bool { DISPATCH_STAMPS.get(ENV_DISPATCH_STAMPS, || false)");
+    assert!(
+        compact(include_str!("ab_flags.rs")).contains(&flag),
+        "ab_flags::dispatch_stamps changed"
     );
 }
 

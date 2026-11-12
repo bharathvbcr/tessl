@@ -35,8 +35,8 @@ mod json;
 use common::{with_gpu, with_two_gpus};
 use json::{Json, Syntax};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tessl::dequant::{
     check_dequant_affine_fault, dequant_affine_bf16, dequant_affine_q4_bf16, dequant_affine_q8_bf16,
@@ -654,7 +654,7 @@ const GENERATOR: &str = "scripts/gen_dequant_affine_fixtures.py";
 /// What a git call gives back: `(exit code, trimmed stdout)`, or why it could not run.
 type GitOutput = Result<(i32, String), String>;
 /// A way of running git, so the verdict can be tested against scripted outcomes.
-type GitRun = dyn Fn(&[&str]) -> GitOutput;
+type GitRun<'a> = dyn Fn(&[&str]) -> GitOutput + 'a;
 /// Longest any one git call may take before provenance is "could not verify".
 const GIT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -710,51 +710,130 @@ fn golden_case(case: &str, bits: u32, gs: usize) -> (Case, Vec<u16>) {
     (c, want)
 }
 
-/// Run git in the repo, with a deadline: `(exit code, stdout)`. A git that is
-/// missing, killed by a signal or past the deadline is an `Err`.
-fn git(args: &[&str]) -> GitOutput {
-    let mut child = Command::new("git")
+/// Repository-locating variables git reads from the environment: `GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`,
+/// `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM`. Any of them
+/// can point git at a repository other than the one this crate is in (a tree with
+/// no `.git`, an empty directory, someone else's history), so [`git`] removes
+/// every one from the child's environment and then checks where git landed.
+const REPO_ENV: [&str; 9] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// Run `program` in `dir` and give `(exit code, trimmed stdout)`, the whole call bounded by
+/// `deadline`: waiting for the exit and reading the output both count. `inherited` is
+/// what the caller's environment would add (applied first), then every name in `remove`
+/// is taken out. A program that cannot start, that a signal ends, that runs past the
+/// deadline, or whose output pipe is still open at the deadline (an orphaned child can
+/// hold it open after the program exits) is an `Err`, and the program is killed. The
+/// reader thread of an orphan-held pipe is left to end when the orphan does.
+fn run_bounded(
+    program: &str,
+    args: &[&str],
+    inherited: &[(&str, &str)],
+    remove: &[&str],
+    dir: &Path,
+    deadline: Duration,
+) -> GitOutput {
+    let what = format!("{program} {args:?}");
+    let mut command = Command::new(program);
+    command
         .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("git {args:?} did not start: {e}"))?;
-    let deadline = Instant::now() + GIT_DEADLINE;
+        .stderr(Stdio::null());
+    for (name, value) in inherited {
+        command.env(name, value);
+    }
+    for name in remove {
+        command.env_remove(name);
+    }
+    let stop = Instant::now() + deadline;
+    let mut child = command.spawn().map_err(|e| format!("{what} did not start: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| format!("{what}: no stdout pipe"))?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let read = std::io::Read::read_to_string(&mut stdout, &mut out).map(|_| out);
+        let _ = sender.send(read);
+    });
+    let kill = |child: &mut Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("git {args:?} still running after {GIT_DEADLINE:?}; killed"));
+            Ok(None) if Instant::now() >= stop => {
+                kill(&mut child);
+                return Err(format!("{what} still running after {deadline:?}; killed"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("git {args:?} could not be waited on: {e}"));
+                kill(&mut child);
+                return Err(format!("{what} could not be waited on: {e}"));
             }
         }
     };
-    let mut out = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        std::io::Read::read_to_string(&mut pipe, &mut out)
-            .map_err(|e| format!("git {args:?} output unreadable: {e}"))?;
-    }
-    let code = status
-        .code()
-        .ok_or_else(|| format!("git {args:?} was killed by a signal"))?;
+    let out = match receiver.recv_timeout(stop.saturating_duration_since(Instant::now())) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("{what} output unreadable: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "{what} exited but its output pipe was still open after {deadline:?} (an orphaned child holds it)"
+            ))
+        }
+    };
+    let code = status.code().ok_or_else(|| format!("{what} was killed by a signal"))?;
     Ok((code, out.trim().to_string()))
 }
 
-/// The provenance verdict for a manifest pin `pin`, given `run` (git). `Ok` only
-/// when the pin is a commit on this history and is the commit that last changed
-/// the generator; every other outcome, including one where a check could not
-/// run, is an `Err` naming it.
-fn judge_provenance(pin: &str, run: &GitRun) -> Result<(), String> {
+/// git in this crate's directory with the repository-locating environment removed
+/// ([`REPO_ENV`]), after `inherited` is applied, bounded by `deadline`.
+fn git_with(args: &[&str], inherited: &[(&str, &str)], deadline: Duration) -> GitOutput {
+    run_bounded(
+        "git",
+        args,
+        inherited,
+        &REPO_ENV,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        deadline,
+    )
+}
+
+fn git(args: &[&str]) -> GitOutput {
+    git_with(args, &[], GIT_DEADLINE)
+}
+
+/// The provenance verdict for a manifest pin `pin`, given `run` (git) and `root`, the
+/// crate's directory. `Ok` only when git sees the repository rooted at `root`, and the
+/// pin is a commit on its history and is the commit that last changed the generator;
+/// every other outcome, including one where a check could not run, is an `Err` naming it.
+fn judge_provenance(pin: &str, root: &Path, run: &GitRun<'_>) -> Result<(), String> {
     let unverified = |why: String| format!("could not verify provenance: {why}");
+    let (code, top) = run(&["rev-parse", "--show-toplevel"]).map_err(unverified)?;
+    if code != 0 {
+        return Err(unverified(format!("rev-parse --show-toplevel exited {code}")));
+    }
+    let seen = std::fs::canonicalize(&top).map_err(|e| unverified(format!("git's toplevel {top:?}: {e}")))?;
+    let want = std::fs::canonicalize(root).map_err(|e| unverified(format!("crate directory {root:?}: {e}")))?;
+    if seen != want {
+        return Err(unverified(format!(
+            "git sees the repository at {}, not at the crate directory {}",
+            seen.display(),
+            want.display()
+        )));
+    }
     let (code, shallow) = run(&["rev-parse", "--is-shallow-repository"]).map_err(unverified)?;
     if code != 0 || shallow != "false" {
         return Err(unverified(format!(
@@ -788,10 +867,19 @@ fn judge_provenance(pin: &str, run: &GitRun) -> Result<(), String> {
     Ok(())
 }
 
-/// The manifest's `generator_commit` of the fixture directory.
-fn manifest_pin() -> Result<String, String> {
-    let text = String::from_utf8(fixture("MANIFEST.json")).map_err(|e| format!("MANIFEST.json is not UTF-8: {e}"))?;
-    let doc = json::parse(
+fn fixture_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dequant_affine")
+}
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The parsed `MANIFEST.json` of the fixture directory `dir`.
+fn read_manifest(dir: &Path) -> Result<Json, String> {
+    let path = dir.join("MANIFEST.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    json::parse(
         &text,
         Syntax {
             what: "MANIFEST.json",
@@ -800,24 +888,71 @@ fn manifest_pin() -> Result<String, String> {
             literals: true,
         },
     )
-    .map_err(|e| format!("MANIFEST.json does not parse: {e}"))?;
-    match doc.get("generator_commit") {
-        Some(Json::Str(pin))
-            if pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-        {
-            Ok(pin.clone())
-        }
+    .map_err(|e| format!("MANIFEST.json does not parse: {e}"))
+}
+
+/// The manifest's `generator_commit`.
+fn manifest_pin(manifest: &Json) -> Result<String, String> {
+    match manifest.get("generator_commit") {
+        Some(Json::Str(pin)) if is_lower_hex(pin, 40) => Ok(pin.clone()),
         other => Err(format!(
             "MANIFEST.json generator_commit is not a 40-hex commit: {other:?}"
         )),
     }
 }
 
+/// Every file the manifest lists has the sha256 it records, and the directory holds
+/// no file the manifest does not list: the pin names the generator, this names the bytes.
+fn verify_fixture_bytes(dir: &Path, manifest: &Json) -> Result<(), String> {
+    let Some(Json::Object(files)) = manifest.get("files") else {
+        return Err("MANIFEST.json has no files object".into());
+    };
+    let mut listed = std::collections::BTreeSet::new();
+    for (name, meta) in files {
+        if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." || name == "MANIFEST.json" {
+            return Err(format!(
+                "MANIFEST.json lists {name:?}, which is not a plain fixture file name"
+            ));
+        }
+        let Some(Json::Str(want)) = meta.get("sha256") else {
+            return Err(format!("{name}: MANIFEST.json records no sha256"));
+        };
+        if !is_lower_hex(want, 64) {
+            return Err(format!(
+                "{name}: the recorded sha256 {want:?} is not 64 lowercase hex digits"
+            ));
+        }
+        let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let got = ojas_io::sha256::sha256_hex(&bytes);
+        if &got != want {
+            return Err(format!("{name}: sha256 is {got}, MANIFEST.json records {want}"));
+        }
+        if !listed.insert(name.clone()) {
+            return Err(format!("MANIFEST.json lists {name} twice"));
+        }
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != "MANIFEST.json" && !listed.contains(&name) {
+            return Err(format!("{name} is in the fixture directory but not in MANIFEST.json"));
+        }
+    }
+    Ok(())
+}
+
 /// Panics unless the goldens were written by the generator as it is now, from a
-/// commit on this history. Called inside `with_gpu`, so it never runs in the
-/// hosted device-free selection (a hosted clone is shallow and could not verify).
+/// commit on this history, and their bytes are the ones the manifest recorded. Called
+/// inside `with_gpu`, so it never runs in the hosted device-free selection (a hosted
+/// clone is shallow and could not verify).
 fn assert_fixture_provenance() {
-    let verdict = manifest_pin().and_then(|pin| judge_provenance(&pin, &git));
+    let dir = fixture_dir();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let verdict = read_manifest(&dir).and_then(|manifest| {
+        judge_provenance(&manifest_pin(&manifest)?, root, &git)?;
+        verify_fixture_bytes(&dir, &manifest)
+    });
     if let Err(why) = verdict {
         panic!("dequant_affine fixtures: {why}");
     }
@@ -837,6 +972,18 @@ fn assert_matches_mlx(rt: &Arc<GpuRuntime>, case: &str, bits: u32, gs: usize, c:
             want.contains(&0x0000) && want.contains(&0x8000),
             "no zeros of both signs in the {what} golden"
         );
+        if gs != GROUP {
+            // The group sizes added with the extended corner list (NaN, both infinities).
+            assert!(
+                want.contains(&0x7F80) && want.contains(&0xFF80),
+                "the {what} golden lacks +inf or -inf"
+            );
+            assert!(want.iter().any(|&v| v & 0x7FFF > 0x7F80), "no NaN in the {what} golden");
+            assert!(
+                want.iter().any(|&v| v & 0x7FFF == 0x7F7F),
+                "no maximum-magnitude finite value in the {what} golden"
+            );
+        }
         // The device model reproduces mlx exactly; the IEEE one does not
         // (subnormal operands and results), which is why the kernel is not
         // compared against it here.
@@ -886,48 +1033,199 @@ fn matches_mlx_gpu_dequantize_at_group_sizes_32_and_128() {
 fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
     let pin = "a".repeat(40);
     let other = "b".repeat(40);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let top = root.to_string_lossy().into_owned();
     // A scripted git: `shallow`, `has_commit`, `ancestor`, `last` pick each answer.
-    let scripted = |shallow: &'static str, has_commit: i32, ancestor: i32, last: String| {
+    let scripted = |toplevel: String, shallow: &'static str, has_commit: i32, ancestor: i32, last: String| {
         move |args: &[&str]| -> GitOutput {
-            Ok(match args[0] {
-                "rev-parse" => (0, shallow.to_string()),
-                "cat-file" => (has_commit, String::new()),
-                "merge-base" => (ancestor, String::new()),
-                "log" => (0, last.clone()),
-                other => panic!("unexpected git {other}"),
+            Ok(match (args[0], args.get(1).copied()) {
+                ("rev-parse", Some("--show-toplevel")) => (0, toplevel.clone()),
+                ("rev-parse", _) => (0, shallow.to_string()),
+                ("cat-file", _) => (has_commit, String::new()),
+                ("merge-base", _) => (ancestor, String::new()),
+                ("log", _) => (0, last.clone()),
+                (other, _) => panic!("unexpected git {other}"),
             })
         }
     };
-    judge_provenance(&pin, &scripted("false", 0, 0, pin.clone())).expect("the one passing outcome");
+    let good = |shallow, has_commit, ancestor, last| scripted(top.clone(), shallow, has_commit, ancestor, last);
+    judge_provenance(&pin, root, &good("false", 0, 0, pin.clone())).expect("the one passing outcome");
 
-    let fails = |run: &GitRun, needle: &str| {
-        let e = judge_provenance(&pin, run).expect_err("must not pass");
+    let fails = |run: &GitRun<'_>, needle: &str| {
+        let e = judge_provenance(&pin, root, run).expect_err("must not pass");
         assert!(e.contains(needle), "wanted {needle:?} in {e:?}");
     };
-    fails(&scripted("false", 0, 1, pin.clone()), "not on this history");
+    fails(&good("false", 0, 1, pin.clone()), "not on this history");
     fails(
-        &scripted("false", 0, 0, other.clone()),
+        &good("false", 0, 0, other.clone()),
         "generator changed after the fixtures",
     );
-    fails(&scripted("true", 0, 0, pin.clone()), "could not verify provenance");
-    fails(&scripted("", 0, 0, pin.clone()), "could not verify provenance");
-    fails(&scripted("false", 128, 0, pin.clone()), "could not verify provenance");
-    fails(&scripted("false", 0, 128, pin.clone()), "could not verify provenance");
-    fails(&scripted("false", 0, 0, String::new()), "could not verify provenance");
+    fails(&good("true", 0, 0, pin.clone()), "could not verify provenance");
+    fails(&good("", 0, 0, pin.clone()), "could not verify provenance");
+    fails(&good("false", 128, 0, pin.clone()), "could not verify provenance");
+    fails(&good("false", 0, 128, pin.clone()), "could not verify provenance");
+    fails(&good("false", 0, 0, String::new()), "could not verify provenance");
     fails(&|_| Err("git is missing".into()), "could not verify provenance");
     fails(
         &|args| {
-            if args[0] == "rev-parse" {
-                Ok((0, "false".into()))
-            } else {
+            if args.get(1) == Some(&"--is-shallow-repository") {
                 Err("deadline".into())
+            } else {
+                Ok((0, top.clone()))
             }
         },
+        "could not verify provenance",
+    );
+    // A git that landed in some other repository (or an empty directory) is not this one,
+    // whatever it then says about the pin.
+    let elsewhere = std::env::temp_dir().to_string_lossy().into_owned();
+    fails(
+        &scripted(elsewhere, "false", 0, 0, pin.clone()),
+        "not at the crate directory",
+    );
+    fails(
+        &scripted("/this/path/does/not/exist".into(), "false", 0, 0, pin.clone()),
         "could not verify provenance",
     );
     // The real check on this checkout, against the real git. Inside `with_gpu` so that this
     // test, like every test here, is outside the hosted device-free selection.
     with_gpu(|_| assert_fixture_provenance());
+}
+
+/// A fresh empty directory under the system temp dir.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("tessl_dequant_{tag}_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+#[test]
+fn git_helper_ignores_repository_redirecting_environment() {
+    with_gpu(|_| {
+        let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("crate dir");
+        let empty = scratch_dir("empty");
+        let empty_s = empty.to_string_lossy().into_owned();
+        let missing = empty.join("missing").to_string_lossy().into_owned();
+        let toplevel = |inherited: &[(&str, &str)]| {
+            let (code, top) = git_with(&["rev-parse", "--show-toplevel"], inherited, GIT_DEADLINE).expect("git runs");
+            assert_eq!(code, 0, "rev-parse failed under {inherited:?}: {top}");
+            std::fs::canonicalize(top).expect("toplevel exists")
+        };
+        assert_eq!(toplevel(&[]), root, "baseline: git sees this crate's repository");
+        let redirects: [(&str, &str); 9] = [
+            ("GIT_DIR", &empty_s),
+            ("GIT_WORK_TREE", &empty_s),
+            ("GIT_INDEX_FILE", &missing),
+            ("GIT_OBJECT_DIRECTORY", &missing),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", &missing),
+            ("GIT_COMMON_DIR", &empty_s),
+            ("GIT_NAMESPACE", "elsewhere"),
+            ("GIT_CEILING_DIRECTORIES", &empty_s),
+            ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0"),
+        ];
+        assert_eq!(
+            redirects.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            REPO_ENV,
+            "this test must exercise every variable the helper removes"
+        );
+        for one in &redirects {
+            assert_eq!(toplevel(&[*one]), root, "{} redirected the provenance check", one.0);
+        }
+        assert_eq!(toplevel(&redirects), root, "all of them together redirected it");
+        // The provenance verdict itself is not fooled either: with a GIT_DIR in the
+        // environment, the same helper still reaches the real repository and its commits.
+        let (code, _) =
+            git_with(&["rev-parse", "--verify", "HEAD^{commit}"], &redirects, GIT_DEADLINE).expect("git runs");
+        assert_eq!(code, 0, "HEAD must resolve in the real repository");
+    });
+}
+
+#[test]
+fn the_deadline_covers_reading_the_output_not_only_the_exit() {
+    with_gpu(|_| {
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let run = |script: &str, deadline: Duration| {
+            let started = Instant::now();
+            let got = run_bounded("sh", &["-c", script], &[], &[], here, deadline);
+            (got, started.elapsed())
+        };
+        let (got, _) = run("echo hi", Duration::from_secs(20));
+        assert_eq!(got, Ok((0, "hi".to_string())));
+        // The program outlives the deadline: killed, an error.
+        let (got, took) = run("sleep 20", Duration::from_secs(1));
+        assert!(got.is_err(), "{got:?}");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        // The program exits at once but an orphan keeps its stdout open for 15 s: the call
+        // must fail at the deadline, not wait for the pipe.
+        let (got, took) = run("sleep 15 & echo hi", Duration::from_secs(2));
+        let why = got.expect_err("an orphan-held pipe must not read as a success");
+        assert!(why.contains("output pipe was still open"), "{why}");
+        assert!(
+            took < Duration::from_secs(10),
+            "took {took:?}, the 2 s deadline did not bound the read"
+        );
+    });
+}
+
+/// A copy of the fixture directory to damage.
+fn copy_fixture_dir() -> std::path::PathBuf {
+    let copy = scratch_dir("fixtures");
+    for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copy");
+    }
+    copy
+}
+
+#[test]
+fn the_manifest_pins_every_fixture_byte_and_every_file() {
+    with_gpu(|_| {
+        assert_eq!(
+            ojas_io::sha256::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the hash the check relies on must be SHA-256"
+        );
+        let pristine = copy_fixture_dir();
+        let check = |dir: &Path| verify_fixture_bytes(dir, &read_manifest(dir).expect("manifest"));
+        check(&pristine).expect("the committed fixtures match their manifest");
+
+        let victim = "crafted_q8_g32_out.bin";
+        let damaged = copy_fixture_dir();
+        let mut bytes = std::fs::read(damaged.join(victim)).expect("read");
+        bytes[0] ^= 1;
+        std::fs::write(damaged.join(victim), bytes).expect("write");
+        let why = check(&damaged).expect_err("a flipped bit must fail");
+        assert!(why.contains(victim) && why.contains("sha256"), "{why}");
+
+        let extra = copy_fixture_dir();
+        std::fs::write(extra.join("stowaway.bin"), [0u8; 4]).expect("write");
+        let why = check(&extra).expect_err("an unlisted file must fail");
+        assert!(why.contains("stowaway.bin"), "{why}");
+
+        let missing = copy_fixture_dir();
+        std::fs::remove_file(missing.join(victim)).expect("remove");
+        let why = check(&missing).expect_err("a listed file that is gone must fail");
+        assert!(why.contains(victim), "{why}");
+
+        let unrecorded = copy_fixture_dir();
+        let text = std::fs::read_to_string(unrecorded.join("MANIFEST.json")).expect("manifest");
+        assert!(text.contains("\"sha256\""));
+        std::fs::write(
+            unrecorded.join("MANIFEST.json"),
+            text.replace("\"sha256\"", "\"sha_256\""),
+        )
+        .expect("write");
+        let why = check(&unrecorded).expect_err("a manifest without checksums must fail");
+        assert!(why.contains("no sha256"), "{why}");
+
+        let traversal = copy_fixture_dir();
+        let text = std::fs::read_to_string(traversal.join("MANIFEST.json")).expect("manifest");
+        std::fs::write(traversal.join("MANIFEST.json"), text.replace(victim, "../x.bin")).expect("write");
+        let why = check(&traversal).expect_err("a path in a file name must fail");
+        assert!(why.contains("plain fixture file name"), "{why}");
+    });
 }
 
 // -------------------------------------------------------------- refusals ---

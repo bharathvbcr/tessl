@@ -43,19 +43,32 @@ fi
 # runs (other checkouts, other agents) never share a file. mktemp's template
 # form is the one both BSD (the macos-26 runners) and GNU accept.
 #
-# The traps go in BEFORE mktemp, and RUN_DIR is assigned straight from it (bash
-# runs a signal trap that arrived during the command substitution only after the
-# assignment), so a signal right after the dir is made still reaches cleanup.
-# Nothing is removed unless run_dir_ok holds, in cleanup as well as at the
-# start: `rm -rf -- ""` and `"$RUN_DIR"/*` can never become `/*`, and a path
-# that is not a fresh directory directly under the resolved TMPDIR is never
-# deleted.
+# Guarantee: nothing is ever removed unless RUN_DIR is exactly what mktemp was
+# asked to make: a real (non-symlink) directory named
+# "$tmp_base/<crate>-release-ready.XXXXXX" whose parent is TMPDIR itself and
+# which is not TMPDIR. run_dir_ok checks that with no command substitution, so
+# it cannot be fooled by text already buffered for a closed stdout, and it runs
+# at the start and again before every rm in cleanup. So `rm -rf -- ""`, an
+# existing foreign directory, a symlink, TMPDIR itself and "/" are all refused.
+#
+# The traps are installed BEFORE mktemp and RUN_DIR is assigned straight from
+# it; bash runs a trap that arrived during the command substitution only after
+# the assignment, so a signal right after the dir is made still reaches cleanup.
 #
 # keep: the one log a failing step wants to leave behind (empty: remove all).
-# INT/TERM/HUP clear it, so an aborted run leaves nothing. SIGKILL cannot be
-# trapped and leaves the dir behind; that is accepted. A signal sent to the
-# script's pid alone (not its process group, as Ctrl-C does) is deferred by
-# bash until the foreground child exits; that is also accepted.
+# INT/TERM/HUP/QUIT/PIPE clear it, so an aborted run leaves nothing.
+#
+# Known leaks, all accepted:
+#  - SIGKILL cannot be trapped; the dir stays.
+#  - A signal sent to the script's pid alone (not its process group, as Ctrl-C
+#    does) is deferred by bash until the foreground child exits.
+#  - A process-group signal while mktemp itself is running kills mktemp (or a
+#    wrapper of it) between making the dir and printing its name: the name is
+#    lost, so nothing can remove it.
+#  - Closed stdout is not a leak: SIGPIPE is trapped (exit 141), and with
+#    SIGPIPE ignored the failing echo ends the run through errexit, which runs
+#    cleanup. (A signal with no trap here, e.g. SIGUSR1, still kills the shell
+#    without running it.)
 #
 # A cleanup failure must not change the verdict: the gate already decided, and
 # failing a ready release over a temp dir (or turning a failure into a
@@ -64,15 +77,13 @@ fi
 RUN_DIR=""
 keep=""
 run_dir_ok() {
-  local tmp_real run_real
-  [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]] || return 1
-  tmp_real="$(cd "$tmp_base" 2>/dev/null && pwd -P)" || return 1
-  run_real="$(cd "$RUN_DIR" 2>/dev/null && pwd -P)" || return 1
-  [[ -n "$tmp_real" && "$(dirname "$run_real")" == "$tmp_real" ]]
+  [[ -n "$RUN_DIR" && -d "$RUN_DIR" && ! -L "$RUN_DIR" ]] || return 1
+  [[ "$RUN_DIR" == "$tmp_base/${crate}-release-ready."?????? ]] || return 1
+  [[ "$RUN_DIR/.." -ef "$tmp_base" && ! "$RUN_DIR" -ef "$tmp_base" ]]
 }
 cleanup() {
   local rc=$?
-  trap '' INT TERM HUP # a second signal must not abort the removal
+  trap '' INT TERM HUP QUIT PIPE # a second signal must not abort the removal
   set +e
   if [[ -n "$RUN_DIR" ]]; then
     if ! run_dir_ok; then
@@ -94,6 +105,8 @@ trap cleanup EXIT
 trap 'keep=""; exit 130' INT
 trap 'keep=""; exit 129' HUP
 trap 'keep=""; exit 143' TERM
+trap 'keep=""; exit 131' QUIT
+trap 'keep=""; exit 141' PIPE
 
 RUN_DIR="$(mktemp -d "$tmp_base/${crate}-release-ready.XXXXXX")" || {
   echo "error: could not create a temp dir under $tmp_base" >&2

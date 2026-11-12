@@ -29,6 +29,12 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 const FAKE_RUSTC: &str = "#!/bin/sh\n\
 out=\n\
+i=0\n\
+while [ -n \"$FAKE_RUSTC_WAIT\" ] && [ ! -e \"$FAKE_RUSTC_WAIT\" ]; do\n\
+  i=$((i + 1))\n\
+  [ \"$i\" -gt 600 ] && exit 99\n\
+  sleep 0.1\n\
+done\n\
 while [ $# -gt 0 ]; do\n\
   if [ \"$1\" = -o ]; then out=\"$2\"; fi\n\
   shift\n\
@@ -90,6 +96,14 @@ case "$*" in
   ;;
 esac
 "#;
+
+/// Shell text that polls (bounded to 60 s) until `$1` exists, then continues.
+fn wait_for_shell(path: &Path) -> String {
+    format!(
+        "i=0\nwhile [ ! -e '{}' ]; do\n  i=$((i + 1))\n  [ \"$i\" -gt 600 ] && exit 99\n  sleep 0.1\ndone\n",
+        path.display()
+    )
+}
 
 fn unique_crate(tag: &str) -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -299,7 +313,42 @@ fn path_with(fx: &Fixture, dirs: &[&Path]) -> OsString {
     path
 }
 
+/// How the test reads the script's stdout.
+#[derive(Clone, Copy, PartialEq)]
+enum Stdout {
+    /// Read everything.
+    All,
+    /// Read up to and including the `==> run dir:` line, then close the pipe.
+    CloseAfterRunDir,
+}
+
 fn spawn_in(fx: &Fixture, cwd: &Path, tmp: &Tmp, env: &[(&'static str, OsString)]) -> Spawned {
+    spawn_with(fx, cwd, tmp, env, Stdout::All, false)
+}
+
+fn drain_until_run_dir(mut r: impl std::io::Read + Send + 'static) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while r.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+            buf.push(byte[0]);
+            let text = String::from_utf8_lossy(&buf);
+            if text.lines().any(|l| l.starts_with("==> run dir: ")) && text.ends_with('\n') {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+fn spawn_with(
+    fx: &Fixture,
+    cwd: &Path,
+    tmp: &Tmp,
+    env: &[(&'static str, OsString)],
+    stdout: Stdout,
+    ignore_sigpipe: bool,
+) -> Spawned {
     let path = path_with(fx, &[]);
     let mut cmd = Command::new("bash");
     cmd.arg(fx.path("repo/scripts/check_release_ready.sh"))
@@ -326,15 +375,23 @@ fn spawn_in(fx: &Fixture, cwd: &Path, tmp: &Tmp, env: &[(&'static str, OsString)
     // the async-signal-safe `signal`. A `cargo test` started in the background
     // inherits SIGINT as ignored; the script's own INT trap needs it default.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(
+                libc::SIGPIPE,
+                if ignore_sigpipe { libc::SIG_IGN } else { libc::SIG_DFL },
+            );
             Ok(())
         });
     }
     let mut child = cmd.spawn().unwrap();
     let pgid = child.id() as i32;
-    let out = Some(drain(child.stdout.take().unwrap()));
+    let so = child.stdout.take().unwrap();
+    let out = Some(match stdout {
+        Stdout::All => drain(so),
+        Stdout::CloseAfterRunDir => drain_until_run_dir(so),
+    });
     let err = Some(drain(child.stderr.take().unwrap()));
     Spawned {
         child: Some(child),
@@ -717,6 +774,7 @@ fn signals_remove_the_run_dir() {
         ("INT", libc::SIGINT, 130),
         ("TERM", libc::SIGTERM, 143),
         ("HUP", libc::SIGHUP, 129),
+        ("QUIT", libc::SIGQUIT, 131),
     ] {
         let c = unique_crate(name);
         let tmp_guard = CrateTmp::new(&c);
@@ -811,21 +869,34 @@ fn empty_package_list_fails() {
 
 #[test]
 fn run_dir_is_verified_before_anything_is_removed() {
-    // A mktemp that prints nothing, a file, or a directory outside TMPDIR must
-    // be refused, and the recording `rm` must never be called.
-    for variant in ["empty", "file", "elsewhere"] {
+    // A mktemp that prints nothing, a file, a directory outside TMPDIR, a
+    // foreign directory inside TMPDIR, or a symlink (inside TMPDIR, or outside
+    // it, pointing at a TMPDIR child) must be refused, and the recording `rm`
+    // must never be called.
+    for variant in ["empty", "file", "elsewhere", "foreign", "symlink_in", "symlink_out"] {
         let c = unique_crate(variant);
         let _tmp = CrateTmp::new(&c);
         let fx = Fixture::new(&c, &format!("tag-{variant}"), &["src/lib.rs"]);
         let tmpdir = tmpdir_with_sentinel("relready-tmp");
+        let foreign = tmpdir.join("foreign-dir");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("precious"), "x\n").unwrap();
         let outside = Scratch::dir("relready-outside");
         let file = outside.join("a-file");
         std::fs::write(&file, "x\n").unwrap();
+        let link_in = tmpdir.join(format!("{c}-release-ready.AAAAAA"));
+        let link_out = outside.join(format!("{c}-release-ready.BBBBBB"));
+        std::os::unix::fs::symlink(&foreign, &link_in).unwrap();
+        std::os::unix::fs::symlink(&foreign, &link_out).unwrap();
+        let before = entries(&tmpdir);
         let rmlog = fx.path("rm.log");
         let printed = match variant {
             "empty" => String::new(),
             "file" => file.display().to_string(),
-            _ => outside.display().to_string(),
+            "elsewhere" => outside.display().to_string(),
+            "foreign" => foreign.display().to_string(),
+            "symlink_in" => link_in.display().to_string(),
+            _ => link_out.display().to_string(),
         };
         let mk_body = if printed.is_empty() {
             "exit 0\n".to_string()
@@ -845,10 +916,95 @@ fn run_dir_is_verified_before_anything_is_removed() {
         let calls = std::fs::read_to_string(&rmlog).unwrap_or_default();
         assert_eq!(calls, "", "[{variant}] rm was called: {calls}\n{}", out.all());
         assert!(
-            file.exists() && outside.exists(),
-            "[{variant}] a path outside TMPDIR was touched"
+            file.exists() && outside.exists() && foreign.join("precious").exists(),
+            "[{variant}] a path outside the run was touched"
         );
-        assert_only_sentinel(&tmpdir, variant, &out);
+        assert_eq!(entries(&tmpdir), before, "[{variant}] TMPDIR changed\n{}", out.all());
+    }
+}
+
+#[test]
+fn run_dir_check_handles_trailing_slash_symlink_and_dotdot_tmpdirs() {
+    // The real mktemp, under TMPDIRs that are spelled in awkward ways: each run
+    // must succeed and clean up (a wrongly refused run dir would leak).
+    let c = unique_crate("shapes");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-shapes", &["src/lib.rs"]);
+    let parent = Scratch::dir("relready-shapes");
+    let real = parent.join("real");
+    std::fs::create_dir_all(real.join("sub")).unwrap();
+    std::fs::write(real.join("sentinel"), "x\n").unwrap();
+    let link = parent.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let via_sub = parent.join("subs");
+    std::os::unix::fs::symlink(real.join("sub"), &via_sub).unwrap();
+    let mut slash = OsString::from(&real);
+    slash.push("/");
+    let mut dotdot = OsString::from(&via_sub);
+    dotdot.push("/..");
+    for (name, tmp) in [
+        ("trailing slash", slash),
+        ("symlinked", OsString::from(&link)),
+        ("symlink/..", dotdot),
+    ] {
+        let out = run(&fx, &Tmp::Set(tmp), &[]);
+        assert_released(&out, &c);
+        assert!(
+            !out.stderr.contains("warning:"),
+            "[{name}] unexpected warning\n{}",
+            out.all()
+        );
+        assert_eq!(
+            entries(&real),
+            vec!["sentinel".to_string(), "sub".to_string()],
+            "[{name}] leaked\n{}",
+            out.all()
+        );
+    }
+}
+
+#[test]
+fn closed_stdout_still_cleans_up_without_a_false_warning() {
+    // The reader closes the pipe right after the run-dir line (`| head -1`).
+    // Whether SIGPIPE is default (the script traps it) or ignored (the echo
+    // fails with EPIPE and errexit ends the run), the run dir must go, with no
+    // `warning: not removing`.
+    for ignore in [false, true] {
+        let c = unique_crate(if ignore { "pipe-ign" } else { "pipe-dfl" });
+        let tmp_guard = CrateTmp::new(&c);
+        let fx = Fixture::new(&c, "tag-pipe", &["src/lib.rs"]);
+        let tmpdir = tmpdir_with_sentinel("relready-tmp");
+        let release = fx.path("release");
+        // The fake rustc parks the script until the reader has closed the pipe,
+        // so the next echo certainly hits a closed stdout.
+        let s = spawn_with(
+            &fx,
+            &fx.path("."),
+            &Tmp::Set(tmpdir.path().into()),
+            &[ev("FAKE_RUSTC_WAIT", &release)],
+            Stdout::CloseAfterRunDir,
+            ignore,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !s.out.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "stdout reader never closed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(&release, "go\n").unwrap();
+        let out = s.wait(60);
+        let what = format!("[sigpipe ignored: {ignore}]");
+        assert!(
+            matches!(out.code, Some(1) | Some(141)),
+            "{what} unexpected rc\n{}",
+            out.all()
+        );
+        assert!(
+            !out.stderr.contains("warning: not removing"),
+            "{what} false warning\n{}",
+            out.all()
+        );
+        assert_only_sentinel(&tmpdir, &format!("{what} run dir leaked"), &out);
+        assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new());
     }
 }
 
@@ -861,22 +1017,25 @@ fn trap_is_installed_before_mktemp() {
     let _tmp = CrateTmp::new(&c);
     let fx = Fixture::new(&c, "tag-early", &["src/lib.rs"]);
     let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let made = fx.path("made");
+    let release = fx.path("release");
     let slow = wrapper(
         &fx,
         "mktemp",
-        "d=$(PATH=/usr/bin:/bin mktemp \"$@\") || exit 1\nsleep 2\necho \"$d\"\n",
+        &format!(
+            "d=$(PATH=/usr/bin:/bin mktemp \"$@\") || exit 1\n: > '{}'\n{}echo \"$d\"\n",
+            made.display(),
+            wait_for_shell(&release)
+        ),
     );
-    let s = spawn(
+    let mut s = spawn(
         &fx,
         &Tmp::Set(tmpdir.path().into()),
         &[ev("PATH", path_with(&fx, &[&slow]))],
     );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while entries(&tmpdir).len() < 2 {
-        assert!(Instant::now() < deadline, "mktemp never made its dir");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    s.wait_for_file(&made, 60, "mktemp to make its dir");
     s.signal_pid(libc::SIGTERM);
+    std::fs::write(&release, "go\n").unwrap();
     let out = s.wait(20);
     assert_eq!(out.code, Some(143), "{}", out.all());
     assert_only_sentinel(&tmpdir, "dir leaked between mkdir and trap", &out);
@@ -911,10 +1070,15 @@ fn second_signal_during_cleanup_is_ignored() {
     let tmpdir = tmpdir_with_sentinel("relready-tmp");
     let started = fx.path("started");
     let in_rm = fx.path("in-rm");
+    let release = fx.path("release");
     let rm = wrapper(
         &fx,
         "rm",
-        &format!(": > '{}'\nsleep 2\nexec /bin/rm \"$@\"\n", in_rm.display()),
+        &format!(
+            ": > '{}'\n{}exec /bin/rm \"$@\"\n",
+            in_rm.display(),
+            wait_for_shell(&release)
+        ),
     );
     let mut s = spawn(
         &fx,
@@ -928,7 +1092,11 @@ fn second_signal_during_cleanup_is_ignored() {
     s.wait_for_file(&started, 60, "the hung `cargo package` to start");
     s.signal_group(libc::SIGINT);
     s.wait_for_file(&in_rm, 30, "cleanup to reach rm");
+    // The wrapper rm is parked until `release`, so this INT lands while the
+    // cleanup is certainly still running.
     s.signal_group(libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&release, "go\n").unwrap();
     let out = s.wait(20);
     assert_eq!(out.code, Some(130), "{}", out.all());
     assert_only_sentinel(&tmpdir, "a second INT aborted the cleanup", &out);
@@ -948,7 +1116,11 @@ fn signal_inside_fail_log_leaves_nothing() {
         let tail = wrapper(
             &fx,
             "tail",
-            &format!(": > '{}'\nsleep 3\nexec /usr/bin/tail \"$@\"\n", in_tail.display()),
+            &format!(
+                ": > '{}'\n{}exec /usr/bin/tail \"$@\"\n",
+                in_tail.display(),
+                wait_for_shell(&fx.path("never"))
+            ),
         );
         let mut s = spawn(
             &fx,

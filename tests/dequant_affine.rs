@@ -651,6 +651,10 @@ const GROUP: usize = 64;
 const ROWS: usize = 17;
 const COLS: usize = 1024;
 const GENERATOR: &str = "scripts/gen_dequant_affine_fixtures.py";
+/// What a git call gives back: `(exit code, trimmed stdout)`, or why it could not run.
+type GitOutput = Result<(i32, String), String>;
+/// A way of running git, so the verdict can be tested against scripted outcomes.
+type GitRun = dyn Fn(&[&str]) -> GitOutput;
 /// Longest any one git call may take before provenance is "could not verify".
 const GIT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -708,7 +712,7 @@ fn golden_case(case: &str, bits: u32, gs: usize) -> (Case, Vec<u16>) {
 
 /// Run git in the repo, with a deadline: `(exit code, stdout)`. A git that is
 /// missing, killed by a signal or past the deadline is an `Err`.
-fn git(args: &[&str]) -> Result<(i32, String), String> {
+fn git(args: &[&str]) -> GitOutput {
     let mut child = Command::new("git")
         .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -749,7 +753,7 @@ fn git(args: &[&str]) -> Result<(i32, String), String> {
 /// when the pin is a commit on this history and is the commit that last changed
 /// the generator; every other outcome, including one where a check could not
 /// run, is an `Err` naming it.
-fn judge_provenance(pin: &str, run: &dyn Fn(&[&str]) -> Result<(i32, String), String>) -> Result<(), String> {
+fn judge_provenance(pin: &str, run: &GitRun) -> Result<(), String> {
     let unverified = |why: String| format!("could not verify provenance: {why}");
     let (code, shallow) = run(&["rev-parse", "--is-shallow-repository"]).map_err(unverified)?;
     if code != 0 || shallow != "false" {
@@ -884,7 +888,7 @@ fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
     let other = "b".repeat(40);
     // A scripted git: `shallow`, `has_commit`, `ancestor`, `last` pick each answer.
     let scripted = |shallow: &'static str, has_commit: i32, ancestor: i32, last: String| {
-        move |args: &[&str]| -> Result<(i32, String), String> {
+        move |args: &[&str]| -> GitOutput {
             Ok(match args[0] {
                 "rev-parse" => (0, shallow.to_string()),
                 "cat-file" => (has_commit, String::new()),
@@ -896,7 +900,7 @@ fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
     };
     judge_provenance(&pin, &scripted("false", 0, 0, pin.clone())).expect("the one passing outcome");
 
-    let fails = |run: &dyn Fn(&[&str]) -> Result<(i32, String), String>, needle: &str| {
+    let fails = |run: &GitRun, needle: &str| {
         let e = judge_provenance(&pin, run).expect_err("must not pass");
         assert!(e.contains(needle), "wanted {needle:?} in {e:?}");
     };

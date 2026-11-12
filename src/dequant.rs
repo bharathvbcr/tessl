@@ -78,7 +78,7 @@ const _: () = {
     let mut i = 0;
     while i < DEQUANT_AFFINE_GROUP_SIZES.len() {
         let g = DEQUANT_AFFINE_GROUP_SIZES[i];
-        assert!(g.is_power_of_two() && g % 8 == 0);
+        assert!(g.is_power_of_two() && g.is_multiple_of(8));
         i += 1;
     }
 };

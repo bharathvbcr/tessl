@@ -22,9 +22,13 @@ Group size 64 keeps the original file names ({case}_q{bits}_{part}.bin); 32 and
 128 are {case}_q{bits}_g{G}_{part}.bin. The weights and the G=64 crafted cases
 come from one numpy stream, drawn in a fixed order that must not change (it
 keeps the G=64 files byte-identical); each other group size's crafted case draws
-from its own stream, default_rng([20261110, G]). The script refuses to write a
-G=32/128 case whose crafted golden lacks an infinity or a zero of either sign,
-or whose device-model tally is not zero mismatches.
+from its own stream, default_rng([20261110, G]), over the group-size-64 corners
+plus a NaN and both infinities. The script refuses to write a G=32/128 case whose
+crafted golden lacks both infinities, a NaN, a maximum-magnitude finite value or a
+zero of either sign, or whose device-model tally is not zero mismatches.
+
+MANIFEST.json records the sha256 of every fixture file, so a test can tell the
+bytes it loads are the bytes this script wrote.
 
 The golden of every case is mx.dequantize's bf16 output as raw bits, so a test
 compares bit patterns (NaN payloads, signed zeros and infinities included).
@@ -32,6 +36,7 @@ Host-side rounding to bf16 is done in numpy (round to nearest even), never by
 an mlx op, so the only mlx computations are the two that define the goldens.
 The host formulas the tallies compare against are the ones the Rust test uses.
 """
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -84,14 +89,23 @@ def weights(rng):
     return w
 
 
-# bf16 bit patterns that matter: signed zeros, subnormals (smallest, largest,
-# negative), smallest normal, +-1, +-max finite, 2^125 (times a code it
-# overflows f32 itself, and an exact fma still lands finite against -max), and
-# a value near 0.01.
+# bf16 bit patterns that matter. The list is the group-size-64 stream's and its
+# length is part of that stream (rng.integers(0, len(CORNERS))): changing it moves
+# the group-size-64 files. 0x0000/0x8000 signed zeros; 0x0001 smallest subnormal,
+# 0x007F largest, 0x8001 a negative one; 0x0080 smallest normal; 0x3F80/0xBF80 +-1;
+# 0x7F7F/0xFF7F +-max finite; 0x7E00 is 2^125 (times a code it overflows f32
+# itself, and an exact fma still lands finite against -max), NOT a NaN; 0x4B00 is
+# 2^23; 0x3C23 a value near 0.01.
 CORNERS = np.array(
     [0x0000, 0x8000, 0x0001, 0x007F, 0x8001, 0x0080, 0x3F80, 0xBF80, 0x7F7F, 0xFF7F, 0x7E00, 0x4B00, 0x3C23],
     dtype=np.uint16,
 )
+
+# The corners of the group sizes added later (32, 128), whose streams are their own:
+# CORNERS plus a true NaN (0x7FC0, the quiet NaN: exponent all ones, mantissa non-zero)
+# and both infinities (0x7F80, 0xFF80), so NaN and infinity propagation are compared
+# against mlx as well.
+CORNERS_WITH_NON_FINITE = np.concatenate([CORNERS, np.array([0x7FC0, 0x7F80, 0xFF80], dtype=np.uint16)])
 
 # (scale, bias) pairs of normal operands whose code-1 result is a subnormal:
 # 2^-126 - 2^-126 * (1 + 2^-7) = -2^-133, and its mirror and 2^-125 versions.
@@ -99,11 +113,11 @@ CORNERS = np.array(
 SUBNORMAL_RESULT_PAIRS = [(0x0080, 0x8081), (0x8080, 0x0081), (0x0100, 0x8101), (0x8100, 0x0101)]
 
 
-def crafted(rng, bits, group):
+def crafted(rng, bits, group, corners):
     words = COLS * bits // 32
     packed = rng.integers(0, 2**32, size=(ROWS, words), dtype=np.uint64).astype(np.uint32)
     n = ROWS * (COLS // group)
-    pick = lambda: CORNERS[rng.integers(0, len(CORNERS), size=n)]
+    pick = lambda: corners[rng.integers(0, len(corners), size=n)]
     sb, bb = pick(), pick()
     # Half of the groups draw an ordinary random scale/bias instead, so the
     # corner groups are mixed with arithmetic that is not degenerate.
@@ -193,7 +207,12 @@ def write_manifest(commit):
                         origin = f"crafted corner values, numpy default_rng({SEED})"
                     else:
                         origin = f"crafted corner values, numpy default_rng([{SEED}, {group}])"
-                    files[name] = {"role": role, "published": True, "note": f"{notes(group)[part]}; {origin}"}
+                    files[name] = {
+                        "role": role,
+                        "published": True,
+                        "note": f"{notes(group)[part]}; {origin}",
+                        "sha256": hashlib.sha256((OUT / name).read_bytes()).hexdigest(),
+                    }
     manifest = {
         "schema": 1,
         "generator": GENERATOR,
@@ -217,8 +236,12 @@ def write_manifest(commit):
 
 def check_crafted_golden(name, obits, tallies):
     """A crafted golden must hold the corners it is there for, and the device model must reproduce it."""
-    if not ((obits & 0x7FFF) == 0x7F80).any():
-        sys.exit(f"{name}: the crafted golden holds no infinity; not writing it (do not reseed silently)")
+    if not ((obits == 0x7F80).any() and (obits == 0xFF80).any()):
+        sys.exit(f"{name}: the crafted golden lacks +inf or -inf; not writing it (do not reseed silently)")
+    if not ((obits & 0x7FFF) > 0x7F80).any():
+        sys.exit(f"{name}: the crafted golden holds no NaN; not writing it (do not reseed silently)")
+    if not ((obits & 0x7FFF) == 0x7F7F).any():
+        sys.exit(f"{name}: the crafted golden holds no maximum-magnitude finite value; not writing it")
     if not ((obits == 0x0000).any() and (obits == 0x8000).any()):
         sys.exit(f"{name}: the crafted golden lacks a zero of both signs; not writing it (do not reseed silently)")
     if tallies["ftz_model_mismatches"] != 0:
@@ -244,7 +267,7 @@ def main():
         for suffix, a in (("packed", packed), ("scales", sbits), ("biases", bbits), ("out", obits)):
             write(fname("quant", bits, GROUP, suffix), a)
 
-        packed, sbits, bbits = crafted(rng, bits, GROUP)
+        packed, sbits, bbits = crafted(rng, bits, GROUP, CORNERS)
         out = mx.dequantize(mx.array(packed), from_bits(sbits), from_bits(bbits), group_size=GROUP, bits=bits, stream=GPU)
         mx.eval(out)
         obits = bits_of(out)
@@ -266,7 +289,7 @@ def main():
             report[key] = tally(packed, sbits, bbits, obits, bits, group)
             pending.append(("quant", bits, group, packed, sbits, bbits, obits))
 
-            packed, sbits, bbits = crafted(crng, bits, group)
+            packed, sbits, bbits = crafted(crng, bits, group, CORNERS_WITH_NON_FINITE)
             out = mx.dequantize(mx.array(packed), from_bits(sbits), from_bits(bbits), group_size=group, bits=bits, stream=GPU)
             mx.eval(out)
             obits = bits_of(out)

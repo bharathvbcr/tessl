@@ -11,22 +11,36 @@
 //!   f32 result is a zero of its own sign; NaN is the canonical `0x7fc0`.
 //!
 //! `tests/fixtures/dequant_affine/` holds `mx.dequantize(stream=mx.gpu)`
-//! outputs (`scripts/gen_dequant_affine_fixtures.py`, mlx 0.31.2). The kernel
-//! agrees with them bit for bit, including on subnormal and overflowing
-//! corners, and the device model reproduces every one of them while the IEEE
-//! model does not: the flush is mlx's behaviour too, not a quirk of this kernel.
+//! outputs (`scripts/gen_dequant_affine_fixtures.py`, mlx 0.31.2) at group
+//! sizes 32, 64 and 128, for q8 and q4, from `mx.quantize` and from crafted
+//! corner values. The kernel agrees with them bit for bit, including on
+//! subnormal and overflowing corners, and the device model reproduces every
+//! crafted one of them while the IEEE model does not: the flush is mlx's
+//! behaviour too, not a quirk of this kernel. Each golden test also checks the
+//! fixtures' provenance (`assert_fixture_provenance`): the manifest's
+//! `generator_commit` must be on this history and be the commit that last
+//! changed the generator, and any check that cannot run fails.
+//!
+//! The fault-word tests cover `check_dequant_affine_fault`, the checked read of
+//! the word `dequant_affine_bf16` raises.
 //!
 //! All tests need the device (`with_gpu`), so none belongs in the hosted
 //! device-free selection.
 
 mod common;
 
+#[path = "../src/bin/common/json.rs"]
+mod json;
+
 use common::{with_gpu, with_two_gpus};
+use json::{Json, Syntax};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tessl::dequant::{
-    dequant_affine_bf16, dequant_affine_q4_bf16, dequant_affine_q8_bf16, validate_dequant_affine_bf16, AffineBits,
-    DequantAffineBank, DEQUANT_AFFINE_GROUP_SIZES,
+    check_dequant_affine_fault, dequant_affine_bf16, dequant_affine_q4_bf16, dequant_affine_q8_bf16,
+    validate_dequant_affine_bf16, AffineBits, DequantAffineBank, DequantAffineFault, DEQUANT_AFFINE_GROUP_SIZES,
 };
 use tessl::nn::QuantShape;
 use tessl::tensor::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_bf16_bits_gpu, GpuBuffer};
@@ -636,6 +650,9 @@ fn subnormals_flush_to_signed_zero_where_the_ieee_formula_does_not() {
 const GROUP: usize = 64;
 const ROWS: usize = 17;
 const COLS: usize = 1024;
+const GENERATOR: &str = "scripts/gen_dequant_affine_fixtures.py";
+/// Longest any one git call may take before provenance is "could not verify".
+const GIT_DEADLINE: Duration = Duration::from_secs(30);
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -658,13 +675,21 @@ fn u32s(name: &str) -> Vec<u32> {
     words.iter().map(|b| u32::from_le_bytes(*b)).collect()
 }
 
-fn golden_case(case: &str, bits: u32) -> (Case, Vec<u16>) {
-    let name = |part: &str| format!("{case}_q{bits}_{part}.bin");
+/// One golden: its inputs as a [`Case`] and mlx's output bits. Group size 64 keeps
+/// the original file names; the others carry `_g{gs}`.
+fn golden_case(case: &str, bits: u32, gs: usize) -> (Case, Vec<u16>) {
+    let name = |part: &str| {
+        if gs == GROUP {
+            format!("{case}_q{bits}_{part}.bin")
+        } else {
+            format!("{case}_q{bits}_g{gs}_{part}.bin")
+        }
+    };
     let c = Case {
         bits,
         rows: ROWS,
         cols: COLS,
-        gs: GROUP,
+        gs,
         packed: u32s(&name("packed")),
         scales: u16s(&name("scales")),
         biases: u16s(&name("biases")),
@@ -672,47 +697,233 @@ fn golden_case(case: &str, bits: u32) -> (Case, Vec<u16>) {
     assert_eq!(
         c.packed.len(),
         Case::words(bits, ROWS, COLS),
-        "{case} q{bits} packed length"
+        "{case} q{bits} g{gs} packed length"
     );
-    assert_eq!(c.scales.len(), ROWS * COLS / GROUP);
-    assert_eq!(c.biases.len(), ROWS * COLS / GROUP);
+    assert_eq!(c.scales.len(), ROWS * COLS / gs);
+    assert_eq!(c.biases.len(), ROWS * COLS / gs);
     let want = u16s(&name("out"));
     assert_eq!(want.len(), ROWS * COLS);
     (c, want)
 }
 
+/// Run git in the repo, with a deadline: `(exit code, stdout)`. A git that is
+/// missing, killed by a signal or past the deadline is an `Err`.
+fn git(args: &[&str]) -> Result<(i32, String), String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("git {args:?} did not start: {e}"))?;
+    let deadline = Instant::now() + GIT_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {args:?} still running after {GIT_DEADLINE:?}; killed"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {args:?} could not be waited on: {e}"));
+            }
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut pipe, &mut out)
+            .map_err(|e| format!("git {args:?} output unreadable: {e}"))?;
+    }
+    let code = status
+        .code()
+        .ok_or_else(|| format!("git {args:?} was killed by a signal"))?;
+    Ok((code, out.trim().to_string()))
+}
+
+/// The provenance verdict for a manifest pin `pin`, given `run` (git). `Ok` only
+/// when the pin is a commit on this history and is the commit that last changed
+/// the generator; every other outcome, including one where a check could not
+/// run, is an `Err` naming it.
+fn judge_provenance(pin: &str, run: &dyn Fn(&[&str]) -> Result<(i32, String), String>) -> Result<(), String> {
+    let unverified = |why: String| format!("could not verify provenance: {why}");
+    let (code, shallow) = run(&["rev-parse", "--is-shallow-repository"]).map_err(unverified)?;
+    if code != 0 || shallow != "false" {
+        return Err(unverified(format!(
+            "this is not a full clone (rev-parse --is-shallow-repository exited {code}, printed {shallow:?})"
+        )));
+    }
+    let commit = format!("{pin}^{{commit}}");
+    let (code, _) = run(&["cat-file", "-e", &commit]).map_err(unverified)?;
+    if code != 0 {
+        return Err(unverified(format!(
+            "commit {pin} is not in this repository (cat-file -e exited {code})"
+        )));
+    }
+    let (code, _) = run(&["merge-base", "--is-ancestor", pin, "HEAD"]).map_err(unverified)?;
+    match code {
+        0 => {}
+        1 => return Err(format!("generator_commit {pin} is not on this history")),
+        other => return Err(unverified(format!("merge-base --is-ancestor exited {other}"))),
+    }
+    let (code, last) = run(&["log", "-1", "--format=%H", "--", GENERATOR]).map_err(unverified)?;
+    if code != 0 || last.len() != 40 {
+        return Err(unverified(format!(
+            "git log of {GENERATOR} exited {code} and printed {last:?}"
+        )));
+    }
+    if last != pin {
+        return Err(format!(
+            "generator changed after the fixtures: the manifest pins {pin}, the generator was last changed in {last}; regenerate"
+        ));
+    }
+    Ok(())
+}
+
+/// The manifest's `generator_commit` of the fixture directory.
+fn manifest_pin() -> Result<String, String> {
+    let text = String::from_utf8(fixture("MANIFEST.json")).map_err(|e| format!("MANIFEST.json is not UTF-8: {e}"))?;
+    let doc = json::parse(
+        &text,
+        Syntax {
+            what: "MANIFEST.json",
+            max_depth: 8,
+            uints_only: false,
+            literals: true,
+        },
+    )
+    .map_err(|e| format!("MANIFEST.json does not parse: {e}"))?;
+    match doc.get("generator_commit") {
+        Some(Json::Str(pin))
+            if pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            Ok(pin.clone())
+        }
+        other => Err(format!(
+            "MANIFEST.json generator_commit is not a 40-hex commit: {other:?}"
+        )),
+    }
+}
+
+/// Panics unless the goldens were written by the generator as it is now, from a
+/// commit on this history. Called inside `with_gpu`, so it never runs in the
+/// hosted device-free selection (a hosted clone is shallow and could not verify).
+fn assert_fixture_provenance() {
+    let verdict = manifest_pin().and_then(|pin| judge_provenance(&pin, &git));
+    if let Err(why) = verdict {
+        panic!("dequant_affine fixtures: {why}");
+    }
+}
+
+/// The kernel against one mlx golden, plus what the golden must contain.
+fn assert_matches_mlx(rt: &Arc<GpuRuntime>, case: &str, bits: u32, gs: usize, c: &Case, want: &[u16]) {
+    let what = format!("{case} q{bits} g{gs}");
+    assert_bits(&format!("{what} vs mlx"), &run(rt, c, 0), want);
+    if case == "crafted" {
+        // The goldens must contain the corners they are there for.
+        assert!(
+            want.iter().any(|&v| v & 0x7FFF == 0x7F80),
+            "no infinity in the {what} golden"
+        );
+        assert!(
+            want.contains(&0x0000) && want.contains(&0x8000),
+            "no zeros of both signs in the {what} golden"
+        );
+        // The device model reproduces mlx exactly; the IEEE one does not
+        // (subnormal operands and results), which is why the kernel is not
+        // compared against it here.
+        assert_eq!(c.model(Model::Device), want, "{what}: device model vs mlx");
+        let ieee_misses = c.model(Model::Ieee).iter().zip(want).filter(|(a, b)| a != b).count();
+        assert!(ieee_misses > 0, "{what}: the golden has no subnormal case");
+    }
+}
+
 #[test]
 fn matches_mlx_gpu_dequantize_bit_for_bit() {
+    // Real mx.quantize output (weights spanning ~1e-30 to 1e3, an all-negative
+    // row, a constant row and a zero row), then random packed words with scales
+    // and biases drawn from the corners: signed zeros, subnormals, the smallest
+    // normal, +-max, 2^125.
+    let goldens: Vec<_> = [8u32, 4]
+        .into_iter()
+        .flat_map(|bits| ["quant", "crafted"].map(|case| (case, bits, golden_case(case, bits, GROUP))))
+        .collect();
     with_gpu(|rt| {
-        for bits in [8u32, 4] {
-            // Real mx.quantize output (weights spanning ~1e-30 to 1e3, an all-negative
-            // row, a constant row and a zero row).
-            let (c, want) = golden_case("quant", bits);
-            assert_bits(&format!("quant q{bits} vs mlx"), &run(rt, &c, 0), &want);
-
-            // Random packed words with scales and biases drawn from the corners:
-            // signed zeros, subnormals, the smallest normal, +-max, 2^125.
-            let (c, want) = golden_case("crafted", bits);
-            let got = run(rt, &c, 0);
-            assert_bits(&format!("crafted q{bits} vs mlx"), &got, &want);
-
-            // The goldens must contain the corners they are there for.
-            assert!(
-                want.iter().any(|&v| v & 0x7FFF == 0x7F80),
-                "no infinity in the crafted golden"
-            );
-            assert!(
-                want.contains(&0x0000) && want.contains(&0x8000),
-                "no zeros of both signs"
-            );
-            // The device model reproduces mlx exactly; the IEEE one does not
-            // (subnormal operands and results), which is why the kernel is not
-            // compared against it here.
-            assert_eq!(c.model(Model::Device), want, "crafted q{bits}: device model vs mlx");
-            let ieee_misses = c.model(Model::Ieee).iter().zip(&want).filter(|(a, b)| a != b).count();
-            assert!(ieee_misses > 0, "crafted q{bits}: the golden has no subnormal case");
+        assert_fixture_provenance();
+        for (case, bits, (c, want)) in &goldens {
+            assert_matches_mlx(rt, case, *bits, GROUP, c, want);
         }
     });
+}
+
+#[test]
+fn matches_mlx_gpu_dequantize_at_group_sizes_32_and_128() {
+    let goldens: Vec<_> = [32usize, 128]
+        .into_iter()
+        .flat_map(|gs| {
+            [8u32, 4].into_iter().flat_map(move |bits| {
+                ["quant", "crafted"].map(move |case| (case, bits, gs, golden_case(case, bits, gs)))
+            })
+        })
+        .collect();
+    with_gpu(|rt| {
+        assert_fixture_provenance();
+        for (case, bits, gs, (c, want)) in &goldens {
+            assert_matches_mlx(rt, case, *bits, *gs, c, want);
+        }
+    });
+}
+
+#[test]
+fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
+    let pin = "a".repeat(40);
+    let other = "b".repeat(40);
+    // A scripted git: `shallow`, `has_commit`, `ancestor`, `last` pick each answer.
+    let scripted = |shallow: &'static str, has_commit: i32, ancestor: i32, last: String| {
+        move |args: &[&str]| -> Result<(i32, String), String> {
+            Ok(match args[0] {
+                "rev-parse" => (0, shallow.to_string()),
+                "cat-file" => (has_commit, String::new()),
+                "merge-base" => (ancestor, String::new()),
+                "log" => (0, last.clone()),
+                other => panic!("unexpected git {other}"),
+            })
+        }
+    };
+    judge_provenance(&pin, &scripted("false", 0, 0, pin.clone())).expect("the one passing outcome");
+
+    let fails = |run: &dyn Fn(&[&str]) -> Result<(i32, String), String>, needle: &str| {
+        let e = judge_provenance(&pin, run).expect_err("must not pass");
+        assert!(e.contains(needle), "wanted {needle:?} in {e:?}");
+    };
+    fails(&scripted("false", 0, 1, pin.clone()), "not on this history");
+    fails(
+        &scripted("false", 0, 0, other.clone()),
+        "generator changed after the fixtures",
+    );
+    fails(&scripted("true", 0, 0, pin.clone()), "could not verify provenance");
+    fails(&scripted("", 0, 0, pin.clone()), "could not verify provenance");
+    fails(&scripted("false", 128, 0, pin.clone()), "could not verify provenance");
+    fails(&scripted("false", 0, 128, pin.clone()), "could not verify provenance");
+    fails(&scripted("false", 0, 0, String::new()), "could not verify provenance");
+    fails(&|_| Err("git is missing".into()), "could not verify provenance");
+    fails(
+        &|args| {
+            if args[0] == "rev-parse" {
+                Ok((0, "false".into()))
+            } else {
+                Err("deadline".into())
+            }
+        },
+        "could not verify provenance",
+    );
+    // The real check on this checkout, against the real git. Inside `with_gpu` so that this
+    // test, like every test here, is outside the hosted device-free selection.
+    with_gpu(|_| assert_fixture_provenance());
 }
 
 // -------------------------------------------------------------- refusals ---
@@ -933,5 +1144,181 @@ fn the_fault_word_is_raised_by_a_non_finite_output_and_is_never_cleared() {
                 "q{bits}: the other rows stay finite"
             );
         }
+    });
+}
+
+// -------------------------------------------------- checked fault-word read ---
+
+/// Dispatch `c` once into `fault` (whatever it holds) and synchronize.
+fn dispatch_and_sync(rt: &Arc<GpuRuntime>, c: &Case, fault: &GpuBuffer) {
+    let bufs = Buffers::upload(rt, c);
+    let out = rt.alloc_buffer((c.rows * c.cols).max(1) * 2).expect("alloc out");
+    dequant_affine_bf16(rt, ab(c.bits), bufs.bank(), &out, fault, c.shape()).expect("dequant");
+    rt.synchronize().expect("sync");
+}
+
+/// A case with one overflowing group (row 1's scale is bf16 max, bias 0, so every
+/// code >= 2 gives an infinity).
+fn overflowing(rng: &mut Rng, bits: u32) -> Case {
+    let mut bad = Case::random(rng, bits, 3, 64, 64);
+    bad.scales[1] = 0x7F7F;
+    bad.biases[1] = 0;
+    bad
+}
+
+#[test]
+fn check_returns_ok_for_finite_output_and_raised_for_a_non_finite_one() {
+    with_gpu(|rt| {
+        let mut rng = Rng(0xc4);
+        for bits in [8u32, 4] {
+            let fault = rt.alloc_buffer(4).expect("fault");
+            fault.try_zero().expect("zero");
+            dispatch_and_sync(rt, &Case::random(&mut rng, bits, 3, 64, 64), &fault);
+            assert_eq!(check_dequant_affine_fault(&fault), Ok(()), "q{bits}: a clean run");
+
+            dispatch_and_sync(rt, &overflowing(&mut rng, bits), &fault);
+            let want = Err(DequantAffineFault::Raised { word: 1 });
+            assert_eq!(check_dequant_affine_fault(&fault), want, "q{bits}: a faulting run");
+            // Sticky: the check does not clear it, and a clean run after does not either.
+            assert_eq!(
+                check_dequant_affine_fault(&fault),
+                want,
+                "q{bits}: the read must not clear"
+            );
+            dispatch_and_sync(rt, &Case::random(&mut rng, bits, 3, 64, 64), &fault);
+            assert_eq!(
+                check_dequant_affine_fault(&fault),
+                want,
+                "q{bits}: a clean run must not clear"
+            );
+            fault.try_zero().expect("reset");
+            assert_eq!(
+                check_dequant_affine_fault(&fault),
+                Ok(()),
+                "q{bits}: after the caller's reset"
+            );
+        }
+
+        // Only word 0 of a larger buffer is read.
+        let wide = rt.alloc_buffer(64).expect("64 bytes");
+        let mut words = vec![u32::MAX; 16];
+        words[0] = 0;
+        wide.write_u32(&words);
+        assert_eq!(
+            check_dequant_affine_fault(&wide),
+            Ok(()),
+            "words past the first are not the fault"
+        );
+        words = vec![0; 16];
+        words[0] = 3;
+        wide.write_u32(&words);
+        assert_eq!(
+            check_dequant_affine_fault(&wide),
+            Err(DequantAffineFault::Raised { word: 3 })
+        );
+    });
+}
+
+#[test]
+fn check_reports_a_stale_word_and_never_clears_it() {
+    with_gpu(|rt| {
+        let mut rng = Rng(0x57a1e);
+        let fault = rt.alloc_buffer(4).expect("fault");
+        fault.write_u32(&[0xABCD]);
+        // A clean dequant leaves the caller's word alone, so a word that was not
+        // zeroed first reads as raised: stale and new faults are indistinguishable.
+        dispatch_and_sync(rt, &Case::random(&mut rng, 8, 3, 64, 64), &fault);
+        assert_eq!(
+            fault.read_u32()[0],
+            0xABCD,
+            "a clean dequant leaves the word as it found it"
+        );
+        assert_eq!(
+            check_dequant_affine_fault(&fault),
+            Err(DequantAffineFault::Raised { word: 0xABCD })
+        );
+        assert_eq!(fault.read_u32()[0], 0xABCD, "the check never writes");
+        // A faulting dequant stores 1 over it (a store, not an OR).
+        dispatch_and_sync(rt, &overflowing(&mut rng, 8), &fault);
+        assert_eq!(fault.read_u32()[0], 1, "a fault overwrites the caller's code with 1");
+        assert_eq!(
+            check_dequant_affine_fault(&fault),
+            Err(DequantAffineFault::Raised { word: 1 })
+        );
+
+        // Zero rows dispatches nothing, so the check reads whatever the caller left.
+        let (packed, scales, biases, out) = (
+            rt.alloc_buffer(8).expect("packed"),
+            rt.alloc_buffer(8).expect("scales"),
+            rt.alloc_buffer(8).expect("biases"),
+            rt.alloc_buffer(8).expect("out"),
+        );
+        let bank = DequantAffineBank {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+        };
+        let shape = QuantShape {
+            rows: 0,
+            cols: 64,
+            group_size: 64,
+        };
+        fault.write_u32(&[0x77]);
+        dequant_affine_q8_bf16(rt, bank, &out, &fault, shape).expect("zero rows");
+        assert_eq!(
+            check_dequant_affine_fault(&fault),
+            Err(DequantAffineFault::Raised { word: 0x77 })
+        );
+    });
+}
+
+#[test]
+fn check_on_a_poisoned_runtime_is_unread_not_ok() {
+    with_gpu(|rt| {
+        let mut rng = Rng(0x9015);
+        let fault = rt.alloc_buffer(4).expect("fault");
+        fault.try_zero().expect("zero");
+        dispatch_and_sync(rt, &Case::random(&mut rng, 8, 3, 64, 64), &fault);
+        assert_eq!(
+            check_dequant_affine_fault(&fault),
+            Ok(()),
+            "healthy runtime, clean word"
+        );
+        rt.poison_as_shared_event_timeout_for_test();
+        // The word's bytes are still 0, but the host cannot be sure of that.
+        match check_dequant_affine_fault(&fault) {
+            Err(DequantAffineFault::Unread { why }) => assert!(!why.is_empty()),
+            other => panic!("a poisoned runtime must give Unread, not {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn check_refuses_a_short_buffer_and_reads_a_six_byte_one() {
+    with_gpu(|rt| {
+        let mut rng = Rng(0x6b);
+        let short = rt.alloc_buffer(2).expect("2 bytes");
+        assert_eq!(short.nbytes(), 2);
+        match check_dequant_affine_fault(&short) {
+            Err(DequantAffineFault::Unread { why }) => assert!(why.contains("2 bytes"), "{why}"),
+            other => panic!("a 2-byte buffer must give Unread, not {other:?}"),
+        }
+
+        // Not a multiple of four: a `u32` mapping would refuse it, a byte read does not.
+        let six = rt.alloc_buffer(6).expect("6 bytes");
+        assert_eq!(
+            six.nbytes(),
+            6,
+            "alloc_buffer(6) must be 6 bytes for this test to mean anything"
+        );
+        six.try_zero().expect("zero");
+        // The dispatch path accepts it too: it needs 4 bytes, not a multiple of 4.
+        dispatch_and_sync(rt, &Case::random(&mut rng, 8, 3, 64, 64), &six);
+        assert_eq!(check_dequant_affine_fault(&six), Ok(()));
+        dispatch_and_sync(rt, &overflowing(&mut rng, 8), &six);
+        assert_eq!(
+            check_dequant_affine_fault(&six),
+            Err(DequantAffineFault::Raised { word: 1 })
+        );
     });
 }

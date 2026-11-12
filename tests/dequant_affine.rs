@@ -1674,3 +1674,61 @@ fn check_refuses_a_short_buffer_and_reads_a_six_byte_one() {
         );
     });
 }
+
+#[test]
+fn check_reads_every_byte_of_the_word_at_every_buffer_length() {
+    with_gpu(|rt| {
+        let mut rng = Rng(0x1e57);
+        for n in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 64] {
+            // A zero-length allocation may be refused outright; that is not this check's concern.
+            let Ok(buf) = rt.alloc_buffer(n) else {
+                assert_eq!(n, 0, "alloc_buffer({n}) failed");
+                continue;
+            };
+            if buf.nbytes() < 4 {
+                // Under a word: nothing is mapped, whatever the buffer holds.
+                match check_dequant_affine_fault(&buf) {
+                    Err(DequantAffineFault::Unread { why }) => assert!(why.contains(&format!("{n} bytes")), "{why}"),
+                    other => panic!("len {n}: a buffer under 4 bytes must give Unread, not {other:?}"),
+                }
+                continue;
+            }
+            buf.try_zero().expect("zero");
+            assert_eq!(check_dequant_affine_fault(&buf), Ok(()), "len {n}: zeroed");
+            // Each byte of word 0 on its own, and the high bit alone, little-endian: a read
+            // of only the low half, the low byte or bit 0 would call one of these clean.
+            for (byte, value) in [(0usize, 0x01u8), (1, 0x01), (2, 0x01), (3, 0x01), (3, 0x80)] {
+                let mut bytes = vec![0u8; buf.nbytes()];
+                bytes[byte] = value;
+                buf.write_bytes(&bytes);
+                let word = u32::from(value) << (8 * byte);
+                assert_eq!(
+                    check_dequant_affine_fault(&buf),
+                    Err(DequantAffineFault::Raised { word }),
+                    "len {n}: byte {byte} = {value:#04x}"
+                );
+            }
+            // Bytes past the word are not the fault.
+            if buf.nbytes() > 4 {
+                let mut bytes = vec![0u8; buf.nbytes()];
+                bytes[4..].fill(0xFF);
+                buf.write_bytes(&bytes);
+                assert_eq!(
+                    check_dequant_affine_fault(&buf),
+                    Ok(()),
+                    "len {n}: only bytes past the word set"
+                );
+            }
+            // And a real run into this length, clean then faulting.
+            buf.try_zero().expect("zero");
+            dispatch_and_sync(rt, &Case::random(&mut rng, 8, 3, 64, 64), &buf);
+            assert_eq!(check_dequant_affine_fault(&buf), Ok(()), "len {n}: clean run");
+            dispatch_and_sync(rt, &overflowing(&mut rng, 8), &buf);
+            assert_eq!(
+                check_dequant_affine_fault(&buf),
+                Err(DequantAffineFault::Raised { word: 1 }),
+                "len {n}: faulting run"
+            );
+        }
+    });
+}

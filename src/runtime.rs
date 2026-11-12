@@ -3532,6 +3532,8 @@ impl Drop for GpuRuntime {
                 .iter()
                 .map(|slot| slot.in_flight),
         );
+        #[cfg(test)]
+        DROP_WAITED_FOR.with(|c| c.set(Some(max_event)));
         if max_event == 0 {
             self.release_pool_ledger();
             return;
@@ -5041,6 +5043,10 @@ thread_local! {
     static COMMIT_FAULT: std::cell::Cell<Option<CommitFault>> = const { std::cell::Cell::new(None) };
     /// `endCommandBuffer` calls this thread's runtimes have made.
     static END_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The event value the last `GpuRuntime` drop on this thread decided to
+    /// wait for (0 when it had nothing to wait for). The runtime is `!Send`, so
+    /// its drop runs on the thread that reads this.
+    static DROP_WAITED_FOR: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]

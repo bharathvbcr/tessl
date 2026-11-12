@@ -23,10 +23,12 @@
 //
 // Non-finite results are stored, not trapped (a sum beyond the bf16 range is
 // +-infinity, as in `cast_f32_to_bf16`), and reported: a thread whose output
-// holds an infinity or a NaN sets `*fault` to 1. The word is the caller's, is
-// never cleared here, and is one word shared by every thread (unlike
-// `i8_quantize_rows`, whose `bad` flag is per row); the caller reads it once,
-// after as many dequants as it likes have OR-ed into it. The test is on the
+// holds an infinity or a NaN stores 1 to `*fault` (a store, not an OR: a
+// caller's own non-zero code is overwritten with 1, and a clean dequant leaves
+// the word unchanged, so each run wants a word of its own). The word is the
+// caller's, is never cleared here, and is one word shared by every thread
+// (unlike `i8_quantize_rows`, whose `bad` flag is per row); the caller reads it
+// once, after as many dequants as it likes have stored into it. The test is on the
 // exponent bits, an integer test fast math cannot fold (see `qwen35_round_stochastic`).
 //
 // Default (fast) math applies, as in the other kernels: the GPU flushes f32

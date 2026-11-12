@@ -67,7 +67,7 @@ bin relaxed_predicate 1
 bin results_report 13
 bin release_check 14
 bin safetensors 12
-bin shader_index_arithmetic 31
+bin shader_index_arithmetic 34
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6

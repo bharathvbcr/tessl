@@ -2088,14 +2088,32 @@ fn accum_chunk_obj(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report) 
         cases.push(("all-negative".into(), negative, 0.0, 0));
         // Subnormal dists only, one per lane, so none is swamped by a larger term: every f32
         // subnormal is a multiple of 2^-149, so the f64 sums are exact.
-        let sub: Vec<f32> = (0..16u32)
-            .map(|i| {
-                let mant = [
-                    0x7f_ffff, 0x40_0001, 0x00_0001, 0x55_aaaa, 0x2a_5555, 0x7f_0000, 0x01_0000, 0x6d_b6db,
-                ][i as usize % 8];
-                f32::from_bits(((i / 8) << 31) | mant)
-            })
-            .collect();
+        // 16 distinct mantissas (sign, mantissa): small ones need many normalisation shifts (0x1,
+        // 0x3, 0x5), 0x7f_ffff is the top of the subnormal range, three are negative. No two are
+        // opposites, and the sum is asserted non-zero below, so every input moves the result.
+        let sub_bits: [(u32, u32); 16] = [
+            (0, 0x7f_ffff),
+            (0, 0x40_0001),
+            (0, 0x00_0001),
+            (0, 0x55_aaaa),
+            (0, 0x2a_5555),
+            (0, 0x7f_0000),
+            (0, 0x01_0000),
+            (0, 0x6d_b6db),
+            (0, 0x00_0003),
+            (0, 0x00_0102),
+            (0, 0x13_579b),
+            (0, 0x3c_0f0f),
+            (1, 0x00_0005),
+            (1, 0x24_6801),
+            (1, 0x00_8421),
+            (0, 0x71_1717),
+        ];
+        let sub: Vec<f32> = sub_bits.iter().map(|&(s, m)| f32::from_bits((s << 31) | m)).collect();
+        let sub_sum: f64 = sub.iter().map(|&v| f64::from(v)).sum();
+        if sub_sum == 0.0 {
+            rep.fail(format!("{name}[subnormal-only]: ORACLE the fixture sums to zero"));
+        }
         cases.push(("subnormal-only".into(), sub, 0.0, 0));
         // Exact cancellation inside a lane (dists[t] and dists[t + 256] are opposites), and near
         // cancellation by 2^-20 and 2^-22 that renormalises the difference.

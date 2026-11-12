@@ -251,7 +251,11 @@ pub fn dequant_affine_bf16(
 }
 
 /// Why [`check_dequant_affine_fault`] did not return `Ok`.
+///
+/// `#[non_exhaustive]`: variants may be added (a fault word at an offset is planned), so a
+/// `match` needs a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DequantAffineFault {
     /// The word was read and is non-zero: some output written since the caller
     /// zeroed it holds a non-finite value (or the caller left a non-zero word).

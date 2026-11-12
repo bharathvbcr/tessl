@@ -28,12 +28,14 @@
 //! device-free selection.
 
 mod common;
+mod scratch_support;
 
 #[path = "../src/bin/common/json.rs"]
 mod json;
 
 use common::{with_gpu, with_two_gpus};
 use json::{Json, Syntax};
+use scratch_support::Scratch;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
@@ -710,37 +712,38 @@ fn golden_case(case: &str, bits: u32, gs: usize) -> (Case, Vec<u16>) {
     (c, want)
 }
 
-/// Repository-locating variables git reads from the environment: `GIT_DIR`,
-/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
-/// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`,
-/// `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM`. Any of them
-/// can point git at a repository other than the one this crate is in (a tree with
-/// no `.git`, an empty directory, someone else's history), so [`git`] removes
-/// every one from the child's environment and then checks where git landed.
-const REPO_ENV: [&str; 9] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-];
+/// Every environment variable whose name starts with this is removed from a git child.
+/// git reads a long list of them, and several change what a history question answers or
+/// where it lands, not only which repository is opened: `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+/// `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_GRAFT_FILE` (fakes
+/// parents, so a commit that is not an ancestor can pass), `GIT_REPLACE_REF_BASE`,
+/// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` (any config key). A
+/// prefix removes them all, and any that a later git adds.
+const GIT_ENV_PREFIX: &str = "GIT_";
+
+/// Set on a git child after the scrub, so the user's and the system's git config cannot
+/// change an answer (an `alias`, a `core.fsmonitor` daemon, a `core.worktree`, `grafts`):
+/// `GIT_CONFIG_NOSYSTEM` skips `/etc/gitconfig`, and `GIT_CONFIG_GLOBAL=/dev/null`
+/// skips `~/.gitconfig` and the XDG one. The repository's own `.git/config` still
+/// applies. Hooks and the fsmonitor are also switched off with `-c` in [`git_with`].
+const GIT_ENV_AFTER_SCRUB: [(&str, &str); 2] = [("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null")];
 
 /// Run `program` in `dir` and give `(exit code, trimmed stdout)`, the whole call bounded by
 /// `deadline`: waiting for the exit and reading the output both count. `inherited` is
-/// what the caller's environment would add (applied first), then every name in `remove`
-/// is taken out. A program that cannot start, that a signal ends, that runs past the
-/// deadline, or whose output pipe is still open at the deadline (an orphaned child can
-/// hold it open after the program exits) is an `Err`, and the program is killed. The
-/// reader thread of an orphan-held pipe is left to end when the orphan does.
+/// what the caller's environment would add (applied first). With `scrub_prefix`, every
+/// variable of the real environment or of `inherited` whose name starts with it is then
+/// removed, and `after_scrub` is set last. A program that cannot start, that a signal
+/// ends, that runs past the deadline, or whose output pipe is still open at the deadline
+/// is an `Err`. A program still running at the deadline is killed. One that has already
+/// exited is not: an orphaned child holds the pipe open, stays running, and its reader
+/// thread ends when the orphan closes it.
 fn run_bounded(
     program: &str,
     args: &[&str],
     inherited: &[(&str, &str)],
-    remove: &[&str],
+    scrub_prefix: Option<&str>,
+    after_scrub: &[(&str, &str)],
     dir: &Path,
     deadline: Duration,
 ) -> GitOutput {
@@ -755,8 +758,17 @@ fn run_bounded(
     for (name, value) in inherited {
         command.env(name, value);
     }
-    for name in remove {
-        command.env_remove(name);
+    if let Some(prefix) = scrub_prefix {
+        let real = std::env::vars_os().map(|(name, _)| name);
+        let modelled = inherited.iter().map(|(name, _)| std::ffi::OsString::from(name));
+        for name in real.chain(modelled) {
+            if name.to_string_lossy().starts_with(prefix) {
+                command.env_remove(name);
+            }
+        }
+    }
+    for (name, value) in after_scrub {
+        command.env(name, value);
     }
     let stop = Instant::now() + deadline;
     let mut child = command.spawn().map_err(|e| format!("{what} did not start: {e}"))?;
@@ -798,14 +810,19 @@ fn run_bounded(
     Ok((code, out.trim().to_string()))
 }
 
-/// git in this crate's directory with the repository-locating environment removed
-/// ([`REPO_ENV`]), after `inherited` is applied, bounded by `deadline`.
+/// git in this crate's directory with every `GIT_*` variable removed ([`GIT_ENV_PREFIX`]),
+/// `inherited` modelling what the caller's environment held, the user and system config
+/// switched off ([`GIT_ENV_AFTER_SCRUB`]), and hooks and the fsmonitor disabled, bounded
+/// by `deadline`.
 fn git_with(args: &[&str], inherited: &[(&str, &str)], deadline: Duration) -> GitOutput {
+    let mut full = vec!["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+    full.extend_from_slice(args);
     run_bounded(
         "git",
-        args,
+        &full,
         inherited,
-        &REPO_ENV,
+        Some(GIT_ENV_PREFIX),
+        &GIT_ENV_AFTER_SCRUB,
         Path::new(env!("CARGO_MANIFEST_DIR")),
         deadline,
     )
@@ -1092,29 +1109,25 @@ fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
     with_gpu(|_| assert_fixture_provenance());
 }
 
-/// A fresh empty directory under the system temp dir.
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("tessl_dequant_{tag}_{}_{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
-}
-
 #[test]
 fn git_helper_ignores_repository_redirecting_environment() {
     with_gpu(|_| {
         let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("crate dir");
-        let empty = scratch_dir("empty");
+        let empty = Scratch::dir("tessl_dequant_empty");
         let empty_s = empty.to_string_lossy().into_owned();
         let missing = empty.join("missing").to_string_lossy().into_owned();
+        let git_ok = |args: &[&str], inherited: &[(&str, &str)]| {
+            let (code, out) = git_with(args, inherited, GIT_DEADLINE).expect("git runs");
+            (code, out)
+        };
         let toplevel = |inherited: &[(&str, &str)]| {
-            let (code, top) = git_with(&["rev-parse", "--show-toplevel"], inherited, GIT_DEADLINE).expect("git runs");
+            let (code, top) = git_ok(&["rev-parse", "--show-toplevel"], inherited);
             assert_eq!(code, 0, "rev-parse failed under {inherited:?}: {top}");
             std::fs::canonicalize(top).expect("toplevel exists")
         };
         assert_eq!(toplevel(&[]), root, "baseline: git sees this crate's repository");
-        let redirects: [(&str, &str); 9] = [
+        let config_parameters = format!("'core.worktree'='{empty_s}'");
+        let redirects: [(&str, &str); 14] = [
             ("GIT_DIR", &empty_s),
             ("GIT_WORK_TREE", &empty_s),
             ("GIT_INDEX_FILE", &missing),
@@ -1124,21 +1137,58 @@ fn git_helper_ignores_repository_redirecting_environment() {
             ("GIT_NAMESPACE", "elsewhere"),
             ("GIT_CEILING_DIRECTORIES", &empty_s),
             ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0"),
+            ("GIT_REPLACE_REF_BASE", "refs/nothing/"),
+            ("GIT_CONFIG_PARAMETERS", &config_parameters),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.worktree"),
+            ("GIT_CONFIG_VALUE_0", &empty_s),
         ];
-        assert_eq!(
-            redirects.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            REPO_ENV,
-            "this test must exercise every variable the helper removes"
-        );
         for one in &redirects {
             assert_eq!(toplevel(&[*one]), root, "{} redirected the provenance check", one.0);
         }
         assert_eq!(toplevel(&redirects), root, "all of them together redirected it");
         // The provenance verdict itself is not fooled either: with a GIT_DIR in the
         // environment, the same helper still reaches the real repository and its commits.
-        let (code, _) =
-            git_with(&["rev-parse", "--verify", "HEAD^{commit}"], &redirects, GIT_DEADLINE).expect("git runs");
+        let (code, _) = git_ok(&["rev-parse", "--verify", "HEAD^{commit}"], &redirects);
         assert_eq!(code, 0, "HEAD must resolve in the real repository");
+
+        // A graft file makes a history question answer differently: with HEAD grafted to have
+        // no parents, its real parent stops being an ancestor. The helper must not see it.
+        let (code, head) = git_ok(&["rev-parse", "HEAD"], &[]);
+        assert_eq!(code, 0);
+        let graft = Scratch::file("tessl_dequant_graft", ".txt");
+        std::fs::write(&*graft, format!("{head}\n")).expect("graft file");
+        let graft_s = graft.to_string_lossy().into_owned();
+        let (code, _) = git_ok(
+            &["merge-base", "--is-ancestor", "HEAD~1", "HEAD"],
+            &[("GIT_GRAFT_FILE", &graft_s)],
+        );
+        assert_eq!(code, 0, "GIT_GRAFT_FILE changed which commits are ancestors");
+
+        // Every GIT_* variable is gone from the child, and only the two set after the scrub
+        // remain; the rest of the environment is untouched.
+        let (code, env) = run_bounded(
+            "sh",
+            &["-c", "env"],
+            &[("GIT_ANYTHING_AT_ALL", "1"), ("GIT_CONFIG_NOSYSTEM", "0")],
+            Some(GIT_ENV_PREFIX),
+            &GIT_ENV_AFTER_SCRUB,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            Duration::from_secs(20),
+        )
+        .expect("env runs");
+        assert_eq!(code, 0);
+        let mut git_vars: Vec<&str> = env.lines().filter(|l| l.starts_with("GIT_")).collect();
+        git_vars.sort_unstable();
+        assert_eq!(
+            git_vars,
+            ["GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"],
+            "{env}"
+        );
+        assert!(
+            env.lines().any(|l| l.starts_with("PATH=")),
+            "the scrub must not clear the environment"
+        );
     });
 }
 
@@ -1148,7 +1198,7 @@ fn the_deadline_covers_reading_the_output_not_only_the_exit() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         let run = |script: &str, deadline: Duration| {
             let started = Instant::now();
-            let got = run_bounded("sh", &["-c", script], &[], &[], here, deadline);
+            let got = run_bounded("sh", &["-c", script], &[], None, &[], here, deadline);
             (got, started.elapsed())
         };
         let (got, _) = run("echo hi", Duration::from_secs(20));
@@ -1170,8 +1220,8 @@ fn the_deadline_covers_reading_the_output_not_only_the_exit() {
 }
 
 /// A copy of the fixture directory to damage.
-fn copy_fixture_dir() -> std::path::PathBuf {
-    let copy = scratch_dir("fixtures");
+fn copy_fixture_dir() -> Scratch {
+    let copy = Scratch::dir("tessl_dequant_fixtures");
     for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
         let entry = entry.expect("entry");
         std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copy");

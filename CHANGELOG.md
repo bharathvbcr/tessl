@@ -37,7 +37,7 @@ All notable changes to `tessl` are recorded here. The format follows
   `tests/dequant_affine.rs`; ft-e7708c32). A read-side helper for the fault word that
   `dequant_affine_bf16` raises: `Ok(())` only when the word was read and is zero,
   `Err(Raised { word })` when it is non-zero and `Err(Unread { why })` when it could not be
-  read (a buffer under 4 bytes, a poisoned or busy runtime, private storage). It reads the first
+  read (a buffer under 4 bytes, a poisoned or busy runtime, private storage). `DequantAffineFault` is `#[non_exhaustive]`. It reads the first
   four bytes through a `u8` mapping, so a buffer whose length is not a multiple of four works,
   and it never writes. `dequant_affine_bf16` and its signature are unchanged; the zero, dispatch,
   synchronize, read protocol is now written on it. The module and kernel docs now say the fault

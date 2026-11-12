@@ -71,14 +71,18 @@ use crate::tensor::GpuBuffer;
 /// never straddles two groups.
 pub const DEQUANT_AFFINE_GROUP_SIZES: [u32; 3] = [32, 64, 128];
 
-// `plan` relies on this: every group size is a power of two and a multiple of
-// 8, so `cols % group_size == 0` gives `8 | cols`, and `cols * 4` and
-// `cols * 8` are then whole numbers of 32-bit words.
+// `plan` relies on this in place of a whole-word check on `cols * bits`: `cols %
+// group_size == 0` and `8 | group_size` give `8 | cols`, so `cols * 4` and
+// `cols * 8` are whole numbers of 32-bit words. All the proof needs is `8 | g`;
+// the assertion is stricter on purpose: a power of two (the kernel indexes a
+// group by shift) of at least 32, the smallest size the kernel is documented and
+// tested for, so a smaller size such as 8 or 16 cannot enter the list without
+// someone re-reading this reasoning and the kernel's.
 const _: () = {
     let mut i = 0;
     while i < DEQUANT_AFFINE_GROUP_SIZES.len() {
         let g = DEQUANT_AFFINE_GROUP_SIZES[i];
-        assert!(g.is_power_of_two() && g.is_multiple_of(8));
+        assert!(g.is_power_of_two() && g >= 32 && g.is_multiple_of(8));
         i += 1;
     }
 };

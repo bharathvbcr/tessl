@@ -937,6 +937,13 @@ fn dequant_affine_offsets_are_widened() {
     forbid(DEQUANT_AFFINE, "const uint first", "dequant_affine first code index");
     forbid(DEQUANT_AFFINE, "const uint group", "dequant_affine group index");
     require(DEQUANT_RS, "if words > u32::MAX as usize {", "dequant host word bound");
+    // `plan` drops its whole-word check on this premise: every group size is a power of two, a
+    // multiple of 8 and at least 32 (the smallest the kernel is documented and tested for).
+    require(
+        DEQUANT_RS,
+        "g.is_power_of_two() && g >= 32 && g.is_multiple_of(8)",
+        "dequant group size premise",
+    );
 }
 
 /// Segment means read [rows, D] and write [S, D]; normalize walks rows spaced
@@ -1601,59 +1608,356 @@ fn emeans_offsets_are_widened() {
     }
 }
 
-/// Every `#[test]` in this file carries its own `///` doc comment, directly above
-/// it, so an inserted test cannot steal a neighbour's doc (as the dequant test once
-/// did from the embed-pool one).
-#[test]
-fn every_test_carries_its_own_doc_comment() {
-    const SELF_SOURCE: &str = include_str!("shader_index_arithmetic.rs");
-    let lines: Vec<&str> = SELF_SOURCE.lines().collect();
-    // The doc block directly above `fn name`, skipping attribute lines.
-    let doc_above = |index: usize| -> Vec<&str> {
-        let mut at = index;
-        while at > 0 && lines[at - 1].trim_start().starts_with("#[") {
-            at -= 1;
+/// A token of the doc-comment scanner: only what it needs to find a `#[test]` and the docs
+/// around it. Comments and literals are consumed whole, so a `#[test]` inside a string, a raw
+/// string or a block comment is never seen.
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Ident(String),
+    Punct(char),
+    /// A doc comment (`///` or `/** */`) with non-empty text.
+    Doc(String),
+    /// A string or character literal (its text, empty for a character).
+    Lit(String),
+}
+
+/// End (exclusive) of the quoted string whose opening quote is `c[start]`, with escapes.
+fn lex_quoted(c: &[char], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 2,
+            '"' => return i + 1,
+            _ => i += 1,
         }
-        let mut doc = Vec::new();
-        while at > 0 && lines[at - 1].trim_start().starts_with("///") {
-            at -= 1;
-            doc.push(lines[at]);
+    }
+    c.len()
+}
+
+fn lex(src: &str) -> Vec<Tok> {
+    let c: Vec<char> = src.chars().collect();
+    let at = |i: usize| c.get(i).copied();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '/' && at(i + 1) == Some('/') {
+            let end = c[i..].iter().position(|&x| x == '\n').map_or(c.len(), |p| i + p);
+            let text: String = c[i..end].iter().collect();
+            // `///` is a doc comment, `////` is not, and an empty one documents nothing.
+            if text.starts_with("///") && !text.starts_with("////") && !text[3..].trim().is_empty() {
+                toks.push(Tok::Doc(text[3..].trim().to_string()));
+            }
+            i = end;
+        } else if ch == '/' && at(i + 1) == Some('*') {
+            let start = i;
+            let mut depth = 0;
+            while i < c.len() {
+                if c[i] == '/' && at(i + 1) == Some('*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && at(i + 1) == Some('/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let text: String = c[start..i.min(c.len())].iter().collect();
+            if text.starts_with("/**") && !text.starts_with("/***") && text.len() >= 5 {
+                let body = text[3..text.len() - 2].trim_matches(|x: char| x == '*' || x.is_whitespace());
+                if !body.is_empty() {
+                    toks.push(Tok::Doc(body.to_string()));
+                }
+            }
+        } else if ch == '"' {
+            let end = lex_quoted(&c, i);
+            toks.push(Tok::Lit(c[i + 1..end.saturating_sub(1).max(i + 1)].iter().collect()));
+            i = end;
+        } else if ch == '\'' {
+            if at(i + 1) == Some('\\') {
+                let end = c[i + 3..]
+                    .iter()
+                    .position(|&x| x == '\'')
+                    .map_or(c.len(), |p| i + 4 + p);
+                toks.push(Tok::Lit(String::new()));
+                i = end;
+            } else if at(i + 2) == Some('\'') {
+                toks.push(Tok::Lit(String::new()));
+                i += 3;
+            } else {
+                toks.push(Tok::Punct('\''));
+                i += 1;
+            }
+        } else if ch.is_alphanumeric() || ch == '_' {
+            let start = i;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            let ident: String = c[start..i].iter().collect();
+            let hashes = c[i..].iter().take_while(|&&x| x == '#').count();
+            if matches!(ident.as_str(), "r" | "br" | "cr") && at(i + hashes) == Some('"') {
+                // A raw string ends at a quote followed by as many hashes as opened it.
+                let body = i + hashes + 1;
+                let closing: Vec<char> = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                let end = (body..c.len())
+                    .find(|&k| c[k..].starts_with(&closing))
+                    .map_or(c.len(), |k| k + closing.len());
+                toks.push(Tok::Lit(
+                    c[body..end.saturating_sub(closing.len()).max(body)].iter().collect(),
+                ));
+                i = end;
+            } else if matches!(ident.as_str(), "b" | "c") && at(i) == Some('"') {
+                let end = lex_quoted(&c, i);
+                toks.push(Tok::Lit(String::new()));
+                i = end;
+            } else {
+                toks.push(Tok::Ident(ident));
+            }
+        } else {
+            toks.push(Tok::Punct(ch));
+            i += 1;
         }
-        doc.reverse();
-        doc
+    }
+    toks
+}
+
+/// If an attribute (`#[..]`, `#![..]`) starts at `toks[i]`: the index after its closing
+/// bracket, and its text when it is `doc = "non-empty"`.
+fn attribute_at(toks: &[Tok], i: usize) -> Option<(usize, Option<String>)> {
+    if toks.get(i) != Some(&Tok::Punct('#')) {
+        return None;
+    }
+    let open = if toks.get(i + 1) == Some(&Tok::Punct('!')) {
+        i + 2
+    } else {
+        i + 1
     };
-    let mut undocumented = Vec::new();
-    let mut tests = 0;
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim() != "#[test]" {
+    if toks.get(open) != Some(&Tok::Punct('[')) {
+        return None;
+    }
+    let mut depth = 0;
+    for (k, tok) in toks.iter().enumerate().skip(open) {
+        match tok {
+            Tok::Punct('[') => depth += 1,
+            Tok::Punct(']') => {
+                depth -= 1;
+                if depth == 0 {
+                    let doc = match &toks[open + 1..k] {
+                        [Tok::Ident(name), Tok::Punct('='), Tok::Lit(text)]
+                            if name == "doc" && !text.trim().is_empty() =>
+                        {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    };
+                    return Some((k + 1, doc));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The docs of the item whose attribute run and doc comments end just before `toks[end]`
+/// (searched backwards over attributes and doc comments).
+fn docs_before(toks: &[Tok], end: usize) -> Vec<String> {
+    let mut docs = Vec::new();
+    let mut k = end;
+    while k > 0 {
+        match &toks[k - 1] {
+            Tok::Doc(text) => {
+                docs.push(text.clone());
+                k -= 1;
+            }
+            Tok::Punct(']') => {
+                let mut depth = 0;
+                let Some(open) = (0..k - 1).rev().find(|&m| match toks[m] {
+                    Tok::Punct(']') => {
+                        depth += 1;
+                        false
+                    }
+                    Tok::Punct('[') if depth == 0 => true,
+                    Tok::Punct('[') => {
+                        depth -= 1;
+                        false
+                    }
+                    _ => false,
+                }) else {
+                    break;
+                };
+                let hash = if open > 0 && toks[open - 1] == Tok::Punct('!') {
+                    open.wrapping_sub(2)
+                } else {
+                    open.wrapping_sub(1)
+                };
+                match attribute_at(toks, hash) {
+                    Some((_, doc)) => docs.extend(doc),
+                    None => break,
+                }
+                k = hash;
+            }
+            _ => break,
+        }
+    }
+    docs.reverse();
+    docs
+}
+
+/// The docs after `toks[start]` up to the first token that is neither an attribute nor a
+/// doc comment, and that token's index.
+fn docs_after(toks: &[Tok], start: usize) -> (Vec<String>, usize) {
+    let mut docs = Vec::new();
+    let mut j = start;
+    loop {
+        match toks.get(j) {
+            Some(Tok::Doc(text)) => {
+                docs.push(text.clone());
+                j += 1;
+            }
+            Some(Tok::Punct('#')) => match attribute_at(toks, j) {
+                Some((end, doc)) => {
+                    docs.extend(doc);
+                    j = end;
+                }
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    (docs, j)
+}
+
+/// The name of the `fn` that starts within a few tokens of `toks[from]` (past `pub`, `async`
+/// and the like), or "?".
+fn fn_name_from(toks: &[Tok], from: usize) -> String {
+    let Some(at) = (from..toks.len().min(from + 8)).find(|&k| toks[k] == Tok::Ident("fn".into())) else {
+        return "?".into();
+    };
+    match (toks.get(at + 1), toks.get(at + 2)) {
+        (Some(Tok::Ident(name)), _) => name.clone(),
+        (Some(Tok::Punct('$')), Some(Tok::Ident(name))) => format!("${name}"),
+        _ => "?".into(),
+    }
+}
+
+/// How many `#[test]` attributes `source` has, and the names of the functions among them
+/// that carry no doc comment (`///` or `/** */` with text, or `#[doc = ".."]`, before or
+/// after the attribute run). A `#[test]` inside a `macro_rules!` body is seen once, at the
+/// definition, not once per generated test, so a macro that generates tests is checked only
+/// for the doc on its template; this file has none.
+fn undocumented_tests(source: &str) -> (usize, Vec<String>) {
+    let toks = lex(source);
+    let (mut tests, mut undocumented) = (0, Vec::new());
+    for i in 0..toks.len() {
+        let is_test = matches!(
+            toks.get(i..i + 4),
+            Some([Tok::Punct('#'), Tok::Punct('['), Tok::Ident(t), Tok::Punct(']')]) if t == "test"
+        );
+        if !is_test {
             continue;
         }
         tests += 1;
-        if doc_above(i).is_empty() {
-            let name = lines[i + 1..]
-                .iter()
-                .find(|l| l.contains("fn "))
-                .copied()
-                .unwrap_or("?");
-            undocumented.push(name.trim().to_string());
+        let (after, next) = docs_after(&toks, i + 4);
+        if docs_before(&toks, i).is_empty() && after.is_empty() {
+            undocumented.push(fn_name_from(&toks, next));
         }
     }
-    assert!(tests > 30, "found only {tests} #[test] lines; the scan is broken");
+    (tests, undocumented)
+}
+
+/// The doc text above `fn name` in `source` (before its attributes, past `pub` and the like).
+fn docs_of_fn(source: &str, name: &str) -> String {
+    let toks = lex(source);
+    let at = (0..toks.len())
+        .find(|&k| toks[k] == Tok::Ident("fn".into()) && toks.get(k + 1) == Some(&Tok::Ident(name.into())))
+        .unwrap_or_else(|| panic!("no fn {name}"));
+    let mut start = at;
+    while start > 0
+        && matches!(&toks[start - 1], Tok::Ident(m) if matches!(m.as_str(), "pub" | "async" | "unsafe" | "const"))
+    {
+        start -= 1;
+    }
+    docs_before(&toks, start).join("\n")
+}
+
+/// Every `#[test]` in this file carries its own doc comment, so an inserted test cannot
+/// steal a neighbour's doc (as the dequant test once did from the embed-pool one). The
+/// scan is over tokens, not lines: see [`undocumented_tests`].
+#[test]
+fn every_test_carries_its_own_doc_comment() {
+    const SELF_SOURCE: &str = include_str!("shader_index_arithmetic.rs");
+    let (tests, undocumented) = undocumented_tests(SELF_SOURCE);
+    assert!(tests > 30, "found only {tests} #[test] attributes; the scan is broken");
     assert!(undocumented.is_empty(), "tests without a doc comment: {undocumented:?}");
 
-    let doc_of = |name: &str| {
-        let index = lines
-            .iter()
-            .position(|l| l.starts_with(&format!("fn {name}(")))
-            .unwrap_or_else(|| panic!("no fn {name}"));
-        doc_above(index).join("\n")
-    };
     assert!(
-        doc_of("embed_pool_offsets_are_widened").contains("Segment means read [rows, D]"),
+        docs_of_fn(SELF_SOURCE, "embed_pool_offsets_are_widened").contains("Segment means read [rows, D]"),
         "the embed-pool doc comment must sit on the embed-pool test"
     );
     assert!(
-        !doc_of("dequant_affine_offsets_are_widened").contains("Segment means read"),
+        !docs_of_fn(SELF_SOURCE, "dequant_affine_offsets_are_widened").contains("Segment means read"),
         "the dequant test must not carry the embed-pool doc comment"
+    );
+}
+
+/// The scanner behind `every_test_carries_its_own_doc_comment` rejects a test whose doc is
+/// missing, empty, a plain comment or somebody else's, however the attribute is spelled.
+#[test]
+fn the_doc_scan_rejects_tests_without_a_real_doc_comment() {
+    for (what, source) in [
+        ("one line", "#[test] fn x(){}"),
+        ("trailing comment", "/// d\nfn other(){}\n#[test] // c\nfn x(){}"),
+        ("spaced attribute", "#[ test ]\nfn x(){}"),
+        ("four slashes", "//// not doc\n#[test]\nfn x(){}"),
+        ("empty doc", "///\n#[test]\nfn x(){}"),
+        ("blank doc", "///   \n#[test]\nfn x(){}"),
+        ("empty block doc", "/** */\n#[test]\nfn x(){}"),
+        ("plain block comment", "/* c */ #[test] fn x(){}"),
+        ("empty doc attribute", "#[doc = \"\"]\n#[test]\nfn x(){}"),
+        ("inner doc", "//! module\n#[test]\nfn x(){}"),
+        ("doc of the previous item", "/// d\nstruct S;\n#[test]\nfn x(){}"),
+    ] {
+        let (tests, undocumented) = undocumented_tests(source);
+        assert_eq!((tests, undocumented), (1, vec!["x".to_string()]), "{what}: {source:?}");
+    }
+}
+
+/// The scanner accepts every real way to document a test, and ignores `#[test]` in
+/// strings, raw strings and comments.
+#[test]
+fn the_doc_scan_accepts_every_real_doc_and_ignores_test_attributes_in_literals() {
+    for (what, source) in [
+        ("line doc", "/// d\n#[test]\nfn x(){}"),
+        ("block doc", "/** d */\n#[test]\nfn x(){}"),
+        ("doc attribute", "#[doc = \"d\"]\n#[test]\nfn x(){}"),
+        (
+            "multi-line attribute",
+            "/// d\n#[cfg_attr(\n    all(),\n    allow(dead_code)\n)]\n#[test]\nfn x(){}",
+        ),
+        ("attribute after", "/// d\n#[test]\n#[ignore = \"why\"]\nfn x(){}"),
+        ("doc after the attribute", "#[test]\n/// d\nfn x(){}"),
+        ("same line", "/// d\n#[test] #[ignore] fn x() {}"),
+        ("pub fn", "/// d\n#[test]\npub fn x(){}"),
+    ] {
+        assert_eq!(undocumented_tests(source), (1, vec![]), "{what}: {source:?}");
+    }
+    let hidden = "const S: &str = r#\"\n#[test]\nfn a(){}\n\"#;\n/* #[test] fn b(){} */\n\
+                  const T: &str = \"#[test] \\\" #[test]\";\nconst C: char = '#';\n/// d\n#[test]\nfn x(){}";
+    assert_eq!(
+        undocumented_tests(hidden),
+        (1, vec![]),
+        "literals and comments hide no test"
+    );
+    assert_eq!(
+        docs_of_fn("/// one\n/// two\n#[test]\npub fn x(){}", "x"),
+        "one\ntwo",
+        "docs_of_fn joins the doc lines above the attributes"
     );
 }

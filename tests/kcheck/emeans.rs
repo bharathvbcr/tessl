@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::common::{buf, buf_u32, random_f32};
+use crate::common::{buf, buf_u32, random_f32, reduction_bound};
 use tessl::dispatch::{dispatch_1d, Binder};
 use tessl::emeans::revival_gumbel_key;
 use tessl::runtime::mtl_size;
@@ -1207,6 +1207,33 @@ fn assign_kernel(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, rep: &mut Report, bf
                 for part_c in 0..case.split {
                     let at = part_c * m + i;
                     w_ps[at] = got_ps[at];
+                }
+            }
+            if !bf16 && fx.self_row.is_some() {
+                // The non-integer centroid 40 wins part 0 for many ordinary rows, and in the f32
+                // arms its score `cn - 2 dot` carries the matrix unit's f32 accumulation order
+                // (first locked run: up to 13 ulp). Those scores are held to the documented
+                // reduction bound over the sum of absolute terms; every integer score stays
+                // bit-exact, and the label and finalized distance of these rows stay exact too.
+                for part_c in 0..case.split {
+                    for i in 0..m {
+                        let at = part_c * m + i;
+                        if w_pl[at] != 40 {
+                            continue;
+                        }
+                        let scale: f64 = fx
+                            .xr(i)
+                            .iter()
+                            .zip(fx.cr(40))
+                            .map(|(&a, &b)| (f64::from(a) * f64::from(b)).abs())
+                            .sum::<f64>()
+                            * 2.0
+                            + f64::from(fx.cn[40]);
+                        let diff = (f64::from(f32::from_bits(got_ps[at])) - f64::from(f32::from_bits(w_ps[at]))).abs();
+                        if diff <= reduction_bound(d, scale) {
+                            w_ps[at] = got_ps[at];
+                        }
+                    }
                 }
             }
             rep.cmp(&tag, "chunk_labels", &rd32(&chunk_labels, m + PAD), &w_labels);

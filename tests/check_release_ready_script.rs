@@ -68,6 +68,18 @@ case "$*" in
   ;;
 "package --locked")
   echo "tag $FAKE_TAG"
+  if [ -n "$FAKE_PARK" ]; then
+    : > "$FAKE_STARTED"
+    i=0
+    while [ ! -e "$FAKE_PARK" ]; do
+      i=$((i + 1))
+      if [ "$i" -gt 600 ]; then
+        echo "park timeout" >&2
+        exit 98
+      fi
+      sleep 0.1
+    done
+  fi
   if [ "$FAKE_HANG" = package ]; then
     : > "$FAKE_STARTED"
     sleep 60
@@ -774,7 +786,6 @@ fn signals_remove_the_run_dir() {
         ("INT", libc::SIGINT, 130),
         ("TERM", libc::SIGTERM, 143),
         ("HUP", libc::SIGHUP, 129),
-        ("QUIT", libc::SIGQUIT, 131),
     ] {
         let c = unique_crate(name);
         let tmp_guard = CrateTmp::new(&c);
@@ -993,11 +1004,10 @@ fn closed_stdout_still_cleans_up_without_a_false_warning() {
         std::fs::write(&release, "go\n").unwrap();
         let out = s.wait(60);
         let what = format!("[sigpipe ignored: {ignore}]");
-        assert!(
-            matches!(out.code, Some(1) | Some(141)),
-            "{what} unexpected rc\n{}",
-            out.all()
-        );
+        // SIGPIPE default: the PIPE trap exits 141. Ignored: the failing echo
+        // ends the run through errexit with 1.
+        let want = if ignore { 1 } else { 141 };
+        assert_eq!(out.code, Some(want), "{what} unexpected rc\n{}", out.all());
         assert!(
             !out.stderr.contains("warning: not removing"),
             "{what} false warning\n{}",
@@ -1170,4 +1180,61 @@ fn leading_dash_tmpdir_gets_our_own_error() {
         out.all()
     );
     assert_eq!(entries(&cwd.join("-d")), Vec::<String>::new());
+}
+
+/// Crash reports macOS writes when a process dies of a core-dumping signal
+/// (SIGQUIT included). `None` when the directory cannot be read.
+fn crash_reports() -> Option<Vec<String>> {
+    let home = std::env::var_os("HOME")?;
+    let dir = Path::new(&home).join("Library/Logs/DiagnosticReports");
+    let rd = std::fs::read_dir(&dir).ok()?;
+    let mut v: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".ips") && ["sleep-", "sh-", "bash-"].iter().any(|p| n.starts_with(p)))
+        .collect();
+    v.sort();
+    Some(v)
+}
+
+#[test]
+fn quit_is_trapped_and_nothing_dies_of_sigquit() {
+    // SIGQUIT to the script pid alone, while `cargo package` is parked on a
+    // release file: bash defers the QUIT trap until the child exits normally,
+    // so no process dies of SIGQUIT (which on macOS goes through ReportCrash,
+    // slow to reap and noisy in DiagnosticReports). The trap exits 131 and
+    // cleanup removes the run dir.
+    let before = crash_reports();
+    if before.is_none() {
+        eprintln!("skipping the crash-report assertion: ~/Library/Logs/DiagnosticReports is not readable");
+    }
+    let c = unique_crate("quit");
+    let tmp_guard = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-quit", &["src/lib.rs"]);
+    let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let started = fx.path("started");
+    let park = fx.path("park");
+    let mut s = spawn(
+        &fx,
+        &Tmp::Set(tmpdir.path().into()),
+        &[ev("FAKE_PARK", &park), ev("FAKE_STARTED", &started)],
+    );
+    s.wait_for_file(&started, 60, "the parked `cargo package` to start");
+    s.signal_pid(libc::SIGQUIT);
+    std::fs::write(&park, "go\n").unwrap();
+    let out = s.wait(20);
+    assert_eq!(out.code, Some(131), "{}", out.all());
+    let run_dir = out.run_dir();
+    assert!(
+        !run_dir.exists(),
+        "run dir {} survived\n{}",
+        run_dir.display(),
+        out.all()
+    );
+    assert_only_sentinel(&tmpdir, "QUIT", &out);
+    assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new());
+    if let (Some(before), Some(after)) = (before, crash_reports()) {
+        let new: Vec<&String> = after.iter().filter(|n| !before.contains(n)).collect();
+        assert!(new.is_empty(), "a process died of SIGQUIT: new crash reports {new:?}");
+    }
 }

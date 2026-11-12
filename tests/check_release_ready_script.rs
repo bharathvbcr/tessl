@@ -37,13 +37,13 @@ printf '#!/bin/sh\\nexit 0\\n' > \"$out\"\n\
 chmod 755 \"$out\"\n";
 
 const FAKE_CARGO: &str = r#"#!/bin/sh
-echo "tag $FAKE_TAG"
 case "$*" in
 "package --locked --list")
+  # stdout is the list itself, so the tag goes to stderr here.
+  echo "tag $FAKE_TAG" >&2
   cat "$FAKE_LIST"
   if [ "${FAKE_LIST_RC:-0}" != 0 ]; then
     echo "error: fake list failure" >&2
-    echo "tag $FAKE_TAG" >&2
     exit "$FAKE_LIST_RC"
   fi
   if [ -n "$FAKE_LISTED" ]; then
@@ -61,6 +61,7 @@ case "$*" in
   exit 0
   ;;
 "package --locked")
+  echo "tag $FAKE_TAG"
   if [ "$FAKE_HANG" = package ]; then
     : > "$FAKE_STARTED"
     sleep 60
@@ -75,6 +76,7 @@ case "$*" in
   exit "$rc"
   ;;
 "check --locked")
+  echo "tag $FAKE_TAG"
   rc="${FAKE_DOCSRS_RC:-0}"
   if [ "$rc" != 0 ]; then
     echo "error: fake docs.rs failure" >&2
@@ -281,12 +283,27 @@ fn drain(mut r: impl std::io::Read + Send + 'static) -> JoinHandle<String> {
 }
 
 fn spawn(fx: &Fixture, tmp: &Tmp, env: &[(&'static str, OsString)]) -> Spawned {
-    let mut path = OsString::from(fx.path("fakebin"));
+    spawn_in(fx, &fx.path("."), tmp, env)
+}
+
+/// `PATH` with `dirs` (wrapper tools) first, then the fixture's fake tools.
+fn path_with(fx: &Fixture, dirs: &[&Path]) -> OsString {
+    let mut path = OsString::new();
+    for d in dirs {
+        path.push(d);
+        path.push(":");
+    }
+    path.push(fx.path("fakebin"));
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+fn spawn_in(fx: &Fixture, cwd: &Path, tmp: &Tmp, env: &[(&'static str, OsString)]) -> Spawned {
+    let path = path_with(fx, &[]);
     let mut cmd = Command::new("bash");
     cmd.arg(fx.path("repo/scripts/check_release_ready.sh"))
-        .current_dir(fx.path("."))
+        .current_dir(cwd)
         .env("PATH", path)
         .env("FAKE_TAG", &fx.tag)
         .env("FAKE_LIST", fx.path("list.txt"))
@@ -333,6 +350,13 @@ impl Spawned {
         // vanished group just yields ESRCH.
         unsafe {
             libc::kill(-self.pgid, sig);
+        }
+    }
+
+    fn signal_pid(&self, sig: i32) {
+        // SAFETY: plain syscall on the script's own pid, which is still unreaped.
+        unsafe {
+            libc::kill(self.pgid, sig);
         }
     }
 
@@ -600,7 +624,7 @@ fn each_failing_step_keeps_only_its_log_and_names_it() {
         Case {
             name: "denied",
             env: vec![],
-            list: vec!["src/lib.rs", ".devmap/denied"],
+            list: vec!["src/lib.rs", ".devmap/tag-denied"],
             log: "package.list",
             msg: "package list contains excluded/stale paths",
             tail: None,
@@ -655,6 +679,13 @@ fn each_failing_step_keeps_only_its_log_and_names_it() {
             kept.display(),
             out.all()
         );
+        assert!(
+            out.stderr
+                .contains(&format!("release-ready FAILED: kept {}", kept.display())),
+            "[{}] no `release-ready FAILED: kept` line\n{}",
+            case.name,
+            out.all()
+        );
         if let Some(tail) = case.tail {
             assert!(
                 out.stderr.contains("--- last 40 lines of") && out.stderr.contains(tail),
@@ -682,7 +713,11 @@ fn each_failing_step_keeps_only_its_log_and_names_it() {
 
 #[test]
 fn signals_remove_the_run_dir() {
-    for (name, sig, code) in [("INT", libc::SIGINT, 130), ("TERM", libc::SIGTERM, 143)] {
+    for (name, sig, code) in [
+        ("INT", libc::SIGINT, 130),
+        ("TERM", libc::SIGTERM, 143),
+        ("HUP", libc::SIGHUP, 129),
+    ] {
         let c = unique_crate(name);
         let tmp_guard = CrateTmp::new(&c);
         let fx = Fixture::new(&c, &format!("tag-{name}"), &["src/lib.rs"]);
@@ -742,4 +777,225 @@ fn crate_name_is_validated() {
         out.all()
     );
     assert_eq!(entries(&tmpdir), vec!["sentinel".to_string()]);
+}
+
+/// A directory holding one wrapper tool; `body` is the shell text after the shebang.
+fn wrapper(fx: &Fixture, tool: &str, body: &str) -> PathBuf {
+    let dir = fx.path(&format!("wrap-{tool}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_exec(&dir.join(tool), &format!("#!/bin/sh\n{body}"));
+    dir
+}
+
+fn assert_only_sentinel(tmpdir: &Path, what: &str, out: &Out) {
+    assert_eq!(entries(tmpdir), vec!["sentinel".to_string()], "{what}\n{}", out.all());
+}
+
+#[test]
+fn empty_package_list_fails() {
+    let c = unique_crate("empty");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-empty", &[]);
+    let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let out = run(&fx, &Tmp::Set(tmpdir.path().into()), &[]);
+    assert_eq!(out.code, Some(1), "an empty package list passed\n{}", out.all());
+    let kept = out.run_dir().join("package.list");
+    assert!(
+        out.stderr.contains("error:") && out.stderr.contains(&format!("; see {}", kept.display())),
+        "{}",
+        out.all()
+    );
+    assert_eq!(entries(&out.run_dir()), vec!["package.list".to_string()]);
+    remove_path(&out.run_dir());
+}
+
+#[test]
+fn run_dir_is_verified_before_anything_is_removed() {
+    // A mktemp that prints nothing, a file, or a directory outside TMPDIR must
+    // be refused, and the recording `rm` must never be called.
+    for variant in ["empty", "file", "elsewhere"] {
+        let c = unique_crate(variant);
+        let _tmp = CrateTmp::new(&c);
+        let fx = Fixture::new(&c, &format!("tag-{variant}"), &["src/lib.rs"]);
+        let tmpdir = tmpdir_with_sentinel("relready-tmp");
+        let outside = Scratch::dir("relready-outside");
+        let file = outside.join("a-file");
+        std::fs::write(&file, "x\n").unwrap();
+        let rmlog = fx.path("rm.log");
+        let printed = match variant {
+            "empty" => String::new(),
+            "file" => file.display().to_string(),
+            _ => outside.display().to_string(),
+        };
+        let mk_body = if printed.is_empty() {
+            "exit 0\n".to_string()
+        } else {
+            format!("echo '{printed}'\n")
+        };
+        let mk = wrapper(&fx, "mktemp", &mk_body);
+        let rm = wrapper(&fx, "rm", &format!("echo \"rm $*\" >> '{}'\n", rmlog.display()));
+        let out = run(
+            &fx,
+            &Tmp::Set(tmpdir.path().into()),
+            &[ev("PATH", path_with(&fx, &[&rm, &mk]))],
+        );
+        assert_eq!(out.code, Some(1), "[{variant}] {}", out.all());
+        assert!(out.stderr.contains("error:"), "[{variant}] {}", out.all());
+        assert!(!out.stdout.contains("release-ready:"), "[{variant}] {}", out.all());
+        let calls = std::fs::read_to_string(&rmlog).unwrap_or_default();
+        assert_eq!(calls, "", "[{variant}] rm was called: {calls}\n{}", out.all());
+        assert!(
+            file.exists() && outside.exists(),
+            "[{variant}] a path outside TMPDIR was touched"
+        );
+        assert_only_sentinel(&tmpdir, variant, &out);
+    }
+}
+
+#[test]
+fn trap_is_installed_before_mktemp() {
+    // mktemp has made the dir but is slow to print it; TERM goes to the script
+    // pid alone. With the trap already in, bash defers it until mktemp is done
+    // and cleanup removes the dir; without it TERM kills bash at once.
+    let c = unique_crate("early");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-early", &["src/lib.rs"]);
+    let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let slow = wrapper(
+        &fx,
+        "mktemp",
+        "d=$(PATH=/usr/bin:/bin mktemp \"$@\") || exit 1\nsleep 2\necho \"$d\"\n",
+    );
+    let s = spawn(
+        &fx,
+        &Tmp::Set(tmpdir.path().into()),
+        &[ev("PATH", path_with(&fx, &[&slow]))],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while entries(&tmpdir).len() < 2 {
+        assert!(Instant::now() < deadline, "mktemp never made its dir");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.signal_pid(libc::SIGTERM);
+    let out = s.wait(20);
+    assert_eq!(out.code, Some(143), "{}", out.all());
+    assert_only_sentinel(&tmpdir, "dir leaked between mkdir and trap", &out);
+}
+
+#[test]
+fn cleanup_failure_on_success_keeps_rc_and_warns() {
+    let c = unique_crate("rmfail");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-rmfail", &["src/lib.rs"]);
+    let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let rm = wrapper(&fx, "rm", "exit 1\n");
+    let out = run(
+        &fx,
+        &Tmp::Set(tmpdir.path().into()),
+        &[ev("PATH", path_with(&fx, &[&rm]))],
+    );
+    assert_released(&out, &c);
+    assert!(
+        out.stderr.contains("warning: could not remove run dir"),
+        "a failed cleanup was silent\n{}",
+        out.all()
+    );
+    remove_path(&out.run_dir());
+}
+
+#[test]
+fn second_signal_during_cleanup_is_ignored() {
+    let c = unique_crate("twice");
+    let tmp_guard = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-twice", &["src/lib.rs"]);
+    let tmpdir = tmpdir_with_sentinel("relready-tmp");
+    let started = fx.path("started");
+    let in_rm = fx.path("in-rm");
+    let rm = wrapper(
+        &fx,
+        "rm",
+        &format!(": > '{}'\nsleep 2\nexec /bin/rm \"$@\"\n", in_rm.display()),
+    );
+    let mut s = spawn(
+        &fx,
+        &Tmp::Set(tmpdir.path().into()),
+        &[
+            ev("PATH", path_with(&fx, &[&rm])),
+            ev("FAKE_HANG", "package"),
+            ev("FAKE_STARTED", &started),
+        ],
+    );
+    s.wait_for_file(&started, 60, "the hung `cargo package` to start");
+    s.signal_group(libc::SIGINT);
+    s.wait_for_file(&in_rm, 30, "cleanup to reach rm");
+    s.signal_group(libc::SIGINT);
+    let out = s.wait(20);
+    assert_eq!(out.code, Some(130), "{}", out.all());
+    assert_only_sentinel(&tmpdir, "a second INT aborted the cleanup", &out);
+    assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn signal_inside_fail_log_leaves_nothing() {
+    // The fail path has already set `keep`; a signal while it prints the tail
+    // must still clear it, so the aborted run keeps nothing.
+    for (name, sig, code) in [("INT", libc::SIGINT, 130), ("TERM", libc::SIGTERM, 143)] {
+        let c = unique_crate(name);
+        let _tmp = CrateTmp::new(&c);
+        let fx = Fixture::new(&c, &format!("tag-{name}"), &["src/lib.rs"]);
+        let tmpdir = tmpdir_with_sentinel("relready-tmp");
+        let in_tail = fx.path("in-tail");
+        let tail = wrapper(
+            &fx,
+            "tail",
+            &format!(": > '{}'\nsleep 3\nexec /usr/bin/tail \"$@\"\n", in_tail.display()),
+        );
+        let mut s = spawn(
+            &fx,
+            &Tmp::Set(tmpdir.path().into()),
+            &[ev("PATH", path_with(&fx, &[&tail])), ev("FAKE_PACKAGE_RC", "3")],
+        );
+        s.wait_for_file(&in_tail, 60, "fail_log to reach tail");
+        s.signal_group(sig);
+        let out = s.wait(20);
+        assert_eq!(out.code, Some(code), "[{name}] {}", out.all());
+        assert_only_sentinel(&tmpdir, name, &out);
+    }
+}
+
+#[test]
+fn relative_tmpdir_means_the_callers_cwd() {
+    let c = unique_crate("rel");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-rel", &["src/lib.rs"]);
+    let cwd = Scratch::dir("relready-cwd");
+    let rel = cwd.join("reltmp");
+    std::fs::create_dir(&rel).unwrap();
+    std::fs::write(rel.join("sentinel"), "keep\n").unwrap();
+    let out = spawn_in(&fx, &cwd, &Tmp::Set("reltmp".into()), &[]).wait(120);
+    assert_released(&out, &c);
+    assert_eq!(
+        out.run_dir().parent().unwrap().canonicalize().unwrap(),
+        rel.canonicalize().unwrap(),
+        "{}",
+        out.all()
+    );
+    assert_only_sentinel(&rel, "relative TMPDIR", &out);
+}
+
+#[test]
+fn leading_dash_tmpdir_gets_our_own_error() {
+    let c = unique_crate("dash");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-dash", &["src/lib.rs"]);
+    let cwd = Scratch::dir("relready-cwd");
+    std::fs::create_dir(cwd.join("-d")).unwrap();
+    let out = spawn_in(&fx, &cwd, &Tmp::Set("-d".into()), &[]).wait(120);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(
+        out.stderr.contains("error: TMPDIR '-d' starts with '-'") && !out.stderr.contains("usage:"),
+        "{}",
+        out.all()
+    );
+    assert_eq!(entries(&cwd.join("-d")), Vec::<String>::new());
 }

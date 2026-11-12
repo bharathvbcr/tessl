@@ -20,7 +20,7 @@ bin capi_contract 81
 bin ce_collapse_host 7
 bin check_kernel_ir_planted 6
 # Runs scripts/check_release_ready.sh in fixture git repos with a fake cargo and rustc.
-bin check_release_ready_script 8
+bin check_release_ready_script 16
 # Runs scripts/check_siblings.sh against fixture trees. Device-free, but slower
 # than its neighbours (~2 min): one case runs the real script over the real
 # checkout, which resolves two lockfiles with `cargo metadata`.

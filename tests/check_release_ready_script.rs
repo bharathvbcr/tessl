@@ -122,7 +122,10 @@ impl CrateTmp {
             .iter()
             .map(|n| Scratch::file_at(PathBuf::from(format!("/tmp/{crate_name}-{n}"))))
             .collect();
-        CrateTmp { crate_name: crate_name.to_string(), _fixed: fixed }
+        CrateTmp {
+            crate_name: crate_name.to_string(),
+            _fixed: fixed,
+        }
     }
 
     fn present(&self) -> Vec<PathBuf> {
@@ -188,12 +191,20 @@ impl Fixture {
             format!("[package]\nname = \"{manifest_name}\"\nversion = \"0.0.0\"\n"),
         )
         .unwrap();
-        std::fs::write(repo.join("CHANGELOG.md"), "## [0.0.0]\n\n[0.0.0]: https://example.invalid\n").unwrap();
+        std::fs::write(
+            repo.join("CHANGELOG.md"),
+            "## [0.0.0]\n\n[0.0.0]: https://example.invalid\n",
+        )
+        .unwrap();
         std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
         std::fs::write(repo.join("src/bin/release_check.rs"), "fn main() {}\n").unwrap();
         write_exec(&root.join("fakebin/rustc"), FAKE_RUSTC);
         write_exec(&root.join("fakebin/cargo"), FAKE_CARGO);
-        std::fs::write(root.join("list.txt"), list.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            root.join("list.txt"),
+            list.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
         git(&repo, &["init", "-q"]);
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-qm", "fx"]);
@@ -208,7 +219,10 @@ impl Fixture {
             "fixture tree is not clean: {}",
             String::from_utf8_lossy(&status.stdout)
         );
-        Fixture { root, tag: tag.to_string() }
+        Fixture {
+            root,
+            tag: tag.to_string(),
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -305,7 +319,12 @@ fn spawn(fx: &Fixture, tmp: &Tmp, env: &[(&'static str, OsString)]) -> Spawned {
     let pgid = child.id() as i32;
     let out = Some(drain(child.stdout.take().unwrap()));
     let err = Some(drain(child.stderr.take().unwrap()));
-    Spawned { child: Some(child), pgid, out, err }
+    Spawned {
+        child: Some(child),
+        pgid,
+        out,
+        err,
+    }
 }
 
 impl Spawned {
@@ -336,7 +355,11 @@ impl Spawned {
         self.signal_group(libc::SIGKILL);
         let stdout = self.out.take().unwrap().join().unwrap();
         let stderr = self.err.take().unwrap().join().unwrap();
-        let out = Out { code: status.and_then(|s| s.code()), stdout, stderr };
+        let out = Out {
+            code: status.and_then(|s| s.code()),
+            stdout,
+            stderr,
+        };
         match status {
             None => panic!("script still running after {secs}s\n{}", out.all()),
             Some(s) if s.code().is_none() => {
@@ -443,12 +466,7 @@ fn concurrent_runs_false_pass() {
 
     std::fs::write(&release, "go\n").unwrap();
     let oa = sa.wait(60);
-    assert_eq!(
-        oa.code,
-        Some(1),
-        "the gate passed on another run's list\n{}",
-        oa.all()
-    );
+    assert_eq!(oa.code, Some(1), "the gate passed on another run's list\n{}", oa.all());
     assert!(oa.all().contains(".devmap/tag-A-cfp"), "{}", oa.all());
 }
 
@@ -461,7 +479,12 @@ fn success_leaves_nothing_and_no_fixed_tmp_path() {
 
     let out = run(&fx, &Tmp::Set(tmpdir.path().into()), &[]);
     assert_released(&out, &c);
-    assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new(), "fixed /tmp files written\n{}", out.all());
+    assert_eq!(
+        tmp_guard.present(),
+        Vec::<PathBuf>::new(),
+        "fixed /tmp files written\n{}",
+        out.all()
+    );
     let run_dir = out.run_dir();
     assert_eq!(
         run_dir.parent().unwrap().canonicalize().unwrap(),
@@ -487,7 +510,12 @@ fn hostile_tmpdirs() {
             "{}",
             out.all()
         );
-        assert!(!run_dir.exists(), "run dir {} survived\n{}", run_dir.display(), out.all());
+        assert!(
+            !run_dir.exists(),
+            "run dir {} survived\n{}",
+            run_dir.display(),
+            out.all()
+        );
     };
 
     // Spaces and non-ASCII.
@@ -541,7 +569,12 @@ fn nonexistent_tmpdir_fails_closed() {
         out.all()
     );
     assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
-    assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new(), "fell back to /tmp\n{}", out.all());
+    assert_eq!(
+        tmp_guard.present(),
+        Vec::<PathBuf>::new(),
+        "fell back to /tmp\n{}",
+        out.all()
+    );
     assert!(!missing.exists());
 }
 
@@ -604,7 +637,13 @@ fn each_failing_step_keeps_only_its_log_and_names_it() {
         }
         assert_ne!(out.code, Some(0), "[{}] {}", case.name, out.all());
         assert!(!out.stdout.contains("release-ready: "), "[{}] {}", case.name, out.all());
-        assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new(), "[{}] {}", case.name, out.all());
+        assert_eq!(
+            tmp_guard.present(),
+            Vec::<PathBuf>::new(),
+            "[{}] {}",
+            case.name,
+            out.all()
+        );
         let run_dir = out.run_dir();
         let kept = run_dir.join(case.log);
         assert!(
@@ -626,8 +665,17 @@ fn each_failing_step_keeps_only_its_log_and_names_it() {
         }
         let text = std::fs::read_to_string(&kept)
             .unwrap_or_else(|e| panic!("[{}] kept log {}: {e}\n{}", case.name, kept.display(), out.all()));
-        assert!(text.contains(&tag), "[{}] kept log lacks this run's tag: {text:?}", case.name);
-        assert_eq!(entries(&run_dir), vec![case.log.to_string()], "[{}] extra files kept", case.name);
+        assert!(
+            text.contains(&tag),
+            "[{}] kept log lacks this run's tag: {text:?}",
+            case.name
+        );
+        assert_eq!(
+            entries(&run_dir),
+            vec![case.log.to_string()],
+            "[{}] extra files kept",
+            case.name
+        );
         remove_path(&run_dir);
     }
 }
@@ -650,7 +698,12 @@ fn signals_remove_the_run_dir() {
         let out = s.wait(10);
         assert_eq!(out.code, Some(code), "[{name}] {}", out.all());
         let run_dir = out.run_dir();
-        assert!(!run_dir.exists(), "[{name}] run dir {} survived\n{}", run_dir.display(), out.all());
+        assert!(
+            !run_dir.exists(),
+            "[{name}] run dir {} survived\n{}",
+            run_dir.display(),
+            out.all()
+        );
         assert_eq!(tmp_guard.present(), Vec::<PathBuf>::new(), "[{name}] {}", out.all());
         assert_eq!(entries(&tmpdir), vec!["sentinel".to_string()], "[{name}]");
     }
@@ -682,6 +735,11 @@ fn crate_name_is_validated() {
         "the error must name the crate\n{}",
         out.all()
     );
-    assert_eq!(leftovers(&escaped, &escape_prefix), Vec::<PathBuf>::new(), "{}", out.all());
+    assert_eq!(
+        leftovers(&escaped, &escape_prefix),
+        Vec::<PathBuf>::new(),
+        "{}",
+        out.all()
+    );
     assert_eq!(entries(&tmpdir), vec!["sentinel".to_string()]);
 }

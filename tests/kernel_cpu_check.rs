@@ -38,6 +38,7 @@ fn every_numeric_kernel_matches_a_cpu_reference() {
             kcheck::rest::run(rt, &mut ledger);
             kcheck::adamw::run(rt, &mut ledger);
             kcheck::qwen::run(rt, &mut ledger);
+            kcheck::emeans::run(rt, &mut ledger);
             ledger.report_and_assert();
         });
     });

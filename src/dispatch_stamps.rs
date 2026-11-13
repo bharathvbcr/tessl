@@ -33,6 +33,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTL4ComputeCommandEncoder, MTL4TimestampGranularity, MTLDevice};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// Slots in the per-dispatch heap: slot 0 is the origin stamp, the rest are one
 /// per dispatch.
@@ -84,6 +85,22 @@ impl StampLog {
         self.overflowed = false;
         self.armed = false;
     }
+}
+
+/// Lock the stamp log, recovering the guard if a panic poisoned it.
+///
+/// Every `stamp_log` lock goes through here. A poisoned lock must not turn
+/// stamping off for good with no error and no flag, which is what a
+/// `let Ok(..) = lock() else { return }` site does. Recovery is sound because
+/// the log is plain counters and vectors and no update under the lock can
+/// leave a half-applied state that a later reader misreads:
+/// - [`StampLog::begin_command_buffer`] clears `meta`, `barrier_pending`,
+///   `overflowed` and `armed` at the start of the next command buffer, and a
+///   buffer left armed with stamps by the panic is then counted as dropped;
+/// - `dropped_batches` is only ever incremented by one saturating add or
+///   reset by a single store, so it is never torn.
+fn stamp_log_guard(log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
+    log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One dispatch, as seen by the stamps.
@@ -141,7 +158,7 @@ impl GpuRuntime {
     /// Arm (or disarm) stamping for the command buffer that just began. Called
     /// with the command buffer open and before any encoder exists.
     pub(crate) fn arm_dispatch_stamps(&self) {
-        let Ok(mut log) = self.stamp_log.lock() else { return };
+        let mut log = stamp_log_guard(&self.stamp_log);
         log.begin_command_buffer();
         if !crate::ab_flags::dispatch_stamps() {
             return;
@@ -160,7 +177,7 @@ impl GpuRuntime {
         let Some(heap) = self.metal4.stamp_heap.as_ref() else {
             return;
         };
-        let Ok(log) = self.stamp_log.lock() else { return };
+        let log = stamp_log_guard(&self.stamp_log);
         if !log.armed || !log.meta.is_empty() {
             return;
         }
@@ -172,14 +189,13 @@ impl GpuRuntime {
 
     /// True when the command buffer being encoded is armed.
     pub(crate) fn dispatch_stamps_armed(&self) -> bool {
-        crate::ab_flags::dispatch_stamps() && self.stamp_log.lock().map(|l| l.armed).unwrap_or(false)
+        crate::ab_flags::dispatch_stamps() && stamp_log_guard(&self.stamp_log).armed
     }
 
     pub(crate) fn stamp_note_barrier(&self) {
-        if let Ok(mut log) = self.stamp_log.lock() {
-            if log.armed {
-                log.barrier_pending = true;
-            }
+        let mut log = stamp_log_guard(&self.stamp_log);
+        if log.armed {
+            log.barrier_pending = true;
         }
     }
 
@@ -189,7 +205,7 @@ impl GpuRuntime {
         let Some(heap) = self.metal4.stamp_heap.as_ref() else {
             return;
         };
-        let Ok(mut log) = self.stamp_log.lock() else { return };
+        let mut log = stamp_log_guard(&self.stamp_log);
         if !log.armed {
             return;
         }
@@ -213,7 +229,7 @@ impl GpuRuntime {
 
     /// Read back an armed command buffer after its waiting commit completed.
     pub(crate) fn resolve_dispatch_stamps(&self) {
-        let Ok(mut log) = self.stamp_log.lock() else { return };
+        let mut log = stamp_log_guard(&self.stamp_log);
         if !log.armed {
             return;
         }
@@ -459,6 +475,61 @@ mod counter_tests {
         let mut live = armed_with_stamps(7);
         live.begin_command_buffer();
         assert_eq!(live.dropped_batches, 8);
+    }
+
+    /// Poison `m` the way a panic under the lock does: on a spawned thread,
+    /// mid-update, joined with the panic caught.
+    fn poison_mid_update(m: std::sync::Arc<Mutex<StampLog>>) {
+        let t = std::thread::spawn(move || {
+            let mut log = m.lock().unwrap();
+            log.armed = true;
+            log.meta.push(StampMeta {
+                pipeline: 7,
+                barrier_before: false,
+                layer: 3,
+            });
+            log.dropped_batches = 4;
+            panic!("poison the stamp log (expected by the test)");
+        });
+        assert!(t.join().is_err(), "the helper thread must have panicked");
+    }
+
+    /// A poisoned stamp_log must neither disable stamping nor lose the counts:
+    /// the helper hands back a usable guard with the pre-panic state, and the
+    /// next command buffer counts the stranded one as dropped and starts clean.
+    #[test]
+    fn a_poisoned_stamp_log_is_recovered_not_swallowed() {
+        let m = std::sync::Arc::new(Mutex::new(StampLog::default()));
+        poison_mid_update(m.clone());
+        assert!(
+            m.is_poisoned(),
+            "the log must be poisoned for this test to mean anything"
+        );
+
+        let mut log = stamp_log_guard(&m);
+        assert!(
+            log.armed,
+            "the armed flag survives, so dispatch_stamps_armed still answers true"
+        );
+        assert_eq!(log.meta.len(), 1);
+        assert_eq!(log.dropped_batches, 4);
+
+        log.begin_command_buffer();
+        assert_eq!(
+            log.dropped_batches, 5,
+            "the buffer stranded by the panic is counted as dropped"
+        );
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, 6);
+        drop(log);
+
+        // Later sites still lock the same (still poisoned) mutex and get live state.
+        stamp_log_guard(&m).armed = true;
+        assert!(
+            stamp_log_guard(&m).armed,
+            "writes after recovery are visible to later readers"
+        );
     }
 
     #[test]

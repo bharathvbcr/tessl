@@ -675,8 +675,8 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
         .expect("a pid");
     let gone = |pid: libc::pid_t| {
         // SAFETY: signal 0 only probes whether `pid` exists.
-        unsafe { libc::kill(pid, 0) == -1 }
-        &&std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     };
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !gone(child) && std::time::Instant::now() < until {

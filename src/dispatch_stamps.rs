@@ -33,6 +33,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTL4ComputeCommandEncoder, MTL4TimestampGranularity, MTLDevice};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// Slots in the per-dispatch heap: slot 0 is the origin stamp, the rest are one
 /// per dispatch.
@@ -66,6 +67,42 @@ pub struct StampLog {
     dropped_batches: u32,
 }
 
+impl StampLog {
+    /// Count one armed command buffer whose stamps were discarded.
+    fn note_dropped(&mut self) {
+        self.dropped_batches = self.dropped_batches.saturating_add(1);
+    }
+
+    /// The state transition when a new command buffer begins: an armed buffer
+    /// that recorded stamps but never reached a waiting commit is counted as
+    /// dropped, then the per-buffer state is cleared and the log is disarmed.
+    fn begin_command_buffer(&mut self) {
+        if self.armed && !self.meta.is_empty() {
+            self.note_dropped();
+        }
+        self.meta.clear();
+        self.barrier_pending = false;
+        self.overflowed = false;
+        self.armed = false;
+    }
+}
+
+/// Lock the stamp log, recovering the guard if a panic poisoned it.
+///
+/// Every `stamp_log` lock goes through here. A poisoned lock must not turn
+/// stamping off for good with no error and no flag, which is what a
+/// `let Ok(..) = lock() else { return }` site does. Recovery is sound because
+/// the log is plain counters and vectors and no update under the lock can
+/// leave a half-applied state that a later reader misreads:
+/// - [`StampLog::begin_command_buffer`] clears `meta`, `barrier_pending`,
+///   `overflowed` and `armed` at the start of the next command buffer, and a
+///   buffer left armed with stamps by the panic is then counted as dropped;
+/// - `dropped_batches` is only ever incremented by one saturating add or
+///   reset by a single store, so it is never torn.
+fn stamp_log_guard(stamp_log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
+    stamp_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// One dispatch, as seen by the stamps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchStamp {
@@ -96,12 +133,15 @@ pub struct DispatchStampBatch {
     /// More dispatches than the heap holds: `stamps` is a prefix, not the token.
     pub overflowed: bool,
     /// Earlier armed command buffers that ended without a waiting commit and
-    /// whose stamps were discarded.
+    /// whose stamps were discarded. Saturates at `u32::MAX`: a value equal to
+    /// `u32::MAX` is a floor ("at least this many"), not an exact count.
     pub dropped_batches: u32,
     /// Waiting commits folded into this batch. 1 for a token encoded into one
     /// command buffer; more when host mappings commit mid-token. A later
     /// command buffer's first `dt_ns` is measured from its own origin stamp,
     /// so the time between command buffers is in `t_end_ns` but in no `dt_ns`.
+    /// Saturates at `u32::MAX`: a value equal to `u32::MAX` is a floor, not an
+    /// exact count.
     pub command_buffers: u32,
 }
 
@@ -109,8 +149,8 @@ impl DispatchStampBatch {
     pub(crate) fn merge(&mut self, next: DispatchStampBatch) {
         self.stamps.extend(next.stamps);
         self.overflowed |= next.overflowed;
-        self.dropped_batches += next.dropped_batches;
-        self.command_buffers += next.command_buffers;
+        self.dropped_batches = self.dropped_batches.saturating_add(next.dropped_batches);
+        self.command_buffers = self.command_buffers.saturating_add(next.command_buffers);
     }
 }
 
@@ -118,14 +158,8 @@ impl GpuRuntime {
     /// Arm (or disarm) stamping for the command buffer that just began. Called
     /// with the command buffer open and before any encoder exists.
     pub(crate) fn arm_dispatch_stamps(&self) {
-        let Ok(mut log) = self.stamp_log.lock() else { return };
-        if log.armed && !log.meta.is_empty() {
-            log.dropped_batches += 1;
-        }
-        log.meta.clear();
-        log.barrier_pending = false;
-        log.overflowed = false;
-        log.armed = false;
+        let mut log = stamp_log_guard(&self.stamp_log);
+        log.begin_command_buffer();
         if !crate::ab_flags::dispatch_stamps() {
             return;
         }
@@ -143,7 +177,7 @@ impl GpuRuntime {
         let Some(heap) = self.metal4.stamp_heap.as_ref() else {
             return;
         };
-        let Ok(log) = self.stamp_log.lock() else { return };
+        let log = stamp_log_guard(&self.stamp_log);
         if !log.armed || !log.meta.is_empty() {
             return;
         }
@@ -155,14 +189,13 @@ impl GpuRuntime {
 
     /// True when the command buffer being encoded is armed.
     pub(crate) fn dispatch_stamps_armed(&self) -> bool {
-        crate::ab_flags::dispatch_stamps() && self.stamp_log.lock().map(|l| l.armed).unwrap_or(false)
+        crate::ab_flags::dispatch_stamps() && stamp_log_guard(&self.stamp_log).armed
     }
 
     pub(crate) fn stamp_note_barrier(&self) {
-        if let Ok(mut log) = self.stamp_log.lock() {
-            if log.armed {
-                log.barrier_pending = true;
-            }
+        let mut log = stamp_log_guard(&self.stamp_log);
+        if log.armed {
+            log.barrier_pending = true;
         }
     }
 
@@ -172,7 +205,7 @@ impl GpuRuntime {
         let Some(heap) = self.metal4.stamp_heap.as_ref() else {
             return;
         };
-        let Ok(mut log) = self.stamp_log.lock() else { return };
+        let mut log = stamp_log_guard(&self.stamp_log);
         if !log.armed {
             return;
         }
@@ -196,7 +229,7 @@ impl GpuRuntime {
 
     /// Read back an armed command buffer after its waiting commit completed.
     pub(crate) fn resolve_dispatch_stamps(&self) {
-        let Ok(mut log) = self.stamp_log.lock() else { return };
+        let mut log = stamp_log_guard(&self.stamp_log);
         if !log.armed {
             return;
         }
@@ -355,5 +388,220 @@ mod tests {
         assert!(batch.overflowed);
         assert!(batch.stamps.len() < STAMP_HEAP_SLOTS);
         crate::ab_flags::set_dispatch_stamps(false);
+    }
+}
+
+/// Device-free: the counters are plain integers, so these run in the hosted pass.
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    fn batch(dropped_batches: u32, command_buffers: u32) -> DispatchStampBatch {
+        DispatchStampBatch {
+            freq_hz: 1,
+            t0_ns: 0,
+            stamps: Vec::new(),
+            overflowed: false,
+            dropped_batches,
+            command_buffers,
+        }
+    }
+
+    #[test]
+    fn dropped_batches_saturate_at_u32_max() {
+        let mut log = StampLog {
+            dropped_batches: u32::MAX - 1,
+            ..StampLog::default()
+        };
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, u32::MAX);
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, u32::MAX, "a saturated count stays a floor");
+    }
+
+    /// An armed log holding stamps of a buffer that never reached a waiting commit.
+    fn armed_with_stamps(dropped_batches: u32) -> StampLog {
+        StampLog {
+            armed: true,
+            meta: vec![StampMeta {
+                pipeline: 1,
+                barrier_before: true,
+                layer: 0,
+            }],
+            barrier_pending: true,
+            overflowed: true,
+            dropped_batches,
+        }
+    }
+
+    /// The path `arm_dispatch_stamps` takes under the lock: from `u32::MAX - 1`
+    /// two more dropped buffers land on `u32::MAX`, and each call still clears
+    /// the per-buffer state.
+    #[test]
+    fn beginning_command_buffers_past_the_limit_saturates_and_resets() {
+        let mut log = armed_with_stamps(u32::MAX - 1);
+        log.begin_command_buffer();
+        assert_eq!(log.dropped_batches, u32::MAX);
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+
+        let mut log = StampLog {
+            dropped_batches: u32::MAX,
+            ..armed_with_stamps(0)
+        };
+        log.begin_command_buffer();
+        assert_eq!(log.dropped_batches, u32::MAX, "a saturated count stays a floor");
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+    }
+
+    #[test]
+    fn beginning_a_command_buffer_counts_only_armed_buffers_that_recorded_stamps() {
+        let mut empty = StampLog {
+            armed: true,
+            dropped_batches: 7,
+            ..StampLog::default()
+        };
+        empty.begin_command_buffer();
+        assert_eq!(empty.dropped_batches, 7, "armed but nothing stamped is not a drop");
+
+        let mut unarmed = StampLog {
+            dropped_batches: 7,
+            ..armed_with_stamps(7)
+        };
+        unarmed.armed = false;
+        unarmed.begin_command_buffer();
+        assert_eq!(unarmed.dropped_batches, 7, "an unarmed buffer is not a drop");
+        assert!(unarmed.meta.is_empty() && !unarmed.barrier_pending && !unarmed.overflowed);
+
+        let mut live = armed_with_stamps(7);
+        live.begin_command_buffer();
+        assert_eq!(live.dropped_batches, 8);
+    }
+
+    /// The production half of this file, comments stripped (the test modules
+    /// quote the patterns below, so they are cut off at the first `#[cfg(test)]`).
+    fn production_code() -> String {
+        let src = include_str!("dispatch_stamps.rs");
+        let end = src
+            .find("\n#[cfg(test)]")
+            .expect("the test modules follow the production code");
+        src[..end]
+            .lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Source-text contract: a lock site that bails out on `Err` would switch
+    /// stamping off for good after one panic, and the GPU-only sites cannot
+    /// show it. So the one `lock(` call is the recovering helper's, and every
+    /// other access to the field goes through that helper.
+    #[test]
+    fn every_stamp_log_access_goes_through_the_recovering_guard() {
+        let code = production_code();
+        assert_eq!(
+            code.matches("stamp_log.lock(").count(),
+            1,
+            "stamp_log.lock( must occur exactly once"
+        );
+        assert_eq!(
+            code.matches(".lock(").count(),
+            1,
+            "no other lock call may appear in the production code"
+        );
+        let start = code.find("fn stamp_log_guard").expect("the helper exists");
+        let body_end = start + code[start..].find("\n}\n").expect("the helper body ends");
+        let at = code.find("stamp_log.lock(").unwrap();
+        assert!(
+            (start..body_end).contains(&at),
+            "the lock call must sit inside fn stamp_log_guard"
+        );
+        assert!(
+            code[start..body_end].contains("into_inner"),
+            "the helper must recover a poisoned guard"
+        );
+
+        let accesses: Vec<usize> = code.match_indices("self.stamp_log").map(|(i, _)| i).collect();
+        assert!(
+            accesses.len() >= 6,
+            "expected the six lock sites, found {}",
+            accesses.len()
+        );
+        for i in accesses {
+            assert!(
+                code[..i].ends_with("stamp_log_guard(&"),
+                "self.stamp_log at byte {i} is not passed to stamp_log_guard: {:?}",
+                &code[i.saturating_sub(40)..i + 20]
+            );
+        }
+    }
+
+    /// Poison `m` the way a panic under the lock does: on a spawned thread,
+    /// mid-update, joined with the panic caught.
+    fn poison_mid_update(m: std::sync::Arc<Mutex<StampLog>>) {
+        let t = std::thread::spawn(move || {
+            let mut log = m.lock().unwrap();
+            log.armed = true;
+            log.meta.push(StampMeta {
+                pipeline: 7,
+                barrier_before: false,
+                layer: 3,
+            });
+            log.dropped_batches = 4;
+            panic!("poison the stamp log (expected by the test)");
+        });
+        assert!(t.join().is_err(), "the helper thread must have panicked");
+    }
+
+    /// A poisoned stamp_log must neither disable stamping nor lose the counts:
+    /// the helper hands back a usable guard with the pre-panic state, and the
+    /// next command buffer counts the stranded one as dropped and starts clean.
+    #[test]
+    fn a_poisoned_stamp_log_is_recovered_not_swallowed() {
+        let m = std::sync::Arc::new(Mutex::new(StampLog::default()));
+        poison_mid_update(m.clone());
+        assert!(
+            m.is_poisoned(),
+            "the log must be poisoned for this test to mean anything"
+        );
+
+        let mut log = stamp_log_guard(&m);
+        assert!(
+            log.armed,
+            "the armed flag survives, so dispatch_stamps_armed still answers true"
+        );
+        assert_eq!(log.meta.len(), 1);
+        assert_eq!(log.dropped_batches, 4);
+
+        log.begin_command_buffer();
+        assert_eq!(
+            log.dropped_batches, 5,
+            "the buffer stranded by the panic is counted as dropped"
+        );
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, 6);
+        drop(log);
+
+        // Later sites still lock the same (still poisoned) mutex and get live state.
+        stamp_log_guard(&m).armed = true;
+        assert!(
+            stamp_log_guard(&m).armed,
+            "writes after recovery are visible to later readers"
+        );
+    }
+
+    #[test]
+    fn merge_saturates_both_counters_at_u32_max() {
+        let mut a = batch(u32::MAX - 1, u32::MAX - 1);
+        a.merge(batch(5, 5));
+        assert_eq!(a.dropped_batches, u32::MAX);
+        assert_eq!(a.command_buffers, u32::MAX);
+    }
+
+    #[test]
+    fn merge_below_the_limit_is_still_exact() {
+        let mut a = batch(2, 1);
+        a.merge(batch(3, 4));
+        assert_eq!((a.dropped_batches, a.command_buffers), (5, 5));
     }
 }

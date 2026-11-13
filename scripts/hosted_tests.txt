@@ -33,7 +33,7 @@ bin embedgemma2_pre 5
 bin embedgemma2_tok_tiny 13
 bin embedgemma2_tok_batch 8
 bin gdn_fixtures 12
-bin fixture_manifests 4
+bin fixture_manifests 12
 bin gdn_gates 22
 bin gdn_state 10
 bin go_link_frameworks 2
@@ -134,6 +134,8 @@ lib parser_mutation:: 16
 lib pool_ledger::tests:: 11
 lib qwen35::tests:: 6
 lib qwen35_bwd::layout_tests:: 2
+# Only this one of dequant_affine's tests is device-free (the goldens' corners and host-model tallies); the rest use the GPU.
+exact dequant_affine every_golden_holds_its_corners_and_the_host_models_match_the_tallies
 exact lib encode_batch::tests::batch_shape_refusals_in_order
 exact lib gdn_train::tests::the_chunked_workspace_bytes_follow_the_key_heads
 lib runtime::alloc_failure_tests:: 3

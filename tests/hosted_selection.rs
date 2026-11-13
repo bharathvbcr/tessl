@@ -1401,7 +1401,10 @@ fn a_marker_inside_a_string_literal_still_counts() {
 /// later and opens a device; the walk must reach it, not the quoted empty one.
 #[test]
 fn a_quoted_definition_with_a_body_does_not_shadow_the_real_one() {
-    let src = "#[test]\nfn pin() { let q = \"fn x() { }\"; x(); }\n\
+    // The quoted `fn x() { }` is followed, with no `;` between, by the `{` of an
+    // `if`: a lookup that took the quoted text for a definition would read that
+    // block as `x`'s body, and the real `x` below would go unscanned.
+    let src = "#[test]\nfn pin() { if \"fn x() { }\".is_empty() { let _ = 1; } x(); }\n\
                fn x() { let _rt = GpuRuntime::new(); }\n";
     assert_eq!(body_of(src, "x"), "{ let _rt = GpuRuntime::new(); }");
     assert!(device_marker(src, "pin")

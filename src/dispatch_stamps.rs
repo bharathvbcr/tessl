@@ -99,8 +99,8 @@ impl StampLog {
 ///   buffer left armed with stamps by the panic is then counted as dropped;
 /// - `dropped_batches` is only ever incremented by one saturating add or
 ///   reset by a single store, so it is never torn.
-fn stamp_log_guard(log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
-    log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn stamp_log_guard(stamp_log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
+    stamp_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One dispatch, as seen by the stamps.
@@ -475,6 +475,64 @@ mod counter_tests {
         let mut live = armed_with_stamps(7);
         live.begin_command_buffer();
         assert_eq!(live.dropped_batches, 8);
+    }
+
+    /// The production half of this file, comments stripped (the test modules
+    /// quote the patterns below, so they are cut off at the first `#[cfg(test)]`).
+    fn production_code() -> String {
+        let src = include_str!("dispatch_stamps.rs");
+        let end = src
+            .find("\n#[cfg(test)]")
+            .expect("the test modules follow the production code");
+        src[..end]
+            .lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Source-text contract: a lock site that bails out on `Err` would switch
+    /// stamping off for good after one panic, and the GPU-only sites cannot
+    /// show it. So the one `lock(` call is the recovering helper's, and every
+    /// other access to the field goes through that helper.
+    #[test]
+    fn every_stamp_log_access_goes_through_the_recovering_guard() {
+        let code = production_code();
+        assert_eq!(
+            code.matches("stamp_log.lock(").count(),
+            1,
+            "stamp_log.lock( must occur exactly once"
+        );
+        assert_eq!(
+            code.matches(".lock(").count(),
+            1,
+            "no other lock call may appear in the production code"
+        );
+        let start = code.find("fn stamp_log_guard").expect("the helper exists");
+        let body_end = start + code[start..].find("\n}\n").expect("the helper body ends");
+        let at = code.find("stamp_log.lock(").unwrap();
+        assert!(
+            (start..body_end).contains(&at),
+            "the lock call must sit inside fn stamp_log_guard"
+        );
+        assert!(
+            code[start..body_end].contains("into_inner"),
+            "the helper must recover a poisoned guard"
+        );
+
+        let accesses: Vec<usize> = code.match_indices("self.stamp_log").map(|(i, _)| i).collect();
+        assert!(
+            accesses.len() >= 6,
+            "expected the six lock sites, found {}",
+            accesses.len()
+        );
+        for i in accesses {
+            assert!(
+                code[..i].ends_with("stamp_log_guard(&"),
+                "self.stamp_log at byte {i} is not passed to stamp_log_guard: {:?}",
+                &code[i.saturating_sub(40)..i + 20]
+            );
+        }
     }
 
     /// Poison `m` the way a panic under the lock does: on a spawned thread,

@@ -26,7 +26,8 @@ pub struct Ran {
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Process groups of the children now running, for the terminal-signal handler.
-/// A slot holds a group id, or 0 when free. A fixed table of atomics, because
+/// A slot holds a group id, 0 when free, or -1 while a call has claimed it and
+/// not yet spawned its child. A fixed table of atomics, because
 /// the handler may only call async-signal-safe functions: no lock, no
 /// allocation, and `kill` is on the safe list. `run_bounded` may be called from
 /// several threads at once (`kcov::inventory` preprocesses on up to 8), and each
@@ -34,8 +35,8 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 static ACTIVE_GROUPS: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
 
 /// Signals whose default action ends this process and which a terminal or a
-/// supervisor sends to it: Ctrl-C, a `kill`, a closed terminal.
-const FATAL_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+/// supervisor sends to it: Ctrl-C, a `kill`, a closed terminal, Ctrl-\.
+const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 /// The handler: kill every registered child group, then die of the signal as
 /// the default action would have. `SA_RESETHAND` has already put the default
@@ -80,19 +81,21 @@ fn install_signal_handlers() {
     });
 }
 
-/// A registered child group, released when dropped.
+/// A claimed slot of [`ACTIVE_GROUPS`], released when dropped.
 struct Registered(usize);
 
 impl Registered {
-    /// Claim a slot for `group`, or `None` when all are taken.
-    fn new(group: libc::pid_t) -> Option<Registered> {
+    /// Claim a free slot, or `None` when all are taken.
+    fn reserve() -> Option<Registered> {
         ACTIVE_GROUPS
             .iter()
-            .position(|s| {
-                s.compare_exchange(0, group, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            })
+            .position(|s| s.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed).is_ok())
             .map(Registered)
+    }
+
+    /// Record the child's group in the claimed slot, from now on killed by the handler.
+    fn set(&self, group: libc::pid_t) {
+        ACTIVE_GROUPS[self.0].store(group, Ordering::Release);
     }
 }
 
@@ -134,7 +137,7 @@ fn stop_group(child: &mut Child) {
 /// The child runs in its own process group, so that a timeout can end the whole
 /// tree ([`stop_group`]) and so that a terminal interrupt, which goes to the
 /// parent's group only, does not leave it running: for as long as the child
-/// runs, SIGINT, SIGTERM and SIGHUP to this process kill the child's group before
+/// runs, SIGINT, SIGTERM, SIGHUP and SIGQUIT to this process kill the child's group before
 /// the process dies of the signal (see [`install_signal_handlers`]). There is a
 /// window between `spawn` and the registration of the group, a few instructions
 /// wide, in which such a signal still leaves the child behind.
@@ -146,6 +149,10 @@ fn stop_group(child: &mut Child) {
 /// without joining them, a normal exit waits.
 pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
     install_signal_handlers();
+    // Claimed before the spawn: with no free slot nothing is started.
+    let Some(registered) = Registered::reserve() else {
+        return Err("too many children running at once".to_string());
+    };
     let mut child = cmd
         .process_group(0)
         .stdin(Stdio::null())
@@ -154,10 +161,7 @@ pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     let group = child.id() as libc::pid_t;
-    let Some(_registered) = Registered::new(group) else {
-        stop_group(&mut child);
-        return Err("too many children running at once".to_string());
-    };
+    registered.set(group);
     fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut buf = Vec::new();

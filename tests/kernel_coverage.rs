@@ -800,7 +800,7 @@ fn run_bounded_sends_sigterm_first_and_does_not_wait_out_the_grace() {
     );
 }
 
-/// Body of the interrupt test's child process: this same test binary, run with
+/// Body of the interrupt tests' child process: this same test binary, run with
 /// `TESSL_PROC_HELPER_PIDFILE` set, drives `run_bounded` over a shell that
 /// backgrounds a `sleep`. Without the variable it does nothing.
 #[test]
@@ -816,59 +816,199 @@ fn run_bounded_interrupt_helper() {
     let _ = proc::run_bounded(&mut cmd, 120);
 }
 
-/// A terminal interrupt goes to the parent's process group only; the child of
-/// `run_bounded` leads its own group, so the parent has to take it down itself.
-/// This is Ctrl-C on a `kernel_coverage` or `attn_tune` run: the tool dies of
-/// SIGINT, and the bench it was running must not outlive it.
+/// Body of the table-full test's child process (`TESSL_PROC_HELPER_FILL_DIR`
+/// set): hold 64 children, make a 65th call, record what it returned, then
+/// SIGTERM itself so the handler has 64 groups to take down. A process of its
+/// own because the table is process-wide and the other tests use it.
 #[test]
-fn an_interrupt_to_the_parent_takes_the_childs_whole_group_down() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-    let d = tmp("sigint");
-    let pidfile = d.path().join("sleep.pid");
-    let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "run_bounded_interrupt_helper",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env("TESSL_PROC_HELPER_PIDFILE", &pidfile)
+fn run_bounded_table_helper() {
+    let Some(dir) = std::env::var_os("TESSL_PROC_HELPER_FILL_DIR").map(PathBuf::from) else {
+        return;
+    };
+    for i in 0..64 {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("echo $$ > '{}/k{i}'; sleep 60", dir.display()));
+            let _ = proc::run_bounded(&mut cmd, 120);
+        });
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while (0..64).any(|i| !dir.join(format!("k{i}")).exists()) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Registration follows the spawn by a few instructions.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!("echo $$ > '{}/extra'", dir.display()));
+    let r = proc::run_bounded(&mut cmd, 10);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let text = match r {
+        Ok(ran) => format!("ok {:?}", ran.code),
+        Err(e) => format!("err {e}"),
+    };
+    std::fs::write(dir.join("result"), text).unwrap();
+    // SAFETY: raises SIGTERM on this process; the handler under test ends it.
+    unsafe { libc::raise(libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+/// Start this test binary on `helper` in its own process group, as a terminal's
+/// foreground job is. The signals are reset to their defaults first (a runner
+/// under `nohup` or a background shell hands its children `SIG_IGN`, which the
+/// helper must not inherit by accident), then `ignored` are set to `SIG_IGN`.
+fn spawn_helper(helper: &str, env: (&str, &Path), ignored: &[libc::c_int]) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let ignored = ignored.to_vec();
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    cmd.args(["--exact", helper, "--test-threads=1", "--nocapture"])
+        .env(env.0, env.1)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .process_group(0) // its own group, as a terminal's foreground job is
-        .spawn()
-        .expect("spawn the helper");
-    let sleep = read_pid(&pidfile);
-    // Ctrl-C: SIGINT to the helper's group (the helper leads it).
-    // SAFETY: the negated pid names the group of the child spawned above.
-    unsafe { libc::kill(-(helper.id() as libc::pid_t), libc::SIGINT) };
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let status = loop {
-        if let Some(s) = helper.try_wait().expect("wait") {
-            break Some(s);
+        .process_group(0);
+    // SAFETY: only `signal` and `setrlimit`, both async-signal-safe, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            for &sig in &ignored {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+            Ok(())
+        });
+    }
+    cmd.spawn().expect("spawn the helper")
+}
+
+/// Wait up to `secs` for `child`, `None` if it is still running.
+fn wait_for(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(s) = child.try_wait().expect("wait") {
+            return Some(s);
         }
         if std::time::Instant::now() > until {
-            break None;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    let sleep_gone = wait_until_gone(sleep, 5);
+    }
+}
+
+/// A terminal signal goes to the parent's process group only; the child of
+/// `run_bounded` leads its own group, so the parent has to take it down itself.
+/// Ctrl-C, a `kill`, a closed terminal and Ctrl-\ on a `kernel_coverage` or
+/// `attn_tune` run: the tool dies of the signal, and the bench it was running
+/// must not outlive it.
+#[test]
+fn a_terminal_signal_to_the_parent_takes_the_childs_whole_group_down() {
+    use std::os::unix::process::ExitStatusExt;
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        let d = tmp(&format!("sig{sig}"));
+        let pidfile = d.path().join("sleep.pid");
+        let mut helper = spawn_helper(
+            "run_bounded_interrupt_helper",
+            ("TESSL_PROC_HELPER_PIDFILE", &pidfile),
+            &[],
+        );
+        let sleep = read_pid(&pidfile);
+        // SAFETY: the negated pid names the group of the child spawned above.
+        unsafe { libc::kill(-(helper.id() as libc::pid_t), sig) };
+        let status = wait_for(&mut helper, 10);
+        let sleep_gone = wait_until_gone(sleep, 5);
+        if status.is_none() {
+            let _ = helper.kill();
+            let _ = helper.wait();
+        }
+        if !sleep_gone {
+            // SAFETY: the pid the helper's shell wrote for its own `sleep`.
+            unsafe { libc::kill(sleep, libc::SIGKILL) };
+        }
+        let status = status.unwrap_or_else(|| panic!("signal {sig}: the helper did not exit within 10 s"));
+        assert_eq!(
+            status.signal(),
+            Some(sig),
+            "signal {sig}: the helper died of {status:?}"
+        );
+        assert!(sleep_gone, "signal {sig}: the helper's child {sleep} survived it");
+    }
+}
+
+/// A signal the process ignores stays ignored: under `nohup` the handler must
+/// not install itself over `SIG_IGN` and take the children down with a signal
+/// the parent was told to survive.
+#[test]
+fn an_ignored_signal_leaves_the_parent_and_its_child_running() {
+    let d = tmp("sigign");
+    let pidfile = d.path().join("sleep.pid");
+    let mut helper = spawn_helper(
+        "run_bounded_interrupt_helper",
+        ("TESSL_PROC_HELPER_PIDFILE", &pidfile),
+        &[libc::SIGINT],
+    );
+    let sleep = read_pid(&pidfile);
+    // SAFETY: the negated pid names the group of the child spawned above.
+    unsafe { libc::kill(-(helper.id() as libc::pid_t), libc::SIGINT) };
+    let exited = wait_for(&mut helper, 2);
+    let child_alive = !pid_gone(sleep);
+    // Clean up by pid: the sleep ends, so the helper's `run_bounded` returns and it exits.
+    // SAFETY: the pid the helper's shell wrote for its own `sleep`.
+    unsafe { libc::kill(sleep, libc::SIGKILL) };
+    if exited.is_none() && wait_for(&mut helper, 10).is_none() {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    assert!(exited.is_none(), "an ignored SIGINT ended the helper: {exited:?}");
+    assert!(child_alive, "an ignored SIGINT took the helper's child down");
+}
+
+/// With every slot taken, the next call fails closed before spawning anything,
+/// and the 64 children it could not be counted among are all taken down by the
+/// handler when the parent is signalled.
+#[test]
+fn run_bounded_refuses_a_child_it_has_no_slot_to_track() {
+    use std::os::unix::process::ExitStatusExt;
+    let d = tmp("table");
+    let mut helper = spawn_helper(
+        "run_bounded_table_helper",
+        ("TESSL_PROC_HELPER_FILL_DIR", d.path()),
+        &[],
+    );
+    let status = wait_for(&mut helper, 60);
+    let kids: Vec<libc::pid_t> = (0..64)
+        .filter_map(|i| {
+            std::fs::read_to_string(d.path().join(format!("k{i}")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect();
+    let all_gone = kids.iter().all(|&k| wait_until_gone(k, 5));
+    if !all_gone {
+        for &k in &kids {
+            // SAFETY: pids the helper's shells wrote for themselves.
+            unsafe { libc::kill(k, libc::SIGKILL) };
+        }
+    }
     if status.is_none() {
         let _ = helper.kill();
         let _ = helper.wait();
     }
-    if !sleep_gone {
-        // SAFETY: the pid the helper's shell wrote for its own `sleep`.
-        unsafe { libc::kill(sleep, libc::SIGKILL) };
-    }
-    let status = status.expect("the helper did not exit within 10 s of SIGINT");
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGINT),
-        "the helper died of something else: {status:?}"
-    );
-    assert!(sleep_gone, "the interrupted helper's child {sleep} survived it");
+    let result = std::fs::read_to_string(d.path().join("result")).unwrap_or_default();
+    let status = status.expect("the helper did not finish within 60 s");
+    assert_eq!(kids.len(), 64, "the helper held {} children, not 64", kids.len());
+    assert_eq!(result, "err too many children running at once");
+    assert!(!d.path().join("extra").exists(), "the 65th call started its child");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    assert!(all_gone, "the handler left some of the 64 children running");
 }
 
 #[test]

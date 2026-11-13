@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_media_video_exact_fixtures.py",
- "generator_commit": "c433eae9caefa2717d94a35f322d0f80a4eef299",
+ "generator_commit": "7ea7be98920eec28b9b7cefb696ac5ecab892196",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",

@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_resample_cr_fixtures.py",
- "generator_commit": "d4badc78c90aeb58f1335b2e70b0b24e56839106",
+ "generator_commit": "fbf3c6306ad7d9aee8cf0c66b18e6e8673cf5fd8",
  "versions": {
   "torch": "2.14.1",
   "transformers": "5.19.0",

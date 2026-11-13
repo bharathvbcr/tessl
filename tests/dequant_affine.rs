@@ -16,30 +16,22 @@
 //! corner values. The kernel agrees with them bit for bit, including on
 //! subnormal and overflowing corners, and the device model reproduces every
 //! crafted one of them while the IEEE model does not: the flush is mlx's
-//! behaviour too, not a quirk of this kernel. Each golden test also checks the
-//! fixtures' provenance (`assert_fixture_provenance`): the manifest's
-//! `generator_commit` must be on this history and be the commit that last
-//! changed the generator, and any check that cannot run fails.
+//! behaviour too, not a quirk of this kernel. The fixtures' provenance and
+//! checksums are checked device-free in `tests/fixture_manifests.rs`, which also
+//! holds the git helper.
 //!
 //! The fault-word tests cover `check_dequant_affine_fault`, the checked read of
 //! the word `dequant_affine_bf16` raises.
 //!
-//! All tests need the device (`with_gpu`), so none belongs in the hosted
-//! device-free selection.
+//! Every test needs the device (`with_gpu`) except
+//! `every_golden_holds_its_corners_and_the_host_models_match_the_tallies`, the one
+//! `scripts/hosted_tests.txt` selects.
 
 mod common;
-mod scratch_support;
-
-#[path = "../src/bin/common/json.rs"]
-mod json;
 
 use common::{with_gpu, with_two_gpus};
-use json::{Json, Syntax};
-use scratch_support::Scratch;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tessl::dequant::{
     check_dequant_affine_fault, dequant_affine_bf16, dequant_affine_q4_bf16, dequant_affine_q8_bf16,
     validate_dequant_affine_bf16, AffineBits, DequantAffineBank, DequantAffineFault, DEQUANT_AFFINE_GROUP_SIZES,
@@ -780,7 +772,7 @@ fn matches_mlx_gpu_dequantize_at_group_sizes_32_and_128() {
     });
 }
 
-/// The 24 goldens in the order the generator writes them: group sizes 64, 32, 128, each
+/// The 12 goldens (each four files) in the order the generator writes them: group sizes 64, 32, 128, each
 /// q8 then q4, each `quant` then `crafted`.
 fn every_golden() -> Vec<(&'static str, u32, usize, Case, Vec<u16>)> {
     [GROUP, 32, 128]
@@ -802,17 +794,40 @@ fn model_misses(c: &Case, want: &[u16]) -> (usize, usize) {
     (misses(Model::Ieee), misses(Model::Device))
 }
 
-/// Device-free: the goldens hold the corners they exist for, and the device model
-/// reproduces every one of them (the generator's `ftz_model_mismatches` tally, which it
-/// prints but never stores, so the test recomputes it).
+/// The per-golden tallies `scripts/gen_dequant_affine_fixtures.py` prints and never
+/// stores (`ieee_fma_mismatches`, `ftz_model_mismatches`), as `(case, bits, group size,
+/// IEEE misses, device-model misses)`. The device model must reproduce every golden; the
+/// IEEE one misses only the crafted ones, at the counts the generator reported. A
+/// regenerated fixture that moves any count fails here until this table is re-derived.
+const GOLDEN_TALLIES: [(&str, u32, usize, usize, usize); 12] = [
+    ("quant", 8, 64, 0, 0),
+    ("crafted", 8, 64, 1546, 0),
+    ("quant", 4, 64, 0, 0),
+    ("crafted", 4, 64, 1072, 0),
+    ("quant", 8, 32, 0, 0),
+    ("crafted", 8, 32, 898, 0),
+    ("quant", 4, 32, 0, 0),
+    ("crafted", 4, 32, 1359, 0),
+    ("quant", 8, 128, 0, 0),
+    ("crafted", 8, 128, 640, 0),
+    ("quant", 4, 128, 0, 0),
+    ("crafted", 4, 128, 881, 0),
+];
+
+/// Device-free: the goldens hold the corners they exist for, and the host models'
+/// mismatch counts against every golden are the recorded tallies.
 #[test]
-fn every_golden_holds_its_corners_and_the_device_model_reproduces_it() {
+fn every_golden_holds_its_corners_and_the_host_models_match_the_tallies() {
     let goldens = every_golden();
-    assert_eq!(goldens.len(), 12, "3 group sizes x q8/q4 x quant/crafted");
-    for (case, bits, gs, c, want) in &goldens {
+    assert_eq!(goldens.len(), GOLDEN_TALLIES.len(), "3 group sizes x q8/q4 x quant/crafted");
+    for ((case, bits, gs, c, want), tally) in goldens.iter().zip(GOLDEN_TALLIES) {
+        assert_eq!((*case, *bits, *gs), (tally.0, tally.1, tally.2), "golden order");
         assert_golden_holds_its_corners(case, *bits, *gs, c, want);
-        let (ieee, device) = model_misses(c, want);
-        eprintln!("TALLY {case} q{bits} g{gs}: ieee {ieee} device {device}");
+        assert_eq!(
+            model_misses(c, want),
+            (tally.3, tally.4),
+            "{case} q{bits} g{gs}: (IEEE, device) misses"
+        );
     }
 }
 

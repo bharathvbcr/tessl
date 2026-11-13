@@ -34,7 +34,19 @@
 
 set -uo pipefail
 
-root=$(cd "$(dirname "$0")/.." && pwd)
+# TMPDIR is read before the cd below, so a relative one means the caller's cwd.
+# Every temp path below goes under it (ft-bc7a0de6), so two worktrees running
+# this at once never share a backup dir, log dir or plan file.
+tmp_base=${TMPDIR:-/tmp}
+case "$tmp_base" in
+  -*) echo "guard_break_it: TMPDIR '$tmp_base' starts with '-'; use an absolute path or ./-name" >&2; exit 2 ;;
+  /*) ;;
+  *) tmp_base=$PWD/$tmp_base ;;
+esac
+tmp_base=${tmp_base%/}
+
+root=$(cd "$(dirname "$0")/.." && pwd) || exit 2
+[ -n "$root" ] || exit 2
 cd "$root" || exit 2
 
 test_timeout=${TESSL_GUARD_TEST_TIMEOUT:-1800}
@@ -426,7 +438,10 @@ if [ "$mode" = plan ]; then
   exit $?
 fi
 
-dirty=$(git status --porcelain --untracked-files=all -- tests/reductions.rs tests/nn_adversarial.rs)
+# git's exit status is read apart from its output: a git that cannot run prints
+# nothing, and nothing must not read as "both files match HEAD".
+dirty=$(git status --porcelain --untracked-files=all -- tests/reductions.rs tests/nn_adversarial.rs) ||
+  die "'git status --porcelain' failed (rc $?); cannot tell whether the test files match HEAD"
 if [ -n "$dirty" ] && [ "${TESSL_GUARD_ALLOW_DIRTY:-}" != 1 ]; then
   echo "guard_break_it: tests/reductions.rs or tests/nn_adversarial.rs differs from HEAD." >&2
   echo "$dirty" >&2
@@ -439,10 +454,21 @@ if [ "$mode" = check ]; then
   exit $?
 fi
 
-bak=$(mktemp -d /tmp/tessl-guard-bak.XXXXXX)
-cp tests/reductions.rs tests/nn_adversarial.rs "$bak/"
-before=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs)
+# hash_tests: the two test files' hashes. A shasum that fails must not give an
+# empty string that then "matches" another empty string after a restore.
+hash_tests() {
+  local out
+  out=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+bak=$(mktemp -d "$tmp_base/tessl-guard-bak.XXXXXX") || die "could not create a backup dir under $tmp_base"
+[ -n "$bak" ] && [ -d "$bak" ] || die "mktemp gave no backup dir under $tmp_base"
+cp tests/reductions.rs tests/nn_adversarial.rs "$bak/" || die "could not back up the test files to $bak"
+before=$(hash_tests) || die "shasum failed on the test files (rc $?)"
 restored=0
+planfile=""
 restore() {
   if [ "$restored" -eq 1 ]; then
     return
@@ -450,7 +476,7 @@ restore() {
   restored=1
   cp "$bak/reductions.rs" tests/reductions.rs || exit 2
   cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs || exit 2
-  after=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs)
+  after=$(hash_tests) || after="(shasum failed)"
   if [ "$before" != "$after" ]; then
     echo "guard_break_it: RESTORE FAILED" >&2
     echo "before: $before" >&2
@@ -458,6 +484,7 @@ restore() {
     exit 2
   fi
   rm -rf "$bak"
+  [ -z "$planfile" ] || rm -f "$planfile"
 }
 trap restore EXIT INT TERM HUP
 
@@ -510,7 +537,8 @@ classify() {
   echo "NOT RUN (exit $code)"
 }
 
-logdir=$(mktemp -d /tmp/tessl-guard-log.XXXXXX)
+logdir=$(mktemp -d "$tmp_base/tessl-guard-log.XXXXXX") || die "could not create a log dir under $tmp_base"
+[ -n "$logdir" ] && [ -d "$logdir" ] || die "mktemp gave no log dir under $tmp_base"
 caught=0
 missed=0
 notrun=0
@@ -524,7 +552,8 @@ run_cargo() {
     cargo test --manifest-path "$root/Cargo.toml" --test "$bin" -- "$name" --exact --test-threads=1 --nocapture
 }
 
-planfile=$(mktemp /tmp/tessl-guard-plan.XXXXXX)
+planfile=$(mktemp "$tmp_base/tessl-guard-plan.XXXXXX") || die "could not create a plan file under $tmp_base"
+[ -n "$planfile" ] && [ -f "$planfile" ] || die "mktemp gave no plan file under $tmp_base"
 py plan "$only" > "$planfile" || die "plan failed"
 current_bin=""
 current_test=""
@@ -551,7 +580,7 @@ while IFS= read -r line; do
       base_fail=$((base_fail + 1))
       note "BASELINE $current_bin $current_test $bver (log $blog)"
     fi
-    after_row=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs)
+    after_row=$(hash_tests) || die "shasum failed after the baseline of $current_bin $current_test"
     if [ "$before" != "$after_row" ]; then
       die "baseline changed a test file"
     fi
@@ -569,10 +598,10 @@ while IFS= read -r line; do
   if ! py apply "$id"; then
     note "$id NOT RUN (old string not unique)"
     notrun=$((notrun + 1))
-    restore_mid=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs)
+    restore_mid=$(hash_tests) || restore_mid="(shasum failed)"
     if [ "$before" != "$restore_mid" ]; then
-      cp "$bak/reductions.rs" tests/reductions.rs
-      cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs
+      cp "$bak/reductions.rs" tests/reductions.rs || die "could not restore tests/reductions.rs after $id"
+      cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs || die "could not restore tests/nn_adversarial.rs after $id"
     fi
     continue
   fi
@@ -581,11 +610,15 @@ while IFS= read -r line; do
   run_cargo "$current_bin" "$current_test" "$rlog"
   rcode=$?
   set -e
-  needle=$(py list | awk -F '\t' -v id="$id" '$1 == id { print $4; exit }')
+  # An empty needle makes `grep -F -q ""` match every log, so a py or awk that
+  # failed would read as CAUGHT for every row: refuse an empty one.
+  needle=$(py list | awk -F '\t' -v id="$id" '$1 == id { print $4; exit }') ||
+    die "could not read the needle for $id from the perturbation table"
+  [ -n "$needle" ] || die "empty needle for $id in the perturbation table"
   rver=$(classify "$rlog" "$rcode" "$needle")
-  cp "$bak/reductions.rs" tests/reductions.rs
-  cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs
-  after_row=$(shasum -a 256 tests/reductions.rs tests/nn_adversarial.rs)
+  cp "$bak/reductions.rs" tests/reductions.rs || die "could not restore tests/reductions.rs after $id"
+  cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs || die "could not restore tests/nn_adversarial.rs after $id"
+  after_row=$(hash_tests) || die "shasum failed after the restore for $id"
   if [ "$before" != "$after_row" ]; then
     die "restore after $id failed"
   fi

@@ -1242,3 +1242,420 @@ fn quit_is_trapped_and_nothing_dies_of_sigquit() {
         assert!(new.is_empty(), "a process died of SIGQUIT: new crash reports {new:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// ft-bc7a0de6: a check that could not run must not read as a check that passed.
+// The dirty-tree check, the denylist grep and the other tool calls of
+// check_release_ready.sh, then the same class in dev_fast_check.sh and
+// guard_break_it.sh.
+// ---------------------------------------------------------------------------
+
+/// Stand-in `grep`: exits 2 (a read error) when any argument contains
+/// `$FAKE_GREP_FAIL_ON`, otherwise runs the system grep.
+const FAKE_GREP: &str = "#!/bin/sh\n\
+for a in \"$@\"; do\n\
+  case \"$a\" in\n\
+    *\"$FAKE_GREP_FAIL_ON\"*) echo \"grep: $a: fake read error\" >&2; exit 2 ;;\n\
+  esac\n\
+done\n\
+for g in /usr/bin/grep /bin/grep; do\n\
+  [ -x \"$g\" ] && exec \"$g\" \"$@\"\n\
+done\n\
+exit 99\n";
+
+/// A tool that always fails with `rc`, saying so on stderr.
+fn failing_tool(rc: i32) -> String {
+    format!("#!/bin/sh\necho \"fake: tool failed\" >&2\nexit {rc}\n")
+}
+
+/// A directory holding one stand-in tool, to put first on `PATH`.
+fn tool_dir(name: &str, text: &str) -> Scratch {
+    let d = Scratch::dir("relready-tool");
+    write_exec(&d.join(name), text);
+    d
+}
+
+/// Run `fx` with `dir` first on `PATH` and `extra` in the environment.
+fn run_with_tool(fx: &Fixture, dir: &Path, extra: &[(&'static str, OsString)]) -> Out {
+    let tmpdir = Scratch::dir("relready-tmp");
+    let mut env = vec![ev("PATH", path_with(fx, &[dir]))];
+    env.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
+    run(fx, &Tmp::Set(tmpdir.path().into()), &env)
+}
+
+#[test]
+fn clean_checkout_is_released() {
+    let c = unique_crate("clean");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-clean", &["src/lib.rs"]);
+    let out = run_with_tool(&fx, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_released(&out, &c);
+}
+
+#[test]
+fn dirty_tracked_file_fails_before_any_build() {
+    let c = unique_crate("dirty");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-dirty", &["src/lib.rs"]);
+    std::fs::write(fx.path("repo/README.md"), "edited after the commit\n").unwrap();
+    let out = run_with_tool(&fx, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("working tree is dirty"), "{}", out.all());
+    assert!(out.stderr.contains(" M README.md"), "{}", out.all());
+    assert!(!out.all().contains("tag-dirty"), "a fake cargo ran\n{}", out.all());
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+}
+
+#[test]
+fn untracked_file_counts_as_dirty() {
+    let c = unique_crate("untracked");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-untracked", &["src/lib.rs"]);
+    std::fs::write(fx.path("repo/stray.txt"), "not committed\n").unwrap();
+    let out = run_with_tool(&fx, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("working tree is dirty"), "{}", out.all());
+    assert!(out.stderr.contains("?? stray.txt"), "{}", out.all());
+}
+
+#[test]
+fn failing_git_status_is_not_a_clean_tree() {
+    // A git that exits 128 prints nothing on stdout; that must not pass as clean.
+    let c = unique_crate("gitfail");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-gitfail", &["src/lib.rs"]);
+    let dir = tool_dir("git", &failing_tool(128));
+    let out = run_with_tool(&fx, &dir, &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(
+        out.stderr.contains("'git status --porcelain' failed (rc 128)"),
+        "{}",
+        out.all()
+    );
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+    assert!(!out.all().contains("tag-gitfail"), "a fake cargo ran\n{}", out.all());
+}
+
+#[test]
+fn not_a_repository_is_not_a_clean_tree() {
+    // The fixture repo with its .git removed: the real git fails (rc 128).
+    // The parent of the scratch dir must not itself be a work tree, or git
+    // would find that one; the guard below skips the case rather than lie.
+    let c = unique_crate("norepo");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-norepo", &["src/lib.rs"]);
+    std::fs::remove_dir_all(fx.path("repo/.git")).unwrap();
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(fx.path("repo"))
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .unwrap();
+    if probe.status.success() {
+        eprintln!("skipping: the scratch dir sits inside another git work tree");
+        return;
+    }
+    let out = run_with_tool(&fx, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("'git status --porcelain' failed"), "{}", out.all());
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+}
+
+#[test]
+fn denylist_grep_read_error_fails_closed() {
+    let c = unique_crate("grepdeny");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-grepdeny", &["src/lib.rs"]);
+    let dir = tool_dir("grep", FAKE_GREP);
+    let out = run_with_tool(&fx, &dir, &[ev("FAKE_GREP_FAIL_ON", "package.list")]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(
+        out.stderr.contains("grep failed (rc 2) reading ") && out.stderr.contains("package.list"),
+        "{}",
+        out.all()
+    );
+    assert!(out.stderr.contains("the denylist was not checked"), "{}", out.all());
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+    assert!(
+        !out.stdout.contains("cargo package --locked (verify build)"),
+        "the run went on past the unchecked denylist\n{}",
+        out.all()
+    );
+}
+
+#[test]
+fn denylist_match_and_clean_still_decide() {
+    // rc 0 (a denied path) fails, rc 1 (clean) passes: the rc-2 branch did not
+    // swallow either.
+    let c = unique_crate("denyrc");
+    let _tmp = CrateTmp::new(&c);
+    let denied = Fixture::new(&c, "tag-denied", &["src/lib.rs", "assets/concepts/a.png"]);
+    let out = run_with_tool(&denied, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("excluded/stale paths"), "{}", out.all());
+    assert!(out.all().contains("assets/concepts/a.png"), "{}", out.all());
+    let clean = Fixture::new(&c, "tag-denyclean", &["src/lib.rs"]);
+    let out = run_with_tool(&clean, Path::new("/nonexistent-tool-dir"), &[]);
+    assert_released(&out, &c);
+}
+
+#[test]
+fn changelog_footer_grep_read_error_is_not_a_missing_footer() {
+    // An unreadable CHANGELOG.md is a grep error and says so; it must not be
+    // reported as, or pass as, a footer verdict.
+    let c = unique_crate("grepfoot");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-grepfoot", &["src/lib.rs"]);
+    let dir = tool_dir("grep", FAKE_GREP);
+    let out = run_with_tool(&fx, &dir, &[ev("FAKE_GREP_FAIL_ON", "CHANGELOG.md")]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(
+        out.stderr.contains("grep failed (rc 2) reading CHANGELOG.md"),
+        "{}",
+        out.all()
+    );
+    assert!(!out.stderr.contains("missing footer link"), "{}", out.all());
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+}
+
+#[test]
+fn failing_uname_does_not_skip_the_docsrs_check() {
+    // A uname that fails used to read as "not Darwin" and skip DOCS_RS=1.
+    let c = unique_crate("uname");
+    let _tmp = CrateTmp::new(&c);
+    let fx = Fixture::new(&c, "tag-uname", &["src/lib.rs"]);
+    let dir = tool_dir("uname", &failing_tool(1));
+    let out = run_with_tool(&fx, &dir, &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("'uname -s' failed (rc 1)"), "{}", out.all());
+    assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+}
+
+// --- dev_fast_check.sh and guard_break_it.sh --------------------------------
+
+/// A throwaway committed repo holding one real script plus the files it needs,
+/// with a fake `cargo` that logs what it sees.
+struct ScriptRepo {
+    root: Scratch,
+}
+
+/// Stand-in `cargo`: `check` passes; `test` prints a passing result and writes
+/// the listing of `$TMPDIR` to `$FAKE_LS` so a test can see what the script put
+/// there while it ran.
+const FAKE_DEV_CARGO: &str = r#"#!/bin/sh
+case "$1" in
+check) exit 0 ;;
+test)
+  if [ -n "$FAKE_LS" ]; then ls "$TMPDIR" > "$FAKE_LS"; fi
+  echo "running 3 tests"
+  echo "test result: ok. 3 passed; 0 failed"
+  exit 0
+  ;;
+*) echo "fake cargo: unexpected arguments: $*" >&2; exit 97 ;;
+esac
+"#;
+
+/// Stand-in `cargo` for guard_break_it: every run is "no test result", so each
+/// baseline is red and the driver stops without editing any test. Records the
+/// listing of `$TMPDIR` on every call.
+const FAKE_GUARD_CARGO: &str = r#"#!/bin/sh
+if [ -n "$FAKE_LS" ]; then ls "$TMPDIR" >> "$FAKE_LS"; fi
+echo "fake cargo: no test result"
+exit 0
+"#;
+
+impl ScriptRepo {
+    fn new(script: &str, files: &[&str], cargo: &str) -> ScriptRepo {
+        let root = Scratch::dir("relready-script");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::create_dir_all(root.join("fakebin")).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts").join(script);
+        std::fs::copy(&src, repo.join("scripts").join(script)).unwrap();
+        for f in files {
+            std::fs::write(repo.join(f), "// fixture\n").unwrap();
+        }
+        write_exec(&root.join("fakebin/cargo"), cargo);
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "fx"]);
+        ScriptRepo { root }
+    }
+
+    /// Run `scripts/<script> <args>` with `dirs` ahead of the fake cargo on PATH.
+    fn run(
+        &self,
+        script: &str,
+        args: &[&str],
+        dirs: &[&Path],
+        tmpdir: Option<&Path>,
+        env: &[(&'static str, OsString)],
+    ) -> Out {
+        let mut path = OsString::new();
+        for d in dirs {
+            path.push(d);
+            path.push(":");
+        }
+        path.push(self.root.join("fakebin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        let mut cmd = Command::new("bash");
+        cmd.arg(self.root.join("repo/scripts").join(script))
+            .args(args)
+            .current_dir(self.root.join("repo"))
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        match tmpdir {
+            Some(t) => cmd.env("TMPDIR", t),
+            None => cmd.env_remove("TMPDIR"),
+        };
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pgid = child.id() as i32;
+        let out = drain(child.stdout.take().unwrap());
+        let err = drain(child.stderr.take().unwrap());
+        Spawned {
+            child: Some(child),
+            pgid,
+            out: Some(out),
+            err: Some(err),
+        }
+        .wait(120)
+    }
+}
+
+fn dev_repo() -> ScriptRepo {
+    ScriptRepo::new("dev_fast_check.sh", &[], FAKE_DEV_CARGO)
+}
+
+#[test]
+fn dev_fast_check_passes_when_tests_ran() {
+    let repo = dev_repo();
+    let tmp = Scratch::dir("relready-devtmp");
+    let out = repo.run("dev_fast_check.sh", &[], &[], Some(tmp.path()), &[]);
+    assert_eq!(out.code, Some(0), "{}", out.all());
+    assert!(out.stdout.contains("SUCCESS"), "{}", out.all());
+}
+
+#[test]
+fn dev_fast_check_grep_read_error_is_not_tests_ran() {
+    // grep rc 2 on the log used to read as "tests ran", so the run reported SUCCESS.
+    let repo = dev_repo();
+    let tmp = Scratch::dir("relready-devtmp");
+    let dir = tool_dir("grep", FAKE_GREP);
+    let out = repo.run(
+        "dev_fast_check.sh",
+        &[],
+        &[dir.path()],
+        Some(tmp.path()),
+        &[ev("FAKE_GREP_FAIL_ON", "tessl_fast_check_")],
+    );
+    assert_ne!(out.code, Some(0), "{}", out.all());
+    assert!(out.stderr.contains("grep failed (rc 2)"), "{}", out.all());
+    assert!(!out.stdout.contains("SUCCESS"), "{}", out.all());
+}
+
+#[test]
+fn dev_fast_check_log_lives_under_tmpdir_and_is_removed() {
+    let repo = dev_repo();
+    let tmp = Scratch::dir("relready-devtmp");
+    let ls = repo.root.join("ls.txt");
+    let out = repo.run(
+        "dev_fast_check.sh",
+        &[],
+        &[],
+        Some(tmp.path()),
+        &[ev("FAKE_LS", &ls)],
+    );
+    assert_eq!(out.code, Some(0), "{}", out.all());
+    let seen = std::fs::read_to_string(&ls).unwrap();
+    assert!(
+        seen.lines().any(|l| l.starts_with("tessl_fast_check_")),
+        "the log was not made under TMPDIR; it held: {seen:?}"
+    );
+    assert_eq!(entries(tmp.path()), Vec::<String>::new());
+}
+
+#[test]
+fn dev_fast_check_unusable_tmpdir_fails() {
+    let repo = dev_repo();
+    let missing = repo.root.join("no-such-tmpdir");
+    let out = repo.run("dev_fast_check.sh", &[], &[], Some(&missing), &[]);
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    assert!(out.stderr.contains("could not create a temp log"), "{}", out.all());
+    assert!(!out.stdout.contains("SUCCESS"), "{}", out.all());
+}
+
+fn guard_repo() -> ScriptRepo {
+    ScriptRepo::new(
+        "guard_break_it.sh",
+        &["tests/reductions.rs", "tests/nn_adversarial.rs"],
+        FAKE_GUARD_CARGO,
+    )
+}
+
+#[test]
+fn guard_break_it_failing_git_status_refuses() {
+    // A git that cannot run printed nothing, which read as "both test files
+    // match HEAD" and let the run go on to edit them.
+    let repo = guard_repo();
+    let tmp = Scratch::dir("relready-guardtmp");
+    let dir = tool_dir("git", &failing_tool(128));
+    let out = repo.run("guard_break_it.sh", &[], &[dir.path()], Some(tmp.path()), &[]);
+    assert_eq!(out.code, Some(2), "{}", out.all());
+    assert!(
+        out.stderr.contains("'git status --porcelain' failed (rc 128)"),
+        "{}",
+        out.all()
+    );
+    assert_eq!(entries(tmp.path()), Vec::<String>::new());
+}
+
+#[test]
+fn guard_break_it_failing_shasum_refuses() {
+    // An empty hash from a failed shasum used to equal the empty hash after the
+    // restore, so a restore that changed nothing proved nothing.
+    let repo = guard_repo();
+    let tmp = Scratch::dir("relready-guardtmp");
+    let dir = tool_dir("shasum", &failing_tool(1));
+    let out = repo.run("guard_break_it.sh", &[], &[dir.path()], Some(tmp.path()), &[]);
+    assert_eq!(out.code, Some(2), "{}", out.all());
+    assert!(out.stderr.contains("shasum failed"), "{}", out.all());
+}
+
+#[test]
+fn guard_break_it_temp_paths_live_under_tmpdir() {
+    let repo = guard_repo();
+    let tmp = Scratch::dir("relready-guardtmp");
+    let ls = repo.root.join("ls.txt");
+    let out = repo.run(
+        "guard_break_it.sh",
+        &[],
+        &[],
+        Some(tmp.path()),
+        &[ev("FAKE_LS", &ls)],
+    );
+    // Every baseline is red (no test result), so the verdict is failure.
+    assert_eq!(out.code, Some(1), "{}", out.all());
+    let seen = std::fs::read_to_string(&ls).unwrap();
+    for prefix in ["tessl-guard-bak.", "tessl-guard-log.", "tessl-guard-plan."] {
+        assert!(
+            seen.lines().any(|l| l.starts_with(prefix)),
+            "no {prefix}* under TMPDIR while the driver ran; it held: {seen:?}"
+        );
+    }
+    // The backup dir and the plan file are removed; only the log dir (which the
+    // summary points at) stays.
+    let left = entries(tmp.path());
+    assert!(
+        left.len() == 1 && left[0].starts_with("tessl-guard-log."),
+        "left behind: {left:?}\n{}",
+        out.all()
+    );
+}

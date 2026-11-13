@@ -139,13 +139,21 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
   echo "==> [Stage 3/3] Unit Tests (cargo test --lib ${TEST_ARGS[*]:-} -- --test-threads=1)"
   STAGE3_START=$(date +%s)
 
-  local_log=$(mktemp /tmp/tessl_fast_check_XXXXXX)
+  # TMPDIR is honoured (two worktrees running at once must not share a log),
+  # and an unusable one fails the run instead of logging to "" (ft-bc7a0de6).
+  tmp_base="${TMPDIR:-/tmp}"
+  local_log=$(mktemp "${tmp_base%/}/tessl_fast_check_XXXXXX") || {
+    echo "ERROR: could not create a temp log under '$tmp_base'" >&2
+    exit 1
+  }
   TMP_LOG_FILES+=("$local_log")
 
   set +e
   cargo test --lib "${TEST_ARGS[@]+"${TEST_ARGS[@]}"}" -- --test-threads=1 2>&1 | tee "$local_log"
-  TEST_RC=${PIPESTATUS[0]}
+  pipe_rcs=("${PIPESTATUS[@]}")
   set -e
+  TEST_RC=${pipe_rcs[0]}
+  TEE_RC=${pipe_rcs[1]}
 
   if [[ $TEST_RC -ne 0 ]]; then
     rm -f "$local_log"
@@ -153,7 +161,21 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
     exit "$TEST_RC"
   fi
 
-  if grep -qE "(running 0 tests|test result: .* 0 passed; 0 failed)" "$local_log"; then
+  # A tee that could not write leaves a log that proves nothing either way.
+  if [[ "$TEE_RC" -ne 0 ]]; then
+    echo "ERROR: tee failed (rc $TEE_RC) writing $local_log; cannot tell whether any test ran" >&2
+    exit 1
+  fi
+
+  # grep: 0 = nothing ran, 1 = tests ran, 2 or more = the log could not be read.
+  # Only 1 is "tests ran"; `if grep` would read an error as that.
+  grep_rc=0
+  grep -qE "(running 0 tests|test result: .* 0 passed; 0 failed)" "$local_log" || grep_rc=$?
+  if [[ "$grep_rc" -gt 1 ]]; then
+    echo "ERROR: grep failed (rc $grep_rc) reading $local_log; cannot tell whether any test ran" >&2
+    exit 1
+  fi
+  if [[ "$grep_rc" -eq 0 ]]; then
     rm -f "$local_log"
     echo "" >&2
     echo "======================================================================" >&2

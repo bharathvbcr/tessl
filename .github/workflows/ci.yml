@@ -147,6 +147,10 @@ jobs:
       - name: Whole model vs transformers (prefill, cached decode, shared snapshot)
         run: python3 tools/msl_emu/check_qwen35_model.py
       - name: Fast-math bounds
+        # MSL_EMU_OUT=/tmp/emu-* here and in the sanitizer steps below stays a
+        # fixed path (ft-bc7a0de6): this job owns its ubuntu-latest VM alone, each
+        # step uses its own name (emu-fast, emu-asan, emu-tsan), and a fixed path
+        # here cannot be shared with a peer run.
         run: MSL_EMU_OUT=/tmp/emu-fast python3 tools/msl_emu/check_qwen35.py --fast-math
       - name: Let the sanitizers map their shadow memory
         # Recent runner kernels randomise mmap with 32 bits, which leaves ASan
@@ -186,6 +190,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: code/research/tessl
+          # Full history for this tessl checkout only (ft-bab435ce): the
+          # fixture-provenance test in scripts/hosted_tests.sh resolves each
+          # fixture MANIFEST's generator_commit in git history, and the
+          # default fetch-depth of 1 holds only the tip commit. The ojas
+          # checkout below does not need it.
+          fetch-depth: 0
       - uses: actions/checkout@v4
         with:
           repository: bharathvbcr/ojas

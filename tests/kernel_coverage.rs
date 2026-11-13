@@ -651,8 +651,15 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
     assert!(t.failures[0].contains("older than kernels/*.metal"), "{:?}", t.failures);
     assert!(t.traced.is_empty());
 
-    // And a hang is bounded.
-    fake_bin(&bin, "bench_nn_kernels", "sleep 30");
+    // And a hang is bounded, and takes what the hung suite started with it: the
+    // shell is killed on the timeout, but its `sleep` used to outlive it, reparented
+    // to launchd, and outlived the whole test run (mac_heavy reaped it).
+    let pidfile = bin.join("hung_child.pid");
+    fake_bin(
+        &bin,
+        "bench_nn_kernels",
+        &format!("sleep 30 &\necho $! > '{}'\nwait", pidfile.display()),
+    );
     let t = kcov::run_suites(
         &[one_suite("bench_nn_kernels", &[], &[])],
         &bin,
@@ -661,6 +668,27 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
         1,
     );
     assert!(t.failures[0].contains("timed out after 1s"), "{:?}", t.failures);
+    let child: libc::pid_t = std::fs::read_to_string(&pidfile)
+        .expect("the hung suite recorded its child's pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let gone = |pid: libc::pid_t| {
+        // SAFETY: signal 0 only probes whether `pid` exists.
+        unsafe { libc::kill(pid, 0) == -1 }
+        &&std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !gone(child) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let survived = !gone(child);
+    if survived {
+        // Our own pid, recorded above; do not leave it for the next run.
+        // SAFETY: `child` is the pid the fake bin wrote for its own `sleep`.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+    }
+    assert!(!survived, "the hung suite's child {child} outlived the timeout");
 }
 
 #[test]

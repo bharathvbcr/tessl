@@ -9,7 +9,8 @@
 #![allow(dead_code)] // Each includer uses a subset.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// What a finished process left behind.
@@ -19,10 +20,36 @@ pub struct Ran {
     pub stderr: String,
 }
 
+/// How long a timed-out child gets to act on SIGTERM before its group is killed.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// End a timed-out child and everything it started. The child leads its own
+/// process group (see [`run_bounded`]), so the group is signalled, not only the
+/// child: a shell that runs `sleep 30` dies on a kill of the shell alone while
+/// the `sleep` lives on, reparented to launchd.
+fn stop_group(child: &mut Child) {
+    let group = -(child.id() as libc::pid_t);
+    // SAFETY: `kill` takes a pid and a signal; the negated pid is the group of
+    // the child spawned with `process_group(0)`, whose pid is its group id.
+    unsafe { libc::kill(group, libc::SIGTERM) };
+    let grace = Instant::now() + TERM_GRACE;
+    while Instant::now() < grace && !matches!(child.try_wait(), Ok(Some(_))) {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    // The leader may have exited on TERM with a descendant still running, so
+    // the group is killed either way; the child is then reaped.
+    // SAFETY: as above.
+    unsafe { libc::kill(group, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run `cmd` to completion within `secs`. `Err` is a process that could not be
-/// started or did not finish; a non-zero exit is a normal `Ok`.
+/// started or did not finish; a non-zero exit is a normal `Ok`. The child runs
+/// in its own process group, and a timeout ends the whole group.
 pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
     let mut child = cmd
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -42,11 +69,9 @@ pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if Instant::now() >= deadline => {
-                // Our own child, by handle. A grandchild that outlives it may
-                // still hold the pipes open, so the readers are left to finish
-                // by themselves rather than joined.
-                let _ = child.kill();
-                let _ = child.wait();
+                // The group is gone, so its pipes close and the readers finish by
+                // themselves; they are not joined.
+                stop_group(&mut child);
                 return Err(format!("timed out after {secs}s"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(15)),

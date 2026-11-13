@@ -106,42 +106,72 @@ fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn strip_comments(src: &str) -> String {
-    src.lines()
-        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// `src` with every comment blanked, string and char literals kept.
+///
+/// Byte for byte as long as `src`. Literals stay because a marker inside a
+/// string is the conservative side for the device scan; comments go because a
+/// marker named in prose opens nothing. Comments are found by the lexer in
+/// `literal_end`, not by cutting at the first `//`, which a `https://` inside a
+/// string also has (that cut dropped the rest of the line, quotes and braces
+/// included, and could leave a body unterminated).
+fn blank_comments(src: &str) -> String {
+    blank_tokens(src, false)
 }
 
-/// The `{...}` body of `fn name(`, or `None` if there is no such function.
-fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+/// The `{...}` body of `fn name(`: `Ok(None)` if `src` defines no such function,
+/// or defines it with no body (`fn name(..);` in a trait), and `Err` naming the
+/// function if its body cannot be delimited. There is no guessed span: the
+/// callers are checks, and a check that cannot read a body must say so rather
+/// than scan whatever text happens to follow it.
+///
+/// Structure is read off the literal-blanked copy, so the definition is never a
+/// `fn name(` quoted inside a string (a pin that asserts on another function's
+/// source holds exactly that), and a `{` or `}` in a string, raw string, byte
+/// string, char literal or comment is not counted. The span is taken from `src`
+/// itself, which `blank_literals` keeps offset-aligned.
+fn fn_body<'a>(src: &'a str, name: &str) -> Result<Option<&'a str>, String> {
+    let blank = blank_literals(src);
     let key = format!("fn {name}(");
-    let at = src.match_indices(&key).map(|(i, _)| i).find(|&i| {
-        src[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
-    })?;
-    let open = at + src[at..].find('{')?;
+    let Some(at) = blank
+        .match_indices(&key)
+        .map(|(i, _)| i)
+        .find(|&i| at_word_start(&blank, i))
+    else {
+        return Ok(None);
+    };
+    // The signature runs to the first `{` outside any parenthesis or bracket; a
+    // `;` out there first means a declaration with no body.
+    let mut nesting = 0usize;
+    let mut open = None;
+    for (i, c) in blank[at..].char_indices() {
+        match c {
+            '(' | '[' => nesting += 1,
+            ')' | ']' => nesting = nesting.saturating_sub(1),
+            ';' if nesting == 0 => return Ok(None),
+            '{' if nesting == 0 => {
+                open = Some(at + i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let open = open.ok_or_else(|| format!("`fn {name}(`: no `{{` after the signature"))?;
     let mut depth = 0usize;
-    for (i, c) in src[open..].char_indices() {
+    for (i, c) in blank[open..].char_indices() {
         match c {
             '{' => depth += 1,
             '}' => {
-                depth -= 1;
+                depth -= 1; // `open` is a `{`, so depth is at least 1 here
                 if depth == 0 {
-                    return Some(&src[open..open + i + 1]);
+                    return Ok(Some(&src[open..open + i + 1]));
                 }
             }
             _ => {}
         }
     }
-    // Braces inside string or char literals can leave the count open. Fall back
-    // to the text up to the next item: a longer span can only add markers, so
-    // the scan stays conservative.
-    let rest = &src[at..];
-    let end = rest[1..].find("\n#[test]").map_or(rest.len(), |i| i + 1);
-    Some(&rest[..end])
+    Err(format!(
+        "`fn {name}(`: its body opens at byte {open} and never closes ({depth} `{{` left open)"
+    ))
 }
 
 /// Every function name defined in `src`.
@@ -186,7 +216,7 @@ fn without_exempt_calls(body: &str) -> String {
 
 /// A device marker reachable from `test` through functions defined in `src`.
 fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
-    let src = strip_comments(src);
+    let src = blank_comments(src);
     let known = defined_fns(&src);
     let mut seen = HashSet::new();
     let mut work = vec![test.to_string()];
@@ -194,7 +224,7 @@ fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(body) = fn_body(&src, &name) else {
+        let Some(body) = fn_body(&src, &name)? else {
             if name == test {
                 return Err(format!("no `fn {test}(` found"));
             }
@@ -269,19 +299,24 @@ struct LibTest {
 ///
 /// Brace depth over the result is the real module nesting: a `{` inside a
 /// shader source, a JSON fixture or a doc comment cannot shift it. This is what
-/// `strip_comments` cannot do — it cuts at the first `//`, which a `https://`
+/// `blank_comments` is there for — it cuts at the first `//`, which a `https://`
 /// inside a string literal also has.
 ///
 /// Byte for byte as long as `src`, so an offset into one indexes the other: the
 /// structure is read off this, and an attribute's own text — a `#[path = "…"]`
 /// — off the source it came from.
 fn blank_literals(src: &str) -> String {
+    blank_tokens(src, true)
+}
+
+/// `blank_literals`, or with `strings` false only the comments blanked.
+fn blank_tokens(src: &str, strings: bool) -> String {
     let c: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
     while i < c.len() {
         let end = literal_end(&c, i);
-        if end > i {
+        if end > i && (strings || c[i] == '/') {
             for &ch in &c[i..end] {
                 if ch == '\n' {
                     out.push('\n');
@@ -292,6 +327,9 @@ fn blank_literals(src: &str) -> String {
                     }
                 }
             }
+            i = end;
+        } else if end > i {
+            out.extend(&c[i..end]);
             i = end;
         } else {
             out.push(c[i]);
@@ -1015,12 +1053,12 @@ fn the_device_marker_exemptions_are_still_pure() {
     for (path, file, name) in DEVICE_MARKER_EXEMPT {
         let full = root().join(file);
         let src = fs::read_to_string(&full).unwrap_or_else(|e| panic!("{path}: cannot read {}: {e}", full.display()));
-        let stripped = strip_comments(&src);
+        let stripped = blank_comments(&src);
 
         // One definition, or `fn_body` would be reading whichever came first.
         // Counted over literal-blanked source, which cannot mistake a `fn x(`
         // inside a string for a definition; the marker check below stays on
-        // `strip_comments` output, both to match what `device_marker` itself
+        // `blank_comments` output, both to match what `device_marker` itself
         // scans and because keeping string contents is the conservative side
         // for a check whose job is to refuse the exemption.
         let defined = fn_definitions(&blank_literals(&src), name);
@@ -1032,7 +1070,9 @@ fn the_device_marker_exemptions_are_still_pure() {
             full.display()
         );
 
-        let body = fn_body(&stripped, name).unwrap_or_else(|| panic!("{path}: no `fn {name}(` in {}", full.display()));
+        let body = fn_body(&stripped, name)
+            .unwrap_or_else(|e| panic!("{path}: {e} in {}", full.display()))
+            .unwrap_or_else(|| panic!("{path}: no `fn {name}(` with a body in {}", full.display()));
         for m in DEVICE_MARKERS {
             assert!(
                 !body.contains(m),
@@ -1070,6 +1110,114 @@ fn the_scanner_flags_a_planted_device_test() {
         device_marker("fn other() {}", "missing").is_err(),
         "a missing test must be an error, not a pass"
     );
+}
+
+/// `fn_body` unwrapped, for the self-tests below.
+fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+    fn_body(src, name)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .unwrap_or_else(|| panic!("no body for {name}"))
+}
+
+/// Braces in every literal and comment kind, none of which may move the count.
+/// The raw strings use `##` so a `"#` inside them is not their end.
+#[test]
+fn fn_body_ignores_braces_in_literals_and_comments() {
+    let src = r####"
+fn sig_comment(x: u8) /* { not the body */ -> u8 // { nor this
+{
+    let a = "open { and quote \" and close }";
+    let b = r##"raw { "# still raw } "##;
+    let c = b"byte {";
+    let d = br#"byte raw } "#;
+    let (e, f, g, h) = ('{', '}', '\'', b'}');
+    let i = '\u{7b}';
+    fn lifetime<'a>(s: &'a str) -> &'a str { s }
+    // a line comment with { and a https://x.y/z URL
+    /* a block comment with } /* nested { */ still a comment } */
+    let url = "https://example.com/{";
+    drop((a, b, c, d, e, f, g, h, i, url));
+    0
+}
+fn after() { let _rt = GpuRuntime::new(); }
+"####;
+    let body = body_of(src, "sig_comment");
+    assert!(body.starts_with("{\n    let a = \"open"), "body starts wrong: {body:?}");
+    assert!(body.ends_with("    0\n}"), "body ends wrong: {body:?}");
+    assert!(!body.contains("GpuRuntime"), "the body ran on into the next function");
+    assert_eq!(body_of(src, "after"), "{ let _rt = GpuRuntime::new(); }");
+}
+
+/// A body that cannot be delimited is an error naming the function, never a span
+/// guessed from the text after it.
+#[test]
+fn fn_body_refuses_a_body_it_cannot_delimit() {
+    let err = fn_body("fn open_ended() { let a = 1;\n#[test]\nfn next() {}\n", "open_ended").unwrap_err();
+    assert!(err.contains("open_ended") && err.contains("never closes"), "{err}");
+    let err = fn_body("fn headless(x: u8)", "headless").unwrap_err();
+    assert!(err.contains("headless"), "{err}");
+    // A declaration has no body to scan, and must not borrow the next item's.
+    assert_eq!(fn_body("fn decl(&self);\nfn other() { 1 }\n", "decl"), Ok(None));
+    assert_eq!(fn_body("fn other() {}", "absent"), Ok(None));
+    // `device_marker` surfaces it rather than reporting the test clean.
+    assert!(device_marker("fn t() { let a = 1;", "t").is_err());
+}
+
+/// The 3a83bda layout. A pin asserts on another function's source, so its body
+/// quotes `fn end_command_buffer(` and a `{` that never closes. The old scanner
+/// took the quoted text for a definition, counted from the quoted `{`, never
+/// closed, and ran on to the next `#[test]`: GpuRuntime tests appended after the
+/// pin were read as the pin's own code and the exact entry was refused. It must
+/// pass because the pin's body ends at its own brace, so the span is asserted.
+#[test]
+fn a_pin_that_quotes_a_function_is_not_charged_for_the_tests_after_it() {
+    let src = r#"
+#[test]
+fn pin() {
+    let ender = compact_fn(src, "fn end_command_buffer(");
+    let want = compact("fn end_command_buffer(&self) { self.endCommandBuffer();");
+    assert_eq!(ender, want);
+}
+
+#[test]
+fn appended_after_the_pin() {
+    let rt = GpuRuntime::new();
+    drop(rt);
+}
+"#;
+    assert_eq!(fn_body(src, "end_command_buffer"), Ok(None), "a quoted `fn x(` was read as a definition");
+    assert_eq!(device_marker(src, "pin"), Ok(None), "the pin was charged for the test after it");
+    assert!(device_marker(src, "appended_after_the_pin").unwrap().is_some());
+    let pin = body_of(src, "pin");
+    assert!(pin.ends_with("assert_eq!(ender, want);\n}"), "span: {pin:?}");
+}
+
+/// The false pass the old count allowed: a `}` in a string closed the body
+/// early, and a device use after it went unseen.
+#[test]
+fn a_device_use_after_a_brace_in_a_literal_is_still_flagged() {
+    for (label, lead) in [
+        ("string", r#"let s = "}";"#),
+        ("raw string", r##"let s = r#"} }"#;"##),
+        ("char", "let s = '}';"),
+        ("byte char", "let s = b'}';"),
+        ("byte string", r#"let s = b"}}";"#),
+        ("escaped quote", r#"let s = "\"}";"#),
+        ("url before a brace", r#"let s = "https://x/}"; let t = "}";"#),
+    ] {
+        let src = format!("#[test]\nfn pinned() {{\n    {lead}\n    let _rt = GpuRuntime::new();\n}}\n");
+        let found = device_marker(&src, "pinned").unwrap();
+        assert!(
+            found.is_some_and(|m| m.contains("GpuRuntime")),
+            "{label}: a GpuRuntime use after a brace in a literal went unseen"
+        );
+    }
+    // A `//` inside a string is not a comment: what follows it on the line is code.
+    let src = "#[test]\nfn pinned() { let u = \"https://x\"; let _rt = GpuRuntime::new(); }\n";
+    assert!(device_marker(src, "pinned").unwrap().is_some(), "a `//` in a string hid the rest of the line");
+    // And a marker named only in a comment still does not count.
+    let src = "#[test]\nfn fine() { let u = \"}\"; /* with_gpu } */ // GpuRuntime\n let _ = u; }\n";
+    assert!(device_marker(src, "fine").unwrap().is_none());
 }
 
 #[test]

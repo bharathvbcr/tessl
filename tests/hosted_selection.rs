@@ -118,60 +118,99 @@ fn blank_comments(src: &str) -> String {
     blank_tokens(src, false)
 }
 
-/// The `{...}` body of `fn name(`: `Ok(None)` if `src` defines no such function,
-/// or defines it with no body (`fn name(..);` in a trait), and `Err` naming the
-/// function if its body cannot be delimited. There is no guessed span: the
-/// callers are checks, and a check that cannot read a body must say so rather
-/// than scan whatever text happens to follow it.
-///
-/// Structure is read off the literal-blanked copy, so the definition is never a
-/// `fn name(` quoted inside a string (a pin that asserts on another function's
-/// source holds exactly that), and a `{` or `}` in a string, raw string, byte
-/// string, char literal or comment is not counted. The span is taken from `src`
-/// itself, which `blank_literals` keeps offset-aligned.
-fn fn_body<'a>(src: &'a str, name: &str) -> Result<Option<&'a str>, String> {
-    let blank = blank_literals(src);
-    let key = format!("fn {name}(");
-    let Some(at) = blank
+/// Where each `fn name` definition starts in `blank` (literal-blanked source):
+/// `fn name` at a word boundary, then optional whitespace, then `(` or `<`, so
+/// `fn helper<T>(` and `fn helper (` are definitions as well as `fn helper(`.
+fn fn_sites(blank: &str, name: &str) -> Vec<usize> {
+    let key = format!("fn {name}");
+    blank
         .match_indices(&key)
         .map(|(i, _)| i)
-        .find(|&i| at_word_start(&blank, i))
-    else {
-        return Ok(None);
-    };
-    // The signature runs to the first `{` outside any parenthesis or bracket; a
-    // `;` out there first means a declaration with no body.
-    let mut nesting = 0usize;
-    let mut open = None;
-    for (i, c) in blank[at..].char_indices() {
-        match c {
-            '(' | '[' => nesting += 1,
-            ')' | ']' => nesting = nesting.saturating_sub(1),
-            ';' if nesting == 0 => return Ok(None),
-            '{' if nesting == 0 => {
-                open = Some(at + i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let open = open.ok_or_else(|| format!("`fn {name}(`: no `{{` after the signature"))?;
-    let mut depth = 0usize;
-    for (i, c) in blank[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1; // `open` is a `{`, so depth is at least 1 here
-                if depth == 0 {
-                    return Ok(Some(&src[open..open + i + 1]));
+        .filter(|&i| {
+            let rest = blank[i + key.len()..].trim_start();
+            at_word_start(blank, i) && (rest.starts_with('(') || rest.starts_with('<'))
+        })
+        .collect()
+}
+
+/// Does `body` call `callee`: the name at a word boundary, then `(` or a
+/// turbofish (`callee::<T>(`), whitespace allowed before either.
+fn calls(body: &str, callee: &str) -> bool {
+    body.match_indices(callee).any(|(i, _)| {
+        let rest = body[i + callee.len()..].trim_start();
+        at_word_start(body, i) && (rest.starts_with('(') || rest.starts_with("::<"))
+    })
+}
+
+/// Every `{...}` body of a function named `name` in `src`, in source order.
+/// Empty if `src` defines none, or only declares it (`fn name(..);` in a trait).
+/// `Err` names the function if a body cannot be delimited. There is no guessed
+/// span: the callers are checks, and a check that cannot read a body must say so
+/// rather than scan whatever text happens to follow it.
+///
+/// A name can have several bodies (a trait declaration and each impl of it, or
+/// the same helper in two modules of one file). The scan cannot tell which one a
+/// call reaches, so every body is returned and the caller scans all of them: the
+/// conservative side, and the only one that cannot hide a device call behind a
+/// bodiless declaration that happens to come first.
+///
+/// Structure is read off the literal-blanked copy, so a definition is never a
+/// `fn name(` quoted inside a string (a pin that asserts on another function's
+/// source holds exactly that), and a `{` or `}` in a string, raw string, byte or
+/// C string, char literal or comment is not counted. Spans are taken from `src`
+/// itself, which `blank_literals` keeps offset-aligned.
+///
+/// Known gap: a helper defined by `macro_rules!` is not a `fn name` in the source
+/// text, so its body is never scanned. The scan reads source, not expansions.
+fn fn_bodies<'a>(src: &'a str, name: &str) -> Result<Vec<&'a str>, String> {
+    let blank = blank_literals(src);
+    let mut bodies = Vec::new();
+    for at in fn_sites(&blank, name) {
+        // The signature runs to the first `{` outside any parenthesis or bracket;
+        // a `;` out there first means a declaration with no body.
+        let mut nesting = 0usize;
+        let mut open = None;
+        let mut declaration = false;
+        for (i, c) in blank[at..].char_indices() {
+            match c {
+                '(' | '[' => nesting += 1,
+                ')' | ']' => nesting = nesting.saturating_sub(1),
+                ';' if nesting == 0 => {
+                    declaration = true;
+                    break;
                 }
+                '{' if nesting == 0 => {
+                    open = Some(at + i);
+                    break;
+                }
+                _ => {}
             }
-            _ => {}
         }
+        if declaration {
+            continue;
+        }
+        let open = open.ok_or_else(|| format!("`fn {name}`: no `{{` after the signature"))?;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in blank[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1; // `open` is a `{`, so depth is at least 1 here
+                    if depth == 0 {
+                        end = Some(open + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.ok_or_else(|| {
+            format!("`fn {name}`: its body opens at byte {open} and never closes ({depth} `{{` left open)")
+        })?;
+        bodies.push(&src[open..end]);
     }
-    Err(format!(
-        "`fn {name}(`: its body opens at byte {open} and never closes ({depth} `{{` left open)"
-    ))
+    Ok(bodies)
 }
 
 /// Every function name defined in `src`.
@@ -224,24 +263,24 @@ fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(body) = fn_body(&src, &name)? else {
-            if name == test {
-                return Err(format!("no `fn {test}(` found"));
-            }
-            continue;
-        };
-        // Only the exempt call paths are blanked, and only for the marker scan;
-        // every other mention of a device type still counts, and the call-graph
-        // walk below still sees the body as written.
-        let scanned = without_exempt_calls(body);
-        for m in DEVICE_MARKERS {
-            if scanned.contains(m) {
-                return Ok(Some(format!("{name} mentions {m}")));
-            }
+        let bodies = fn_bodies(&src, &name)?;
+        if bodies.is_empty() && name == test {
+            return Err(format!("no `fn {test}(` with a body found"));
         }
-        for callee in &known {
-            if body.contains(&format!("{callee}(")) {
-                work.push(callee.clone());
+        for body in bodies {
+            // Only the exempt call paths are blanked, and only for the marker scan;
+            // every other mention of a device type still counts, and the call-graph
+            // walk below still sees the body as written.
+            let scanned = without_exempt_calls(body);
+            for m in DEVICE_MARKERS {
+                if scanned.contains(m) {
+                    return Ok(Some(format!("{name} mentions {m}")));
+                }
+            }
+            for callee in &known {
+                if calls(body, callee) {
+                    work.push(callee.clone());
+                }
             }
         }
     }
@@ -372,11 +411,11 @@ fn literal_end(c: &[char], i: usize) -> usize {
             j
         }
         '"' => quoted_end(c, i + 1),
-        // `b"…"`, `r"…"`, `br"…"` and their `#`-hashed raw forms. A name
+        // `b"…"`, `c"…"`, `r"…"`, `br"…"`, `cr"…"` and their `#`-hashed raw forms. A name
         // character in front means this is the tail of an identifier.
-        'b' | 'r' if i == 0 || !name_char(c[i - 1]) => {
+        'b' | 'c' | 'r' if i == 0 || !name_char(c[i - 1]) => {
             let mut j = i;
-            if at(j) == 'b' {
+            if at(j) == 'b' || at(j) == 'c' {
                 j += 1;
             }
             if at(j) == 'r' {
@@ -393,15 +432,21 @@ fn literal_end(c: &[char], i: usize) -> usize {
                 i
             }
         }
-        // A char literal, against a lifetime: `'a'` against `'a`.
+        // A char literal, against a lifetime: `'a'` against `'a`. Every escape
+        // form: `'\n'`, `'\''`, `'\\'`, `'\x41'` (two hex digits), `'\u{7b}'`.
         '\'' if at(i + 1) == '\\' => {
-            let mut j = i + 2;
-            if at(j) == 'u' && at(j + 1) == '{' {
-                while j < c.len() && at(j) != '}' {
+            let mut j = i + 3;
+            match at(i + 2) {
+                'x' => j = i + 5,
+                'u' if at(i + 3) == '{' => {
+                    j = i + 4;
+                    while j < c.len() && at(j) != '}' {
+                        j += 1;
+                    }
                     j += 1;
                 }
+                _ => {}
             }
-            j += 1;
             if at(j) == '\'' {
                 j + 1
             } else {
@@ -660,13 +705,12 @@ fn lib_tests_matching<'a>(all: &'a [LibTest], filter: &str) -> Vec<&'a LibTest> 
 
 /// How many `fn NAME(` definitions `src` has, counted at a name boundary.
 fn fn_definitions(src: &str, name: &str) -> usize {
-    let key = format!("fn {name}(");
-    src.match_indices(&key).filter(|&(i, _)| at_word_start(src, i)).count()
+    fn_sites(src, name).len()
 }
 
 /// Scan one resolved test, reading each file at most once. A leaf name defined
-/// twice in the same file is refused rather than guessed at: `fn_body` takes
-/// the first match, and in a file with a dozen test modules that need not be
+/// twice in the same file is refused rather than guessed at: `fn_bodies` returns
+/// every match, and in a file with a dozen test modules that need not be
 /// the one the filter selected.
 fn scan_resolved(test: &LibTest, cache: &mut HashMap<PathBuf, String>, what: &str) {
     let src = cache.entry(test.file.clone()).or_insert_with(|| {
@@ -1042,7 +1086,7 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
 /// is a claim someone checked once; it would go on passing the day its function
 /// grew a device call, and the exemption is exactly what would hide that from
 /// every test calling it. So the claim is re-derived on every run, from the same
-/// `fn_body` and `DEVICE_MARKERS` the scan itself uses.
+/// `fn_bodies` and `DEVICE_MARKERS` the scan itself uses.
 #[test]
 fn the_device_marker_exemptions_are_still_pure() {
     assert!(
@@ -1055,7 +1099,7 @@ fn the_device_marker_exemptions_are_still_pure() {
         let src = fs::read_to_string(&full).unwrap_or_else(|e| panic!("{path}: cannot read {}: {e}", full.display()));
         let stripped = blank_comments(&src);
 
-        // One definition, or `fn_body` would be reading whichever came first.
+        // One definition, or the exemption would rest on whichever body came first.
         // Counted over literal-blanked source, which cannot mistake a `fn x(`
         // inside a string for a definition; the marker check below stays on
         // `blank_comments` output, both to match what `device_marker` itself
@@ -1070,9 +1114,15 @@ fn the_device_marker_exemptions_are_still_pure() {
             full.display()
         );
 
-        let body = fn_body(&stripped, name)
-            .unwrap_or_else(|e| panic!("{path}: {e} in {}", full.display()))
-            .unwrap_or_else(|| panic!("{path}: no `fn {name}(` with a body in {}", full.display()));
+        let bodies = fn_bodies(&stripped, name).unwrap_or_else(|e| panic!("{path}: {e} in {}", full.display()));
+        assert_eq!(
+            bodies.len(),
+            1,
+            "{path}: `fn {name}` has {} bodies in {}",
+            bodies.len(),
+            full.display()
+        );
+        let body = bodies[0];
         for m in DEVICE_MARKERS {
             assert!(
                 !body.contains(m),
@@ -1112,11 +1162,11 @@ fn the_scanner_flags_a_planted_device_test() {
     );
 }
 
-/// `fn_body` unwrapped, for the self-tests below.
+/// The one body of `name` in `src`, for the self-tests below.
 fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
-    fn_body(src, name)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .unwrap_or_else(|| panic!("no body for {name}"))
+    let bodies = fn_bodies(src, name).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(bodies.len(), 1, "expected one body for {name}, got {bodies:?}");
+    bodies[0]
 }
 
 /// Braces in every literal and comment kind, none of which may move the count.
@@ -1152,13 +1202,13 @@ fn after() { let _rt = GpuRuntime::new(); }
 /// guessed from the text after it.
 #[test]
 fn fn_body_refuses_a_body_it_cannot_delimit() {
-    let err = fn_body("fn open_ended() { let a = 1;\n#[test]\nfn next() {}\n", "open_ended").unwrap_err();
+    let err = fn_bodies("fn open_ended() { let a = 1;\n#[test]\nfn next() {}\n", "open_ended").unwrap_err();
     assert!(err.contains("open_ended") && err.contains("never closes"), "{err}");
-    let err = fn_body("fn headless(x: u8)", "headless").unwrap_err();
+    let err = fn_bodies("fn headless(x: u8)", "headless").unwrap_err();
     assert!(err.contains("headless"), "{err}");
     // A declaration has no body to scan, and must not borrow the next item's.
-    assert_eq!(fn_body("fn decl(&self);\nfn other() { 1 }\n", "decl"), Ok(None));
-    assert_eq!(fn_body("fn other() {}", "absent"), Ok(None));
+    assert_eq!(fn_bodies("fn decl(&self);\nfn other() { 1 }\n", "decl"), Ok(vec![]));
+    assert_eq!(fn_bodies("fn other() {}", "absent"), Ok(vec![]));
     // `device_marker` surfaces it rather than reporting the test clean.
     assert!(device_marker("fn t() { let a = 1;", "t").is_err());
 }
@@ -1186,8 +1236,8 @@ fn appended_after_the_pin() {
 }
 "#;
     assert_eq!(
-        fn_body(src, "end_command_buffer"),
-        Ok(None),
+        fn_bodies(src, "end_command_buffer"),
+        Ok(vec![]),
         "a quoted `fn x(` was read as a definition"
     );
     assert_eq!(
@@ -1229,6 +1279,133 @@ fn a_device_use_after_a_brace_in_a_literal_is_still_flagged() {
     // And a marker named only in a comment still does not count.
     let src = "#[test]\nfn fine() { let u = \"}\"; /* with_gpu } */ // GpuRuntime\n let _ = u; }\n";
     assert!(device_marker(src, "fine").unwrap().is_none());
+}
+
+/// A trait declaration comes before its impls. The declaration has no body, and
+/// must not stand in for the definitions: the old scanner took the first
+/// `fn go(`, found nothing to scan, and a device call in an impl went unseen.
+/// Every body of the name is scanned, because the scan cannot tell which impl a
+/// call reaches.
+#[test]
+fn a_bodyless_declaration_does_not_hide_the_impl_that_follows() {
+    let src = "trait T { fn go(&self); }\n\
+               impl T for A { fn go(&self) { let _ = 1; } }\n\
+               impl T for B { fn go(&self) { let _rt = GpuRuntime::new(); } }\n\
+               #[test]\nfn t() { A.go(); }\n";
+    assert_eq!(
+        fn_bodies(src, "go").unwrap().len(),
+        2,
+        "declaration kept, two impls expected"
+    );
+    assert!(
+        device_marker(src, "t")
+            .unwrap()
+            .is_some_and(|m| m.contains("go mentions GpuRuntime")),
+        "a device call in the second impl went unseen"
+    );
+    // A name only ever declared has no body to scan and is not an error.
+    let src = "trait T { fn go(&self); }\n#[test]\nfn t() { A.go(); }\n";
+    assert_eq!(device_marker(src, "t"), Ok(None));
+}
+
+/// Char escapes other than `\n`, `\'`, `\\` and `\u{..}`: `'\x41'` was not
+/// read as a literal, so the `'` after it opened a bogus one and swallowed a real
+/// brace, closing the body early.
+#[test]
+fn every_char_escape_form_is_one_literal() {
+    for lit in ["'\\n'", "'\\x41'", "'\\u{7b}'", "'\\''", "'\\\\'", "'\\0'", "b'\\x7d'"] {
+        let src = format!("#[test]\nfn t() {{ let c = ({lit}, '}}'); let _rt = GpuRuntime::new(); }}\n");
+        assert!(
+            device_marker(&src, "t").unwrap().is_some(),
+            "{lit} was not read as a single literal: the body closed early"
+        );
+        let src = format!("fn t() {{ let c = ({lit}, '}}'); let z = 1; }}\nfn u() {{ }}\n");
+        assert!(
+            body_of(&src, "t").ends_with("let z = 1; }"),
+            "{lit}: the span of `t` is wrong"
+        );
+    }
+}
+
+/// C-string literals (`c"…"`, `cr#"…"#`) hold braces like any other string.
+#[test]
+fn c_strings_are_literals() {
+    for lit in [r#"c"}""#, r##"cr#"} "#"##, r#"c"\"}""#, r#"cr"}""#] {
+        let src = format!("#[test]\nfn t() {{ let s = {lit}; let _rt = GpuRuntime::new(); }}\n");
+        assert!(
+            device_marker(&src, "t").unwrap().is_some(),
+            "{lit}: a brace in a C string closed the body early"
+        );
+    }
+}
+
+/// Helpers the call walk could not reach: generic (`fn helper<T>(`), spaced
+/// (`fn helper (`), called through a turbofish.
+#[test]
+fn generic_and_spaced_helpers_are_scanned() {
+    for (label, def, call) in [
+        (
+            "generic",
+            "fn helper<T: Copy>(x: T) { let _rt = GpuRuntime::new(); }",
+            "helper(1);",
+        ),
+        ("spaced", "fn helper () { let _rt = GpuRuntime::new(); }", "helper();"),
+        (
+            "turbofish",
+            "fn helper<T>() { let _rt = GpuRuntime::new(); }",
+            "helper::<u8>();",
+        ),
+        (
+            "spaced call",
+            "fn helper() { let _rt = GpuRuntime::new(); }",
+            "helper ();",
+        ),
+    ] {
+        let src = format!("{def}\n#[test]\nfn t() {{ {call} }}\n");
+        assert!(
+            device_marker(&src, "t").unwrap().is_some(),
+            "{label}: the helper's device call went unseen"
+        );
+    }
+    // A longer name is not the helper: `fn helper_two(` is not `fn helper`.
+    let src = "fn helper_two() { let _rt = GpuRuntime::new(); }\n#[test]\nfn t() { helper(); }\n";
+    assert_eq!(device_marker(src, "t"), Ok(None));
+}
+
+/// A device marker inside a string literal counts. A string can be `format!`ed
+/// into a command that opens a device, and the scan cannot tell, so it takes the
+/// conservative side. `blank_comments` must blank comments only: if it ever
+/// blanked strings too, this goes red.
+#[test]
+fn a_marker_inside_a_string_literal_still_counts() {
+    let src = "#[test]\nfn t() { let s = \"GpuRuntime\"; drop(s); }\n";
+    assert!(device_marker(src, "t")
+        .unwrap()
+        .is_some_and(|m| m.contains("GpuRuntime")));
+    let src = "#[test]\nfn t() { let s = r#\"with_gpu\"#; drop(s); }\n";
+    assert!(device_marker(src, "t").unwrap().is_some());
+    assert_eq!(
+        blank_comments("let s = \"a // b\"; // c\n"),
+        "let s = \"a // b\";     \n"
+    );
+}
+
+/// A quoted definition that is followed by a block, `"fn x() { }"`, is as good
+/// a definition as the real one to a lookup on raw source. The real `x` is
+/// later and opens a device; the walk must reach it, not the quoted empty one.
+#[test]
+fn a_quoted_definition_with_a_body_does_not_shadow_the_real_one() {
+    let src = "#[test]\nfn pin() { let q = \"fn x() { }\"; x(); }\n\
+               fn x() { let _rt = GpuRuntime::new(); }\n";
+    assert_eq!(
+        fn_bodies(src, "x").unwrap().len(),
+        1,
+        "the quoted text counted as a definition"
+    );
+    assert_eq!(body_of(src, "x"), "{ let _rt = GpuRuntime::new(); }");
+    assert!(device_marker(src, "pin")
+        .unwrap()
+        .is_some_and(|m| m.contains("x mentions GpuRuntime")));
 }
 
 #[test]

@@ -66,6 +66,13 @@ pub struct StampLog {
     dropped_batches: u32,
 }
 
+impl StampLog {
+    /// Count one armed command buffer whose stamps were discarded.
+    fn note_dropped(&mut self) {
+        self.dropped_batches += 1;
+    }
+}
+
 /// One dispatch, as seen by the stamps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchStamp {
@@ -120,7 +127,7 @@ impl GpuRuntime {
     pub(crate) fn arm_dispatch_stamps(&self) {
         let Ok(mut log) = self.stamp_log.lock() else { return };
         if log.armed && !log.meta.is_empty() {
-            log.dropped_batches += 1;
+            log.note_dropped();
         }
         log.meta.clear();
         log.barrier_pending = false;
@@ -355,5 +362,50 @@ mod tests {
         assert!(batch.overflowed);
         assert!(batch.stamps.len() < STAMP_HEAP_SLOTS);
         crate::ab_flags::set_dispatch_stamps(false);
+    }
+}
+
+/// Device-free: the counters are plain integers, so these run in the hosted pass.
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    fn batch(dropped_batches: u32, command_buffers: u32) -> DispatchStampBatch {
+        DispatchStampBatch {
+            freq_hz: 1,
+            t0_ns: 0,
+            stamps: Vec::new(),
+            overflowed: false,
+            dropped_batches,
+            command_buffers,
+        }
+    }
+
+    #[test]
+    fn dropped_batches_saturate_at_u32_max() {
+        let mut log = StampLog {
+            dropped_batches: u32::MAX - 1,
+            ..StampLog::default()
+        };
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, u32::MAX);
+        log.note_dropped();
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, u32::MAX, "a saturated count stays a floor");
+    }
+
+    #[test]
+    fn merge_saturates_both_counters_at_u32_max() {
+        let mut a = batch(u32::MAX - 1, u32::MAX - 1);
+        a.merge(batch(5, 5));
+        assert_eq!(a.dropped_batches, u32::MAX);
+        assert_eq!(a.command_buffers, u32::MAX);
+    }
+
+    #[test]
+    fn merge_below_the_limit_is_still_exact() {
+        let mut a = batch(2, 1);
+        a.merge(batch(3, 4));
+        assert_eq!((a.dropped_batches, a.command_buffers), (5, 5));
     }
 }

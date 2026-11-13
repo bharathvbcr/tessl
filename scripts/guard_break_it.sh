@@ -17,7 +17,8 @@
 #   scripts/guard_break_it.sh --list
 #   scripts/guard_break_it.sh [--only id,id] baselines, then one perturbation at a time
 #
-# The two test files are copied aside and restored by an EXIT/INT/TERM/HUP trap.
+# The two test files are copied aside and restored by an EXIT/INT/TERM/HUP trap
+# (a signal restores, then exits 128+signal).
 # The run refuses to start when either file differs from HEAD unless
 # TESSL_GUARD_ALLOW_DIRTY=1. Restore puts back the bytes from the start of the
 # run, and the script exits non-zero if those hashes do not match.
@@ -463,30 +464,47 @@ hash_tests() {
   printf '%s\n' "$out"
 }
 
-bak=$(mktemp -d "$tmp_base/tessl-guard-bak.XXXXXX") || die "could not create a backup dir under $tmp_base"
-[ -n "$bak" ] && [ -d "$bak" ] || die "mktemp gave no backup dir under $tmp_base"
-cp tests/reductions.rs tests/nn_adversarial.rs "$bak/" || die "could not back up the test files to $bak"
-before=$(hash_tests) || die "shasum failed on the test files (rc $?)"
-restored=0
+# The cleanup trap goes in BEFORE the first temp path is made, so a run that
+# dies early (mktemp, the backup copy, the first hash) still removes what it made.
+# Test files are only copied back once the backup is complete and hashed
+# (backed_up=1): before that nothing has been edited, so there is nothing to put
+# back, and a half-made backup must never overwrite a good file.
+bak=""
 planfile=""
+before=""
+backed_up=0
+restored=0
 restore() {
   if [ "$restored" -eq 1 ]; then
     return
   fi
   restored=1
-  cp "$bak/reductions.rs" tests/reductions.rs || exit 2
-  cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs || exit 2
-  after=$(hash_tests) || after="(shasum failed)"
-  if [ "$before" != "$after" ]; then
-    echo "guard_break_it: RESTORE FAILED" >&2
-    echo "before: $before" >&2
-    echo "after:  $after" >&2
-    exit 2
-  fi
-  rm -rf "$bak"
   [ -z "$planfile" ] || rm -f "$planfile"
+  if [ "$backed_up" -eq 1 ]; then
+    cp "$bak/reductions.rs" tests/reductions.rs || exit 2
+    cp "$bak/nn_adversarial.rs" tests/nn_adversarial.rs || exit 2
+    after=$(hash_tests) || after="(shasum failed)"
+    if [ "$before" != "$after" ]; then
+      echo "guard_break_it: RESTORE FAILED" >&2
+      echo "before: $before" >&2
+      echo "after:  $after" >&2
+      exit 2
+    fi
+  fi
+  [ -z "$bak" ] || rm -rf "$bak"
 }
-trap restore EXIT INT TERM HUP
+# A signal restores and then EXITS: a handler that returned would let the loop
+# go on perturbing files after the backup was gone (128 + signal number).
+trap restore EXIT
+trap 'restore; exit 130' INT
+trap 'restore; exit 143' TERM
+trap 'restore; exit 129' HUP
+
+bak=$(mktemp -d "$tmp_base/tessl-guard-bak.XXXXXX") || die "could not create a backup dir under $tmp_base"
+[ -n "$bak" ] && [ -d "$bak" ] || die "mktemp gave no backup dir under $tmp_base"
+cp tests/reductions.rs tests/nn_adversarial.rs "$bak/" || die "could not back up the test files to $bak"
+before=$(hash_tests) || die "shasum failed on the test files (rc $?)"
+backed_up=1
 
 run_bounded() {
   perl -e '

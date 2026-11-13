@@ -74,6 +74,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          # An empty version (no `version = "..."` line) must not read as a match
+          # or reach GITHUB_ENV: fail here (ft-bc7a0de6).
+          if [[ -z "$VERSION" ]]; then
+            echo "error: could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
           # Anything that publishes must come from a v* tag matching Cargo.toml.
           # Only a dispatch dry run (publishes nothing) may run from a branch.
           if [[ "${{ github.event_name }}" == "push" || "${{ inputs.dry_run }}" == "false" ]]; then

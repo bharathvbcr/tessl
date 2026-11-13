@@ -16,6 +16,19 @@
 
 set -euo pipefail
 
+# TMPDIR is read before the cd below, so a relative one means the caller's cwd
+# (as in check_release_ready.sh and guard_break_it.sh). A leading '-' would be
+# parsed by mktemp as a flag: refuse it with our own error.
+tmp_base="${TMPDIR:-/tmp}"
+case "$tmp_base" in
+  -*)
+    echo "ERROR: TMPDIR '$tmp_base' starts with '-'; use an absolute path or ./-name" >&2
+    exit 1
+    ;;
+  /*) ;;
+  *) tmp_base="$PWD/$tmp_base" ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -141,7 +154,6 @@ if [[ "$SKIP_TESTS" -eq 0 ]]; then
 
   # TMPDIR is honoured (two worktrees running at once must not share a log),
   # and an unusable one fails the run instead of logging to "" (ft-bc7a0de6).
-  tmp_base="${TMPDIR:-/tmp}"
   local_log=$(mktemp "${tmp_base%/}/tessl_fast_check_XXXXXX") || {
     echo "ERROR: could not create a temp log under '$tmp_base'" >&2
     exit 1

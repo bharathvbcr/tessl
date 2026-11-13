@@ -934,7 +934,7 @@ fn a_call_that_fails_after_encoding_returns_only_after_its_work_completes() {
     let n = 4096usize;
     let src = rt.alloc_buffer(n * 4).unwrap();
     let dst = rt.alloc_buffer(n * 4).unwrap();
-    src.write_f32(&(0..n).map(|i| i as f32 + 1.0).collect::<Vec<_>>());
+    src.write_f32(&Vec::from_fn(n, |i| i as f32 + 1.0));
     dst.write_f32(&vec![0.0; n]);
     let pipe = rt.pipeline("copy_f32").unwrap();
     // The destination's bytes without the buffer's own accessors: those wait
@@ -1077,7 +1077,7 @@ fn write_entry(model: *mut TesslQwen35, i: usize, src: &[f32]) -> (i32, String) 
 }
 
 /// A NaN payload no read produces. (A fn from when the floor was 1.82; `f32::from_bits`
-/// is const from 1.83, well under the 1.97 this crate now declares.)
+/// is const from 1.83, well under the 1.100 this crate now declares.)
 fn guard() -> f32 {
     f32::from_bits(0x7FC0_DEAD)
 }
@@ -1355,7 +1355,7 @@ fn turning_async_encode_off_waits_for_work_in_flight() {
     let n = 4096usize;
     let src = rt.alloc_buffer(n * 4).unwrap();
     let dst = rt.alloc_buffer(n * 4).unwrap();
-    src.write_f32(&(0..n).map(|i| i as f32 + 1.0).collect::<Vec<_>>());
+    src.write_f32(&Vec::from_fn(n, |i| i as f32 + 1.0));
     dst.write_f32(&vec![0.0; n]);
     let pipe = rt.pipeline("copy_f32").unwrap();
     let before = rt.last_signaled_value();

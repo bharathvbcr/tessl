@@ -6,6 +6,24 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Rust floor raised to 1.100** (owner override, 2026-11-12; it was 1.97). `Cargo.toml`,
+  `go/engine/Cargo.toml` and `numcheck/Cargo.toml` declare `rust-version = "1.100"`, as does the
+  ojas workspace this crate path-depends on, and the README badge and requirement lines say 1.100+.
+  The `msrv` job still reads the field from the manifest. Verified at the floor on 2026-11-12:
+  `cargo +1.100.0 check --locked --all-targets` and
+  `cargo +1.100.0 check --locked --features quant-prep` both exit 0. Adopted from 1.100:
+  `trim_prefix` and `trim_suffix` in tests, `std::mem::DropGuard` for single-use test restorers,
+  `Vec::from_fn` for index-only `collect`s, and 1.100's `needless_range_loop` fixed in
+  `src/media/jpeg/huff.rs`, `tests/embedgemma2_kernels.rs` and
+  `tests/embedgemma2_vision_model.rs`. A `.cargo/config.toml` (also in `go/engine`)
+  holds back crate versions published less than 3 days ago.
+- **Cargo 1.100 build-dir layout.** Test and bench binaries are in
+  `target/<profile>/build/<pkg>/<hash>/out/`, not `deps/`: `src/bin/common/mod.rs`
+  (`others_running`) recognises both, and the metallib check in `metal-compile.yml` globs both
+  `build/*/out/` and `build/*/*/out/`.
+
 ### Removed
 
 - **Duplicate `safetensors`, `json`, `npy`, and `plain` parsers (-1,595 LOC)** (`src/lib.rs`,

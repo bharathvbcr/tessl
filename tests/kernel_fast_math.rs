@@ -452,7 +452,7 @@ fn no_kernel_spells_an_infinity_in_code() {
     for path in &sources {
         let src = std::fs::read_to_string(path).expect("kernel source is readable UTF-8");
         for line in infinity_lines(&strip_comments(&src)) {
-            hits.push(format!("{}:{line}", path.strip_prefix(&root).unwrap_or(path).display()));
+            hits.push(format!("{}:{line}", path.trim_prefix(&root).display()));
         }
     }
     assert!(
@@ -511,7 +511,7 @@ fn no_kernel_uses_a_fast_math_poison_constant() {
     for path in kernel_sources(&root) {
         let src = std::fs::read_to_string(&path).expect("kernel source is readable UTF-8");
         let code = strip_comments(&src);
-        let name = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        let name = path.trim_prefix(&root).display().to_string();
         for token in POISON_TOKENS {
             for line in token_lines(&code, token) {
                 hits.push(format!("{name}:{line} {token}"));
@@ -536,10 +536,7 @@ fn no_kernel_compares_a_value_with_itself() {
     for path in kernel_sources(&root) {
         let src = std::fs::read_to_string(&path).expect("kernel source is readable UTF-8");
         for line in self_compare_lines(&strip_comments(&src)) {
-            hits.push(format!(
-                "{}:{line}",
-                path.strip_prefix(&root).unwrap_or(&path).display()
-            ));
+            hits.push(format!("{}:{line}", path.trim_prefix(&root).display()));
         }
     }
     assert!(
@@ -631,10 +628,7 @@ fn no_kernel_compares_a_value_with_neg_flt_max() {
     for path in kernel_sources(&root) {
         let src = std::fs::read_to_string(&path).expect("kernel source is readable UTF-8");
         for line in neg_flt_max_compare_lines(&strip_comments(&src)) {
-            hits.push(format!(
-                "{}:{line}",
-                path.strip_prefix(&root).unwrap_or(&path).display()
-            ));
+            hits.push(format!("{}:{line}", path.trim_prefix(&root).display()));
         }
     }
     assert!(

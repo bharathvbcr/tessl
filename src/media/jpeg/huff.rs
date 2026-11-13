@@ -33,8 +33,8 @@ impl Derived {
     pub fn build(spec: &HuffSpec, is_dc: bool, tblno: usize, lossless: bool) -> R<Derived> {
         let mut huffsize = [0u8; 257];
         let mut p = 0usize;
-        for l in 1..=16usize {
-            let i = usize::from(spec.bits[l]);
+        for (l, &count) in spec.bits.iter().enumerate().skip(1) {
+            let i = usize::from(count);
             if p + i > 256 {
                 return invalid(format!(
                     "Huffman table {tblno} has more than 256 codes (JERR_BAD_HUFF_TABLE)"

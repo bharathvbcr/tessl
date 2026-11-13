@@ -599,8 +599,8 @@ jobs:
           xcrun metal --version
       - name: Check the library and all targets
         # `--all-targets` also builds the `numcheck` path dev-dependency, whose
-        # own floor (1.82) is below this one, so the tests are held to the same
-        # toolchain as the library.
+        # own floor is the same one since 2026-11-12 (it said 1.82 before), so the
+        # tests are held to the same toolchain as the library.
         run: cargo check --locked --all-targets
       - name: Check with quant-prep enabled
         # The feature is off by default, which means nothing else in this

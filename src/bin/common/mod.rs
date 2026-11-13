@@ -177,6 +177,7 @@ pub fn median(mut v: Vec<f64>) -> Result<f64, String> {
 // that print their peak include the same source.
 #[path = "footprint.rs"]
 mod footprint;
+mod procpath;
 #[allow(unused_imports)] // Each bin uses a subset of `common`.
 pub use footprint::peak_footprint;
 
@@ -597,14 +598,8 @@ pub fn others_running() -> Vec<String> {
             continue;
         }
         let path = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
-        let in_target =
-            path.contains("/research/tessl") && (path.contains("/target/release/") || path.contains("/target/debug/"));
         let file = path.rsplit('/').next().unwrap_or("");
-        let gpu_bin = path.contains("/deps/")
-            || file.starts_with("bench_")
-            || file.starts_with("probe_")
-            || file.starts_with("profile_");
-        if in_target && gpu_bin {
+        if procpath::is_tessl_gpu_binary(&path) {
             found.push(file.to_string());
         }
     }

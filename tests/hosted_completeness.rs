@@ -175,7 +175,7 @@ fn every_device_free_test_is_on_the_hosted_manifest() {
             for line in run(exe, &args, true).lines() {
                 let ok = line.strip_prefix("test ").and_then(|l| l.strip_suffix(" ... ok"));
                 // A #[should_panic] test prints `name - should panic ... ok`.
-                if let Some(t) = ok.map(|t| t.strip_suffix(" - should panic").unwrap_or(t)) {
+                if let Some(t) = ok.map(|t| t.trim_suffix(" - should panic")) {
                     passing.insert((kind.clone(), name.clone(), t.to_string()));
                 }
             }

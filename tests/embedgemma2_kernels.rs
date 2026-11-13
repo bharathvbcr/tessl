@@ -1893,8 +1893,8 @@ fn the_bf16_output_attention_is_the_bf16_kernel_rounded_bit_for_bit() {
                 wrong.map_or(0, |i| want[i])
             );
             // The padding rows are +0 in bf16 too (bits 0).
-            for bi in 0..b {
-                for ti in a.lens[bi].min(t)..t {
+            for (bi, &len) in a.lens[..b].iter().enumerate() {
+                for ti in len.min(t)..t {
                     let base = (bi * t + ti) * h * d;
                     assert!(
                         got[base..base + h * d].iter().all(|&x| x == 0),

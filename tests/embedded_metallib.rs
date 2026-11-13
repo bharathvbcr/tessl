@@ -6,6 +6,7 @@
 //! the copy.
 
 use std::fs;
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,10 +30,11 @@ fn embedded_metallib_opens_after_the_build_artifact_is_renamed() {
     );
     let hidden = hidden_path(&path);
     fs::rename(&path, &hidden).unwrap_or_else(|e| panic!("rename {} -> {}: {e}", path.display(), hidden.display()));
-    let _restore = Restore {
-        from: hidden.clone(),
-        to: path.clone(),
-    };
+    let _restore = DropGuard::new((hidden.clone(), path.clone()), |(from, to)| {
+        if from.exists() {
+            let _ = fs::rename(&from, &to);
+        }
+    });
 
     let exe = std::env::current_exe().expect("current test binary");
     let scratch = Scratch::dir("tessl-embed-probe");
@@ -58,17 +60,4 @@ fn embedded_metallib_opens_after_the_build_artifact_is_renamed() {
 fn hidden_path(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("metallib");
     path.with_file_name(format!("{name}.hidden-{}", std::process::id()))
-}
-
-struct Restore {
-    from: PathBuf,
-    to: PathBuf,
-}
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        if self.from.exists() {
-            let _ = fs::rename(&self.from, &self.to);
-        }
-    }
 }

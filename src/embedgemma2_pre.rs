@@ -1836,7 +1836,7 @@ mod tests {
     fn mel_filters_are_triangles_with_the_documented_zero_first_filter() {
         let cfg = PreConfig::from_json(SNAPSHOT_CONFIG).unwrap().audio;
         let dense = htk_mel_filters(&cfg);
-        let col = |m: usize| (0..257).map(|f| dense[f * 128 + m]).collect::<Vec<f64>>();
+        let col = |m: usize| Vec::<f64>::from_fn(257, |f| dense[f * 128 + m]);
         assert!(dense.iter().all(|&w| (0.0..=1.0).contains(&w)));
         // 128 filters over 257 bins: the lowest falls between two bins and is all zero
         // (transformers warns about it and keeps it); the next few have a single bin.
@@ -1855,7 +1855,7 @@ mod tests {
         let cfg = video_cfg();
         // 10 s at 30 fps: one frame per second, the first of each.
         let idx = sample_frame_indices(&cfg, 300, 30.0).unwrap();
-        assert_eq!(idx, (0..10).map(|s| s * 30).collect::<Vec<_>>());
+        assert_eq!(idx, Vec::from_fn(10, |s| s * 30));
         // Under one second still yields a frame.
         assert_eq!(sample_frame_indices(&cfg, 5, 30.0).unwrap(), vec![0]);
         // 100 s: 100 sampled, capped to 32 uniformly, first and last kept.
@@ -1869,7 +1869,7 @@ mod tests {
         };
         assert_eq!(
             sample_frame_indices(&t, 3000, 30.0).unwrap(),
-            (0..32).map(|s| s * 30).collect::<Vec<_>>()
+            Vec::from_fn(32, |s| s * 30)
         );
         // No fps: every frame, then the cap.
         let all = VideoConfig {

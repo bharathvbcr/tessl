@@ -177,10 +177,10 @@ fn embedgemma2_vision_matches_sentence_transformers() {
                 &rows(&format!("image{n}_patch_embed.npy")),
             );
             assert_eq!(out.trace.layers.len(), LAYERS);
-            for l in 0..LAYERS {
+            for (l, layer) in out.trace.layers.iter().enumerate() {
                 gate(
                     &format!("image{n} layer{l}"),
-                    &out.trace.layers[l][0],
+                    &layer[0],
                     &rows(&format!("image{n}_layer{l}.npy")),
                 );
             }

@@ -2,7 +2,7 @@
 name = "tessl-go-engine"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.97"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 description = "Umbrella staticlib for the Go binding: Gusset plus tessl's EmbeddingGemma 2 C ABI. One archive per Go binary (R14)."
 publish = false

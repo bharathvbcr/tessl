@@ -108,12 +108,17 @@ jobs:
         run: |
           set -euo pipefail
           # Newest build's artifact (a `for` glob, not `ls -t`: shellcheck SC2012).
+          # Two layouts: Cargo before 1.100 writes a build script's OUT_DIR to
+          # target/release/build/<pkg>-<hash>/out/, and 1.100 to
+          # target/release/build/<pkg>/<hash>/out/. An unmatched glob stays literal,
+          # hence the -f test.
           metallib=""
-          for candidate in target/release/build/*/out/default-*.metallib; do
+          for candidate in target/release/build/*/out/default-*.metallib target/release/build/*/*/out/default-*.metallib; do
+            [[ -f "$candidate" ]] || continue
             if [[ -z "$metallib" || "$candidate" -nt "$metallib" ]]; then metallib="$candidate"; fi
           done
           if [[ ! -f "$metallib" ]]; then
-            echo "::error::no target/release/build/*/out/default-*.metallib was built"
+            echo "::error::no target/release/build/*/out/default-*.metallib (Cargo < 1.100 layout) or target/release/build/*/*/out/default-*.metallib (1.100 layout) was built"
             exit 1
           fi
           echo "metallib: $metallib"

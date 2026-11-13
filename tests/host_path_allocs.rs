@@ -8,6 +8,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::mem::DropGuard;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Counting;
@@ -56,18 +57,10 @@ fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, ALLOCS.load(Ordering::Relaxed) - before)
 }
 
-struct IcbModeRestore;
-
-impl Drop for IcbModeRestore {
-    fn drop(&mut self) {
-        tessl::decode_icb::set_icb_pipelines(false);
-    }
-}
-
 #[test]
 fn a_pipeline_cache_hit_allocates_nothing_in_either_mode() {
     let rt = tessl::GpuRuntime::new().expect("GpuRuntime::new");
-    let _restore = IcbModeRestore;
+    let _restore = DropGuard::new((), |()| tessl::decode_icb::set_icb_pipelines(false));
     for icb in [false, true] {
         tessl::decode_icb::set_icb_pipelines(icb);
         rt.pipeline("rms_norm_f32").expect("warm the cache");

@@ -26,7 +26,7 @@ Rows are L2-normalized `[]float32`, one per item, `EmbeddingDim()` wide (the
 ## Requirements and the one command
 
 Apple silicon (darwin/arm64) with a Metal device; Go 1.26 or newer (built and
-tested with 1.27.2); a Rust toolchain for the engine archive (1.97 or newer);
+tested with 1.27.2); a Rust toolchain for the engine archive (1.100 or newer);
 a snapshot directory of `google/embeddinggemma-2`. The package refuses to build
 anywhere else with a message that says so.
 

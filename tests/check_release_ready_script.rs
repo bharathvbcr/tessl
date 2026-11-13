@@ -1932,11 +1932,11 @@ fn guard_empty_needle_is_refused_and_the_plan_file_is_removed() {
     );
 }
 
-#[test]
-fn guard_signal_restores_the_tests_and_exits() {
-    // SIGTERM while a row's cargo run is parked (the test files are perturbed
-    // then): the handler must restore, clean up and exit 128+15, not return
-    // into the loop and carry on perturbing with the backup gone.
+/// `sig` to the driver while a row's cargo run is parked (the test files are
+/// perturbed then): the handler must restore, clean up and exit with `want`
+/// (128 + the signal), not return into the loop and carry on perturbing with
+/// the backup gone.
+fn guard_signal_restores_and_exits(sig: i32, want: i32) {
     let repo = guard_real_repo();
     let id = first_row_id(&repo);
     let tmp = Scratch::dir("relready-guardtmp");
@@ -1966,10 +1966,10 @@ fn guard_signal_restores_the_tests_and_exits() {
         !perturbed.stdout.is_empty(),
         "the row was not applied while cargo ran; the test proves nothing"
     );
-    s.signal_pid(libc::SIGTERM);
+    s.signal_pid(sig);
     std::fs::write(&release, "go\n").unwrap();
     let out = s.wait(60);
-    assert_eq!(out.code, Some(143), "{}", out.all());
+    assert_eq!(out.code, Some(want), "{}", out.all());
     let after = Command::new("git")
         .arg("-C")
         .arg(repo.root.join("repo"))
@@ -1988,6 +1988,21 @@ fn guard_signal_restores_the_tests_and_exits() {
         "left behind: {left:?}\n{}",
         out.all()
     );
+}
+
+#[test]
+fn guard_term_restores_the_tests_and_exits() {
+    guard_signal_restores_and_exits(libc::SIGTERM, 143);
+}
+
+#[test]
+fn guard_int_restores_the_tests_and_exits() {
+    guard_signal_restores_and_exits(libc::SIGINT, 130);
+}
+
+#[test]
+fn guard_hup_restores_the_tests_and_exits() {
+    guard_signal_restores_and_exits(libc::SIGHUP, 129);
 }
 
 #[test]

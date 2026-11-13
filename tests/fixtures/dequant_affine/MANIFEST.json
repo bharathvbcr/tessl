@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "scripts/gen_dequant_affine_fixtures.py",
- "generator_commit": "f933c4a0bb9ed6f4dc9367c1c6eb4768b9312cd1",
+ "generator_commit": "c555551f59e6a512c5d1269850ce741aaecc1dff",
  "versions": {
   "torch": "not used",
   "transformers": "not used",
@@ -11,87 +11,295 @@
  },
  "versions_role": "produced",
  "mlx_stream": "mx.gpu on every quantize and dequantize call that defines a golden (mx.cpu differs)",
- "inputs_source": "weights and crafted scales/biases/codes are drawn from numpy default_rng(20261110) by this script; regenerating reproduces them for the same numpy, and the goldens for the same mlx on the same GPU family",
+ "inputs_source": "weights and the group-size-64 crafted scales/biases/codes are drawn from numpy default_rng(20261110) by this script, and the crafted ones of group sizes 32 and 128 from default_rng([20261110, group_size]); regenerating reproduces them for the same numpy, and the goldens for the same mlx on the same GPU family",
  "files": {
   "quant_q8_packed.bin": {
    "role": "input",
    "published": true,
-   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)"
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "08ce1e9dbbb24246c0ea58ab9443062644bcd7f106d2ddd1245f6bceab089f1f"
   },
   "quant_q8_scales.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "bae3553249051cec8aa9dc7029454ff4c7bb7fc6f18496eb02130d009be7e621"
   },
   "quant_q8_biases.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "ea1196274c805d3aaa52f40e4effbf57aaf97594b7eb9d3456eca7bb0c65b350"
   },
   "quant_q8_out.bin": {
    "role": "golden",
    "published": true,
-   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)"
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "2a12986da61d560f565e39f360dc2dbee23d1306d7e178ea426f49cc84bd25a5"
   },
   "quant_q4_packed.bin": {
    "role": "input",
    "published": true,
-   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)"
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "de905cded4d82b79b515b2a11b0558678f99973a8cc304a1c9328f99f52d5fcf"
   },
   "quant_q4_scales.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "fbb4ab394b48258691edf03c7297a3d36233200561e7b484b0ec7f72b8d3182a"
   },
   "quant_q4_biases.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "ea1196274c805d3aaa52f40e4effbf57aaf97594b7eb9d3456eca7bb0c65b350"
   },
   "quant_q4_out.bin": {
    "role": "golden",
    "published": true,
-   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)"
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "9ddc7c8876b6e7bac332bd909744417e5f15a57fd43ea573c9f27e179ec708f1"
   },
   "crafted_q8_packed.bin": {
    "role": "input",
    "published": true,
-   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)"
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "52e02cc5a291a32f4c5db5f56ce9cf3f469411ad2c5cd26e1b70eae25ba7a61a"
   },
   "crafted_q8_scales.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "adfee600a308abf7bd290557f2d789084eca8a5c473decf99e204720710fb13e"
   },
   "crafted_q8_biases.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "c442b2f7d68e9de13dec672aa20e6fc162f2f9a1e34e1370f697c0e0026e8f15"
   },
   "crafted_q8_out.bin": {
    "role": "golden",
    "published": true,
-   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)"
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "8381d831978cf789f7908a90b03f516d1fabd39423b8351814f4791a05289ca6"
   },
   "crafted_q4_packed.bin": {
    "role": "input",
    "published": true,
-   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)"
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "a282d8922fbef5ec3ef79a43d7f0e350b858d7a0c528d2c457d34fe2150072df"
   },
   "crafted_q4_scales.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "ebe3ae0dc73d239fae14360aef3944b2cdb53b4b2f37217f4615c00566c8d74f"
   },
   "crafted_q4_biases.bin": {
    "role": "input",
    "published": true,
-   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)"
+   "note": "bf16 bits, uint16 little-endian, [17, 16]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "51ac0d564e9d6a2a2f99fc1fe172289e54171265786028dc520c44bb5e1a9db8"
   },
   "crafted_q4_out.bin": {
    "role": "golden",
    "published": true,
-   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)"
+   "note": "mx.dequantize(..., group_size=64, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng(20261110)",
+   "sha256": "1b406077ddb2229f0dbcd572e0ef9d3afc71a3230b895e3220000c0d6b23e58b"
+  },
+  "quant_q8_g32_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "975261b0efe6e9e35fef86b7d68aecb27dcf284aa3d13abd7efa5eba8fc9e93b"
+  },
+  "quant_q8_g32_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "5c2fdaf1f2dd66d749f515956d96ba41dab88b6d4e25f1c8c1b56a08f63505fe"
+  },
+  "quant_q8_g32_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "3eca23a4745acfd00083e026d3b691fbd3fa1f289cb13506c99d2fd880be5735"
+  },
+  "quant_q8_g32_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=32, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "a9ca6f46c889a0826289520348c8c949efdb8725ef8b6599fcc00466577d6c8a"
+  },
+  "quant_q4_g32_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "f0252a0b08f8721e6dfdcd0e7defaa4888bc74cdba5b1a9ee03c82047ebbadeb"
+  },
+  "quant_q4_g32_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "298ceab02454d30ccc4af73542be5ff0f8aa8bbec6bf2b59ab32339d58a82870"
+  },
+  "quant_q4_g32_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "3eca23a4745acfd00083e026d3b691fbd3fa1f289cb13506c99d2fd880be5735"
+  },
+  "quant_q4_g32_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=32, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "2c5533de1bbebd89f54b55e19731cfcb6ae3831e2ac6a1b2b82b4cfb50eeef74"
+  },
+  "crafted_q8_g32_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "6e47121d9d87f18a26711641c4cfc965fa36986451b5559e6723708cbc2bb1a8"
+  },
+  "crafted_q8_g32_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "1e99897186b37809a1885c8996222a350a4c82fc318276b5894c580a89e478d1"
+  },
+  "crafted_q8_g32_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "88ffbc6138d302ca7edb0d6f93079d6ebf5a150534b6b7e46fc03f862d4b1f4b"
+  },
+  "crafted_q8_g32_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=32, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "2be65cc06b8cc3510bdb89f425a96d2785054e2a52da4876b48952d7a93b9a1e"
+  },
+  "crafted_q4_g32_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "9aa7b2ea9d8b265ee4fa20099796b148b69fa2461a995883b0a47c33906a3696"
+  },
+  "crafted_q4_g32_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "04a65bffd8c2d8584fae9d459b029962085cb6cfd54b0dc96d4ac809f2e81f4a"
+  },
+  "crafted_q4_g32_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 32]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "1be90f48d6d2d8e12a8e3130133d21e5e63e8c8050e4892b0add10bbdc7c1ec9"
+  },
+  "crafted_q4_g32_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=32, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng([20261110, 32])",
+   "sha256": "d61cfd77adff5f31c4e7947aa137aaa902208c11841054ee1ecc41004426d15a"
+  },
+  "quant_q8_g128_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "6d4b18d181c041c66cbcd5b8894ede5d4e65087d1948115fe3b56580828097c6"
+  },
+  "quant_q8_g128_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "c5d9ed2b80d39d36b732bc57f792510d1722e7794c6ab09be5c51d2cb84bd433"
+  },
+  "quant_q8_g128_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "534221e566e6b3efe172f100e3f3e8cf19c5b95353f9d1cd6a07d244f8fa39e1"
+  },
+  "quant_q8_g128_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=128, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "466b515a24fa62dcd9d7e44d139c0b5d5c4e32cec7486364b517cb1b95e9b3ee"
+  },
+  "quant_q4_g128_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; from mx.quantize(stream=mx.gpu)",
+   "sha256": "befa1fb22a58a4b333bcef960b5f7f0b7e7f181192ed3aa42f971090f6593b1a"
+  },
+  "quant_q4_g128_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "c255fe40cf54b0b70087d8743131ebad9b9455944a9ef4352c4c5d0fa1337660"
+  },
+  "quant_q4_g128_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "534221e566e6b3efe172f100e3f3e8cf19c5b95353f9d1cd6a07d244f8fa39e1"
+  },
+  "quant_q4_g128_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=128, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; from mx.quantize(stream=mx.gpu)",
+   "sha256": "10e9403d8eb1b62569769810c54b03f520194f798295f6792c3ad29d68f43443"
+  },
+  "crafted_q8_g128_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "69ce6d6e0cde0a21ff156b731a6afe8a73adad57666af06ebd81234a64027a46"
+  },
+  "crafted_q8_g128_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "292c809680305207d1447b9da9e4f924416dfdb6ba59e737b1704cdf2e73cc14"
+  },
+  "crafted_q8_g128_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "3cf9fde2c8b44aa72ed66cd7656cd172666442d45be593c92bfcc9bab980482a"
+  },
+  "crafted_q8_g128_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=128, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "30edf4009853b2f0d722487b351ea1346c0f39f186e893704892ab2e8f036cfe"
+  },
+  "crafted_q4_g128_packed.bin": {
+   "role": "input",
+   "published": true,
+   "note": "uint32 little-endian, [17, cols * bits / 32], MLX row-major layout; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "491c9d9cf79ad36ac76116c68a44f1d42eda8236d6d44646ed3233f8f26f39db"
+  },
+  "crafted_q4_g128_scales.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "9f522e24d6b1772d2a842849aff2a5a36bf976ba04b266ca0a04e3453eb94da8"
+  },
+  "crafted_q4_g128_biases.bin": {
+   "role": "input",
+   "published": true,
+   "note": "bf16 bits, uint16 little-endian, [17, 8]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "07a073375f8aa44de5bb0a9c567b923a76a66dd251027ccdf361d25bf39faffe"
+  },
+  "crafted_q4_g128_out.bin": {
+   "role": "golden",
+   "published": true,
+   "note": "mx.dequantize(..., group_size=128, stream=mx.gpu) output as bf16 bits, uint16 little-endian, [17, 1024]; crafted corner values, numpy default_rng([20261110, 128])",
+   "sha256": "a1c710fb14e8eb2097df6a630ebe7a484755be09dd12281aa929d67c8825191e"
   }
  }
 }

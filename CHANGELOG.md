@@ -51,6 +51,16 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`dequant::check_dequant_affine_fault` and `DequantAffineFault`** (`src/dequant.rs`,
+  `tests/dequant_affine.rs`; ft-e7708c32). A read-side helper for the fault word that
+  `dequant_affine_bf16` raises: `Ok(())` only when the word was read and is zero,
+  `Err(Raised { word })` when it is non-zero and `Err(Unread { why })` when it could not be
+  read (a buffer under 4 bytes, a poisoned or busy runtime, private storage). `DequantAffineFault` is `#[non_exhaustive]`. It reads the first
+  four bytes through a `u8` mapping, so a buffer whose length is not a multiple of four works,
+  and it never writes. `dequant_affine_bf16` and its signature are unchanged; the zero, dispatch,
+  synchronize, read protocol is now written on it. The module and kernel docs now say the fault
+  is a store of `1`, not an OR.
+
 - **Q8 affine matmul2d** (`nn::gemm_q8_tensorops`, `kernels/gemm_q8_tensorops.metal`,
   `tests/gemm_q8_tensorops.rs`). `Y[M, N] = X[M, K] @ W[N, K]^T` with
   `W = scale * (q - zero)`, groups 32, 64, and 128. The `matmul2d` right operand

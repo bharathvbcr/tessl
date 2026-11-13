@@ -4,6 +4,18 @@
 # Portable: uses rustc + grep/sed only (no ripgrep, no Python) so GitHub runners work.
 set -euo pipefail
 
+# TMPDIR is read before the cd below, so a relative one means the caller's cwd.
+# A leading '-' would be parsed by mktemp as a flag: refuse it with our own error.
+tmp_base="${TMPDIR:-/tmp}"
+case "$tmp_base" in
+  -*)
+    echo "error: TMPDIR '$tmp_base' starts with '-'; use an absolute path or ./-name" >&2
+    exit 1
+    ;;
+  /*) ;;
+  *) tmp_base="$PWD/$tmp_base" ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -20,15 +32,113 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
+# The crate name is used in a temp-dir template below: fail closed on anything
+# that is not a plain package name (a path separator would escape the template).
+if ! [[ "$crate" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "error: crate name '$crate' from Cargo.toml is not [A-Za-z0-9_-]+" >&2
+  exit 1
+fi
+
+# One run dir holds the release_check binary and every log of this run, so two
+# runs (other checkouts, other agents) never share a file. mktemp's template
+# form is the one both BSD (the macos-26 runners) and GNU accept.
+#
+# Guarantee: nothing is ever removed unless RUN_DIR is exactly what mktemp was
+# asked to make: a real (non-symlink) directory named
+# "$tmp_base/<crate>-release-ready.XXXXXX" whose parent is TMPDIR itself and
+# which is not TMPDIR. run_dir_ok checks that with no command substitution, so
+# it cannot be fooled by text already buffered for a closed stdout, and it runs
+# at the start and again before every rm in cleanup. So `rm -rf -- ""`, an
+# existing foreign directory, a symlink, TMPDIR itself and "/" are all refused.
+#
+# The traps are installed BEFORE mktemp and RUN_DIR is assigned straight from
+# it; bash runs a trap that arrived during the command substitution only after
+# the assignment, so a signal right after the dir is made still reaches cleanup.
+#
+# keep: the one log a failing step wants to leave behind (empty: remove all).
+# INT/TERM/HUP/QUIT/PIPE clear it, so an aborted run leaves nothing.
+#
+# Known leaks, all accepted:
+#  - SIGKILL cannot be trapped; the dir stays.
+#  - A signal sent to the script's pid alone (not its process group, as Ctrl-C
+#    does) is deferred by bash until the foreground child exits.
+#  - A signal ignored on entry (e.g. SIGINT/SIGQUIT under `&` from a
+#    non-interactive shell, or SIGHUP under nohup) cannot be trapped by bash:
+#    such a run is not stopped by that signal and cleans up normally at its end.
+#  - A process-group signal while mktemp itself is running kills mktemp (or a
+#    wrapper of it) between making the dir and printing its name: the name is
+#    lost, so nothing can remove it.
+#  - Closed stdout is not a leak: SIGPIPE is trapped (exit 141), and with
+#    SIGPIPE ignored the failing echo ends the run through errexit, which runs
+#    cleanup. (A signal with no trap here, e.g. SIGUSR1, still kills the shell
+#    without running it.)
+#
+# A cleanup failure must not change the verdict: the gate already decided, and
+# failing a ready release over a temp dir (or turning a failure into a
+# different one) would mislead. So cleanup keeps the exit status it started
+# with, warns loudly on stderr, and `set +e` stops errexit from altering it.
+RUN_DIR=""
+keep=""
+run_dir_ok() {
+  [[ -n "$RUN_DIR" && -d "$RUN_DIR" && ! -L "$RUN_DIR" ]] || return 1
+  [[ "$RUN_DIR" == "$tmp_base/${crate}-release-ready."?????? ]] || return 1
+  [[ "$RUN_DIR/.." -ef "$tmp_base" && ! "$RUN_DIR" -ef "$tmp_base" ]]
+}
+cleanup() {
+  local rc=$?
+  trap '' INT TERM HUP QUIT PIPE # a second signal must not abort the removal
+  set +e
+  if [[ -n "$RUN_DIR" ]]; then
+    if ! run_dir_ok; then
+      echo "warning: not removing '$RUN_DIR': not a directory directly under TMPDIR '$tmp_base'" >&2
+    elif [[ -n "$keep" ]]; then
+      local f
+      for f in "$RUN_DIR"/*; do
+        [[ "$f" == "$keep" ]] || rm -rf -- "$f" ||
+          echo "warning: could not remove $f" >&2
+      done
+      echo "release-ready FAILED: kept $keep" >&2
+    else
+      rm -rf -- "$RUN_DIR" || echo "warning: could not remove run dir $RUN_DIR" >&2
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'keep=""; exit 130' INT
+trap 'keep=""; exit 129' HUP
+trap 'keep=""; exit 143' TERM
+trap 'keep=""; exit 131' QUIT
+trap 'keep=""; exit 141' PIPE
+
+RUN_DIR="$(mktemp -d "$tmp_base/${crate}-release-ready.XXXXXX")" || {
+  echo "error: could not create a temp dir under $tmp_base" >&2
+  exit 1
+}
+if ! run_dir_ok; then
+  echo "error: mktemp gave '$RUN_DIR', not a directory directly under TMPDIR '$tmp_base'" >&2
+  exit 1
+fi
+echo "==> run dir: $RUN_DIR (removed on success; a failing step's log is kept)"
+
+# fail_log PATH MSG: keep PATH, say where it is, show its tail, exit 1.
+fail_log() {
+  keep="$1"
+  echo "error: $2; see $1" >&2
+  if [[ -s "$1" ]]; then
+    echo "--- last 40 lines of $1 ---" >&2
+    tail -n 40 -- "$1" >&2
+  fi
+  exit 1
+}
+
 # The README / CHANGELOG / Cargo.lock text checks are src/bin/release_check.rs,
 # built here with a bare rustc: it is std-only, so it needs neither the crate's
 # dependencies nor the Metal toolchain, and it runs before either is built.
-RC_DIR="$(mktemp -d)"
-trap 'rm -rf "$RC_DIR"' EXIT
-rustc --edition 2021 -O -o "$RC_DIR/release_check" src/bin/release_check.rs
+rustc --edition 2021 -O -o "$RUN_DIR/release_check" src/bin/release_check.rs
 
-"$RC_DIR/release_check" readme README.md "$version"
-"$RC_DIR/release_check" changelog CHANGELOG.md "$version"
+"$RUN_DIR/release_check" readme README.md "$version"
+"$RUN_DIR/release_check" changelog CHANGELOG.md "$version"
 
 if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
   echo "error: CHANGELOG.md missing footer link [$version]:" >&2
@@ -36,25 +146,33 @@ if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
 fi
 
 if [[ -f Cargo.lock ]]; then
-  "$RC_DIR/release_check" lock Cargo.lock "$crate" "$version"
+  "$RUN_DIR/release_check" lock Cargo.lock "$crate" "$version"
 fi
 
 echo "==> cargo package --locked --list ($crate $version)"
-cargo package --locked --list >"/tmp/${crate}-package.list"
-if grep -E '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "/tmp/${crate}-package.list"; then
-  echo "error: package list contains excluded/stale paths (listed above)" >&2
+cargo package --locked --list >"$RUN_DIR/package.list" 2>"$RUN_DIR/package-list.log" ||
+  fail_log "$RUN_DIR/package-list.log" "cargo package --locked --list failed"
+if [[ -s "$RUN_DIR/package-list.log" ]]; then
+  cat "$RUN_DIR/package-list.log" >&2
+fi
+# A package with no files is never release-ready (and an empty list would let
+# the denylist grep below pass vacuously).
+[[ -s "$RUN_DIR/package.list" ]] ||
+  fail_log "$RUN_DIR/package.list" "cargo package --locked --list produced an empty package list"
+if grep -E '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "$RUN_DIR/package.list"; then
+  keep="$RUN_DIR/package.list"
+  echo "error: package list contains excluded/stale paths (listed above); see $RUN_DIR/package.list" >&2
   exit 1
 fi
 
 echo "==> cargo package --locked (verify build)"
-cargo package --locked >/tmp/"${crate}-package.log" 2>&1
+cargo package --locked >"$RUN_DIR/package.log" 2>&1 ||
+  fail_log "$RUN_DIR/package.log" "cargo package --locked failed"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> DOCS_RS=1 cargo check (docs.rs AOT skip)"
-  DOCS_RS=1 cargo check --locked >/tmp/"${crate}-docsrs.log" 2>&1 || {
-    echo "error: DOCS_RS=1 cargo check failed; see /tmp/${crate}-docsrs.log" >&2
-    exit 1
-  }
+  DOCS_RS=1 cargo check --locked >"$RUN_DIR/docsrs.log" 2>&1 ||
+    fail_log "$RUN_DIR/docsrs.log" "DOCS_RS=1 cargo check failed"
 fi
 
 echo "release-ready: $crate $version"

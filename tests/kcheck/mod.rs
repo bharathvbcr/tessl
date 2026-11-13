@@ -3,6 +3,7 @@
 mod ledger;
 
 pub mod adamw;
+pub mod emeans;
 pub mod flash;
 pub mod gemm;
 pub mod quant;

@@ -1185,8 +1185,16 @@ fn appended_after_the_pin() {
     drop(rt);
 }
 "#;
-    assert_eq!(fn_body(src, "end_command_buffer"), Ok(None), "a quoted `fn x(` was read as a definition");
-    assert_eq!(device_marker(src, "pin"), Ok(None), "the pin was charged for the test after it");
+    assert_eq!(
+        fn_body(src, "end_command_buffer"),
+        Ok(None),
+        "a quoted `fn x(` was read as a definition"
+    );
+    assert_eq!(
+        device_marker(src, "pin"),
+        Ok(None),
+        "the pin was charged for the test after it"
+    );
     assert!(device_marker(src, "appended_after_the_pin").unwrap().is_some());
     let pin = body_of(src, "pin");
     assert!(pin.ends_with("assert_eq!(ender, want);\n}"), "span: {pin:?}");
@@ -1214,7 +1222,10 @@ fn a_device_use_after_a_brace_in_a_literal_is_still_flagged() {
     }
     // A `//` inside a string is not a comment: what follows it on the line is code.
     let src = "#[test]\nfn pinned() { let u = \"https://x\"; let _rt = GpuRuntime::new(); }\n";
-    assert!(device_marker(src, "pinned").unwrap().is_some(), "a `//` in a string hid the rest of the line");
+    assert!(
+        device_marker(src, "pinned").unwrap().is_some(),
+        "a `//` in a string hid the rest of the line"
+    );
     // And a marker named only in a comment still does not count.
     let src = "#[test]\nfn fine() { let u = \"}\"; /* with_gpu } */ // GpuRuntime\n let _ = u; }\n";
     assert!(device_marker(src, "fine").unwrap().is_none());

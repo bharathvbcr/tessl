@@ -1472,7 +1472,10 @@ fn a_brace_inside_generics_is_not_the_body() {
             "const default (P25)",
             "fn h<const N: usize = { 3 }>() { let _rt = GpuRuntime::new(); }",
         ),
-        ("return type (P6)", "fn h() -> Foo<{ 3 }> { let _rt = GpuRuntime::new(); }"),
+        (
+            "return type (P6)",
+            "fn h() -> Foo<{ 3 }> { let _rt = GpuRuntime::new(); }",
+        ),
         (
             "an operator in the block",
             "fn h() -> Foo<{ N >= 3 && N > 2 }> { let _rt = GpuRuntime::new(); }",
@@ -1565,9 +1568,19 @@ fn a_callee_that_is_the_tail_of_another_name_is_not_called() {
     let src = "fn helper() { let _rt = GpuRuntime::new(); }\n\
                fn my_helper() {}\n\
                #[test]\nfn t() { my_helper(); }\n";
-    assert_eq!(device_marker(src, "t"), Ok(None), "`my_helper(` was read as a call to `helper`");
+    assert_eq!(
+        device_marker(src, "t"),
+        Ok(None),
+        "`my_helper(` was read as a call to `helper`"
+    );
     // The boundary is on the left only; a real call still counts around it.
-    for call in ["helper();", "x.helper();", "Self::helper();", "(helper)();", "helper::<u8>();"] {
+    for call in [
+        "helper();",
+        "x.helper();",
+        "Self::helper();",
+        "(helper)();",
+        "helper::<u8>();",
+    ] {
         let src = format!("fn helper() {{ let _rt = GpuRuntime::new(); }}\n#[test]\nfn t() {{ {call} }}\n");
         let found = device_marker(&src, "t").unwrap();
         // `(helper)()` is a fn pointer call, which the scan does not follow.

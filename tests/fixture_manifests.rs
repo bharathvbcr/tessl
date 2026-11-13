@@ -604,8 +604,8 @@ fn judge_pin(pin: &str, root: &Path, run: &GitRun<'_>) -> Result<(), String> {
 /// `Ok` when `pin` is the commit that last changed `generator`. Run after [`judge_pin`]
 /// has passed, which settles that the history is complete.
 fn judge_last_touch(pin: &str, generator: &str, run: &GitRun<'_>) -> Result<(), String> {
-    let (code, last) = run(&["log", "-1", "--format=%H", "--", generator])
-        .map_err(|e| format!("could not verify provenance: {e}"))?;
+    let (code, last) =
+        run(&["log", "-1", "--format=%H", "--", generator]).map_err(|e| format!("could not verify provenance: {e}"))?;
     if code != 0 || last.len() != 40 {
         return Err(format!(
             "could not verify provenance: git log of {generator} exited {code} and printed {last:?}"
@@ -800,7 +800,10 @@ fn a_shallow_clone_is_not_run_and_never_passes() {
     );
     for (code, printed) in [(0, ""), (0, "--is-shallow-repository"), (128, "false"), (1, "true")] {
         let why = shallow_verdict(code, printed).expect_err("anything but a plain false must not pass");
-        assert!(why.contains("could not verify provenance") || why.starts_with("NOT RUN"), "{why}");
+        assert!(
+            why.contains("could not verify provenance") || why.starts_with("NOT RUN"),
+            "{why}"
+        );
     }
 
     let (code, head) = git_in(repo(), &["rev-parse", "HEAD"], &[], GIT_DEADLINE).expect("rev-parse HEAD");
@@ -893,6 +896,44 @@ fn provenance_passes_only_for_an_ancestor_of_head_in_a_full_clone() {
     }
     let e = judge_last_touch(&pin, "g.py", &|_| Err("git is missing".into())).expect_err("must not pass");
     assert!(e.contains("could not verify provenance"), "{e}");
+}
+
+/// A commit that exists in the object store but is not on the checkout's history must
+/// fail: `cat-file -e` alone would pass it (the store here also holds scratch refs and
+/// every other worktree's branches). A real repository with a side branch.
+#[test]
+fn a_commit_that_exists_but_is_not_an_ancestor_of_head_fails() {
+    let dir = Scratch::dir("tessl_ancestry_repo");
+    let git = |args: &[&str]| {
+        let mut full = vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        full.extend_from_slice(args);
+        let (code, out) = git_in(&dir, &full, &[], GIT_DEADLINE).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(code, 0, "git {args:?}: {out}");
+        out
+    };
+    git(&["init", "--quiet", "--initial-branch=main", "."]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "--quiet", "-b", "side"]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", "side only"]);
+    let side = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "--quiet", "main"]);
+    let run = |args: &[&str]| git_in(&dir, args, &[], GIT_DEADLINE);
+    assert_eq!(
+        run(&["cat-file", "-e", &format!("{side}^{{commit}}")]).expect("runs").0,
+        0,
+        "side exists"
+    );
+    judge_pin(&base, &dir, &run).expect("an ancestor of HEAD passes");
+    let why = judge_pin(&side, &dir, &run).expect_err("a commit off this history must fail");
+    assert!(why.contains("is not on this history"), "{why}");
 }
 
 #[test]

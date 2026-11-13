@@ -33,7 +33,7 @@ bin embedgemma2_pre 5
 bin embedgemma2_tok_tiny 13
 bin embedgemma2_tok_batch 8
 bin gdn_fixtures 12
-bin fixture_manifests 12
+bin fixture_manifests 13
 bin gdn_gates 22
 bin gdn_state 10
 bin go_link_frameworks 2

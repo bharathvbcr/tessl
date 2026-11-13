@@ -819,7 +819,11 @@ const GOLDEN_TALLIES: [(&str, u32, usize, usize, usize); 12] = [
 #[test]
 fn every_golden_holds_its_corners_and_the_host_models_match_the_tallies() {
     let goldens = every_golden();
-    assert_eq!(goldens.len(), GOLDEN_TALLIES.len(), "3 group sizes x q8/q4 x quant/crafted");
+    assert_eq!(
+        goldens.len(),
+        GOLDEN_TALLIES.len(),
+        "3 group sizes x q8/q4 x quant/crafted"
+    );
     for ((case, bits, gs, c, want), tally) in goldens.iter().zip(GOLDEN_TALLIES) {
         assert_eq!((*case, *bits, *gs), (tally.0, tally.1, tally.2), "golden order");
         assert_golden_holds_its_corners(case, *bits, *gs, c, want);

@@ -119,16 +119,20 @@ fn blank_comments(src: &str) -> String {
 }
 
 /// Where each `fn name` definition starts in `blank` (literal-blanked source):
-/// `fn name` at a word boundary, then optional whitespace, then `(` or `<`, so
-/// `fn helper<T>(` and `fn helper (` are definitions as well as `fn helper(`.
+/// `fn`, then whitespace of any kind and length, then exactly `name`, then
+/// optional whitespace and `(` or `<`. So `fn helper<T>(`, `fn helper (`,
+/// `fn  helper(` and `fn\thelper(` are definitions, `fn helper_two(` is not, and
+/// the `fn(u8)` of a fn-pointer type is not.
 fn fn_sites(blank: &str, name: &str) -> Vec<usize> {
-    let key = format!("fn {name}");
     blank
-        .match_indices(&key)
+        .match_indices("fn")
         .map(|(i, _)| i)
         .filter(|&i| {
-            let rest = blank[i + key.len()..].trim_start();
-            at_word_start(blank, i) && (rest.starts_with('(') || rest.starts_with('<'))
+            at_word_start(blank, i)
+                && declared_name(blank, i, "fn").is_some_and(|(found, after)| {
+                    let rest = blank[after..].trim_start();
+                    found == name && (rest.starts_with('(') || rest.starts_with('<'))
+                })
         })
         .collect()
 }
@@ -140,6 +144,58 @@ fn calls(body: &str, callee: &str) -> bool {
         let rest = body[i + callee.len()..].trim_start();
         at_word_start(body, i) && (rest.starts_with('(') || rest.starts_with("::<"))
     })
+}
+
+/// How the signature that starts at `at` ends.
+enum SignatureEnd {
+    /// The `{` that opens the body, at this offset.
+    Body(usize),
+    /// A `;` first: a declaration with no body.
+    Declaration,
+    /// Neither: unbalanced generics, or the text ran out.
+    Unterminated,
+}
+
+/// Where the signature at `at` (the `fn`, or `impl`, keyword) ends.
+///
+/// The body is the first `{` that is outside every parenthesis and bracket and
+/// outside every `<...>`. A `{` inside angle brackets is a const-generic
+/// expression (`Tr<{ 1 }>`, `Foo<{ N >= 3 }>`, a default `<const N: usize = { 3 }>`),
+/// and is skipped whole, braces and anything inside them: a `>` in there is an
+/// operator, not a closing bracket. In the signature proper, a `>` closes an
+/// angle bracket unless it is the head of `->`, and `>>` and `>=` close as many
+/// as they hold. Angle depth is only tracked outside `()` and `[]`, which cover
+/// the other places `<` and `>` are comparisons.
+///
+/// A `;` while an angle bracket is still open is `Unterminated`, not a
+/// declaration: an unbalanced `<` would otherwise swallow the body and read the
+/// next item's `;` as this function's end, a silent pass.
+fn signature_end(blank: &str, at: usize) -> SignatureEnd {
+    let (mut nesting, mut angle, mut braces) = (0usize, 0usize, 0usize);
+    let mut prev = ' ';
+    for (i, c) in blank[at..].char_indices() {
+        if braces > 0 {
+            match c {
+                '{' => braces += 1,
+                '}' => braces -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '(' | '[' => nesting += 1,
+            ')' | ']' => nesting = nesting.saturating_sub(1),
+            '<' if nesting == 0 => angle += 1,
+            '>' if nesting == 0 && prev != '-' => angle = angle.saturating_sub(1),
+            ';' if nesting == 0 && angle > 0 => return SignatureEnd::Unterminated,
+            ';' if nesting == 0 => return SignatureEnd::Declaration,
+            '{' if nesting == 0 && angle > 0 => braces = 1,
+            '{' if nesting == 0 => return SignatureEnd::Body(at + i),
+            _ => {}
+        }
+        prev = c;
+    }
+    SignatureEnd::Unterminated
 }
 
 /// The `{...}` body of the first function named `name` in `src` that has one.
@@ -156,43 +212,34 @@ fn calls(body: &str, callee: &str) -> bool {
 /// `fn name(` quoted inside a string (a pin that asserts on another function's
 /// source holds exactly that), and a `{` or `}` in a string, raw string, byte or
 /// C string, char literal or comment is not counted. Spans are taken from `src`
-/// itself, which `blank_literals` keeps offset-aligned.
+/// itself, which `blank_literals` keeps offset-aligned. Where the signature ends
+/// is `signature_end`'s call: a `{` inside generics, a where clause or a return
+/// type is not the body.
 ///
-/// Known gaps, both pre-existing:
-/// - a helper defined by `macro_rules!` is not a `fn name` in the source text, so
-///   its body is never scanned: the scan reads source, not expansions;
+/// Known gaps, all pre-existing:
 /// - resolution is by name alone. When several functions share a name (six
 ///   `fn new(` in `src/runtime.rs`), the first one with a body is the one
 ///   scanned, whichever type a call actually reaches. Narrowing by receiver or
 ///   path is not done here, and scanning every same-named body would flag
-///   device-free tests that merely call some other type's `new`.
+///   device-free tests that merely call some other type's `new`. (Resolving
+///   `Type::name(` to `impl Type` was tried: against 936fe8e it flips 30 lib
+///   tests from pass to flag, every one a test that really opens a device, so it
+///   is a change to what the manifest is judged by and is kept off this branch;
+///   it is on `gp/w10-scangaps-item1`.)
+/// - a helper defined by `macro_rules!` is not a `fn name` in the source text, so
+///   its body is never scanned: the scan reads source, not expansions;
+/// - a function reached through a pointer (`let f = make; f();`) is not a call
+///   to `make` in the text, so it is not followed. Following every bare mention
+///   of a defined name instead would flag tests that merely hold a variable
+///   named like a function.
 fn fn_body<'a>(src: &'a str, name: &str) -> Result<Option<&'a str>, String> {
     let blank = blank_literals(src);
     for at in fn_sites(&blank, name) {
-        // The signature runs to the first `{` outside any parenthesis or bracket;
-        // a `;` out there first means a declaration with no body.
-        let mut nesting = 0usize;
-        let mut open = None;
-        let mut declaration = false;
-        for (i, c) in blank[at..].char_indices() {
-            match c {
-                '(' | '[' => nesting += 1,
-                ')' | ']' => nesting = nesting.saturating_sub(1),
-                ';' if nesting == 0 => {
-                    declaration = true;
-                    break;
-                }
-                '{' if nesting == 0 => {
-                    open = Some(at + i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if declaration {
-            continue;
-        }
-        let open = open.ok_or_else(|| format!("`fn {name}`: no `{{` after the signature"))?;
+        let open = match signature_end(&blank, at) {
+            SignatureEnd::Declaration => continue,
+            SignatureEnd::Body(open) => open,
+            SignatureEnd::Unterminated => return Err(format!("`fn {name}`: no `{{` after the signature")),
+        };
         let mut depth = 0usize;
         let mut end = None;
         for (i, c) in blank[open..].char_indices() {
@@ -216,16 +263,10 @@ fn fn_body<'a>(src: &'a str, name: &str) -> Result<Option<&'a str>, String> {
     Ok(None)
 }
 
-/// Every function name defined in `src`.
+/// Every function name defined in `src`: `fn`, whitespace of any kind, a name.
 fn defined_fns(src: &str) -> HashSet<String> {
-    src.match_indices("fn ")
-        .filter_map(|(i, _)| {
-            let name: String = src[i + 3..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
+    src.match_indices("fn")
+        .filter_map(|(i, _)| declared_name(src, i, "fn").map(|(name, _)| name))
         .collect()
 }
 
@@ -739,8 +780,9 @@ fn scan_resolved(test: &LibTest, cache: &mut HashMap<PathBuf, String>, what: &st
 }
 
 fn test_attribute_precedes(src: &str, name: &str) -> bool {
-    let key = format!("fn {name}(");
-    let Some(at) = src.find(&key) else { return false };
+    let Some(&at) = fn_sites(&blank_literals(src), name).first() else {
+        return false;
+    };
     let head: Vec<&str> = src[..at].lines().rev().take(6).collect();
     head.iter().any(|l| l.trim_start().starts_with("#[test]"))
 }
@@ -1410,6 +1452,127 @@ fn a_quoted_definition_with_a_body_does_not_shadow_the_real_one() {
     assert!(device_marker(src, "pin")
         .unwrap()
         .is_some_and(|m| m.contains("x mentions GpuRuntime")));
+}
+
+/// A `{` that is not the body, before the body. Generics, a where clause and a
+/// return type can all hold a const-generic block; the old signature scan took
+/// the first `{` outside `()` and `[]` and read that block as the function.
+#[test]
+fn a_brace_inside_generics_is_not_the_body() {
+    for (label, def) in [
+        (
+            "where T: Tr<{1}> (P24)",
+            "fn h<T>() where T: Tr<{1}> { let _rt = GpuRuntime::new(); }",
+        ),
+        (
+            "where on a non-generic fn (P24c)",
+            "fn h() where u8: Tr<{1}> { let _rt = GpuRuntime::new(); }",
+        ),
+        (
+            "const default (P25)",
+            "fn h<const N: usize = { 3 }>() { let _rt = GpuRuntime::new(); }",
+        ),
+        ("return type (P6)", "fn h() -> Foo<{ 3 }> { let _rt = GpuRuntime::new(); }"),
+        (
+            "an operator in the block",
+            "fn h() -> Foo<{ N >= 3 && N > 2 }> { let _rt = GpuRuntime::new(); }",
+        ),
+        (
+            "a nested block",
+            "fn h() where T: Tr<{ { 1 } }> { let _rt = GpuRuntime::new(); }",
+        ),
+        (
+            "a `->` inside the generics, then a block",
+            "fn h<F: Fn() -> u8, const N: usize = { 3 }>() { let _rt = GpuRuntime::new(); }",
+        ),
+        (
+            "arrow, closing pair and a block",
+            "fn h<F: Fn(u8) -> Vec<Vec<u8>>>() -> impl Fn() -> Foo<{ 2 }> { let _rt = GpuRuntime::new(); }",
+        ),
+    ] {
+        // As a helper the test calls, and as the test itself.
+        let src = format!("{def}\n#[test]\nfn t() {{ h(); }}\n");
+        let body = body_of(&src, "h");
+        assert!(
+            body.contains("GpuRuntime") && body.starts_with("{ let"),
+            "{label}: the body was read as {body:?}"
+        );
+        assert!(
+            device_marker(&src, "t").unwrap().is_some(),
+            "{label}: the device call in the helper went unseen"
+        );
+        let as_test = def.replacen("fn h", "fn t", 1);
+        assert!(
+            device_marker(&as_test, "t").unwrap().is_some(),
+            "{label}: the device call in the test itself went unseen"
+        );
+    }
+}
+
+/// The other side: angle tracking must not turn a clean signature into a flag or
+/// an error, and must not eat a body that follows a `->`, a `>>` or a comparison.
+#[test]
+fn angle_tracking_keeps_clean_signatures_clean() {
+    for def in [
+        "fn t() -> Vec<Vec<u8>> { vec![] }",
+        "fn t<F: Fn(u8) -> u8>(f: F) -> u8 { f(1) }",
+        "fn t() -> impl Fn() -> u8 { || 1 }",
+        "fn t<const N: usize>() -> [u8; N] where [(); N * 2]: { [0; N] }",
+        "fn t(a: u8, b: u8) -> bool where u8: Tr<{ 1 < 2 }> { a < b && b > a }",
+        "fn t<'a>(s: &'a str) -> Result<&'a str, ()> { Ok(s) }",
+    ] {
+        let src = format!("{def}\nfn after() {{ let _rt = GpuRuntime::new(); }}\n");
+        assert_eq!(device_marker(&src, "t"), Ok(None), "{def}: the scan ran past the body");
+        assert!(
+            body_of(&src, "t").ends_with('}') && !body_of(&src, "t").contains("GpuRuntime"),
+            "{def}: wrong span"
+        );
+    }
+    // Unbalanced generics are an error, never a quiet skip of the function: the
+    // `;` below is the next item's, not this signature's.
+    let err = fn_body("fn t<T() { let a = 1; }\nconst X: u8 = 1;\n", "t").unwrap_err();
+    assert!(err.contains("`fn t`"), "{err}");
+}
+
+/// `fn  h(` and `fn\th(`: rustfmt never writes them, but a definition the scan
+/// cannot find is a body it never reads.
+#[test]
+fn a_definition_is_found_through_any_whitespace_after_fn() {
+    for gap in ["  ", "\t", " \t ", "\n"] {
+        let src = format!("fn{gap}h() {{ let _rt = GpuRuntime::new(); }}\n#[test]\nfn t() {{ h(); }}\n");
+        assert_eq!(
+            fn_definitions(&blank_literals(&src), "h"),
+            1,
+            "{gap:?}: the definition was not found"
+        );
+        assert!(
+            device_marker(&src, "t").unwrap().is_some(),
+            "{gap:?}: the helper's device call went unseen"
+        );
+        // And as the test itself.
+        let src = format!("#[test]\nfn{gap}t() {{ let _rt = GpuRuntime::new(); }}\n");
+        assert!(device_marker(&src, "t").unwrap().is_some(), "{gap:?}: the test itself");
+    }
+    // A fn-pointer type and a longer name are not definitions of `h`.
+    assert_eq!(fn_definitions("let f: fn(u8) -> u8; fn  hh() {}", "h"), 0);
+}
+
+/// The word boundary in the call walk. `my_helper(` is a call to `my_helper`, not
+/// to `helper`: a callee whose name is the tail of another identifier must not
+/// be followed, or a clean test is charged for an unrelated device helper.
+#[test]
+fn a_callee_that_is_the_tail_of_another_name_is_not_called() {
+    let src = "fn helper() { let _rt = GpuRuntime::new(); }\n\
+               fn my_helper() {}\n\
+               #[test]\nfn t() { my_helper(); }\n";
+    assert_eq!(device_marker(src, "t"), Ok(None), "`my_helper(` was read as a call to `helper`");
+    // The boundary is on the left only; a real call still counts around it.
+    for call in ["helper();", "x.helper();", "Self::helper();", "(helper)();", "helper::<u8>();"] {
+        let src = format!("fn helper() {{ let _rt = GpuRuntime::new(); }}\n#[test]\nfn t() {{ {call} }}\n");
+        let found = device_marker(&src, "t").unwrap();
+        // `(helper)()` is a fn pointer call, which the scan does not follow.
+        assert_eq!(found.is_some(), call != "(helper)();", "{call}");
+    }
 }
 
 #[test]

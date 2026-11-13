@@ -672,18 +672,34 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
     let survived = !wait_until_gone(child, 5);
     if survived {
         // Our own pid, recorded above; do not leave it for the next run.
-        // SAFETY: `child` is the pid the fake bin wrote for its own `sleep`.
-        unsafe { libc::kill(child, libc::SIGKILL) };
+        kill_pid(child, libc::SIGKILL);
     }
     assert!(!survived, "the hung suite's child {child} outlived the timeout");
+}
+
+/// `pid` if it can be a child of this test: above 1. A pidfile holding 0, -1 or 1
+/// would make `kill` signal this runner's process group, every process the user
+/// owns, or launchd, so such a value fails the test before anything is signalled.
+fn checked_pid(pid: libc::pid_t) -> libc::pid_t {
+    assert!(pid > 1, "a pidfile held {pid}, not a usable pid; refusing to signal it");
+    pid
+}
+
+/// Signal one process, never a group or everything: the pid is checked first.
+fn kill_pid(pid: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: `kill` with a pid above 1 signals exactly that process.
+    unsafe { libc::kill(checked_pid(pid), sig) };
 }
 
 /// The pid a fake bin wrote into `path`, waiting for the file to appear.
 fn read_pid(path: &Path) -> libc::pid_t {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
-            return pid;
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+        {
+            return checked_pid(pid);
         }
         assert!(
             std::time::Instant::now() < until,
@@ -697,8 +713,8 @@ fn read_pid(path: &Path) -> libc::pid_t {
 /// Whether `pid` no longer exists. A zombie still does (signal 0 reaches it), so
 /// this is also the "was reaped" check.
 fn pid_gone(pid: libc::pid_t) -> bool {
-    // SAFETY: signal 0 only probes whether `pid` exists.
-    let rc = unsafe { libc::kill(pid, 0) };
+    // SAFETY: signal 0 only probes whether `pid` exists; the pid is checked first.
+    let rc = unsafe { libc::kill(checked_pid(pid), 0) };
     rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
@@ -732,8 +748,7 @@ fn run_bounded_escalates_to_sigkill_and_reaps_the_child() {
     let reaped = pid_gone(sh);
     let sleep_gone = wait_until_gone(sleep, 5);
     if !sleep_gone {
-        // SAFETY: the pid the fake bin wrote for its own `sleep`.
-        unsafe { libc::kill(sleep, libc::SIGKILL) };
+        kill_pid(sleep, libc::SIGKILL);
     }
     assert!(err.contains("timed out after 3s"), "{err}");
     assert!(
@@ -765,8 +780,7 @@ fn run_bounded_sweeps_what_a_finished_child_left_in_its_group() {
     let sleep = read_pid(&pidfile);
     let gone = wait_until_gone(sleep, 5);
     if !gone {
-        // SAFETY: the pid the shell wrote for its own `sleep`.
-        unsafe { libc::kill(sleep, libc::SIGKILL) };
+        kill_pid(sleep, libc::SIGKILL);
     }
     assert!(gone, "the finished shell's child {sleep} was left running");
 }
@@ -798,6 +812,22 @@ fn run_bounded_sends_sigterm_first_and_does_not_wait_out_the_grace() {
         took < std::time::Duration::from_millis(3500),
         "waited out the grace period although the child exits on TERM: {took:?}"
     );
+}
+
+/// A pidfile holding a value that is no child's pid fails the test before any
+/// signal is sent: 0 is this runner's group, -1 is everything the user owns, 1 is launchd.
+#[test]
+fn a_pidfile_that_holds_no_usable_pid_is_refused_before_anything_is_signalled() {
+    let d = tmp("badpid");
+    for bad in ["0", "-1", "1", "-4242"] {
+        let f = d.path().join("pid");
+        std::fs::write(&f, bad).unwrap();
+        let msg = match std::panic::catch_unwind(|| read_pid(&f)) {
+            Ok(pid) => panic!("{bad:?} was accepted as pid {pid}"),
+            Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(msg.contains("not a usable pid"), "{bad:?}: {msg}");
+    }
 }
 
 /// Body of the interrupt tests' child process: this same test binary, run with
@@ -928,8 +958,7 @@ fn a_terminal_signal_to_the_parent_takes_the_childs_whole_group_down() {
             let _ = helper.wait();
         }
         if !sleep_gone {
-            // SAFETY: the pid the helper's shell wrote for its own `sleep`.
-            unsafe { libc::kill(sleep, libc::SIGKILL) };
+            kill_pid(sleep, libc::SIGKILL);
         }
         let status = status.unwrap_or_else(|| panic!("signal {sig}: the helper did not exit within 10 s"));
         assert_eq!(
@@ -959,8 +988,7 @@ fn an_ignored_signal_leaves_the_parent_and_its_child_running() {
     let exited = wait_for(&mut helper, 2);
     let child_alive = !pid_gone(sleep);
     // Clean up by pid: the sleep ends, so the helper's `run_bounded` returns and it exits.
-    // SAFETY: the pid the helper's shell wrote for its own `sleep`.
-    unsafe { libc::kill(sleep, libc::SIGKILL) };
+    kill_pid(sleep, libc::SIGKILL);
     if exited.is_none() && wait_for(&mut helper, 10).is_none() {
         let _ = helper.kill();
         let _ = helper.wait();
@@ -990,12 +1018,12 @@ fn run_bounded_refuses_a_child_it_has_no_slot_to_track() {
                 .parse()
                 .ok()
         })
+        .map(checked_pid)
         .collect();
     let all_gone = kids.iter().all(|&k| wait_until_gone(k, 5));
     if !all_gone {
         for &k in &kids {
-            // SAFETY: pids the helper's shells wrote for themselves.
-            unsafe { libc::kill(k, libc::SIGKILL) };
+            kill_pid(k, libc::SIGKILL);
         }
     }
     if status.is_none() {

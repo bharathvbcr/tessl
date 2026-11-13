@@ -1759,6 +1759,13 @@ fn guard_real_repo() -> ScriptRepo {
 
 /// The id of the first perturbation row, from the driver's own `--list`.
 fn first_row_id(repo: &ScriptRepo) -> String {
+    row_id_in(repo, None)
+}
+
+/// The id of the first perturbation row whose test binary is `bin` (rows of
+/// `nn_adversarial` edit the file the driver restores second), or the first
+/// row at all for `None`.
+fn row_id_in(repo: &ScriptRepo, bin: Option<&str>) -> String {
     let out = Command::new("bash")
         .arg(repo.root.join("repo/scripts/guard_break_it.sh"))
         .arg("--list")
@@ -1772,10 +1779,10 @@ fn first_row_id(repo: &ScriptRepo) -> String {
     );
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.lines()
-        .next()
-        .and_then(|l| l.split('\t').next())
-        .unwrap_or_else(|| panic!("no rows in --list output: {text:?}"))
-        .to_string()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .find(|f| f.len() >= 2 && bin.is_none_or(|b| f[1] == b))
+        .map(|f| f[0].to_string())
+        .unwrap_or_else(|| panic!("no row for {bin:?} in --list output: {text:?}"))
 }
 
 fn real_python() -> OsString {
@@ -2089,4 +2096,84 @@ fn missing_changelog_footer_still_fails_the_gate() {
     );
     assert!(!out.stderr.contains("grep failed"), "{}", out.all());
     assert!(!out.stdout.contains("release-ready:"), "{}", out.all());
+}
+
+/// `cp` that, from call `$FAKE_SLOW_FROM` on, announces itself in
+/// `$FAKE_CP_STARTED` and takes two seconds, so a second signal can arrive
+/// while the driver's restore is part-way through its copies.
+const FAKE_SLOW_CP: &str = "#!/bin/sh\n\
+n=$(cat \"$FAKE_COUNT_DIR/cp\" 2>/dev/null || echo 0)\n\
+n=$((n + 1))\n\
+echo \"$n\" > \"$FAKE_COUNT_DIR/cp\"\n\
+if [ \"$n\" -ge \"$FAKE_SLOW_FROM\" ]; then : > \"$FAKE_CP_STARTED\"; sleep 2; fi\n\
+exec /bin/cp \"$@\"\n";
+
+/// `first` while a nn_adversarial row is perturbed and cargo is parked, then
+/// `second` once the restore's first (slow) copy is under way. The restore must
+/// finish all the same: tests put back, no backup dir left, exit 128 + `first`.
+fn guard_double_signal(first: i32, second: i32, want: i32) {
+    let repo = guard_real_repo();
+    let id = row_id_in(&repo, Some("nn_adversarial"));
+    let tmp = Scratch::dir("relready-guardtmp");
+    let dir = tools_dir(&[("cp", FAKE_SLOW_CP)]);
+    let started = repo.root.join("started");
+    let release = repo.root.join("release");
+    let cp_started = repo.root.join("cp-started");
+    let mut s = repo.spawn(
+        "guard_break_it.sh",
+        &["--only", &id],
+        &repo.root.join("repo"),
+        &[dir.path()],
+        Some(tmp.path()),
+        &[
+            ev("FAKE_PARK_AT", "2"),
+            ev("FAKE_STARTED", &started),
+            ev("FAKE_RELEASE", &release),
+            // cp call 1 is the backup; call 2 is the first copy of the restore.
+            ev("FAKE_SLOW_FROM", "2"),
+            ev("FAKE_CP_STARTED", &cp_started),
+        ],
+    );
+    s.wait_for_file(&started, 60, "the perturbed row's cargo run to start");
+    let status = |repo: &ScriptRepo| {
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(repo.root.join("repo"))
+            .args(["status", "--porcelain", "--", "tests"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    assert!(
+        status(&repo).contains("nn_adversarial.rs"),
+        "the nn_adversarial row was not applied; the test proves nothing"
+    );
+    s.signal_pid(first);
+    std::fs::write(&release, "go\n").unwrap();
+    s.wait_for_file(&cp_started, 60, "the restore's slow copy to start");
+    s.signal_pid(second);
+    let out = s.wait(60);
+    assert_eq!(out.code, Some(want), "{}", out.all());
+    assert_eq!(status(&repo), "", "tests left modified\n{}", out.all());
+    let left = entries(tmp.path());
+    assert!(
+        left.len() == 1 && left[0].starts_with("tessl-guard-log."),
+        "left behind: {left:?}\n{}",
+        out.all()
+    );
+}
+
+#[test]
+fn guard_term_then_term_during_restore_still_restores() {
+    guard_double_signal(libc::SIGTERM, libc::SIGTERM, 143);
+}
+
+#[test]
+fn guard_int_then_term_during_restore_still_restores() {
+    guard_double_signal(libc::SIGINT, libc::SIGTERM, 130);
+}
+
+#[test]
+fn guard_hup_then_int_during_restore_still_restores() {
+    guard_double_signal(libc::SIGHUP, libc::SIGINT, 129);
 }

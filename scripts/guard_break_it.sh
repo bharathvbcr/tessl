@@ -479,6 +479,9 @@ restore() {
     return
   fi
   restored=1
+  # A second signal must not start another handler mid-restore: its restore
+  # would see restored=1, return at once, and exit with the files half put back.
+  trap '' INT TERM HUP
   [ -z "$planfile" ] || rm -f "$planfile"
   if [ "$backed_up" -eq 1 ]; then
     cp "$bak/reductions.rs" tests/reductions.rs || exit 2
@@ -494,11 +497,13 @@ restore() {
   [ -z "$bak" ] || rm -rf "$bak"
 }
 # A signal restores and then EXITS: a handler that returned would let the loop
-# go on perturbing files after the backup was gone (128 + signal number).
+# go on perturbing files after the backup was gone (128 + signal number). Each
+# handler's first command ignores further signals, so a second one cannot
+# interrupt the restore; restore() does the same for the EXIT path.
 trap restore EXIT
-trap 'restore; exit 130' INT
-trap 'restore; exit 143' TERM
-trap 'restore; exit 129' HUP
+trap "trap '' INT TERM HUP; restore; exit 130" INT
+trap "trap '' INT TERM HUP; restore; exit 143" TERM
+trap "trap '' INT TERM HUP; restore; exit 129" HUP
 
 bak=$(mktemp -d "$tmp_base/tessl-guard-bak.XXXXXX") || die "could not create a backup dir under $tmp_base"
 [ -n "$bak" ] && [ -d "$bak" ] || die "mktemp gave no backup dir under $tmp_base"

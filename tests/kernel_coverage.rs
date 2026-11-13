@@ -771,6 +771,35 @@ fn run_bounded_sweeps_what_a_finished_child_left_in_its_group() {
     assert!(gone, "the finished shell's child {sleep} was left running");
 }
 
+/// A timed-out child gets SIGTERM before any SIGKILL: one that traps TERM, records
+/// it and exits is not made to wait out the grace period, and its trap runs.
+#[test]
+fn run_bounded_sends_sigterm_first_and_does_not_wait_out_the_grace() {
+    let d = tmp("sigterm");
+    let note = d.path().join("note");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "trap 'echo term > \"{n}\"; exit 0' TERM; echo ready > \"{n}.ready\"; sleep 300 & wait",
+        n = note.display()
+    ));
+    let t0 = std::time::Instant::now();
+    let err = proc::run_bounded(&mut cmd, 2).err().expect("a hang is an error");
+    let took = t0.elapsed();
+    assert!(err.contains("timed out after 2s"), "{err}");
+    // The trap is installed before `ready` is written; no ready file means the
+    // timeout fired before the shell got that far and says nothing about TERM.
+    assert!(d.path().join("note.ready").exists(), "the shell never started");
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap_or_default().trim(),
+        "term",
+        "the child was killed before it saw SIGTERM"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(3500),
+        "waited out the grace period although the child exits on TERM: {took:?}"
+    );
+}
+
 /// Body of the interrupt test's child process: this same test binary, run with
 /// `TESSL_PROC_HELPER_PIDFILE` set, drives `run_bounded` over a shell that
 /// backgrounds a `sleep`. Without the variable it does nothing.

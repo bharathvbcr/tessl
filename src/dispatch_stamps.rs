@@ -69,7 +69,7 @@ pub struct StampLog {
 impl StampLog {
     /// Count one armed command buffer whose stamps were discarded.
     fn note_dropped(&mut self) {
-        self.dropped_batches += 1;
+        self.dropped_batches = self.dropped_batches.saturating_add(1);
     }
 }
 
@@ -103,12 +103,15 @@ pub struct DispatchStampBatch {
     /// More dispatches than the heap holds: `stamps` is a prefix, not the token.
     pub overflowed: bool,
     /// Earlier armed command buffers that ended without a waiting commit and
-    /// whose stamps were discarded.
+    /// whose stamps were discarded. Saturates at `u32::MAX`: a value equal to
+    /// `u32::MAX` is a floor ("at least this many"), not an exact count.
     pub dropped_batches: u32,
     /// Waiting commits folded into this batch. 1 for a token encoded into one
     /// command buffer; more when host mappings commit mid-token. A later
     /// command buffer's first `dt_ns` is measured from its own origin stamp,
     /// so the time between command buffers is in `t_end_ns` but in no `dt_ns`.
+    /// Saturates at `u32::MAX`: a value equal to `u32::MAX` is a floor, not an
+    /// exact count.
     pub command_buffers: u32,
 }
 
@@ -116,8 +119,8 @@ impl DispatchStampBatch {
     pub(crate) fn merge(&mut self, next: DispatchStampBatch) {
         self.stamps.extend(next.stamps);
         self.overflowed |= next.overflowed;
-        self.dropped_batches += next.dropped_batches;
-        self.command_buffers += next.command_buffers;
+        self.dropped_batches = self.dropped_batches.saturating_add(next.dropped_batches);
+        self.command_buffers = self.command_buffers.saturating_add(next.command_buffers);
     }
 }
 

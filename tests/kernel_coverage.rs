@@ -752,8 +752,15 @@ fn run_bounded_sweeps_what_a_finished_child_left_in_its_group() {
     let pidfile = d.path().join("sleep.pid");
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
-        .arg(format!("sleep 300 & echo $! > '{}'; exit 0", pidfile.display()));
-    let ran = proc::run_bounded(&mut cmd, 30).expect("the shell exits by itself");
+        .arg(format!("sleep 60 & echo $! > '{}'; exit 0", pidfile.display()));
+    let t0 = std::time::Instant::now();
+    let ran = proc::run_bounded(&mut cmd, 120).expect("the shell exits by itself");
+    // Without the sweep the `sleep` holds the output pipes and the call waits it out.
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(30),
+        "waited on the leftover child: {:?}",
+        t0.elapsed()
+    );
     assert_eq!(ran.code, Some(0));
     let sleep = read_pid(&pidfile);
     let gone = wait_until_gone(sleep, 5);

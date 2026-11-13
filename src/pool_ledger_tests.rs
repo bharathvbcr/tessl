@@ -2192,10 +2192,12 @@ fn commit_m4_has_no_failure_point_between_the_submit_and_the_in_flight_record() 
 /// The begin-to-install window of `ensure_m4_cb_open` has no Rust failure
 /// point in release: ObjC sends, then `arm_dispatch_stamps`, then the install.
 /// This pin records the audit and fixes nothing: it is green before and after
-/// ft-ec125ae2. One known gap is outside this window's file, and so outside
-/// the fix: `dropped_batches += 1` in `arm_dispatch_stamps` is a `u32` that
-/// panics on overflow in a debug build only (release wraps), after 2^32 armed,
-/// unresolved batches.
+/// ft-ec125ae2. `arm_dispatch_stamps` now takes the lock through
+/// `stamp_log_guard`, which recovers a poisoned lock instead of returning
+/// (ft-aec9c56b), and does its bookkeeping in `StampLog::begin_command_buffer`,
+/// whose dropped-batch count saturates instead of overflowing (ft-309b6364).
+/// Both helpers are pinned below, because the window's failure points now live
+/// in their bodies. `Mutex::lock` itself is unchanged from the audited code.
 #[test]
 fn ensure_m4_cb_open_has_no_rust_failure_point_between_begin_and_install() {
     let src = include_str!("runtime.rs");
@@ -2228,17 +2230,12 @@ fn ensure_m4_cb_open_has_no_rust_failure_point_between_begin_and_install() {
     );
     assert_eq!(window, expected, "the begin-to-install window changed");
 
-    let arm = compact_fn(include_str!("dispatch_stamps.rs"), "pub(crate) fn arm_dispatch_stamps(");
+    let stamps_src = include_str!("dispatch_stamps.rs");
+    let arm = compact_fn(stamps_src, "pub(crate) fn arm_dispatch_stamps(");
     let expected_arm = compact(
         "pub(crate) fn arm_dispatch_stamps(&self) {
-             let Ok(mut log) = self.stamp_log.lock() else { return };
-             if log.armed && !log.meta.is_empty() {
-                 log.dropped_batches += 1;
-             }
-             log.meta.clear();
-             log.barrier_pending = false;
-             log.overflowed = false;
-             log.armed = false;
+             let mut log = stamp_log_guard(&self.stamp_log);
+             log.begin_command_buffer();
              if !crate::ab_flags::dispatch_stamps() {
                  return;
              }
@@ -2248,6 +2245,35 @@ fn ensure_m4_cb_open_has_no_rust_failure_point_between_begin_and_install() {
              log.armed = true;",
     );
     assert_eq!(arm, expected_arm, "arm_dispatch_stamps changed");
+
+    // The helpers arm_dispatch_stamps calls inside the window, each pinned to its exact body.
+    let begin = compact_fn(stamps_src, "fn begin_command_buffer(");
+    let expected_begin = compact(
+        "fn begin_command_buffer(&mut self) {
+             if self.armed && !self.meta.is_empty() {
+                 self.note_dropped();
+             }
+             self.meta.clear();
+             self.barrier_pending = false;
+             self.overflowed = false;
+             self.armed = false;",
+    );
+    assert_eq!(begin, expected_begin, "StampLog::begin_command_buffer changed");
+    let stamps_compact = compact(stamps_src);
+    for (helper, pinned) in [
+        (
+            "StampLog::note_dropped",
+            "fn note_dropped(&mut self) { self.dropped_batches = self.dropped_batches.saturating_add(1); }",
+        ),
+        (
+            "stamp_log_guard",
+            "fn stamp_log_guard(stamp_log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
+                 stamp_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+             }",
+        ),
+    ] {
+        assert!(stamps_compact.contains(&compact(pinned)), "{helper} changed");
+    }
 
     let flag = compact("pub fn dispatch_stamps() -> bool { DISPATCH_STAMPS.get(ENV_DISPATCH_STAMPS, || false)");
     assert!(

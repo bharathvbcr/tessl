@@ -142,17 +142,15 @@ fn calls(body: &str, callee: &str) -> bool {
     })
 }
 
-/// Every `{...}` body of a function named `name` in `src`, in source order.
-/// Empty if `src` defines none, or only declares it (`fn name(..);` in a trait).
-/// `Err` names the function if a body cannot be delimited. There is no guessed
-/// span: the callers are checks, and a check that cannot read a body must say so
-/// rather than scan whatever text happens to follow it.
+/// The `{...}` body of the first function named `name` in `src` that has one.
+/// `Ok(None)` if `src` defines none, or only declares it (`fn name(..);` in a
+/// trait). `Err` names the function if its body cannot be delimited. There is no
+/// guessed span: the callers are checks, and a check that cannot read a body
+/// must say so rather than scan whatever text happens to follow it.
 ///
-/// A name can have several bodies (a trait declaration and each impl of it, or
-/// the same helper in two modules of one file). The scan cannot tell which one a
-/// call reaches, so every body is returned and the caller scans all of them: the
-/// conservative side, and the only one that cannot hide a device call behind a
-/// bodiless declaration that happens to come first.
+/// A bodiless declaration is skipped, not taken as the answer: with a trait
+/// `fn go(&self);` ahead of `impl T for X { fn go(&self) { .. } }`, the impl is
+/// the body that is scanned.
 ///
 /// Structure is read off the literal-blanked copy, so a definition is never a
 /// `fn name(` quoted inside a string (a pin that asserts on another function's
@@ -160,11 +158,16 @@ fn calls(body: &str, callee: &str) -> bool {
 /// C string, char literal or comment is not counted. Spans are taken from `src`
 /// itself, which `blank_literals` keeps offset-aligned.
 ///
-/// Known gap: a helper defined by `macro_rules!` is not a `fn name` in the source
-/// text, so its body is never scanned. The scan reads source, not expansions.
-fn fn_bodies<'a>(src: &'a str, name: &str) -> Result<Vec<&'a str>, String> {
+/// Known gaps, both pre-existing:
+/// - a helper defined by `macro_rules!` is not a `fn name` in the source text, so
+///   its body is never scanned: the scan reads source, not expansions;
+/// - resolution is by name alone. When several functions share a name (six
+///   `fn new(` in `src/runtime.rs`), the first one with a body is the one
+///   scanned, whichever type a call actually reaches. Narrowing by receiver or
+///   path is not done here, and scanning every same-named body would flag
+///   device-free tests that merely call some other type's `new`.
+fn fn_body<'a>(src: &'a str, name: &str) -> Result<Option<&'a str>, String> {
     let blank = blank_literals(src);
-    let mut bodies = Vec::new();
     for at in fn_sites(&blank, name) {
         // The signature runs to the first `{` outside any parenthesis or bracket;
         // a `;` out there first means a declaration with no body.
@@ -208,9 +211,9 @@ fn fn_bodies<'a>(src: &'a str, name: &str) -> Result<Vec<&'a str>, String> {
         let end = end.ok_or_else(|| {
             format!("`fn {name}`: its body opens at byte {open} and never closes ({depth} `{{` left open)")
         })?;
-        bodies.push(&src[open..end]);
+        return Ok(Some(&src[open..end]));
     }
-    Ok(bodies)
+    Ok(None)
 }
 
 /// Every function name defined in `src`.
@@ -263,24 +266,24 @@ fn device_marker(src: &str, test: &str) -> Result<Option<String>, String> {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let bodies = fn_bodies(&src, &name)?;
-        if bodies.is_empty() && name == test {
-            return Err(format!("no `fn {test}(` with a body found"));
-        }
-        for body in bodies {
-            // Only the exempt call paths are blanked, and only for the marker scan;
-            // every other mention of a device type still counts, and the call-graph
-            // walk below still sees the body as written.
-            let scanned = without_exempt_calls(body);
-            for m in DEVICE_MARKERS {
-                if scanned.contains(m) {
-                    return Ok(Some(format!("{name} mentions {m}")));
-                }
+        let Some(body) = fn_body(&src, &name)? else {
+            if name == test {
+                return Err(format!("no `fn {test}(` with a body found"));
             }
-            for callee in &known {
-                if calls(body, callee) {
-                    work.push(callee.clone());
-                }
+            continue;
+        };
+        // Only the exempt call paths are blanked, and only for the marker scan;
+        // every other mention of a device type still counts, and the call-graph
+        // walk below still sees the body as written.
+        let scanned = without_exempt_calls(body);
+        for m in DEVICE_MARKERS {
+            if scanned.contains(m) {
+                return Ok(Some(format!("{name} mentions {m}")));
+            }
+        }
+        for callee in &known {
+            if calls(body, callee) {
+                work.push(callee.clone());
             }
         }
     }
@@ -709,8 +712,8 @@ fn fn_definitions(src: &str, name: &str) -> usize {
 }
 
 /// Scan one resolved test, reading each file at most once. A leaf name defined
-/// twice in the same file is refused rather than guessed at: `fn_bodies` returns
-/// every match, and in a file with a dozen test modules that need not be
+/// twice in the same file is refused rather than guessed at: `fn_body` takes
+/// the first match, and in a file with a dozen test modules that need not be
 /// the one the filter selected.
 fn scan_resolved(test: &LibTest, cache: &mut HashMap<PathBuf, String>, what: &str) {
     let src = cache.entry(test.file.clone()).or_insert_with(|| {
@@ -1086,7 +1089,7 @@ fn a_planted_manifest_entry_over_a_device_test_is_refused() {
 /// is a claim someone checked once; it would go on passing the day its function
 /// grew a device call, and the exemption is exactly what would hide that from
 /// every test calling it. So the claim is re-derived on every run, from the same
-/// `fn_bodies` and `DEVICE_MARKERS` the scan itself uses.
+/// `fn_body` and `DEVICE_MARKERS` the scan itself uses.
 #[test]
 fn the_device_marker_exemptions_are_still_pure() {
     assert!(
@@ -1114,15 +1117,9 @@ fn the_device_marker_exemptions_are_still_pure() {
             full.display()
         );
 
-        let bodies = fn_bodies(&stripped, name).unwrap_or_else(|e| panic!("{path}: {e} in {}", full.display()));
-        assert_eq!(
-            bodies.len(),
-            1,
-            "{path}: `fn {name}` has {} bodies in {}",
-            bodies.len(),
-            full.display()
-        );
-        let body = bodies[0];
+        let body = fn_body(&stripped, name)
+            .unwrap_or_else(|e| panic!("{path}: {e} in {}", full.display()))
+            .unwrap_or_else(|| panic!("{path}: no `fn {name}` with a body in {}", full.display()));
         for m in DEVICE_MARKERS {
             assert!(
                 !body.contains(m),
@@ -1162,11 +1159,11 @@ fn the_scanner_flags_a_planted_device_test() {
     );
 }
 
-/// The one body of `name` in `src`, for the self-tests below.
+/// `fn_body` unwrapped, for the self-tests below.
 fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
-    let bodies = fn_bodies(src, name).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(bodies.len(), 1, "expected one body for {name}, got {bodies:?}");
-    bodies[0]
+    fn_body(src, name)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .unwrap_or_else(|| panic!("no body for {name}"))
 }
 
 /// Braces in every literal and comment kind, none of which may move the count.
@@ -1202,13 +1199,13 @@ fn after() { let _rt = GpuRuntime::new(); }
 /// guessed from the text after it.
 #[test]
 fn fn_body_refuses_a_body_it_cannot_delimit() {
-    let err = fn_bodies("fn open_ended() { let a = 1;\n#[test]\nfn next() {}\n", "open_ended").unwrap_err();
+    let err = fn_body("fn open_ended() { let a = 1;\n#[test]\nfn next() {}\n", "open_ended").unwrap_err();
     assert!(err.contains("open_ended") && err.contains("never closes"), "{err}");
-    let err = fn_bodies("fn headless(x: u8)", "headless").unwrap_err();
+    let err = fn_body("fn headless(x: u8)", "headless").unwrap_err();
     assert!(err.contains("headless"), "{err}");
     // A declaration has no body to scan, and must not borrow the next item's.
-    assert_eq!(fn_bodies("fn decl(&self);\nfn other() { 1 }\n", "decl"), Ok(vec![]));
-    assert_eq!(fn_bodies("fn other() {}", "absent"), Ok(vec![]));
+    assert_eq!(fn_body("fn decl(&self);\nfn other() { 1 }\n", "decl"), Ok(None));
+    assert_eq!(fn_body("fn other() {}", "absent"), Ok(None));
     // `device_marker` surfaces it rather than reporting the test clean.
     assert!(device_marker("fn t() { let a = 1;", "t").is_err());
 }
@@ -1236,8 +1233,8 @@ fn appended_after_the_pin() {
 }
 "#;
     assert_eq!(
-        fn_bodies(src, "end_command_buffer"),
-        Ok(vec![]),
+        fn_body(src, "end_command_buffer"),
+        Ok(None),
         "a quoted `fn x(` was read as a definition"
     );
     assert_eq!(
@@ -1289,19 +1286,18 @@ fn a_device_use_after_a_brace_in_a_literal_is_still_flagged() {
 #[test]
 fn a_bodyless_declaration_does_not_hide_the_impl_that_follows() {
     let src = "trait T { fn go(&self); }\n\
-               impl T for A { fn go(&self) { let _ = 1; } }\n\
                impl T for B { fn go(&self) { let _rt = GpuRuntime::new(); } }\n\
                #[test]\nfn t() { A.go(); }\n";
     assert_eq!(
-        fn_bodies(src, "go").unwrap().len(),
-        2,
-        "declaration kept, two impls expected"
+        body_of(src, "go"),
+        "{ let _rt = GpuRuntime::new(); }",
+        "the declaration was taken as the definition, or a later impl was preferred"
     );
     assert!(
         device_marker(src, "t")
             .unwrap()
             .is_some_and(|m| m.contains("go mentions GpuRuntime")),
-        "a device call in the second impl went unseen"
+        "the impl body that follows the declaration went unscanned"
     );
     // A name only ever declared has no body to scan and is not an error.
     let src = "trait T { fn go(&self); }\n#[test]\nfn t() { A.go(); }\n";
@@ -1397,11 +1393,6 @@ fn a_marker_inside_a_string_literal_still_counts() {
 fn a_quoted_definition_with_a_body_does_not_shadow_the_real_one() {
     let src = "#[test]\nfn pin() { let q = \"fn x() { }\"; x(); }\n\
                fn x() { let _rt = GpuRuntime::new(); }\n";
-    assert_eq!(
-        fn_bodies(src, "x").unwrap().len(),
-        1,
-        "the quoted text counted as a definition"
-    );
     assert_eq!(body_of(src, "x"), "{ let _rt = GpuRuntime::new(); }");
     assert!(device_marker(src, "pin")
         .unwrap()

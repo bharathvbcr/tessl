@@ -1566,13 +1566,7 @@ fn dev_fast_check_log_lives_under_tmpdir_and_is_removed() {
     let repo = dev_repo();
     let tmp = Scratch::dir("relready-devtmp");
     let ls = repo.root.join("ls.txt");
-    let out = repo.run(
-        "dev_fast_check.sh",
-        &[],
-        &[],
-        Some(tmp.path()),
-        &[ev("FAKE_LS", &ls)],
-    );
+    let out = repo.run("dev_fast_check.sh", &[], &[], Some(tmp.path()), &[ev("FAKE_LS", &ls)]);
     assert_eq!(out.code, Some(0), "{}", out.all());
     let seen = std::fs::read_to_string(&ls).unwrap();
     assert!(
@@ -1634,13 +1628,7 @@ fn guard_break_it_temp_paths_live_under_tmpdir() {
     let repo = guard_repo();
     let tmp = Scratch::dir("relready-guardtmp");
     let ls = repo.root.join("ls.txt");
-    let out = repo.run(
-        "guard_break_it.sh",
-        &[],
-        &[],
-        Some(tmp.path()),
-        &[ev("FAKE_LS", &ls)],
-    );
+    let out = repo.run("guard_break_it.sh", &[], &[], Some(tmp.path()), &[ev("FAKE_LS", &ls)]);
     // Every baseline is red (no test result), so the verdict is failure.
     assert_eq!(out.code, Some(1), "{}", out.all());
     let seen = std::fs::read_to_string(&ls).unwrap();

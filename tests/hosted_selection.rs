@@ -1310,12 +1310,14 @@ fn a_bodyless_declaration_does_not_hide_the_impl_that_follows() {
 #[test]
 fn every_char_escape_form_is_one_literal() {
     for lit in ["'\\n'", "'\\x41'", "'\\u{7b}'", "'\\''", "'\\\\'", "'\\0'", "b'\\x7d'"] {
-        let src = format!("#[test]\nfn t() {{ let c = ({lit}, '}}'); let _rt = GpuRuntime::new(); }}\n");
+        // No space after the comma: `',` followed by `'` is what a lexer that
+        // missed the escape reads as a char literal `','`, exposing the brace.
+        let src = format!("#[test]\nfn t() {{ let c = ({lit},'}}'); let _rt = GpuRuntime::new(); }}\n");
         assert!(
             device_marker(&src, "t").unwrap().is_some(),
             "{lit} was not read as a single literal: the body closed early"
         );
-        let src = format!("fn t() {{ let c = ({lit}, '}}'); let z = 1; }}\nfn u() {{ }}\n");
+        let src = format!("fn t() {{ let c = ({lit},'}}'); let z = 1; }}\nfn u() {{ }}\n");
         assert!(
             body_of(&src, "t").ends_with("let z = 1; }"),
             "{lit}: the span of `t` is wrong"
@@ -1326,7 +1328,15 @@ fn every_char_escape_form_is_one_literal() {
 /// C-string literals (`c"…"`, `cr#"…"#`) hold braces like any other string.
 #[test]
 fn c_strings_are_literals() {
-    for lit in [r#"c"}""#, r##"cr#"} "#"##, r#"c"\"}""#, r#"cr"}""#] {
+    // The hashed raw forms hold a `"` inside, so a lexer that does not know the
+    // `c` prefix ends the string at that quote and exposes the brace after it.
+    for lit in [
+        r#"c"}""#,
+        r##"cr#"x"} "#"##,
+        r###"cr##"x"# }"##"###,
+        r#"c"\"}""#,
+        r#"cr"}""#,
+    ] {
         let src = format!("#[test]\nfn t() {{ let s = {lit}; let _rt = GpuRuntime::new(); }}\n");
         assert!(
             device_marker(&src, "t").unwrap().is_some(),

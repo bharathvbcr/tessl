@@ -71,6 +71,19 @@ impl StampLog {
     fn note_dropped(&mut self) {
         self.dropped_batches = self.dropped_batches.saturating_add(1);
     }
+
+    /// The state transition when a new command buffer begins: an armed buffer
+    /// that recorded stamps but never reached a waiting commit is counted as
+    /// dropped, then the per-buffer state is cleared and the log is disarmed.
+    fn begin_command_buffer(&mut self) {
+        if self.armed && !self.meta.is_empty() {
+            self.note_dropped();
+        }
+        self.meta.clear();
+        self.barrier_pending = false;
+        self.overflowed = false;
+        self.armed = false;
+    }
 }
 
 /// One dispatch, as seen by the stamps.
@@ -129,13 +142,7 @@ impl GpuRuntime {
     /// with the command buffer open and before any encoder exists.
     pub(crate) fn arm_dispatch_stamps(&self) {
         let Ok(mut log) = self.stamp_log.lock() else { return };
-        if log.armed && !log.meta.is_empty() {
-            log.note_dropped();
-        }
-        log.meta.clear();
-        log.barrier_pending = false;
-        log.overflowed = false;
-        log.armed = false;
+        log.begin_command_buffer();
         if !crate::ab_flags::dispatch_stamps() {
             return;
         }
@@ -393,8 +400,65 @@ mod counter_tests {
         log.note_dropped();
         assert_eq!(log.dropped_batches, u32::MAX);
         log.note_dropped();
-        log.note_dropped();
         assert_eq!(log.dropped_batches, u32::MAX, "a saturated count stays a floor");
+    }
+
+    /// An armed log holding stamps of a buffer that never reached a waiting commit.
+    fn armed_with_stamps(dropped_batches: u32) -> StampLog {
+        StampLog {
+            armed: true,
+            meta: vec![StampMeta {
+                pipeline: 1,
+                barrier_before: true,
+                layer: 0,
+            }],
+            barrier_pending: true,
+            overflowed: true,
+            dropped_batches,
+        }
+    }
+
+    /// The path `arm_dispatch_stamps` takes under the lock: from `u32::MAX - 1`
+    /// two more dropped buffers land on `u32::MAX`, and each call still clears
+    /// the per-buffer state.
+    #[test]
+    fn beginning_command_buffers_past_the_limit_saturates_and_resets() {
+        let mut log = armed_with_stamps(u32::MAX - 1);
+        log.begin_command_buffer();
+        assert_eq!(log.dropped_batches, u32::MAX);
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+
+        let mut log = StampLog {
+            dropped_batches: u32::MAX,
+            ..armed_with_stamps(0)
+        };
+        log.begin_command_buffer();
+        assert_eq!(log.dropped_batches, u32::MAX, "a saturated count stays a floor");
+        assert!(log.meta.is_empty() && !log.barrier_pending && !log.overflowed && !log.armed);
+    }
+
+    #[test]
+    fn beginning_a_command_buffer_counts_only_armed_buffers_that_recorded_stamps() {
+        let mut empty = StampLog {
+            armed: true,
+            dropped_batches: 7,
+            ..StampLog::default()
+        };
+        empty.begin_command_buffer();
+        assert_eq!(empty.dropped_batches, 7, "armed but nothing stamped is not a drop");
+
+        let mut unarmed = StampLog {
+            dropped_batches: 7,
+            ..armed_with_stamps(7)
+        };
+        unarmed.armed = false;
+        unarmed.begin_command_buffer();
+        assert_eq!(unarmed.dropped_batches, 7, "an unarmed buffer is not a drop");
+        assert!(unarmed.meta.is_empty() && !unarmed.barrier_pending && !unarmed.overflowed);
+
+        let mut live = armed_with_stamps(7);
+        live.begin_command_buffer();
+        assert_eq!(live.dropped_batches, 8);
     }
 
     #[test]

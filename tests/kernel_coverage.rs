@@ -651,8 +651,15 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
     assert!(t.failures[0].contains("older than kernels/*.metal"), "{:?}", t.failures);
     assert!(t.traced.is_empty());
 
-    // And a hang is bounded.
-    fake_bin(&bin, "bench_nn_kernels", "sleep 30");
+    // And a hang is bounded, and takes what the hung suite started with it: the
+    // shell is killed on the timeout, but its `sleep` used to outlive it, reparented
+    // to launchd, and outlived the whole test run (mac_heavy reaped it).
+    let pidfile = bin.join("hung_child.pid");
+    fake_bin(
+        &bin,
+        "bench_nn_kernels",
+        &format!("sleep 30 &\necho $! > '{}'\nwait", pidfile.display()),
+    );
     let t = kcov::run_suites(
         &[one_suite("bench_nn_kernels", &[], &[])],
         &bin,
@@ -661,6 +668,375 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
         1,
     );
     assert!(t.failures[0].contains("timed out after 1s"), "{:?}", t.failures);
+    let child = read_pid(&pidfile);
+    let survived = !wait_until_gone(child, 5);
+    if survived {
+        // Our own pid, recorded above; do not leave it for the next run.
+        kill_pid(child, libc::SIGKILL);
+    }
+    assert!(!survived, "the hung suite's child {child} outlived the timeout");
+}
+
+/// `pid` if it can be a child of this test: above 1. A pidfile holding 0, -1 or 1
+/// would make `kill` signal this runner's process group, every process the user
+/// owns, or launchd, so such a value fails the test before anything is signalled.
+fn checked_pid(pid: libc::pid_t) -> libc::pid_t {
+    assert!(pid > 1, "a pidfile held {pid}, not a usable pid; refusing to signal it");
+    pid
+}
+
+/// Signal one process, never a group or everything: the pid is checked first.
+fn kill_pid(pid: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: `kill` with a pid above 1 signals exactly that process.
+    unsafe { libc::kill(checked_pid(pid), sig) };
+}
+
+/// The pid a fake bin wrote into `path`, waiting for the file to appear.
+fn read_pid(path: &Path) -> libc::pid_t {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+        {
+            return checked_pid(pid);
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "{} was never written",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` no longer exists. A zombie still does (signal 0 reaches it), so
+/// this is also the "was reaped" check.
+fn pid_gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes whether `pid` exists; the pid is checked first.
+    let rc = unsafe { libc::kill(checked_pid(pid), 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// `pid_gone`, polled for up to `secs`.
+fn wait_until_gone(pid: libc::pid_t, secs: u64) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !pid_gone(pid) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    pid_gone(pid)
+}
+
+/// A child that ignores SIGTERM (and hands that on to its own children) is ended
+/// by the SIGKILL that follows the grace period, and is reaped: neither it nor
+/// what it started survives, and the shell is not left a zombie.
+#[test]
+fn run_bounded_escalates_to_sigkill_and_reaps_the_child() {
+    let d = tmp("sigkill");
+    let (shpid, sleeppid) = (d.path().join("sh.pid"), d.path().join("sleep.pid"));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "trap '' TERM; echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+        shpid.display(),
+        sleeppid.display()
+    ));
+    let t0 = std::time::Instant::now();
+    let err = proc::run_bounded(&mut cmd, 3).err().expect("a hang is an error");
+    let took = t0.elapsed();
+    let (sh, sleep) = (read_pid(&shpid), read_pid(&sleeppid));
+    // Reaped on return, not eventually: a zombie would still answer signal 0.
+    let reaped = pid_gone(sh);
+    let sleep_gone = wait_until_gone(sleep, 5);
+    if !sleep_gone {
+        kill_pid(sleep, libc::SIGKILL);
+    }
+    assert!(err.contains("timed out after 3s"), "{err}");
+    assert!(
+        took >= std::time::Duration::from_millis(4500),
+        "TERM alone ended it? {took:?}"
+    );
+    assert!(reaped, "the shell {sh} was not reaped");
+    assert!(sleep_gone, "the shell's child {sleep} survived the SIGKILL");
+}
+
+/// A child that exits by itself but leaves a backgrounded descendant in its group
+/// does not leave it running: `run_bounded` sweeps the group after the exit.
+#[test]
+fn run_bounded_sweeps_what_a_finished_child_left_in_its_group() {
+    let d = tmp("sweep");
+    let pidfile = d.path().join("sleep.pid");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("sleep 60 & echo $! > '{}'; exit 0", pidfile.display()));
+    let t0 = std::time::Instant::now();
+    let ran = proc::run_bounded(&mut cmd, 120).expect("the shell exits by itself");
+    // Without the sweep the `sleep` holds the output pipes and the call waits it out.
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(30),
+        "waited on the leftover child: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(ran.code, Some(0));
+    let sleep = read_pid(&pidfile);
+    let gone = wait_until_gone(sleep, 5);
+    if !gone {
+        kill_pid(sleep, libc::SIGKILL);
+    }
+    assert!(gone, "the finished shell's child {sleep} was left running");
+}
+
+/// A timed-out child gets SIGTERM before any SIGKILL: one that traps TERM, records
+/// it and exits is not made to wait out the grace period, and its trap runs.
+#[test]
+fn run_bounded_sends_sigterm_first_and_does_not_wait_out_the_grace() {
+    let d = tmp("sigterm");
+    let note = d.path().join("note");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "trap 'echo term > \"{n}\"; exit 0' TERM; echo ready > \"{n}.ready\"; sleep 300 & wait",
+        n = note.display()
+    ));
+    let t0 = std::time::Instant::now();
+    let err = proc::run_bounded(&mut cmd, 2).err().expect("a hang is an error");
+    let took = t0.elapsed();
+    assert!(err.contains("timed out after 2s"), "{err}");
+    // The trap is installed before `ready` is written; no ready file means the
+    // timeout fired before the shell got that far and says nothing about TERM.
+    assert!(d.path().join("note.ready").exists(), "the shell never started");
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap_or_default().trim(),
+        "term",
+        "the child was killed before it saw SIGTERM"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(3500),
+        "waited out the grace period although the child exits on TERM: {took:?}"
+    );
+}
+
+/// A pidfile holding a value that is no child's pid fails the test before any
+/// signal is sent: 0 is this runner's group, -1 is everything the user owns, 1 is launchd.
+#[test]
+fn a_pidfile_that_holds_no_usable_pid_is_refused_before_anything_is_signalled() {
+    let d = tmp("badpid");
+    for bad in ["0", "-1", "1", "-4242"] {
+        let f = d.path().join("pid");
+        std::fs::write(&f, bad).unwrap();
+        let msg = match std::panic::catch_unwind(|| read_pid(&f)) {
+            Ok(pid) => panic!("{bad:?} was accepted as pid {pid}"),
+            Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(msg.contains("not a usable pid"), "{bad:?}: {msg}");
+    }
+}
+
+/// Body of the interrupt tests' child process: this same test binary, run with
+/// `TESSL_PROC_HELPER_PIDFILE` set, drives `run_bounded` over a shell that
+/// backgrounds a `sleep`. Without the variable it does nothing.
+#[test]
+fn run_bounded_interrupt_helper() {
+    let Some(pidfile) = std::env::var_os("TESSL_PROC_HELPER_PIDFILE") else {
+        return;
+    };
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "sleep 300 & echo $! > '{}'; wait",
+        Path::new(&pidfile).display()
+    ));
+    let _ = proc::run_bounded(&mut cmd, 120);
+}
+
+/// Body of the table-full test's child process (`TESSL_PROC_HELPER_FILL_DIR`
+/// set): hold 64 children, make a 65th call, record what it returned, then
+/// SIGTERM itself so the handler has 64 groups to take down. A process of its
+/// own because the table is process-wide and the other tests use it.
+#[test]
+fn run_bounded_table_helper() {
+    let Some(dir) = std::env::var_os("TESSL_PROC_HELPER_FILL_DIR").map(PathBuf::from) else {
+        return;
+    };
+    for i in 0..64 {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("echo $$ > '{}/k{i}'; sleep 60", dir.display()));
+            let _ = proc::run_bounded(&mut cmd, 120);
+        });
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while (0..64).any(|i| !dir.join(format!("k{i}")).exists()) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Registration follows the spawn by a few instructions.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!("echo $$ > '{}/extra'", dir.display()));
+    let r = proc::run_bounded(&mut cmd, 10);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let text = match r {
+        Ok(ran) => format!("ok {:?}", ran.code),
+        Err(e) => format!("err {e}"),
+    };
+    std::fs::write(dir.join("result"), text).unwrap();
+    // SAFETY: raises SIGTERM on this process; the handler under test ends it.
+    unsafe { libc::raise(libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+/// Start this test binary on `helper` in its own process group, as a terminal's
+/// foreground job is. The signals are reset to their defaults first (a runner
+/// under `nohup` or a background shell hands its children `SIG_IGN`, which the
+/// helper must not inherit by accident), then `ignored` are set to `SIG_IGN`.
+fn spawn_helper(helper: &str, env: (&str, &Path), ignored: &[libc::c_int]) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let ignored = ignored.to_vec();
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    cmd.args(["--exact", helper, "--test-threads=1", "--nocapture"])
+        .env(env.0, env.1)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    // SAFETY: only `signal` and `setrlimit`, both async-signal-safe, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            for &sig in &ignored {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+            Ok(())
+        });
+    }
+    cmd.spawn().expect("spawn the helper")
+}
+
+/// Wait up to `secs` for `child`, `None` if it is still running.
+fn wait_for(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(s) = child.try_wait().expect("wait") {
+            return Some(s);
+        }
+        if std::time::Instant::now() > until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A terminal signal goes to the parent's process group only; the child of
+/// `run_bounded` leads its own group, so the parent has to take it down itself.
+/// Ctrl-C, a `kill`, a closed terminal and Ctrl-\ on a `kernel_coverage` or
+/// `attn_tune` run: the tool dies of the signal, and the bench it was running
+/// must not outlive it.
+#[test]
+fn a_terminal_signal_to_the_parent_takes_the_childs_whole_group_down() {
+    use std::os::unix::process::ExitStatusExt;
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        let d = tmp(&format!("sig{sig}"));
+        let pidfile = d.path().join("sleep.pid");
+        let mut helper = spawn_helper(
+            "run_bounded_interrupt_helper",
+            ("TESSL_PROC_HELPER_PIDFILE", &pidfile),
+            &[],
+        );
+        let sleep = read_pid(&pidfile);
+        // SAFETY: the negated pid names the group of the child spawned above.
+        unsafe { libc::kill(-(helper.id() as libc::pid_t), sig) };
+        let status = wait_for(&mut helper, 10);
+        let sleep_gone = wait_until_gone(sleep, 5);
+        if status.is_none() {
+            let _ = helper.kill();
+            let _ = helper.wait();
+        }
+        if !sleep_gone {
+            kill_pid(sleep, libc::SIGKILL);
+        }
+        let status = status.unwrap_or_else(|| panic!("signal {sig}: the helper did not exit within 10 s"));
+        assert_eq!(
+            status.signal(),
+            Some(sig),
+            "signal {sig}: the helper died of {status:?}"
+        );
+        assert!(sleep_gone, "signal {sig}: the helper's child {sleep} survived it");
+    }
+}
+
+/// A signal the process ignores stays ignored: under `nohup` the handler must
+/// not install itself over `SIG_IGN` and take the children down with a signal
+/// the parent was told to survive.
+#[test]
+fn an_ignored_signal_leaves_the_parent_and_its_child_running() {
+    let d = tmp("sigign");
+    let pidfile = d.path().join("sleep.pid");
+    let mut helper = spawn_helper(
+        "run_bounded_interrupt_helper",
+        ("TESSL_PROC_HELPER_PIDFILE", &pidfile),
+        &[libc::SIGINT],
+    );
+    let sleep = read_pid(&pidfile);
+    // SAFETY: the negated pid names the group of the child spawned above.
+    unsafe { libc::kill(-(helper.id() as libc::pid_t), libc::SIGINT) };
+    let exited = wait_for(&mut helper, 2);
+    let child_alive = !pid_gone(sleep);
+    // Clean up by pid: the sleep ends, so the helper's `run_bounded` returns and it exits.
+    kill_pid(sleep, libc::SIGKILL);
+    if exited.is_none() && wait_for(&mut helper, 10).is_none() {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    assert!(exited.is_none(), "an ignored SIGINT ended the helper: {exited:?}");
+    assert!(child_alive, "an ignored SIGINT took the helper's child down");
+}
+
+/// With every slot taken, the next call fails closed before spawning anything,
+/// and the 64 children it could not be counted among are all taken down by the
+/// handler when the parent is signalled.
+#[test]
+fn run_bounded_refuses_a_child_it_has_no_slot_to_track() {
+    use std::os::unix::process::ExitStatusExt;
+    let d = tmp("table");
+    let mut helper = spawn_helper(
+        "run_bounded_table_helper",
+        ("TESSL_PROC_HELPER_FILL_DIR", d.path()),
+        &[],
+    );
+    let status = wait_for(&mut helper, 60);
+    let kids: Vec<libc::pid_t> = (0..64)
+        .filter_map(|i| {
+            std::fs::read_to_string(d.path().join(format!("k{i}")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .map(checked_pid)
+        .collect();
+    let all_gone = kids.iter().all(|&k| wait_until_gone(k, 5));
+    if !all_gone {
+        for &k in &kids {
+            kill_pid(k, libc::SIGKILL);
+        }
+    }
+    if status.is_none() {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    let result = std::fs::read_to_string(d.path().join("result")).unwrap_or_default();
+    let status = status.expect("the helper did not finish within 60 s");
+    assert_eq!(kids.len(), 64, "the helper held {} children, not 64", kids.len());
+    assert_eq!(result, "err too many children running at once");
+    assert!(!d.path().join("extra").exists(), "the 65th call started its child");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    assert!(all_gone, "the handler left some of the 64 children running");
 }
 
 #[test]

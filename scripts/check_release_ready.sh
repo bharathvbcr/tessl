@@ -26,9 +26,18 @@ if [[ -z "$crate" || -z "$version" ]]; then
   exit 1
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
+# git's own exit status is read apart from its output: a git that cannot run
+# (not a repo, a lock, a corrupt index, no git on PATH) prints nothing, and
+# nothing must not read as a clean tree (ft-bc7a0de6).
+git_rc=0
+dirty="$(git status --porcelain)" || git_rc=$?
+if [[ "$git_rc" -ne 0 ]]; then
+  echo "error: 'git status --porcelain' failed (rc $git_rc) in $ROOT; cannot tell whether the tree is clean" >&2
+  exit 1
+fi
+if [[ -n "$dirty" ]]; then
   echo "error: working tree is dirty; commit or stash before release" >&2
-  git status --porcelain >&2
+  echo "$dirty" >&2
   exit 1
 fi
 
@@ -140,10 +149,21 @@ rustc --edition 2021 -O -o "$RUN_DIR/release_check" src/bin/release_check.rs
 "$RUN_DIR/release_check" readme README.md "$version"
 "$RUN_DIR/release_check" changelog CHANGELOG.md "$version"
 
-if ! grep -q "^\[${version}\]:" CHANGELOG.md; then
-  echo "error: CHANGELOG.md missing footer link [$version]:" >&2
-  exit 1
-fi
+# grep: rc 0 = match, 1 = no match, 2 or more = it could not read the file. Only
+# 1 means "no match"; anything else is an error and must not pass as one.
+grep_rc=0
+grep -q "^\[${version}\]:" CHANGELOG.md || grep_rc=$?
+case "$grep_rc" in
+  0) ;;
+  1)
+    echo "error: CHANGELOG.md missing footer link [$version]:" >&2
+    exit 1
+    ;;
+  *)
+    echo "error: grep failed (rc $grep_rc) reading CHANGELOG.md for the footer link [$version]:" >&2
+    exit 1
+    ;;
+esac
 
 if [[ -f Cargo.lock ]]; then
   "$RUN_DIR/release_check" lock Cargo.lock "$crate" "$version"
@@ -159,17 +179,36 @@ fi
 # the denylist grep below pass vacuously).
 [[ -s "$RUN_DIR/package.list" ]] ||
   fail_log "$RUN_DIR/package.list" "cargo package --locked --list produced an empty package list"
-if grep -E '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "$RUN_DIR/package.list"; then
-  keep="$RUN_DIR/package.list"
-  echo "error: package list contains excluded/stale paths (listed above); see $RUN_DIR/package.list" >&2
-  exit 1
-fi
+# Fail closed on a grep that could not run: rc 0 = denied path found (fail),
+# 1 = clean (pass), 2 or more = error (fail; `if grep` would read it as clean).
+grep_rc=0
+grep -E '\.devmap/|@2048\.png|build_logo\.py|assets/concepts/' "$RUN_DIR/package.list" || grep_rc=$?
+case "$grep_rc" in
+  0)
+    keep="$RUN_DIR/package.list"
+    echo "error: package list contains excluded/stale paths (listed above); see $RUN_DIR/package.list" >&2
+    exit 1
+    ;;
+  1) ;;
+  *)
+    keep="$RUN_DIR/package.list"
+    echo "error: grep failed (rc $grep_rc) reading $RUN_DIR/package.list; the denylist was not checked" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> cargo package --locked (verify build)"
 cargo package --locked >"$RUN_DIR/package.log" 2>&1 ||
   fail_log "$RUN_DIR/package.log" "cargo package --locked failed"
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
+# A uname that fails must not read as "not Darwin" and skip the docs.rs check.
+uname_rc=0
+os="$(uname -s)" || uname_rc=$?
+if [[ "$uname_rc" -ne 0 || -z "$os" ]]; then
+  echo "error: 'uname -s' failed (rc $uname_rc); cannot tell whether to run the DOCS_RS=1 check" >&2
+  exit 1
+fi
+if [[ "$os" == "Darwin" ]]; then
   echo "==> DOCS_RS=1 cargo check (docs.rs AOT skip)"
   DOCS_RS=1 cargo check --locked >"$RUN_DIR/docsrs.log" 2>&1 ||
     fail_log "$RUN_DIR/docsrs.log" "DOCS_RS=1 cargo check failed"

@@ -97,11 +97,23 @@ jobs:
 
       - name: No kernel fell back to metal3.2
         run: |
-          if grep -q "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log"; then
-            grep -A40 "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log"
-            echo "::error::a kernel only compiled under the metal3.2 fallback"
-            exit 1
-          fi
+          # grep: 0 = fallback seen, 1 = none, 2 or more = the log could not be
+          # read. Only 1 is "no fallback"; `if grep` would read an error as that
+          # (ft-bc7a0de6).
+          rc=0
+          grep -q "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log" || rc=$?
+          case "$rc" in
+            0)
+              grep -A40 "falling back to -std=metal3.2" "$RUNNER_TEMP/build.log"
+              echo "::error::a kernel only compiled under the metal3.2 fallback"
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::grep failed (rc $rc) reading $RUNNER_TEMP/build.log; the metal3.2 fallback was not checked"
+              exit 1
+              ;;
+          esac
           echo "every kernel compiled under -std=metal4.0"
 
       - name: Check every Qwen3.5 / training / encoder entry point is exported by the built metallib

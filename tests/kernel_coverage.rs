@@ -744,6 +744,26 @@ fn run_bounded_escalates_to_sigkill_and_reaps_the_child() {
     assert!(sleep_gone, "the shell's child {sleep} survived the SIGKILL");
 }
 
+/// A child that exits by itself but leaves a backgrounded descendant in its group
+/// does not leave it running: `run_bounded` sweeps the group after the exit.
+#[test]
+fn run_bounded_sweeps_what_a_finished_child_left_in_its_group() {
+    let d = tmp("sweep");
+    let pidfile = d.path().join("sleep.pid");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("sleep 300 & echo $! > '{}'; exit 0", pidfile.display()));
+    let ran = proc::run_bounded(&mut cmd, 30).expect("the shell exits by itself");
+    assert_eq!(ran.code, Some(0));
+    let sleep = read_pid(&pidfile);
+    let gone = wait_until_gone(sleep, 5);
+    if !gone {
+        // SAFETY: the pid the shell wrote for its own `sleep`.
+        unsafe { libc::kill(sleep, libc::SIGKILL) };
+    }
+    assert!(gone, "the finished shell's child {sleep} was left running");
+}
+
 /// Body of the interrupt test's child process: this same test binary, run with
 /// `TESSL_PROC_HELPER_PIDFILE` set, drives `run_bounded` over a shell that
 /// backgrounds a `sleep`. Without the variable it does nothing.

@@ -71,7 +71,7 @@ bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
 bin bench_gemm_sweep_cli 5
 bin gemm_parity 41
-bin kernel_coverage 58
+bin kernel_coverage 59
 bin attn_tune 24
 bin scratch_guard 5
 bin bench_flash_attn_cli 6

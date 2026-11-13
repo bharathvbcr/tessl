@@ -668,27 +668,151 @@ fn every_way_a_suite_can_fail_is_a_failure_not_an_empty_trace() {
         1,
     );
     assert!(t.failures[0].contains("timed out after 1s"), "{:?}", t.failures);
-    let child: libc::pid_t = std::fs::read_to_string(&pidfile)
-        .expect("the hung suite recorded its child's pid")
-        .trim()
-        .parse()
-        .expect("a pid");
-    let gone = |pid: libc::pid_t| {
-        // SAFETY: signal 0 only probes whether `pid` exists.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    };
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !gone(child) && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let survived = !gone(child);
+    let child = read_pid(&pidfile);
+    let survived = !wait_until_gone(child, 5);
     if survived {
         // Our own pid, recorded above; do not leave it for the next run.
         // SAFETY: `child` is the pid the fake bin wrote for its own `sleep`.
         unsafe { libc::kill(child, libc::SIGKILL) };
     }
     assert!(!survived, "the hung suite's child {child} outlived the timeout");
+}
+
+/// The pid a fake bin wrote into `path`, waiting for the file to appear.
+fn read_pid(path: &Path) -> libc::pid_t {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "{} was never written",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` no longer exists. A zombie still does (signal 0 reaches it), so
+/// this is also the "was reaped" check.
+fn pid_gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes whether `pid` exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// `pid_gone`, polled for up to `secs`.
+fn wait_until_gone(pid: libc::pid_t, secs: u64) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !pid_gone(pid) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    pid_gone(pid)
+}
+
+/// A child that ignores SIGTERM (and hands that on to its own children) is ended
+/// by the SIGKILL that follows the grace period, and is reaped: neither it nor
+/// what it started survives, and the shell is not left a zombie.
+#[test]
+fn run_bounded_escalates_to_sigkill_and_reaps_the_child() {
+    let d = tmp("sigkill");
+    let (shpid, sleeppid) = (d.path().join("sh.pid"), d.path().join("sleep.pid"));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "trap '' TERM; echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+        shpid.display(),
+        sleeppid.display()
+    ));
+    let t0 = std::time::Instant::now();
+    let err = proc::run_bounded(&mut cmd, 3).err().expect("a hang is an error");
+    let took = t0.elapsed();
+    let (sh, sleep) = (read_pid(&shpid), read_pid(&sleeppid));
+    // Reaped on return, not eventually: a zombie would still answer signal 0.
+    let reaped = pid_gone(sh);
+    let sleep_gone = wait_until_gone(sleep, 5);
+    if !sleep_gone {
+        // SAFETY: the pid the fake bin wrote for its own `sleep`.
+        unsafe { libc::kill(sleep, libc::SIGKILL) };
+    }
+    assert!(err.contains("timed out after 3s"), "{err}");
+    assert!(
+        took >= std::time::Duration::from_millis(4500),
+        "TERM alone ended it? {took:?}"
+    );
+    assert!(reaped, "the shell {sh} was not reaped");
+    assert!(sleep_gone, "the shell's child {sleep} survived the SIGKILL");
+}
+
+/// Body of the interrupt test's child process: this same test binary, run with
+/// `TESSL_PROC_HELPER_PIDFILE` set, drives `run_bounded` over a shell that
+/// backgrounds a `sleep`. Without the variable it does nothing.
+#[test]
+fn run_bounded_interrupt_helper() {
+    let Some(pidfile) = std::env::var_os("TESSL_PROC_HELPER_PIDFILE") else {
+        return;
+    };
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "sleep 300 & echo $! > '{}'; wait",
+        Path::new(&pidfile).display()
+    ));
+    let _ = proc::run_bounded(&mut cmd, 120);
+}
+
+/// A terminal interrupt goes to the parent's process group only; the child of
+/// `run_bounded` leads its own group, so the parent has to take it down itself.
+/// This is Ctrl-C on a `kernel_coverage` or `attn_tune` run: the tool dies of
+/// SIGINT, and the bench it was running must not outlive it.
+#[test]
+fn an_interrupt_to_the_parent_takes_the_childs_whole_group_down() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let d = tmp("sigint");
+    let pidfile = d.path().join("sleep.pid");
+    let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "run_bounded_interrupt_helper",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("TESSL_PROC_HELPER_PIDFILE", &pidfile)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0) // its own group, as a terminal's foreground job is
+        .spawn()
+        .expect("spawn the helper");
+    let sleep = read_pid(&pidfile);
+    // Ctrl-C: SIGINT to the helper's group (the helper leads it).
+    // SAFETY: the negated pid names the group of the child spawned above.
+    unsafe { libc::kill(-(helper.id() as libc::pid_t), libc::SIGINT) };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(s) = helper.try_wait().expect("wait") {
+            break Some(s);
+        }
+        if std::time::Instant::now() > until {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let sleep_gone = wait_until_gone(sleep, 5);
+    if status.is_none() {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    if !sleep_gone {
+        // SAFETY: the pid the helper's shell wrote for its own `sleep`.
+        unsafe { libc::kill(sleep, libc::SIGKILL) };
+    }
+    let status = status.expect("the helper did not exit within 10 s of SIGINT");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "the helper died of something else: {status:?}"
+    );
+    assert!(sleep_gone, "the interrupted helper's child {sleep} survived it");
 }
 
 #[test]

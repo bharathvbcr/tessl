@@ -16,30 +16,22 @@
 //! corner values. The kernel agrees with them bit for bit, including on
 //! subnormal and overflowing corners, and the device model reproduces every
 //! crafted one of them while the IEEE model does not: the flush is mlx's
-//! behaviour too, not a quirk of this kernel. Each golden test also checks the
-//! fixtures' provenance (`assert_fixture_provenance`): the manifest's
-//! `generator_commit` must be on this history and be the commit that last
-//! changed the generator, and any check that cannot run fails.
+//! behaviour too, not a quirk of this kernel. The fixtures' provenance and
+//! checksums are checked device-free in `tests/fixture_manifests.rs`, which also
+//! holds the git helper.
 //!
 //! The fault-word tests cover `check_dequant_affine_fault`, the checked read of
 //! the word `dequant_affine_bf16` raises.
 //!
-//! All tests need the device (`with_gpu`), so none belongs in the hosted
-//! device-free selection.
+//! Every test needs the device (`with_gpu`) except
+//! `every_golden_holds_its_corners_and_the_host_models_match_the_tallies`, the one
+//! `scripts/hosted_tests.txt` selects.
 
 mod common;
-mod scratch_support;
-
-#[path = "../src/bin/common/json.rs"]
-mod json;
 
 use common::{with_gpu, with_two_gpus};
-use json::{Json, Syntax};
-use scratch_support::Scratch;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tessl::dequant::{
     check_dequant_affine_fault, dequant_affine_bf16, dequant_affine_q4_bf16, dequant_affine_q8_bf16,
     validate_dequant_affine_bf16, AffineBits, DequantAffineBank, DequantAffineFault, DEQUANT_AFFINE_GROUP_SIZES,
@@ -652,13 +644,6 @@ fn subnormals_flush_to_signed_zero_where_the_ieee_formula_does_not() {
 const GROUP: usize = 64;
 const ROWS: usize = 17;
 const COLS: usize = 1024;
-const GENERATOR: &str = "scripts/gen_dequant_affine_fixtures.py";
-/// What a git call gives back: `(exit code, trimmed stdout)`, or why it could not run.
-type GitOutput = Result<(i32, String), String>;
-/// A way of running git, so the verdict can be tested against scripted outcomes.
-type GitRun<'a> = dyn Fn(&[&str]) -> GitOutput + 'a;
-/// Longest any one git call may take before provenance is "could not verify".
-const GIT_DEADLINE: Duration = Duration::from_secs(30);
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -712,273 +697,10 @@ fn golden_case(case: &str, bits: u32, gs: usize) -> (Case, Vec<u16>) {
     (c, want)
 }
 
-/// Every environment variable whose name starts with this is removed from a git child.
-/// git reads a long list of them, and several change what a history question answers or
-/// where it lands, not only which repository is opened: `GIT_DIR`, `GIT_WORK_TREE`,
-/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-/// `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`, `GIT_GRAFT_FILE` (fakes
-/// parents, so a commit that is not an ancestor can pass), `GIT_REPLACE_REF_BASE`,
-/// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` (any config key). A
-/// prefix removes them all, and any that a later git adds.
-const GIT_ENV_PREFIX: &str = "GIT_";
-
-/// Set on a git child after the scrub, so the user's and the system's git config cannot
-/// change an answer (an `alias`, a `core.fsmonitor` daemon, a `core.worktree`, `grafts`):
-/// `GIT_CONFIG_NOSYSTEM` skips `/etc/gitconfig`, and `GIT_CONFIG_GLOBAL=/dev/null`
-/// skips `~/.gitconfig` and the XDG one. The repository's own `.git/config` still
-/// applies. Hooks and the fsmonitor are also switched off with `-c` in [`git_with`].
-const GIT_ENV_AFTER_SCRUB: [(&str, &str); 2] = [("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null")];
-
-/// Run `program` in `dir` and give `(exit code, trimmed stdout)`, the whole call bounded by
-/// `deadline`: waiting for the exit and reading the output both count. `inherited` is
-/// what the caller's environment would add (applied first). With `scrub_prefix`, every
-/// variable of the real environment or of `inherited` whose name starts with it is then
-/// removed, and `after_scrub` is set last. A program that cannot start, that a signal
-/// ends, that runs past the deadline, or whose output pipe is still open at the deadline
-/// is an `Err`. A program still running at the deadline is killed. One that has already
-/// exited is not: an orphaned child holds the pipe open, stays running, and its reader
-/// thread ends when the orphan closes it.
-fn run_bounded(
-    program: &str,
-    args: &[&str],
-    inherited: &[(&str, &str)],
-    scrub_prefix: Option<&str>,
-    after_scrub: &[(&str, &str)],
-    dir: &Path,
-    deadline: Duration,
-) -> GitOutput {
-    let what = format!("{program} {args:?}");
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for (name, value) in inherited {
-        command.env(name, value);
-    }
-    if let Some(prefix) = scrub_prefix {
-        let real = std::env::vars_os().map(|(name, _)| name);
-        let modelled = inherited.iter().map(|(name, _)| std::ffi::OsString::from(name));
-        for name in real.chain(modelled) {
-            if name.to_string_lossy().starts_with(prefix) {
-                command.env_remove(name);
-            }
-        }
-    }
-    for (name, value) in after_scrub {
-        command.env(name, value);
-    }
-    let stop = Instant::now() + deadline;
-    let mut child = command.spawn().map_err(|e| format!("{what} did not start: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| format!("{what}: no stdout pipe"))?;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = String::new();
-        let read = std::io::Read::read_to_string(&mut stdout, &mut out).map(|_| out);
-        let _ = sender.send(read);
-    });
-    let kill = |child: &mut Child| {
-        let _ = child.kill();
-        let _ = child.wait();
-    };
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= stop => {
-                kill(&mut child);
-                return Err(format!("{what} still running after {deadline:?}; killed"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                kill(&mut child);
-                return Err(format!("{what} could not be waited on: {e}"));
-            }
-        }
-    };
-    let out = match receiver.recv_timeout(stop.saturating_duration_since(Instant::now())) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("{what} output unreadable: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "{what} exited but its output pipe was still open after {deadline:?} (an orphaned child holds it)"
-            ))
-        }
-    };
-    let code = status.code().ok_or_else(|| format!("{what} was killed by a signal"))?;
-    Ok((code, out.trim().to_string()))
-}
-
-/// git in this crate's directory with every `GIT_*` variable removed ([`GIT_ENV_PREFIX`]),
-/// `inherited` modelling what the caller's environment held, the user and system config
-/// switched off ([`GIT_ENV_AFTER_SCRUB`]), and hooks and the fsmonitor disabled, bounded
-/// by `deadline`.
-fn git_with(args: &[&str], inherited: &[(&str, &str)], deadline: Duration) -> GitOutput {
-    let mut full = vec!["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
-    full.extend_from_slice(args);
-    run_bounded(
-        "git",
-        &full,
-        inherited,
-        Some(GIT_ENV_PREFIX),
-        &GIT_ENV_AFTER_SCRUB,
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-        deadline,
-    )
-}
-
-fn git(args: &[&str]) -> GitOutput {
-    git_with(args, &[], GIT_DEADLINE)
-}
-
-/// The provenance verdict for a manifest pin `pin`, given `run` (git) and `root`, the
-/// crate's directory. `Ok` only when git sees the repository rooted at `root`, and the
-/// pin is a commit on its history and is the commit that last changed the generator;
-/// every other outcome, including one where a check could not run, is an `Err` naming it.
-fn judge_provenance(pin: &str, root: &Path, run: &GitRun<'_>) -> Result<(), String> {
-    let unverified = |why: String| format!("could not verify provenance: {why}");
-    let (code, top) = run(&["rev-parse", "--show-toplevel"]).map_err(unverified)?;
-    if code != 0 {
-        return Err(unverified(format!("rev-parse --show-toplevel exited {code}")));
-    }
-    let seen = std::fs::canonicalize(&top).map_err(|e| unverified(format!("git's toplevel {top:?}: {e}")))?;
-    let want = std::fs::canonicalize(root).map_err(|e| unverified(format!("crate directory {root:?}: {e}")))?;
-    if seen != want {
-        return Err(unverified(format!(
-            "git sees the repository at {}, not at the crate directory {}",
-            seen.display(),
-            want.display()
-        )));
-    }
-    let (code, shallow) = run(&["rev-parse", "--is-shallow-repository"]).map_err(unverified)?;
-    if code != 0 || shallow != "false" {
-        return Err(unverified(format!(
-            "this is not a full clone (rev-parse --is-shallow-repository exited {code}, printed {shallow:?})"
-        )));
-    }
-    let commit = format!("{pin}^{{commit}}");
-    let (code, _) = run(&["cat-file", "-e", &commit]).map_err(unverified)?;
-    if code != 0 {
-        return Err(unverified(format!(
-            "commit {pin} is not in this repository (cat-file -e exited {code})"
-        )));
-    }
-    let (code, _) = run(&["merge-base", "--is-ancestor", pin, "HEAD"]).map_err(unverified)?;
-    match code {
-        0 => {}
-        1 => return Err(format!("generator_commit {pin} is not on this history")),
-        other => return Err(unverified(format!("merge-base --is-ancestor exited {other}"))),
-    }
-    let (code, last) = run(&["log", "-1", "--format=%H", "--", GENERATOR]).map_err(unverified)?;
-    if code != 0 || last.len() != 40 {
-        return Err(unverified(format!(
-            "git log of {GENERATOR} exited {code} and printed {last:?}"
-        )));
-    }
-    if last != pin {
-        return Err(format!(
-            "generator changed after the fixtures: the manifest pins {pin}, the generator was last changed in {last}; regenerate"
-        ));
-    }
-    Ok(())
-}
-
-fn fixture_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dequant_affine")
-}
-
-fn is_lower_hex(text: &str, len: usize) -> bool {
-    text.len() == len && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-/// The parsed `MANIFEST.json` of the fixture directory `dir`.
-fn read_manifest(dir: &Path) -> Result<Json, String> {
-    let path = dir.join("MANIFEST.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    json::parse(
-        &text,
-        Syntax {
-            what: "MANIFEST.json",
-            max_depth: 8,
-            uints_only: false,
-            literals: true,
-        },
-    )
-    .map_err(|e| format!("MANIFEST.json does not parse: {e}"))
-}
-
-/// The manifest's `generator_commit`.
-fn manifest_pin(manifest: &Json) -> Result<String, String> {
-    match manifest.get("generator_commit") {
-        Some(Json::Str(pin)) if is_lower_hex(pin, 40) => Ok(pin.clone()),
-        other => Err(format!(
-            "MANIFEST.json generator_commit is not a 40-hex commit: {other:?}"
-        )),
-    }
-}
-
-/// Every file the manifest lists has the sha256 it records, and the directory holds
-/// no file the manifest does not list: the pin names the generator, this names the bytes.
-fn verify_fixture_bytes(dir: &Path, manifest: &Json) -> Result<(), String> {
-    let Some(Json::Object(files)) = manifest.get("files") else {
-        return Err("MANIFEST.json has no files object".into());
-    };
-    let mut listed = std::collections::BTreeSet::new();
-    for (name, meta) in files {
-        if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." || name == "MANIFEST.json" {
-            return Err(format!(
-                "MANIFEST.json lists {name:?}, which is not a plain fixture file name"
-            ));
-        }
-        let Some(Json::Str(want)) = meta.get("sha256") else {
-            return Err(format!("{name}: MANIFEST.json records no sha256"));
-        };
-        if !is_lower_hex(want, 64) {
-            return Err(format!(
-                "{name}: the recorded sha256 {want:?} is not 64 lowercase hex digits"
-            ));
-        }
-        let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
-        let got = ojas_io::sha256::sha256_hex(&bytes);
-        if &got != want {
-            return Err(format!("{name}: sha256 is {got}, MANIFEST.json records {want}"));
-        }
-        if !listed.insert(name.clone()) {
-            return Err(format!("MANIFEST.json lists {name} twice"));
-        }
-    }
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name != "MANIFEST.json" && !listed.contains(&name) {
-            return Err(format!("{name} is in the fixture directory but not in MANIFEST.json"));
-        }
-    }
-    Ok(())
-}
-
-/// Panics unless the goldens were written by the generator as it is now, from a
-/// commit on this history, and their bytes are the ones the manifest recorded. Called
-/// inside `with_gpu`, so it never runs in the hosted device-free selection (a hosted
-/// clone is shallow and could not verify).
-fn assert_fixture_provenance() {
-    let dir = fixture_dir();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let verdict = read_manifest(&dir).and_then(|manifest| {
-        judge_provenance(&manifest_pin(&manifest)?, root, &git)?;
-        verify_fixture_bytes(&dir, &manifest)
-    });
-    if let Err(why) = verdict {
-        panic!("dequant_affine fixtures: {why}");
-    }
-}
-
-/// The kernel against one mlx golden, plus what the golden must contain.
-fn assert_matches_mlx(rt: &Arc<GpuRuntime>, case: &str, bits: u32, gs: usize, c: &Case, want: &[u16]) {
+/// What the golden for `case` must contain, and how the two host models fare against it.
+/// Device-free: it reads the fixture and runs the host models only.
+fn assert_golden_holds_its_corners(case: &str, bits: u32, gs: usize, c: &Case, want: &[u16]) {
     let what = format!("{case} q{bits} g{gs}");
-    assert_bits(&format!("{what} vs mlx"), &run(rt, c, 0), want);
     if case == "crafted" {
         // The goldens must contain the corners they are there for.
         assert!(
@@ -1010,6 +732,12 @@ fn assert_matches_mlx(rt: &Arc<GpuRuntime>, case: &str, bits: u32, gs: usize, c:
     }
 }
 
+/// The kernel against one mlx golden, plus what the golden must contain.
+fn assert_matches_mlx(rt: &Arc<GpuRuntime>, case: &str, bits: u32, gs: usize, c: &Case, want: &[u16]) {
+    assert_bits(&format!("{case} q{bits} g{gs} vs mlx"), &run(rt, c, 0), want);
+    assert_golden_holds_its_corners(case, bits, gs, c, want);
+}
+
 #[test]
 fn matches_mlx_gpu_dequantize_bit_for_bit() {
     // Real mx.quantize output (weights spanning ~1e-30 to 1e3, an all-negative
@@ -1021,7 +749,6 @@ fn matches_mlx_gpu_dequantize_bit_for_bit() {
         .flat_map(|bits| ["quant", "crafted"].map(|case| (case, bits, golden_case(case, bits, GROUP))))
         .collect();
     with_gpu(|rt| {
-        assert_fixture_provenance();
         for (case, bits, (c, want)) in &goldens {
             assert_matches_mlx(rt, case, *bits, GROUP, c, want);
         }
@@ -1039,243 +766,73 @@ fn matches_mlx_gpu_dequantize_at_group_sizes_32_and_128() {
         })
         .collect();
     with_gpu(|rt| {
-        assert_fixture_provenance();
         for (case, bits, gs, (c, want)) in &goldens {
             assert_matches_mlx(rt, case, *bits, *gs, c, want);
         }
     });
 }
 
-#[test]
-fn provenance_passes_only_for_an_ancestor_that_is_the_generators_last_touch() {
-    let pin = "a".repeat(40);
-    let other = "b".repeat(40);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let top = root.to_string_lossy().into_owned();
-    // A scripted git: `shallow`, `has_commit`, `ancestor`, `last` pick each answer.
-    let scripted = |toplevel: String, shallow: &'static str, has_commit: i32, ancestor: i32, last: String| {
-        move |args: &[&str]| -> GitOutput {
-            Ok(match (args[0], args.get(1).copied()) {
-                ("rev-parse", Some("--show-toplevel")) => (0, toplevel.clone()),
-                ("rev-parse", _) => (0, shallow.to_string()),
-                ("cat-file", _) => (has_commit, String::new()),
-                ("merge-base", _) => (ancestor, String::new()),
-                ("log", _) => (0, last.clone()),
-                (other, _) => panic!("unexpected git {other}"),
+/// The 12 goldens (each four files) in the order the generator writes them: group sizes 64, 32, 128, each
+/// q8 then q4, each `quant` then `crafted`.
+fn every_golden() -> Vec<(&'static str, u32, usize, Case, Vec<u16>)> {
+    [GROUP, 32, 128]
+        .into_iter()
+        .flat_map(|gs| {
+            [8u32, 4].into_iter().flat_map(move |bits| {
+                ["quant", "crafted"].map(move |case| {
+                    let (c, want) = golden_case(case, bits, gs);
+                    (case, bits, gs, c, want)
+                })
             })
-        }
-    };
-    let good = |shallow, has_commit, ancestor, last| scripted(top.clone(), shallow, has_commit, ancestor, last);
-    judge_provenance(&pin, root, &good("false", 0, 0, pin.clone())).expect("the one passing outcome");
-
-    let fails = |run: &GitRun<'_>, needle: &str| {
-        let e = judge_provenance(&pin, root, run).expect_err("must not pass");
-        assert!(e.contains(needle), "wanted {needle:?} in {e:?}");
-    };
-    fails(&good("false", 0, 1, pin.clone()), "not on this history");
-    fails(
-        &good("false", 0, 0, other.clone()),
-        "generator changed after the fixtures",
-    );
-    fails(&good("true", 0, 0, pin.clone()), "could not verify provenance");
-    fails(&good("", 0, 0, pin.clone()), "could not verify provenance");
-    fails(&good("false", 128, 0, pin.clone()), "could not verify provenance");
-    fails(&good("false", 0, 128, pin.clone()), "could not verify provenance");
-    fails(&good("false", 0, 0, String::new()), "could not verify provenance");
-    fails(&|_| Err("git is missing".into()), "could not verify provenance");
-    fails(
-        &|args| {
-            if args.get(1) == Some(&"--is-shallow-repository") {
-                Err("deadline".into())
-            } else {
-                Ok((0, top.clone()))
-            }
-        },
-        "could not verify provenance",
-    );
-    // A git that landed in some other repository (or an empty directory) is not this one,
-    // whatever it then says about the pin.
-    let elsewhere = std::env::temp_dir().to_string_lossy().into_owned();
-    fails(
-        &scripted(elsewhere, "false", 0, 0, pin.clone()),
-        "not at the crate directory",
-    );
-    fails(
-        &scripted("/this/path/does/not/exist".into(), "false", 0, 0, pin.clone()),
-        "could not verify provenance",
-    );
-    // The real check on this checkout, against the real git. Inside `with_gpu` so that this
-    // test, like every test here, is outside the hosted device-free selection.
-    with_gpu(|_| assert_fixture_provenance());
+        })
+        .collect()
 }
 
+/// Mismatches of the host model against the golden: `(Ieee, Device)`.
+fn model_misses(c: &Case, want: &[u16]) -> (usize, usize) {
+    let misses = |model| c.model(model).iter().zip(want).filter(|(a, b)| a != b).count();
+    (misses(Model::Ieee), misses(Model::Device))
+}
+
+/// The per-golden tallies `scripts/gen_dequant_affine_fixtures.py` prints and never
+/// stores (`ieee_fma_mismatches`, `ftz_model_mismatches`), as `(case, bits, group size,
+/// IEEE misses, device-model misses)`. The device model must reproduce every golden; the
+/// IEEE one misses only the crafted ones, at the counts the generator reported. A
+/// regenerated fixture that moves any count fails here until this table is re-derived.
+const GOLDEN_TALLIES: [(&str, u32, usize, usize, usize); 12] = [
+    ("quant", 8, 64, 0, 0),
+    ("crafted", 8, 64, 1546, 0),
+    ("quant", 4, 64, 0, 0),
+    ("crafted", 4, 64, 1072, 0),
+    ("quant", 8, 32, 0, 0),
+    ("crafted", 8, 32, 898, 0),
+    ("quant", 4, 32, 0, 0),
+    ("crafted", 4, 32, 1359, 0),
+    ("quant", 8, 128, 0, 0),
+    ("crafted", 8, 128, 640, 0),
+    ("quant", 4, 128, 0, 0),
+    ("crafted", 4, 128, 881, 0),
+];
+
+/// Device-free: the goldens hold the corners they exist for, and the host models'
+/// mismatch counts against every golden are the recorded tallies.
 #[test]
-fn git_helper_ignores_repository_redirecting_environment() {
-    with_gpu(|_| {
-        let root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("crate dir");
-        let empty = Scratch::dir("tessl_dequant_empty");
-        let empty_s = empty.to_string_lossy().into_owned();
-        let missing = empty.join("missing").to_string_lossy().into_owned();
-        let git_ok = |args: &[&str], inherited: &[(&str, &str)]| {
-            let (code, out) = git_with(args, inherited, GIT_DEADLINE).expect("git runs");
-            (code, out)
-        };
-        let toplevel = |inherited: &[(&str, &str)]| {
-            let (code, top) = git_ok(&["rev-parse", "--show-toplevel"], inherited);
-            assert_eq!(code, 0, "rev-parse failed under {inherited:?}: {top}");
-            std::fs::canonicalize(top).expect("toplevel exists")
-        };
-        assert_eq!(toplevel(&[]), root, "baseline: git sees this crate's repository");
-        let config_parameters = format!("'core.worktree'='{empty_s}'");
-        let redirects: [(&str, &str); 14] = [
-            ("GIT_DIR", &empty_s),
-            ("GIT_WORK_TREE", &empty_s),
-            ("GIT_INDEX_FILE", &missing),
-            ("GIT_OBJECT_DIRECTORY", &missing),
-            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", &missing),
-            ("GIT_COMMON_DIR", &empty_s),
-            ("GIT_NAMESPACE", "elsewhere"),
-            ("GIT_CEILING_DIRECTORIES", &empty_s),
-            ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0"),
-            ("GIT_REPLACE_REF_BASE", "refs/nothing/"),
-            ("GIT_CONFIG_PARAMETERS", &config_parameters),
-            ("GIT_CONFIG_COUNT", "1"),
-            ("GIT_CONFIG_KEY_0", "core.worktree"),
-            ("GIT_CONFIG_VALUE_0", &empty_s),
-        ];
-        for one in &redirects {
-            assert_eq!(toplevel(&[*one]), root, "{} redirected the provenance check", one.0);
-        }
-        assert_eq!(toplevel(&redirects), root, "all of them together redirected it");
-        // The provenance verdict itself is not fooled either: with a GIT_DIR in the
-        // environment, the same helper still reaches the real repository and its commits.
-        let (code, _) = git_ok(&["rev-parse", "--verify", "HEAD^{commit}"], &redirects);
-        assert_eq!(code, 0, "HEAD must resolve in the real repository");
-
-        // A graft file makes a history question answer differently: with HEAD grafted to have
-        // no parents, its real parent stops being an ancestor. The helper must not see it.
-        let (code, head) = git_ok(&["rev-parse", "HEAD"], &[]);
-        assert_eq!(code, 0);
-        let graft = Scratch::file("tessl_dequant_graft", ".txt");
-        std::fs::write(&*graft, format!("{head}\n")).expect("graft file");
-        let graft_s = graft.to_string_lossy().into_owned();
-        let (code, _) = git_ok(
-            &["merge-base", "--is-ancestor", "HEAD~1", "HEAD"],
-            &[("GIT_GRAFT_FILE", &graft_s)],
-        );
-        assert_eq!(code, 0, "GIT_GRAFT_FILE changed which commits are ancestors");
-
-        // Every GIT_* variable is gone from the child, and only the two set after the scrub
-        // remain; the rest of the environment is untouched.
-        let (code, env) = run_bounded(
-            "sh",
-            &["-c", "env"],
-            &[("GIT_ANYTHING_AT_ALL", "1"), ("GIT_CONFIG_NOSYSTEM", "0")],
-            Some(GIT_ENV_PREFIX),
-            &GIT_ENV_AFTER_SCRUB,
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-            Duration::from_secs(20),
-        )
-        .expect("env runs");
-        assert_eq!(code, 0);
-        let mut git_vars: Vec<&str> = env.lines().filter(|l| l.starts_with("GIT_")).collect();
-        git_vars.sort_unstable();
+fn every_golden_holds_its_corners_and_the_host_models_match_the_tallies() {
+    let goldens = every_golden();
+    assert_eq!(
+        goldens.len(),
+        GOLDEN_TALLIES.len(),
+        "3 group sizes x q8/q4 x quant/crafted"
+    );
+    for ((case, bits, gs, c, want), tally) in goldens.iter().zip(GOLDEN_TALLIES) {
+        assert_eq!((*case, *bits, *gs), (tally.0, tally.1, tally.2), "golden order");
+        assert_golden_holds_its_corners(case, *bits, *gs, c, want);
         assert_eq!(
-            git_vars,
-            ["GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"],
-            "{env}"
+            model_misses(c, want),
+            (tally.3, tally.4),
+            "{case} q{bits} g{gs}: (IEEE, device) misses"
         );
-        assert!(
-            env.lines().any(|l| l.starts_with("PATH=")),
-            "the scrub must not clear the environment"
-        );
-    });
-}
-
-#[test]
-fn the_deadline_covers_reading_the_output_not_only_the_exit() {
-    with_gpu(|_| {
-        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let run = |script: &str, deadline: Duration| {
-            let started = Instant::now();
-            let got = run_bounded("sh", &["-c", script], &[], None, &[], here, deadline);
-            (got, started.elapsed())
-        };
-        let (got, _) = run("echo hi", Duration::from_secs(20));
-        assert_eq!(got, Ok((0, "hi".to_string())));
-        // The program outlives the deadline: killed, an error.
-        let (got, took) = run("sleep 20", Duration::from_secs(1));
-        assert!(got.is_err(), "{got:?}");
-        assert!(took < Duration::from_secs(10), "took {took:?}");
-        // The program exits at once but an orphan keeps its stdout open for 15 s: the call
-        // must fail at the deadline, not wait for the pipe.
-        let (got, took) = run("sleep 15 & echo hi", Duration::from_secs(2));
-        let why = got.expect_err("an orphan-held pipe must not read as a success");
-        assert!(why.contains("output pipe was still open"), "{why}");
-        assert!(
-            took < Duration::from_secs(10),
-            "took {took:?}, the 2 s deadline did not bound the read"
-        );
-    });
-}
-
-/// A copy of the fixture directory to damage.
-fn copy_fixture_dir() -> Scratch {
-    let copy = Scratch::dir("tessl_dequant_fixtures");
-    for entry in std::fs::read_dir(fixture_dir()).expect("fixture dir") {
-        let entry = entry.expect("entry");
-        std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copy");
     }
-    copy
-}
-
-#[test]
-fn the_manifest_pins_every_fixture_byte_and_every_file() {
-    with_gpu(|_| {
-        assert_eq!(
-            ojas_io::sha256::sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            "the hash the check relies on must be SHA-256"
-        );
-        let pristine = copy_fixture_dir();
-        let check = |dir: &Path| verify_fixture_bytes(dir, &read_manifest(dir).expect("manifest"));
-        check(&pristine).expect("the committed fixtures match their manifest");
-
-        let victim = "crafted_q8_g32_out.bin";
-        let damaged = copy_fixture_dir();
-        let mut bytes = std::fs::read(damaged.join(victim)).expect("read");
-        bytes[0] ^= 1;
-        std::fs::write(damaged.join(victim), bytes).expect("write");
-        let why = check(&damaged).expect_err("a flipped bit must fail");
-        assert!(why.contains(victim) && why.contains("sha256"), "{why}");
-
-        let extra = copy_fixture_dir();
-        std::fs::write(extra.join("stowaway.bin"), [0u8; 4]).expect("write");
-        let why = check(&extra).expect_err("an unlisted file must fail");
-        assert!(why.contains("stowaway.bin"), "{why}");
-
-        let missing = copy_fixture_dir();
-        std::fs::remove_file(missing.join(victim)).expect("remove");
-        let why = check(&missing).expect_err("a listed file that is gone must fail");
-        assert!(why.contains(victim), "{why}");
-
-        let unrecorded = copy_fixture_dir();
-        let text = std::fs::read_to_string(unrecorded.join("MANIFEST.json")).expect("manifest");
-        assert!(text.contains("\"sha256\""));
-        std::fs::write(
-            unrecorded.join("MANIFEST.json"),
-            text.replace("\"sha256\"", "\"sha_256\""),
-        )
-        .expect("write");
-        let why = check(&unrecorded).expect_err("a manifest without checksums must fail");
-        assert!(why.contains("no sha256"), "{why}");
-
-        let traversal = copy_fixture_dir();
-        let text = std::fs::read_to_string(traversal.join("MANIFEST.json")).expect("manifest");
-        std::fs::write(traversal.join("MANIFEST.json"), text.replace(victim, "../x.bin")).expect("write");
-        let why = check(&traversal).expect_err("a path in a file name must fail");
-        assert!(why.contains("plain fixture file name"), "{why}");
-    });
 }
 
 // -------------------------------------------------------------- refusals ---

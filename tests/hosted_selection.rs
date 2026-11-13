@@ -156,7 +156,7 @@ enum SignatureEnd {
     Unterminated,
 }
 
-/// Where the signature at `at` (the `fn`, or `impl`, keyword) ends.
+/// Where the signature of the `fn` whose keyword is at `at` ends.
 ///
 /// The body is the first `{` that is outside every parenthesis and bracket and
 /// outside every `<...>`. A `{` inside angle brackets is a const-generic
@@ -222,10 +222,11 @@ fn signature_end(blank: &str, at: usize) -> SignatureEnd {
 ///   scanned, whichever type a call actually reaches. Narrowing by receiver or
 ///   path is not done here, and scanning every same-named body would flag
 ///   device-free tests that merely call some other type's `new`. (Resolving
-///   `Type::name(` to `impl Type` was tried: against 936fe8e it flips 30 lib
-///   tests from pass to flag, every one a test that really opens a device, so it
-///   is a change to what the manifest is judged by and is kept off this branch;
-///   it is on `gp/w10-scangaps-item1`.)
+///   `Type::name(` to `impl Type` exists on branch `gp/w10-scangaps-item1` and
+///   was not landed: against 936fe8e it flips 30 lib tests of
+///   `runtime::pool_ledger_tests` from pass to flag, none of them in the
+///   manifest. 13 of the 30 were traced to `Rig::new`, which calls
+///   `GpuRuntime::new`; the other 17 were not traced.)
 /// - a helper defined by `macro_rules!` is not a `fn name` in the source text, so
 ///   its body is never scanned: the scan reads source, not expansions;
 /// - a function reached through a pointer (`let f = make; f();`) is not a call
@@ -1588,6 +1589,36 @@ fn a_callee_that_is_the_tail_of_another_name_is_not_called() {
         // `(helper)()` is a fn pointer call, which the scan does not follow.
         assert_eq!(found.is_some(), call != "(helper)();", "{call}");
     }
+}
+
+/// The remaining survivors of the adversary's round: `test_attribute_precedes`
+/// reads the same definition sites as the scan, a `{` nested inside a
+/// const-generic block stays inside it, and a `>` inside parentheses never closes
+/// an angle bracket outside them.
+#[test]
+fn the_signature_scan_edges_the_adversary_found() {
+    for gap in ["\t", "  ", " \t"] {
+        let src = format!("#[test]\nfn{gap}t() {{}}\n");
+        assert!(
+            test_attribute_precedes(&src, "t"),
+            "{gap:?}: the #[test] above `fn{gap}t` was not seen"
+        );
+    }
+    assert!(!test_attribute_precedes("fn t() {}\n", "t"));
+    let src = "fn h() where u8: Tr<{ { 1 }; 2 }> { let _rt = GpuRuntime::new(); }\n";
+    assert_eq!(
+        body_of(src, "h"),
+        "{ let _rt = GpuRuntime::new(); }",
+        "a nested block ended the const-generic block early"
+    );
+    let src = "fn h<F: Fn(Vec<u8>), const N: usize = { 3 }>() { let _rt = GpuRuntime::new(); }\n\
+               #[test]\nfn t() { h(|_| ()); }\n";
+    assert!(
+        device_marker(src, "t")
+            .unwrap()
+            .is_some_and(|m| m.contains("h mentions GpuRuntime")),
+        "a `>` inside parentheses closed the generics early"
+    );
 }
 
 #[test]

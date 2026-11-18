@@ -3,7 +3,9 @@
 package embedgemma2
 
 /*
-// The umbrella archive (go/engine, `make -C go test` builds it) is libgusset.a:
+// The umbrella archive (go/engine, `make -C go test` builds it, and strips its LLVM
+// bitcode into engine/target/stage, the only directory cgo searches: Go 1.27.4's
+// flag check refuses an LTO section in any -L directory) is libgusset.a:
 // gusset and tessl in one Rust staticlib, so a Go binary links exactly one
 // (docs/adoption.md in gusset, R14). A Rust staticlib carries none of the
 // system libraries its crates link, so they are named here: what
@@ -16,7 +18,7 @@ package embedgemma2
 // bytes of the archive they name. go/Makefile puts the archive's hash in
 // CGO_CFLAGS for that reason; a bare `go test` after rebuilding the archive
 // should pass -count=1 -a.
-#cgo LDFLAGS: -L${SRCDIR}/../engine/target/release -lgusset
+#cgo LDFLAGS: -L${SRCDIR}/../engine/target/stage -lgusset
 #cgo darwin LDFLAGS: -framework AudioToolbox -framework AVFoundation -framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation -framework ImageIO -framework Metal -framework VideoToolbox -lobjc -liconv
 #cgo noescape tessl_go_engine_init
 #cgo nocallback tessl_go_engine_init

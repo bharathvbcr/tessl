@@ -1,0 +1,390 @@
+{
+ "schema": 1,
+ "generator": "tools/timesfm3_ref/make_reference.py",
+ "generator_commit": "01def68675fce0987b2cbb6b627547eee4e720e6",
+ "versions": {
+  "torch": "2.12.1",
+  "transformers": "5.19.0",
+  "numpy": "2.5.0",
+  "python": "3.14.10"
+ },
+ "versions_role": "produced",
+ "inputs_source": "drawn: numpy default_rng(20261118) draws the series and torch.Generator().manual_seed(20261118) the weights; both are committed (model.safetensors and the in_*.npy files), so the draws are the inputs.",
+ "files": {
+  "a_univariate.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, NaN counts and versions"
+  },
+  "a_univariate.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "a_univariate.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "a_univariate.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "a_univariate.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, NaN counts and versions"
+  },
+  "b_covariates.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "b_covariates.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "b_covariates.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "b_covariates.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, NaN counts and versions"
+  },
+  "c_constant.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+  },
+  "c_constant.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() input or the forward() input decode() built"
+  },
+  "c_constant.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "c_constant.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model"
+  },
+  "model.safetensors": {
+   "role": "model",
+   "published": true,
+   "note": "the seeded tiny TimesFM 3 (2 layers, d 160, 2 heads of 80)"
+  }
+ }
+}

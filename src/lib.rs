@@ -287,6 +287,8 @@ pub mod shared;
 pub mod shared_buf;
 pub mod sq_norm;
 pub mod tensor;
+pub mod timesfm3;
+pub mod timesfm3_host;
 
 pub use cb_replay::{
     cb_replay_api_gap_summary, survey_cb_replay_api_gaps, CbReplayApiGap, CbReplayError, CbReplayPhase, CbSlot,

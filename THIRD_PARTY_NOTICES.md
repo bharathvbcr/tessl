@@ -74,6 +74,24 @@ commercial products, provided that all warranty or liability claims are
 assumed by the product vendor.
 ```
 
+## TimesFM 3 (`src/timesfm3.rs`, `src/timesfm3_host.rs`, `kernels/timesfm3.metal`)
+
+The TimesFM 3 forward and its host-side forecasting steps are a Rust and Metal port of
+Google Research's PyTorch implementation in google-research/timesfm
+(`src/timesfm3/torch/`, commit 918df02c9d366b2145bc5876135fa2131d3ed2a6), which is
+Copyright 2026 Google LLC and licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). The port follows its structure and
+numerics (patching, linear detrending, running RevIN statistics, the CPM iterative RevIN
+refinement, stitching, the mixing transformer); no Python source is included, and nothing
+here runs Python. `tools/timesfm3_ref/` reads that source by path, offline, to produce
+test fixtures.
+
+The pretrained checkpoint (`google/timesfm-3.0-pytorch`) is not part of this repository. It
+is distributed under the TimesFM Non-Commercial License v1.0, which limits it to
+non-commercial, non-production use; anyone loading it with this code is bound by that
+licence. The committed fixtures in `tests/fixtures/timesfm3_tiny/` come from a seeded random
+model, not from the checkpoint.
+
 ## Design references (not copied sources)
 
 The int8 and int4 TensorOps path (`kernels/i8_w8a8.metal`,

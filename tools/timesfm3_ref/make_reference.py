@@ -292,8 +292,9 @@ def write_manifest(out_dir, metas):
         for name in meta["files"]:
             files[f"{case}.{name}"] = {
                 "role": role(name), "published": True,
-                "note": f"float32 CPU forward of upstream timesfm3.torch at {PINNED}" if role(name) == "golden"
-                else "decode() input or the forward() input decode() built",
+                "note": {"golden": f"float32 CPU forward of upstream timesfm3.torch at {PINNED}",
+                         "config": "the case's horizon, shapes, NaN counts and versions",
+                         "input": "decode() input or the forward() input decode() built"}[role(name)],
             }
     fm.write_manifest(
         out_dir, "tools/timesfm3_ref/make_reference.py",

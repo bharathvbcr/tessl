@@ -46,8 +46,12 @@ takes):
   logits.npy      f32 [b, v, n, 64, 9]         forward()'s final logits
   out.npy         f32 [b, v, horizon, 9]       decode()'s forecast
   case.json       horizon, shapes, NaN counts and what was run
+  f64.<name>      (--tiny) float64 copies of fwd_values, revin_mean/std,
+                  resblock_input, raw_logits and out from the same model and
+                  inputs cast to f64
 """
 import argparse
+import copy
 import glob
 import json
 import os
@@ -159,11 +163,20 @@ def u8(x):
 
 
 def f32(x):
-    return x.detach().cpu().numpy().astype(np.float32)
+    # float32 for the fp32 pass; the f64 pass's save() keeps float64.
+    x = x.detach().cpu().numpy()
+    return x if x.dtype == np.float64 else x.astype(np.float32)
 
 
-def run_case(model, case, out_dir):
-    prefix = case["name"] + "."
+# What the f64 pass records: the host stages and the forecast, whose fp32
+# error is dominated by conditioning (detrending a steep series, then dividing
+# by a small sigma). Tests hold the port to "no further from f64 than
+# upstream's own fp32 run", which a fixed tolerance cannot state.
+F64_KEEP = ("fwd_values.npy", "revin_mean.npy", "revin_std.npy", "resblock_input.npy", "raw_logits.npy", "out.npy")
+
+
+def run_case(model, case, out_dir, f64=False):
+    prefix = case["name"] + (".f64." if f64 else ".")
     captured = {}
     orig_forward = model.forward
 
@@ -184,7 +197,10 @@ def run_case(model, case, out_dir):
     model.forward = forward
     try:
         def t(x):
-            return None if x is None else torch.from_numpy(np.ascontiguousarray(x))
+            if x is None:
+                return None
+            x = torch.from_numpy(np.ascontiguousarray(x))
+            return x.double() if f64 and x.is_floating_point() else x
 
         out, aux = model.decode(
             t(case["target"]), horizon=case["horizon"],
@@ -201,6 +217,10 @@ def run_case(model, case, out_dir):
     files = {}
 
     def save(name, arr):
+        if f64:
+            if name not in F64_KEEP:
+                return
+            arr = arr.astype(np.float64)
         np.save(os.path.join(out_dir, prefix + name), arr)
         files[name] = list(arr.shape)
 
@@ -231,6 +251,8 @@ def run_case(model, case, out_dir):
     save("raw_logits.npy", f32(head[0]))
     save("logits.npy", f32(aux["logits"]))
     save("out.npy", f32(out))
+    if f64:
+        return {"files": files}
     meta = {
         "horizon": case["horizon"], "freeze_after": captured["freeze_after"], "files": files,
         "nan": {k: int(np.isnan(np.load(os.path.join(out_dir, prefix + k))).sum())
@@ -273,6 +295,9 @@ def main():
     with torch.no_grad():
         for case in cases(rng, big=not args.tiny):
             metas[case["name"]] = run_case(model, case, args.out)
+            if args.tiny:
+                f64_files = run_case(copy.deepcopy(model).double(), case, args.out, f64=True)["files"]
+                metas[case["name"]]["files"].update({f"f64.{k}": v for k, v in f64_files.items()})
     if args.tiny and args.manifest:
         write_manifest(args.out, metas)
     print(json.dumps({k: v["nan"] for k, v in metas.items()}, indent=1))
@@ -283,6 +308,8 @@ def write_manifest(out_dir, metas):
     import fixture_manifest as fm
 
     def role(name):
+        if name.startswith("f64."):
+            return "golden"
         if name.startswith("in_") or name.startswith("fwd_"):
             return "input"
         if name == "case.json":
@@ -298,7 +325,9 @@ def write_manifest(out_dir, metas):
         for name in meta["files"]:
             files[f"{case}.{name}"] = {
                 "role": role(name), "published": True,
-                "note": {"golden": f"float32 CPU forward of upstream timesfm3.torch at {PINNED}",
+                "note": {"golden": (f"float64 CPU forward of upstream timesfm3.torch at {PINNED} (the model and "
+                                    "inputs cast to f64)" if name.startswith("f64.") else
+                                    f"float32 CPU forward of upstream timesfm3.torch at {PINNED}"),
                          "config": "the case's horizon, shapes, NaN counts and versions",
                          "input": "decode() input or the forward() input decode() built"}[role(name)],
             }

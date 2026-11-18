@@ -27,20 +27,22 @@ d_model so a transposed weight cannot pass. Weights are re-drawn because a
 zero-initialised PerDimScale and unit norm gains would let a missing gain pass.
 
 Every file is flat in --out, named `<case>.<name>` (so one MANIFEST.json can account
-for the directory), all little-endian .npy (bool arrays as uint8):
+for the directory), all little-endian .npy (bool arrays as float32 0/1, which ojas-io's npy reader
+takes):
 
   in_target.npy / in_target_mask.npy           the decode() inputs
   in_po.npy / in_po_mask.npy                   past-only covariates (if any)
   in_pf.npy / in_pf_mask.npy                   past+future covariates (if any)
   fwd_values.npy  f32 [b, v, n, 32]            what decode() hands forward()
-  fwd_masks.npy   u8  [b, v, n, 32]
-  fwd_patch_is_target.npy u8 [b, v, n]
-  fwd_cpm.npy     u8  [b, n]                   horizon CPM mask
+  fwd_masks.npy   0/1 [b, v, n, 32]
+  fwd_patch_is_target.npy 0/1 [b, v, n]
+  fwd_cpm.npy     0/1 [b, n]                   horizon CPM mask
   resblock_input.npy  f32 [b, v, n, 192]
   transformer_input.npy f32 [b, v, n, d]
-  effective_patch_mask.npy u8 [b, v, n]        cumprod(all-masked) per row
+  effective_patch_mask.npy 0/1 [b, v, n]       cumprod(all-masked) per row
   layer_{l}.npy   f32 [b, v, n, d]             residual stream after layer l
   revin_mean.npy / revin_std.npy f32 [b, v, n] running stats before CPM refine
+  raw_logits.npy  f32 [b, v, n, 576]           the output head, before RevIN is undone
   logits.npy      f32 [b, v, n, 64, 9]         forward()'s final logits
   out.npy         f32 [b, v, horizon, 9]       decode()'s forecast
   case.json       horizon, shapes, NaN counts and what was run
@@ -153,7 +155,7 @@ def cases(rng, big):
 
 
 def u8(x):
-    return x.detach().cpu().numpy().astype(np.uint8)
+    return x.detach().cpu().numpy().astype(np.float32)
 
 
 def f32(x):
@@ -175,8 +177,10 @@ def run_case(model, case, out_dir):
                             return_aux_outputs=True)
 
     layers = []
+    head = []
     hooks = [layer.register_forward_hook(lambda m, i, o: layers.append(o[0].detach().clone()))
              for layer in model.transformer_stack.layers]
+    hooks.append(model.output_head.register_forward_hook(lambda m, i, o: head.append(o.detach().clone())))
     model.forward = forward
     try:
         def t(x):
@@ -202,11 +206,11 @@ def run_case(model, case, out_dir):
 
     save("in_target.npy", case["target"].astype(np.float32))
     save("in_target_mask.npy", (case.get("target_mask") if case.get("target_mask") is not None
-                                else np.zeros(case["target"].shape, dtype=bool)).astype(np.uint8))
+                                else np.zeros(case["target"].shape, dtype=bool)).astype(np.float32))
     for key in ("po", "pf"):
         if case.get(key) is not None:
             save(f"in_{key}.npy", case[key].astype(np.float32))
-            save(f"in_{key}_mask.npy", np.zeros(case[key].shape, dtype=np.uint8))
+            save(f"in_{key}_mask.npy", np.zeros(case[key].shape, dtype=np.float32))
     save("fwd_values.npy", f32(captured["values"]))
     save("fwd_masks.npy", u8(captured["masks"]))
     save("fwd_patch_is_target.npy", u8(captured["patch_is_target"]))
@@ -223,6 +227,8 @@ def run_case(model, case, out_dir):
     mean, std = aux["revin_stats"]
     save("revin_mean.npy", f32(mean))
     save("revin_std.npy", f32(std))
+    assert len(head) == 1, "the output head ran more than once"
+    save("raw_logits.npy", f32(head[0]))
     save("logits.npy", f32(aux["logits"]))
     save("out.npy", f32(out))
     meta = {

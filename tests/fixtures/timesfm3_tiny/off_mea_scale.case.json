@@ -1,0 +1,133 @@
+{
+ "files": {
+  "effective_patch_mask.npy": [
+   2,
+   4,
+   11
+  ],
+  "fwd_cpm.npy": [
+   2,
+   11
+  ],
+  "fwd_masks.npy": [
+   2,
+   4,
+   11,
+   32
+  ],
+  "fwd_patch_is_target.npy": [
+   2,
+   4,
+   11
+  ],
+  "fwd_values.npy": [
+   2,
+   4,
+   11,
+   32
+  ],
+  "in_pf.npy": [
+   2,
+   1,
+   326
+  ],
+  "in_pf_mask.npy": [
+   2,
+   1,
+   326
+  ],
+  "in_po.npy": [
+   2,
+   1,
+   256
+  ],
+  "in_po_mask.npy": [
+   2,
+   1,
+   256
+  ],
+  "in_target.npy": [
+   2,
+   2,
+   256
+  ],
+  "in_target_mask.npy": [
+   2,
+   2,
+   256
+  ],
+  "layer_0.npy": [
+   2,
+   4,
+   11,
+   160
+  ],
+  "layer_1.npy": [
+   2,
+   4,
+   11,
+   160
+  ],
+  "logits.npy": [
+   2,
+   4,
+   11,
+   64,
+   9
+  ],
+  "out.npy": [
+   2,
+   4,
+   70,
+   9
+  ],
+  "raw_logits.npy": [
+   2,
+   4,
+   11,
+   576
+  ],
+  "resblock_input.npy": [
+   2,
+   4,
+   11,
+   192
+  ],
+  "revin_mean.npy": [
+   2,
+   4,
+   11
+  ],
+  "revin_std.npy": [
+   2,
+   4,
+   11
+  ],
+  "transformer_input.npy": [
+   2,
+   4,
+   11,
+   160
+  ]
+ },
+ "freeze_after": null,
+ "horizon": 70,
+ "inputs_of": "b_covariates",
+ "nan": {
+  "fwd_values.npy": 0,
+  "layer_0.npy": 0,
+  "layer_1.npy": 0,
+  "logits.npy": 0,
+  "out.npy": 0,
+  "raw_logits.npy": 0,
+  "resblock_input.npy": 0,
+  "revin_mean.npy": 0,
+  "revin_std.npy": 0,
+  "transformer_input.npy": 0
+ },
+ "off": [
+  "use_memory_efficient_attention"
+ ],
+ "torch": "2.14.0",
+ "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
+}

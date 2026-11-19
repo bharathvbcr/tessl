@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "tools/timesfm3_ref/make_reference.py",
- "generator_commit": "e43c85dde3d88d454e7c5fd1c3e384555311ffb0",
+ "generator_commit": "a5bb24ef7e9a0f398d5bd07e7b64389d52dcf48f",
  "versions": {
   "torch": "2.14.0",
   "transformers": "5.17.0",
@@ -1378,6 +1378,1002 @@
    "published": true,
    "note": "the seeded tiny TimesFM 3 (2 layers, d 160, 2 heads of 80)",
    "sha256": "2c9b5ceb04885e7898785db2c9efba530000faca4df5777ee974053f945a306b"
+  },
+  "off_all.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "9a1b92aa382509fed770561eebdc86e7558575ef7d39986934952450f090765a"
+  },
+  "off_all.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_iterative_cpm_revin', 'use_linear_detrending', 'use_memory_efficient_attention', 'use_stitching', 'use_variate_attention'] off, the rest on",
+   "sha256": "b8447cf093797780372f38b966267f2685ff98b9be0e8936589ec492e29020ed"
+  },
+  "off_all.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "aecc23308a052138fe60caae456dc81f1fd6ceb3af2ccadb4fc092dd99c828fa"
+  },
+  "off_all.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "53922305e32f9f06d815146c40854dc223000a17e03240b99410bd813373d6d7"
+  },
+  "off_all.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "d163872e0c04b5d1e6e538a0a11f05d7f5d37754cd72d7723651c5380a67518d"
+  },
+  "off_all.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "f6fd5b05e333c3b5241d25947e32c34c24129f3c2b9d7b67f72b23e4924c95d8"
+  },
+  "off_all.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "4dd2d6901accad47283d9d7dfa066a905068409379811aa03d14bd2a2e774cc5"
+  },
+  "off_all.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b75cc4206fc5ca40df1df671bc06f75d66685f9802c10949c567132ede7c3131"
+  },
+  "off_all.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "acebdc49464dacc87b07f4fa2e2cefffd12d4123c3be6eb8140ef91fad432733"
+  },
+  "off_all.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "150879c72bd52201cb9387ea90a3262155756b0b400b0a5558abe7c6a33b4d4a"
+  },
+  "off_all.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "af64f7b596bab47c46a340d7e41acbe563a4a6e8a58c6553bff00095a5839089"
+  },
+  "off_all.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "007fda479c08a407fa77b99f00419b17b3403bfd0fe118c03d15b94b1cc16731"
+  },
+  "off_all.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "88f9db57b0df8af4ea9b0e695cd4ce2950800c6afd9d13f707c8a2a78258d277"
+  },
+  "off_all.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
+  },
+  "off_all.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
+  },
+  "off_all.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
+  },
+  "off_all.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
+  },
+  "off_all.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
+  },
+  "off_all.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
+  },
+  "off_all.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "80377031ff82dbda304b4d39f081f80a4852a537c4fedd467ed2d35691d3202a"
+  },
+  "off_all.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "d43ade8afb5e1b1afebc9a3b0e5ff2360f7876303b9eab958f15f6996648372d"
+  },
+  "off_all.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a5cb8eb70e952194fc261e74f5aeccfbb0ce291d610c863faab50a64cf4702b7"
+  },
+  "off_all.model.safetensors": {
+   "role": "model",
+   "published": true,
+   "note": "the tiny model's weights without the variate-attention tensors (a model with that switch off has none)",
+   "sha256": "4ab83926d28b12204666f7a9699073e46555a878266b42897b2317dbf556c87e"
+  },
+  "off_all.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "df3e23de4b7712bc3d384b2537c43b2320472a501c79db37334d99b444184e96"
+  },
+  "off_all.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f2c22ea7924c14a4041b6b9fe8cf05681f3448cb7f7b70d9d19b06da2b5e221c"
+  },
+  "off_all.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "89d8f7570e322f7fa5e16ddb9a26c2b7358f62b7b0418c831eb5e6b3e79e3401"
+  },
+  "off_all.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "697967073b174333bbeab138681435b9a1b3a0f986601ba0b302668b20827a53"
+  },
+  "off_all.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "25f0a168dcd45296bfe056a481159a9a7ad909c07749011c7afcbf8c0b3ff7b2"
+  },
+  "off_all.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28c3346e6cdb4a7e47370f6b5f1ecb35a2ae74c3902e8945135d510445c1a72f"
+  },
+  "off_cpm_refine.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "7df42ee719f031fded43f89b06cf70dfc304980f6a0cd4506f9cc85de76adcb4"
+  },
+  "off_cpm_refine.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_iterative_cpm_revin'] off, the rest on",
+   "sha256": "7143e55f60a4a4e8caf420d533e65c506acaa70e7ba9768f15282631431fc128"
+  },
+  "off_cpm_refine.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3954cbef6991e4f85a43514bea24f780efd5e9d79f0406d05af35b6c1ce11843"
+  },
+  "off_cpm_refine.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "fcbb9e4a353948fe20f2f3f2870499cd87eaf0eb734d3117e8a72ea91e0b980d"
+  },
+  "off_cpm_refine.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "79304ab83ecf970d61dfe98bf8c2bf12cd5b81d9b70817b516af124d1e00aa30"
+  },
+  "off_cpm_refine.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "2c27b7c931210b8c3ab381b833bb6d41b6f86a16f23164fd4a7abd2073fb7f7a"
+  },
+  "off_cpm_refine.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "cb39ba5666d39f48c847bf73d91c9bf6aa39535636930b89925da88618d620e4"
+  },
+  "off_cpm_refine.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "890fcc7ab731fdd203e5e10033be0d5e0f3b3f208498e3ef602647c2d6c0c528"
+  },
+  "off_cpm_refine.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b01d598c8dea4232026c8f064fc7d1f2db8ef18431f75900c400e34bb68b7ca8"
+  },
+  "off_cpm_refine.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5e901b231cf2450a29c3783d09f21caf7faa4d37a85501ed91087074edd4e8ed"
+  },
+  "off_cpm_refine.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1bd6d2f8984dbcb75207446b255eba7fe46fd8240ff7f4d803c5b8fde6195fd7"
+  },
+  "off_cpm_refine.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "cc49e6d1398de95b438fddc766fcdb8b4fa4d731585419c9d430e8278015f0ba"
+  },
+  "off_cpm_refine.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "9c77850b7d1d65d1fa9b45e491ebec0d25a9ce059536a0a355f3593a887767bf"
+  },
+  "off_cpm_refine.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
+  },
+  "off_cpm_refine.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
+  },
+  "off_cpm_refine.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
+  },
+  "off_cpm_refine.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
+  },
+  "off_cpm_refine.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
+  },
+  "off_cpm_refine.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
+  },
+  "off_cpm_refine.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "d45d9a8b8123595e3264fbce36d911d045311cbb3308f92a07741416c40469b3"
+  },
+  "off_cpm_refine.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4bb7aa8f1b35bbbde333d12a784e2657802f8d1f7778141985b5c9ff24848980"
+  },
+  "off_cpm_refine.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "1ee3822f68ee85ea276254772ee8856e50a7d8f1d19c001a6355567b024ed7c9"
+  },
+  "off_cpm_refine.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "96880cf38f37fc93f3ca9897ff65e4e0715c3941851e7a4d0e797f339d4213bd"
+  },
+  "off_cpm_refine.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "aa8ebd1c457614c69d1cff55509717f3cbbd63e0b4b2d85b8b00e0d0f3534ef2"
+  },
+  "off_cpm_refine.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28f2366d691bdee380515e8be68ce0abbc8438f1187e50d116d82f7070e7206a"
+  },
+  "off_cpm_refine.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "81e42bbb42c2913114d93cfa4f13d6fbf417c4e2621b29e7c1bb060f9067b49f"
+  },
+  "off_cpm_refine.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8fa748f02afe8572a5c020bd121452236b3697e1e9a648c3e949ad3d76a33b18"
+  },
+  "off_cpm_refine.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "84fc77c6320c8ad303501e77cde41d51b052675fccbcf99227c1b3753db02167"
+  },
+  "off_detrending.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "dc1a9d57914e47f3d2624621fb4369b57df3f54af68b5161a113c79943be9d10"
+  },
+  "off_detrending.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_linear_detrending'] off, the rest on",
+   "sha256": "61c3671c52c6cc755a04c8656cec41d90851738a0b5bafbccf19d3eeb99376ab"
+  },
+  "off_detrending.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3954cbef6991e4f85a43514bea24f780efd5e9d79f0406d05af35b6c1ce11843"
+  },
+  "off_detrending.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "54a92bee17279a40be9491ada4a2df69a314cc29c9b70f5f751ad15a37603e18"
+  },
+  "off_detrending.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "6d13b0d9f49fc5751ff720265e991e261f9687dd07a2e51b7cd2761224a56dcc"
+  },
+  "off_detrending.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b1d2455fefa3821b82f6d04a63bfafa4166639bde40efa28498eae4bcd834c6e"
+  },
+  "off_detrending.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "5428015504d10bb9aed9b02449368a94ecfdd2363bc4a91b0f531d4e8b34ef50"
+  },
+  "off_detrending.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "adf606d1f01ae6c9320d3d23e7cef5e8ede600866d40f7cd57c658f5f86a68de"
+  },
+  "off_detrending.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "06df79216c205562f36517d8443b89a10f2cd5ab8ca08b16cffb9d6dbb0fb155"
+  },
+  "off_detrending.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5e901b231cf2450a29c3783d09f21caf7faa4d37a85501ed91087074edd4e8ed"
+  },
+  "off_detrending.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1bd6d2f8984dbcb75207446b255eba7fe46fd8240ff7f4d803c5b8fde6195fd7"
+  },
+  "off_detrending.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "cc49e6d1398de95b438fddc766fcdb8b4fa4d731585419c9d430e8278015f0ba"
+  },
+  "off_detrending.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "37fced1c9f275dce40c00ac335c5ed8ee665786e05f602d7c4f82f4c60af7fd4"
+  },
+  "off_detrending.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
+  },
+  "off_detrending.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
+  },
+  "off_detrending.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
+  },
+  "off_detrending.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
+  },
+  "off_detrending.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
+  },
+  "off_detrending.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
+  },
+  "off_detrending.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bc3a1d942d5683cd4a7505bfc52686ea9bf41ee0b1673e5f76776e6e5b706d42"
+  },
+  "off_detrending.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "33a6f65f4143a0d2b8202f7579376f0d1961a355ba38d955dad70846f3b94780"
+  },
+  "off_detrending.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c7927caf935376c994aaeee608c020ed43de860378f4d0ebc08e85832b453f46"
+  },
+  "off_detrending.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "5c14479e841bc0a764fa0cfe7162e561a9ceb4b0783112a5e6cde992c40490e2"
+  },
+  "off_detrending.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8c2363f0123ef97241dc8249f580440e659cb985ec6ff9852bb89b31d5c5e980"
+  },
+  "off_detrending.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "7252cdf97a38427d57ca5a916d9ab69e24e1295719ab67535b2d529aeaa031a2"
+  },
+  "off_detrending.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "88354e62f2463dad0c04e14154398422d19af53214e238facf6112af77102cbb"
+  },
+  "off_detrending.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "adc8be1938c5f51ca75daec6318ef333dc68d9cb30546ff011776a0a49f30f13"
+  },
+  "off_detrending.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "b373cde3127b22556858ebff01fdd0d4e356ff13d597fb807d523bf5cb8e25b8"
+  },
+  "off_mea_scale.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "9743fb45ae271e8c4dcae3a927fd3951a9323b96c1b6ea080ccc8877ddbb3c4a"
+  },
+  "off_mea_scale.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_memory_efficient_attention'] off, the rest on",
+   "sha256": "a347d720d44f20d5bf05e5b695a9a8208c3c280ea9179e0c72627afe96b557be"
+  },
+  "off_mea_scale.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3954cbef6991e4f85a43514bea24f780efd5e9d79f0406d05af35b6c1ce11843"
+  },
+  "off_mea_scale.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "fcbb9e4a353948fe20f2f3f2870499cd87eaf0eb734d3117e8a72ea91e0b980d"
+  },
+  "off_mea_scale.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "0a46f13427c993d88b3f60689357e03898c5f7d0b98bf0a4ee94edbf44b51cf1"
+  },
+  "off_mea_scale.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "049b2c032ea7cafcb428848577bbb32a733713213351ab3586edc3fa927ce9b4"
+  },
+  "off_mea_scale.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "cb39ba5666d39f48c847bf73d91c9bf6aa39535636930b89925da88618d620e4"
+  },
+  "off_mea_scale.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "890fcc7ab731fdd203e5e10033be0d5e0f3b3f208498e3ef602647c2d6c0c528"
+  },
+  "off_mea_scale.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b01d598c8dea4232026c8f064fc7d1f2db8ef18431f75900c400e34bb68b7ca8"
+  },
+  "off_mea_scale.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5e901b231cf2450a29c3783d09f21caf7faa4d37a85501ed91087074edd4e8ed"
+  },
+  "off_mea_scale.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1bd6d2f8984dbcb75207446b255eba7fe46fd8240ff7f4d803c5b8fde6195fd7"
+  },
+  "off_mea_scale.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "cc49e6d1398de95b438fddc766fcdb8b4fa4d731585419c9d430e8278015f0ba"
+  },
+  "off_mea_scale.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "9c77850b7d1d65d1fa9b45e491ebec0d25a9ce059536a0a355f3593a887767bf"
+  },
+  "off_mea_scale.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
+  },
+  "off_mea_scale.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
+  },
+  "off_mea_scale.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
+  },
+  "off_mea_scale.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
+  },
+  "off_mea_scale.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
+  },
+  "off_mea_scale.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
+  },
+  "off_mea_scale.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "57349f34c037c613352e31cc87888db463b2d9519c0adeb60d0bc5009fb57eac"
+  },
+  "off_mea_scale.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c15ffa24ecca577aba1ddecd524a59627809df89763e20aea7e1cd138d2e09c8"
+  },
+  "off_mea_scale.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "6fc257f9e9b96044530e18f2e7c7708a86c3eac936b396fbdd71e71316d0781e"
+  },
+  "off_mea_scale.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "91b7d3b2abbd18b02f80509ebf077959c95362b351b14a1763d5c014cd183446"
+  },
+  "off_mea_scale.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "68be6cd00faebaab8f483ee8636e115ee55732e118d0ea5ce531abb4deef69d5"
+  },
+  "off_mea_scale.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28f2366d691bdee380515e8be68ce0abbc8438f1187e50d116d82f7070e7206a"
+  },
+  "off_mea_scale.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "81e42bbb42c2913114d93cfa4f13d6fbf417c4e2621b29e7c1bb060f9067b49f"
+  },
+  "off_mea_scale.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8fa748f02afe8572a5c020bd121452236b3697e1e9a648c3e949ad3d76a33b18"
+  },
+  "off_mea_scale.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "84fc77c6320c8ad303501e77cde41d51b052675fccbcf99227c1b3753db02167"
+  },
+  "off_stitching.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "811b1d53f7ce5185cefa14c1c6f02c28c211829b1d21b0a33d3432c291b6f2ec"
+  },
+  "off_stitching.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_stitching'] off, the rest on",
+   "sha256": "57cc7823bb67bde7cf14f49dcff96449e5d02a9b9acbcb29f48e2d6671d55e50"
+  },
+  "off_stitching.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "53f235a733e9dcd681502bac62b4137622699bc69c1ebc507b07d4903b8b7549"
+  },
+  "off_stitching.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "3c0e53d84926b5d23b5d47791ccc777410e1dd6ead09282b3bfc1dd434c504eb"
+  },
+  "off_stitching.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "fc196caabbaeca7cb24cc76c322546281b708232786143ebfc68938e8b6a0071"
+  },
+  "off_stitching.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "d3dafc94f04dd8cbe9f10d1e141edb2bf4f0d0aa89a6a5bf740cfe91088016bc"
+  },
+  "off_stitching.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "bd4ea986516ecb81ea2702a3b78cc4bfbfcb131f960e06d89715e87280cc07fb"
+  },
+  "off_stitching.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "22593d1447df481c3625c0f05e0dc24df0be0cb6c2cd28b1cd9b5d4723cd5712"
+  },
+  "off_stitching.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "d312d8157eeede6df4fdf2f85842c0dc5159801010862119720f9f8af0cd4cba"
+  },
+  "off_stitching.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "8e3c228db7f4a3aba96fbbcac1805e2c51c8a2892b1b2ee1d71a67df73f1aa15"
+  },
+  "off_stitching.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6fc91dee29ace70e873976278417b3fdc82ed04cfd1edb38ca57280dd8c9dbf6"
+  },
+  "off_stitching.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "8781ea79c3d095e4064965756509ffa7617476732d364b382240fb0e3b32d32d"
+  },
+  "off_stitching.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "3efdcdc502e16cb31b70ea3a7e4c42a01b57782eda4ab0946a3228aeca080af4"
+  },
+  "off_stitching.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "45bff6de22b1f45cf23158fd52d710988fd5309ba6f1faf9d37ce218e29ee744"
+  },
+  "off_stitching.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "43980298f7ac5cfcc34a8a76f565909bf34f49a1a96c272c25543456e5dcb52f"
+  },
+  "off_stitching.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28fd6213d9abc0a4a757e7d79f5cea536c62b86589cf4646b9ba182910185fa0"
+  },
+  "off_stitching.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f99f52ac9f08cc024cc85d5e761eb911b6c256f579324ee3557f9747d9b18ab6"
+  },
+  "off_stitching.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c1f4907c8927201820c98a4dd8b3bab816d20b90ab03f2b8e6baf9d9a06c83cb"
+  },
+  "off_stitching.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "78fcc4cda1efed6f871b119d2ce9c6a3c6cbd0ab4b5bae7ef5f0835b16f0a9ec"
+  },
+  "off_stitching.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f3f59da3c7484d8e65ec9f3f4dcf647cfc32f2228dcb3ecd97a421a972bf523b"
+  },
+  "off_stitching.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4f7a35fcf54cb4d29fdd91c491975bedaccfdfbf95914f3bb5f80ac1c652c560"
+  },
+  "off_stitching.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f983b2701acc9e09e7f6243f5c02488e8af1c4e264357f89af8221998d3faca3"
+  },
+  "off_stitching.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "9168ff6165ca56e975d459105f4b5d4fe90ff0b925a51a85dd4fec2ed41b81dd"
+  },
+  "off_stitching.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "1b17170887998c1381ac3ddd9f5d00d1bccf3c120a8191cd971033101e929908"
+  },
+  "off_variate_attention.case.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "349b3a246110121303c4050966e6834bedd1c4d6bd71200858dc259d3b0b6309"
+  },
+  "off_variate_attention.config.json": {
+   "role": "config",
+   "published": true,
+   "note": "TimesFM3Torch.to_dict() of the tiny model with ['use_variate_attention'] off, the rest on",
+   "sha256": "806fe947e1d7ae3eb682714cf31b01bd9b80d23b060bf1f3a85b8e84b47d8687"
+  },
+  "off_variate_attention.effective_patch_mask.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3954cbef6991e4f85a43514bea24f780efd5e9d79f0406d05af35b6c1ce11843"
+  },
+  "off_variate_attention.f64.fwd_values.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "fcbb9e4a353948fe20f2f3f2870499cd87eaf0eb734d3117e8a72ea91e0b980d"
+  },
+  "off_variate_attention.f64.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "608943fc74dfaf21be238c407dd4103a81d6ddb88c7ac9599e736ded6da59b96"
+  },
+  "off_variate_attention.f64.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "c376d615fd2956ef6543c0943851687612d65608709515a5de885b3b969a45db"
+  },
+  "off_variate_attention.f64.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "cb39ba5666d39f48c847bf73d91c9bf6aa39535636930b89925da88618d620e4"
+  },
+  "off_variate_attention.f64.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "890fcc7ab731fdd203e5e10033be0d5e0f3b3f208498e3ef602647c2d6c0c528"
+  },
+  "off_variate_attention.f64.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b01d598c8dea4232026c8f064fc7d1f2db8ef18431f75900c400e34bb68b7ca8"
+  },
+  "off_variate_attention.fwd_cpm.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5e901b231cf2450a29c3783d09f21caf7faa4d37a85501ed91087074edd4e8ed"
+  },
+  "off_variate_attention.fwd_masks.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1bd6d2f8984dbcb75207446b255eba7fe46fd8240ff7f4d803c5b8fde6195fd7"
+  },
+  "off_variate_attention.fwd_patch_is_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "cc49e6d1398de95b438fddc766fcdb8b4fa4d731585419c9d430e8278015f0ba"
+  },
+  "off_variate_attention.fwd_values.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "9c77850b7d1d65d1fa9b45e491ebec0d25a9ce059536a0a355f3593a887767bf"
+  },
+  "off_variate_attention.in_pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
+  },
+  "off_variate_attention.in_pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
+  },
+  "off_variate_attention.in_po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
+  },
+  "off_variate_attention.in_po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
+  },
+  "off_variate_attention.in_target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
+  },
+  "off_variate_attention.in_target_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
+  },
+  "off_variate_attention.layer_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "db213e416b95470469a63796ce43226ad4ccc11e67ae83d0322528589d2e06e3"
+  },
+  "off_variate_attention.layer_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c93d1bb70a68deb50cf5072d434798d6d5c493a8c4829e2fdfc40234b9bbadf8"
+  },
+  "off_variate_attention.logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "dd1bf74526d0abdb814aebdb3da432238847dc21eb063c699d26fc9f0f758c3d"
+  },
+  "off_variate_attention.model.safetensors": {
+   "role": "model",
+   "published": true,
+   "note": "the tiny model's weights without the variate-attention tensors (a model with that switch off has none)",
+   "sha256": "4ab83926d28b12204666f7a9699073e46555a878266b42897b2317dbf556c87e"
+  },
+  "off_variate_attention.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "2491049cab63457745472b74b65e0323332569987b00d44263a7505404e267e4"
+  },
+  "off_variate_attention.raw_logits.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "46e646a5c8b73b64fdfeaa8c22fc027acb8edb897826e41f0c1f0be72be734a3"
+  },
+  "off_variate_attention.resblock_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28f2366d691bdee380515e8be68ce0abbc8438f1187e50d116d82f7070e7206a"
+  },
+  "off_variate_attention.revin_mean.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "81e42bbb42c2913114d93cfa4f13d6fbf417c4e2621b29e7c1bb060f9067b49f"
+  },
+  "off_variate_attention.revin_std.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8fa748f02afe8572a5c020bd121452236b3697e1e9a648c3e949ad3d76a33b18"
+  },
+  "off_variate_attention.transformer_input.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "84fc77c6320c8ad303501e77cde41d51b052675fccbcf99227c1b3753db02167"
   }
  }
 }

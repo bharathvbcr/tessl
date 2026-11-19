@@ -23,75 +23,90 @@ fn config() -> Timesfm3Config {
 #[test]
 fn host_steps_match_upstream_on_every_tiny_case() {
     let cfg = config();
+    for case in tfm::TINY_CASES {
+        check_host_steps(&cfg, case);
+    }
+}
+
+/// The host steps with a switch off (no stitching: whole output patches; no
+/// detrending: no trend; no CPM refinement: the running RevIN statistics
+/// de-normalise the horizon) against upstream built with it off.
+#[test]
+fn host_steps_match_upstream_on_every_off_branch_case() {
+    let dir = tfm::tiny_dir();
+    for case in tfm::OFF_CASES {
+        check_host_steps(&tfm::off_config(&dir, case), case);
+    }
+}
+
+fn check_host_steps(cfg: &Timesfm3Config, case: &str) {
     let hc = &cfg.host;
     let dir = tfm::tiny_dir();
-    for case in tfm::TINY_CASES {
-        let inp = tfm::decode_input(&dir, case);
-        let pr = prepare(hc, &inp).unwrap_or_else(|e| panic!("{case}: {e}"));
-        let fv = tfm::load(&dir, case, "fwd_values");
-        assert_eq!(
-            fv.shape,
-            [pr.batch, pr.variates, pr.patches, hc.input_patch_len],
-            "{case}: patched shape"
-        );
+    let inp = tfm::decode_input(&dir, case);
+    let pr = prepare(hc, &inp).unwrap_or_else(|e| panic!("{case}: {e}"));
+    let fv = tfm::load(&dir, case, "fwd_values");
+    assert_eq!(
+        fv.shape,
+        [pr.batch, pr.variates, pr.patches, hc.input_patch_len],
+        "{case}: patched shape"
+    );
+    tfm::assert_no_worse_than_upstream(
+        &format!("{case} fwd_values"),
+        &pr.values,
+        &fv.data,
+        &tfm::load64(&dir, case, "fwd_values"),
+    );
+    assert_eq!(
+        pr.masks,
+        tfm::mask(&tfm::load(&dir, case, "fwd_masks")),
+        "{case}: masks"
+    );
+    assert_eq!(
+        pr.patch_is_target,
+        tfm::mask(&tfm::load(&dir, case, "fwd_patch_is_target")),
+        "{case}: targets"
+    );
+    assert_eq!(pr.cpm, tfm::mask(&tfm::load(&dir, case, "fwd_cpm")), "{case}: cpm");
+
+    let pre = preprocess(hc, &pr).unwrap_or_else(|e| panic!("{case}: {e}"));
+    for (name, got) in [
+        ("revin_mean", &pre.running_mean),
+        ("revin_std", &pre.running_std),
+        ("resblock_input", &pre.resblock_input),
+    ] {
+        let want = tfm::load(&dir, case, name);
         tfm::assert_no_worse_than_upstream(
-            &format!("{case} fwd_values"),
-            &pr.values,
-            &fv.data,
-            &tfm::load64(&dir, case, "fwd_values"),
-        );
-        assert_eq!(
-            pr.masks,
-            tfm::mask(&tfm::load(&dir, case, "fwd_masks")),
-            "{case}: masks"
-        );
-        assert_eq!(
-            pr.patch_is_target,
-            tfm::mask(&tfm::load(&dir, case, "fwd_patch_is_target")),
-            "{case}: targets"
-        );
-        assert_eq!(pr.cpm, tfm::mask(&tfm::load(&dir, case, "fwd_cpm")), "{case}: cpm");
-
-        let pre = preprocess(hc, &pr).unwrap_or_else(|e| panic!("{case}: {e}"));
-        for (name, got) in [
-            ("revin_mean", &pre.running_mean),
-            ("revin_std", &pre.running_std),
-            ("resblock_input", &pre.resblock_input),
-        ] {
-            let want = tfm::load(&dir, case, name);
-            tfm::assert_no_worse_than_upstream(
-                &format!("{case} {name}"),
-                got,
-                &want.data,
-                &tfm::load64(&dir, case, name),
-            );
-        }
-        let eff = tfm::mask(&tfm::load(&dir, case, "effective_patch_mask"));
-        let n = pr.patches;
-        let lead: Vec<u32> = eff
-            .chunks(n)
-            .map(|row| row.iter().take_while(|&&m| m == 1).count() as u32)
-            .collect();
-        for (r, row) in eff.chunks(n).enumerate() {
-            // The effective mask is a prefix by construction (cumprod).
-            assert!(
-                row.iter().skip(lead[r] as usize).all(|&m| m == 0),
-                "{case}: row {r} mask is not a prefix"
-            );
-        }
-        assert_eq!(pre.leading_masked, lead, "{case}: leading masked patches");
-
-        // Post-processing alone: upstream's own raw head output in, so the
-        // only differences are the host steps after the head.
-        let raw = tfm::load(&dir, case, "raw_logits");
-        let out = postprocess(hc, &pr, &pre, &raw.data).unwrap_or_else(|e| panic!("{case}: {e}"));
-        tfm::assert_close(
-            &format!("{case} forecast from raw logits"),
-            &out,
-            &tfm::load(&dir, case, "out").data,
-            1e-5,
+            &format!("{case} {name}"),
+            got,
+            &want.data,
+            &tfm::load64(&dir, case, name),
         );
     }
+    let eff = tfm::mask(&tfm::load(&dir, case, "effective_patch_mask"));
+    let n = pr.patches;
+    let lead: Vec<u32> = eff
+        .chunks(n)
+        .map(|row| row.iter().take_while(|&&m| m == 1).count() as u32)
+        .collect();
+    for (r, row) in eff.chunks(n).enumerate() {
+        // The effective mask is a prefix by construction (cumprod).
+        assert!(
+            row.iter().skip(lead[r] as usize).all(|&m| m == 0),
+            "{case}: row {r} mask is not a prefix"
+        );
+    }
+    assert_eq!(pre.leading_masked, lead, "{case}: leading masked patches");
+
+    // Post-processing alone: upstream's own raw head output in, so the
+    // only differences are the host steps after the head.
+    let raw = tfm::load(&dir, case, "raw_logits");
+    let out = postprocess(hc, &pr, &pre, &raw.data).unwrap_or_else(|e| panic!("{case}: {e}"));
+    tfm::assert_close(
+        &format!("{case} forecast from raw logits"),
+        &out,
+        &tfm::load(&dir, case, "out").data,
+        1e-5,
+    );
 }
 
 #[test]
@@ -110,6 +125,35 @@ fn case_b_exercises_the_paths_it_was_built_for() {
         "no leading fully-masked patch"
     );
     assert!(pr.variates > 1 && pr.horizon > cfg.host.output_patch_len);
+}
+
+#[test]
+fn off_branch_cases_exercise_the_switch_they_turn_off() {
+    // Guards the fixtures, not the code (the generator also asserts that off
+    // and on forecasts differ): the inputs must reach the branch, that is a
+    // horizon past one output patch (stitching), a trend that detrending
+    // removes, and several variates (variate attention).
+    let on = config();
+    let dir = tfm::tiny_dir();
+    let off = tfm::off_config(&dir, "off_stitching");
+    let h = tfm::load(&dir, "off_stitching", "out").shape[2];
+    assert!(h > off.host.output_patch_len, "horizon {h} fits one output patch");
+
+    let inp = tfm::decode_input(&dir, "off_detrending");
+    let off = tfm::off_config(&dir, "off_detrending");
+    assert!(
+        prepare(&on.host, &inp).unwrap().detrended.contains(&1),
+        "all-on detrends nothing"
+    );
+    assert!(prepare(&off.host, &inp).unwrap().detrended.iter().all(|&d| d == 0));
+
+    let off = tfm::off_config(&dir, "off_variate_attention");
+    assert!(
+        prepare(&off.host, &tfm::decode_input(&dir, "off_variate_attention"))
+            .unwrap()
+            .variates
+            > 1
+    );
 }
 
 #[test]

@@ -85,8 +85,12 @@ def import_forecaster():
     return timesfm3_forecaster
 
 
-def tiny_model(model_lib):
+def tiny_model(model_lib, use_mea=True, **switches):
+    """The seeded tiny model; `switches` are TimesFM3Torch constructor switches
+    (use_stitching, ...) and `use_mea` the transformer's
+    use_memory_efficient_attention, for the off-branch variants."""
     model = model_lib.TimesFM3Torch(
+        **switches,
         input_patch_len=32,
         output_patch_len=64,
         residual_block_config=dict(hidden_dims=176, output_dims=160, use_bias=False, activation="relu"),
@@ -96,7 +100,7 @@ def tiny_model(model_lib):
                 model_dims=160, hidden_dims=224, num_heads=2, attention_norm="rms",
                 feedforward_norm="rms", qk_norm="rms", use_bias=False, use_rope_seq=True,
                 use_rope_var=False, ff_activation="relu", deterministic=True,
-                use_memory_efficient_attention=True, use_sdpa=True,
+                use_memory_efficient_attention=use_mea, use_sdpa=True,
             ),
         ),
     )
@@ -113,6 +117,35 @@ def tiny_model(model_lib):
                 fan_in = p.shape[1]
                 p.copy_(torch.randn(p.shape, generator=g) / np.sqrt(fan_in))
     return model
+
+
+# Off-branch cases: one TimesFM 3 config switch off (the rest on), on the inputs
+# of an existing case, so the committed all-on fixtures stay as they are. Each
+# has its own <case>.config.json; a model with no variate attention also has
+# its own <case>.model.safetensors (its state dict lacks the variate-attention
+# tensors), every other variant loads the base model.safetensors.
+OFF_CASES = (
+    ("off_stitching", "a_univariate", dict(use_stitching=False)),
+    ("off_detrending", "b_covariates", dict(use_linear_detrending=False)),
+    ("off_cpm_refine", "b_covariates", dict(use_iterative_cpm_revin=False)),
+    ("off_variate_attention", "b_covariates", dict(use_variate_attention=False)),
+    ("off_mea_scale", "b_covariates", dict(use_mea=False)),
+    ("off_all", "b_covariates", dict(use_stitching=False, use_linear_detrending=False,
+                                     use_iterative_cpm_revin=False, use_variate_attention=False,
+                                     use_mea=False)),
+)
+# Off and on must differ by more than fp32 noise (2e-5) on the case's forecast,
+# relative to its peak, or the fixture could not tell the branches apart.
+OFF_MIN_REL_DIFF = 1e-3
+
+
+def off_model(model_lib, base, switches):
+    """The tiny model with `switches` off and the base model's weights."""
+    model = tiny_model(model_lib, **{k: False for k in switches})
+    missing, unexpected = model.load_state_dict(base.state_dict(), strict=False)
+    assert not missing, f"off model lacks {missing}"
+    assert all("var_attn" in k or "var_attn_ln" in k for k in unexpected), unexpected
+    return model.eval()
 
 
 def real_model(model_lib, model_dir):
@@ -328,7 +361,7 @@ def f32(x):
 F64_KEEP = ("fwd_values.npy", "revin_mean.npy", "revin_std.npy", "resblock_input.npy", "raw_logits.npy", "out.npy")
 
 
-def run_case(model, case, out_dir, f64=False):
+def run_case(model, case, out_dir, f64=False, extra=None):
     prefix = case["name"] + (".f64." if f64 else ".")
     captured = {}
     orig_forward = model.forward
@@ -411,6 +444,7 @@ def run_case(model, case, out_dir, f64=False):
         "nan": {k: int(np.isnan(np.load(os.path.join(out_dir, prefix + k))).sum())
                 for k in files if k.endswith(".npy") and not k.startswith(("in_", "fwd_m", "fwd_p", "fwd_c", "eff"))},
         "upstream": PINNED, "torch": torch.__version__,
+        **(extra or {}),
     }
     with open(os.path.join(out_dir, prefix + "case.json"), "w") as f:
         json.dump(meta, f, indent=1, sort_keys=True)
@@ -451,6 +485,10 @@ def main():
             if args.tiny:
                 f64_files = run_case(copy.deepcopy(model).double(), case, args.out, f64=True)["files"]
                 metas[case["name"]]["files"].update({f"f64.{k}": v for k, v in f64_files.items()})
+    extra_files = {}
+    if args.tiny:
+        off_metas, extra_files = run_off_cases(model_lib, model, args.out)
+        metas.update(off_metas)
     forecaster_lib = import_forecaster()
     fc = forecaster_lib.TimesFM3Forecaster.from_pretrained(
         args.out if args.tiny else args.model_dir, device="cpu", local_files_only=True)
@@ -458,11 +496,46 @@ def main():
         for case in forecast_cases(np.random.default_rng(FC_SEED), big=not args.tiny):
             metas[case["name"]] = run_forecast_case(fc, case, args.out)
     if args.tiny and args.manifest:
-        write_manifest(args.out, metas)
+        write_manifest(args.out, metas, extra_files)
     print(json.dumps({k: v["nan"] for k, v in metas.items()}, indent=1))
 
 
-def write_manifest(out_dir, metas):
+def run_off_cases(model_lib, base, out_dir):
+    """Runs every OFF_CASES entry and asserts its forecast differs from the
+    all-on model's on the same inputs. Returns the cases' metas and the
+    manifest entries of the config and weight files it wrote."""
+    from safetensors.torch import save_file
+
+    inputs = {c["name"]: c for c in cases(np.random.default_rng(SEED), big=False)}
+    metas, entries = {}, {}
+    for name, source, switches in OFF_CASES:
+        case = {**inputs[source], "name": name}
+        model = off_model(model_lib, base, switches)
+        config_keys = ["use_memory_efficient_attention" if k == "use_mea" else k for k in switches]
+        with open(os.path.join(out_dir, f"{name}.config.json"), "w") as f:
+            json.dump(model.to_dict(), f, indent=1, sort_keys=True)
+        entries[f"{name}.config.json"] = {
+            "role": "config", "published": True,
+            "note": f"TimesFM3Torch.to_dict() of the tiny model with {sorted(config_keys)} off, the rest on"}
+        if not switches.get("use_variate_attention", True):
+            save_file({k: v.contiguous() for k, v in model.state_dict().items()},
+                      os.path.join(out_dir, f"{name}.model.safetensors"))
+            entries[f"{name}.model.safetensors"] = {
+                "role": "model", "published": True,
+                "note": "the tiny model's weights without the variate-attention tensors (a model with that switch off has none)"}
+        meta = run_case(model, case, out_dir, extra={"off": sorted(config_keys), "inputs_of": source})
+        meta_f64 = run_case(copy.deepcopy(model).double(), case, out_dir, f64=True)["files"]
+        want = np.load(os.path.join(out_dir, f"{source}.out.npy"))
+        got = np.load(os.path.join(out_dir, f"{name}.out.npy"))
+        rel = float(np.abs(got - want).max() / max(np.abs(want).max(), 1e-6))
+        print(f"{name}: max |off - on| / peak = {rel:.3e} on the inputs of {source}")
+        assert rel > OFF_MIN_REL_DIFF, f"{name}: off and on agree to {rel:.3e}; the fixture cannot tell them apart"
+        meta["files"].update({f"f64.{k}": v for k, v in meta_f64.items()})
+        metas[name] = meta
+    return metas, entries
+
+
+def write_manifest(out_dir, metas, extra_files=None):
     sys.path.insert(0, os.path.join(ROOT, "tools", "qwen35_ref"))
     import fixture_manifest as fm
 
@@ -478,6 +551,7 @@ def write_manifest(out_dir, metas):
         return "golden"
 
     files = {
+        **(extra_files or {}),
         "model.safetensors": {"role": "model", "published": True,
                               "note": "the seeded tiny TimesFM 3 (2 layers, d 160, 2 heads of 80)"},
         "config.json": {"role": "config", "published": True, "note": "TimesFM3Torch.to_dict() of the tiny model"},

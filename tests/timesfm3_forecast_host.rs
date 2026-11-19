@@ -167,6 +167,7 @@ fn plan_refuses_malformed_requests_by_name() {
     };
     let cases: Vec<(Vec<Series>, usize, PredictOptions, &str)> = vec![
         (vec![one(8)], 0, ok.clone(), "horizon must be a positive integer"),
+        (vec![one(8)], usize::MAX, ok.clone(), "overflows"),
         (
             vec![one(8)],
             4,

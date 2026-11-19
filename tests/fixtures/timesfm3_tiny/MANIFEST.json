@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "tools/timesfm3_ref/make_reference.py",
- "generator_commit": "4b43224cef1440d1645ce563f248a84c2f721512",
+ "generator_commit": "e43c85dde3d88d454e7c5fd1c3e384555311ffb0",
  "versions": {
   "torch": "2.14.0",
   "transformers": "5.17.0",
@@ -1156,6 +1156,222 @@
    "published": true,
    "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
    "sha256": "65695e385c4d8de1f97160e526b4ddbb1a732c69de19ba942f644dfe22731b48"
+  },
+  "fg_options_cov.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "023ebfbb7aa46bb0305cd877809bae834cab9a0aefa5f03c0b796e354fc79f7e"
+  },
+  "fg_options_cov.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "030de12f242b4fc63fe506eb8f4bca78f968fcc88bc4065eefc416141559810f"
+  },
+  "fg_options_cov.call_0.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "a7dc7e083b79b57061e5d78aa54ba103addb3cc77a230126df43fd8c26a5630c"
+  },
+  "fg_options_cov.call_0.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "dca3db15193baa6fca9e75b8daf521708a9119c132a51a76b6828cbbcb91ba5f"
+  },
+  "fg_options_cov.call_0.po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "52ba3ddb73534506a306d71ccb7cbd33e5d9a9ab00217194241a39631d6d1283"
+  },
+  "fg_options_cov.call_0.po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "404d0d6f0fa9f415f8ca0bdf02c267d059efa9b665ef8b70ffba5f99cc960a1f"
+  },
+  "fg_options_cov.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "a0883760b7f6edc1f0743a45b228810109bf19bec0576c13b59a396ebbc55a64"
+  },
+  "fg_options_cov.call_1.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "82d8d05812ce3c2675bab01c7c5ccb9818ff08d24ebba4629e18a5120358a811"
+  },
+  "fg_options_cov.call_1.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8df05849d8344edf11e1d3ff2598814891874d1c3e32ca356e913389075bdea3"
+  },
+  "fg_options_cov.call_1.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "8773a8efd7d153871698f69a7253a299613ec07f3be9bab9f6cb1e2bac2a4fd2"
+  },
+  "fg_options_cov.call_1.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "5c6dd9de2f2e62e9ec1475d6babd396c9bd1ba71848307aa78f0e1456ffd6c18"
+  },
+  "fg_options_cov.call_1.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "153a324ee420d76b3b8bd9fc9c906ab30d570fbabe7b3bef5b55acc1ba9027fd"
+  },
+  "fg_options_cov.call_2.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "e531ae0514d4dbb800fd42917cbd40e180832e14db9204763c438fdb1a5f69df"
+  },
+  "fg_options_cov.call_2.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "381b21612fd725a1b1a2e01c541a0af558ae25ccad827a129d69eab4601854b2"
+  },
+  "fg_options_cov.call_2.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "3817cead4b421a656aaa15c6f1975c39ed84470d5f562595f73390b6dcb5d3a8"
+  },
+  "fg_options_cov.call_2.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "ba10b4d1f88c93755f232a69f8299a1bbf4b6027e14ed445ee37ed46ce8bb37f"
+  },
+  "fg_options_cov.call_2.po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "746cb4d02b51e8e31e8212c90cf343fe1b68b974a8b8776a92b2676da3a1a0dc"
+  },
+  "fg_options_cov.call_2.po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "c82237f9bd1e0dc836c76c249e6413f1f67f98764b8c9093390661f68bd33e84"
+  },
+  "fg_options_cov.call_2.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "a7dfb5b856c02ad0e6e8af0b989709cd7397d066c8f19327ba277c81ddfa4570"
+  },
+  "fg_options_cov.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "839e75a0c5f1addc5c66a7329dcc935bc220ad675a2864b86eb043dee3703871"
+  },
+  "fg_options_cov.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "fb5d253054bef7a5663a7149db95ce87d8b98e7a17311651e7c67e93beb6733d"
+  },
+  "fg_options_cov.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6ab855af4acba531b34c84b838cc06fbf02b6ef2a197e516df462cba7080fa83"
+  },
+  "fg_options_cov.in_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "61939c65821ef43d65e0996fb8069a4453a5d3d435ec3a0430e83a868a43b72f"
+  },
+  "fg_options_cov.in_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "57cf6293011bb2bf02c07edd3c203e1453e51e272f78fea72a25d8ec4c780e51"
+  },
+  "fg_options_cov.in_pf_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e24636456d394189fa58e53f2e414c9a1a1f8a5c8b3ba81c6d8a0901b0ee5c5c"
+  },
+  "fg_options_cov.in_pf_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "11de1f9fc3f95b20c31ca80ec937c5615a27e425a5f48b8e53bf55c5b1e14bc1"
+  },
+  "fg_options_cov.in_po_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "eb1584db9ce21f4d367084e7e070233bfc29f22b1b0c992b8cb766b84a770ba3"
+  },
+  "fg_options_cov.in_po_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "38b4e48a7590507db61f1da144956b5cda228b74a002dce0441876e9e03496a1"
+  },
+  "fg_options_cov.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "be8538dfbf62f04fcb35f0bdc19bceb5fa6581014e1a92b66c0aa6ff9843d15b"
+  },
+  "fg_options_cov.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c61319021fba7861f6d061b2d81a85b175411c4a8a62404ee929f935c3226d2a"
+  },
+  "fg_options_cov.out_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "b146e69218683da19e98cc3c6ddb43b9bc41c1236ecf7b8af9e29f867628321d"
+  },
+  "fg_options_cov.out_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "6adc2f4a845c39e82c06cfff9f01c35c7c49147da8efd4d57f5b8ade5ede375e"
+  },
+  "fg_options_cov.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "23946dd4165a97904ce6133bf47a952b6bdc72c06b635397d3a05143ddb5b827"
+  },
+  "fg_options_cov.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "fdbe9b97da9e7363b908c23934e7440fa578ad4989e7d1d48a6ee0ea87e08b65"
+  },
+  "fg_options_cov.point_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "ea296dda7aaaba2708269c936c3790fe96b5f918119c6980f012c9c550e2dc5a"
+  },
+  "fg_options_cov.point_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "92103e7fde49854ebafdc652578d1377e22fe61a7c86505aa6957cb7968bcfe1"
   },
   "model.safetensors": {
    "role": "model",

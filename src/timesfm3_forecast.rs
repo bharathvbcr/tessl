@@ -257,7 +257,10 @@ pub fn plan(cfg: &HostConfig, series: &[Series], horizon: usize, opts: &PredictO
     if p == 0 || cfg.output_patch_len == 0 {
         return Err("timesfm3 predict: patch lengths must be non-zero".into());
     }
-    let global_horizon = horizon.div_ceil(cfg.output_patch_len) * cfg.output_patch_len;
+    let global_horizon = horizon
+        .div_ceil(cfg.output_patch_len)
+        .checked_mul(cfg.output_patch_len)
+        .ok_or_else(|| format!("timesfm3 predict: horizon {horizon} overflows when rounded to whole output patches"))?;
     let global_context = MAX_CONTEXT_LENGTH.div_ceil(p) * p;
     let targets = series.first().map_or(1, |s| s.target.rows);
 
@@ -287,7 +290,12 @@ pub fn plan(cfg: &HostConfig, series: &[Series], horizon: usize, opts: &PredictO
         let mut pf = s
             .past_future
             .as_ref()
-            .map(|r| split_rows("past_future", i, r, len + horizon))
+            .map(|r| {
+                let width = len
+                    .checked_add(horizon)
+                    .ok_or_else(|| format!("timesfm3 predict: series {i}: context + horizon overflows"))?;
+                split_rows("past_future", i, r, width)
+            })
             .transpose()?;
         nonneg.push(
             target

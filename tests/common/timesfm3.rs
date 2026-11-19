@@ -140,13 +140,21 @@ pub fn assert_close(what: &str, got: &[f32], want: &[f32], tol: f64) {
 
 /// The forecaster cases `make_reference.py` records on the tiny model, and
 /// on the real one (which adds a group over `MAX_ROWS`).
-pub const FORECAST_TINY: [&str; 5] = ["fa_ragged", "fb_options", "fc_multivariate_cov", "fd_edge", "fe_long"];
-pub const FORECAST_REAL: [&str; 6] = [
+pub const FORECAST_TINY: [&str; 6] = [
     "fa_ragged",
     "fb_options",
     "fc_multivariate_cov",
     "fd_edge",
     "fe_long",
+    "fg_options_cov",
+];
+pub const FORECAST_REAL: [&str; 7] = [
+    "fa_ragged",
+    "fb_options",
+    "fc_multivariate_cov",
+    "fd_edge",
+    "fe_long",
+    "fg_options_cov",
     "ff_over_cap",
 ];
 

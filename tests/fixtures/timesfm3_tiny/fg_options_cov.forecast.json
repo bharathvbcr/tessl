@@ -1,0 +1,203 @@
+{
+ "calls": [
+  {
+   "horizon": 64
+  },
+  {
+   "horizon": 64
+  },
+  {
+   "horizon": 64
+  }
+ ],
+ "files": {
+  "call_0.mask.npy": [
+   3,
+   160
+  ],
+  "call_0.out.npy": [
+   3,
+   5,
+   64,
+   9
+  ],
+  "call_0.pf.npy": [
+   3,
+   2,
+   224
+  ],
+  "call_0.pf_mask.npy": [
+   3,
+   2,
+   224
+  ],
+  "call_0.po.npy": [
+   3,
+   1,
+   160
+  ],
+  "call_0.po_mask.npy": [
+   3,
+   1,
+   160
+  ],
+  "call_0.target.npy": [
+   3,
+   2,
+   160
+  ],
+  "call_1.mask.npy": [
+   3,
+   160
+  ],
+  "call_1.out.npy": [
+   3,
+   4,
+   64,
+   9
+  ],
+  "call_1.pf.npy": [
+   3,
+   2,
+   224
+  ],
+  "call_1.pf_mask.npy": [
+   3,
+   2,
+   224
+  ],
+  "call_1.target.npy": [
+   3,
+   2,
+   160
+  ],
+  "call_2.mask.npy": [
+   2,
+   96
+  ],
+  "call_2.out.npy": [
+   2,
+   5,
+   64,
+   9
+  ],
+  "call_2.pf.npy": [
+   2,
+   2,
+   160
+  ],
+  "call_2.pf_mask.npy": [
+   2,
+   2,
+   160
+  ],
+  "call_2.po.npy": [
+   2,
+   1,
+   96
+  ],
+  "call_2.po_mask.npy": [
+   2,
+   1,
+   96
+  ],
+  "call_2.target.npy": [
+   2,
+   2,
+   96
+  ],
+  "in_0.npy": [
+   2,
+   96
+  ],
+  "in_1.npy": [
+   2,
+   130
+  ],
+  "in_2.npy": [
+   2,
+   64
+  ],
+  "in_3.npy": [
+   2,
+   75
+  ],
+  "in_pf_1.npy": [
+   2,
+   170
+  ],
+  "in_pf_3.npy": [
+   2,
+   115
+  ],
+  "in_po_0.npy": [
+   1,
+   96
+  ],
+  "in_po_3.npy": [
+   1,
+   75
+  ],
+  "out_0.npy": [
+   2,
+   40,
+   9
+  ],
+  "out_1.npy": [
+   2,
+   40,
+   9
+  ],
+  "out_2.npy": [
+   2,
+   40,
+   9
+  ],
+  "out_3.npy": [
+   2,
+   40,
+   9
+  ],
+  "point_0.npy": [
+   2,
+   40
+  ],
+  "point_1.npy": [
+   2,
+   40
+  ],
+  "point_2.npy": [
+   2,
+   40
+  ],
+  "point_3.npy": [
+   2,
+   40
+  ]
+ },
+ "horizon": 40,
+ "median_quantile_index": 4,
+ "nan": {
+  "call_0.out.npy": 0,
+  "call_1.out.npy": 0,
+  "call_2.out.npy": 0,
+  "out_0.npy": 0,
+  "out_1.npy": 0,
+  "out_2.npy": 0,
+  "out_3.npy": 0,
+  "point_0.npy": 0,
+  "point_1.npy": 0,
+  "point_2.npy": 0,
+  "point_3.npy": 0
+ },
+ "options": {
+  "make_positive": true,
+  "padding_mode": "edge",
+  "use_symmetric_averaging": true,
+  "use_znorm": true
+ },
+ "per_core_batch_size": 3,
+ "series": 4,
+ "torch": "2.14.0",
+ "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
+}

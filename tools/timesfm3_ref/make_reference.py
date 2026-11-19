@@ -52,6 +52,7 @@ takes):
 """
 import argparse
 import copy
+import dataclasses
 import glob
 import json
 import os
@@ -74,6 +75,13 @@ def import_upstream(path):
     from timesfm3.torch import model as model_lib
 
     return model_lib
+
+
+def import_forecaster():
+    # import_upstream() put the pinned checkout first on sys.path.
+    from timesfm3.torch import timesfm3_forecaster
+
+    return timesfm3_forecaster
 
 
 def tiny_model(model_lib):
@@ -156,6 +164,136 @@ def cases(rng, big):
         out.append(dict(name="e_multivariate8_ctx512", horizon=96,
                         target=np.stack([series(rng, 512, scale=1.0 + i) for i in range(8)])[None]))
     return out
+
+
+# Forecaster cases: upstream's TimesFM3Forecaster.predict_batch() on top of
+# decode(), from their own generator so the decode cases above are unchanged.
+FC_SEED = SEED + 1
+
+
+def forecast_cases(rng, big):
+    def s(n, **kw):
+        return series(rng, n, **kw)
+
+    out = []
+    # fa: ragged univariate contexts over two groups of four (each group pads
+    # to its own context), a length-1 context, a leading NaN run (trimmed),
+    # interior and trailing NaNs (interpolated) and an all-NaN series (zeros).
+    ctxs = [s(100, offset=5.0), s(37), s(300, trend=0.05), s(64, scale=2.0), s(1, offset=3.0), s(250)]
+    ctxs[1][:10] = np.nan
+    ctxs[2][40:47] = np.nan
+    ctxs[2][-1] = np.nan
+    ctxs[5][:] = np.nan
+    out.append(dict(name="fa_ragged", horizon=50, contexts=ctxs))
+    # fb: z-normalisation, symmetric averaging and make_positive together, with
+    # an odd per_core_batch_size so a +/- pair straddles two groups; one series
+    # non-negative with NaNs, one constant (sigma below the threshold).
+    ctxs = [np.abs(s(128)), s(96, offset=-1.0), np.abs(s(200, offset=4.0)),
+            np.full(80, 2.5, dtype=np.float32), s(160, trend=0.2)]
+    ctxs[2][[5, 60]] = np.nan
+    out.append(dict(name="fb_options", horizon=100, contexts=ctxs, per_core_batch_size=3,
+                    use_znorm=True, use_symmetric_averaging=True, make_positive=True))
+    # fc: two target variates per series; past-only covariates on some series
+    # and past+future on others, so groups mix real covariates with masked
+    # placeholders; an all-NaN variate (interpolates to zeros) and a NaN run
+    # in one variate only (not trimmed: only all-variate NaN columns are).
+    hor = 70
+    ctxs, po, pf = [], [], []
+    for i, n in enumerate([150, 90, 200, 64, 120]):
+        ctxs.append(np.stack([s(n, offset=float(i)), s(n, scale=0.5)]))
+        po.append(s(n)[None] if i in (0, 2) else None)
+        pf.append(np.stack([s(n + hor), s(n + hor, trend=0.1)]) if i in (1, 2, 4) else None)
+    ctxs[3][1, :] = np.nan
+    ctxs[0][0, :20] = np.nan
+    out.append(dict(name="fc_multivariate_cov", horizon=hor, contexts=ctxs, po=po, pf=pf))
+    # fd: edge padding of the past+future covariates to the patch-rounded
+    # horizon, and quantiles left unsorted.
+    ctxs = [s(n) for n in (120, 75, 64)]
+    pf = [s(n + hor)[None] for n in (120, 75, 64)]
+    out.append(dict(name="fd_edge", horizon=hor, contexts=ctxs, pf=pf, padding_mode="edge",
+                    sort_quantiles=False))
+    # fe: contexts past the global context (15360) are truncated, past+future
+    # covariates with them; a second series one patch short of it.
+    n0, n1 = 15360 + 300, 15360 - 25
+    ctxs = [np.stack([s(n0, offset=1.0), s(n0, scale=0.3)]), np.stack([s(n1), s(n1, trend=0.001)])]
+    pf = [s(n0 + 64)[None], None]
+    out.append(dict(name="fe_long", horizon=64, contexts=ctxs, pf=pf))
+    if big:
+        # ff: one group of four 8-variate series at the global context, about
+        # 15.4k patch rows: more than tessl runs in one forward (MAX_ROWS), so
+        # the port must split the group without changing any series.
+        out.append(dict(name="ff_over_cap", horizon=128,
+                        contexts=[np.stack([s(15360, offset=float(i + j)) for j in range(8)]) for i in range(4)]))
+    return out
+
+
+FC_OPTIONS = ("use_symmetric_averaging", "make_positive", "sort_quantiles", "use_znorm", "padding_mode")
+
+
+def run_forecast_case(fc, case, out_dir):
+    """Runs upstream's predict_batch() and records every decode() call it makes."""
+    prefix = case["name"] + "."
+    calls = []
+    orig_decode = fc.model.decode
+
+    def decode(**kw):
+        out = orig_decode(**kw)
+        calls.append((kw, out))
+        return out
+
+    fc.model.decode = decode
+    orig_bs = fc.config.per_core_batch_size
+    if "per_core_batch_size" in case:
+        fc.config = dataclasses.replace(fc.config, per_core_batch_size=case["per_core_batch_size"])
+    try:
+        opts = {k: case[k] for k in FC_OPTIONS if k in case}
+        results = list(fc.predict_batch(
+            contexts=case["contexts"], horizon=case["horizon"],
+            past_only_covariates=case.get("po"), past_future_covariates=case.get("pf"),
+            return_quantiles=True, **opts))
+    finally:
+        fc.model.decode = orig_decode
+        per_core = fc.config.per_core_batch_size
+        fc.config = dataclasses.replace(fc.config, per_core_batch_size=orig_bs)
+
+    files = {}
+
+    def save(name, arr):
+        np.save(os.path.join(out_dir, prefix + name), arr)
+        files[name] = list(arr.shape)
+
+    for i, ctx in enumerate(case["contexts"]):
+        save(f"in_{i}.npy", np.asarray(ctx, dtype=np.float32))
+        for key in ("po", "pf"):
+            cov = (case.get(key) or [None] * len(case["contexts"]))[i]
+            if cov is not None:
+                save(f"in_{key}_{i}.npy", np.asarray(cov, dtype=np.float32))
+        save(f"out_{i}.npy", results[i].quantiles.astype(np.float32))
+        save(f"point_{i}.npy", results[i].forecast.astype(np.float32))
+    call_meta = []
+    for k, (kw, out) in enumerate(calls):
+        c = f"call_{k}."
+        save(c + "target.npy", kw["target"].numpy().astype(np.float32))
+        save(c + "mask.npy", kw["mask"].numpy().astype(np.float32))
+        for key, mkey in (("past_only_covariates", "past_only_mask"), ("past_future_covariates", "past_future_mask")):
+            short = "po" if key.startswith("past_only") else "pf"
+            if kw.get(key) is not None:
+                save(c + f"{short}.npy", kw[key].numpy().astype(np.float32))
+                save(c + f"{short}_mask.npy", kw[mkey].numpy().astype(np.float32))
+        save(c + "out.npy", out.numpy().astype(np.float32))
+        call_meta.append({"horizon": int(kw["horizon"])})
+    meta = {
+        "horizon": case["horizon"], "series": len(case["contexts"]), "per_core_batch_size": per_core,
+        "options": {k: case.get(k) for k in FC_OPTIONS if k in case}, "calls": call_meta,
+        "median_quantile_index": fc.config.median_quantile_index, "files": files,
+        "nan": {k: int(np.isnan(np.load(os.path.join(out_dir, prefix + k))).sum())
+                for k in files if k.startswith(("out_", "point_")) or k.endswith(".out.npy")},
+        "upstream": PINNED, "torch": torch.__version__,
+    }
+    with open(os.path.join(out_dir, prefix + "forecast.json"), "w") as f:
+        json.dump(meta, f, indent=1, sort_keys=True)
+    files["forecast.json"] = None
+    return meta
 
 
 def u8(x):
@@ -298,6 +436,12 @@ def main():
             if args.tiny:
                 f64_files = run_case(copy.deepcopy(model).double(), case, args.out, f64=True)["files"]
                 metas[case["name"]]["files"].update({f"f64.{k}": v for k, v in f64_files.items()})
+    forecaster_lib = import_forecaster()
+    fc = forecaster_lib.TimesFM3Forecaster.from_pretrained(
+        args.out if args.tiny else args.model_dir, device="cpu", local_files_only=True)
+    with torch.no_grad():
+        for case in forecast_cases(np.random.default_rng(FC_SEED), big=not args.tiny):
+            metas[case["name"]] = run_forecast_case(fc, case, args.out)
     if args.tiny and args.manifest:
         write_manifest(args.out, metas)
     print(json.dumps({k: v["nan"] for k, v in metas.items()}, indent=1))
@@ -312,7 +456,9 @@ def write_manifest(out_dir, metas):
             return "golden"
         if name.startswith("in_") or name.startswith("fwd_"):
             return "input"
-        if name == "case.json":
+        if name.startswith("call_"):
+            return "golden" if name.endswith(".out.npy") else "input"
+        if name in ("case.json", "forecast.json"):
             return "config"
         return "golden"
 
@@ -327,9 +473,12 @@ def write_manifest(out_dir, metas):
                 "role": role(name), "published": True,
                 "note": {"golden": (f"float64 CPU forward of upstream timesfm3.torch at {PINNED} (the model and "
                                     "inputs cast to f64)" if name.startswith("f64.") else
+                                    f"TimesFM3Forecaster.predict_batch() output (float32 CPU) at {PINNED}"
+                                    if name.startswith(("out_", "point_")) else
                                     f"float32 CPU forward of upstream timesfm3.torch at {PINNED}"),
-                         "config": "the case's horizon, shapes, NaN counts and versions",
-                         "input": "decode() input or the forward() input decode() built"}[role(name)],
+                         "config": "the case's horizon, shapes, options, NaN counts and versions",
+                         "input": ("a decode() call TimesFM3Forecaster.predict_batch() made" if name.startswith("call_")
+                                   else "decode() or predict_batch() input, or the forward() input decode() built")}[role(name)],
             }
     fm.write_manifest(
         out_dir, "tools/timesfm3_ref/make_reference.py",

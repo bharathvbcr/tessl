@@ -219,6 +219,20 @@ def forecast_cases(rng, big):
     ctxs = [np.stack([s(n0, offset=1.0), s(n0, scale=0.3)]), np.stack([s(n1), s(n1, trend=0.001)])]
     pf = [s(n0 + 64)[None], None]
     out.append(dict(name="fe_long", horizon=64, contexts=ctxs, pf=pf))
+    # fg: the options on two target variates with covariates: past-only and
+    # past+future covariates z-normalised and negated with the series (mixed
+    # within groups), make_positive per variate (the first variate is
+    # non-negative, the second is not) and on an all-NaN series (nothing
+    # finite, so not clamped), edge padding, an odd group size.
+    hor = 40
+    ctxs, po, pf = [], [], []
+    for i, n in enumerate([96, 130, 64, 75]):
+        ctxs.append(np.stack([np.abs(s(n, offset=3.0)), s(n, offset=-0.5)]))
+        po.append(s(n, scale=2.0)[None] if i in (0, 3) else None)
+        pf.append(np.stack([s(n + hor), s(n + hor, trend=0.05)]) if i in (1, 3) else None)
+    ctxs[2][:, :] = np.nan
+    out.append(dict(name="fg_options_cov", horizon=hor, contexts=ctxs, po=po, pf=pf, per_core_batch_size=3,
+                    use_znorm=True, use_symmetric_averaging=True, make_positive=True, padding_mode="edge"))
     if big:
         # ff: one group of four 8-variate series at the global context, about
         # 15.4k patch rows: more than tessl runs in one forward (MAX_ROWS), so

@@ -7,7 +7,10 @@
 //! variates with covariates, a left-padded context, a fully-masked leading
 //! patch (sequence keys masked, an all-masked query row, variate keys
 //! masked), detrending on and off, a constant series and a horizon past one
-//! output patch (stitching).
+//! output patch (stitching). The off-branch cases hold each `config.json`
+//! switch the port reads (stitching, linear detrending, CPM refinement,
+//! variate attention, the memory-efficient-attention scale) off, one at a time
+//! and all together, to upstream built with that switch off.
 
 mod common;
 #[path = "common/timesfm3.rs"]
@@ -30,38 +33,66 @@ fn model(rt: &std::sync::Arc<tessl::runtime::GpuRuntime>) -> Timesfm3Model {
     Timesfm3Model::load(rt, &st, cfg).unwrap()
 }
 
+/// Forward pass of `case` on `m`, driven from upstream's own residual-block
+/// input, held to every layer and the raw logits.
+fn check_forward(m: &Timesfm3Model, case: &str) {
+    let dir = tfm::tiny_dir();
+    let inp = tfm::decode_input(&dir, case);
+    let pr = prepare(&m.config().host, &inp).unwrap();
+    let pre = preprocess(&m.config().host, &pr).unwrap();
+    // Drive the device from upstream's own residual-block input, so a
+    // host difference cannot hide or cause a device one.
+    let rin = tfm::load(&dir, case, "resblock_input");
+    let out = m
+        .forward(pr.batch, pr.variates, pr.patches, &rin.data, &pre.leading_masked, true)
+        .unwrap_or_else(|e| panic!("{case}: {e}"));
+    assert_eq!(out.trace.len(), 1 + m.config().layers as usize);
+    tfm::assert_close(
+        &format!("{case} transformer_input"),
+        &out.trace[0],
+        &tfm::load(&dir, case, "transformer_input").data,
+        LAYER_TOL,
+    );
+    for l in 0..m.config().layers as usize {
+        let want = tfm::load(&dir, case, &format!("layer_{l}"));
+        tfm::assert_close(&format!("{case} layer {l}"), &out.trace[l + 1], &want.data, LAYER_TOL);
+    }
+    tfm::assert_close(
+        &format!("{case} raw logits"),
+        &out.raw_logits,
+        &tfm::load(&dir, case, "raw_logits").data,
+        LAYER_TOL,
+    );
+}
+
+/// The whole decode() of `case` on `m`, held to upstream's fp32 forecast and
+/// to no further from its f64 run than its fp32 run is.
+fn check_decode(m: &Timesfm3Model, case: &str) {
+    let dir = tfm::tiny_dir();
+    let f = m
+        .decode(&tfm::decode_input(&dir, case))
+        .unwrap_or_else(|e| panic!("{case}: {e}"));
+    let want = tfm::load(&dir, case, "out");
+    assert_eq!(
+        [f.batch, f.variates, f.horizon, f.quantiles].as_slice(),
+        want.shape.as_slice(),
+        "{case}"
+    );
+    tfm::assert_close(&format!("{case} forecast vs fp32"), &f.values, &want.data, OUT_TOL);
+    tfm::assert_no_worse_than_upstream(
+        &format!("{case} forecast"),
+        &f.values,
+        &want.data,
+        &tfm::load64(&dir, case, "out"),
+    );
+}
+
 #[test]
 fn tiny_forward_matches_upstream_layer_by_layer() {
     with_gpu(|rt| {
         let m = model(rt);
-        let dir = tfm::tiny_dir();
         for case in tfm::TINY_CASES {
-            let inp = tfm::decode_input(&dir, case);
-            let pr = prepare(&m.config().host, &inp).unwrap();
-            let pre = preprocess(&m.config().host, &pr).unwrap();
-            // Drive the device from upstream's own residual-block input, so a
-            // host difference cannot hide or cause a device one.
-            let rin = tfm::load(&dir, case, "resblock_input");
-            let out = m
-                .forward(pr.batch, pr.variates, pr.patches, &rin.data, &pre.leading_masked, true)
-                .unwrap_or_else(|e| panic!("{case}: {e}"));
-            assert_eq!(out.trace.len(), 1 + m.config().layers as usize);
-            tfm::assert_close(
-                &format!("{case} transformer_input"),
-                &out.trace[0],
-                &tfm::load(&dir, case, "transformer_input").data,
-                LAYER_TOL,
-            );
-            for l in 0..m.config().layers as usize {
-                let want = tfm::load(&dir, case, &format!("layer_{l}"));
-                tfm::assert_close(&format!("{case} layer {l}"), &out.trace[l + 1], &want.data, LAYER_TOL);
-            }
-            tfm::assert_close(
-                &format!("{case} raw logits"),
-                &out.raw_logits,
-                &tfm::load(&dir, case, "raw_logits").data,
-                LAYER_TOL,
-            );
+            check_forward(&m, case);
         }
     });
 }
@@ -70,24 +101,37 @@ fn tiny_forward_matches_upstream_layer_by_layer() {
 fn tiny_decode_matches_upstream_forecast() {
     with_gpu(|rt| {
         let m = model(rt);
-        let dir = tfm::tiny_dir();
         for case in tfm::TINY_CASES {
-            let f = m
-                .decode(&tfm::decode_input(&dir, case))
-                .unwrap_or_else(|e| panic!("{case}: {e}"));
-            let want = tfm::load(&dir, case, "out");
-            assert_eq!(
-                [f.batch, f.variates, f.horizon, f.quantiles].as_slice(),
-                want.shape.as_slice(),
-                "{case}"
-            );
-            tfm::assert_close(&format!("{case} forecast vs fp32"), &f.values, &want.data, OUT_TOL);
-            tfm::assert_no_worse_than_upstream(
-                &format!("{case} forecast"),
-                &f.values,
-                &want.data,
-                &tfm::load64(&dir, case, "out"),
-            );
+            check_decode(&m, case);
+        }
+    });
+}
+
+/// The model of an off-branch case: its own config (one or more switches
+/// off) and weights.
+fn off_model(rt: &std::sync::Arc<tessl::runtime::GpuRuntime>, case: &str) -> Timesfm3Model {
+    let dir = tfm::tiny_dir();
+    let cfg = tfm::off_config(&dir, case);
+    let st = SafeTensors::open(&tfm::off_weights_path(&dir, case)).unwrap();
+    Timesfm3Model::load(rt, &st, cfg).unwrap_or_else(|e| panic!("{case}: {e}"))
+}
+
+/// Every `config.json` switch the port reads, off one at a time and all
+/// together, against upstream's own forward on a model built with it off.
+#[test]
+fn off_branch_forward_matches_upstream_layer_by_layer() {
+    with_gpu(|rt| {
+        for case in tfm::OFF_CASES {
+            check_forward(&off_model(rt, case), case);
+        }
+    });
+}
+
+#[test]
+fn off_branch_decode_matches_upstream_forecast() {
+    with_gpu(|rt| {
+        for case in tfm::OFF_CASES {
+            check_decode(&off_model(rt, case), case);
         }
     });
 }

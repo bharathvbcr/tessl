@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use tessl::npy;
+use tessl::timesfm3::Timesfm3Config;
 use tessl::timesfm3_forecast::{CovariatePadding, PredictOptions, Rows, Series};
 use tessl::timesfm3_host::DecodeInput;
 
@@ -75,6 +76,68 @@ pub fn tiny_dir() -> PathBuf {
 }
 
 pub const TINY_CASES: [&str; 3] = ["a_univariate", "b_covariates", "c_constant"];
+/// The off-branch cases: the inputs of an all-on case run on a model with the
+/// switches named in the case's `case.json` `off` turned off (the rest on).
+pub const OFF_CASES: [&str; 6] = [
+    "off_stitching",
+    "off_detrending",
+    "off_cpm_refine",
+    "off_variate_attention",
+    "off_mea_scale",
+    "off_all",
+];
+
+/// The config an off-branch case ran upstream with.
+pub fn off_config_path(dir: &Path, case: &str) -> PathBuf {
+    dir.join(format!("{case}.config.json"))
+}
+
+/// Its weights: its own file when its state dict differs (no variate
+/// attention), else the base model's.
+pub fn off_weights_path(dir: &Path, case: &str) -> PathBuf {
+    let own = dir.join(format!("{case}.model.safetensors"));
+    if own.is_file() {
+        own
+    } else {
+        dir.join("model.safetensors")
+    }
+}
+
+/// The `config.json` keys the case turned off, from its `case.json`.
+pub fn off_switches(dir: &Path, case: &str) -> Vec<String> {
+    let p = dir.join(format!("{case}.case.json"));
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let j = ojas_io::json::parse_json(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    j.get_array("off")
+        .unwrap_or_else(|e| panic!("{case} off: {e}"))
+        .iter()
+        .map(|k| k.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Loads the case's config and checks that it reads back as the case says:
+/// the named switches off and every other switch on, so a fixture whose
+/// config and `case.json` disagree cannot pass.
+pub fn off_config(dir: &Path, case: &str) -> Timesfm3Config {
+    let cfg = Timesfm3Config::from_config_file(&off_config_path(dir, case)).unwrap_or_else(|e| panic!("{case}: {e}"));
+    let off = off_switches(dir, case);
+    assert!(!off.is_empty(), "{case}: no switch is off");
+    for (key, on) in [
+        ("use_stitching", cfg.host.use_stitching),
+        ("use_linear_detrending", cfg.host.use_linear_detrending),
+        ("use_iterative_cpm_revin", cfg.host.use_iterative_cpm_revin),
+        ("use_variate_attention", cfg.use_variate_attention),
+        ("use_memory_efficient_attention", cfg.mea_scale),
+    ] {
+        assert_eq!(
+            on,
+            !off.iter().any(|k| k == key),
+            "{case}: {key} in config.json vs case.json"
+        );
+    }
+    cfg
+}
+
 pub const REAL_CASES: [&str; 5] = [
     "a_univariate",
     "b_covariates",

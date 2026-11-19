@@ -80,7 +80,8 @@ batching.
 | `from_pretrained(hub id)`, `cache_dir`, `token`, `revision` | Not ported: no network code. Fetch with curl (above) |
 | `.pth` / `.pt` checkpoints | Not ported: safetensors only |
 | `use_frozen_running_stats=True`, `input_transform` other than `identity`, non-RMS norms, `v_norm`, non-ReLU, biases, `use_rope_var`, non-causal attention, head dim other than 80 | Refused by name at `config.json` (`Timesfm3Config::from_config_json`); the published checkpoint uses none of them |
-| `use_variate_attention`, `use_stitching`, `use_linear_detrending` (and threshold), `use_iterative_cpm_revin`, `value_clip`, `use_memory_efficient_attention` | Read from `config.json` and both settings implemented. Only the published checkpoint's settings (all on) are checked against upstream; the off branches are not |
+| `use_stitching`, `use_linear_detrending`, `use_iterative_cpm_revin`, `use_variate_attention`, `use_memory_efficient_attention` (the scale of the attention logits) | Read from `config.json`; **both settings are implemented and each off branch is held to upstream** on a tiny model built with that switch off and the others on (`off_stitching`, `off_detrending`, `off_cpm_refine`, `off_variate_attention`, `off_mea_scale`), and with all five off together (`off_all`). The fixtures carry their own `config.json` (and weights without the variate-attention tensors for `off_variate_attention`/`off_all`), and `make_reference.py` asserts each one's forecast differs from the all-on forecast on the same inputs. Same tolerances as the all-on cases. None is refused |
+| `linear_detrending_threshold`, `value_clip` | Read from `config.json`; only the tiny config's values (0.5, 1e20) are checked against upstream |
 | ±inf in a series; covariates with different channel counts in one group | Refused by name. Upstream accepts infinities into its interpolation, and fails inside `np.stack` on mismatched channels |
 | `return_aux_outputs` | Not ported; `Timesfm3Model::forward(.., trace = true)` returns every layer's residual stream instead |
 | `TimesFM3Evaluator` (evaluation helper) | Not ported |
@@ -110,16 +111,18 @@ writes:
   `MANIFEST.json`): a seeded 2-layer model with the real structure. They hold
   three `decode()` cases with every intermediate, plus float64 references.
   They also hold six forecaster cases, each recording every `decode()` call
-  upstream's forecaster made and its final forecast.
+  upstream's forecaster made and its final forecast, and six off-branch
+  `decode()` cases (a `config.json` switch off, one at a time and all five
+  together, each with its own config and, without variate attention, weights).
 - **Real references** (`target/timesfm3_ref_real`, never committed): five
   `decode()` cases, and seven forecaster cases. The forecaster cases include
   contexts past 15360 and one group of about 15.5k patch rows.
 
 | Test | What it holds | Measured on M5 Pro, 2026-11-19 (max \|diff\| / peak) |
 | :--- | :--- | :--- |
-| `timesfm3_host` (device-free) | Host steps against upstream's fp32 and f64 runs | — |
+| `timesfm3_host` (device-free) | Host steps against upstream's fp32 and f64 runs, on the all-on and the off-branch cases | — |
 | `timesfm3_forecast_host` (device-free) | `plan` makes upstream's `decode()` calls; `finish` turns upstream's decode outputs into its forecast; malformed requests refused by name | values ≤ 3.3e-7 (z-norm rows; the rest exact), masks and shapes exact |
-| `timesfm3_tiny` | Layer by layer, decode, `predict_batch` against upstream; a group in pieces equals one forward | forecaster ≤ 1.4e-5 (gate 5e-5); pieces 0 |
+| `timesfm3_tiny` | Layer by layer, decode, `predict_batch` against upstream; a group in pieces equals one forward; the same layer-by-layer and decode checks on the six off-branch cases | forecaster ≤ 1.4e-5 (gate 5e-5); pieces 0; off-branch layers and raw logits ≤ 2.8e-6 (gate 2e-5), off-branch forecasts ≤ 2.9e-6 (gate 5e-5) |
 | `timesfm3_real` (`--ignored`) | Real checkpoint: layers 0/10/19, raw logits, decode, and `predict_batch` on all seven forecaster cases | decode ≤ 7.6e-6, forecaster ≤ 1.4e-5 (gate 1e-3) |
 | `timesfm3_forecast` binary, by hand | CSV in, CSV out on the real checkpoint (three series of 300, 90 and 700 points, a gap, `--positive`, horizon 96) against upstream's `predict_batch()` on the same CSV | ≤ 9.8e-7; same rows and quantile labels |
 
@@ -143,7 +146,7 @@ alone, turns `timesfm3_forecast_host` red:
 - clamping every variate by the first variate's sign;
 - treating an all-NaN series as non-negative.
 
-Disabling RoPE turns `timesfm3_tiny` red.
+Disabling RoPE turns `timesfm3_tiny` red. So does ignoring any one off-branch switch where it is honoured (always stitching, always detrending, always CPM refinement, variate attention always on, attention scale always √d): `timesfm3_host` and/or `timesfm3_tiny` fail on that switch's case. Ignoring `use_variate_attention` fails at load (the off checkpoint has no variate-attention tensors), not numerically.
 
 ```sh
 tools/timesfm3_ref/fetch_upstream.sh

@@ -64,6 +64,8 @@ const EMEANS_RS: &str = include_str!("../src/emeans.rs");
 const QWEN35_TRAIN_STORAGE: &str = include_str!("../kernels/qwen35_train_storage.metal");
 const DEQUANT_AFFINE: &str = include_str!("../kernels/dequant_affine.metal");
 const DEQUANT_RS: &str = include_str!("../src/dequant.rs");
+const TIMESFM3: &str = include_str!("../kernels/timesfm3.metal");
+const TIMESFM3_RS: &str = include_str!("../src/timesfm3.rs");
 
 /// Every `.metal` file this suite inspects.
 ///
@@ -112,6 +114,7 @@ const INSPECTED_KERNELS: &[&str] = &[
     "rms_norm.metal",
     "rms_qkv_rope.metal",
     "softcap_sample.metal",
+    "timesfm3.metal",
     "utils.metal",
     "w4a8_tensorops.metal",
 ];
@@ -1276,6 +1279,51 @@ fn w4a8_extents_are_host_bounded_and_addresses_are_widened() {
     // because the validator caps n * k at i32::MAX before the allocation.
     require(I8_PIPELINE_RS, "let count = numel(&[n, k], \"gemm_w4a8\")?;", label);
     require(I8_PIPELINE_RS, "dispatch_1d(rt, &p, count, |bnd| {", label);
+}
+
+/// TimesFM 3's QK prep and head-dim-80 attention. Every buffer address is
+/// `ulong` arithmetic. The only 32-bit products are `rows * H` (and twice it)
+/// in the QK prep and `seqs * H` in the attention grid: the host dispatches
+/// the prep's `2 * rows * H` threads through `dispatch_1d`, which refuses a
+/// grid over `u32::MAX`, and the forward refuses more than `MAX_ROWS` patch
+/// rows, so neither wraps.
+#[test]
+fn timesfm3_addresses_are_widened_and_rows_are_host_capped() {
+    let label = "timesfm3";
+    require(
+        TIMESFM3,
+        "(is_k ? K : Q) + (ulong)m * H * TFM3_D + (ulong)h * TFM3_D;",
+        label,
+    );
+    require(TIMESFM3, "const ulong t = (ulong)(m % n) * TFM3_HALF;", label);
+    require(
+        TIMESFM3,
+        "const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;",
+        label,
+    );
+    require(TIMESFM3, "const ulong row_stride = (ulong)H * 80u;", label);
+    require(
+        TIMESFM3,
+        "const ulong seq_base = (ulong)(s / P) * S1 + (ulong)(s % P) * S2;",
+        label,
+    );
+    require(
+        TIMESFM3,
+        "const ulong o_off = (seq_base + (ulong)t_q * S3) * row_stride + head;",
+        label,
+    );
+    require(
+        TIMESFM3,
+        "const ulong kv = (seq_base + t * S3) * row_stride + head;",
+        label,
+    );
+    forbid(TIMESFM3, "(is_k ? K : Q) + m * H", label);
+    forbid(TIMESFM3, "(seq_base + t_q * S3)", label);
+    require(TIMESFM3_RS, "let threads = 2 * rows * h as usize;", label);
+    require(TIMESFM3_RS, "dispatch_1d(rt, &prep, threads, |bnd| {", label);
+    require(DISPATCH_RS, "if n > u32::MAX as usize {", label);
+    require(TIMESFM3_RS, "pub const MAX_ROWS: usize = 8192;", label);
+    require(TIMESFM3_RS, "if rows > MAX_ROWS {", label);
 }
 
 /// Every `.metal` file under `kernels/` is either inspected by this file or listed

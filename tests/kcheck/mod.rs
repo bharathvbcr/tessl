@@ -9,5 +9,6 @@ pub mod gemm;
 pub mod quant;
 pub mod qwen;
 pub mod rest;
+pub mod timesfm3;
 
 pub use ledger::Ledger;

@@ -156,6 +156,10 @@ name = "probe_gemm_parity"
 path = "src/bin/probe_gemm_parity.rs"
 
 [[bin]]
+name = "bench_timesfm3"
+path = "src/bin/bench_timesfm3.rs"
+
+[[bin]]
 name = "bench_nn_kernels"
 path = "src/bin/bench_nn_kernels.rs"
 

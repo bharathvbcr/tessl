@@ -157,6 +157,24 @@ The oracle environment is `tools/msl_emu/requirements.txt` plus `safetensors`.
 Regenerating the tiny fixtures under torch 2.14.0 reproduced the 2.12.1 ones
 byte for byte; only the version line in `case.json` changed.
 
+## Profiling
+
+`BENCH_STAGES=kernels` runs the staged call with per-dispatch GPU timestamps
+(`dispatch_stamps`) armed around each forward and reports, per workload, the
+stamped dispatches by kernel and by a kernel class derived from the kernel name
+(gemm, attention, qk_prep_rope, norm, softmax, copy_transpose, elementwise,
+other), the ten costliest kernels, dispatches and commits per forward, and the
+same work with stamps off for the overhead ratio and a forecast cross-check.
+It exits non-zero if a command buffer overflowed the 1,023-dispatch stamp heap,
+a batch was dropped or no stamps came back. Stamped time is an upper bound on
+unstamped GPU time (stamps serialise dispatches). Classes come from names only:
+the forward does not tag layers, so GEMMs are not split by layer kind. Upload
+and read-back sit inside `Timesfm3Model::forward` and are reported as
+standalone proxies, not in place. `BENCH_PREDICT_SWEEP=1,4,16,64` repeats each
+predict workload at those `per_core_batch_size` values to separate fixed
+per-forward cost from per-row cost. Module docs of `src/bin/bench_timesfm3.rs`
+have the field list.
+
 ## Not done yet
 
 - **Timings.** `bench_timesfm3` (with `bench/timesfm3_torch.py` and
@@ -165,7 +183,8 @@ byte for byte; only the version line in `case.json` changed.
   optional covariates (`BENCH_PREDICT`; the torch lane runs upstream's
   `TimesFM3Forecaster.predict_batch` on the same series), and a per-stage
   split of either (`BENCH_STAGES=1`: plan, prepare, preprocess, forward,
-  postprocess, finish; tessl only). The MLX lane has no predict workloads. No
+  postprocess, finish; tessl only). `BENCH_STAGES=kernels` splits the forward
+  itself (see Profiling). The MLX lane has no predict workloads. No
   number is claimed until it runs under the machine's heavy-job lock on an
   idle GPU. The MLX lane also needs an MLX environment that does not exist on
   this machine yet.

@@ -1,7 +1,8 @@
 //! End-to-end forecast latency of `tessl::timesfm3` on the real checkpoint:
 //! the model's `decode` (`BENCH_WORKLOADS`), the user path
 //! `Timesfm3Model::predict_batch` (`BENCH_PREDICT`), and a per-stage split of
-//! either (`BENCH_STAGES=1`).
+//! either (`BENCH_STAGES=1`), and a per-kernel-class GPU profile of the
+//! forward (`BENCH_STAGES=kernels`).
 //!
 //! ```text
 //! TIMESFM3_DIR=<google/timesfm-3.0-pytorch snapshot> \
@@ -61,6 +62,53 @@
 //! needing more than `MAX_ROWS` patch rows is refused (lower
 //! `BENCH_PREDICT_BATCH`); the plain `predict_batch` splits it.
 //!
+//! # Kernel profile
+//!
+//! `BENCH_STAGES=kernels` splits the forward itself. The runtime is built with
+//! per-dispatch GPU timestamps (`tessl::dispatch_stamps`), armed only around
+//! each `Timesfm3Model::forward`. Every stamped dispatch is aggregated by kernel
+//! name and by a class derived from the name alone (`classify`: gemm,
+//! attention, qk_prep_rope, norm, softmax, copy_transpose, elementwise, other).
+//! A stamp delta brackets one dispatch including its launch, drain and
+//! barrier, and stamps serialise dispatches, so the stamped time is an upper
+//! bound on the unstamped GPU time. The kernel names do not say which layer
+//! kind (sequence attention, variate attention, feed-forward) a GEMM serves and
+//! the forward does not tag layers, so the split is by kernel class only.
+//!
+//! Each iteration runs the staged call twice, stamps off then stamps on, so
+//! the overhead of the stamps is measured on the same work: `ms_min` and
+//! `ms_median` are the stamps-off wall time, and the row's `kernels` object
+//! holds `forward_ms_off`, `forward_ms_on`, `overhead_forward` (on over off),
+//! `wall_ms_on`, `overhead_wall`, `dispatches_per_forward`,
+//! `commits_per_forward` (waiting commits of the forward's command buffers),
+//! `gpu_stamped_ms` (the summed per-kernel median stamp deltas),
+//! `host_outside_stamped_ms` (the stamps-on forward wall minus that: host
+//! allocation, RoPE tables, upload, encoding, commit latency, read-back),
+//! `proxy_upload_ms` and `proxy_readback_ms` (see below), `max_abs_diff` and
+//! `bit_equal` (stamped against unstamped forecast), then `classes` (class,
+//! dispatches per iteration, ms, share of the stamped time) and `top_kernels`
+//! (the ten costliest kernels). Per-kernel times are the median over the
+//! iterations, so the shares sum to one over the medians.
+//!
+//! The run refuses (non-zero exit) when a command buffer overflowed the
+//! 1,023-dispatch stamp heap, a batch was dropped, no stamps came back, or the
+//! dispatch counts change between iterations: a profile never covers part of
+//! the forward. A forward that overflows needs a smaller group (lower
+//! `BENCH_PREDICT_BATCH`) or workload.
+//!
+//! Upload and read-back happen inside `Timesfm3Model::forward`, which the bench
+//! cannot instrument, so they are not timed in place.
+//! `proxy_upload_ms` (allocate and write a buffer of one forward's input size)
+//! and `proxy_readback_ms` (copy one forward's logits out of a buffer) are
+//! standalone minima of the same host operations, an estimate of their order
+//! of magnitude, not a slice of the forward.
+//!
+//! `BENCH_PREDICT_SWEEP` (kernels mode only; a list such as `1,4,16,64`) runs
+//! every predict workload once per `per_core_batch_size`, so the rows of one
+//! workload differ only in the patch rows per forward: forward ms against
+//! rows separates the fixed per-forward cost from the per-row cost, e.g.
+//! `BENCH_PREDICT=64x512:128 BENCH_PREDICT_SWEEP=1,4,16,64`.
+//!
 //! # Output
 //!
 //! One JSON array on stdout, one object per workload: `{workload, backend,
@@ -76,9 +124,11 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use tessl::dispatch_stamps::{DispatchStampBatch, STAMP_HEAP_SLOTS};
 use tessl::safetensors::SafeTensors;
 use tessl::timesfm3::{Forecast, Timesfm3Config, Timesfm3Model, MAX_ROWS};
 use tessl::timesfm3_forecast::{self as forecast, PredictOptions, Rows, Series, SeriesForecast};
@@ -188,7 +238,7 @@ fn parse_predict(w: &str) -> Result<Predict, String> {
     })
 }
 
-/// `BENCH_STAGES`: `0` or `1`, nothing else.
+/// A `BENCH_STAGES` flag value: `0` or `1`, nothing else.
 fn parse_flag(name: &str, raw: &str) -> Result<bool, String> {
     match raw {
         "0" => Ok(false),
@@ -197,12 +247,48 @@ fn parse_flag(name: &str, raw: &str) -> Result<bool, String> {
     }
 }
 
-fn env_flag(name: &str) -> Result<bool, String> {
-    match std::env::var(name) {
-        Ok(v) => parse_flag(name, &v),
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(e) => Err(format!("{name}: {e}")),
+/// What `BENCH_STAGES` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stages {
+    /// One opaque call per iteration.
+    Off,
+    /// The host and forward stage split.
+    Split,
+    /// The per-kernel-class GPU profile.
+    Kernels,
+}
+
+/// `BENCH_STAGES`: `0`, `1` or `kernels`, nothing else.
+fn parse_stages(raw: &str) -> Result<Stages, String> {
+    if raw == "kernels" {
+        return Ok(Stages::Kernels);
     }
+    match parse_flag("BENCH_STAGES", raw) {
+        Ok(on) => Ok(if on { Stages::Split } else { Stages::Off }),
+        Err(_) => Err(format!("BENCH_STAGES={raw:?} must be 0, 1 or kernels")),
+    }
+}
+
+fn env_stages() -> Result<Stages, String> {
+    match std::env::var("BENCH_STAGES") {
+        Ok(v) => parse_stages(&v),
+        Err(std::env::VarError::NotPresent) => Ok(Stages::Off),
+        Err(e) => Err(format!("BENCH_STAGES: {e}")),
+    }
+}
+
+/// `BENCH_PREDICT_SWEEP`: comma-separated `per_core_batch_size` values, each a
+/// count of at least one, no repeats.
+fn parse_sweep(raw: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let v = parse_count("BENCH_PREDICT_SWEEP", part, 1)?;
+        if out.contains(&v) {
+            return Err(format!("BENCH_PREDICT_SWEEP lists {v} twice"));
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 fn env_opt(name: &str) -> Result<Option<String>, String> {
@@ -310,8 +396,14 @@ fn stage<T>(acc: &mut StageMs, name: &'static str, f: impl FnOnce() -> Result<T,
 }
 
 /// `Timesfm3Model::decode`, from its public pieces (the same calls in the same
-/// order), each timed into `acc`. Refuses more than `MAX_ROWS` patch rows.
-fn staged_decode(model: &Timesfm3Model, inp: &DecodeInput, acc: &mut StageMs) -> Result<Forecast, String> {
+/// order), each timed into `acc`; the forward goes through `probe` when there
+/// is one. Refuses more than `MAX_ROWS` patch rows.
+fn staged_decode(
+    model: &Timesfm3Model,
+    inp: &DecodeInput,
+    acc: &mut StageMs,
+    probe: Option<&mut Probe<'_>>,
+) -> Result<Forecast, String> {
     let hc = &model.config().host;
     let pr = stage(acc, "prepare", || host::prepare(hc, inp))?;
     let pre = stage(acc, "preprocess", || host::preprocess(hc, &pr))?;
@@ -324,14 +416,20 @@ fn staged_decode(model: &Timesfm3Model, inp: &DecodeInput, acc: &mut StageMs) ->
         ));
     }
     let fwd = stage(acc, "forward", || {
-        model.forward(
-            pr.batch,
-            pr.variates,
-            pr.patches,
-            &pre.resblock_input,
-            &pre.leading_masked,
-            false,
-        )
+        let run = || {
+            model.forward(
+                pr.batch,
+                pr.variates,
+                pr.patches,
+                &pre.resblock_input,
+                &pre.leading_masked,
+                false,
+            )
+        };
+        match probe {
+            Some(p) => p.forward(run),
+            None => run(),
+        }
     })?;
     let values = stage(acc, "postprocess", || host::postprocess(hc, &pr, &pre, &fwd.raw_logits))?;
     Ok(Forecast {
@@ -351,15 +449,15 @@ fn staged_predict(
     horizon: usize,
     opts: &PredictOptions,
     acc: &mut StageMs,
+    mut probe: Option<&mut Probe<'_>>,
 ) -> Result<Vec<SeriesForecast>, String> {
     let plan = stage(acc, "plan", || {
         forecast::plan(&model.config().host, series, horizon, opts)
     })?;
-    let outs = plan
-        .calls
-        .iter()
-        .map(|call| staged_decode(model, call, acc))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut outs = Vec::with_capacity(plan.calls.len());
+    for call in &plan.calls {
+        outs.push(staged_decode(model, call, acc, probe.as_deref_mut())?);
+    }
     stage(acc, "finish", || forecast::finish(&plan, &outs))
 }
 
@@ -383,6 +481,406 @@ fn agree(what: &str, staged: &[f32], plain: &[f32]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// One device forward as the probe saw it: the host wall time of
+/// `Timesfm3Model::forward` and, when stamping, the dispatch stamps it left.
+struct ForwardRecord {
+    host_ms: f64,
+    batch: Option<DispatchStampBatch>,
+}
+
+/// Wraps each `Timesfm3Model::forward` of a staged call. With `stamps` it arms
+/// the per-dispatch timestamps for exactly that forward and takes the batch
+/// afterwards; without, it only times the forward and checks that no stamps
+/// leaked.
+struct Probe<'a> {
+    rt: &'a GpuRuntime,
+    stamps: bool,
+    records: Vec<ForwardRecord>,
+}
+
+impl Probe<'_> {
+    fn forward<T>(&mut self, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        if self.stamps {
+            drop(self.rt.take_dispatch_stamps());
+            tessl::ab_flags::set_dispatch_stamps(true);
+        }
+        let t0 = Instant::now();
+        let out = run();
+        let host_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if self.stamps {
+            tessl::ab_flags::set_dispatch_stamps(false);
+        }
+        let out = out?;
+        let batch = match (self.stamps, self.rt.take_dispatch_stamps()) {
+            (true, Some(Ok(b))) => Some(b),
+            (true, Some(Err(e))) => {
+                return Err(format!("BENCH_STAGES=kernels: the stamps could not be read back: {e}"))
+            }
+            (true, None) => {
+                return Err(
+                    "BENCH_STAGES=kernels: no stamps came back from a forward (was the runtime built with \
+                            stamps on, and did the forward reach a waiting commit?)"
+                        .to_string(),
+                )
+            }
+            (false, None) => None,
+            (false, Some(_)) => {
+                return Err("BENCH_STAGES=kernels: a forward with stamps off produced stamps".to_string())
+            }
+        };
+        self.records.push(ForwardRecord { host_ms, batch });
+        Ok(out)
+    }
+}
+
+/// Refuses a stamp batch that does not cover the whole forward.
+fn validate_batch(b: &DispatchStampBatch) -> Result<(), String> {
+    if b.overflowed {
+        return Err(format!(
+            "BENCH_STAGES=kernels: a command buffer overflowed the stamp heap ({} stamps kept, at most {} fit per \
+             command buffer): the profile would cover part of the forward; lower BENCH_PREDICT_BATCH or use a \
+             smaller workload",
+            b.stamps.len(),
+            STAMP_HEAP_SLOTS - 1
+        ));
+    }
+    if b.dropped_batches > 0 {
+        return Err(format!(
+            "BENCH_STAGES=kernels: {} armed command buffer(s) ended without a waiting commit and their stamps were \
+             dropped: the profile would cover part of the forward",
+            b.dropped_batches
+        ));
+    }
+    if b.stamps.is_empty() || b.command_buffers == 0 {
+        return Err("BENCH_STAGES=kernels: the stamp batch holds no dispatches".to_string());
+    }
+    Ok(())
+}
+
+/// The kernel class of a dispatch, from its name alone. The first rule that
+/// matches wins, so a fused `rms_norm_residual_add` is a norm, not an add.
+fn classify(kernel: &str) -> &'static str {
+    const RULES: &[(&str, &[&str])] = &[
+        ("qk_prep_rope", &["qk_prep", "rope"]),
+        ("attention", &["attn", "attention"]),
+        ("norm", &["norm"]),
+        ("softmax", &["softmax"]),
+        ("gemm", &["gemm", "matmul", "gemv"]),
+        ("copy_transpose", &["copy", "transpose", "zero_", "fill"]),
+        (
+            "elementwise",
+            &["add_", "scale_", "mul_", "relu", "gelu", "silu", "softcap", "mlp_"],
+        ),
+    ];
+    RULES
+        .iter()
+        .find(|(_, needles)| needles.iter().any(|n| kernel.contains(n)))
+        .map_or("other", |(class, _)| class)
+}
+
+/// One iteration's stamped dispatches over all its forwards: per kernel name
+/// the dispatch count and summed stamp deltas (ns).
+#[derive(Clone, Debug, PartialEq)]
+struct Profile {
+    kernels: BTreeMap<String, (usize, u64)>,
+    forwards: usize,
+    commits: usize,
+}
+
+fn profile_of(records: &[ForwardRecord]) -> Result<Profile, String> {
+    if records.is_empty() {
+        return Err("BENCH_STAGES=kernels: the iteration ran no forward".to_string());
+    }
+    let mut p = Profile {
+        kernels: BTreeMap::new(),
+        forwards: records.len(),
+        commits: 0,
+    };
+    for r in records {
+        let b = r
+            .batch
+            .as_ref()
+            .ok_or("BENCH_STAGES=kernels: a forward has no stamp batch")?;
+        validate_batch(b)?;
+        p.commits += b.command_buffers as usize;
+        for s in &b.stamps {
+            let e = p.kernels.entry(s.name.clone()).or_default();
+            e.0 += 1;
+            e.1 += s.dt_ns;
+        }
+    }
+    Ok(p)
+}
+
+#[derive(Debug)]
+struct KernelRow {
+    name: String,
+    class: &'static str,
+    dispatches: usize,
+    ms: f64,
+    share: f64,
+}
+
+#[derive(Debug)]
+struct ClassRow {
+    class: &'static str,
+    dispatches: usize,
+    ms: f64,
+    share: f64,
+}
+
+/// The profile over the iterations: per-kernel medians, by kernel and class.
+#[derive(Debug)]
+struct Summary {
+    /// Costliest first.
+    kernels: Vec<KernelRow>,
+    /// Costliest first.
+    classes: Vec<ClassRow>,
+    forwards: usize,
+    commits: usize,
+    dispatches: usize,
+    /// Sum of the per-kernel medians.
+    stamped_ms: f64,
+}
+
+fn summarize(profiles: &[Profile]) -> Result<Summary, String> {
+    let first = profiles.first().ok_or("BENCH_STAGES=kernels: no profiled iteration")?;
+    for p in profiles {
+        let same_counts = p.kernels.len() == first.kernels.len()
+            && p.kernels
+                .iter()
+                .zip(&first.kernels)
+                .all(|((na, (ca, _)), (nb, (cb, _)))| na == nb && ca == cb);
+        if p.forwards != first.forwards || p.commits != first.commits || !same_counts {
+            return Err("BENCH_STAGES=kernels: the dispatches or commits changed between iterations".to_string());
+        }
+    }
+    let mut kernels = Vec::new();
+    for (name, (count, _)) in &first.kernels {
+        let ns: Vec<f64> = profiles.iter().map(|p| p.kernels[name].1 as f64).collect();
+        kernels.push(KernelRow {
+            name: name.clone(),
+            class: classify(name),
+            dispatches: *count,
+            ms: median(ns)? / 1e6,
+            share: 0.0,
+        });
+    }
+    let stamped_ms: f64 = kernels.iter().map(|k| k.ms).sum();
+    if stamped_ms.is_nan() || stamped_ms <= 0.0 {
+        return Err("BENCH_STAGES=kernels: the stamped time sums to zero".to_string());
+    }
+    let mut by_class: BTreeMap<&'static str, (usize, f64)> = BTreeMap::new();
+    for k in &mut kernels {
+        k.share = k.ms / stamped_ms;
+        let e = by_class.entry(k.class).or_default();
+        e.0 += k.dispatches;
+        e.1 += k.ms;
+    }
+    let mut classes: Vec<ClassRow> = by_class
+        .into_iter()
+        .map(|(class, (dispatches, ms))| ClassRow {
+            class,
+            dispatches,
+            ms,
+            share: ms / stamped_ms,
+        })
+        .collect();
+    classes.sort_by(|a, b| b.ms.total_cmp(&a.ms).then(a.class.cmp(b.class)));
+    kernels.sort_by(|a, b| b.ms.total_cmp(&a.ms).then(a.name.cmp(&b.name)));
+    Ok(Summary {
+        dispatches: first.kernels.values().map(|v| v.0).sum(),
+        forwards: first.forwards,
+        commits: first.commits,
+        kernels,
+        classes,
+        stamped_ms,
+    })
+}
+
+/// Everything a kernel-profile row needs from the timed iterations.
+struct KernelRun {
+    off_wall: Vec<f64>,
+    on_wall: Vec<f64>,
+    off_forward: Vec<f64>,
+    on_forward: Vec<f64>,
+    profiles: Vec<Profile>,
+    max_abs_diff: f32,
+    bit_equal: bool,
+}
+
+/// Largest absolute difference between two equal-length forecasts, and
+/// whether they are bit-identical. A NaN anywhere makes the difference
+/// infinite.
+fn forecast_diff(a: &[f32], b: &[f32]) -> (f32, bool) {
+    let mut max = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        let d = (x - y).abs();
+        max = if d.is_nan() { f32::INFINITY } else { max.max(d) };
+    }
+    (max, a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
+}
+
+/// One staged call with stamps on or off: its forecast values, wall ms and
+/// forward records.
+fn kernel_arm(
+    rt: &GpuRuntime,
+    stamps: bool,
+    run: &mut impl FnMut(Option<&mut Probe<'_>>) -> Result<Vec<f32>, String>,
+) -> Result<(Vec<f32>, f64, Vec<ForwardRecord>), String> {
+    let mut probe = Probe {
+        rt,
+        stamps,
+        records: Vec::new(),
+    };
+    let t0 = Instant::now();
+    let values = run(Some(&mut probe))?;
+    Ok((values, t0.elapsed().as_secs_f64() * 1e3, probe.records))
+}
+
+/// `warmup` untimed then `iters` timed iterations, each a stamps-off then a
+/// stamps-on staged call. The stamped forecast must match the unstamped one
+/// and every stamped forward must be fully covered ([`validate_batch`]).
+fn run_kernels(
+    rt: &GpuRuntime,
+    what: &str,
+    warmup: usize,
+    iters: usize,
+    mut run: impl FnMut(Option<&mut Probe<'_>>) -> Result<Vec<f32>, String>,
+) -> Result<KernelRun, String> {
+    let (off, _, _) = kernel_arm(rt, false, &mut run)?;
+    let (on, _, _) = kernel_arm(rt, true, &mut run)?;
+    agree(&format!("{what} (stamps on against off)"), &on, &off)?;
+    for _ in 0..warmup {
+        kernel_arm(rt, false, &mut run)?;
+        kernel_arm(rt, true, &mut run)?;
+    }
+    let mut k = KernelRun {
+        off_wall: Vec::with_capacity(iters),
+        on_wall: Vec::with_capacity(iters),
+        off_forward: Vec::with_capacity(iters),
+        on_forward: Vec::with_capacity(iters),
+        profiles: Vec::with_capacity(iters),
+        max_abs_diff: 0.0,
+        bit_equal: true,
+    };
+    for _ in 0..iters {
+        let (off, off_wall, off_rec) = kernel_arm(rt, false, &mut run)?;
+        let (on, on_wall, on_rec) = kernel_arm(rt, true, &mut run)?;
+        agree(&format!("{what} (stamps on against off)"), &on, &off)?;
+        let (d, bit) = forecast_diff(&on, &off);
+        k.max_abs_diff = k.max_abs_diff.max(d);
+        k.bit_equal &= bit;
+        k.off_wall.push(off_wall);
+        k.on_wall.push(on_wall);
+        k.off_forward.push(off_rec.iter().map(|r| r.host_ms).sum());
+        k.on_forward.push(on_rec.iter().map(|r| r.host_ms).sum());
+        k.profiles.push(profile_of(&on_rec)?);
+    }
+    Ok(k)
+}
+
+/// Minimum of five standalone runs of the host-side upload (allocate a buffer
+/// and write `up` floats) and read-back (copy `down` floats out of a buffer):
+/// estimates of what `Timesfm3Model::forward` does inside, which the bench
+/// cannot time in place.
+fn proxy_host_ms(rt: &GpuRuntime, up: usize, down: usize) -> Result<(f64, f64), String> {
+    let data = vec![0.5f32; up.max(1)];
+    let src = rt.alloc_buffer(down.max(1) * 4)?;
+    src.try_write_f32(&vec![0.5f32; down.max(1)])?;
+    let (mut upload, mut readback) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        let b = rt.alloc_buffer(data.len() * 4)?;
+        b.try_write_f32(&data)?;
+        upload = upload.min(t0.elapsed().as_secs_f64() * 1e3);
+        let t0 = Instant::now();
+        let copy = src.try_contents_f32()?[..down.max(1)].to_vec();
+        readback = readback.min(t0.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(copy);
+    }
+    Ok((upload, readback))
+}
+
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// `"kernels":{...}` for a row, with the row's stamps-off wall min and median.
+fn kernels_json(k: &KernelRun, proxy: (f64, f64), rows_per_forward: usize) -> Result<(f64, f64, String), String> {
+    let s = summarize(&k.profiles)?;
+    let mut off_wall = k.off_wall.clone();
+    off_wall.sort_by(f64::total_cmp);
+    let (off_fwd, on_fwd) = (median(k.off_forward.clone())?, median(k.on_forward.clone())?);
+    let (off_w, on_w) = (median(k.off_wall.clone())?, median(k.on_wall.clone())?);
+    if off_fwd.is_nan() || off_w.is_nan() || off_fwd <= 0.0 || off_w <= 0.0 {
+        return Err("BENCH_STAGES=kernels: a stamps-off time is zero".to_string());
+    }
+    let classes: Vec<String> = s
+        .classes
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"class\":{},\"dispatches\":{},\"ms\":{:.4},\"share\":{:.4}}}",
+                json_str(c.class),
+                c.dispatches,
+                c.ms,
+                c.share
+            )
+        })
+        .collect();
+    let top: Vec<String> = s
+        .kernels
+        .iter()
+        .take(10)
+        .map(|c| {
+            format!(
+                "{{\"kernel\":{},\"class\":{},\"dispatches\":{},\"ms\":{:.4},\"share\":{:.4}}}",
+                json_str(&c.name),
+                json_str(c.class),
+                c.dispatches,
+                c.ms,
+                c.share
+            )
+        })
+        .collect();
+    let json = format!(
+        ",\"kernels\":{{\"forward_ms_off\":{off_fwd:.4},\"forward_ms_on\":{on_fwd:.4},\"overhead_forward\":{:.4},\"wall_ms_on\":{on_w:.4},\"overhead_wall\":{:.4},\"rows_per_forward\":{rows_per_forward},\"dispatches_per_forward\":{:.2},\"commits_per_forward\":{:.2},\"gpu_stamped_ms\":{:.4},\"host_outside_stamped_ms\":{:.4},\"proxy_upload_ms\":{:.4},\"proxy_readback_ms\":{:.4},\"max_abs_diff\":{:e},\"bit_equal\":{},\"classes\":[{}],\"top_kernels\":[{}]}}",
+        on_fwd / off_fwd,
+        on_w / off_w,
+        s.dispatches as f64 / s.forwards as f64,
+        s.commits as f64 / s.forwards as f64,
+        s.stamped_ms,
+        on_fwd - s.stamped_ms,
+        proxy.0,
+        proxy.1,
+        k.max_abs_diff,
+        k.bit_equal,
+        classes.join(","),
+        top.join(",")
+    );
+    Ok((off_wall[0], median(off_wall)?, json))
+}
+
+/// The kernel-profile row tail for one workload: runs it and renders it.
+fn kernel_profile(
+    rt: &GpuRuntime,
+    model: &Timesfm3Model,
+    what: &str,
+    (warmup, iters): (usize, usize),
+    rows_per_forward: usize,
+    run: impl FnMut(Option<&mut Probe<'_>>) -> Result<Vec<f32>, String>,
+) -> Result<(f64, f64, String), String> {
+    let k = run_kernels(rt, what, warmup, iters, run)?;
+    let host = &model.config().host;
+    let proxy = proxy_host_ms(
+        rt,
+        rows_per_forward * host.resblock_in(),
+        rows_per_forward * host.head_out(),
+    )?;
+    kernels_json(&k, proxy, rows_per_forward)
 }
 
 /// Device forwards `decode_capped` runs for a call of `batch` series of
@@ -471,12 +969,31 @@ fn main() -> Result<(), String> {
     let iters = env_usize("BENCH_ITERS", 10, 1)?;
     let warmup = env_usize("BENCH_WARMUP", 3, 0)?;
     let per_core = env_usize("BENCH_PREDICT_BATCH", PredictOptions::default().per_core_batch_size, 1)?;
-    let staged = env_flag("BENCH_STAGES")?;
+    let stages = env_stages()?;
+    let staged = stages != Stages::Off;
+    let sweep = env_opt("BENCH_PREDICT_SWEEP")?
+        .map(|raw| parse_sweep(&raw))
+        .transpose()?;
     let (workloads, predicts) = select(
         env_opt("BENCH_WORKLOADS")?.as_deref(),
         env_opt("BENCH_PREDICT")?.as_deref(),
     )?;
-    let rt = GpuRuntime::new()?;
+    if sweep.is_some() && (stages != Stages::Kernels || predicts.is_empty()) {
+        return Err("BENCH_PREDICT_SWEEP needs BENCH_STAGES=kernels and BENCH_PREDICT".to_string());
+    }
+    // The stamp heap exists only if the runtime is built with stamps on; each
+    // forward arms them itself (`Probe::forward`), so they stay off otherwise.
+    if stages == Stages::Kernels {
+        tessl::ab_flags::set_dispatch_stamps(true);
+    }
+    let rt = GpuRuntime::new();
+    if stages == Stages::Kernels {
+        tessl::ab_flags::set_dispatch_stamps(false);
+    }
+    let rt = rt?;
+    if stages == Stages::Kernels && !rt.dispatch_stamp_heap_available() {
+        return Err("BENCH_STAGES=kernels: the runtime has no dispatch stamp heap".to_string());
+    }
     let cfg = Timesfm3Config::from_config_file(&dir.join("config.json"))?;
     let st = SafeTensors::open(&dir.join("model.safetensors")).map_err(|e| e.to_string())?;
     let model = Timesfm3Model::load(&rt, &st, cfg)?;
@@ -500,22 +1017,29 @@ fn main() -> Result<(), String> {
         }
         let check = sum / (w.b * w.v * h) as f64;
         if staged {
-            let f = staged_decode(&model, &inp, &mut Vec::new())?;
+            let f = staged_decode(&model, &inp, &mut Vec::new(), None)?;
             agree(&w.name, &f.values, &first.values)?;
         }
-        let mut t = measure(warmup, iters, || {
-            let mut acc = Vec::new();
-            if staged {
-                std::hint::black_box(staged_decode(&model, &inp, &mut acc)?.values);
-            } else {
-                std::hint::black_box(model.decode(&inp)?.values);
-            }
-            Ok(acc)
-        })?;
-        let (ms_min, ms_median, stages) = timing_json(&mut t)?;
+        let (ms_min, ms_median, tail) = if stages == Stages::Kernels {
+            let rows_per_forward = w.b * model.config().host.rows_per_series(w.v, w.ctx, w.horizon);
+            kernel_profile(&rt, &model, &w.name, (warmup, iters), rows_per_forward, |probe| {
+                Ok(staged_decode(&model, &inp, &mut Vec::new(), probe)?.values)
+            })?
+        } else {
+            let mut t = measure(warmup, iters, || {
+                let mut acc = Vec::new();
+                if staged {
+                    std::hint::black_box(staged_decode(&model, &inp, &mut acc, None)?.values);
+                } else {
+                    std::hint::black_box(model.decode(&inp)?.values);
+                }
+                Ok(acc)
+            })?;
+            timing_json(&mut t)?
+        };
         let peak_mib = peak_footprint()? as f64 / (1u64 << 20) as f64;
         rows_out.push(format!(
-            "{{\"workload\":\"{}\",\"backend\":\"tessl-f32\",\"ms_min\":{ms_min:.4},\"ms_median\":{ms_median:.4},\"iters\":{},\"rows\":{},\"check\":{:.6},\"peak_footprint_mib\":{:.1}{stages}}}",
+            "{{\"workload\":\"{}\",\"backend\":\"tessl-f32\",\"ms_min\":{ms_min:.4},\"ms_median\":{ms_median:.4},\"iters\":{},\"rows\":{},\"check\":{:.6},\"peak_footprint_mib\":{:.1}{tail}}}",
             w.name,
             iters,
             w.b * model.config().host.rows_per_series(w.v, w.ctx, w.horizon),
@@ -523,11 +1047,12 @@ fn main() -> Result<(), String> {
             peak_mib
         ));
     }
-    let opts = PredictOptions {
-        per_core_batch_size: per_core,
-        ..PredictOptions::default()
-    };
-    for p in &predicts {
+    let pcbs = sweep.unwrap_or_else(|| vec![per_core]);
+    for (p, per_core) in predicts.iter().flat_map(|p| pcbs.iter().map(move |&c| (p, c))) {
+        let opts = PredictOptions {
+            per_core_batch_size: per_core,
+            ..PredictOptions::default()
+        };
         let ser = predict_series(p);
         let plan = forecast::plan(&model.config().host, &ser, p.horizon, &opts)?;
         let (mut rows, mut forwards) = (0usize, 0usize);
@@ -552,24 +1077,32 @@ fn main() -> Result<(), String> {
         }
         let check = sum / count as f64;
         if staged {
-            let f = staged_predict(&model, &ser, p.horizon, &opts, &mut Vec::new())?;
+            let f = staged_predict(&model, &ser, p.horizon, &opts, &mut Vec::new(), None)?;
             for (i, (a, b)) in f.iter().zip(&first).enumerate() {
                 agree(&format!("{} series {i}", p.name), &a.values, &b.values)?;
             }
         }
-        let mut t = measure(warmup, iters, || {
-            let mut acc = Vec::new();
-            if staged {
-                std::hint::black_box(staged_predict(&model, &ser, p.horizon, &opts, &mut acc)?);
-            } else {
-                std::hint::black_box(model.predict_batch(&ser, p.horizon, &opts)?);
-            }
-            Ok(acc)
-        })?;
-        let (ms_min, ms_median, stages) = timing_json(&mut t)?;
+        let (ms_min, ms_median, tail) = if stages == Stages::Kernels {
+            let label = format!("{} (per_core_batch_size {per_core})", p.name);
+            kernel_profile(&rt, &model, &label, (warmup, iters), rows / forwards, |probe| {
+                let f = staged_predict(&model, &ser, p.horizon, &opts, &mut Vec::new(), probe)?;
+                Ok(f.into_iter().flat_map(|s| s.values).collect())
+            })?
+        } else {
+            let mut t = measure(warmup, iters, || {
+                let mut acc = Vec::new();
+                if staged {
+                    std::hint::black_box(staged_predict(&model, &ser, p.horizon, &opts, &mut acc, None)?);
+                } else {
+                    std::hint::black_box(model.predict_batch(&ser, p.horizon, &opts)?);
+                }
+                Ok(acc)
+            })?;
+            timing_json(&mut t)?
+        };
         let peak_mib = peak_footprint()? as f64 / (1u64 << 20) as f64;
         rows_out.push(format!(
-            "{{\"workload\":\"{}\",\"mode\":\"predict\",\"backend\":\"tessl-f32\",\"ms_min\":{ms_min:.4},\"ms_median\":{ms_median:.4},\"iters\":{},\"series\":{},\"per_core_batch_size\":{per_core},\"groups\":{},\"forwards\":{forwards},\"rows\":{rows},\"check\":{check:.6},\"peak_footprint_mib\":{peak_mib:.1}{stages}}}",
+            "{{\"workload\":\"{}\",\"mode\":\"predict\",\"backend\":\"tessl-f32\",\"ms_min\":{ms_min:.4},\"ms_median\":{ms_median:.4},\"iters\":{},\"series\":{},\"per_core_batch_size\":{per_core},\"groups\":{},\"forwards\":{forwards},\"rows\":{rows},\"check\":{check:.6},\"peak_footprint_mib\":{peak_mib:.1}{tail}}}",
             p.name,
             iters,
             plan.series(),
@@ -801,5 +1334,180 @@ mod tests {
         assert!(r.is_err());
         let t = measure(1, 3, || Ok(vec![("a", 1.0), ("b", 2.0)])).unwrap();
         assert_eq!((t.wall_ms.len(), t.stages.len(), t.stages[1].1.len()), (3, 2, 3));
+    }
+
+    #[test]
+    fn stages_accept_zero_one_and_kernels_only() {
+        assert_eq!(parse_stages("0").unwrap(), Stages::Off);
+        assert_eq!(parse_stages("1").unwrap(), Stages::Split);
+        assert_eq!(parse_stages("kernels").unwrap(), Stages::Kernels);
+        for bad in ["", "2", "Kernels", "kernel", "true", " kernels"] {
+            let e = parse_stages(bad).unwrap_err();
+            assert!(
+                e.contains("BENCH_STAGES") && e.contains("0, 1 or kernels"),
+                "{bad:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_is_a_list_of_distinct_counts() {
+        assert_eq!(parse_sweep("1,4,16,64").unwrap(), [1, 4, 16, 64]);
+        assert_eq!(parse_sweep("8").unwrap(), [8]);
+        for bad in ["", "0", "1,,2", "1,1", "1, 2", "x", "1,"] {
+            assert!(parse_sweep(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn kernels_are_classified_by_name() {
+        for (name, class) in [
+            ("matmul2d_tensorops_nn_f32", "gemm"),
+            ("matmul2d_tensorops_nn_accum_f32", "gemm"),
+            ("gemm_epilogue_tiled", "gemm"),
+            ("timesfm3_attn_h80_r4_g16", "attention"),
+            ("timesfm3_qk_prep_h80", "qk_prep_rope"),
+            ("rms_norm_f32", "norm"),
+            ("rms_norm_residual_add_f32", "norm"),
+            ("zero_f32", "copy_transpose"),
+            ("copy_f32", "copy_transpose"),
+            ("transpose2d_f32", "copy_transpose"),
+            ("add_inplace_f32", "elementwise"),
+            ("mlp_silu", "elementwise"),
+            ("execute_icb", "other"),
+            ("?", "other"),
+        ] {
+            assert_eq!(classify(name), class, "{name}");
+        }
+    }
+
+    fn stamp(name: &str, dt_ns: u64) -> tessl::dispatch_stamps::DispatchStamp {
+        tessl::dispatch_stamps::DispatchStamp {
+            name: name.to_string(),
+            layer: -1,
+            barrier_before: true,
+            t_end_ns: dt_ns,
+            dt_ns,
+        }
+    }
+
+    fn batch(stamps: &[(&str, u64)]) -> DispatchStampBatch {
+        DispatchStampBatch {
+            freq_hz: 1_000_000_000,
+            t0_ns: 0,
+            stamps: stamps.iter().map(|&(n, dt)| stamp(n, dt)).collect(),
+            overflowed: false,
+            dropped_batches: 0,
+            command_buffers: 1,
+        }
+    }
+
+    fn record(b: Option<DispatchStampBatch>) -> ForwardRecord {
+        ForwardRecord { host_ms: 1.0, batch: b }
+    }
+
+    #[test]
+    fn aggregation_sums_by_kernel_and_class() {
+        let p = profile_of(&[
+            record(Some(batch(&[
+                ("gemm", 3_000_000),
+                ("rms_norm_f32", 1_000_000),
+                ("gemm", 4_000_000),
+            ]))),
+            record(Some(batch(&[("timesfm3_attn_h80_r4_g16", 2_000_000)]))),
+        ])
+        .unwrap();
+        assert_eq!((p.forwards, p.commits), (2, 2));
+        assert_eq!(p.kernels["gemm"], (2, 7_000_000));
+        let s = summarize(&[p]).unwrap();
+        assert_eq!((s.dispatches, s.forwards, s.commits), (4, 2, 2));
+        assert!((s.stamped_ms - 10.0).abs() < 1e-9);
+        let classes: Vec<_> = s.classes.iter().map(|c| (c.class, c.dispatches)).collect();
+        assert_eq!(classes, [("gemm", 2), ("attention", 1), ("norm", 1)]);
+        assert!((s.classes.iter().map(|c| c.share).sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((s.classes[0].share - 0.7).abs() < 1e-12);
+        assert_eq!(s.kernels[0].name, "gemm");
+    }
+
+    #[test]
+    fn summary_takes_the_median_per_kernel_and_refuses_a_changing_profile() {
+        let one = |ns| profile_of(&[record(Some(batch(&[("gemm", ns), ("copy_f32", 10)])))]).unwrap();
+        let s = summarize(&[one(1_000_000), one(9_000_000), one(2_000_000)]).unwrap();
+        assert!((s.kernels[0].ms - 2.0).abs() < 1e-9, "{}", s.kernels[0].ms);
+        let other = profile_of(&[record(Some(batch(&[("gemm", 1)])))]).unwrap();
+        assert!(summarize(&[one(1), other])
+            .unwrap_err()
+            .contains("changed between iterations"));
+        assert!(summarize(&[]).is_err());
+    }
+
+    #[test]
+    fn a_profile_that_misses_part_of_the_forward_is_refused() {
+        let good = batch(&[("gemm", 1)]);
+        assert!(profile_of(&[record(Some(good.clone()))]).is_ok());
+        let mut over = good.clone();
+        over.overflowed = true;
+        let e = profile_of(&[record(Some(over))]).unwrap_err();
+        assert!(
+            e.contains("overflowed") && e.contains("1023") && e.contains("BENCH_PREDICT_BATCH"),
+            "{e}"
+        );
+        let mut dropped = good.clone();
+        dropped.dropped_batches = 1;
+        assert!(profile_of(&[record(Some(dropped))]).unwrap_err().contains("dropped"));
+        assert!(profile_of(&[record(None)]).unwrap_err().contains("no stamp batch"));
+        assert!(profile_of(&[record(Some(batch(&[])))])
+            .unwrap_err()
+            .contains("no dispatches"));
+        assert!(profile_of(&[]).is_err());
+        // One bad forward among good ones refuses the whole profile.
+        let mut bad = good.clone();
+        bad.overflowed = true;
+        assert!(profile_of(&[record(Some(good)), record(Some(bad))]).is_err());
+    }
+
+    #[test]
+    fn forecast_diff_reports_max_and_bit_equality() {
+        assert_eq!(forecast_diff(&[1.0, 2.0], &[1.0, 2.0]), (0.0, true));
+        let (d, bit) = forecast_diff(&[1.0, 2.5], &[1.0, 2.0]);
+        assert_eq!((d, bit), (0.5, false));
+        assert!(forecast_diff(&[f32::NAN], &[1.0]).0.is_infinite());
+    }
+
+    #[test]
+    fn kernel_row_reports_classes_overhead_and_top_kernels() {
+        let prof = |g| profile_of(&[record(Some(batch(&[("gemm", g), ("rms_norm_f32", 1_000_000)])))]).unwrap();
+        let k = KernelRun {
+            off_wall: vec![12.0, 10.0, 11.0],
+            on_wall: vec![24.0, 20.0, 22.0],
+            off_forward: vec![8.0, 8.0, 8.0],
+            on_forward: vec![16.0, 16.0, 16.0],
+            profiles: vec![prof(3_000_000), prof(3_000_000), prof(3_000_000)],
+            max_abs_diff: 0.0,
+            bit_equal: true,
+        };
+        let (lo, med, j) = kernels_json(&k, (0.25, 0.5), 64).unwrap();
+        assert_eq!((lo, med), (10.0, 11.0));
+        for want in [
+            "\"overhead_forward\":2.0000",
+            "\"overhead_wall\":2.0000",
+            "\"dispatches_per_forward\":2.00",
+            "\"commits_per_forward\":1.00",
+            "\"gpu_stamped_ms\":4.0000",
+            "\"host_outside_stamped_ms\":12.0000",
+            "\"proxy_upload_ms\":0.2500",
+            "\"rows_per_forward\":64",
+            "\"bit_equal\":true",
+            "{\"class\":\"gemm\",\"dispatches\":1,\"ms\":3.0000,\"share\":0.7500}",
+            "{\"kernel\":\"rms_norm_f32\",\"class\":\"norm\",\"dispatches\":1,\"ms\":1.0000,\"share\":0.2500}",
+        ] {
+            assert!(j.contains(want), "{want} not in {j}");
+        }
+        let mut zero = KernelRun {
+            off_forward: vec![0.0],
+            ..k
+        };
+        zero.off_wall = vec![1.0];
+        assert!(kernels_json(&zero, (0.0, 0.0), 1).is_err());
     }
 }

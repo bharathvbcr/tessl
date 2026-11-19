@@ -126,3 +126,57 @@ fn forward_refuses_malformed_calls() {
         }
     });
 }
+
+#[test]
+fn tiny_predict_batch_matches_upstream_forecaster() {
+    with_gpu(|rt| {
+        let m = model(rt);
+        let dir = tfm::tiny_dir();
+        for case in tfm::FORECAST_TINY {
+            let fc = tfm::forecast_case(&dir, case);
+            let got = m
+                .predict_batch(&fc.series, fc.horizon, &fc.opts)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(got.len(), fc.series.len(), "{case}: series");
+            for (i, f) in got.iter().enumerate() {
+                let want = tfm::load(&dir, case, &format!("out_{i}"));
+                assert_eq!(f.values.len(), want.data.len(), "{case} series {i}: {:?}", want.shape);
+                tfm::assert_close(&format!("{case} series {i} forecast"), &f.values, &want.data, OUT_TOL);
+                let point = tfm::load(&dir, case, &format!("point_{i}"));
+                tfm::assert_close(&format!("{case} series {i} point"), &f.point(), &point.data, OUT_TOL);
+            }
+        }
+    });
+}
+
+/// A group run as several forwards of whole series gives what one forward
+/// gives (series in a batch never interact), and a cap below one series is
+/// refused by name.
+#[test]
+fn predict_batch_in_pieces_matches_one_forward() {
+    with_gpu(|rt| {
+        let m = model(rt);
+        let dir = tfm::tiny_dir();
+        for case in ["fa_ragged", "fc_multivariate_cov", "fe_long"] {
+            let fc = tfm::forecast_case(&dir, case);
+            let whole = m.predict_batch(&fc.series, fc.horizon, &fc.opts).unwrap();
+            let pl = tessl::timesfm3_forecast::plan(&m.config().host, &fc.series, fc.horizon, &fc.opts).unwrap();
+            assert!(pl.calls.iter().any(|c| c.batch > 1), "{case}: no group to split");
+            let one = pl
+                .calls
+                .iter()
+                .map(|c| m.config().host.rows_per_series(c.variates(), c.context, c.horizon))
+                .max()
+                .unwrap();
+            let pieces = m.predict_batch_capped(&fc.series, fc.horizon, &fc.opts, one).unwrap();
+            for (i, (a, b)) in whole.iter().zip(&pieces).enumerate() {
+                tfm::assert_close(&format!("{case} series {i} in pieces"), &b.values, &a.values, 1e-6);
+            }
+            let e = m
+                .predict_batch_capped(&fc.series, fc.horizon, &fc.opts, one - 1)
+                .err()
+                .unwrap_or_else(|| panic!("{case}: a cap below one series was accepted"));
+            assert!(e.contains("one series needs"), "{case}: {e}");
+        }
+    });
+}

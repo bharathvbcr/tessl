@@ -141,15 +141,13 @@ fn main() -> Result<(), String> {
         }
         ms.sort_by(f64::total_cmp);
         let peak_mib = peak_footprint()? as f64 / (1u64 << 20) as f64;
-        let p = model.config().host.input_patch_len;
-        let n = w.ctx.div_ceil(p) + w.horizon.saturating_sub(p).div_ceil(p).max(1) + model.config().host.rolls() - 1;
         rows_out.push(format!(
             "{{\"workload\":\"{}\",\"backend\":\"tessl-f32\",\"ms_min\":{:.4},\"ms_median\":{:.4},\"iters\":{},\"rows\":{},\"check\":{:.6},\"peak_footprint_mib\":{:.1}}}",
             w.name,
             ms[0],
             ms[ms.len() / 2],
             iters,
-            w.b * w.v * n,
+            w.b * model.config().host.rows_per_series(w.v, w.ctx, w.horizon),
             check,
             peak_mib
         ));

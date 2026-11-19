@@ -104,6 +104,6 @@
   "revin_std.npy": 0,
   "transformer_input.npy": 0
  },
- "torch": "2.12.1",
+ "torch": "2.14.0",
  "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
 }

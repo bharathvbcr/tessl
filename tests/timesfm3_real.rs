@@ -8,6 +8,11 @@
 //!       --model-dir $TIMESFM3_DIR --out target/timesfm3_ref_real
 //!   TIMESFM3_DIR=<snapshot dir> TIMESFM3_REF_DIR=target/timesfm3_ref_real \
 //!       cargo test --release --test timesfm3_real -- --ignored --test-threads=1
+//!
+//! `real_predict_batch_matches_upstream_forecaster` holds the forecaster to
+//! upstream's `TimesFM3Forecaster.predict_batch()`, including contexts at and
+//! past the 15360 global context and one group of about 15.4k patch rows,
+//! which runs as several forwards (`MAX_ROWS`).
 
 mod common;
 #[path = "common/timesfm3.rs"]
@@ -59,6 +64,28 @@ fn real_checkpoint_matches_upstream() {
                 &tfm::load(&rdir, case, "out").data,
                 1e-3,
             );
+        }
+    });
+}
+
+#[test]
+#[ignore]
+fn real_predict_batch_matches_upstream_forecaster() {
+    let (wdir, rdir) = (env_dir("TIMESFM3_DIR"), env_dir("TIMESFM3_REF_DIR"));
+    with_gpu(|rt| {
+        let cfg = Timesfm3Config::from_config_file(&wdir.join("config.json")).unwrap();
+        let st = SafeTensors::open(&wdir.join("model.safetensors")).unwrap();
+        let m = Timesfm3Model::load(rt, &st, cfg).unwrap();
+        for case in tfm::FORECAST_REAL {
+            let fc = tfm::forecast_case(&rdir, case);
+            let got = m
+                .predict_batch(&fc.series, fc.horizon, &fc.opts)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(got.len(), fc.series.len(), "{case}: series");
+            for (i, f) in got.iter().enumerate() {
+                let want = tfm::load(&rdir, case, &format!("out_{i}"));
+                tfm::assert_close(&format!("{case} series {i} forecast"), &f.values, &want.data, 1e-3);
+            }
         }
     });
 }

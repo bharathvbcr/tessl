@@ -288,6 +288,7 @@ pub mod shared_buf;
 pub mod sq_norm;
 pub mod tensor;
 pub mod timesfm3;
+pub mod timesfm3_forecast;
 pub mod timesfm3_host;
 
 pub use cb_replay::{

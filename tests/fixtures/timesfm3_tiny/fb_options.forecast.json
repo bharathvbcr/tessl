@@ -1,0 +1,155 @@
+{
+ "calls": [
+  {
+   "horizon": 128
+  },
+  {
+   "horizon": 128
+  },
+  {
+   "horizon": 128
+  },
+  {
+   "horizon": 128
+  }
+ ],
+ "files": {
+  "call_0.mask.npy": [
+   3,
+   128
+  ],
+  "call_0.out.npy": [
+   3,
+   1,
+   128,
+   9
+  ],
+  "call_0.target.npy": [
+   3,
+   1,
+   128
+  ],
+  "call_1.mask.npy": [
+   3,
+   224
+  ],
+  "call_1.out.npy": [
+   3,
+   1,
+   128,
+   9
+  ],
+  "call_1.target.npy": [
+   3,
+   1,
+   224
+  ],
+  "call_2.mask.npy": [
+   3,
+   160
+  ],
+  "call_2.out.npy": [
+   3,
+   1,
+   128,
+   9
+  ],
+  "call_2.target.npy": [
+   3,
+   1,
+   160
+  ],
+  "call_3.mask.npy": [
+   1,
+   160
+  ],
+  "call_3.out.npy": [
+   1,
+   1,
+   128,
+   9
+  ],
+  "call_3.target.npy": [
+   1,
+   1,
+   160
+  ],
+  "in_0.npy": [
+   128
+  ],
+  "in_1.npy": [
+   96
+  ],
+  "in_2.npy": [
+   200
+  ],
+  "in_3.npy": [
+   80
+  ],
+  "in_4.npy": [
+   160
+  ],
+  "out_0.npy": [
+   100,
+   9
+  ],
+  "out_1.npy": [
+   100,
+   9
+  ],
+  "out_2.npy": [
+   100,
+   9
+  ],
+  "out_3.npy": [
+   100,
+   9
+  ],
+  "out_4.npy": [
+   100,
+   9
+  ],
+  "point_0.npy": [
+   100
+  ],
+  "point_1.npy": [
+   100
+  ],
+  "point_2.npy": [
+   100
+  ],
+  "point_3.npy": [
+   100
+  ],
+  "point_4.npy": [
+   100
+  ]
+ },
+ "horizon": 100,
+ "median_quantile_index": 4,
+ "nan": {
+  "call_0.out.npy": 0,
+  "call_1.out.npy": 0,
+  "call_2.out.npy": 0,
+  "call_3.out.npy": 0,
+  "out_0.npy": 0,
+  "out_1.npy": 0,
+  "out_2.npy": 0,
+  "out_3.npy": 0,
+  "out_4.npy": 0,
+  "point_0.npy": 0,
+  "point_1.npy": 0,
+  "point_2.npy": 0,
+  "point_3.npy": 0,
+  "point_4.npy": 0
+ },
+ "options": {
+  "make_positive": true,
+  "use_symmetric_averaging": true,
+  "use_znorm": true
+ },
+ "per_core_batch_size": 3,
+ "series": 5,
+ "torch": "2.14.0",
+ "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
+}

@@ -52,6 +52,7 @@ use crate::qwen35;
 use crate::runtime::GpuRuntime;
 use crate::safetensors::SafeTensors;
 use crate::tensor::{DType, GpuBuffer, Tensor};
+use crate::timesfm3_forecast::{self as forecast, PredictOptions, Series, SeriesForecast};
 use crate::timesfm3_host::{self as host, DecodeInput, HostConfig};
 
 const BACKEND: GemmBackend = GemmBackend::TensorOps;
@@ -86,6 +87,8 @@ pub struct Timesfm3Config {
     pub use_variate_attention: bool,
     /// `use_memory_efficient_attention`: SDPA at scale √d (true) or 1.
     pub mea_scale: bool,
+    /// The quantile levels the head predicts, in output order (`quantiles`).
+    pub quantile_levels: Vec<f64>,
 }
 
 impl Timesfm3Config {
@@ -113,10 +116,14 @@ impl Timesfm3Config {
         let flag = |o: &ojas_io::json::JsonValue, k: &str, default: bool| -> Result<bool, String> {
             Ok(config_json::flag(o, k)?.unwrap_or(default))
         };
-        let quantiles = match config_json::field(&c, "quantiles")? {
-            ojas_io::json::JsonValue::Array(a) => a.len(),
+        let quantile_levels = match config_json::field(&c, "quantiles")? {
+            ojas_io::json::JsonValue::Array(a) => a
+                .iter()
+                .map(|x| config_json::float(x, "quantiles"))
+                .collect::<Result<Vec<f64>, String>>()?,
             v => return Err(format!("config.json: quantiles must be an array, got {v:?}")),
         };
+        let quantiles = quantile_levels.len();
         want_str(&c, "input_transform", "identity", Some("identity"))?;
         want_flag(&c, "use_frozen_running_stats", false, false)?;
         let rb = config_json::field(&c, "residual_block_config")?;
@@ -155,6 +162,7 @@ impl Timesfm3Config {
             resblock_hidden: uint(rb, "hidden_dims")?,
             use_variate_attention: flag(&c, "use_variate_attention", true)?,
             mea_scale: flag(t, "use_memory_efficient_attention", true)?,
+            quantile_levels,
         };
         if uint(rb, "output_dims")? != cfg.model_dims {
             return Err("config.json: residual_block_config.output_dims must equal model_dims".into());
@@ -397,6 +405,80 @@ impl Timesfm3Model {
             variates: pr.variates,
             horizon: pr.horizon,
             quantiles: hc.num_quantiles,
+            values,
+        })
+    }
+
+    /// Upstream's `TimesFM3Forecaster.predict_batch()`: one quantile forecast
+    /// per series, `[targets, horizon, quantiles]` (see
+    /// [`crate::timesfm3_forecast`] for what is done to the series around
+    /// the model). A group of queries that would exceed [`MAX_ROWS`] patch
+    /// rows runs as several forwards of whole series, which changes nothing:
+    /// series in one batch never interact.
+    pub fn predict_batch(
+        &self,
+        series: &[Series],
+        horizon: usize,
+        opts: &PredictOptions,
+    ) -> Result<Vec<SeriesForecast>, String> {
+        self.predict_batch_capped(series, horizon, opts, MAX_ROWS)
+    }
+
+    /// [`Self::predict_batch`] with at most `max_rows` patch rows per
+    /// forward (tests lower it to exercise the split).
+    #[doc(hidden)]
+    pub fn predict_batch_capped(
+        &self,
+        series: &[Series],
+        horizon: usize,
+        opts: &PredictOptions,
+        max_rows: usize,
+    ) -> Result<Vec<SeriesForecast>, String> {
+        let plan = forecast::plan(&self.cfg.host, series, horizon, opts)?;
+        let outs = plan
+            .calls
+            .iter()
+            .map(|call| self.decode_capped(call, max_rows))
+            .collect::<Result<Vec<_>, _>>()?;
+        forecast::finish(&plan, &outs)
+    }
+
+    /// [`Self::decode`] in pieces of whole batch elements, each at most
+    /// `max_rows` (and [`MAX_ROWS`]) patch rows; the pieces' forecasts are
+    /// concatenated. Refuses, naming the sizes, a single batch element larger
+    /// than that.
+    pub fn decode_capped(&self, input: &DecodeInput, max_rows: usize) -> Result<Forecast, String> {
+        let cap = max_rows.min(MAX_ROWS);
+        let per = self
+            .cfg
+            .host
+            .rows_per_series(input.variates(), input.context, input.horizon);
+        if per > cap {
+            return Err(format!(
+                "timesfm3: one series needs {per} patch rows ({} variates, context {}, horizon {}), more than \
+                 one forward runs ({cap}); shorten the context or use fewer variates",
+                input.variates(),
+                input.context,
+                input.horizon
+            ));
+        }
+        let chunk = cap / per.max(1);
+        if chunk >= input.batch {
+            return self.decode(input);
+        }
+        let mut values = Vec::new();
+        let mut shape = None;
+        for start in (0..input.batch).step_by(chunk) {
+            let f = self.decode(&input.slice_batch(start, (start + chunk).min(input.batch))?)?;
+            shape = Some((f.variates, f.horizon, f.quantiles));
+            values.extend_from_slice(&f.values);
+        }
+        let (variates, horizon, quantiles) = shape.ok_or("timesfm3: empty batch")?;
+        Ok(Forecast {
+            batch: input.batch,
+            variates,
+            horizon,
+            quantiles,
             values,
         })
     }

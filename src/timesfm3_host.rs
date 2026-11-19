@@ -44,6 +44,27 @@ impl HostConfig {
         self.output_patch_len / self.input_patch_len
     }
 
+    /// Horizon patches `decode()` lays out for `horizon`. Stitching: forecast
+    /// patches of `p`, plus `rolls - 1` so the last forecast patch's output
+    /// patch lies inside the sequence. Without it: the horizon rounded up to
+    /// whole output patches.
+    pub fn horizon_patches(&self, horizon: usize) -> usize {
+        let p = self.input_patch_len;
+        if self.use_stitching {
+            let extract = (2 * p).min(self.output_patch_len);
+            let overlap = extract - p;
+            horizon.saturating_sub(overlap).div_ceil(p).max(1) + self.rolls() - 1
+        } else {
+            horizon.div_ceil(self.output_patch_len) * self.output_patch_len / p
+        }
+    }
+
+    /// Patch rows one batch element of `variates` occupies in the forward for
+    /// a `context` and `horizon` (the context left-padded to whole patches).
+    pub fn rows_per_series(&self, variates: usize, context: usize, horizon: usize) -> usize {
+        variates * (context.div_ceil(self.input_patch_len) + self.horizon_patches(horizon))
+    }
+
     /// The residual block's input width, `2 * (p + o)`.
     pub fn resblock_in(&self) -> usize {
         2 * (self.input_patch_len + self.output_patch_len)
@@ -99,6 +120,61 @@ pub struct DecodeInput {
     pub num_past_future: usize,
     pub past_future: Option<Vec<f32>>,
     pub past_future_mask: Option<Vec<u8>>,
+}
+
+impl DecodeInput {
+    /// Variates per batch element: targets, past-only and past+future
+    /// covariates.
+    pub fn variates(&self) -> usize {
+        self.num_target
+            + if self.past_only.is_some() {
+                self.num_past_only
+            } else {
+                0
+            }
+            + if self.past_future.is_some() {
+                self.num_past_future
+            } else {
+                0
+            }
+    }
+
+    /// Batch elements `start..end` as their own input. Elements never
+    /// interact in decode(), so decoding the slices and concatenating gives
+    /// the whole batch's forecast. Refuses a range outside the batch or arrays
+    /// whose lengths do not match the shape.
+    pub fn slice_batch(&self, start: usize, end: usize) -> Result<DecodeInput, String> {
+        if start >= end || end > self.batch {
+            return Err(format!("timesfm3: batch slice {start}..{end} of {}", self.batch));
+        }
+        fn cut<T: Copy>(what: &str, x: &[T], batch: usize, start: usize, end: usize) -> Result<Vec<T>, String> {
+            if batch == 0 || !x.len().is_multiple_of(batch) {
+                return Err(format!(
+                    "timesfm3: {what} holds {} values, not a multiple of batch {batch}",
+                    x.len()
+                ));
+            }
+            let per = x.len() / batch;
+            Ok(x[start * per..end * per].to_vec())
+        }
+        let b = self.batch;
+        let opt = |what: &str, x: &Option<Vec<f32>>| x.as_ref().map(|x| cut(what, x, b, start, end)).transpose();
+        let optm = |what: &str, x: &Option<Vec<u8>>| x.as_ref().map(|x| cut(what, x, b, start, end)).transpose();
+        Ok(DecodeInput {
+            batch: end - start,
+            context: self.context,
+            horizon: self.horizon,
+            num_target: self.num_target,
+            target: cut("target", &self.target, b, start, end)?,
+            target_mask: optm("target_mask", &self.target_mask)?,
+            num_past_only: self.num_past_only,
+            past_only: opt("past_only", &self.past_only)?,
+            past_only_mask: optm("past_only_mask", &self.past_only_mask)?,
+            num_past_future: self.num_past_future,
+            past_future: opt("past_future", &self.past_future)?,
+            past_future_mask: optm("past_future_mask", &self.past_future_mask)?,
+        })
+    }
 }
 
 /// [`prepare`]'s output: the forward's patched input and what
@@ -251,24 +327,16 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
     let context = ctx0 + pad;
     let v = u + po + w;
 
-    // Horizon layout (stitching: forecast patches of p, plus rolls - 1 so the
-    // last forecast patch's output patch lies inside the sequence).
-    let (num_horizon_patches, padded_horizon) = if cfg.use_stitching {
-        let extract = (2 * p).min(cfg.output_patch_len);
-        let overlap = extract - p;
-        let nfp = horizon.saturating_sub(overlap).div_ceil(p).max(1);
-        let nhp = nfp + cfg.rolls() - 1;
-        (nhp, nhp * p)
-    } else {
-        let padded = horizon.div_ceil(cfg.output_patch_len) * cfg.output_patch_len;
-        (padded / p, padded)
-    };
+    let num_horizon_patches = cfg.horizon_patches(horizon);
+    let padded_horizon = num_horizon_patches * p;
     let ncp = context / p;
     let n = ncp + num_horizon_patches;
     let total = context + padded_horizon;
 
-    // Context values and masks per variate, left-padded; the global mask is
-    // just the padding (decode()'s `mask` argument is not exposed).
+    // Context values and masks per variate, left-padded. decode()'s global
+    // `[b, context]` mask is not a field: upstream only ORs it into every
+    // variate's context mask, so a caller folds it into the masks it passes
+    // (as the forecaster does, crate::timesfm3_forecast).
     let mut ctx_vals = vec![0.0f32; b * v * context];
     let mut ctx_masks = vec![0u8; b * v * context];
     let fill = |dst_v: &mut [f32], dst_m: &mut [u8], src: &[f32], src_m: Option<&[u8]>| {

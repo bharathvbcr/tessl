@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use tessl::npy;
+use tessl::timesfm3_forecast::{CovariatePadding, PredictOptions, Rows, Series};
 use tessl::timesfm3_host::DecodeInput;
 
 pub struct Arr {
@@ -135,4 +136,90 @@ pub fn assert_close(what: &str, got: &[f32], want: &[f32], tol: f64) {
     let r = rel_peak(what, got, want);
     eprintln!("{what}: max |diff| / peak = {r:.3e}");
     assert!(r <= tol, "{what}: max |diff| / peak = {r:.3e} > {tol:.0e}");
+}
+
+/// The forecaster cases `make_reference.py` records on the tiny model, and
+/// on the real one (which adds a group over `MAX_ROWS`).
+pub const FORECAST_TINY: [&str; 5] = ["fa_ragged", "fb_options", "fc_multivariate_cov", "fd_edge", "fe_long"];
+pub const FORECAST_REAL: [&str; 6] = [
+    "fa_ragged",
+    "fb_options",
+    "fc_multivariate_cov",
+    "fd_edge",
+    "fe_long",
+    "ff_over_cap",
+];
+
+/// One recorded `predict_batch()` call: its series, horizon and options, and
+/// the horizon of each `decode()` call it made.
+pub struct ForecastCase {
+    pub horizon: usize,
+    pub series: Vec<Series>,
+    pub opts: PredictOptions,
+    pub call_horizons: Vec<usize>,
+}
+
+fn rows(a: Arr) -> Rows {
+    match a.shape.len() {
+        1 => Rows {
+            rows: 1,
+            values: a.data,
+        },
+        2 => Rows {
+            rows: a.shape[0],
+            values: a.data,
+        },
+        _ => panic!("a series is 1-D or 2-D, got {:?}", a.shape),
+    }
+}
+
+/// Reads `<case>.forecast.json` and the case's inputs. The options are
+/// what upstream ran with, read from the record rather than restated here.
+pub fn forecast_case(dir: &Path, case: &str) -> ForecastCase {
+    let p = dir.join(format!("{case}.forecast.json"));
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let j = ojas_io::json::parse_json(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let u = |k: &str| j.get_u64(k).unwrap_or_else(|e| panic!("{case} {k}: {e}")) as usize;
+    let mut opts = PredictOptions {
+        per_core_batch_size: u("per_core_batch_size"),
+        ..PredictOptions::default()
+    };
+    let o = j.get_object("options").unwrap();
+    o.deny_unknown_keys(&[
+        "use_symmetric_averaging",
+        "make_positive",
+        "sort_quantiles",
+        "use_znorm",
+        "padding_mode",
+    ])
+    .unwrap();
+    let flag = |k: &str, d: bool| o.get(k).map_or(d, |v| v.as_bool().unwrap());
+    opts.use_symmetric_averaging = flag("use_symmetric_averaging", false);
+    opts.make_positive = flag("make_positive", false);
+    opts.sort_quantiles = flag("sort_quantiles", true);
+    opts.use_znorm = flag("use_znorm", false);
+    opts.padding = match o.get("padding_mode").map(|v| v.as_str().unwrap()) {
+        None | Some("none") => CovariatePadding::None,
+        Some("edge") => CovariatePadding::Edge,
+        Some(m) => panic!("{case}: padding_mode {m:?}"),
+    };
+    let series = (0..u("series"))
+        .map(|i| Series {
+            target: rows(load(dir, case, &format!("in_{i}"))),
+            past_only: maybe(dir, case, &format!("in_po_{i}")).map(rows),
+            past_future: maybe(dir, case, &format!("in_pf_{i}")).map(rows),
+        })
+        .collect();
+    let call_horizons = j
+        .get_array("calls")
+        .unwrap()
+        .iter()
+        .map(|c| c.get_u64("horizon").unwrap() as usize)
+        .collect();
+    ForecastCase {
+        horizon: u("horizon"),
+        series,
+        opts,
+        call_horizons,
+    }
 }

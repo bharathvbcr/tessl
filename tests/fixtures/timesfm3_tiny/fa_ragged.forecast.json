@@ -1,0 +1,125 @@
+{
+ "calls": [
+  {
+   "horizon": 64
+  },
+  {
+   "horizon": 64
+  }
+ ],
+ "files": {
+  "call_0.mask.npy": [
+   4,
+   320
+  ],
+  "call_0.out.npy": [
+   4,
+   1,
+   64,
+   9
+  ],
+  "call_0.target.npy": [
+   4,
+   1,
+   320
+  ],
+  "call_1.mask.npy": [
+   2,
+   256
+  ],
+  "call_1.out.npy": [
+   2,
+   1,
+   64,
+   9
+  ],
+  "call_1.target.npy": [
+   2,
+   1,
+   256
+  ],
+  "in_0.npy": [
+   100
+  ],
+  "in_1.npy": [
+   37
+  ],
+  "in_2.npy": [
+   300
+  ],
+  "in_3.npy": [
+   64
+  ],
+  "in_4.npy": [
+   1
+  ],
+  "in_5.npy": [
+   250
+  ],
+  "out_0.npy": [
+   50,
+   9
+  ],
+  "out_1.npy": [
+   50,
+   9
+  ],
+  "out_2.npy": [
+   50,
+   9
+  ],
+  "out_3.npy": [
+   50,
+   9
+  ],
+  "out_4.npy": [
+   50,
+   9
+  ],
+  "out_5.npy": [
+   50,
+   9
+  ],
+  "point_0.npy": [
+   50
+  ],
+  "point_1.npy": [
+   50
+  ],
+  "point_2.npy": [
+   50
+  ],
+  "point_3.npy": [
+   50
+  ],
+  "point_4.npy": [
+   50
+  ],
+  "point_5.npy": [
+   50
+  ]
+ },
+ "horizon": 50,
+ "median_quantile_index": 4,
+ "nan": {
+  "call_0.out.npy": 0,
+  "call_1.out.npy": 0,
+  "out_0.npy": 0,
+  "out_1.npy": 0,
+  "out_2.npy": 0,
+  "out_3.npy": 0,
+  "out_4.npy": 0,
+  "out_5.npy": 0,
+  "point_0.npy": 0,
+  "point_1.npy": 0,
+  "point_2.npy": 0,
+  "point_3.npy": 0,
+  "point_4.npy": 0,
+  "point_5.npy": 0
+ },
+ "options": {},
+ "per_core_batch_size": 4,
+ "series": 6,
+ "torch": "2.14.0",
+ "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
+}

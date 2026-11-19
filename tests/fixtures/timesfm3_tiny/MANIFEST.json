@@ -1,11 +1,11 @@
 {
  "schema": 1,
  "generator": "tools/timesfm3_ref/make_reference.py",
- "generator_commit": "01def68675fce0987b2cbb6b627547eee4e720e6",
+ "generator_commit": "69879e2a076759ad8691958b64a858fca26a0cd9",
  "versions": {
-  "torch": "2.12.1",
-  "transformers": "5.19.0",
-  "numpy": "2.5.0",
+  "torch": "2.14.0",
+  "transformers": "5.17.0",
+  "numpy": "2.4.6",
   "python": "3.14.10"
  },
  "versions_role": "produced",
@@ -14,7 +14,7 @@
   "a_univariate.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
   },
   "a_univariate.effective_patch_mask.npy": {
    "role": "golden",
@@ -54,32 +54,32 @@
   "a_univariate.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "a_univariate.layer_0.npy": {
    "role": "golden",
@@ -129,7 +129,7 @@
   "b_covariates.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
   },
   "b_covariates.effective_patch_mask.npy": {
    "role": "golden",
@@ -169,52 +169,52 @@
   "b_covariates.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_pf.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_po.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_po_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "b_covariates.layer_0.npy": {
    "role": "golden",
@@ -264,7 +264,7 @@
   "c_constant.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
   },
   "c_constant.effective_patch_mask.npy": {
    "role": "golden",
@@ -304,32 +304,32 @@
   "c_constant.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() input or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
   },
   "c_constant.layer_0.npy": {
    "role": "golden",
@@ -380,6 +380,591 @@
    "role": "config",
    "published": true,
    "note": "TimesFM3Torch.to_dict() of the tiny model"
+  },
+  "fa_ragged.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fa_ragged.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fa_ragged.call_1.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fa_ragged.call_1.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.call_1.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fa_ragged.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
+  },
+  "fa_ragged.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.in_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.in_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.in_4.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.in_5.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fa_ragged.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.out_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.out_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.out_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.out_5.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fa_ragged.point_5.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_1.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_1.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.call_1.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_2.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_2.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.call_2.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_3.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.call_3.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.call_3.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fb_options.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
+  },
+  "fb_options.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fb_options.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fb_options.in_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fb_options.in_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fb_options.in_4.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fb_options.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.out_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.out_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.out_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.point_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.point_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fb_options.point_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.call_0.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_0.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_0.po.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_0.po_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_1.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_1.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.call_1.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_1.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.call_1.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fc_multivariate_cov.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
+  },
+  "fc_multivariate_cov.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_3.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_4.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_pf_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_pf_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_pf_4.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_po_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.in_po_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fc_multivariate_cov.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.out_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.out_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.out_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.point_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.point_3.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fc_multivariate_cov.point_4.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fd_edge.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.call_0.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fd_edge.call_0.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fd_edge.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fd_edge.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
+  },
+  "fd_edge.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.in_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.in_pf_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.in_pf_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.in_pf_2.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fd_edge.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.out_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fd_edge.point_2.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fe_long.call_0.mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fe_long.call_0.out.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fe_long.call_0.pf.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fe_long.call_0.pf_mask.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fe_long.call_0.target.npy": {
+   "role": "input",
+   "published": true,
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+  },
+  "fe_long.forecast.json": {
+   "role": "config",
+   "published": true,
+   "note": "the case's horizon, shapes, options, NaN counts and versions"
+  },
+  "fe_long.in_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fe_long.in_1.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fe_long.in_pf_0.npy": {
+   "role": "input",
+   "published": true,
+   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+  },
+  "fe_long.out_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fe_long.out_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fe_long.point_0.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+  },
+  "fe_long.point_1.npy": {
+   "role": "golden",
+   "published": true,
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
   },
   "model.safetensors": {
    "role": "model",

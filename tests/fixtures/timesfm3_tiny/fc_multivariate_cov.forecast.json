@@ -1,0 +1,178 @@
+{
+ "calls": [
+  {
+   "horizon": 128
+  },
+  {
+   "horizon": 128
+  }
+ ],
+ "files": {
+  "call_0.mask.npy": [
+   4,
+   224
+  ],
+  "call_0.out.npy": [
+   4,
+   5,
+   70,
+   9
+  ],
+  "call_0.pf.npy": [
+   4,
+   2,
+   294
+  ],
+  "call_0.pf_mask.npy": [
+   4,
+   2,
+   294
+  ],
+  "call_0.po.npy": [
+   4,
+   1,
+   224
+  ],
+  "call_0.po_mask.npy": [
+   4,
+   1,
+   224
+  ],
+  "call_0.target.npy": [
+   4,
+   2,
+   224
+  ],
+  "call_1.mask.npy": [
+   1,
+   128
+  ],
+  "call_1.out.npy": [
+   1,
+   4,
+   70,
+   9
+  ],
+  "call_1.pf.npy": [
+   1,
+   2,
+   198
+  ],
+  "call_1.pf_mask.npy": [
+   1,
+   2,
+   198
+  ],
+  "call_1.target.npy": [
+   1,
+   2,
+   128
+  ],
+  "in_0.npy": [
+   2,
+   150
+  ],
+  "in_1.npy": [
+   2,
+   90
+  ],
+  "in_2.npy": [
+   2,
+   200
+  ],
+  "in_3.npy": [
+   2,
+   64
+  ],
+  "in_4.npy": [
+   2,
+   120
+  ],
+  "in_pf_1.npy": [
+   2,
+   160
+  ],
+  "in_pf_2.npy": [
+   2,
+   270
+  ],
+  "in_pf_4.npy": [
+   2,
+   190
+  ],
+  "in_po_0.npy": [
+   1,
+   150
+  ],
+  "in_po_2.npy": [
+   1,
+   200
+  ],
+  "out_0.npy": [
+   2,
+   70,
+   9
+  ],
+  "out_1.npy": [
+   2,
+   70,
+   9
+  ],
+  "out_2.npy": [
+   2,
+   70,
+   9
+  ],
+  "out_3.npy": [
+   2,
+   70,
+   9
+  ],
+  "out_4.npy": [
+   2,
+   70,
+   9
+  ],
+  "point_0.npy": [
+   2,
+   70
+  ],
+  "point_1.npy": [
+   2,
+   70
+  ],
+  "point_2.npy": [
+   2,
+   70
+  ],
+  "point_3.npy": [
+   2,
+   70
+  ],
+  "point_4.npy": [
+   2,
+   70
+  ]
+ },
+ "horizon": 70,
+ "median_quantile_index": 4,
+ "nan": {
+  "call_0.out.npy": 0,
+  "call_1.out.npy": 0,
+  "out_0.npy": 0,
+  "out_1.npy": 0,
+  "out_2.npy": 0,
+  "out_3.npy": 0,
+  "out_4.npy": 0,
+  "point_0.npy": 0,
+  "point_1.npy": 0,
+  "point_2.npy": 0,
+  "point_3.npy": 0,
+  "point_4.npy": 0
+ },
+ "options": {},
+ "per_core_batch_size": 4,
+ "series": 5,
+ "torch": "2.14.0",
+ "upstream": "918df02c9d366b2145bc5876135fa2131d3ed2a6"
+}

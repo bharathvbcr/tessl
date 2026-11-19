@@ -66,7 +66,9 @@ pub const MAX_VARIATES: usize = 32;
 pub const MAX_ROWS: usize = 8192;
 /// torch's `nn.RMSNorm(eps=None)` for f32.
 const RMS_EPS: f32 = f32::EPSILON;
-/// `_RECIPROCAL_OF_SOFTPLUS_0` in upstream's `normalization.py`.
+/// `_RECIPROCAL_OF_SOFTPLUS_0` in upstream's `normalization.py`, kept as
+/// upstream writes it: a truncated `1 / ln 2`, not `LOG2_E`.
+#[allow(clippy::approx_constant)]
 const RECIPROCAL_OF_SOFTPLUS_0: f64 = 1.442695041;
 /// RoPE's `max_timescale` (min 1).
 const ROPE_MAX_TIMESCALE: f64 = 10000.0;
@@ -93,13 +95,14 @@ impl Timesfm3Config {
         let float = |o: &ojas_io::json::JsonValue, k: &str| -> Result<f64, String> {
             config_json::float(config_json::field(o, k)?, k)
         };
-        let want_str = |o: &ojas_io::json::JsonValue, k: &str, want: &str, default: Option<&str>| -> Result<(), String> {
-            match (config_json::string(o, k)?, default) {
-                (Some(s), _) if s == want => Ok(()),
-                (None, Some(d)) if d == want => Ok(()),
-                (got, _) => Err(format!("config.json: {k} must be {want:?}, got {got:?}")),
-            }
-        };
+        let want_str =
+            |o: &ojas_io::json::JsonValue, k: &str, want: &str, default: Option<&str>| -> Result<(), String> {
+                match (config_json::string(o, k)?, default) {
+                    (Some(s), _) if s == want => Ok(()),
+                    (None, Some(d)) if d == want => Ok(()),
+                    (got, _) => Err(format!("config.json: {k} must be {want:?}, got {got:?}")),
+                }
+            };
         let want_flag = |o: &ojas_io::json::JsonValue, k: &str, want: bool, default: bool| -> Result<(), String> {
             let got = config_json::flag(o, k)?.unwrap_or(default);
             if got != want {
@@ -156,7 +159,15 @@ impl Timesfm3Config {
         if uint(rb, "output_dims")? != cfg.model_dims {
             return Err("config.json: residual_block_config.output_dims must equal model_dims".into());
         }
-        if [cfg.model_dims, cfg.ff_hidden, cfg.heads, cfg.layers, cfg.resblock_hidden].contains(&0) {
+        if [
+            cfg.model_dims,
+            cfg.ff_hidden,
+            cfg.heads,
+            cfg.layers,
+            cfg.resblock_hidden,
+        ]
+        .contains(&0)
+        {
             return Err("config.json: a width, head or layer count is zero".into());
         }
         if !cfg.model_dims.is_multiple_of(cfg.heads) || cfg.model_dims / cfg.heads != HEAD_DIM {
@@ -166,7 +177,10 @@ impl Timesfm3Config {
             ));
         }
         if !(cfg.host.value_clip.is_finite() && cfg.host.value_clip > 0.0) {
-            return Err(format!("config.json: value_clip {} must be positive and finite in f32", cfg.host.value_clip));
+            return Err(format!(
+                "config.json: value_clip {} must be positive and finite in f32",
+                cfg.host.value_clip
+            ));
         }
         Ok(cfg)
     }
@@ -250,7 +264,9 @@ impl Weights<'_> {
         let w = self.ld.f32_finite(name, &[out_f as usize, in_f as usize])?;
         let packed = qwen35::pack_linear_weights_f32(&[&w], &[out_f as usize], in_f as usize)?;
         let t = self.rt.alloc_tensor_f32(&[in_f as usize, out_f as usize])?;
-        t.buffer.try_write_f32(&packed).map_err(|e| format!("timesfm3 load {name}: {e}"))?;
+        t.buffer
+            .try_write_f32(&packed)
+            .map_err(|e| format!("timesfm3 load {name}: {e}"))?;
         Ok(t)
     }
 
@@ -302,7 +318,10 @@ impl Timesfm3Model {
     /// weight must be finite, and a tensor the checkpoint carries that this
     /// model does not read is refused (`Loader::refuse_unread`).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: Timesfm3Config) -> Result<Self, String> {
-        let w = Weights { ld: Loader::new(rt, st, ""), rt };
+        let w = Weights {
+            ld: Loader::new(rt, st, ""),
+            rt,
+        };
         let d = cfg.model_dims;
         let rin = cfg.host.resblock_in() as u32;
         let rh = cfg.resblock_hidden;
@@ -336,7 +355,10 @@ impl Timesfm3Model {
         let head = w.linear("output_head.weight", d, ho)?;
         let hb = w.vec("output_head.bias", ho)?;
         let head_bias = rt.alloc_tensor_f32(&[ho as usize])?;
-        head_bias.buffer.try_write_f32(&hb).map_err(|e| format!("timesfm3 load head bias: {e}"))?;
+        head_bias
+            .buffer
+            .try_write_f32(&hb)
+            .map_err(|e| format!("timesfm3 load head bias: {e}"))?;
         w.ld.refuse_unread()?;
         rt.synchronize()?;
         Ok(Self {
@@ -361,7 +383,14 @@ impl Timesfm3Model {
         let hc = &self.cfg.host;
         let pr = host::prepare(hc, input)?;
         let pre = host::preprocess(hc, &pr)?;
-        let fwd = self.forward(pr.batch, pr.variates, pr.patches, &pre.resblock_input, &pre.leading_masked, false)?;
+        let fwd = self.forward(
+            pr.batch,
+            pr.variates,
+            pr.patches,
+            &pre.resblock_input,
+            &pre.leading_masked,
+            false,
+        )?;
         let values = host::postprocess(hc, &pr, &pre, &fwd.raw_logits)?;
         Ok(Forecast {
             batch: pr.batch,
@@ -388,7 +417,9 @@ impl Timesfm3Model {
         let rt = &self.rt;
         let cfg = &self.cfg;
         if rt.f32_gemm_runs_relaxed() {
-            return Err(format!("{WHAT}: the forward needs exact-f32 GEMMs; switch relaxed precision off"));
+            return Err(format!(
+                "{WHAT}: the forward needs exact-f32 GEMMs; switch relaxed precision off"
+            ));
         }
         let rows = b
             .checked_mul(v)
@@ -398,17 +429,27 @@ impl Timesfm3Model {
             return Err(format!("{WHAT}: empty batch"));
         }
         if rows > MAX_ROWS {
-            return Err(format!("{WHAT}: {rows} patch rows exceed MAX_ROWS = {MAX_ROWS}; split the batch"));
+            return Err(format!(
+                "{WHAT}: {rows} patch rows exceed MAX_ROWS = {MAX_ROWS}; split the batch"
+            ));
         }
         if v > MAX_VARIATES {
             return Err(format!("{WHAT}: {v} variates exceed {MAX_VARIATES}"));
         }
         let rin = cfg.host.resblock_in();
         if resblock_input.len() != rows * rin {
-            return Err(format!("{WHAT}: resblock_input holds {}, expected {}", resblock_input.len(), rows * rin));
+            return Err(format!(
+                "{WHAT}: resblock_input holds {}, expected {}",
+                resblock_input.len(),
+                rows * rin
+            ));
         }
         if leading_masked.len() != b * v {
-            return Err(format!("{WHAT}: leading_masked holds {}, expected {}", leading_masked.len(), b * v));
+            return Err(format!(
+                "{WHAT}: leading_masked holds {}, expected {}",
+                leading_masked.len(),
+                b * v
+            ));
         }
         if let Some(&bad) = leading_masked.iter().find(|&&l| l as usize > n) {
             return Err(format!("{WHAT}: leading_masked {bad} exceeds {n} patches"));
@@ -502,8 +543,14 @@ impl Timesfm3Model {
             out.push(t.buffer.try_contents_f32()?[..rows * d as usize].to_vec());
             Ok(())
         };
-        let relu = Epilogue { activation: Activation::Relu, ..Epilogue::default() };
-        let accumulate = Epilogue { beta: 1.0, ..Epilogue::default() };
+        let relu = Epilogue {
+            activation: Activation::Relu,
+            ..Epilogue::default()
+        };
+        let accumulate = Epilogue {
+            beta: 1.0,
+            ..Epilogue::default()
+        };
 
         // Residual block.
         let rh = a.hidden.try_view(&[rows, cfg.resblock_hidden as usize], 0)?;
@@ -541,11 +588,17 @@ impl Timesfm3Model {
                 snap(&a.x, &mut out_trace)?;
             }
         }
-        let head = Epilogue { bias: Some(&self.head_bias), ..Epilogue::default() };
+        let head = Epilogue {
+            bias: Some(&self.head_bias),
+            ..Epilogue::default()
+        };
         gemm_epilogue(&a.x, &self.head, &a.logits, BACKEND, head)?;
         rt.synchronize()?;
         let raw_logits = a.logits.buffer.try_contents_f32()?[..rows * cfg.host.head_out()].to_vec();
-        Ok(ForwardOutput { raw_logits, trace: out_trace })
+        Ok(ForwardOutput {
+            raw_logits,
+            trace: out_trace,
+        })
     }
 
     /// Q, K, V from `xn`, the QK preparation, and attention into `o`.

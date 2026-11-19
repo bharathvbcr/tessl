@@ -60,14 +60,19 @@ impl HostConfig {
         if p == 0 || o == 0 || self.num_quantiles == 0 {
             return Err("timesfm3: patch lengths and quantile count must be non-zero".into());
         }
-        if o % p != 0 {
-            return Err(format!("timesfm3: output patch {o} is not a multiple of input patch {p}"));
+        if !o.is_multiple_of(p) {
+            return Err(format!(
+                "timesfm3: output patch {o} is not a multiple of input patch {p}"
+            ));
         }
         if self.use_stitching && o <= p {
             return Err("timesfm3: stitching needs output_patch_len > input_patch_len".into());
         }
-        if !(self.value_clip > 0.0) {
-            return Err(format!("timesfm3: value_clip must be positive, got {}", self.value_clip));
+        if self.value_clip.is_nan() || self.value_clip <= 0.0 {
+            return Err(format!(
+                "timesfm3: value_clip must be positive, got {}",
+                self.value_clip
+            ));
         }
         Ok(())
     }
@@ -209,7 +214,11 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
         return Err("timesfm3: decode needs horizon > 0".into());
     }
     let po = if inp.past_only.is_some() { inp.num_past_only } else { 0 };
-    let w = if inp.past_future.is_some() { inp.num_past_future } else { 0 };
+    let w = if inp.past_future.is_some() {
+        inp.num_past_future
+    } else {
+        0
+    };
     if inp.past_only.is_some() && po == 0 || inp.past_future.is_some() && w == 0 {
         return Err("timesfm3: a covariate array was given with zero channels".into());
     }
@@ -225,7 +234,9 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
     } else if inp.past_only_mask.is_some() {
         return Err("timesfm3: past_only_mask without past_only".into());
     }
-    let pf_len = ctx0.checked_add(horizon).ok_or("timesfm3: context + horizon overflows")?;
+    let pf_len = ctx0
+        .checked_add(horizon)
+        .ok_or("timesfm3: context + horizon overflows")?;
     if let Some(x) = &inp.past_future {
         check_len("past_future", x.len(), checked_mul(&[b, w, pf_len], "past_future")?)?;
         if let Some(m) = &inp.past_future_mask {
@@ -278,15 +289,30 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
             let (dv, dm) = (&mut ctx_vals[row..row + context], &mut ctx_masks[row..row + context]);
             if vi < u {
                 let s = (bi * u + vi) * ctx0;
-                fill(dv, dm, &inp.target[s..s + ctx0], inp.target_mask.as_ref().map(|m| &m[s..s + ctx0]));
+                fill(
+                    dv,
+                    dm,
+                    &inp.target[s..s + ctx0],
+                    inp.target_mask.as_ref().map(|m| &m[s..s + ctx0]),
+                );
             } else if vi < u + po {
                 let s = (bi * po + (vi - u)) * ctx0;
                 let x = inp.past_only.as_ref().expect("po > 0");
-                fill(dv, dm, &x[s..s + ctx0], inp.past_only_mask.as_ref().map(|m| &m[s..s + ctx0]));
+                fill(
+                    dv,
+                    dm,
+                    &x[s..s + ctx0],
+                    inp.past_only_mask.as_ref().map(|m| &m[s..s + ctx0]),
+                );
             } else {
                 let s = (bi * w + (vi - u - po)) * pf_len;
                 let x = inp.past_future.as_ref().expect("w > 0");
-                fill(dv, dm, &x[s..s + ctx0], inp.past_future_mask.as_ref().map(|m| &m[s..s + ctx0]));
+                fill(
+                    dv,
+                    dm,
+                    &x[s..s + ctx0],
+                    inp.past_future_mask.as_ref().map(|m| &m[s..s + ctx0]),
+                );
             }
         }
     }
@@ -346,8 +372,8 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
             trend_c[r] = c;
             if std_det < cfg.linear_detrending_threshold * std_orig {
                 detrended[r] = 1;
-                for t in 0..context {
-                    vals[t] -= m * tn(t) + c;
+                for (t, x) in vals.iter_mut().enumerate().take(context) {
+                    *x -= m * tn(t) + c;
                 }
             }
         }
@@ -371,7 +397,10 @@ pub fn prepare(cfg: &HostConfig, inp: &DecodeInput) -> Result<Prepared, String> 
                 let x = inp.past_future.as_ref().expect("w > 0");
                 for h in 0..horizon {
                     let mut y = x[s + ctx0 + h];
-                    let m = inp.past_future_mask.as_ref().map_or(0, |mm| (mm[s + ctx0 + h] != 0) as u8);
+                    let m = inp
+                        .past_future_mask
+                        .as_ref()
+                        .map_or(0, |mm| (mm[s + ctx0 + h] != 0) as u8);
                     if cfg.use_linear_detrending && detrended[r] != 0 {
                         y -= trend_m[r] * ((h + 1) as f32 / cf) + trend_c[r];
                     }
@@ -470,7 +499,7 @@ pub fn preprocess(cfg: &HostConfig, pr: &Prepared) -> Result<Preprocessed, Strin
     let half = p + o;
     let mut resblock_input = vec![0.0f32; checked_mul(&[rows, width], "resblock_input")?];
     let mut leading_masked = vec![0u32; b * v];
-    for r in 0..b * v {
+    for (r, lead) in leading_masked.iter_mut().enumerate() {
         let mut leading = true;
         for i in 0..n {
             let row = r * n + i;
@@ -500,7 +529,7 @@ pub fn preprocess(cfg: &HostConfig, pr: &Prepared) -> Result<Preprocessed, Strin
                 }
             }
             if leading && all_masked {
-                leading_masked[r] += 1;
+                *lead += 1;
             } else {
                 leading = false;
             }
@@ -525,10 +554,20 @@ pub fn cpm_refine(
     pre: &Preprocessed,
     raw_logits: &[f32],
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
-    let (b, v, n, p, q) = (pr.batch, pr.variates, pr.patches, cfg.input_patch_len, cfg.num_quantiles);
+    let (b, v, n, p, q) = (
+        pr.batch,
+        pr.variates,
+        pr.patches,
+        cfg.input_patch_len,
+        cfg.num_quantiles,
+    );
     let rolls = cfg.rolls();
     let width = cfg.head_out();
-    check_len("raw logits", raw_logits.len(), checked_mul(&[b, v, n, width], "logits")?)?;
+    check_len(
+        "raw logits",
+        raw_logits.len(),
+        checked_mul(&[b, v, n, width], "logits")?,
+    )?;
     let median = q / 2;
     let no_mask = vec![0u8; p];
     let mut mu_out = pre.running_mean.clone();
@@ -573,13 +612,28 @@ pub fn cpm_refine(
 /// `forward()`: RevIN refinement, de-normalisation, clipping, stitching and
 /// the trend. `raw_logits` is the head's output, `[b, v, n, o * q]`.
 /// Returns `[b, v, horizon, q]`.
-pub fn postprocess(cfg: &HostConfig, pr: &Prepared, pre: &Preprocessed, raw_logits: &[f32]) -> Result<Vec<f32>, String> {
-    let (b, v, n, p, q) = (pr.batch, pr.variates, pr.patches, cfg.input_patch_len, cfg.num_quantiles);
+pub fn postprocess(
+    cfg: &HostConfig,
+    pr: &Prepared,
+    pre: &Preprocessed,
+    raw_logits: &[f32],
+) -> Result<Vec<f32>, String> {
+    let (b, v, n, p, q) = (
+        pr.batch,
+        pr.variates,
+        pr.patches,
+        cfg.input_patch_len,
+        cfg.num_quantiles,
+    );
     let (o, width, horizon) = (cfg.output_patch_len, cfg.head_out(), pr.horizon);
     let (mu, sd) = if cfg.use_iterative_cpm_revin {
         cpm_refine(cfg, pr, pre, raw_logits)?
     } else {
-        check_len("raw logits", raw_logits.len(), checked_mul(&[b, v, n, width], "logits")?)?;
+        check_len(
+            "raw logits",
+            raw_logits.len(),
+            checked_mul(&[b, v, n, width], "logits")?,
+        )?;
         (pre.running_mean.clone(), pre.running_std.clone())
     };
     let logit = |row: usize, k: usize, qi: usize| -> f32 {
@@ -656,7 +710,13 @@ fn linspace_desc(steps: usize) -> Vec<f32> {
             let step = (0.0f32 - 1.0) / (steps - 1) as f32;
             let half = steps / 2;
             (0..steps)
-                .map(|i| if i < half { 1.0 + step * i as f32 } else { 0.0 - step * (steps - i - 1) as f32 })
+                .map(|i| {
+                    if i < half {
+                        1.0 + step * i as f32
+                    } else {
+                        0.0 - step * (steps - i - 1) as f32
+                    }
+                })
                 .collect()
         }
     }

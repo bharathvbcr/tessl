@@ -39,14 +39,26 @@ fn real_checkpoint_matches_upstream() {
             let pr = prepare(&m.config().host, &inp).unwrap();
             let pre = preprocess(&m.config().host, &pr).unwrap();
             let rin = tfm::load(&rdir, case, "resblock_input");
-            let out = m.forward(pr.batch, pr.variates, pr.patches, &rin.data, &pre.leading_masked, true).unwrap();
+            let out = m
+                .forward(pr.batch, pr.variates, pr.patches, &rin.data, &pre.leading_masked, true)
+                .unwrap();
             for l in [0usize, 10, 19] {
                 let want = tfm::load(&rdir, case, &format!("layer_{l}"));
                 tfm::assert_close(&format!("{case} layer {l}"), &out.trace[l + 1], &want.data, 1e-3);
             }
-            tfm::assert_close(&format!("{case} raw logits"), &out.raw_logits, &tfm::load(&rdir, case, "raw_logits").data, 1e-3);
+            tfm::assert_close(
+                &format!("{case} raw logits"),
+                &out.raw_logits,
+                &tfm::load(&rdir, case, "raw_logits").data,
+                1e-3,
+            );
             let f = m.decode(&inp).unwrap();
-            tfm::assert_close(&format!("{case} forecast"), &f.values, &tfm::load(&rdir, case, "out").data, 1e-3);
+            tfm::assert_close(
+                &format!("{case} forecast"),
+                &f.values,
+                &tfm::load(&rdir, case, "out").data,
+                1e-3,
+            );
         }
     });
 }

@@ -16,7 +16,10 @@ pub struct Arr {
 pub fn load(dir: &Path, case: &str, name: &str) -> Arr {
     let p = dir.join(format!("{case}.{name}.npy"));
     let a = npy::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-    Arr { shape: a.shape.clone(), data: a.f32s().unwrap_or_else(|e| panic!("{}: {e}", p.display())).to_vec() }
+    Arr {
+        shape: a.shape.clone(),
+        data: a.f32s().unwrap_or_else(|e| panic!("{}: {e}", p.display())).to_vec(),
+    }
 }
 
 /// A case's float64 reference (the f64 pass of the same model and inputs).
@@ -44,11 +47,16 @@ pub fn assert_no_worse_than_upstream(what: &str, got: &[f32], torch32: &[f32], f
     let (theirs, _) = max_abs_diff(what, torch32, f64_ref);
     let bound = 2.0 * theirs + 1e-6 * peak;
     eprintln!("{what}: |ours - f64| = {ours:.3e}, |torch fp32 - f64| = {theirs:.3e} (peak {peak:.3e})");
-    assert!(ours <= bound, "{what}: |ours - f64| = {ours:.3e} > 2 * |torch fp32 - f64| + 1e-6 peak = {bound:.3e}");
+    assert!(
+        ours <= bound,
+        "{what}: |ours - f64| = {ours:.3e} > 2 * |torch fp32 - f64| + 1e-6 peak = {bound:.3e}"
+    );
 }
 
 pub fn maybe(dir: &Path, case: &str, name: &str) -> Option<Arr> {
-    dir.join(format!("{case}.{name}.npy")).is_file().then(|| load(dir, case, name))
+    dir.join(format!("{case}.{name}.npy"))
+        .is_file()
+        .then(|| load(dir, case, name))
 }
 
 pub fn mask(a: &Arr) -> Vec<u8> {
@@ -66,8 +74,13 @@ pub fn tiny_dir() -> PathBuf {
 }
 
 pub const TINY_CASES: [&str; 3] = ["a_univariate", "b_covariates", "c_constant"];
-pub const REAL_CASES: [&str; 5] =
-    ["a_univariate", "b_covariates", "c_constant", "d_batch4_ctx1024", "e_multivariate8_ctx512"];
+pub const REAL_CASES: [&str; 5] = [
+    "a_univariate",
+    "b_covariates",
+    "c_constant",
+    "d_batch4_ctx1024",
+    "e_multivariate8_ctx512",
+];
 
 /// The decode() input a case recorded; the horizon is the forecast's length.
 pub fn decode_input(dir: &Path, case: &str) -> DecodeInput {
@@ -110,7 +123,10 @@ pub fn rel_peak(what: &str, got: &[f32], want: &[f32]) -> f64 {
         }
     }
     if worst > 0.0 {
-        eprintln!("{what}: worst at element {at}: got {} want {} (peak {peak})", got[at], want[at]);
+        eprintln!(
+            "{what}: worst at element {at}: got {} want {} (peak {peak})",
+            got[at], want[at]
+        );
     }
     worst / peak
 }

@@ -21,6 +21,7 @@ Comprehensive architectural references, kernel documentation, benchmarks, and pl
 | Document | Topic & Scope |
 |---|---|
 | [**Qwen3.5**](qwen35.md) | Gated Delta Net (GDN) chunked prep and scan, read-only recurrent decode, training backward pass, vocabulary-chunked cross-entropy, and fused AdamW. |
+| [**TimesFM 3**](timesfm3.md) | Time-series forecasting from `google/timesfm-3.0-pytorch`: upstream's forecaster and `decode()` on the host, the mixing transformer on Metal, a CSV command line, and parity with upstream's PyTorch code. |
 | [**EmbeddingGemma 2**](embedgemma2.md) | Full text encoder execution from SafeTensors: symmetric sliding-window attention, per-layer inputs, mean pooling, and Matryoshka dimension truncation. |
 | [**BERT & DistilBERT**](bert.md) | Learned sparse document encoders (`BertForMaskedLM` / `DistilBertForMaskedLM`): fused LayerNorms, exact erf GELU, and segment sparse max reduction. |
 | [**PyTorch Interop**](../python/README.md) | `tessl_torch` C ABI bindings: drop-in cross-entropy, GDN seam patching, and full model `train_step` integration. |

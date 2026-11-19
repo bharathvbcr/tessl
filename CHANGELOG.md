@@ -6,6 +6,17 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **TimesFM 3 forecasting** (`src/timesfm3.rs`, `src/timesfm3_host.rs`, `src/timesfm3_forecast.rs`,
+  `kernels/timesfm3.metal`, `src/bin/timesfm3_forecast.rs`, `docs/timesfm3.md`).
+  `google/timesfm-3.0-pytorch` from `config.json` and `model.safetensors` to quantile forecasts,
+  with no Python on the path. It covers upstream's `TimesFM3Forecaster.predict_batch()` (every
+  option), `decode()` and the forward, plus a CSV command line. A group over `MAX_ROWS` runs as
+  several forwards of whole series. Held to upstream's PyTorch code at 918df02 on tiny fixtures and
+  on the real checkpoint (`tests/timesfm3_*.rs`; real max error 7.6e-6 of peak, 2026-11-19).
+  `bench_timesfm3` is added but not yet timed.
+
 ### Changed
 
 - **Rust floor raised to 1.100** (owner override, 2026-11-12; it was 1.97). `Cargo.toml`,

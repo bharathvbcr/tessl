@@ -160,6 +160,10 @@ name = "bench_timesfm3"
 path = "src/bin/bench_timesfm3.rs"
 
 [[bin]]
+name = "timesfm3_forecast"
+path = "src/bin/timesfm3_forecast.rs"
+
+[[bin]]
 name = "bench_nn_kernels"
 path = "src/bin/bench_nn_kernels.rs"
 

@@ -67,7 +67,7 @@ bin relaxed_predicate 1
 bin results_report 13
 bin release_check 14
 bin safetensors 12
-bin timesfm3_host 5
+bin timesfm3_host 7
 bin timesfm3_forecast_host 4
 bin shader_index_arithmetic 35
 bin icb_flag_env 4
@@ -118,7 +118,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 427
+bins 435
 
 # Library tests.
 lib ab_flags::tests:: 15

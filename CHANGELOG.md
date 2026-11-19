@@ -14,7 +14,7 @@ All notable changes to `tessl` are recorded here. The format follows
   with no Python on the path. It covers upstream's `TimesFM3Forecaster.predict_batch()` (every
   option), `decode()` and the forward, plus a CSV command line. A group over `MAX_ROWS` runs as
   several forwards of whole series. Held to upstream's PyTorch code at 918df02 on tiny fixtures and
-  on the real checkpoint (`tests/timesfm3_*.rs`; real max error 7.6e-6 of peak, 2026-11-19).
+  on the real checkpoint (`tests/timesfm3_*.rs`; real max error 1.4e-5 of peak, 2026-11-19).
   `bench_timesfm3` is added but not yet timed.
 
 ### Changed

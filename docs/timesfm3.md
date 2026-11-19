@@ -72,7 +72,7 @@ batching.
 
 | Upstream | Status |
 | :--- | :--- |
-| `predict()` / `predict_batch()`: every option (`use_symmetric_averaging`, `make_positive`, `sort_quantiles`, `use_znorm`, `padding_mode` `none`/`edge`, `per_core_batch_size`, quantiles and point forecast) | Ported; held to upstream on the tiny and real checkpoints (below) |
+| `predict()` / `predict_batch()`: every option (`use_symmetric_averaging`, `make_positive`, `sort_quantiles`, `use_znorm`, `padding_mode` `none`/`edge`, `per_core_batch_size`, quantiles and point forecast) | Ported; held to upstream on the tiny and real checkpoints (below). The options are tested on one target variate and, together, on two target variates with z-normalised and negated covariates |
 | Ragged contexts, leading/interior/trailing NaNs, all-NaN series and variates, contexts past the 15360 global context | Ported, same tests |
 | Several target variates, past-only and past+future covariates, mixed within a group | Ported, same tests |
 | `decode()` with per-variate masks; its global `mask` | Ported; the global mask is folded into the per-variate masks, which is all upstream does with it |
@@ -80,7 +80,8 @@ batching.
 | `from_pretrained(hub id)`, `cache_dir`, `token`, `revision` | Not ported: no network code. Fetch with curl (above) |
 | `.pth` / `.pt` checkpoints | Not ported: safetensors only |
 | `use_frozen_running_stats=True`, `input_transform` other than `identity`, non-RMS norms, `v_norm`, non-ReLU, biases, `use_rope_var`, non-causal attention, head dim other than 80 | Refused by name at `config.json` (`Timesfm3Config::from_config_json`); the published checkpoint uses none of them |
-| `use_variate_attention`, `use_stitching`, `use_linear_detrending` (and threshold), `use_iterative_cpm_revin`, `value_clip`, `use_memory_efficient_attention` | Read from `config.json`, both settings computed |
+| `use_variate_attention`, `use_stitching`, `use_linear_detrending` (and threshold), `use_iterative_cpm_revin`, `value_clip`, `use_memory_efficient_attention` | Read from `config.json` and both settings implemented. Only the published checkpoint's settings (all on) are checked against upstream; the off branches are not |
+| ±inf in a series; covariates with different channel counts in one group | Refused by name. Upstream accepts infinities into its interpolation, and fails inside `np.stack` on mismatched channels |
 | `return_aux_outputs` | Not ported; `Timesfm3Model::forward(.., trace = true)` returns every layer's residual stream instead |
 | `TimesFM3Evaluator` (evaluation helper) | Not ported |
 | Training / fine-tuning | Not in tessl: ojas owns training (README, ABI 14) |
@@ -108,10 +109,10 @@ writes:
 - **Tiny fixtures** (`tests/fixtures/timesfm3_tiny`, committed, with
   `MANIFEST.json`): a seeded 2-layer model with the real structure. They hold
   three `decode()` cases with every intermediate, plus float64 references.
-  They also hold five forecaster cases, each recording every `decode()` call
+  They also hold six forecaster cases, each recording every `decode()` call
   upstream's forecaster made and its final forecast.
 - **Real references** (`target/timesfm3_ref_real`, never committed): five
-  `decode()` cases, and six forecaster cases. The forecaster cases include
+  `decode()` cases, and seven forecaster cases. The forecaster cases include
   contexts past 15360 and one group of about 15.5k patch rows.
 
 | Test | What it holds | Measured on M5 Pro, 2026-11-19 (max \|diff\| / peak) |
@@ -119,7 +120,7 @@ writes:
 | `timesfm3_host` (device-free) | Host steps against upstream's fp32 and f64 runs | — |
 | `timesfm3_forecast_host` (device-free) | `plan` makes upstream's `decode()` calls; `finish` turns upstream's decode outputs into its forecast; malformed requests refused by name | values ≤ 3.3e-7 (z-norm rows; the rest exact), masks and shapes exact |
 | `timesfm3_tiny` | Layer by layer, decode, `predict_batch` against upstream; a group in pieces equals one forward | forecaster ≤ 1.4e-5 (gate 5e-5); pieces 0 |
-| `timesfm3_real` (`--ignored`) | Real checkpoint: layers 0/10/19, raw logits, decode, and `predict_batch` on all six forecaster cases | decode ≤ 7.6e-6, forecaster ≤ 7.0e-6 (gate 1e-3) |
+| `timesfm3_real` (`--ignored`) | Real checkpoint: layers 0/10/19, raw logits, decode, and `predict_batch` on all seven forecaster cases | decode ≤ 7.6e-6, forecaster ≤ 1.4e-5 (gate 1e-3) |
 | `timesfm3_forecast` binary, by hand | CSV in, CSV out on the real checkpoint (three series of 300, 90 and 700 points, a gap, `--positive`, horizon 96) against upstream's `predict_batch()` on the same CSV | ≤ 9.8e-7; same rows and quantile labels |
 
 Mutation checks run against the host tests. Each of the following, applied
@@ -135,7 +136,12 @@ alone, turns `timesfm3_forecast_host` red:
 - removing the global-context cap;
 - leaving placeholder covariates unmasked;
 - fixing the group size at 4;
-- not zeroing all-NaN series.
+- not zeroing all-NaN series;
+- not z-normalising covariates;
+- not negating past-only covariates;
+- not negating past+future covariates;
+- clamping every variate by the first variate's sign;
+- treating an all-NaN series as non-negative.
 
 Disabling RoPE turns `timesfm3_tiny` red.
 

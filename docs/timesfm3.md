@@ -160,7 +160,12 @@ byte for byte; only the version line in `case.json` changed.
 ## Not done yet
 
 - **Timings.** `bench_timesfm3` (with `bench/timesfm3_torch.py` and
-  `bench/timesfm3_mlx.py` lanes) measures end-to-end decode latency. No
+  `bench/timesfm3_mlx.py` lanes) measures end-to-end `decode` latency
+  (`BENCH_WORKLOADS`), the user path `predict_batch` on ragged series with
+  optional covariates (`BENCH_PREDICT`; the torch lane runs upstream's
+  `TimesFM3Forecaster.predict_batch` on the same series), and a per-stage
+  split of either (`BENCH_STAGES=1`: plan, prepare, preprocess, forward,
+  postprocess, finish; tessl only). The MLX lane has no predict workloads. No
   number is claimed until it runs under the machine's heavy-job lock on an
   idle GPU. The MLX lane also needs an MLX environment that does not exist on
   this machine yet.

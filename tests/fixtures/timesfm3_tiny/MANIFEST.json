@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "generator": "tools/timesfm3_ref/make_reference.py",
- "generator_commit": "69879e2a076759ad8691958b64a858fca26a0cd9",
+ "generator_commit": "4b43224cef1440d1645ce563f248a84c2f721512",
  "versions": {
   "torch": "2.14.0",
   "transformers": "5.17.0",
@@ -14,962 +14,1154 @@
   "a_univariate.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "909e7f79aa7b11565bcf92f9660a545b21fed54c0c9eb92ce4ac2712283c2f04"
   },
   "a_univariate.effective_patch_mask.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "53f235a733e9dcd681502bac62b4137622699bc69c1ebc507b07d4903b8b7549"
   },
   "a_univariate.f64.fwd_values.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "3c0e53d84926b5d23b5d47791ccc777410e1dd6ead09282b3bfc1dd434c504eb"
   },
   "a_univariate.f64.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "9b7450007a6ebbf556ddf016ef6939fc6c76e4546eda5f761150eaf61f474232"
   },
   "a_univariate.f64.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "d3dafc94f04dd8cbe9f10d1e141edb2bf4f0d0aa89a6a5bf740cfe91088016bc"
   },
   "a_univariate.f64.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "bd4ea986516ecb81ea2702a3b78cc4bfbfcb131f960e06d89715e87280cc07fb"
   },
   "a_univariate.f64.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "22593d1447df481c3625c0f05e0dc24df0be0cb6c2cd28b1cd9b5d4723cd5712"
   },
   "a_univariate.f64.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "d312d8157eeede6df4fdf2f85842c0dc5159801010862119720f9f8af0cd4cba"
   },
   "a_univariate.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "8e3c228db7f4a3aba96fbbcac1805e2c51c8a2892b1b2ee1d71a67df73f1aa15"
   },
   "a_univariate.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6fc91dee29ace70e873976278417b3fdc82ed04cfd1edb38ca57280dd8c9dbf6"
   },
   "a_univariate.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "8781ea79c3d095e4064965756509ffa7617476732d364b382240fb0e3b32d32d"
   },
   "a_univariate.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "3efdcdc502e16cb31b70ea3a7e4c42a01b57782eda4ab0946a3228aeca080af4"
   },
   "a_univariate.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "45bff6de22b1f45cf23158fd52d710988fd5309ba6f1faf9d37ce218e29ee744"
   },
   "a_univariate.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "43980298f7ac5cfcc34a8a76f565909bf34f49a1a96c272c25543456e5dcb52f"
   },
   "a_univariate.layer_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28fd6213d9abc0a4a757e7d79f5cea536c62b86589cf4646b9ba182910185fa0"
   },
   "a_univariate.layer_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f99f52ac9f08cc024cc85d5e761eb911b6c256f579324ee3557f9747d9b18ab6"
   },
   "a_univariate.logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c1f4907c8927201820c98a4dd8b3bab816d20b90ab03f2b8e6baf9d9a06c83cb"
   },
   "a_univariate.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "cc2bff57f486c74734f173e355facc73009387d3740f465085ab61717ec960fa"
   },
   "a_univariate.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f3f59da3c7484d8e65ec9f3f4dcf647cfc32f2228dcb3ecd97a421a972bf523b"
   },
   "a_univariate.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4f7a35fcf54cb4d29fdd91c491975bedaccfdfbf95914f3bb5f80ac1c652c560"
   },
   "a_univariate.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f983b2701acc9e09e7f6243f5c02488e8af1c4e264357f89af8221998d3faca3"
   },
   "a_univariate.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "9168ff6165ca56e975d459105f4b5d4fe90ff0b925a51a85dd4fec2ed41b81dd"
   },
   "a_univariate.transformer_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "1b17170887998c1381ac3ddd9f5d00d1bccf3c120a8191cd971033101e929908"
   },
   "b_covariates.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "725dbac389fa69c725b09f67386fb2b8dfa3891a6562fb3f012147f0d55ad29e"
   },
   "b_covariates.effective_patch_mask.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3954cbef6991e4f85a43514bea24f780efd5e9d79f0406d05af35b6c1ce11843"
   },
   "b_covariates.f64.fwd_values.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "fcbb9e4a353948fe20f2f3f2870499cd87eaf0eb734d3117e8a72ea91e0b980d"
   },
   "b_covariates.f64.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "5ac37bf962021ddf61027bcaf0b6c01ba8f355fabfb3ccb414549b848a48e881"
   },
   "b_covariates.f64.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "2c27b7c931210b8c3ab381b833bb6d41b6f86a16f23164fd4a7abd2073fb7f7a"
   },
   "b_covariates.f64.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "cb39ba5666d39f48c847bf73d91c9bf6aa39535636930b89925da88618d620e4"
   },
   "b_covariates.f64.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "890fcc7ab731fdd203e5e10033be0d5e0f3b3f208498e3ef602647c2d6c0c528"
   },
   "b_covariates.f64.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b01d598c8dea4232026c8f064fc7d1f2db8ef18431f75900c400e34bb68b7ca8"
   },
   "b_covariates.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5e901b231cf2450a29c3783d09f21caf7faa4d37a85501ed91087074edd4e8ed"
   },
   "b_covariates.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1bd6d2f8984dbcb75207446b255eba7fe46fd8240ff7f4d803c5b8fde6195fd7"
   },
   "b_covariates.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "cc49e6d1398de95b438fddc766fcdb8b4fa4d731585419c9d430e8278015f0ba"
   },
   "b_covariates.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "9c77850b7d1d65d1fa9b45e491ebec0d25a9ce059536a0a355f3593a887767bf"
   },
   "b_covariates.in_pf.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e5b9d2f228249773913e8ea57db497163cd83e47ba1be34363a37c69d5c45f7e"
   },
   "b_covariates.in_pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1031a23c9f128fa52ed18e10a8ae8bc619d7227477124af7aeb09925fe0ae316"
   },
   "b_covariates.in_po.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6df87c0a04a8dd45048bc832ba742b8b7335c578a662c7ebbbe9799f49e35db1"
   },
   "b_covariates.in_po_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "de739a39eab49d2ca66496a99447de9b439d890bbb2a8aa8374230ad6c7f610a"
   },
   "b_covariates.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "5baf4006ee29816cc6922f337083b0004091b071934db776e089ed05087f096d"
   },
   "b_covariates.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4b87dba962601c0250ffb8431c438ae7cc8eb035b75ab7902c1006a6f1be7568"
   },
   "b_covariates.layer_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "d45d9a8b8123595e3264fbce36d911d045311cbb3308f92a07741416c40469b3"
   },
   "b_covariates.layer_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4bb7aa8f1b35bbbde333d12a784e2657802f8d1f7778141985b5c9ff24848980"
   },
   "b_covariates.logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "62c482d9c846f2e0b4e06d0bf6cdfdf51fc2158d275d9629847936d5909e911b"
   },
   "b_covariates.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f874a8065e11b050132e7d9b21b07f6f8eaa9959b78922324d9ccfc1072c042e"
   },
   "b_covariates.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "aa8ebd1c457614c69d1cff55509717f3cbbd63e0b4b2d85b8b00e0d0f3534ef2"
   },
   "b_covariates.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "28f2366d691bdee380515e8be68ce0abbc8438f1187e50d116d82f7070e7206a"
   },
   "b_covariates.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "81e42bbb42c2913114d93cfa4f13d6fbf417c4e2621b29e7c1bb060f9067b49f"
   },
   "b_covariates.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8fa748f02afe8572a5c020bd121452236b3697e1e9a648c3e949ad3d76a33b18"
   },
   "b_covariates.transformer_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "84fc77c6320c8ad303501e77cde41d51b052675fccbcf99227c1b3753db02167"
   },
   "c_constant.case.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "67dd6be754e31241173c319a026145c8716326d497cbf12bf99cffa9a3a3f6f2"
   },
   "c_constant.effective_patch_mask.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bfe280c931b8de39ba630b8f6dbecf2b2215e3d5e3bc5fe0f077a5f0845c42c8"
   },
   "c_constant.f64.fwd_values.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "b9e7cea5119f05ae6e7ed474636270f350ffbafaa9b8f774fe9ddc2742745d43"
   },
   "c_constant.f64.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "8bb2eb8fb5781f97079c010522a0c126aee93d9c51e5f387bcf3b244f867a9cd"
   },
   "c_constant.f64.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "6922ef067b16e37ac85147a2416cafa03bdc5143e1bcfaf65477ceb72c1c3f7c"
   },
   "c_constant.f64.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "ef5c8e0a9efaef2a7baa7e47e82418ba8835dde3ef6c0d3b67d46c8baa4398e8"
   },
   "c_constant.f64.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "1b134aa48de559637a251f51e7a68f0034c61b5e4eab340e35d56822469e10dc"
   },
   "c_constant.f64.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)"
+   "note": "float64 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6 (the model and inputs cast to f64)",
+   "sha256": "0367a2e374a182b610c694d6c7efaf82898fc8d4db8c4c468d8d5b38d0eff14e"
   },
   "c_constant.fwd_cpm.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "c82e0907f75794bf5b459e9ef31b5ce0582952754b9861c4f1984fbcada106de"
   },
   "c_constant.fwd_masks.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "c356b9e95ccb5cb6bd6e2aa385a5d5d7cd31a53c0b8369cd6fe06c4100358883"
   },
   "c_constant.fwd_patch_is_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1193e66dd7281b89c865d07a93d1ebbd0b19774e72fc147eed6a1c2ea128f66b"
   },
   "c_constant.fwd_values.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "afe5f351e67a7c0014035c5a621806aeacec9878a3b06d38efe06aea1f7e1045"
   },
   "c_constant.in_target.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "b7503b5a9b7904eb89a514ffde8d43afe4ee5b760f5575767ac34624504e7c17"
   },
   "c_constant.in_target_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "10ecc98134b99f2f2208520c9115f48f95274d279f1d292f43aef721ba0a78c0"
   },
   "c_constant.layer_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bcf03abbe7b47d2f7e20af1747cc8fc0ee4e0fa30b949dff29510ebff02c673f"
   },
   "c_constant.layer_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "ef672598eaefc14961e7d8ac38f52bea1e350d474c766a7f5dce3f7615f7c2aa"
   },
   "c_constant.logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a556fefb461edb9b523367cf66c43d4b4c09e9e161595bb27ee8fb2a16718915"
   },
   "c_constant.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "ed271a8f6b3d80bb4c231af94985345871550637b30fe0ca8cf9b3bdff5a8a8e"
   },
   "c_constant.raw_logits.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "584d9682eefab2dc0ad53f840b1501afd4e0183edaa90d7651b2867d288f8273"
   },
   "c_constant.resblock_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "783f2eb7b19579a64793d564c2a5b1dd2d900f63185377f3bab5c47237a75195"
   },
   "c_constant.revin_mean.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "693ba6c8f61a94c71c69f4b93bdcaf7855cd9976a69cb63cd79bf2f3d66acfa3"
   },
   "c_constant.revin_std.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bfe280c931b8de39ba630b8f6dbecf2b2215e3d5e3bc5fe0f077a5f0845c42c8"
   },
   "c_constant.transformer_input.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "9e3a3e4334b0fc597ce72b8aaf1ffd2e6f591afc5b8b00d20fae6e5398a534fd"
   },
   "config.json": {
    "role": "config",
    "published": true,
-   "note": "TimesFM3Torch.to_dict() of the tiny model"
+   "note": "TimesFM3Torch.to_dict() of the tiny model",
+   "sha256": "bfb1e7e0606056b9c742b29e3d3471d9cb5070761968ba66d4424e2ef3cd1f42"
   },
   "fa_ragged.call_0.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "e71e5b316ad77906188561cdbd69bd9d1facfe3d9165b135f5540bb23eeace42"
   },
   "fa_ragged.call_0.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a27d0db871f8ae081c90a49fcf1f3c8a73eec2ff8fea13062343f6f6043ade60"
   },
   "fa_ragged.call_0.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "84bd378ef0bdbf4d4a7154a71b6dd65c7abfb8b780c814aa6fdd781d8ed379a7"
   },
   "fa_ragged.call_1.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "03df2b4397c8b2773f988f413862557beb5b17f958bf01eccdcd38eda3e333d2"
   },
   "fa_ragged.call_1.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8ab101c86b130f5af0c49861e4fb0b4836f1b235acc62737fefcaa7a0530d7c5"
   },
   "fa_ragged.call_1.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "7067159c03dbcfda28acf6b87530712ff0c42bd87698ecc6401d0c5a7076a03f"
   },
   "fa_ragged.forecast.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "5aa6f1d924c4ac4fe82f58c5e6e748f208da9b856548d88f4d1e1469c9b013b3"
   },
   "fa_ragged.in_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "7960c0d2f0b83eb88d8b25e18386c3e736c5e46c88ba9d51dd6a77183ab1f494"
   },
   "fa_ragged.in_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "853494720ddb2492bbb0731b5a41f2045c39f2773436d6f8a49217823930377f"
   },
   "fa_ragged.in_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "a5eb8e28bb51d04ab74c05f41b2e34108a880a68f6e7780f1e2d1f5ada12c78a"
   },
   "fa_ragged.in_3.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "13db49430268ccbe36f6b3d4ae77dcf0175a15f164a9b5dcff1d6b0ef94709bb"
   },
   "fa_ragged.in_4.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "746005fc3e1aebfe66ce6e4851fcfe7537e69281bf8d9b64a0f869113bd95145"
   },
   "fa_ragged.in_5.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "f2ad2e3d3269757575a523c79a34458d82b335c1dcd6958fc50c963f49ad99e4"
   },
   "fa_ragged.out_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8b29688bc88d7c7a0d0239e1df3cd76ecec847bd2ad143c0b0d6395d280c0833"
   },
   "fa_ragged.out_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a9e2ba86ed10398118495e3c448bbdd38372ded3fb02129a35116aaa39630a2e"
   },
   "fa_ragged.out_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "55025e3fbd53245a14b38b6665aa447199a6d88719c21657ac4541b38d9e3bf5"
   },
   "fa_ragged.out_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "342f28366142f6ef052496442fc5fbdac5bc9b4a1874b77bd03a421a1e2ea7c1"
   },
   "fa_ragged.out_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "0032f7daa416db6dc98dd8a39849de25057e0cb886e8841016899eebe5927ec4"
   },
   "fa_ragged.out_5.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "de5babe3d88655d065c03b1439a2abec4af1dc94ec11b55033d39967e3bfa177"
   },
   "fa_ragged.point_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bc54c5f053572f2637ff97864164993ca8eba1d54343d0e650c991bf87bd1c93"
   },
   "fa_ragged.point_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "cbb4fb6babde2025234274dae97cdc3049ee4ad6feff02e73c94313ad5e47668"
   },
   "fa_ragged.point_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "7732788022fe35fb9204cfd14064d64f2b0d1fc3b7e6d5b0078f9f7f9310495e"
   },
   "fa_ragged.point_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "82c50a474938bcd4ed4ceb411726f49388b031df494d4878c383a1da348dc135"
   },
   "fa_ragged.point_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "1e26ef9e79b7e026f62567e3ec2ce81128a05ea5c691ce33b3d298d30d9bb54a"
   },
   "fa_ragged.point_5.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "0b5e92886ec42a0f4e60c0c45347b4002f8393dd832c765227525493db8529f1"
   },
   "fb_options.call_0.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "838073b786f513d5b1107491fc6208cc2169fec653912ec7626c2a350a3a5fa5"
   },
   "fb_options.call_0.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4f195e8abff60991e2107fdc73e5dd624f08517b1ba655f9f85996e9ced34361"
   },
   "fb_options.call_0.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "7bf5b95e67f82ff5e5b62c687fd91ec792175e39f20d9b78948a83135776651b"
   },
   "fb_options.call_1.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "bcb872bfe5718639ad96786adefbb0e46576938d5f2ed2e7317c2fadc10cd2a9"
   },
   "fb_options.call_1.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "41f7ed636ab5dd777bedcd7a7c37d4a16cf5e44de81806bc3e6d7a1aec8960a1"
   },
   "fb_options.call_1.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "283151c782d3e8de881bef31987eebfee90558cee42bbedffea17d9595703922"
   },
   "fb_options.call_2.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "1a7ddcf8dff0f70d0b2ac815c9f44b440e093f361dce2b89ae436d4c922c8718"
   },
   "fb_options.call_2.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "d01de66534f887cd4a5b0940e39c8119daaeac6fc0945d88ac7e71e7d528deef"
   },
   "fb_options.call_2.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "ca819d9dd32c3c13f7588e4cc67f372ebae8bb1c22281a8f155f790f6761da40"
   },
   "fb_options.call_3.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "e535097902010bc097f6312d0e868ec2b620a750c047728358ca98089bc7e9e5"
   },
   "fb_options.call_3.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a07b868590d5cd66a0face0793c35e6236d9871209cd946ef865e9eff80c1ab9"
   },
   "fb_options.call_3.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "c66ea718c616e7355789da1804364afe72502ad4f17b54bc8ac07da9f812870b"
   },
   "fb_options.forecast.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "88f81ff66a6d92394d582a136c14d12727eb38e39b4118c9d9fa790718467513"
   },
   "fb_options.in_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "64d42cd6f0e746d296aea7ea69ca90651f9e51ee142591b5ebc05e349f2655f0"
   },
   "fb_options.in_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "b2196576cfc5878d9e08317b3d3616b2a14e6b5df27da157e8aab268577036f5"
   },
   "fb_options.in_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "048d301356d6ba96a3dbbd64c8ccba8563afae770e3fb2a916b08532ec6ff51b"
   },
   "fb_options.in_3.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "6f7e9c5bb2c33716d391fe3dafd442bdb2be48ce488e769c89b39bcf1fdae980"
   },
   "fb_options.in_4.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "ea54aec365f3113d3c7f2c87cf15074d6f243dce9b3bb26311524d630bc62cc8"
   },
   "fb_options.out_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4efab839726946314332e068b3292cb1471a7660f2054a4d19c7b2e4c7a72524"
   },
   "fb_options.out_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3042f3188dcf9a43008cf92f9add069be46e6c0fa02fd31ff4b36fc6baf97209"
   },
   "fb_options.out_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "4941e75393cc5fe6dfb48b51a525651cf91382810d8d035081101f61887065c6"
   },
   "fb_options.out_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "79ee5771da2de57916a91527b534a503231996953efc571fb79b8da6a0427301"
   },
   "fb_options.out_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "154eeb8aa944e0c43d46f24745886211136e537c58fee9707b437a0824340ed5"
   },
   "fb_options.point_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "04444aceb79bc71fe4549d98559434b7dc32b03eba5cda49be7dbe766e4d9aea"
   },
   "fb_options.point_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "dd0bba8ebf636aa4793b893bb01ea3361d913a3e769a5e24377a8f1b16e850f9"
   },
   "fb_options.point_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "a09a4f453f6fb98e8d2c4bf196ba9a6b925da5d29340ab5d4f1f9f0c77e162d8"
   },
   "fb_options.point_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "3dc74210db56dec18421a3574b5aa23fdc9f85f43825a16f3b45ba5b27c84862"
   },
   "fb_options.point_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "32cf6b0c2d6a9e5e4e6e3eefc8fb185a237c5424ad82e2c49228f72db7392f7d"
   },
   "fc_multivariate_cov.call_0.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "178e521167846d62d44ae6fbf46d960d2b3a9c2be1bde089358020b787b2978a"
   },
   "fc_multivariate_cov.call_0.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "acbca13b1dcd74cb35609ed2b04cce41c5d1f3cfae3d77493431339107b5660a"
   },
   "fc_multivariate_cov.call_0.pf.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "90b21154150dabeed355c14bb1a58246cba261e5a14e44a5dfa35f70c9a58193"
   },
   "fc_multivariate_cov.call_0.pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "35004158583c7a5a6c3d1cecdc6b32d5922249414fd90c4e423a163ea19545e8"
   },
   "fc_multivariate_cov.call_0.po.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "1929bb67e1e06439e8d39aa1507ce51e74bbf376a26835e8b58a6cf8639a16c9"
   },
   "fc_multivariate_cov.call_0.po_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "28345d5a472dfbefa9af139490e030675ab55bd9067765444a62e09352ee0356"
   },
   "fc_multivariate_cov.call_0.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "2c55578510e019e0b250dc21ee0ab04c78660609891c436a0a83a4d2b31ba932"
   },
   "fc_multivariate_cov.call_1.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "f18c447c56f136769f2a6d0e98d15b1092d249a0b842c8e3237e51d1c16c87e8"
   },
   "fc_multivariate_cov.call_1.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "b2e9dba6f6472ecb30d7e9493ccccc1f0255ef4f1661a876489ab3024da303fb"
   },
   "fc_multivariate_cov.call_1.pf.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "ca992b15fe4033a5d2275768cc85188d041eb6a56698b95067e184e9c41c686f"
   },
   "fc_multivariate_cov.call_1.pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "ab4a25d58c10598e398b579d5d82fa0ec98b16db863ef38cd9f3c9484d9679b2"
   },
   "fc_multivariate_cov.call_1.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "bc9e5fbc74ad8f2b812d299dd791fd8dd4415d445feac058c0688a2538c82d64"
   },
   "fc_multivariate_cov.forecast.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "1b0afad3ef535dcb615432222b81eba1599e6b0fa4d635534be0aef71b9445b8"
   },
   "fc_multivariate_cov.in_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "e0cc5bcbd569378a8a49beecedc6dad2dfc1a8a50d4f08e6d1ef46ce022e4cd0"
   },
   "fc_multivariate_cov.in_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "a97d722b2740e8acb6be0d75f0ebdab64d3ad8959e5e1454db07f59590639e22"
   },
   "fc_multivariate_cov.in_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "c4cd1e778a449248184238810a69f2fd665b245bcbe652de2848ea9eb8fa0789"
   },
   "fc_multivariate_cov.in_3.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "84afe48389f7b8877214470c2be8c9337d7949ac1358c2a3b81bf5740d0d48a0"
   },
   "fc_multivariate_cov.in_4.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "3c3d770f3bfbc0957ef99fb4001f1406d459940fa083384936a0a8c6c3bba798"
   },
   "fc_multivariate_cov.in_pf_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "fd120e8568407f11fee7a67b1f8d30209fb596e8deaacf48a49f1be827e0b6ad"
   },
   "fc_multivariate_cov.in_pf_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "4c62ce6674077cd52d600f3fed3529723d93be7ddc8384fa0b4324940a505a46"
   },
   "fc_multivariate_cov.in_pf_4.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "ae16b0429a8a6743bd925c3dae921c3b0ec5c23661ef6347457907ce788e1edd"
   },
   "fc_multivariate_cov.in_po_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "706007ddd4b962de181d82008e77315075fc028c23cc4f7eb83b01a2b287d2bf"
   },
   "fc_multivariate_cov.in_po_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "86e36872e4777cb0b215c7de1b728319e9b045062f278a1847e621e36ebce320"
   },
   "fc_multivariate_cov.out_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "257f4e4626af5b3be9f1b6835e1984166731772cdaaacd5882e522255fa6f80f"
   },
   "fc_multivariate_cov.out_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "0a456f7bc865fed9ebac55423760f5eabe94de01201e3eb559ddbe620442f960"
   },
   "fc_multivariate_cov.out_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "f06b62dc0866e9f472ca211311a8682ca5c7a89e86281405d343498c4e18a559"
   },
   "fc_multivariate_cov.out_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "74b0dd6bfc2aff66f709dcfe8935efa69dd81fa6edbcee6c5ccb152e85718582"
   },
   "fc_multivariate_cov.out_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "c22770f6998b58d8cce18d3d1da6bb274de7f96330739541b92541794cd5dcd1"
   },
   "fc_multivariate_cov.point_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "91cf96f98f6ca9f3bf2c1e804c68addea4ba585a112afbb357a240f7910ff665"
   },
   "fc_multivariate_cov.point_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "cdf9a7f4475d9126d51877407f435f103df78b6315e6a42fa8d3b9ce99829e83"
   },
   "fc_multivariate_cov.point_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "2ec0bf9fa7ac043adaa76694bac3ec163dc046e744cfbbb6b6385331e0e1716e"
   },
   "fc_multivariate_cov.point_3.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "7a61292a81103079f0f2defdc5efd70b013d43af6660342d3d79a6f9455977d2"
   },
   "fc_multivariate_cov.point_4.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "03b1cdcfd705d6e67022d159f27c17a08d5c72cc02f7cc71eee79d88b1d8014a"
   },
   "fd_edge.call_0.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "1345b51f5fe73376f31715c9ecfc91a7173d4b9040eb8f02f89675ed55345500"
   },
   "fd_edge.call_0.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "737ae54c969a6975e2158e01971570a5f172f0ec0956cf080ab9e54f8a0b09f2"
   },
   "fd_edge.call_0.pf.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "23a547339b85191eb53fd11e094998da7f71ca587f36daeeb17f0b849141c37b"
   },
   "fd_edge.call_0.pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "07f9041187db5fbdb518a6f2a59d76ad7af00b589fcc26bd9e9baf751adde633"
   },
   "fd_edge.call_0.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "d307ed1d1c5066d2186f12dd67dac0c2ca78b3659a47e6e2e70d6e03a5985381"
   },
   "fd_edge.forecast.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "8e1a22428ecd34c100d3ff90719c828059f45465531945e827b9eccb933c46d3"
   },
   "fd_edge.in_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "ca89304ebb554b72623a4c6bb882f91b9dd698e4f5f1709341c73dd5727ef39a"
   },
   "fd_edge.in_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "26b6cd57c09e8777b54b5581b89ca6df158e3a1864b879890a787549e5172290"
   },
   "fd_edge.in_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "1f1c6b117ea96b90412833fe9f32a36d6aa24e699eef7572d939dda4351f8123"
   },
   "fd_edge.in_pf_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "c3e3d46994c2f3d0a37b69de3cb0e895848e02570c70d5826a65970fb6c67a5f"
   },
   "fd_edge.in_pf_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "a0816d82eae5072312993caea62bd7df89e47c0148a00b241703f9e03924a2a0"
   },
   "fd_edge.in_pf_2.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "f8913409789f1a9988a601ab4eb91b8d6caf659db417220a0c0f4e70fe334183"
   },
   "fd_edge.out_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "8bc639de2c6bc131e8808c82f6c571e8da95f5aa104392e2f81514edcf4ab391"
   },
   "fd_edge.out_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "71588a2c4c7c2d6d7d8b8ddbfd40b7f3d1bfd99fc9672e470a78b5ec39541fd5"
   },
   "fd_edge.out_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "bea055548cdf7a37d2b2fa35f0b6db6645380d15e3b5b0b49f531132ce86ca7f"
   },
   "fd_edge.point_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "87f20f2d6df53e7dab87a74775e3d918b84a98d2fcd49ea93e096fcf9acaa0ce"
   },
   "fd_edge.point_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "e6cf485b590cd194de38b4b08c9162122acedf8dfba890694835d535df4fa40f"
   },
   "fd_edge.point_2.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "aa501eceaacf996ca4f58b9836f6f517b34d2905eec66ceaacdacc70bcf5d9c3"
   },
   "fe_long.call_0.mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "87e6e73718948bed90bb37d84146553bd79975d4d75d47ffb09aaaa9fb9a5a4a"
   },
   "fe_long.call_0.out.npy": {
    "role": "golden",
    "published": true,
-   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "float32 CPU forward of upstream timesfm3.torch at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "727dd8ffd0fb9a5cd0009dac98ede80ae1b915fa40c19dd50566aa168ae3c1bd"
   },
   "fe_long.call_0.pf.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "29580b89d97e6d22a708ccc9103cd4b921f6f9f540d97d3e9ca428ac2046f975"
   },
   "fe_long.call_0.pf_mask.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "1e2fcda7cf4fd72dcd6d073ba675e73ee78a353464272ec453d0dd17afdebb4a"
   },
   "fe_long.call_0.target.npy": {
    "role": "input",
    "published": true,
-   "note": "a decode() call TimesFM3Forecaster.predict_batch() made"
+   "note": "a decode() call TimesFM3Forecaster.predict_batch() made",
+   "sha256": "7ce4713bf3e72a63365f0963808100a9a015fd7d766699e435040de20aef2414"
   },
   "fe_long.forecast.json": {
    "role": "config",
    "published": true,
-   "note": "the case's horizon, shapes, options, NaN counts and versions"
+   "note": "the case's horizon, shapes, options, NaN counts and versions",
+   "sha256": "5ddd6d00996de0275a0de5ac7e62efe8dae69580bdd2b028683c5f2060c4ac20"
   },
   "fe_long.in_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "06f58b9493609cc0e0b9edccd6f23434ea704086e1e6110e68e3ab8e4ad2b5ee"
   },
   "fe_long.in_1.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "778484efe7c4dc5a9fa7fd30e7c46e3cf64c1f5d27ef73f30aa4a3cf786a7529"
   },
   "fe_long.in_pf_0.npy": {
    "role": "input",
    "published": true,
-   "note": "decode() or predict_batch() input, or the forward() input decode() built"
+   "note": "decode() or predict_batch() input, or the forward() input decode() built",
+   "sha256": "c94eec5404b5561a39dbbbdf48c529832c36e2c953eedf755256a697e7410c54"
   },
   "fe_long.out_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "0903b79053d41cd3596973f659fd178fbc9ed7ec0b4dd9759f3b3303fd7c68c3"
   },
   "fe_long.out_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "29affae10650b1b8ec3170e01259340e8c4ad3e75059ba244b7187a3a84ce9d5"
   },
   "fe_long.point_0.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "2c8130a9fd080685f91835f332ed04596833a901594fa55d44030289a5d23649"
   },
   "fe_long.point_1.npy": {
    "role": "golden",
    "published": true,
-   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6"
+   "note": "TimesFM3Forecaster.predict_batch() output (float32 CPU) at 918df02c9d366b2145bc5876135fa2131d3ed2a6",
+   "sha256": "65695e385c4d8de1f97160e526b4ddbb1a732c69de19ba942f644dfe22731b48"
   },
   "model.safetensors": {
    "role": "model",
    "published": true,
-   "note": "the seeded tiny TimesFM 3 (2 layers, d 160, 2 heads of 80)"
+   "note": "the seeded tiny TimesFM 3 (2 layers, d 160, 2 heads of 80)",
+   "sha256": "2c9b5ceb04885e7898785db2c9efba530000faca4df5777ee974053f945a306b"
   }
  }
 }

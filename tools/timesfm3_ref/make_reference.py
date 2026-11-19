@@ -53,6 +53,7 @@ takes):
 import argparse
 import copy
 import dataclasses
+import hashlib
 import glob
 import json
 import os
@@ -480,6 +481,11 @@ def write_manifest(out_dir, metas):
                          "input": ("a decode() call TimesFM3Forecaster.predict_batch() made" if name.startswith("call_")
                                    else "decode() or predict_batch() input, or the forward() input decode() built")}[role(name)],
             }
+    # Every file's sha256, so tests/fixture_manifests.rs checks the bytes and
+    # not only the names.
+    for name, meta in files.items():
+        with open(os.path.join(out_dir, name), "rb") as f:
+            meta["sha256"] = hashlib.sha256(f.read()).hexdigest()
     fm.write_manifest(
         out_dir, "tools/timesfm3_ref/make_reference.py",
         f"drawn: numpy default_rng({SEED}) draws the series and torch.Generator().manual_seed({SEED}) "

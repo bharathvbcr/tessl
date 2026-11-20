@@ -73,6 +73,30 @@ impl StampLog {
         self.dropped_batches = self.dropped_batches.saturating_add(1);
     }
 
+    /// Disarm an armed log for readback: hand out its stamp metadata, the
+    /// overflow flag and the dropped-batch count (taken, so a batch can carry
+    /// it). `None` when the log is not armed, which leaves it untouched.
+    fn begin_resolve(&mut self) -> Option<(Vec<StampMeta>, bool, u32)> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        Some((
+            std::mem::take(&mut self.meta),
+            self.overflowed,
+            std::mem::take(&mut self.dropped_batches),
+        ))
+    }
+
+    /// Finish a readback begun by [`Self::begin_resolve`]: when no batch
+    /// carried the `dropped` count out (`delivered` is false: a build error
+    /// or no heap), add it back so the next resolved batch still reports it.
+    fn end_resolve(&mut self, dropped: u32, delivered: bool) {
+        if !delivered {
+            self.dropped_batches = self.dropped_batches.saturating_add(dropped);
+        }
+    }
+
     /// The state transition when a new command buffer begins: an armed buffer
     /// that recorded stamps but never reached a waiting commit is counted as
     /// dropped, then the per-buffer state is cleared and the log is disarmed.
@@ -97,8 +121,9 @@ impl StampLog {
 /// - [`StampLog::begin_command_buffer`] clears `meta`, `barrier_pending`,
 ///   `overflowed` and `armed` at the start of the next command buffer, and a
 ///   buffer left armed with stamps by the panic is then counted as dropped;
-/// - `dropped_batches` is only ever incremented by one saturating add or
-///   reset by a single store, so it is never torn.
+/// - `dropped_batches` is only ever changed by one saturating add or a single
+///   take or store, so it is never torn. [`resolve_stamp_log`] takes it and
+///   adds it back when no batch carries it out.
 fn stamp_log_guard(stamp_log: &Mutex<StampLog>) -> MutexGuard<'_, StampLog> {
     stamp_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -229,21 +254,18 @@ impl GpuRuntime {
 
     /// Read back an armed command buffer after its waiting commit completed.
     pub(crate) fn resolve_dispatch_stamps(&self) {
-        let mut log = stamp_log_guard(&self.stamp_log);
-        if !log.armed {
-            return;
-        }
-        log.armed = false;
-        let meta = std::mem::take(&mut log.meta);
-        let overflowed = log.overflowed;
-        let dropped = log.dropped_batches;
-        log.dropped_batches = 0;
-        drop(log);
-        let Some(heap) = self.metal4.stamp_heap.as_ref() else {
+        let Some((meta, overflowed, dropped)) = stamp_log_guard(&self.stamp_log).begin_resolve() else {
             return;
         };
-        let result = self.build_batch(heap, &meta, overflowed, dropped);
-        self.store_dispatch_stamps(result);
+        let result = self
+            .metal4
+            .stamp_heap
+            .as_ref()
+            .map(|heap| self.build_batch(heap, &meta, overflowed, dropped));
+        stamp_log_guard(&self.stamp_log).end_resolve(dropped, matches!(result, Some(Ok(_))));
+        if let Some(result) = result {
+            self.store_dispatch_stamps(result);
+        }
     }
 
     fn build_batch(
@@ -588,6 +610,36 @@ mod counter_tests {
             stamp_log_guard(&m).armed,
             "writes after recovery are visible to later readers"
         );
+    }
+
+    /// A build error must not erase the dropped-batch count: it goes back
+    /// into the log and the next successful batch reports it.
+    #[test]
+    fn a_build_error_keeps_the_dropped_batch_count() {
+        let mut log = armed_with_stamps(3);
+        let (meta, overflowed, dropped) = log.begin_resolve().expect("armed");
+        assert_eq!((meta.len(), overflowed, dropped), (1, true, 3));
+        assert_eq!(log.dropped_batches, 0, "taken for the batch");
+        log.end_resolve(dropped, false);
+        assert_eq!(log.dropped_batches, 3, "the count survives the build error");
+
+        // No heap (no result at all) keeps it too, and a drop in between adds.
+        log.armed = true;
+        let (_, _, dropped) = log.begin_resolve().expect("armed");
+        log.end_resolve(dropped, false);
+        log.note_dropped();
+        assert_eq!(log.dropped_batches, 4);
+
+        // A delivered batch consumes it: it is not reported twice.
+        log.armed = true;
+        let (_, _, dropped) = log.begin_resolve().expect("armed");
+        log.end_resolve(dropped, true);
+        assert_eq!((dropped, log.dropped_batches), (4, 0));
+
+        // An unarmed log is left alone.
+        log.dropped_batches = 2;
+        assert!(log.begin_resolve().is_none());
+        assert_eq!(log.dropped_batches, 2);
     }
 
     #[test]

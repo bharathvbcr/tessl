@@ -65,7 +65,19 @@ fn gemv_q4_matches_an_f64_reference_at_every_lane_boundary() {
             // Model-shaped.
             (64, 4096, 128),
         ] {
-            let q: Vec<i8> = (0..rows * cols).map(|i| ((i * 37 + 11) % 16) as i8 - 8).collect();
+            // The row enters the nibble: with `cols % 16 == 0` the bare `i * 37`
+            // repeats every row's nibbles exactly, so a kernel that read the
+            // wrong row would still match the reference.
+            let q: Vec<i8> = (0..rows * cols)
+                .map(|i| {
+                    let r = i / cols;
+                    ((i * 37 + 11 + r * 7 + r / 16) % 16) as i8 - 8
+                })
+                .collect();
+            assert!(
+                rows < 2 || q[..cols] != q[cols..2 * cols],
+                "gemv_q4 {rows}x{cols}: rows 0 and 1 carry identical nibbles"
+            );
             let groups = rows * (cols / group);
             let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
             let zeros: Vec<f32> = (0..groups).map(|i| -0.5 + (i % 5) as f32 * 0.25).collect();

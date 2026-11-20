@@ -106,7 +106,7 @@ impl HostConfig {
 /// missing; a missing mask means every point is present. NaN values are
 /// allowed only where masked (upstream replaces NaN by 0 before the model,
 /// and a masked point is zeroed anyway).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DecodeInput {
     pub batch: usize,
     pub context: usize,
@@ -147,33 +147,124 @@ impl DecodeInput {
         if start >= end || end > self.batch {
             return Err(format!("timesfm3: batch slice {start}..{end} of {}", self.batch));
         }
-        fn cut<T: Copy>(what: &str, x: &[T], batch: usize, start: usize, end: usize) -> Result<Vec<T>, String> {
-            if batch == 0 || !x.len().is_multiple_of(batch) {
+        Self::concat_batches(&[(self, start, end)])
+    }
+
+    /// Whether `other` has every field the forward depends on equal to this
+    /// input's apart from the batch size: context, horizon, the three variate
+    /// counts, and which of the arrays and masks are present. Two inputs
+    /// that agree can be one batch (see [`Self::concat_batches`]); any
+    /// difference, even in a field a forward would ignore, keeps them apart.
+    pub fn same_shape(&self, other: &DecodeInput) -> bool {
+        let key = |i: &DecodeInput| {
+            (
+                i.context,
+                i.horizon,
+                i.num_target,
+                i.num_past_only,
+                i.num_past_future,
+                [
+                    i.target_mask.is_some(),
+                    i.past_only.is_some(),
+                    i.past_only_mask.is_some(),
+                    i.past_future.is_some(),
+                    i.past_future_mask.is_some(),
+                ],
+            )
+        };
+        key(self) == key(other)
+    }
+
+    /// One input made of batch elements `start..end` of each item, in the
+    /// order given. Every item must have the shape of the first
+    /// ([`Self::same_shape`]) and arrays of exactly `batch` elements, and
+    /// each range must lie inside its item's batch; anything else is refused
+    /// by name. Elements never interact in decode(), so the forecast of the
+    /// result is the items' forecasts end to end.
+    pub fn concat_batches(items: &[(&DecodeInput, usize, usize)]) -> Result<DecodeInput, String> {
+        let (first, _, _) = items.first().ok_or("timesfm3: concatenating no batches")?;
+        let widths = [
+            first.num_target * first.context,
+            first.num_past_only * first.context,
+            first.num_past_future * (first.context + first.horizon),
+        ];
+        let mut out = DecodeInput {
+            batch: 0,
+            context: first.context,
+            horizon: first.horizon,
+            num_target: first.num_target,
+            target: Vec::new(),
+            target_mask: first.target_mask.as_ref().map(|_| Vec::new()),
+            num_past_only: first.num_past_only,
+            past_only: first.past_only.as_ref().map(|_| Vec::new()),
+            past_only_mask: first.past_only_mask.as_ref().map(|_| Vec::new()),
+            num_past_future: first.num_past_future,
+            past_future: first.past_future.as_ref().map(|_| Vec::new()),
+            past_future_mask: first.past_future_mask.as_ref().map(|_| Vec::new()),
+        };
+        fn push<T: Copy>(
+            what: &str,
+            dst: &mut Vec<T>,
+            src: &[T],
+            width: usize,
+            (batch, start, end): (usize, usize, usize),
+        ) -> Result<(), String> {
+            if batch == 0 || !src.len().is_multiple_of(batch) {
                 return Err(format!(
                     "timesfm3: {what} holds {} values, not a multiple of batch {batch}",
-                    x.len()
+                    src.len()
                 ));
             }
-            let per = x.len() / batch;
-            Ok(x[start * per..end * per].to_vec())
+            if src.len() != batch * width {
+                return Err(format!(
+                    "timesfm3: {what} holds {} values, not {batch} elements of {width}",
+                    src.len()
+                ));
+            }
+            dst.extend_from_slice(&src[start * width..end * width]);
+            Ok(())
         }
-        let b = self.batch;
-        let opt = |what: &str, x: &Option<Vec<f32>>| x.as_ref().map(|x| cut(what, x, b, start, end)).transpose();
-        let optm = |what: &str, x: &Option<Vec<u8>>| x.as_ref().map(|x| cut(what, x, b, start, end)).transpose();
-        Ok(DecodeInput {
-            batch: end - start,
-            context: self.context,
-            horizon: self.horizon,
-            num_target: self.num_target,
-            target: cut("target", &self.target, b, start, end)?,
-            target_mask: optm("target_mask", &self.target_mask)?,
-            num_past_only: self.num_past_only,
-            past_only: opt("past_only", &self.past_only)?,
-            past_only_mask: optm("past_only_mask", &self.past_only_mask)?,
-            num_past_future: self.num_past_future,
-            past_future: opt("past_future", &self.past_future)?,
-            past_future_mask: optm("past_future_mask", &self.past_future_mask)?,
-        })
+        for &(item, start, end) in items {
+            if !first.same_shape(item) {
+                return Err("timesfm3: batches of different shapes cannot be one batch".into());
+            }
+            if start > end || end > item.batch {
+                return Err(format!("timesfm3: batch slice {start}..{end} of {}", item.batch));
+            }
+            let at = (item.batch, start, end);
+            push("target", &mut out.target, &item.target, widths[0], at)?;
+            let optional = [
+                ("target_mask", &mut out.target_mask, &item.target_mask, widths[0]),
+                (
+                    "past_only_mask",
+                    &mut out.past_only_mask,
+                    &item.past_only_mask,
+                    widths[1],
+                ),
+                (
+                    "past_future_mask",
+                    &mut out.past_future_mask,
+                    &item.past_future_mask,
+                    widths[2],
+                ),
+            ];
+            for (what, dst, src, width) in optional {
+                if let (Some(dst), Some(src)) = (dst, src) {
+                    push(what, dst, src, width, at)?;
+                }
+            }
+            let covariates = [
+                ("past_only", &mut out.past_only, &item.past_only, widths[1]),
+                ("past_future", &mut out.past_future, &item.past_future, widths[2]),
+            ];
+            for (what, dst, src, width) in covariates {
+                if let (Some(dst), Some(src)) = (dst, src) {
+                    push(what, dst, src, width, at)?;
+                }
+            }
+            out.batch += end - start;
+        }
+        Ok(out)
     }
 }
 

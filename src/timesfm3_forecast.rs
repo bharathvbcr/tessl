@@ -21,9 +21,10 @@
 //!
 //! The grouping is upstream's and changes the numbers (a group's context and
 //! horizon follow from its members), so it is reproduced exactly; how a group
-//! is executed is not (`Timesfm3Model::predict_batch` may run it in pieces).
+//! is executed is not: [`pack`] runs the calls whose shapes agree as shared
+//! forwards.
 
-use crate::timesfm3::Forecast;
+use crate::timesfm3::{Forecast, MAX_ROWS};
 use crate::timesfm3_host::{DecodeInput, HostConfig};
 
 /// Upstream's `_MAX_CONTEXT_LENGTH`: a series longer than this (rounded up
@@ -500,6 +501,175 @@ fn group_call(
         past_future,
         past_future_mask,
     })
+}
+
+/// A slice of one plan call: batch elements `start..end` of `calls[call]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece {
+    pub call: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// [`pack`]'s output: the device forwards to run and where each one's batch
+/// elements came from.
+#[derive(Clone, Debug)]
+pub struct Packing {
+    /// One `decode()` input per device forward, each of at most the row cap.
+    pub forwards: Vec<DecodeInput>,
+    /// `pieces[f]` are the plan calls' batch elements that make up
+    /// `forwards[f]`, in order.
+    pub pieces: Vec<Vec<Piece>>,
+    /// The batch size of each plan call.
+    batches: Vec<usize>,
+}
+
+/// Packs a plan's calls into device forwards: the calls whose shapes agree
+/// ([`DecodeInput::same_shape`]: context, horizon, variates, covariate
+/// layout, masks) share forwards, every other pair never does. Within a
+/// shape the calls' batch elements are laid end to end, in plan order, and cut
+/// into forwards of at most `max_rows` (and [`MAX_ROWS`]) patch rows, whole
+/// elements each; forwards come out in order of first appearance of their
+/// shape. A forward is as many elements wide as fit, so the plan's calls
+/// (upstream's `per_core_batch_size` groups) stop being forwards of their own.
+///
+/// Elements never interact in `decode()`, and nothing a forward does to an
+/// element depends on how many others share it (the GEMMs' routing and tiles
+/// are chosen from N and K, and the attention and norms work per sequence and
+/// per row), so each element's forecast has the same bits packed or alone.
+/// Refuses, naming the sizes, a shape whose single element exceeds the cap.
+pub fn pack(cfg: &HostConfig, calls: &[DecodeInput], max_rows: usize) -> Result<Packing, String> {
+    let cap = max_rows.min(MAX_ROWS);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        match groups.iter_mut().find(|g| calls[g[0]].same_shape(call)) {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    let mut forwards = Vec::new();
+    let mut pieces = Vec::new();
+    let mut flush = |run: &mut Vec<Piece>| -> Result<(), String> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let items: Vec<(&DecodeInput, usize, usize)> = run.iter().map(|p| (&calls[p.call], p.start, p.end)).collect();
+        forwards.push(DecodeInput::concat_batches(&items)?);
+        pieces.push(std::mem::take(run));
+        Ok(())
+    };
+    for group in &groups {
+        let shape = &calls[group[0]];
+        let per = cfg.rows_per_series(shape.variates(), shape.context, shape.horizon);
+        if per > cap {
+            return Err(format!(
+                "timesfm3: one series needs {per} patch rows ({} variates, context {}, horizon {}), more than \
+                 one forward runs ({cap}); shorten the context or use fewer variates",
+                shape.variates(),
+                shape.context,
+                shape.horizon
+            ));
+        }
+        let chunk = cap / per.max(1);
+        let mut run: Vec<Piece> = Vec::new();
+        let mut filled = 0usize;
+        for &call in group {
+            let batch = calls[call].batch;
+            if batch == 0 {
+                // decode() refuses an empty batch by name; keep that refusal.
+                run.push(Piece { call, start: 0, end: 0 });
+                continue;
+            }
+            let mut start = 0;
+            while start < batch {
+                let take = (chunk - filled).min(batch - start);
+                run.push(Piece {
+                    call,
+                    start,
+                    end: start + take,
+                });
+                start += take;
+                filled += take;
+                if filled == chunk {
+                    flush(&mut run)?;
+                    filled = 0;
+                }
+            }
+        }
+        flush(&mut run)?;
+    }
+    Ok(Packing {
+        forwards,
+        pieces,
+        batches: calls.iter().map(|c| c.batch).collect(),
+    })
+}
+
+impl Packing {
+    /// The plan calls' forecasts, in plan order, from `outs`, one forecast per
+    /// [`Self::forwards`] entry: each forward's elements go back to the call
+    /// they came from. Refuses forecasts whose shape disagrees with the
+    /// forwards or with each other.
+    pub fn unpack(&self, outs: &[Forecast]) -> Result<Vec<Forecast>, String> {
+        if outs.len() != self.forwards.len() {
+            return Err(format!(
+                "timesfm3 pack: {} forecasts for {} forwards",
+                outs.len(),
+                self.forwards.len()
+            ));
+        }
+        let mut calls: Vec<Option<Forecast>> = self.batches.iter().map(|_| None).collect();
+        for (k, ((out, pieces), input)) in outs.iter().zip(&self.pieces).zip(&self.forwards).enumerate() {
+            let per = out.variates * out.horizon * out.quantiles;
+            if out.batch != input.batch || out.horizon != input.horizon || out.values.len() != out.batch * per {
+                return Err(format!(
+                    "timesfm3 pack: forecast {k} is [{}, {}, {}, {}] with {} values, expected a batch of {} over \
+                     horizon {}",
+                    out.batch,
+                    out.variates,
+                    out.horizon,
+                    out.quantiles,
+                    out.values.len(),
+                    input.batch,
+                    input.horizon
+                ));
+            }
+            let mut at = 0;
+            for p in pieces {
+                let part = &out.values[at * per..(at + p.end - p.start) * per];
+                at += p.end - p.start;
+                let slot = calls[p.call].get_or_insert_with(|| Forecast {
+                    batch: 0,
+                    variates: out.variates,
+                    horizon: out.horizon,
+                    quantiles: out.quantiles,
+                    values: Vec::new(),
+                });
+                if slot.batch != p.start
+                    || (slot.variates, slot.horizon, slot.quantiles) != (out.variates, out.horizon, out.quantiles)
+                {
+                    return Err(format!(
+                        "timesfm3 pack: call {} piece {}..{} follows {} elements",
+                        p.call, p.start, p.end, slot.batch
+                    ));
+                }
+                slot.values.extend_from_slice(part);
+                slot.batch += p.end - p.start;
+            }
+        }
+        calls
+            .into_iter()
+            .zip(&self.batches)
+            .enumerate()
+            .map(|(i, (slot, &batch))| match slot {
+                Some(f) if f.batch == batch => Ok(f),
+                other => Err(format!(
+                    "timesfm3 pack: call {i} has {} of its {batch} elements",
+                    other.map_or(0, |f| f.batch)
+                )),
+            })
+            .collect()
+    }
 }
 
 /// The rest of upstream's `predict_batch()`: `outs` holds one forecast per

@@ -19,7 +19,7 @@ mod tfm;
 
 use tessl::timesfm3::Forecast;
 use tessl::timesfm3::Timesfm3Config;
-use tessl::timesfm3_forecast::{finish, plan, PredictOptions, Rows, Series};
+use tessl::timesfm3_forecast::{finish, pack, plan, PredictOptions, Rows, Series};
 use tessl::timesfm3_host::DecodeInput;
 
 /// Interpolation and z-normalisation sum in f64 where numpy sums float32
@@ -288,4 +288,249 @@ fn slice_batch_is_the_batch_in_pieces() {
     let mut bad = full.clone();
     bad.target.pop();
     assert!(bad.slice_batch(0, 1).unwrap_err().contains("not a multiple of batch"));
+}
+
+// ---- packing -----------------------------------------------------------------
+
+/// A `decode()` input of `batch` elements whose every value says which call
+/// and element it is (`call * 1000 + element` plus its place in the array), so
+/// a slice that lands on the wrong element changes the result.
+fn input(call: usize, batch: usize, context: usize, horizon: usize, cov: (usize, usize), masks: bool) -> DecodeInput {
+    let fill = |n: usize, salt: usize| -> Vec<f32> {
+        (0..batch * n)
+            .map(|i| (call * 1000 + i / n.max(1) + salt) as f32 + (i % n.max(1)) as f32 * 0.001)
+            .collect()
+    };
+    let mask = |n: usize| masks.then(|| (0..batch * n).map(|i| ((i / n.max(1) + call) % 2) as u8).collect());
+    let (po, pf) = cov;
+    DecodeInput {
+        batch,
+        context,
+        horizon,
+        num_target: 2,
+        target: fill(2 * context, 0),
+        target_mask: mask(2 * context),
+        num_past_only: po,
+        past_only: (po > 0).then(|| fill(po * context, 300)),
+        past_only_mask: if po > 0 { mask(po * context) } else { None },
+        num_past_future: pf,
+        past_future: (pf > 0).then(|| fill(pf * (context + horizon), 600)),
+        past_future_mask: if pf > 0 { mask(pf * (context + horizon)) } else { None },
+    }
+}
+
+/// A stand-in for `decode()` that, like it, treats every batch element on its
+/// own: each output value is a function of that element's inputs alone.
+fn fake_decode(i: &DecodeInput) -> Forecast {
+    const Q: usize = 3;
+    let v = i.variates();
+    let per_target = i.num_target * i.context;
+    let mut values = Vec::new();
+    for e in 0..i.batch {
+        let mut seed = i.target[e * per_target..(e + 1) * per_target].iter().sum::<f32>();
+        if let Some(p) = &i.past_only {
+            let n = i.num_past_only * i.context;
+            seed += p[e * n..(e + 1) * n].iter().sum::<f32>();
+        }
+        if let Some(p) = &i.past_future {
+            let n = i.num_past_future * (i.context + i.horizon);
+            seed += p[e * n..(e + 1) * n].iter().sum::<f32>();
+        }
+        if let Some(m) = &i.target_mask {
+            seed += m[e * per_target..(e + 1) * per_target]
+                .iter()
+                .map(|&x| f32::from(x))
+                .sum::<f32>()
+                * 0.5;
+        }
+        for vi in 0..v {
+            for h in 0..i.horizon {
+                for q in 0..Q {
+                    values.push(seed + (vi * 100 + h * 10 + q) as f32);
+                }
+            }
+        }
+    }
+    Forecast {
+        batch: i.batch,
+        variates: v,
+        horizon: i.horizon,
+        quantiles: Q,
+        values,
+    }
+}
+
+/// Packed and run through `fake_decode`, then unpacked: must be, bit for bit,
+/// one `fake_decode` per call.
+fn packed_equals_unpacked(what: &str, calls: &[DecodeInput], max_rows: usize) -> usize {
+    let cfg = config();
+    let packing = pack(&cfg.host, calls, max_rows).unwrap_or_else(|e| panic!("{what}: {e}"));
+    let outs: Vec<Forecast> = packing.forwards.iter().map(fake_decode).collect();
+    let got = packing.unpack(&outs).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(got.len(), calls.len(), "{what}: forecasts");
+    for (k, (g, call)) in got.iter().zip(calls).enumerate() {
+        let want = fake_decode(call);
+        assert_eq!(
+            (g.batch, g.variates, g.horizon, g.quantiles),
+            (want.batch, want.variates, want.horizon, want.quantiles),
+            "{what} call {k}"
+        );
+        tfm::assert_bit_equal(&format!("{what} call {k}"), &g.values, &want.values);
+    }
+    for (f, (fwd, pieces)) in packing.forwards.iter().zip(&packing.pieces).enumerate() {
+        let rows: usize = pieces
+            .iter()
+            .map(|p| cfg.host.rows_per_series(fwd.variates(), fwd.context, fwd.horizon) * (p.end - p.start))
+            .sum();
+        assert!(
+            rows <= max_rows.min(tessl::timesfm3::MAX_ROWS),
+            "{what}: forward {f} has {rows} rows"
+        );
+        assert!(
+            pieces.iter().all(|p| calls[p.call].same_shape(fwd)),
+            "{what}: forward {f} mixes shapes"
+        );
+        assert_eq!(
+            fwd.batch,
+            pieces.iter().map(|p| p.end - p.start).sum::<usize>(),
+            "{what}: forward {f} batch"
+        );
+    }
+    packing.forwards.len()
+}
+
+#[test]
+fn equal_shapes_share_one_forward_and_unpack_to_their_calls() {
+    // Four calls of 4, 4, 4 and 2 elements: upstream's groups of one request.
+    let calls: Vec<DecodeInput> = [4, 4, 4, 2]
+        .iter()
+        .enumerate()
+        .map(|(k, &b)| input(k, b, 64, 64, (0, 0), true))
+        .collect();
+    assert_eq!(packed_equals_unpacked("equal shapes", &calls, 8192), 1);
+    let pk = pack(&config().host, &calls, 8192).unwrap();
+    assert_eq!(pk.forwards[0].batch, 14);
+}
+
+#[test]
+fn shapes_that_differ_in_any_field_never_share_a_forward() {
+    let base = |k| input(k, 3, 64, 64, (0, 0), true);
+    let variants = [
+        ("context", input(1, 3, 96, 64, (0, 0), true)),
+        ("horizon", input(2, 3, 64, 128, (0, 0), true)),
+        ("past-only channels", input(3, 3, 64, 64, (1, 0), true)),
+        ("past+future channels", input(4, 3, 64, 64, (0, 2), true)),
+        ("covariate layout", input(5, 3, 64, 64, (2, 1), true)),
+        ("masks present", input(6, 3, 64, 64, (0, 0), false)),
+    ];
+    for (field, other) in variants {
+        let calls = [base(0), other, base(7)];
+        let n = packed_equals_unpacked(field, &calls, 8192);
+        assert_eq!(
+            n, 2,
+            "{field}: the two equal calls share one forward, the odd one runs apart"
+        );
+        let pk = pack(&config().host, &calls, 8192).unwrap();
+        assert_eq!(
+            pk.pieces[0].iter().map(|p| p.call).collect::<Vec<_>>(),
+            [0, 2],
+            "{field}: non-adjacent equal calls merge"
+        );
+        assert_eq!(pk.pieces[1].iter().map(|p| p.call).collect::<Vec<_>>(), [1], "{field}");
+    }
+}
+
+#[test]
+fn packing_respects_the_row_cap_and_cuts_whole_elements() {
+    let cfg = config();
+    let one = cfg.host.rows_per_series(2, 64, 64);
+    // Calls of 3, 2 and 4 elements at a cap of 4 elements: forwards of 4, 4, 1,
+    // with the middle call cut across the first two.
+    let calls = [
+        input(0, 3, 64, 64, (0, 0), true),
+        input(1, 2, 64, 64, (0, 0), true),
+        input(2, 4, 64, 64, (0, 0), true),
+    ];
+    assert_eq!(packed_equals_unpacked("capped", &calls, 4 * one), 3);
+    let pk = pack(&cfg.host, &calls, 4 * one).unwrap();
+    assert_eq!(pk.forwards.iter().map(|f| f.batch).collect::<Vec<_>>(), [4, 4, 1]);
+    // A cap below one element is refused by name, and one element exactly fits.
+    let e = pack(&cfg.host, &calls, one - 1).unwrap_err();
+    assert!(e.contains("one series needs") && e.contains(&one.to_string()), "{e}");
+    assert_eq!(packed_equals_unpacked("one element", &calls, one), 9);
+}
+
+/// The forward counts the bench used to compute by hand (`forwards_for`).
+#[test]
+fn forwards_follow_the_row_cap() {
+    let cfg = config();
+    let p = cfg.host.input_patch_len;
+    // A univariate-target call of `batch` elements of `per` patch rows each.
+    let call = |batch: usize, per: usize| {
+        let horizon = cfg.host.output_patch_len;
+        let hp = cfg.host.rows_per_series(1, p, horizon) - 1;
+        let mut c = input(0, batch, p * (per - hp), horizon, (0, 0), false);
+        c.num_target = 1;
+        c.target = vec![0.5; batch * c.context];
+        assert_eq!(
+            cfg.host.rows_per_series(c.variates(), c.context, c.horizon),
+            per,
+            "test bug"
+        );
+        c
+    };
+    let forwards = |batch, per| pack(&cfg.host, &[call(batch, per)], 8192).map(|p| p.forwards.len());
+    assert_eq!(forwards(4, 100).unwrap(), 1);
+    assert_eq!(forwards(4, 4096).unwrap(), 2);
+    assert_eq!(forwards(5, 3000).unwrap(), 3);
+    assert_eq!(forwards(1, 8192).unwrap(), 1);
+    assert!(forwards(1, 8193).unwrap_err().contains("8193"));
+}
+
+#[test]
+fn unpack_refuses_forecasts_that_do_not_fit_the_packing() {
+    let cfg = config();
+    let calls = [input(0, 2, 64, 64, (0, 0), true), input(1, 3, 64, 64, (0, 0), true)];
+    let pk = pack(&cfg.host, &calls, 8192).unwrap();
+    let ok = fake_decode(&pk.forwards[0]);
+    assert!(pk.unpack(&[]).unwrap_err().contains("0 forecasts for 1 forwards"));
+    let mut short = fake_decode(&pk.forwards[0]);
+    short.batch -= 1;
+    short
+        .values
+        .truncate(short.batch * short.variates * short.horizon * short.quantiles);
+    assert!(pk.unpack(&[short]).unwrap_err().contains("expected a batch of 5"));
+    let mut cut = ok;
+    cut.values.pop();
+    assert!(pk.unpack(&[cut]).is_err());
+}
+
+#[test]
+fn concat_and_slice_batches_keep_every_array_aligned() {
+    let a = input(0, 5, 64, 64, (1, 2), true);
+    let b = input(1, 3, 64, 64, (1, 2), true);
+    let c = DecodeInput::concat_batches(&[(&a, 1, 4), (&b, 0, 2), (&a, 4, 5)]).unwrap();
+    assert_eq!(c.batch, 6);
+    for (k, (src, at)) in [(&a, 1), (&a, 2), (&a, 3), (&b, 0), (&b, 1), (&a, 4)]
+        .into_iter()
+        .enumerate()
+    {
+        let one = c.slice_batch(k, k + 1).unwrap();
+        let want = src.slice_batch(at, at + 1).unwrap();
+        assert_eq!(one, want, "element {k}");
+    }
+    let other = input(2, 3, 96, 64, (1, 2), true);
+    assert!(DecodeInput::concat_batches(&[(&a, 0, 1), (&other, 0, 1)])
+        .unwrap_err()
+        .contains("different shapes"));
+    assert!(DecodeInput::concat_batches(&[(&a, 0, 6)])
+        .unwrap_err()
+        .contains("0..6 of 5"));
+    assert!(DecodeInput::concat_batches(&[]).is_err());
+    let mut ragged = a.clone();
+    ragged.target.pop();
+    assert!(DecodeInput::concat_batches(&[(&ragged, 0, 1)])
+        .unwrap_err()
+        .contains("target holds"));
+    assert!(a.slice_batch(2, 2).is_err() && a.slice_batch(0, 6).is_err());
 }

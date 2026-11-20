@@ -12,8 +12,9 @@ NxVxL:H, each optionally +PO+PF) times upstream's TimesFM3Forecaster.predict_bat
 (device mps, per_core_batch_size = BENCH_PREDICT_BATCH, default 4) on the ragged
 synthetic series the module docs of src/bin/bench_timesfm3.rs define; as there,
 setting only BENCH_PREDICT drops the default decode set. Its rows add mode,
-series, per_core_batch_size, groups (one decode per group) and forwards (equal
-to groups here). The stage split (BENCH_STAGES) is tessl-only: this lane refuses
+series, per_core_batch_size, groups (one decode per group) and forwards (upstream's
+count: one forward per group, so equal to groups here; tessl's `forwards` is the
+count after it packs groups of equal shape, a different quantity). The stage split (BENCH_STAGES) is tessl-only: this lane refuses
 it rather than report an unsplit time as a split one.
 
     TIMESFM3_DIR=<snapshot> ~/.venvs/ml/bin/python bench/timesfm3_torch.py

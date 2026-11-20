@@ -245,6 +245,7 @@ pub struct ForwardOutput {
 
 /// A forecast: `[b, v, horizon, q]` for every variate (targets first, then
 /// covariates, as upstream's `decode()` returns them).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Forecast {
     pub batch: usize,
     pub variates: usize,
@@ -412,9 +413,12 @@ impl Timesfm3Model {
     /// Upstream's `TimesFM3Forecaster.predict_batch()`: one quantile forecast
     /// per series, `[targets, horizon, quantiles]` (see
     /// [`crate::timesfm3_forecast`] for what is done to the series around
-    /// the model). A group of queries that would exceed [`MAX_ROWS`] patch
-    /// rows runs as several forwards of whole series, which changes nothing:
-    /// series in one batch never interact.
+    /// the model). The plan's calls (groups of `per_core_batch_size`
+    /// queries) whose shapes agree run as shared forwards of whole series, up
+    /// to [`MAX_ROWS`] patch rows each ([`forecast::pack`]); calls of another
+    /// shape run apart. Series in one batch never interact and a row's bits do
+    /// not depend on how many others share its forward, so a series' forecast
+    /// is the same bit for bit packed, split or alone.
     pub fn predict_batch(
         &self,
         series: &[Series],
@@ -435,52 +439,31 @@ impl Timesfm3Model {
         max_rows: usize,
     ) -> Result<Vec<SeriesForecast>, String> {
         let plan = forecast::plan(&self.cfg.host, series, horizon, opts)?;
-        let outs = plan
-            .calls
+        let packing = forecast::pack(&self.cfg.host, &plan.calls, max_rows)?;
+        let outs = packing
+            .forwards
             .iter()
-            .map(|call| self.decode_capped(call, max_rows))
+            .map(|forward| self.decode(forward))
             .collect::<Result<Vec<_>, _>>()?;
-        forecast::finish(&plan, &outs)
+        forecast::finish(&plan, &packing.unpack(&outs)?)
     }
 
     /// [`Self::decode`] in pieces of whole batch elements, each at most
     /// `max_rows` (and [`MAX_ROWS`]) patch rows; the pieces' forecasts are
     /// concatenated. Refuses, naming the sizes, a single batch element larger
-    /// than that.
+    /// than that. (The cut is [`forecast::pack`]'s, so `predict_batch` and
+    /// this split a call at the same elements.)
     pub fn decode_capped(&self, input: &DecodeInput, max_rows: usize) -> Result<Forecast, String> {
-        let cap = max_rows.min(MAX_ROWS);
-        let per = self
-            .cfg
-            .host
-            .rows_per_series(input.variates(), input.context, input.horizon);
-        if per > cap {
-            return Err(format!(
-                "timesfm3: one series needs {per} patch rows ({} variates, context {}, horizon {}), more than \
-                 one forward runs ({cap}); shorten the context or use fewer variates",
-                input.variates(),
-                input.context,
-                input.horizon
-            ));
-        }
-        let chunk = cap / per.max(1);
-        if chunk >= input.batch {
-            return self.decode(input);
-        }
-        let mut values = Vec::new();
-        let mut shape = None;
-        for start in (0..input.batch).step_by(chunk) {
-            let f = self.decode(&input.slice_batch(start, (start + chunk).min(input.batch))?)?;
-            shape = Some((f.variates, f.horizon, f.quantiles));
-            values.extend_from_slice(&f.values);
-        }
-        let (variates, horizon, quantiles) = shape.ok_or("timesfm3: empty batch")?;
-        Ok(Forecast {
-            batch: input.batch,
-            variates,
-            horizon,
-            quantiles,
-            values,
-        })
+        let packing = forecast::pack(&self.cfg.host, std::slice::from_ref(input), max_rows)?;
+        let outs = packing
+            .forwards
+            .iter()
+            .map(|forward| self.decode(forward))
+            .collect::<Result<Vec<_>, _>>()?;
+        packing
+            .unpack(&outs)?
+            .pop()
+            .ok_or_else(|| "timesfm3: empty batch".to_string())
     }
 
     /// The device forward on `b * v * n` patch rows: `resblock_input` is

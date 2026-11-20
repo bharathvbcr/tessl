@@ -16,8 +16,12 @@
 mod common;
 
 use common::{random_f32, round_trip_bf16, tensor_bf16, tensor_f32, with_gpu};
-use tessl::gemm::{gemm_nt_f32, gemm_tn_f32, gemm_tn_train};
-use tessl::{gemm, gemm_f32, GemmBackend, PrecisionMode, Tensor};
+use std::sync::Arc;
+use tessl::gemm::{
+    gemm_batched, gemm_nt_f32, gemm_tiled, gemm_tn_f32, gemm_tn_train, BatchStrides, BatchedGemm, EpiTile,
+};
+use tessl::tensor::f32_slice_to_f16;
+use tessl::{gemm, gemm_f32, GemmBackend, GpuRuntime, PrecisionMode, Tensor};
 
 /// Enough repeats to cross command-buffer and allocator-slot boundaries; the
 /// Metal 4 package ping-pongs allocators, so a handful of runs could all land
@@ -289,5 +293,177 @@ fn splitk_under_hazard_skip_auto_stays_bit_identical_amid_neighbours() {
         }
         assert!(first.unwrap().iter().any(|&x| x != 0.0), "split-K output stayed zero");
         tessl::ab_flags::set_hazard_barriers(false);
+    });
+}
+
+// ------------------------------------------------- cross-route bit identity
+//
+// Everything above repeats one route against itself. The routes below are the
+// ones `RouteDecision` in `src/gemm.rs` classes as arithmetic-preserving
+// (`route_arithmetic` returns `Preserving` for `AutoCoopTile` and
+// `ForcedMatchingCoopTile` only), so two of them given the same operands must
+// agree to the bit, across shapes and across batch sizes.
+//
+// Excluded, each by that same doc: `PreferTnSplitk` and
+// `SplitKVersusOneLaunch` (they change the association of the K sum),
+// `Dtype` (changes the products), and `EpiTileWidth` (64x64 against 128x64 was
+// not classed bit-equal, so a width change is not a preserving route here;
+// `tests/gemm_correctness.rs` measures that pair on its own).
+
+#[derive(Clone, Copy, Debug)]
+enum Elem {
+    Bf16,
+    F16,
+}
+
+/// Upload `data` as the narrow element type, rounded so the values are exact.
+fn narrow_tensor(rt: &Arc<GpuRuntime>, elem: Elem, shape: &[usize], data: &[f32]) -> Tensor {
+    match elem {
+        Elem::Bf16 => tensor_bf16(rt, shape, &round_trip_bf16(data)),
+        Elem::F16 => {
+            let t = rt.alloc_tensor_f16(shape).expect("alloc_tensor_f16");
+            t.buffer.write_f16_bits(&f32_slice_to_f16(data));
+            t
+        }
+    }
+}
+
+/// The tile `gemm` picks, from its public doc: 64x64 when N <= 512, and for
+/// bf16 also when M does not fill a 128-row tile or C has fewer than 64 tiles of
+/// 128x64; 128x64 otherwise. A wrong copy of the rule cannot hide: the forced
+/// matching tile would then be the other geometry, and the comparison below
+/// holds only if the two geometries happen to agree bit for bit.
+fn documented_auto_tile(elem: Elem, m: usize, n: usize) -> EpiTile {
+    let narrow = n <= 512 || (matches!(elem, Elem::Bf16) && (m < 128 || m.div_ceil(128) * n.div_ceil(64) < 64));
+    if narrow {
+        EpiTile::Narrow
+    } else {
+        EpiTile::Wide
+    }
+}
+
+fn finite_and_written(label: &str, out: &[f32]) {
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "{label}: non-finite or unwritten output"
+    );
+    assert!(out.iter().any(|&v| v != 0.0), "{label}: output stayed zero");
+}
+
+#[test]
+fn auto_tile_and_the_forced_matching_tile_are_bit_identical() {
+    with_gpu(|rt| {
+        // Both sides of every clause of the selection rule: N <= 512, short M,
+        // few tiles (bf16 only), and a grid that fills the device.
+        let shapes: [(Elem, usize, usize, usize); 10] = [
+            (Elem::Bf16, 64, 64, 128),
+            (Elem::Bf16, 96, 512, 64),
+            (Elem::Bf16, 96, 520, 64),
+            (Elem::Bf16, 129, 520, 130),
+            (Elem::Bf16, 128, 4096, 64),
+            (Elem::Bf16, 256, 4096, 96),
+            (Elem::F16, 64, 64, 128),
+            (Elem::F16, 129, 520, 130),
+            (Elem::F16, 128, 4096, 64),
+            (Elem::F16, 67, 511, 33),
+        ];
+        for (case, &(elem, m, n, k)) in shapes.iter().enumerate() {
+            let a = narrow_tensor(rt, elem, &[m, k], &random_f32(m * k, 100 + case as u64));
+            let b = narrow_tensor(rt, elem, &[k, n], &random_f32(k * n, 200 + case as u64));
+            let auto = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            let forced = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            for c in [&auto, &forced] {
+                c.buffer.write_f32_prefix(&vec![f32::NAN; m * n]);
+            }
+            gemm(&a, &b, &auto, GemmBackend::TensorOps).unwrap();
+            gemm_tiled(
+                &a,
+                &b,
+                &forced,
+                GemmBackend::TensorOps,
+                documented_auto_tile(elem, m, n),
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+            let (auto_out, forced_out) = (auto.buffer.read_f32(), forced.buffer.read_f32());
+            let label = format!("{elem:?} {m}x{n}x{k} auto against its forced matching tile");
+            finite_and_written(&label, &auto_out[..m * n]);
+            assert_same_bits(&label, case, &auto_out[..m * n], &forced_out[..m * n]);
+        }
+    });
+}
+
+#[test]
+fn batched_elements_equal_the_single_matrix_gemm_at_every_batch_size() {
+    with_gpu(|rt| {
+        // `gemm_batched` documents each element as bit-identical to the `gemm`
+        // that would have produced it, at the tile `gemm` picks. Strides are
+        // multiples of 16 bytes for both element types (M*K and K*N multiples of
+        // 8 elements), as the batched alignment rule needs. Batch 1 takes the
+        // single-matrix kernel itself; 2 and up take the batched kernels.
+        let shapes: [(usize, usize, usize); 3] = [
+            (64, 64, 128),   // narrow: N <= 512
+            (129, 520, 136), // narrow by grid fill, a partial M and N tile
+            (128, 4096, 64), // wide: the grid fills the device
+        ];
+        for (elem, (m, n, k)) in [Elem::Bf16, Elem::F16]
+            .into_iter()
+            .flat_map(|e| shapes.into_iter().map(move |s| (e, s)))
+        {
+            assert_eq!((m * k) % 8, 0);
+            assert_eq!((k * n) % 8, 0);
+            for batch in [1usize, 2, 3, 5, 8] {
+                for shared_b in [false, true] {
+                    let a_all = narrow_tensor(
+                        rt,
+                        elem,
+                        &[batch * m, k],
+                        &random_f32(batch * m * k, 300 + batch as u64),
+                    );
+                    let b_batches = if shared_b { 1 } else { batch };
+                    let b_all = narrow_tensor(
+                        rt,
+                        elem,
+                        &[b_batches * k, n],
+                        &random_f32(b_batches * k * n, 400 + batch as u64),
+                    );
+                    let c_all = rt.alloc_tensor_f32(&[batch * m, n]).unwrap();
+                    c_all.buffer.write_f32_prefix(&vec![f32::NAN; batch * m * n]);
+                    let strides = if shared_b {
+                        BatchStrides::shared_b(m, n, k)
+                    } else {
+                        BatchStrides::contiguous(m, n, k)
+                    };
+                    gemm_batched(
+                        &a_all,
+                        &b_all,
+                        &c_all,
+                        GemmBackend::TensorOps,
+                        BatchedGemm {
+                            m,
+                            n,
+                            k,
+                            batch,
+                            strides,
+                        },
+                    )
+                    .unwrap();
+                    rt.synchronize().unwrap();
+                    let batched = c_all.buffer.read_f32();
+                    for i in 0..batch {
+                        let a_i = a_all.view(&[m, k], i * m * k);
+                        let b_i = b_all.view(&[k, n], if shared_b { 0 } else { i * k * n });
+                        let single = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                        single.buffer.write_f32_prefix(&vec![f32::NAN; m * n]);
+                        gemm(&a_i, &b_i, &single, GemmBackend::TensorOps).unwrap();
+                        rt.synchronize().unwrap();
+                        let want = single.buffer.read_f32();
+                        let label = format!("{elem:?} {m}x{n}x{k} batch {batch} shared_b {shared_b} element {i}");
+                        finite_and_written(&label, &want[..m * n]);
+                        assert_same_bits(&label, i, &want[..m * n], &batched[i * m * n..(i + 1) * m * n]);
+                    }
+                }
+            }
+        }
     });
 }

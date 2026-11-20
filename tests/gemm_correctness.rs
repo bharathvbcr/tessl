@@ -634,7 +634,12 @@ fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
             check_f32(rt, Layout::Nn, m, n, 8);
         }
 
-        println!("TILE_BITS_DIFFER (M, differing elements, elements): {tile_bits_differ:?}");
+        // The `gemm` doc: both geometries give the same bits.
+        assert!(
+            tile_bits_differ.iter().all(|&(_, differ, _)| differ == 0),
+            "64x64 and 128x64 differ in bits, (M, differing elements, elements): {tile_bits_differ:?}; \
+             the `gemm` doc says the two geometries give the same bits"
+        );
 
         rt.take_dispatch_count();
         let a = tensor_bf16(rt, &[1, 64], &vec![1.0f32; 64]);

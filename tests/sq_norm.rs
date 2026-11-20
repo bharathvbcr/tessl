@@ -5,6 +5,8 @@
 //! anything is encoded.
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::sync::Arc;
 
 use tessl::sq_norm::{decode_sq_norm, sq_norm, SqNormPlan, SqWindow, SQ_OUT_WORDS};
@@ -51,6 +53,7 @@ fn squares(vals: &[f32], rows: usize, width: usize, ld: usize, off: usize) -> f6
 /// rerun, and the caller-buffer encode at offsets giving the same bits.
 #[test]
 fn many_windows_match_f64_in_any_order() {
+    let _gpu = common::gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     let mut keep = Vec::new();
     let mut specs = Vec::new(); // (tensor index, dtype, rows, width, ld, off, byte_off)
@@ -129,6 +132,7 @@ fn many_windows_match_f64_in_any_order() {
 /// the f64 sum within 2^-18, finite and nonzero.
 #[test]
 fn huge_and_tiny_values_are_finite_and_right() {
+    let _gpu = common::gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     let big = 1.0e30f32;
     let mut a = vec![big; 5000];
@@ -161,6 +165,7 @@ fn huge_and_tiny_values_are_finite_and_right() {
 /// A NaN anywhere is NaN, an infinity (and no NaN) +inf, from any window.
 #[test]
 fn a_non_finite_value_is_reported() {
+    let _gpu = common::gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     let base: Vec<f32> = (0..20_000).map(|j| val(5, j)).collect();
     let run = |bad: &[(usize, f32)]| {
@@ -192,6 +197,7 @@ fn a_non_finite_value_is_reported() {
 /// of another runtime.
 #[test]
 fn refusals_encode_nothing() {
+    let _gpu = common::gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     let other = GpuRuntime::new().unwrap();
     let t = f32_tensor(&rt, &[1.0; 100]);
@@ -246,6 +252,7 @@ fn refusals_encode_nothing() {
 
 #[test]
 fn parts_words_is_two_per_piece_and_encode_refuses_one_short() {
+    let _gpu = common::gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     let n = 3 * tessl::sq_norm::SQ_PIECE;
     let t = f32_tensor(&rt, &vec![1.0; n]);

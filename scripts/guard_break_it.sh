@@ -500,10 +500,21 @@ restore() {
 # go on perturbing files after the backup was gone (128 + signal number). Each
 # handler's first command ignores further signals, so a second one cannot
 # interrupt the restore; restore() does the same for the EXIT path.
+# The bounded test run is a background job the shell `wait`s on: bash runs a
+# trap only between commands, so a signal sent to this script alone (a kill, a
+# supervisor's TERM) would otherwise wait out the whole test run, or the
+# timeout, before the trap ran at all. stop_bounded hands the signal on to the
+# runner, whose handler ends the test's own process group.
+bounded_pid=""
+stop_bounded() {
+  local pid=$bounded_pid
+  bounded_pid=""
+  [ -z "$pid" ] || { kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+}
 trap restore EXIT
-trap "trap '' INT TERM HUP; restore; exit 130" INT
-trap "trap '' INT TERM HUP; restore; exit 143" TERM
-trap "trap '' INT TERM HUP; restore; exit 129" HUP
+trap "trap '' INT TERM HUP; stop_bounded; restore; exit 130" INT
+trap "trap '' INT TERM HUP; stop_bounded; restore; exit 143" TERM
+trap "trap '' INT TERM HUP; stop_bounded; restore; exit 129" HUP
 
 bak=$(mktemp -d "$tmp_base/tessl-guard-bak.XXXXXX") || die "could not create a backup dir under $tmp_base"
 [ -n "$bak" ] && [ -d "$bak" ] || die "mktemp gave no backup dir under $tmp_base"
@@ -511,8 +522,11 @@ cp tests/reductions.rs tests/nn_adversarial.rs "$bak/" || die "could not back up
 before=$(hash_tests) || die "shasum failed on the test files (rc $?)"
 backed_up=1
 
+# Runs as a background job (`run_cargo`), where `exec` makes the job's pid the
+# runner's own, so `$!` is the pid `stop_bounded` signals. Never call it in the
+# foreground: the exec would replace this script.
 run_bounded() {
-  perl -e '
+  exec perl -e '
     my ($secs, $log, @cmd) = @ARGV;
     my $pid = fork();
     die "fork: $!" unless defined $pid;
@@ -522,10 +536,19 @@ run_bounded() {
       open(STDERR, ">&STDOUT");
       exec { $cmd[0] } @cmd or exit 127;
     }
-    $SIG{ALRM} = sub {
+    # End the test group (it leads its own, so an INT from the terminal or a
+    # kill of this runner does not reach it by itself): TERM, a grace, KILL, and
+    # only then reap the leader, so the group id cannot have been reused when
+    # it is signalled.
+    my $end = sub {
+      my $code = shift;
       kill "TERM", -$pid; select(undef, undef, undef, 3); kill "KILL", -$pid;
-      waitpid($pid, 0); exit 124;
+      waitpid($pid, 0); exit $code;
     };
+    $SIG{ALRM} = sub { $end->(124) };
+    $SIG{INT}  = sub { $end->(130) };
+    $SIG{TERM} = sub { $end->(143) };
+    $SIG{HUP}  = sub { $end->(129) };
     alarm $secs;
     waitpid($pid, 0);
     my $st = $?;
@@ -570,9 +593,14 @@ base_fail=0
 note() { echo "guard_break_it: $*"; }
 
 run_cargo() {
-  local bin=$1 name=$2 log=$3
+  local bin=$1 name=$2 log=$3 rc
   run_bounded "$test_timeout" "$log" \
-    cargo test --manifest-path "$root/Cargo.toml" --test "$bin" -- "$name" --exact --test-threads=1 --nocapture
+    cargo test --manifest-path "$root/Cargo.toml" --test "$bin" -- "$name" --exact --test-threads=1 --nocapture &
+  bounded_pid=$!
+  wait "$bounded_pid"
+  rc=$?
+  bounded_pid=""
+  return "$rc"
 }
 
 planfile=$(mktemp "$tmp_base/tessl-guard-plan.XXXXXX") || die "could not create a plan file under $tmp_base"

@@ -119,6 +119,60 @@ fn measure(
     })
 }
 
+/// The one place a `METRIC` line is built, so the names this binary prints
+/// cannot drift from what `bench_paired --format metrics` accepts.
+///
+/// That driver takes exactly `METRIC name value` split on whitespace, with
+/// `value` a positive number, and refuses a name reported twice. A kernel's row
+/// shape is free text ("1 pos, 8q/2kv x 256"), so every whitespace or comma run
+/// in `name` becomes one `_`. A name that is empty, or a value that is not
+/// finite and positive once rounded to `decimals`, is refused rather than
+/// printed.
+fn metric_line(name: &str, value: f64, decimals: usize) -> Result<String, String> {
+    let token = name
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if token.is_empty() {
+        return Err(format!("METRIC name {name:?} has no printable characters"));
+    }
+    let text = format!("{value:.decimals$}");
+    if !text.parse::<f64>().is_ok_and(|v| v.is_finite() && v > 0.0) {
+        return Err(format!(
+            "METRIC {token}: value {value} prints as {text}, not a positive number"
+        ));
+    }
+    Ok(format!("METRIC {token} {text}"))
+}
+
+/// Every `host_us/<kernel>/<shape>` line for the table, then the median. Two
+/// rows that sanitize to the same name are an error: the driver would refuse
+/// the run, so say which one here.
+fn host_us_metrics(rows: &[Row], median: f64) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    for r in rows {
+        // The bracketed GFLOP/s in a GEMM row's name changes run to run.
+        let base = r.name.split(" [").next().unwrap_or(&r.name);
+        let tag = r.name.find(" [").map(|i| &r.name[i..]).filter(|t| !t.contains("GFLOP"));
+        let name = format!("{base}{}", tag.unwrap_or("")).replace([' ', '[', ']'], "");
+        let line = metric_line(&format!("host_us/{name}/{}", r.shape), r.host_us, 4)?;
+        if !seen.insert(line.split(' ').nth(1).unwrap_or_default().to_owned()) {
+            return Err(format!("two rows print the same METRIC name: {line}"));
+        }
+        lines.push(line);
+    }
+    lines.push(metric_line("host_us/median", median, 4)?);
+    Ok(lines)
+}
+
+/// Print one `METRIC` line through [`metric_line`].
+fn print_metric(name: &str, value: f64, decimals: usize) -> Result<(), String> {
+    println!("{}", metric_line(name, value, decimals)?);
+    Ok(())
+}
+
 /// Sentinel seeded into every output before the kernel runs. Chosen so no
 /// kernel here could legitimately produce it.
 const UNWRITTEN: f32 = -1.234_567_9e30;
@@ -292,8 +346,9 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
             || nn::row_sum_f32(&rt, &x, &s, r as u32, c as u32),
         )?);
 
-        nn::row_max_f32(&rt, &x, &s, r as u32, c as u32)?;
-        rt.synchronize()?;
+        verify(&rt, "row_max_f32", &s, r, || {
+            nn::row_max_f32(&rt, &x, &s, r as u32, c as u32)
+        })?;
         rows.push(measure(
             &rt,
             "row_max_f32",
@@ -412,14 +467,9 @@ fn kernel_table(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(),
     }
     let host = common::median(rows.iter().map(|r| r.host_us).collect())?;
     println!("\nMedian host encode per batched dispatch: {host:.2} us.");
-    for r in &rows {
-        // The bracketed GFLOP/s in a GEMM row's name changes run to run.
-        let base = r.name.split(" [").next().unwrap_or(&r.name);
-        let tag = r.name.find(" [").map(|i| &r.name[i..]).filter(|t| !t.contains("GFLOP"));
-        let name = format!("{base}{}", tag.unwrap_or("")).replace([' ', '[', ']'], "");
-        println!("METRIC host_us/{name}/{} {:.4}", r.shape, r.host_us);
+    for line in host_us_metrics(&rows, host)? {
+        println!("{line}");
     }
-    println!("METRIC host_us/median {host:.4}");
 
     let floor = common::median(rows.iter().map(|r| r.solo_us).collect())?;
     println!(
@@ -1497,8 +1547,8 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
     tessl::decode_icb::set_icb_pipelines(false);
     println!("pipeline hit:          {plain:>9.1} ns");
     println!("pipeline hit (ICB):    {icb:>9.1} ns");
-    println!("METRIC pipeline_hit_ns {plain:.3}");
-    println!("METRIC pipeline_hit_icb_ns {icb:.3}");
+    print_metric("pipeline_hit_ns", plain, 3)?;
+    print_metric("pipeline_hit_icb_ns", icb, 3)?;
 
     // Decode-style sampling over a full vocabulary: a final-norm-sized
     // dispatch, then the sampler, then read the token.
@@ -1521,8 +1571,8 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
         || read_token(&tok),
     )?;
     println!("softcap_argmax_one_pass token loop: encode {enc:>8.2} us, wall {wall:>8.2} us per token (token {t})");
-    println!("METRIC sample_one_pass_encode_us {enc:.4}");
-    println!("METRIC sample_one_pass_wall_us {wall:.4}");
+    print_metric("sample_one_pass_encode_us", enc, 4)?;
+    print_metric("sample_one_pass_wall_us", wall, 4)?;
 
     // Multi-pass: V -> ceil(V/256) -> ... -> 1.
     let mut ns = vec![VOCAB as u32];
@@ -1557,8 +1607,8 @@ fn host_path(rt: &Arc<GpuRuntime>, warmup: usize, iters: usize) -> Result<(), St
         || read_token(&idx[passes - 1]),
     )?;
     println!("argmax_f32_pass x{passes} token loop:  encode {enc:>8.2} us, wall {wall:>8.2} us per token (token {t})");
-    println!("METRIC sample_multi_pass_encode_us {enc:.4}");
-    println!("METRIC sample_multi_pass_wall_us {wall:.4}");
+    print_metric("sample_multi_pass_encode_us", enc, 4)?;
+    print_metric("sample_multi_pass_wall_us", wall, 4)?;
     Ok(())
 }
 
@@ -1569,7 +1619,123 @@ fn read_token(out: &GpuBuffer) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::timed_token_loop;
+    use super::{host_us_metrics, metric_line, timed_token_loop, Row};
+
+    /// `bench_paired`'s `parse_metrics` grammar: exactly `METRIC name value`
+    /// on whitespace, value a positive number.
+    fn paired_accepts(line: &str) -> bool {
+        let [metric, name, value] = line.split_whitespace().collect::<Vec<_>>()[..] else {
+            return false;
+        };
+        metric == "METRIC" && !name.is_empty() && value.parse::<f64>().is_ok_and(|v| v > 0.0)
+    }
+
+    /// Every row shape the binary can print, read from this file's own source:
+    /// each `&format!("..")` argument, each `let sh = format!("..")`, and each
+    /// bare literal passed as a lane's shape (the line after its name). Format
+    /// holes become a number. Read from source because the shapes are only built
+    /// on a GPU, and a new lane then needs no registration here.
+    fn printable_shapes() -> Vec<String> {
+        let src = include_str!("bench_nn_kernels.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let lines: Vec<&str> = prod.lines().map(str::trim).collect();
+        let literal = |l: &str| -> Option<String> {
+            let rest = l.strip_prefix('"')?;
+            Some(rest[..rest.find("\",")?].to_string())
+        };
+        let mut shapes = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let template = if let Some(r) = l.strip_prefix("&format!(\"") {
+                r.split('"').next().map(str::to_string)
+            } else if let Some(r) = l.strip_prefix("let sh = format!(\"") {
+                r.split('"').next().map(str::to_string)
+            } else if i > 0 && matches!(lines[i - 1], "name," | "&name,") {
+                literal(l)
+            } else {
+                None
+            };
+            let Some(template) = template else { continue };
+            let mut out = String::new();
+            let mut hole = false;
+            for ch in template.chars() {
+                match ch {
+                    '{' => hole = true,
+                    '}' => {
+                        hole = false;
+                        out.push('7');
+                    }
+                    _ if !hole => out.push(ch),
+                    _ => {}
+                }
+            }
+            shapes.push(out);
+        }
+        shapes
+    }
+
+    fn row(name: &str, shape: &str) -> Row {
+        Row {
+            name: name.to_string(),
+            shape: shape.to_string(),
+            batched_us: 1.0,
+            host_us: 0.6807,
+            solo_us: 1.0,
+            gb_s: 1.0,
+        }
+    }
+
+    /// The card's evidence: `bench_paired --format metrics` refused
+    /// `METRIC host_us/rms_qkv_rope/1 pos, 8q/2kv x 256 0.6807`.
+    #[test]
+    fn every_printable_shape_gives_a_name_bench_paired_parses() {
+        let shapes = printable_shapes();
+        assert!(shapes.len() >= 20, "source scan found only {} shapes", shapes.len());
+        assert!(
+            shapes.iter().any(|s| s.contains(' ')),
+            "the scan no longer sees the shapes that contain whitespace: {shapes:?}"
+        );
+        let names = ["gemv_q4 [tiled]", "gemm_i8_dequant [123 GFLOP/s]", "rms_qkv_rope"];
+        let rows: Vec<Row> = shapes
+            .iter()
+            .flat_map(|s| names.iter().map(move |n| row(n, s)))
+            .collect();
+        // Distinct names x distinct shapes may still collide; the shape list
+        // repeats across lanes, so dedupe before asking for uniqueness.
+        let mut uniq: Vec<Row> = Vec::new();
+        for r in rows {
+            if !uniq.iter().any(|u| u.name == r.name && u.shape == r.shape) {
+                uniq.push(r);
+            }
+        }
+        let lines = match host_us_metrics(&uniq, 0.5) {
+            Ok(l) => l,
+            Err(e) => {
+                // A collision between two distinct shapes is a naming defect too.
+                panic!("{e}")
+            }
+        };
+        for line in &lines {
+            assert!(paired_accepts(line), "bench_paired would refuse {line:?}");
+        }
+        assert_eq!(lines.len(), uniq.len() + 1);
+    }
+
+    #[test]
+    fn metric_line_replaces_whitespace_and_commas_and_refuses_bad_input() {
+        let line = metric_line("host_us/rms_qkv_rope/1 pos, 8q/2kv x 256", 0.6807, 4).unwrap();
+        assert_eq!(line, "METRIC host_us/rms_qkv_rope/1_pos_8q/2kv_x_256 0.6807");
+        assert!(paired_accepts(&line));
+        assert!(metric_line(" , ", 1.0, 4).is_err());
+        assert!(metric_line("x", 0.0, 4).is_err());
+        assert!(metric_line("x", f64::NAN, 4).is_err());
+        assert!(metric_line("x", 0.00001, 4).is_err(), "rounds to 0.0000");
+    }
+
+    #[test]
+    fn colliding_sanitized_names_are_refused() {
+        let rows = [row("k", "a b"), row("k", "a,b")];
+        assert!(host_us_metrics(&rows, 1.0).unwrap_err().contains("same METRIC name"));
+    }
 
     /// `BENCH_WARMUP=0` has no warmup read to seed the expected token, so the
     /// first timed read must. (It used to compare against a literal 0 and fail

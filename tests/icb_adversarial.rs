@@ -253,8 +253,10 @@ fn rms_chain(hazard: bool, async_encode: bool) -> (Vec<bool>, usize, usize) {
 /// barrier for a true cross-element RAW chain (each sync scope is its own
 /// command buffer, so live needs none), but replay packs the whole tape into
 /// one encoder, where an unmarked edge is no ordering at all.
-/// CURRENTLY FAILS on gp/w7-icb (marks all false); passed before f632bda,
-/// where replay re-added a hazard barrier after every dispatch.
+/// Passes on 012eb02 (4 of 4 in this file, log target-gp/gpu-w14-vac-seeds.log).
+/// It failed on gp/w7-icb with every mark false, until f9b5fb6 carried the
+/// pending hazard across scope boundaries so sync captures record their RAW
+/// edges; the marker for the last command is legitimately false.
 #[test]
 fn a_sync_hazard_capture_of_a_raw_chain_replays_with_its_barriers() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());

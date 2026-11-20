@@ -90,6 +90,108 @@ fn check_bf16(rt: &std::sync::Arc<GpuRuntime>, layout: Layout, m: usize, n: usiz
     );
 }
 
+/// Extents of 1 in each of M, N and K, and extents that are not a multiple of
+/// any tile edge (32, 64, 128), so a trailing partial tile and a one-element
+/// dimension each reach the kernels on their own.
+const DEGENERATE: [(usize, usize, usize); 10] = [
+    (1, 1, 1),
+    (1, 1, 64),
+    (1, 97, 33),
+    (33, 1, 65),
+    (65, 33, 1),
+    (2, 3, 5),
+    (31, 31, 31),
+    (33, 33, 33),
+    (63, 65, 127),
+    (129, 31, 65),
+];
+
+#[test]
+fn degenerate_extents_f32_match_cpu_reference() {
+    with_gpu(|rt| {
+        for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
+            for &(m, n, k) in &DEGENERATE {
+                check_f32(rt, layout, m, n, k);
+            }
+        }
+    });
+}
+
+#[test]
+fn degenerate_extents_bf16_nn_match_cpu_reference() {
+    with_gpu(|rt| {
+        for &(m, n, k) in &DEGENERATE {
+            check_bf16(rt, Layout::Nn, m, n, k);
+        }
+    });
+}
+
+#[test]
+fn degenerate_extents_bf16_tn_nt_match_cpu_reference() {
+    with_gpu(|rt| {
+        rt.set_precision(PrecisionMode::Bf16);
+        for layout in [Layout::Tn, Layout::Nt] {
+            for &(m, n, k) in &DEGENERATE {
+                check_bf16(rt, layout, m, n, k);
+            }
+        }
+    });
+}
+
+/// A zero extent in M, N or K is refused with the one documented message, and
+/// the refusal encodes nothing. Checked on exact f32 and on bf16, through the
+/// entry each layout has.
+#[test]
+fn zero_extents_are_refused_without_encoding() {
+    with_gpu(|rt| {
+        // The bf16 TN/NT entries only engage under PrecisionMode::Bf16.
+        rt.set_precision(PrecisionMode::Bf16);
+        const REFUSAL: &str = "GEMM requires nonempty rank-2 tensors";
+        let (m, n, k) = (4usize, 8usize, 16usize);
+        for zero in ["m", "n", "k"] {
+            let (zm, zn, zk) = match zero {
+                "m" => (0, n, k),
+                "n" => (m, 0, k),
+                _ => (m, n, 0),
+            };
+            let a_full = rt.alloc_tensor_f32(&[m * k]).unwrap();
+            let b_full = rt.alloc_tensor_f32(&[k * n]).unwrap();
+            let c_full = rt.alloc_tensor_f32(&[m * n]).unwrap();
+            let a_full_bf = rt.alloc_tensor_bf16(&[m * k]).unwrap();
+            let b_full_bf = rt.alloc_tensor_bf16(&[k * n]).unwrap();
+            for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
+                let (a_shape, b_shape) = operand_shapes(layout, zm, zn, zk);
+                let a = a_full.view(&a_shape, 0);
+                let b = b_full.view(&b_shape, 0);
+                let c = c_full.view(&[zm, zn], 0);
+                rt.take_dispatch_count();
+                let f32_err = match layout {
+                    Layout::Nn => gemm_f32(&a, &b, &c, GemmBackend::TensorOps),
+                    Layout::Tn => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps),
+                    Layout::Nt => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps),
+                }
+                .expect_err("zero extent must be refused");
+                assert_eq!(f32_err, REFUSAL, "f32 {layout:?} zero {zero}");
+
+                let a = a_full_bf.view(&a_shape, 0);
+                let b = b_full_bf.view(&b_shape, 0);
+                let bf_err = match layout {
+                    Layout::Nn => gemm(&a, &b, &c, GemmBackend::TensorOps),
+                    Layout::Tn => gemm_tn_train(&a, &b, &c, GemmBackend::TensorOps),
+                    Layout::Nt => gemm_nt_train(&a, &b, &c, GemmBackend::TensorOps),
+                }
+                .expect_err("zero extent must be refused");
+                assert_eq!(bf_err, REFUSAL, "bf16 {layout:?} zero {zero}");
+                assert_eq!(
+                    rt.take_dispatch_count(),
+                    0,
+                    "{layout:?} zero {zero}: a refused GEMM still encoded"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn nn_f32_matches_cpu_reference() {
     with_gpu(|rt| {
@@ -380,8 +482,12 @@ fn f16_tensor(rt: &std::sync::Arc<GpuRuntime>, shape: &[usize], data: &[f32]) ->
 }
 
 /// `|narrow - wide|` against [`tolerance`] with `operand_u = 0`, the bound
-/// [`assert_within_bound`] uses for bf16 GEMM. Bit-identical tiles never
-/// consult a magnitude: the difference is zero, which is inside that bound.
+/// [`assert_within_bound`] uses for bf16 GEMM, and then against zero: the
+/// public doc on `gemm` says both geometries give the same bits, so the caller
+/// asserts the returned count of differing elements is zero, however small the
+/// difference. The tolerance alone passes a one-ulp divergence, which is the
+/// defect this comparison exists to catch. The count is returned, not asserted
+/// here, so one run reports every case.
 #[allow(clippy::too_many_arguments)]
 fn assert_tiles_within_bf16_bound(
     label: &str,
@@ -392,7 +498,7 @@ fn assert_tiles_within_bf16_bound(
     m: usize,
     n: usize,
     k: usize,
-) {
+) -> usize {
     assert_eq!(narrow.len(), m * n, "{label}");
     assert_eq!(wide.len(), m * n, "{label}");
     let mut worst = 0.0f32;
@@ -436,6 +542,7 @@ fn assert_tiles_within_bf16_bound(
         worst_scaled <= 1.0,
         "{label}: element {worst_at} is {worst_scaled:.3}x the bf16 GEMM tolerance"
     );
+    bits_differ
 }
 
 fn same_bits(label: &str, got: &[f32], want: &[f32]) {
@@ -461,6 +568,7 @@ fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
         let b16 = tensor_bf16(rt, &[k, n], &b_h);
         let b_f16 = f16_tensor(rt, &[k, n], &random_f32(k * n, 0xF164));
 
+        let mut tile_bits_differ: Vec<(usize, usize, usize)> = Vec::new();
         for (case, &m) in [1usize, 127, 128, 200].iter().enumerate() {
             let a_h = round_trip_bf16(&random_f32(m * k, 0xA164 + case as u64));
             let a16 = tensor_bf16(rt, &[m, k], &a_h);
@@ -481,7 +589,7 @@ fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
                 wide_out[..m * n].iter().any(|v| v.abs() > 1e-3),
                 "M={m} wide bf16 wrote nothing"
             );
-            assert_tiles_within_bf16_bound(
+            let differ = assert_tiles_within_bf16_bound(
                 &format!("bf16 M={m} {m}x{n}x{k}"),
                 &narrow_out[..m * n],
                 &wide_out[..m * n],
@@ -491,6 +599,7 @@ fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
                 n,
                 k,
             );
+            tile_bits_differ.push((m, differ, m * n));
             let followed = if m < 128 { &narrow_out } else { &wide_out };
             same_bits(&format!("bf16 auto M={m}"), &auto_out[..m * n], &followed[..m * n]);
 
@@ -524,6 +633,8 @@ fn short_m_bf16_plain_gemm_matches_the_wide_tile() {
             // the reference stays cheap; N is still past 512.
             check_f32(rt, Layout::Nn, m, n, 8);
         }
+
+        println!("TILE_BITS_DIFFER (M, differing elements, elements): {tile_bits_differ:?}");
 
         rt.take_dispatch_count();
         let a = tensor_bf16(rt, &[1, 64], &vec![1.0f32; 64]);

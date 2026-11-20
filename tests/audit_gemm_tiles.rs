@@ -653,8 +653,20 @@ fn stale_arch02_copy(crate_root: &Path) -> Result<Option<PathBuf>, PathBuf> {
     if !kernels.is_dir() {
         return Err(kernels);
     }
-    let stale = kernels.join("matmul_tensorops.metal");
-    Ok(stale.exists().then_some(stale))
+    // Any kernel file tessl itself ships is a copy when it reappears there, not
+    // only the one that did once; matmul_tensorops stays named in case tessl's
+    // own tree ever drops it.
+    let mut shared: Vec<String> = fs::read_dir(crate_root.join("kernels"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".metal"))
+        .collect();
+    shared.push("matmul_tensorops.metal".to_string());
+    shared.sort_unstable();
+    shared.dedup();
+    Ok(shared.iter().map(|n| kernels.join(n)).find(|p| p.exists()))
 }
 
 #[test]
@@ -718,6 +730,22 @@ fn the_arch02_guard_sees_a_planted_copy() {
         stale_arch02_copy(&crate_root),
         Ok(Some(planted.join("matmul_tensorops.metal"))),
         "a planted copy went unseen"
+    );
+    // A copy of any other kernel tessl ships is as stale as that one.
+    fs::remove_file(planted.join("matmul_tensorops.metal")).unwrap();
+    fs::create_dir_all(crate_root.join("kernels")).unwrap();
+    fs::write(crate_root.join("kernels/some_shared_kernel.metal"), "").unwrap();
+    fs::write(planted.join("an_arch02_only_kernel.metal"), "").unwrap();
+    assert_eq!(
+        stale_arch02_copy(&crate_root),
+        Ok(None),
+        "a kernel only arch02 has is not a copy"
+    );
+    fs::write(planted.join("some_shared_kernel.metal"), "").unwrap();
+    assert_eq!(
+        stale_arch02_copy(&crate_root),
+        Ok(Some(planted.join("some_shared_kernel.metal"))),
+        "a copy of another of tessl's kernels went unseen"
     );
 }
 

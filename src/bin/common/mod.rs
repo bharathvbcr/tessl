@@ -492,7 +492,9 @@ pub fn max_rel_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String
     let worst = max_abs_diff(lane, got, want)?;
     let scale = want.iter().fold(0.0f64, |m, &w| m.max(f64::from(w).abs()));
     if scale == 0.0 {
-        return Err(format!("{lane}: the reference is all zero, so a relative error has no scale"));
+        return Err(format!(
+            "{lane}: the reference is all zero, so a relative error has no scale"
+        ));
     }
     Ok(worst / scale)
 }
@@ -761,13 +763,23 @@ mod tests {
     fn diff_comparators_fail_on_nan_empty_and_length_mismatch() {
         assert_eq!(max_abs_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.5, 4.0]).unwrap(), 0.5);
         assert_eq!(max_rel_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.0, 5.0]).unwrap(), 0.2);
-        assert!(max_abs_diff("t", &[1.0, f32::NAN], &[1.0, 2.0]).unwrap_err().contains("not finite"));
-        assert!(max_abs_diff("t", &[1.0, 2.0], &[f32::NAN, 2.0]).unwrap_err().contains("not finite"));
+        assert!(max_abs_diff("t", &[1.0, f32::NAN], &[1.0, 2.0])
+            .unwrap_err()
+            .contains("not finite"));
+        assert!(max_abs_diff("t", &[1.0, 2.0], &[f32::NAN, 2.0])
+            .unwrap_err()
+            .contains("not finite"));
         assert!(max_abs_diff("t", &[f32::INFINITY], &[f32::INFINITY]).is_err());
         assert!(max_abs_diff("t", &[], &[]).unwrap_err().contains("nothing to compare"));
-        assert!(max_abs_diff("t", &[1.0], &[]).unwrap_err().contains("nothing to compare"));
-        assert!(max_abs_diff("t", &[1.0, 2.0], &[1.0]).unwrap_err().contains("2 values against 1"));
-        assert!(max_rel_diff("t", &[0.0, 0.0], &[0.0, 0.0]).unwrap_err().contains("all zero"));
+        assert!(max_abs_diff("t", &[1.0], &[])
+            .unwrap_err()
+            .contains("nothing to compare"));
+        assert!(max_abs_diff("t", &[1.0, 2.0], &[1.0])
+            .unwrap_err()
+            .contains("2 values against 1"));
+        assert!(max_rel_diff("t", &[0.0, 0.0], &[0.0, 0.0])
+            .unwrap_err()
+            .contains("all zero"));
         assert!(max_rel_diff("t", &[f32::NAN], &[1.0]).is_err());
         // The lane is named in every refusal.
         assert!(max_abs_diff("the-lane", &[], &[]).unwrap_err().starts_with("the-lane:"));

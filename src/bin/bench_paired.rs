@@ -679,11 +679,14 @@ impl Archive {
     /// is written; if the JSON cannot be written the previous archive is put
     /// back and this run's is kept as a failed one.
     fn commit(&mut self, publish: impl FnOnce() -> Res<()>) -> Res<()> {
-        let aside = PathBuf::from(format!("{}.replaced-{}", self.final_dir.display(), common::unique_stamp()));
+        let aside = PathBuf::from(format!(
+            "{}.replaced-{}",
+            self.final_dir.display(),
+            common::unique_stamp()
+        ));
         let had_old = self.final_dir.exists();
         if had_old {
-            std::fs::rename(&self.final_dir, &aside)
-                .map_err(|e| format!("{}: {e}", self.final_dir.display()))?;
+            std::fs::rename(&self.final_dir, &aside).map_err(|e| format!("{}: {e}", self.final_dir.display()))?;
         }
         if let Err(e) = std::fs::rename(&self.dir, &self.final_dir) {
             if had_old {
@@ -1263,9 +1266,14 @@ fn provenance_files(lanes: &[Lane], envs: &[BTreeMap<String, String>]) -> Res<Ve
     for (lane, env) in lanes.iter().zip(envs) {
         for (i, arg) in lane.argv.iter().enumerate() {
             let resolved = if i == 0 {
-                Some(resolve_executable(arg, env.get("PATH").map(String::as_str)).ok_or_else(|| {
-                    format!("lane {}: {arg} is not on the lane's PATH, so its bytes cannot be hashed", lane.name)
-                })?)
+                Some(
+                    resolve_executable(arg, env.get("PATH").map(String::as_str)).ok_or_else(|| {
+                        format!(
+                            "lane {}: {arg} is not on the lane's PATH, so its bytes cannot be hashed",
+                            lane.name
+                        )
+                    })?,
+                )
             } else {
                 Some(PathBuf::from(arg)).filter(|p| p.is_file())
             };
@@ -2042,7 +2050,11 @@ mod tests {
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
         let lane = parse_lane("a=bench_lane --x").unwrap();
         let env = |path: &str| BTreeMap::from([("PATH".to_string(), path.to_string())]);
-        let found = provenance_files(std::slice::from_ref(&lane), &[env(&format!("/nonexistent:{}", d.display()))]).unwrap();
+        let found = provenance_files(
+            std::slice::from_ref(&lane),
+            &[env(&format!("/nonexistent:{}", d.display()))],
+        )
+        .unwrap();
         assert_eq!(found, vec![("lane:a:bench_lane".to_string(), bin.clone())]);
         // Not on the lane's PATH: refused, naming the lane, not silently left out.
         let err = provenance_files(std::slice::from_ref(&lane), &[env("/nonexistent")]).unwrap_err();
@@ -2072,12 +2084,21 @@ mod tests {
         let lane7 = parse_lane("b:BENCH_ITERS=7=bin").unwrap();
         let get = |v: &[(String, Jv)], k: &str| v.iter().find(|(n, _)| n == k).map(|_| ());
         // Not cleaned: every lane inherits both knobs, and the lanes agree on workloads only.
-        let envs: Vec<_> = [&plain, &lane7].iter().map(|l| lane_env(l, inherited(), false)).collect();
+        let envs: Vec<_> = [&plain, &lane7]
+            .iter()
+            .map(|l| lane_env(l, inherited(), false))
+            .collect();
         let rec = recorded_env(&envs);
         assert!(get(&rec, "BENCH_WORKLOADS").is_some());
-        assert!(get(&rec, "BENCH_ITERS").is_none(), "lanes disagree on BENCH_ITERS: not a single value");
+        assert!(
+            get(&rec, "BENCH_ITERS").is_none(),
+            "lanes disagree on BENCH_ITERS: not a single value"
+        );
         // Cleaned: nothing inherited reaches a lane, so nothing inherited is recorded.
-        let envs: Vec<_> = [&plain, &plain].iter().map(|l| lane_env(l, inherited(), true)).collect();
+        let envs: Vec<_> = [&plain, &plain]
+            .iter()
+            .map(|l| lane_env(l, inherited(), true))
+            .collect();
         assert!(recorded_env(&envs).is_empty(), "{:?}", recorded_env(&envs).len());
         assert!(knobs(&envs[0]).is_empty());
         // A lane's own setting survives and is recorded for that lane.
@@ -2121,7 +2142,10 @@ mod tests {
             // The run fails here: the Archive is dropped without a commit.
         }
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "old json");
-        assert_eq!(std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(), "old lane output");
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "old lane output"
+        );
         assert_eq!(
             std::fs::read_to_string(d.join("o.json.lanes.failed/r01-0-a.stdout")).unwrap(),
             "new lane output"
@@ -2156,11 +2180,19 @@ mod tests {
         let mut a = Archive::create(&out).unwrap();
         lane_stage(&a);
         let o = out.clone();
-        a.commit(|| std::fs::write(&o, "new json").map_err(|e| e.to_string())).unwrap();
+        a.commit(|| std::fs::write(&o, "new json").map_err(|e| e.to_string()))
+            .unwrap();
         drop(a);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "new json");
-        assert_eq!(std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(), "new lane output");
-        assert_eq!(names(&d), ["o.json", "o.json.lanes"], "no staging or replaced dir is left");
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "new lane output"
+        );
+        assert_eq!(
+            names(&d),
+            ["o.json", "o.json.lanes"],
+            "no staging or replaced dir is left"
+        );
 
         let (d2, out2) = archive_fixture("commit_fails");
         let mut a = Archive::create(&out2).unwrap();
@@ -2169,7 +2201,10 @@ mod tests {
         assert_eq!(err, "disk full");
         drop(a);
         assert_eq!(std::fs::read_to_string(&out2).unwrap(), "old json");
-        assert_eq!(std::fs::read_to_string(d2.join("o.json.lanes/r01-0-a.stdout")).unwrap(), "old lane output");
+        assert_eq!(
+            std::fs::read_to_string(d2.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "old lane output"
+        );
         assert_eq!(
             std::fs::read_to_string(d2.join("o.json.lanes.failed/r01-0-a.stdout")).unwrap(),
             "new lane output"
@@ -2191,12 +2226,21 @@ mod tests {
         let d = scratch("timeout");
         let pidfile = d.join("sleep.pid");
         let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!("echo partial-out; echo partial-err >&2; sleep 300 & echo $! > '{}'; wait", pidfile.display()));
+        cmd.arg("-c").arg(format!(
+            "echo partial-out; echo partial-err >&2; sleep 300 & echo $! > '{}'; wait",
+            pidfile.display()
+        ));
         let t0 = std::time::Instant::now();
         let raw = proc::run_bounded_raw(&mut cmd, Duration::from_secs(1));
-        assert!(t0.elapsed() < Duration::from_secs(20), "the timeout did not bound the run");
-        assert!(raw.error.as_deref().is_some_and(|e| e.starts_with("timed out")), "{:?}", raw.error);
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "the timeout did not bound the run"
+        );
+        assert!(
+            raw.error.as_deref().is_some_and(|e| e.starts_with("timed out")),
+            "{:?}",
+            raw.error
+        );
         assert!(String::from_utf8_lossy(&raw.stdout).contains("partial-out"));
         assert!(String::from_utf8_lossy(&raw.stderr).contains("partial-err"));
         let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();

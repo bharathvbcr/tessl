@@ -242,7 +242,9 @@ mod tests {
         assert!(check(&w, &want, 1e-4).is_ok());
         assert!(check_cosine(&w, &want, 0.999).is_ok());
         // Fewer clips answered than the reference holds.
-        assert!(check(&w, &want[..1], 1e-4).unwrap_err().contains("1 clips answered against 2"));
+        assert!(check(&w, &want[..1], 1e-4)
+            .unwrap_err()
+            .contains("1 clips answered against 2"));
         assert!(check_cosine(&w, &want[..1], 0.999).is_err());
         // More clips answered than referenced.
         let mut more = want.clone();

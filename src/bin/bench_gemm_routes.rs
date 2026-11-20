@@ -529,7 +529,11 @@ fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let mut worst = 0.0f64;
             for c in &cs[1..] {
                 let lane = format!("{m}x{n}x{k} acc={acc}");
-                worst = worst.max(common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base)?);
+                worst = worst.max(common::max_rel_diff(
+                    &lane,
+                    c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]),
+                    &base,
+                )?);
             }
             if worst >= 1e-4 {
                 return Err(format!(
@@ -678,7 +682,11 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let mut worst = 0.0f64;
             for c in &cs[1..] {
                 let lane = format!("{name} M={m} N={n} K={k}");
-                worst = worst.max(common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base)?);
+                worst = worst.max(common::max_rel_diff(
+                    &lane,
+                    c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]),
+                    &base,
+                )?);
             }
             if worst >= 1e-5 {
                 return Err(format!(
@@ -866,7 +874,11 @@ fn sam_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             let mut diffs: Vec<String> = Vec::new();
             for ((name, _), c) in calls.iter().zip(&cs).skip(1) {
                 let lane = format!("sam {label} M={m} N={n} K={k}: {name}");
-                let e = common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base[..m * n])?;
+                let e = common::max_rel_diff(
+                    &lane,
+                    c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]),
+                    &base[..m * n],
+                )?;
                 diffs.push(format!("{name} {e:.1e}"));
             }
             let reps = run.reps;

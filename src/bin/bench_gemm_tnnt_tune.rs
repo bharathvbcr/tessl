@@ -129,7 +129,12 @@ fn host_reference(layout: Layout, a: &[f32], b: &[f32], (m, n, k): (usize, usize
     cells.extend((0..SAMPLES - 4).map(|s| ((s * 7919 + 13) % m, (s * 104_729 + 7 * s + 3) % n)));
     let want: Vec<f64> = cells
         .iter()
-        .map(|&(i, j)| offset + (0..k).map(|kk| f64::from(at(i, kk)) * f64::from(bt(kk, j))).sum::<f64>())
+        .map(|&(i, j)| {
+            offset
+                + (0..k)
+                    .map(|kk| f64::from(at(i, kk)) * f64::from(bt(kk, j)))
+                    .sum::<f64>()
+        })
         .collect();
     let scale = want.iter().fold(0.0f64, |s, w| s.max(w.abs()));
     HostRef {
@@ -960,14 +965,24 @@ fn main() -> Result<(), String> {
         }
         production(&prod_c)?;
         rt.synchronize()?;
-        let prod_err = check_against_host(&format!("{label} production"), &prod_c.buffer.try_read_f32()?, &refv, m * n)?;
+        let prod_err = check_against_host(
+            &format!("{label} production"),
+            &prod_c.buffer.try_read_f32()?,
+            &refv,
+            m * n,
+        )?;
         for (v, c, err) in variants.iter_mut() {
             if is_accum {
                 c.buffer.write_f32(&prefill_host);
             }
             dispatch_variant(&rt, v, &a, &b, c, m, n, k)?;
             rt.synchronize()?;
-            *err = check_against_host(&format!("{label} {}", v.kernel), &c.buffer.try_read_f32()?, &refv, m * n)?;
+            *err = check_against_host(
+                &format!("{label} {}", v.kernel),
+                &c.buffer.try_read_f32()?,
+                &refv,
+                m * n,
+            )?;
         }
 
         let mut arms: Vec<common::Arm> = Vec::with_capacity(1 + variants.len());
@@ -1045,12 +1060,20 @@ mod tests {
         let mut bm = vec![0f32; k * n];
         for i in 0..m {
             for kk in 0..k {
-                am[i * k + kk] = if layout == Layout::Tn { a[kk * m + i] } else { a[i * k + kk] };
+                am[i * k + kk] = if layout == Layout::Tn {
+                    a[kk * m + i]
+                } else {
+                    a[i * k + kk]
+                };
             }
         }
         for kk in 0..k {
             for j in 0..n {
-                bm[kk * n + j] = if layout == Layout::Nt { b[j * k + kk] } else { b[kk * n + j] };
+                bm[kk * n + j] = if layout == Layout::Nt {
+                    b[j * k + kk]
+                } else {
+                    b[kk * n + j]
+                };
             }
         }
         let mut c = vec![0f32; m * n];
@@ -1081,8 +1104,7 @@ mod tests {
             let c = full_product(layout, &a, &b, DIMS);
             let r = host_reference(layout, &a, &b, DIMS, 0.0);
             assert_eq!(r.index.len(), SAMPLES);
-            let worst = check_against_host("t", &c, &r, DIMS.0 * DIMS.1)
-                .unwrap_or_else(|e| panic!("{layout:?}: {e}"));
+            let worst = check_against_host("t", &c, &r, DIMS.0 * DIMS.1).unwrap_or_else(|e| panic!("{layout:?}: {e}"));
             assert!(worst < 1e-6, "{layout:?}: {worst}");
             // An accumulate lane: C held 0.25 before.
             let shifted: Vec<f32> = c.iter().map(|x| x + 0.25).collect();
@@ -1107,7 +1129,9 @@ mod tests {
             .expect("the sampler leaves some element of a 6x10 output unread");
         let mut bad = c.clone();
         bad[i] = f32::NAN;
-        assert!(check_against_host("t", &bad, &r, numel).unwrap_err().contains("not finite"));
+        assert!(check_against_host("t", &bad, &r, numel)
+            .unwrap_err()
+            .contains("not finite"));
         // NaN at a sampled element.
         let mut bad = c.clone();
         bad[r.index[7]] = f32::NAN;
@@ -1115,7 +1139,9 @@ mod tests {
         // A wrong value just outside the bound, and just inside it.
         let mut bad = c.clone();
         bad[r.index[9]] += (REL_BOUND * 1.5 * r.scale) as f32;
-        assert!(check_against_host("t", &bad, &r, numel).unwrap_err().contains("host reference"));
+        assert!(check_against_host("t", &bad, &r, numel)
+            .unwrap_err()
+            .contains("host reference"));
         let mut ok = c.clone();
         ok[r.index[9]] += (REL_BOUND * 0.5 * r.scale) as f32;
         check_against_host("t", &ok, &r, numel).unwrap();

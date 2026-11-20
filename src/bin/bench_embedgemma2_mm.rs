@@ -129,7 +129,10 @@ fn check_goldens(g: &Goldens) -> Result<usize, String> {
         ));
     }
     if let Some((k, e)) = g.media_emb.iter().enumerate().find(|(_, e)| e.len() != dim) {
-        return Err(format!("media embedding {k} holds {} values, the text width is {dim}", e.len()));
+        return Err(format!(
+            "media embedding {k} holds {} values, the text width is {dim}",
+            e.len()
+        ));
     }
     Ok(dim)
 }
@@ -238,7 +241,9 @@ fn main() -> Result<(), String> {
     let model = EmbedGemma2Multimodal::load(&rt, &snap, operands)?;
     let dim = model.text().config().embedding_dim as usize;
     if dim != golden_dim {
-        return Err(format!("the model's embedding width {dim} is not the goldens' {golden_dim}"));
+        return Err(format!(
+            "the model's embedding width {dim} is not the goldens' {golden_dim}"
+        ));
     }
     let loaded = rt.current_allocated_bytes();
 

@@ -410,7 +410,7 @@ inline void mm_coop(device ElemT *A, device ElemT *B, device float *C,
 
 // =============================================================================
 // Exact f32 — execution_simdgroup, SM=SN=32 (golden-safe): `mode::multiply`
-// into a C the host zeroed first, or `multiply_accumulate` into C.
+// overwriting C (no zero pass), or `multiply_accumulate` into C.
 // =============================================================================
 
 /// `C (+)= A @ B` exact f32, `TRANS_A` / `TRANS_B` for TN / NT, `ACCUMULATE`

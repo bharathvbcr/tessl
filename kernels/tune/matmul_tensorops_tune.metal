@@ -119,8 +119,8 @@ TUNE_KERNEL(mm_bf16_256x64_bk256_sg8,   256,  64, 256, 8, false)
 
 // A call with no explicit template arguments is `mm_bf16_coop_64x32_sg4`.
 // ElemT = float is the exact-f32 (non-relaxed) descriptor: production's exact
-// f32 NN runs 32x32 on one simdgroup with a zero pre-pass (`TILE_F32`), with
-// no register accumulator; these variants ask whether one pays at f32.
+// f32 NN runs 32x32 on one simdgroup, `mode::multiply` with no zero pre-pass
+// (`TILE_F32`), with no register accumulator; these variants ask whether one pays at f32.
 template <int SM = 64, int SN = 32, int NSG = 4, typename ElemT = bfloat>
 inline void mm_bf16_coop(device ElemT *A, device ElemT *B, device float *C,
                          uint M, uint N, uint K, uint tiles_n, uint tgpig) {

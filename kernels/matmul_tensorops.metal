@@ -3,9 +3,10 @@
 //
 // Three kernel families:
 //   - Exact f32 (NN/TN/NT, their accumulate forms, split-K): 32x32 tiles on
-//     one simdgroup. `mode::multiply` writes into a C the host zeroes first
-//     (the zero and the matmul share one binder); the accumulate and split-K
-//     kernels use `mode::multiply_accumulate` into C instead.
+//     one simdgroup. `mode::multiply` overwrites every in-bounds element of C
+//     (edge tiles and short K included), so C needs no zero pass; the
+//     accumulate and split-K kernels use `mode::multiply_accumulate` into C
+//     instead (split-K's host zero is that kernel's, not multiply's).
 //   - Cooperative destination (bf16, f16 and relaxed-f32 NN, bf16 TN/NT and
 //     their accumulate forms, int8): the accumulator lives in registers for
 //     all of K and C is written once, so there is no zero pre-pass; an
@@ -40,8 +41,9 @@
 #define EXACT_F32_MODE_ACCUMULATE true
 
 /// `C (+)= A @ B` exact f32 (`mm_exact_f32`): LAYOUT is NN, TN (A stored
-/// `[K, M]`) or NT (B stored `[N, K]`); MODE is MULTIPLY (into a C the host
-/// zeroes first) or ACCUMULATE (`multiply_accumulate` into C, no zero). NSG
+/// `[K, M]`) or NT (B stored `[N, K]`); MODE is MULTIPLY (overwrites C; no
+/// zero pass, tests/gemm_exact_f32_overwrite.rs) or ACCUMULATE
+/// (`multiply_accumulate` into the C it is given). NSG
 /// must be 1: the body runs on `execution_simdgroup`.
 #define EXACT_F32_KERNEL(NAME, LAYOUT, SM, SN, NSG, MODE)                      \
     kernel void NAME(device float *A [[buffer(0)]],                            \

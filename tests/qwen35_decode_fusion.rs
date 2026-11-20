@@ -567,9 +567,9 @@ fn fused_decode_matches_the_unfused_step_on_random_models() {
 
 /// Dispatches per decode step, counted with `infer_trace` over separate traced
 /// steps as `bench_qwen35_layers --decode` counts them. The fused step saves
-/// two dispatches per layer for the gate/up in bf16 (a one-dispatch GEMM each,
-/// and the SwiGLU, become one) and four in exact f32 (each GEMM is a `zero_f32`
-/// and a matmul), and, in the exact-f32 forward only, the two residual adds
+/// two dispatches per layer for the gate/up, in bf16 and in exact f32 alike (each
+/// GEMM is one dispatch, with no `zero_f32` pass on C, and the two GEMMs and
+/// the SwiGLU become one), and, in the exact-f32 forward only, the two residual adds
 /// per layer that stop being dispatches of their own (a mixer's output before
 /// the post norm, and the down projection's before the next input norm or the
 /// final one). The bf16 forward folds both adds into the projections.
@@ -606,15 +606,10 @@ fn fused_decode_saves_exactly_the_dispatches_it_replaces() {
             let none = count(DecodeFusion::NONE);
             let adds = if precision == Precision::F32 { 2 * layers } else { 0 };
             // Dispatches the gate/up fusion removes per layer: the gate GEMM, the up
-            // GEMM and the SwiGLU become one. A bf16 GEMM is one dispatch (3 -> 1,
-            // saves 2). An exact-f32 NN GEMM is two: `dispatch_tensorops_nn` encodes
-            // `zero_f32` on C and then the matmul (src/gemm.rs:1230-1261), so 5 -> 1
-            // saves 4. Measured on this model: 78 -> 62 over 4 layers at f32.
-            let gate_up_saved = if precision == Precision::F32 {
-                4 * layers
-            } else {
-                2 * layers
-            };
+            // GEMM and the SwiGLU become one. Both a bf16 and an exact-f32 NN GEMM are one
+            // dispatch (the exact-f32 kernel overwrites C, so `dispatch_tensorops_nn`
+            // encodes no `zero_f32`), so 3 -> 1 saves 2.
+            let gate_up_saved = 2 * layers;
             for (name, fusion, saved) in [
                 (
                     "add_norm",

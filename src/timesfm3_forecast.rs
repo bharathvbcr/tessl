@@ -576,9 +576,7 @@ pub fn pack(cfg: &HostConfig, calls: &[DecodeInput], max_rows: usize) -> Result<
         for &call in group {
             let batch = calls[call].batch;
             if batch == 0 {
-                // decode() refuses an empty batch by name; keep that refusal.
-                run.push(Piece { call, start: 0, end: 0 });
-                continue;
+                return Err(format!("timesfm3 pack: call {call} has an empty batch"));
             }
             let mut start = 0;
             while start < batch {

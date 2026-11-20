@@ -208,7 +208,8 @@ unstamped GPU time (stamps serialise dispatches). Classes come from names only:
 the forward does not tag layers, so GEMMs are not split by layer kind. Upload
 and read-back sit inside `Timesfm3Model::forward` and are reported as
 standalone proxies, not in place. `BENCH_PREDICT_SWEEP=1,4,16,64` repeats each
-predict workload at those `per_core_batch_size` values to separate fixed
+predict workload at those `per_core_batch_size` values (which changes the
+grouping, hence the packed forwards and the rows each carries) to separate fixed
 per-forward cost from per-row cost. Module docs of `src/bin/bench_timesfm3.rs`
 have the field list.
 
@@ -219,8 +220,8 @@ have the field list.
   (`BENCH_WORKLOADS`), the user path `predict_batch` on ragged series with
   optional covariates (`BENCH_PREDICT`; the torch lane runs upstream's
   `TimesFM3Forecaster.predict_batch` on the same series), and a per-stage
-  split of either (`BENCH_STAGES=1`: plan, prepare, preprocess, forward,
-  postprocess, finish; tessl only). `BENCH_STAGES=kernels` splits the forward
+  split of either (`BENCH_STAGES=1`: plan, pack, prepare, preprocess, forward,
+  postprocess, unpack, finish; tessl only). `BENCH_STAGES=kernels` splits the forward
   itself (see Profiling). The MLX lane has no predict workloads. No
   number is claimed until it runs under the machine's heavy-job lock on an
   idle GPU. The MLX lane also needs an MLX environment that does not exist on

@@ -455,6 +455,10 @@ fn packing_respects_the_row_cap_and_cuts_whole_elements() {
     let pk = pack(&cfg.host, &calls, 4 * one).unwrap();
     assert_eq!(pk.forwards.iter().map(|f| f.batch).collect::<Vec<_>>(), [4, 4, 1]);
     // A cap below one element is refused by name, and one element exactly fits.
+    let empty = [input(0, 2, 64, 64, (0, 0), true), input(1, 0, 64, 64, (0, 0), true)];
+    assert!(pack(&cfg.host, &empty, 8192)
+        .unwrap_err()
+        .contains("call 1 has an empty batch"));
     let e = pack(&cfg.host, &calls, one - 1).unwrap_err();
     assert!(e.contains("one series needs") && e.contains(&one.to_string()), "{e}");
     assert_eq!(packed_equals_unpacked("one element", &calls, one), 9);

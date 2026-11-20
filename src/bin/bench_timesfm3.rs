@@ -49,19 +49,20 @@
 //!
 //! `BENCH_STAGES=1` (`0`, the default, or `1`) times, in place of one opaque
 //! call, the library's public pieces one after the other in the same
-//! iteration: `timesfm3_forecast::plan`, then per `decode` call
-//! `timesfm3_host::prepare`, `preprocess`, `Timesfm3Model::forward` (the
-//! device: upload, kernels, read-back) and `timesfm3_host::postprocess`, then
-//! `timesfm3_forecast::finish`. A decode workload has no plan or finish
-//! stage. A stage that repeats over the calls is summed per iteration. The
+//! iteration: `timesfm3_forecast::plan`, `timesfm3_forecast::pack`, then per
+//! packed forward `timesfm3_host::prepare`, `preprocess`,
+//! `Timesfm3Model::forward` (the device: upload, kernels, read-back) and
+//! `timesfm3_host::postprocess`, then `Packing::unpack` and
+//! `timesfm3_forecast::finish`. A decode workload has no plan, pack, unpack or
+//! finish stage. A stage that repeats over the calls is summed per iteration. The
 //! row's `ms_min`/`ms_median` are the wall time of the whole staged
 //! iteration, and `stages` lists `{stage, ms_min, ms_median, share}` where
 //! `share` is the stage's median over the sum of the stage medians. Before
 //! timing, the staged result is compared with the plain call's (elementwise,
 //! 1e-4 relative) and the run refuses on a difference: the split must be the
-//! same work. A stage-mode call runs one forward per `decode` call, so one
-//! needing more than `MAX_ROWS` patch rows is refused (lower
-//! `BENCH_PREDICT_BATCH`); the plain `predict_batch` splits it.
+//! same work. A packed forward never exceeds `MAX_ROWS` patch rows, so a
+//! predict workload always fits; a decode workload is one `decode` call and is
+//! refused above `MAX_ROWS` (use fewer series).
 //!
 //! # Kernel profile
 //!
@@ -105,9 +106,12 @@
 //! of magnitude, not a slice of the forward.
 //!
 //! `BENCH_PREDICT_SWEEP` (kernels mode only; a list such as `1,4,16,64`) runs
-//! every predict workload once per `per_core_batch_size`, so the rows of one
-//! workload differ only in the patch rows per forward: forward ms against
-//! rows separates the fixed per-forward cost from the per-row cost, e.g.
+//! every predict workload once per `per_core_batch_size`. The value changes
+//! the plan's grouping (so the forecasts, since each group pads to its own
+//! context) and so how many packed forwards the workload needs and how many
+//! patch rows each carries: forward ms against `rows_per_forward` (rows over
+//! packed forwards) separates the fixed per-forward cost from the per-row
+//! cost, e.g.
 //! `BENCH_PREDICT=64x512:128 BENCH_PREDICT_SWEEP=1,4,16,64`.
 //!
 //! # Output
@@ -414,7 +418,8 @@ fn staged_decode(
     if rows > MAX_ROWS {
         return Err(format!(
             "BENCH_STAGES: one decode call has {rows} patch rows (batch {}, {} variates, {} patches), above MAX_ROWS = \
-             {MAX_ROWS}; predict_batch would split it, the stage split does not: lower BENCH_PREDICT_BATCH",
+             {MAX_ROWS}; predict_batch cuts a plan into forwards of at most that, a decode workload is one call: use \
+             fewer series",
             pr.batch, pr.variates, pr.patches
         ));
     }

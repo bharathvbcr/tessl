@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use common::with_gpu;
 use tessl::safetensors::SafeTensors;
-use tessl::timesfm3::{Timesfm3Config, Timesfm3Model};
+use tessl::timesfm3::{Timesfm3Config, Timesfm3Model, MAX_ROWS};
 use tessl::timesfm3_forecast::{self as forecast, PredictOptions};
 use tessl::timesfm3_host::{prepare, preprocess};
 
@@ -107,11 +107,20 @@ fn real_decode_bits_do_not_depend_on_batch_size() {
     let wdir = env_dir("TIMESFM3_DIR");
     with_gpu(|rt| {
         let m = load_real(rt, &wdir);
-        // (series, variates, context, horizon): the bench's three predict shapes.
+        // (series, variates, context, horizon): the bench's three predict shapes,
+        // and as many univariate series as fit under the row cap (M just
+        // below MAX_ROWS).
+        let per = m.config().host.rows_per_series(1, 512, 128);
+        let near_cap = MAX_ROWS / per;
+        assert!(
+            near_cap * per + per > MAX_ROWS,
+            "test bug: {near_cap} series do not fill the cap"
+        );
         for (n, v, ctx, horizon) in [
             (64usize, 1usize, 512usize, 128usize),
             (8, 1, 4096, 256),
             (16, 4, 1024, 96),
+            (near_cap, 1, 512, 128),
         ] {
             let series = tfm::synthetic_series(n, v, |_| ctx, 7);
             let opts = PredictOptions {
@@ -182,14 +191,11 @@ fn real_packed_predict_batch_is_bit_equal_to_one_decode_per_call() {
         ));
         for (name, series, horizon, opts) in cases {
             let pl = forecast::plan(host, &series, horizon, &opts).unwrap();
-            let forwards = forecast::pack(host, &pl.calls, tessl::timesfm3::MAX_ROWS)
-                .unwrap()
-                .forwards
-                .len();
+            let forwards = forecast::pack(host, &pl.calls, MAX_ROWS).unwrap().forwards.len();
             let got = m
                 .predict_batch(&series, horizon, &opts)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            let want = tfm::predict_one_decode_per_call(&m, &series, horizon, &opts, tessl::timesfm3::MAX_ROWS);
+            let want = tfm::predict_one_decode_per_call(&m, &series, horizon, &opts, MAX_ROWS);
             tfm::assert_forecasts_bit_equal(&name, &got, &want);
             eprintln!("{name}: {} plan calls in {forwards} forwards", pl.calls.len());
         }

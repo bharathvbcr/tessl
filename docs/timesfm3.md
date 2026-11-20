@@ -88,14 +88,48 @@ batching.
 | Training / fine-tuning | Not in tessl: ojas owns training (README, ABI 14) |
 | `device`, `use_sdpa` | Not applicable: Metal, one attention kernel |
 
+## Group packing
+
+`predict_batch` follows upstream's grouping (`per_core_batch_size` queries per
+`decode()` call, each group padded to its own context), because the grouping
+changes the numbers. It does not run each group as its own forward, which would
+stream all the weights (~1.3 GB of f32) for a few dozen patch rows a time.
+`timesfm3_forecast::pack` lays the plan's calls out as device forwards:
+
+- **The rule.** Calls whose inputs agree in every field the forward depends on
+  share forwards: context, horizon, the target, past-only and past+future
+  channel counts, and which of the arrays and masks are present
+  (`DecodeInput::same_shape`). Calls that differ in any of them are never
+  merged, even in a field a forward would ignore. Equal calls merge whether or
+  not they are adjacent in the plan.
+- **How they are cut.** Within a shape, the calls' batch elements are laid end
+  to end in plan order and cut into forwards of whole elements, as many as fit
+  in `MAX_ROWS` (a lower cap, `predict_batch_capped`, is honoured the same
+  way). `Packing::unpack` hands each call its own elements back, in plan order,
+  before `finish`. `decode_capped` splits through the same function.
+- **Bit-equal.** A packed `predict_batch` returns the same bits for every
+  series as one `decode()` per plan call, checked with bitwise equality on
+  every f32 (no tolerance) on the tiny model and on the real checkpoint. It
+  holds because batch elements never interact and nothing a forward does to an
+  element depends on how many others share it: at this model's widths (every
+  GEMM has K and N of at most 1280) the exact-f32 GEMM takes its single-dispatch
+  kernel (the long-K split needs K·N ≥ 2²³ and is the one route that depends
+  on M), the epilogue GEMMs pick their 128- or 64-row tile from N alone, the
+  small-M split-K is not used (`gemm_small_m` is not called, and it is the
+  call that changes bits with M), and RMSNorm, the query/key preparation and
+  the attention work per row or per sequence. A model config with a wider K·N
+  would have to re-establish this (`real_decode_bits_do_not_depend_on_batch_size`
+  is the check).
+- **Counts.** `bench_timesfm3` reports `groups` (the plan's calls, upstream's
+  forwards) and `forwards` (the packed count, from the same `pack`).
+
 ## Limits
 
 - **Patch rows per forward.** `MAX_ROWS` = 8192 rows of `b × v × n`.
-  `predict_batch` runs a larger group as several forwards of whole series.
-  That changes nothing, because series in a batch never interact: the tiny
-  test holds the two to 1e-6 and measured them equal. One series is refused by name only when
-  it alone exceeds the cap. At the full 15360 context that means more than 16
-  variates, targets and covariates together.
+  `predict_batch` never runs more in one forward; it cuts at whole series (see
+  Group packing). One series is refused by name only when it alone exceeds the
+  cap. At the full 15360 context that means more than 16 variates, targets and
+  covariates together.
 - **Variates.** At most 32 per series (`MAX_VARIATES`, upstream's `max_variates`).
 - **Precision.** f32 weights and activations with exact f32 GEMMs; the
   runtime's relaxed precision must be off.
@@ -121,9 +155,9 @@ writes:
 | Test | What it holds | Measured on M5 Pro, 2026-11-19 (max \|diff\| / peak) |
 | :--- | :--- | :--- |
 | `timesfm3_host` (device-free) | Host steps against upstream's fp32 and f64 runs, on the all-on and the off-branch cases | — |
-| `timesfm3_forecast_host` (device-free) | `plan` makes upstream's `decode()` calls; `finish` turns upstream's decode outputs into its forecast; malformed requests refused by name | values ≤ 3.3e-7 (z-norm rows; the rest exact), masks and shapes exact |
-| `timesfm3_tiny` | Layer by layer, decode, `predict_batch` against upstream; a group in pieces equals one forward; the same layer-by-layer and decode checks on the six off-branch cases | forecaster ≤ 1.4e-5 (gate 5e-5); pieces 0; off-branch layers and raw logits ≤ 2.8e-6 (gate 2e-5), off-branch forecasts ≤ 2.9e-6 (gate 5e-5) |
-| `timesfm3_real` (`--ignored`) | Real checkpoint: layers 0/10/19, raw logits, decode, and `predict_batch` on all seven forecaster cases | decode ≤ 7.6e-6, forecaster ≤ 1.4e-5 (gate 1e-3) |
+| `timesfm3_forecast_host` (device-free) | `plan` makes upstream's `decode()` calls; `finish` turns upstream's decode outputs into its forecast; malformed requests refused by name; `pack` and `unpack` (labelled stand-in forecasts: equal shapes share forwards, any differing field keeps calls apart, the row cap cuts whole elements, every element returns to its call bit for bit) | values ≤ 3.3e-7 (z-norm rows; the rest exact), masks and shapes exact |
+| `timesfm3_tiny` | Layer by layer, decode, `predict_batch` against upstream; a group in pieces equals one forward; packed `predict_batch` equals one `decode()` per plan call bit for bit (recorded and synthetic cases, mixed shapes, four row caps); the same layer-by-layer and decode checks on the six off-branch cases | forecaster ≤ 1.4e-5 (gate 5e-5); pieces 0; packed 0 (bitwise); off-branch layers and raw logits ≤ 2.8e-6 (gate 2e-5), off-branch forecasts ≤ 2.9e-6 (gate 5e-5) |
+| `timesfm3_real` (`--ignored`) | Real checkpoint: layers 0/10/19, raw logits, decode, and `predict_batch` on all seven forecaster cases; a decode in slices of 1 to 16 and packed `predict_batch` against one `decode()` per call, bitwise, on the forecaster cases and ragged bench-shaped workloads | decode ≤ 7.6e-6, forecaster ≤ 1.4e-5 (gate 1e-3) |
 | `timesfm3_forecast` binary, by hand | CSV in, CSV out on the real checkpoint (three series of 300, 90 and 700 points, a gap, `--positive`, horizon 96) against upstream's `predict_batch()` on the same CSV | ≤ 9.8e-7; same rows and quantile labels |
 
 Mutation checks run against the host tests. Each of the following, applied
@@ -174,7 +208,8 @@ unstamped GPU time (stamps serialise dispatches). Classes come from names only:
 the forward does not tag layers, so GEMMs are not split by layer kind. Upload
 and read-back sit inside `Timesfm3Model::forward` and are reported as
 standalone proxies, not in place. `BENCH_PREDICT_SWEEP=1,4,16,64` repeats each
-predict workload at those `per_core_batch_size` values to separate fixed
+predict workload at those `per_core_batch_size` values (which changes the
+grouping, hence the packed forwards and the rows each carries) to separate fixed
 per-forward cost from per-row cost. Module docs of `src/bin/bench_timesfm3.rs`
 have the field list.
 
@@ -185,8 +220,8 @@ have the field list.
   (`BENCH_WORKLOADS`), the user path `predict_batch` on ragged series with
   optional covariates (`BENCH_PREDICT`; the torch lane runs upstream's
   `TimesFM3Forecaster.predict_batch` on the same series), and a per-stage
-  split of either (`BENCH_STAGES=1`: plan, prepare, preprocess, forward,
-  postprocess, finish; tessl only). `BENCH_STAGES=kernels` splits the forward
+  split of either (`BENCH_STAGES=1`: plan, pack, prepare, preprocess, forward,
+  postprocess, unpack, finish; tessl only). `BENCH_STAGES=kernels` splits the forward
   itself (see Profiling). The MLX lane has no predict workloads. No
   number is claimed until it runs under the machine's heavy-job lock on an
   idle GPU. The MLX lane also needs an MLX environment that does not exist on

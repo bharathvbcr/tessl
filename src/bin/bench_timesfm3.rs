@@ -39,8 +39,9 @@
 //! `per_core_batch_size` from `BENCH_PREDICT_BATCH` (default 4, upstream's).
 //!
 //! What is timed: one `predict_batch` over all the series, host arrays in to
-//! per-series quantile forecasts out (planning, one `decode` per group of
-//! `BENCH_PREDICT_BATCH` series, post-processing). When only `BENCH_PREDICT`
+//! per-series quantile forecasts out (planning, packing the groups of
+//! `BENCH_PREDICT_BATCH` series that share a shape into shared forwards, one
+//! `decode` per forward, post-processing). When only `BENCH_PREDICT`
 //! is set the decode workloads do not run; set `BENCH_WORKLOADS` as well to run
 //! both, and neither for the default decode set.
 //!
@@ -48,19 +49,20 @@
 //!
 //! `BENCH_STAGES=1` (`0`, the default, or `1`) times, in place of one opaque
 //! call, the library's public pieces one after the other in the same
-//! iteration: `timesfm3_forecast::plan`, then per `decode` call
-//! `timesfm3_host::prepare`, `preprocess`, `Timesfm3Model::forward` (the
-//! device: upload, kernels, read-back) and `timesfm3_host::postprocess`, then
-//! `timesfm3_forecast::finish`. A decode workload has no plan or finish
-//! stage. A stage that repeats over the calls is summed per iteration. The
+//! iteration: `timesfm3_forecast::plan`, `timesfm3_forecast::pack`, then per
+//! packed forward `timesfm3_host::prepare`, `preprocess`,
+//! `Timesfm3Model::forward` (the device: upload, kernels, read-back) and
+//! `timesfm3_host::postprocess`, then `Packing::unpack` and
+//! `timesfm3_forecast::finish`. A decode workload has no plan, pack, unpack or
+//! finish stage. A stage that repeats over the calls is summed per iteration. The
 //! row's `ms_min`/`ms_median` are the wall time of the whole staged
 //! iteration, and `stages` lists `{stage, ms_min, ms_median, share}` where
 //! `share` is the stage's median over the sum of the stage medians. Before
 //! timing, the staged result is compared with the plain call's (elementwise,
 //! 1e-4 relative) and the run refuses on a difference: the split must be the
-//! same work. A stage-mode call runs one forward per `decode` call, so one
-//! needing more than `MAX_ROWS` patch rows is refused (lower
-//! `BENCH_PREDICT_BATCH`); the plain `predict_batch` splits it.
+//! same work. A packed forward never exceeds `MAX_ROWS` patch rows, so a
+//! predict workload always fits; a decode workload is one `decode` call and is
+//! refused above `MAX_ROWS` (use fewer series).
 //!
 //! # Kernel profile
 //!
@@ -104,9 +106,12 @@
 //! of magnitude, not a slice of the forward.
 //!
 //! `BENCH_PREDICT_SWEEP` (kernels mode only; a list such as `1,4,16,64`) runs
-//! every predict workload once per `per_core_batch_size`, so the rows of one
-//! workload differ only in the patch rows per forward: forward ms against
-//! rows separates the fixed per-forward cost from the per-row cost, e.g.
+//! every predict workload once per `per_core_batch_size`. The value changes
+//! the plan's grouping (so the forecasts, since each group pads to its own
+//! context) and so how many packed forwards the workload needs and how many
+//! patch rows each carries: forward ms against `rows_per_forward` (rows over
+//! packed forwards) separates the fixed per-forward cost from the per-row
+//! cost, e.g.
 //! `BENCH_PREDICT=64x512:128 BENCH_PREDICT_SWEEP=1,4,16,64`.
 //!
 //! # Output
@@ -117,9 +122,11 @@
 //! and `check` the mean of the forecast's median quantile over target variates
 //! (lanes should agree to ~1e-3; a mismatch means they did different work). A
 //! predict row is named `predict:<spec>` and adds `mode`, `series`,
-//! `per_core_batch_size`, `groups` (`decode` calls) and `forwards` (device
-//! forwards; more than `groups` only when a group exceeds `MAX_ROWS`). Before
-//! anything is timed every forecast must be finite. The check value comes from
+//! `per_core_batch_size`, `groups` (the plan's `decode` calls, upstream's
+//! groups) and `forwards` (device forwards after packing: the groups of equal
+//! shape share forwards of up to `MAX_ROWS` patch rows, so `forwards` is at
+//! most what one forward per group (plus the cap's splits) would need, and one
+//! per distinct shape when they all fit). Before anything is timed every forecast must be finite. The check value comes from
 //! the licensed checkpoint: it is not a result to commit.
 
 mod common;
@@ -411,7 +418,8 @@ fn staged_decode(
     if rows > MAX_ROWS {
         return Err(format!(
             "BENCH_STAGES: one decode call has {rows} patch rows (batch {}, {} variates, {} patches), above MAX_ROWS = \
-             {MAX_ROWS}; predict_batch would split it, the stage split does not: lower BENCH_PREDICT_BATCH",
+             {MAX_ROWS}; predict_batch cuts a plan into forwards of at most that, a decode workload is one call: use \
+             fewer series",
             pr.batch, pr.variates, pr.patches
         ));
     }
@@ -442,7 +450,8 @@ fn staged_decode(
 }
 
 /// `Timesfm3Model::predict_batch`, from its public pieces, each timed into
-/// `acc`.
+/// `acc`: the same `plan`, `pack`, one `decode` per packed forward, `unpack`
+/// and `finish` it runs, so the stages time the path the library takes.
 fn staged_predict(
     model: &Timesfm3Model,
     series: &[Series],
@@ -454,10 +463,14 @@ fn staged_predict(
     let plan = stage(acc, "plan", || {
         forecast::plan(&model.config().host, series, horizon, opts)
     })?;
-    let mut outs = Vec::with_capacity(plan.calls.len());
-    for call in &plan.calls {
-        outs.push(staged_decode(model, call, acc, probe.as_deref_mut())?);
+    let packing = stage(acc, "pack", || {
+        forecast::pack(&model.config().host, &plan.calls, MAX_ROWS)
+    })?;
+    let mut outs = Vec::with_capacity(packing.forwards.len());
+    for forward in &packing.forwards {
+        outs.push(staged_decode(model, forward, acc, probe.as_deref_mut())?);
     }
+    let outs = stage(acc, "unpack", || packing.unpack(&outs))?;
     stage(acc, "finish", || forecast::finish(&plan, &outs))
 }
 
@@ -883,18 +896,6 @@ fn kernel_profile(
     kernels_json(&k, proxy, rows_per_forward)
 }
 
-/// Device forwards `decode_capped` runs for a call of `batch` series of
-/// `per` patch rows each, at most `cap` rows a forward.
-fn forwards_for(batch: usize, per: usize, cap: usize) -> Result<usize, String> {
-    if per > cap {
-        return Err(format!(
-            "one series needs {per} patch rows, more than one forward runs ({cap})"
-        ));
-    }
-    let chunk = (cap / per.max(1)).max(1);
-    Ok(batch.div_ceil(chunk))
-}
-
 struct Timing {
     wall_ms: Vec<f64>,
     /// `[stage][iteration]`, empty without `BENCH_STAGES`.
@@ -1055,15 +1056,21 @@ fn main() -> Result<(), String> {
         };
         let ser = predict_series(p);
         let plan = forecast::plan(&model.config().host, &ser, p.horizon, &opts)?;
-        let (mut rows, mut forwards) = (0usize, 0usize);
-        for call in &plan.calls {
-            let per = model
-                .config()
-                .host
-                .rows_per_series(call.variates(), call.context, call.horizon);
-            rows += call.batch * per;
-            forwards += forwards_for(call.batch, per, MAX_ROWS)?;
-        }
+        let rows: usize = plan
+            .calls
+            .iter()
+            .map(|call| {
+                call.batch
+                    * model
+                        .config()
+                        .host
+                        .rows_per_series(call.variates(), call.context, call.horizon)
+            })
+            .sum();
+        // The forwards `predict_batch` runs: the library's packing of the plan.
+        let forwards = forecast::pack(&model.config().host, &plan.calls, MAX_ROWS)?
+            .forwards
+            .len();
         let first = model.predict_batch(&ser, p.horizon, &opts)?;
         let mut sum = 0.0f64;
         let mut count = 0usize;
@@ -1279,15 +1286,6 @@ mod tests {
         assert!(u
             .iter()
             .all(|x| x.past_only.is_none() && x.past_future.is_none() && x.target.rows == 1));
-    }
-
-    #[test]
-    fn forwards_follow_the_row_cap() {
-        assert_eq!(forwards_for(4, 100, 8192).unwrap(), 1);
-        assert_eq!(forwards_for(4, 4096, 8192).unwrap(), 2);
-        assert_eq!(forwards_for(5, 3000, 8192).unwrap(), 3);
-        assert_eq!(forwards_for(1, 8192, 8192).unwrap(), 1);
-        assert!(forwards_for(1, 8193, 8192).unwrap_err().contains("8193"));
     }
 
     #[test]

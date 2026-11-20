@@ -22,7 +22,8 @@ use std::path::PathBuf;
 
 use common::with_gpu;
 use tessl::safetensors::SafeTensors;
-use tessl::timesfm3::{Timesfm3Config, Timesfm3Model};
+use tessl::timesfm3::{Timesfm3Config, Timesfm3Model, MAX_ROWS};
+use tessl::timesfm3_forecast::{self as forecast, PredictOptions};
 use tessl::timesfm3_host::{prepare, preprocess};
 
 fn env_dir(k: &str) -> PathBuf {
@@ -86,6 +87,117 @@ fn real_predict_batch_matches_upstream_forecaster() {
                 let want = tfm::load(&rdir, case, &format!("out_{i}"));
                 tfm::assert_close(&format!("{case} series {i} forecast"), &f.values, &want.data, 1e-3);
             }
+        }
+    });
+}
+
+fn load_real(rt: &std::sync::Arc<tessl::runtime::GpuRuntime>, wdir: &std::path::Path) -> Timesfm3Model {
+    let cfg = Timesfm3Config::from_config_file(&wdir.join("config.json")).unwrap();
+    let st = SafeTensors::open(&wdir.join("model.safetensors")).unwrap();
+    Timesfm3Model::load(rt, &st, cfg).unwrap()
+}
+
+/// The premise of group packing at the real widths: a batch element's output
+/// bits do not depend on how many elements share its forward (the GEMM M, from
+/// one row group up to a few thousand rows). One call decoded whole equals
+/// the same call decoded in slices of several sizes, bit for bit.
+#[test]
+#[ignore]
+fn real_decode_bits_do_not_depend_on_batch_size() {
+    let wdir = env_dir("TIMESFM3_DIR");
+    with_gpu(|rt| {
+        let m = load_real(rt, &wdir);
+        // (series, variates, context, horizon): the bench's three predict shapes,
+        // and as many univariate series as fit under the row cap (M just
+        // below MAX_ROWS).
+        let per = m.config().host.rows_per_series(1, 512, 128);
+        let near_cap = MAX_ROWS / per;
+        assert!(
+            near_cap * per + per > MAX_ROWS,
+            "test bug: {near_cap} series do not fill the cap"
+        );
+        for (n, v, ctx, horizon) in [
+            (64usize, 1usize, 512usize, 128usize),
+            (8, 1, 4096, 256),
+            (16, 4, 1024, 96),
+            (near_cap, 1, 512, 128),
+        ] {
+            let series = tfm::synthetic_series(n, v, |_| ctx, 7);
+            let opts = PredictOptions {
+                per_core_batch_size: n,
+                ..PredictOptions::default()
+            };
+            let pl = forecast::plan(&m.config().host, &series, horizon, &opts).unwrap();
+            assert_eq!(pl.calls.len(), 1, "test bug: one call of {n} series");
+            let call = &pl.calls[0];
+            let whole = m.decode(call).unwrap();
+            for size in [1usize, 3, 4, 5, 7, 13, 16] {
+                let mut values = Vec::new();
+                for start in (0..call.batch).step_by(size) {
+                    let piece = call.slice_batch(start, (start + size).min(call.batch)).unwrap();
+                    values.extend(m.decode(&piece).unwrap().values);
+                }
+                tfm::assert_bit_equal(
+                    &format!("{n}x{v}x{ctx}:{horizon} in slices of {size}"),
+                    &values,
+                    &whole.values,
+                );
+            }
+        }
+    });
+}
+
+/// Group packing on the real checkpoint: `predict_batch` (calls of equal
+/// shape run as shared forwards) against one `decode()` per plan call, bit
+/// for bit, on the recorded forecaster cases (ragged, covariates,
+/// multivariate, over the row cap) and on ragged synthetic workloads shaped
+/// like the bench's. Both sides are live runs of this checkpoint; nothing
+/// computed from it is stored.
+#[test]
+#[ignore]
+fn real_packed_predict_batch_is_bit_equal_to_one_decode_per_call() {
+    let (wdir, rdir) = (env_dir("TIMESFM3_DIR"), env_dir("TIMESFM3_REF_DIR"));
+    with_gpu(|rt| {
+        let m = load_real(rt, &wdir);
+        let host = &m.config().host;
+        let ragged = |longest: usize| move |i: usize| longest - (i * 61) % (longest / 4 + 1);
+        let mut cases: Vec<(String, Vec<_>, usize, PredictOptions)> = Vec::new();
+        for case in tfm::FORECAST_REAL {
+            let fc = tfm::forecast_case(&rdir, case);
+            cases.push((case.to_string(), fc.series, fc.horizon, fc.opts));
+        }
+        cases.push((
+            "ragged 64x512:128".into(),
+            tfm::synthetic_series(64, 1, ragged(512), 11),
+            128,
+            PredictOptions::default(),
+        ));
+        cases.push((
+            "ragged 16x4x1024:96+1+1".into(),
+            tfm::with_covariates(tfm::synthetic_series(16, 4, ragged(1024), 12), 96, 1, 1, |_| true),
+            96,
+            PredictOptions::default(),
+        ));
+        cases.push((
+            "ragged 9x700:200 symmetric, covariates on some".into(),
+            tfm::with_covariates(tfm::synthetic_series(9, 1, ragged(700), 13), 200, 0, 2, |i| i % 3 != 1),
+            200,
+            PredictOptions {
+                use_symmetric_averaging: true,
+                use_znorm: true,
+                per_core_batch_size: 3,
+                ..PredictOptions::default()
+            },
+        ));
+        for (name, series, horizon, opts) in cases {
+            let pl = forecast::plan(host, &series, horizon, &opts).unwrap();
+            let forwards = forecast::pack(host, &pl.calls, MAX_ROWS).unwrap().forwards.len();
+            let got = m
+                .predict_batch(&series, horizon, &opts)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want = tfm::predict_one_decode_per_call(&m, &series, horizon, &opts, MAX_ROWS);
+            tfm::assert_forecasts_bit_equal(&name, &got, &want);
+            eprintln!("{name}: {} plan calls in {forwards} forwards", pl.calls.len());
         }
     });
 }

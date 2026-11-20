@@ -19,6 +19,7 @@ mod tfm;
 use common::with_gpu;
 use tessl::safetensors::SafeTensors;
 use tessl::timesfm3::{Timesfm3Config, Timesfm3Model};
+use tessl::timesfm3_forecast::PredictOptions;
 use tessl::timesfm3_host::{prepare, preprocess};
 
 /// Exact-f32 GEMMs against torch's CPU fp32: differences are operation order
@@ -221,6 +222,93 @@ fn predict_batch_in_pieces_matches_one_forward() {
                 .err()
                 .unwrap_or_else(|| panic!("{case}: a cap below one series was accepted"));
             assert!(e.contains("one series needs"), "{case}: {e}");
+        }
+    });
+}
+
+/// Group packing on the tiny model: `predict_batch` (plan calls of equal shape
+/// run as shared forwards, up to the row cap) against one `decode()` per plan
+/// call, bit for bit, with `==` on every f32 and no tolerance. The cases are
+/// the recorded forecaster cases (ragged, covariates, multivariate, long) and
+/// synthetic ones that make equal-shape groups (merged), mixed shapes (never
+/// merged) and calls past a small row cap (cut inside a call).
+#[test]
+fn packed_predict_batch_is_bit_equal_to_one_decode_per_call() {
+    use tessl::timesfm3::MAX_ROWS;
+    use tessl::timesfm3_forecast::{pack, plan};
+    with_gpu(|rt| {
+        let m = model(rt);
+        let host = &m.config().host;
+        let dir = tfm::tiny_dir();
+        let two = PredictOptions {
+            per_core_batch_size: 2,
+            ..PredictOptions::default()
+        };
+        // (name, series, horizon, options, row cap, merged: Some(forwards < calls) or None)
+        let mut cases: Vec<(String, Vec<_>, usize, PredictOptions)> = Vec::new();
+        for case in tfm::FORECAST_TINY {
+            let fc = tfm::forecast_case(&dir, case);
+            cases.push((case.to_string(), fc.series, fc.horizon, fc.opts));
+        }
+        cases.push((
+            "equal shapes".into(),
+            tfm::synthetic_series(9, 1, |_| 96, 1),
+            70,
+            two.clone(),
+        ));
+        cases.push((
+            "multivariate".into(),
+            tfm::synthetic_series(7, 3, |_| 70, 2),
+            64,
+            two.clone(),
+        ));
+        cases.push((
+            "mixed contexts".into(),
+            tfm::synthetic_series(10, 1, |i| [40, 130, 70][i % 3], 3),
+            64,
+            two.clone(),
+        ));
+        cases.push((
+            "mixed covariate layouts".into(),
+            tfm::with_covariates(tfm::synthetic_series(8, 2, |_| 64, 4), 64, 1, 2, |i| (i / 2) % 2 == 0),
+            64,
+            two.clone(),
+        ));
+        for (name, series, horizon, opts) in &cases {
+            let pl = plan(host, series, *horizon, opts).unwrap();
+            let one = pl
+                .calls
+                .iter()
+                .map(|c| host.rows_per_series(c.variates(), c.context, c.horizon))
+                .max()
+                .unwrap();
+            for cap in [MAX_ROWS, 5 * one, 2 * one, one] {
+                let got = m
+                    .predict_batch_capped(series, *horizon, opts, cap)
+                    .unwrap_or_else(|e| panic!("{name} at cap {cap}: {e}"));
+                let want = tfm::predict_one_decode_per_call(&m, series, *horizon, opts, cap);
+                tfm::assert_forecasts_bit_equal(&format!("{name} at cap {cap}"), &got, &want);
+            }
+            let packed = pack(host, &pl.calls, MAX_ROWS).unwrap().forwards.len();
+            assert!(
+                packed <= pl.calls.len(),
+                "{name}: {packed} forwards for {} calls",
+                pl.calls.len()
+            );
+            match name.as_str() {
+                "equal shapes" | "multivariate" => {
+                    assert_eq!(packed, 1, "{name}: calls of one shape share a forward");
+                    assert!(pl.calls.len() > 1);
+                }
+                "mixed contexts" | "mixed covariate layouts" => {
+                    assert!(
+                        1 < packed && packed < pl.calls.len(),
+                        "{name}: {packed} forwards for {} calls: shapes must merge in part",
+                        pl.calls.len()
+                    );
+                }
+                _ => {}
+            }
         }
     });
 }

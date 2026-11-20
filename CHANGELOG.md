@@ -12,8 +12,9 @@ All notable changes to `tessl` are recorded here. The format follows
   `kernels/timesfm3.metal`, `src/bin/timesfm3_forecast.rs`, `docs/timesfm3.md`).
   `google/timesfm-3.0-pytorch` from `config.json` and `model.safetensors` to quantile forecasts,
   with no Python on the path. It covers upstream's `TimesFM3Forecaster.predict_batch()` (every
-  option), `decode()` and the forward, plus a CSV command line. A group over `MAX_ROWS` runs as
-  several forwards of whole series. Held to upstream's PyTorch code at 918df02 on tiny fixtures and
+  option), `decode()` and the forward, plus a CSV command line. The plan's calls of one shape run
+  as shared forwards of whole series up to `MAX_ROWS` rows (`timesfm3_forecast::pack`), bit for bit
+  what one forward per call gives. Held to upstream's PyTorch code at 918df02 on tiny fixtures and
   on the real checkpoint (`tests/timesfm3_*.rs`; real max error 1.4e-5 of peak, 2026-11-19).
   `bench_timesfm3` is added but not yet timed.
 

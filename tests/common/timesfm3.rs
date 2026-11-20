@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use tessl::npy;
-use tessl::timesfm3::Timesfm3Config;
-use tessl::timesfm3_forecast::{CovariatePadding, PredictOptions, Rows, Series};
+use tessl::timesfm3::{Forecast, Timesfm3Config, Timesfm3Model};
+use tessl::timesfm3_forecast::{finish, plan, CovariatePadding, PredictOptions, Rows, Series, SeriesForecast};
 use tessl::timesfm3_host::DecodeInput;
 
 pub struct Arr {
@@ -292,5 +292,137 @@ pub fn forecast_case(dir: &Path, case: &str) -> ForecastCase {
         series,
         opts,
         call_horizons,
+    }
+}
+
+/// `n` deterministic series of `rows` target variates, series `i` over
+/// `len_of(i)` steps (a sinusoid of its own period and phase plus seeded
+/// noise), for tests that need real-shaped inputs without a recorded fixture.
+pub fn synthetic_series(n: usize, rows: usize, len_of: impl Fn(usize) -> usize, seed: u64) -> Vec<Series> {
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut noise = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2
+    };
+    (0..n)
+        .map(|i| {
+            let len = len_of(i);
+            let values = (0..rows * len)
+                .map(|k| {
+                    let (r, t) = (k / len, k % len);
+                    let period = 11.0 + (i % 7) as f32 * 3.0 + r as f32;
+                    10.0 + i as f32 * 0.25
+                        + (t as f32 * std::f32::consts::TAU / period + i as f32).sin() * 2.0
+                        + noise()
+                })
+                .collect();
+            Series {
+                target: Rows { rows, values },
+                past_only: None,
+                past_future: None,
+            }
+        })
+        .collect()
+}
+
+/// `series` with `po` past-only and `pf` past+future covariate channels on
+/// every series whose index passes `has`, derived from its own target (the
+/// past+future ones run on through `horizon` steps).
+pub fn with_covariates(
+    mut series: Vec<Series>,
+    horizon: usize,
+    po: usize,
+    pf: usize,
+    has: impl Fn(usize) -> bool,
+) -> Vec<Series> {
+    for (i, s) in series.iter_mut().enumerate().filter(|(i, _)| has(*i)) {
+        let len = s.target.values.len() / s.target.rows;
+        let channel = |k: usize, n: usize| {
+            (0..n)
+                .map(|t| ((t + 3 * k + i) as f32 * 0.37).cos() + k as f32)
+                .collect::<Vec<f32>>()
+        };
+        if po > 0 {
+            s.past_only = Some(Rows {
+                rows: po,
+                values: (0..po).flat_map(|k| channel(k, len)).collect(),
+            });
+        }
+        if pf > 0 {
+            s.past_future = Some(Rows {
+                rows: pf,
+                values: (0..pf).flat_map(|k| channel(k + 5, len + horizon)).collect(),
+            });
+        }
+    }
+    series
+}
+
+/// `predict_batch` as it ran before group packing: one `decode()` per plan call
+/// (cut by hand into slices of whole series when the call exceeds `max_rows`),
+/// then `finish`. The reference packed forecasts are held to bit for bit.
+pub fn predict_one_decode_per_call(
+    m: &Timesfm3Model,
+    series: &[Series],
+    horizon: usize,
+    opts: &PredictOptions,
+    max_rows: usize,
+) -> Vec<SeriesForecast> {
+    let host = &m.config().host;
+    let pl = plan(host, series, horizon, opts).unwrap();
+    let outs: Vec<Forecast> = pl
+        .calls
+        .iter()
+        .map(|call| {
+            let per = host.rows_per_series(call.variates(), call.context, call.horizon);
+            let chunk = (max_rows / per).max(1);
+            let mut values = Vec::new();
+            let mut shape = (0, 0, 0);
+            for start in (0..call.batch).step_by(chunk) {
+                let f = m
+                    .decode(&call.slice_batch(start, (start + chunk).min(call.batch)).unwrap())
+                    .unwrap();
+                shape = (f.variates, f.horizon, f.quantiles);
+                values.extend(f.values);
+            }
+            Forecast {
+                batch: call.batch,
+                variates: shape.0,
+                horizon: shape.1,
+                quantiles: shape.2,
+                values,
+            }
+        })
+        .collect();
+    finish(&pl, &outs).unwrap()
+}
+
+/// Holds `got` to `want`, series by series, bit for bit.
+pub fn assert_forecasts_bit_equal(what: &str, got: &[SeriesForecast], want: &[SeriesForecast]) {
+    assert_eq!(got.len(), want.len(), "{what}: series");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            (g.variates, g.horizon, g.quantiles),
+            (w.variates, w.horizon, w.quantiles),
+            "{what} series {i}"
+        );
+        assert_bit_equal(&format!("{what} series {i}"), &g.values, &w.values);
+    }
+}
+
+/// Refuses two f32 slices that differ in any element's bits (stricter than
+/// `==`: it also tells 0.0 from -0.0 and refuses NaN on either side), or in
+/// length.
+pub fn assert_bit_equal(what: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.to_bits() == w.to_bits() && !g.is_nan(),
+            "{what}: element {i} is {g:?} ({:#010x}), expected {w:?} ({:#010x})",
+            g.to_bits(),
+            w.to_bits()
+        );
     }
 }

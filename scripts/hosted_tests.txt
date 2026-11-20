@@ -64,7 +64,7 @@ bin qwen35_config 12
 bin qwen35_mlx_q4_layout 15
 bin qwen35_mlx_q4_adversarial 15
 bin relaxed_predicate 1
-bin results_report 13
+bin results_report 21
 bin release_check 14
 bin safetensors 12
 bin shader_index_arithmetic 34
@@ -116,7 +116,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 386
+bins 424
 
 # Library tests.
 lib ab_flags::tests:: 15

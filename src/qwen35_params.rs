@@ -34,6 +34,13 @@ use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
+thread_local! {
+    /// Test hook ([`Qwen35Model::fail_parameter_copy_after_for_test`]): the
+    /// model's address and the copies still to succeed before one fails;
+    /// `usize::MAX` is off. Per thread, so a test cannot leak it into another.
+    static COPY_FAULT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, usize::MAX)) };
+}
+
 /// One parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParamInfo {
@@ -547,12 +554,52 @@ impl Qwen35Model {
             s.param_window().check(format_args!("{WHAT}: {}", s.info.name))?;
         }
         self.bump_param_generation();
-        for (s, t) in slots.iter().zip(src) {
+        for (i, (s, t)) in slots.iter().zip(src).enumerate() {
             let to = s.param_window();
-            window_copy(&self.rt, &Window::tensor_as(t, &to)?, &to)
-                .map_err(|e| format!("{WHAT}: {}: {e}", s.info.name))?;
+            let copied = self
+                .take_copy_fault()
+                .and_then(|()| window_copy(&self.rt, &Window::tensor_as(t, &to)?, &to));
+            if let Err(e) = copied {
+                let msg = format!("{WHAT}: {}: {e}", s.info.name);
+                // Entries before `i` are already encoded, so the table is part
+                // old and part new; a failure on the first entry has encoded
+                // nothing and leaves every weight as it was.
+                if i > 0 {
+                    self.mark_torn(msg.clone());
+                }
+                return Err(msg);
+            }
         }
-        self.rt.synchronize()
+        // The copies are encoded: an error here cannot say how many of them
+        // ran, so the weights are as torn as after a failed copy.
+        self.rt.synchronize().inspect_err(|e| {
+            self.mark_torn(format!("{WHAT}: synchronize after the copies: {e}"));
+        })
+    }
+
+    /// Make the `write_parameters` copy that comes after `n` more successful
+    /// ones fail with an error, once, on this model and this thread:
+    /// `fail_parameter_copy_after_for_test(0)` fails the first copy, before
+    /// any weight is written, and `n > 0` fails after `n` entries were
+    /// encoded. `usize::MAX` disarms it. Tests only.
+    #[doc(hidden)]
+    pub fn fail_parameter_copy_after_for_test(&self, n: usize) {
+        COPY_FAULT.with(|c| c.set((self as *const Self as usize, n)));
+    }
+
+    fn take_copy_fault(&self) -> Result<(), String> {
+        COPY_FAULT.with(|c| {
+            let (model, left) = c.get();
+            if model != self as *const Self as usize || left == usize::MAX {
+                return Ok(());
+            }
+            if left == 0 {
+                c.set((0, usize::MAX));
+                return Err("copy: injected fault (fail_parameter_copy_after_for_test)".into());
+            }
+            c.set((model, left - 1));
+            Ok(())
+        })
     }
 
     /// Copy parameter-table entry `index` into `dst` on the host, in its

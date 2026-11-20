@@ -117,7 +117,7 @@ const VARIANTS: &[Variant] = &[
 ];
 
 /// Exact-f32 (non-relaxed) coop variants, measured against production's exact
-/// f32 NN (32x32, one simdgroup, zero pre-pass) on f32 operands. Qwen35's
+/// f32 NN (32x32, one simdgroup, no zero pre-pass) on f32 operands. Qwen35's
 /// `train_step` runs every GEMM on that kernel.
 const F32_VARIANTS: &[Variant] = &[
     Variant {

@@ -1,6 +1,6 @@
 //! GEMM dispatch: TensorOps `matmul2d` (preferred) or `simdgroup_matrix` fallback.
 //!
-//! GEMM v2: Morton 1D TG walk, packed zero+matmul (one binder), MLP/bf16 split-K,
+//! GEMM v2: Morton 1D TG walk, one binder per GEMM (no C zero pass), MLP/bf16 split-K,
 //! `execution_simdgroups<4>` on bf16/relaxed kernels (see matmul_tensorops.metal).
 //!
 //! Phase H: `PrecisionMode::Bf16` uses bf16 TensorOps GEMMs (f32 accumulate).
@@ -572,7 +572,6 @@ fn gemm_dispatch(
             }
             NnF32Route::Single | NnF32Route::SmallPar(_) => {
                 let pipeline = rt.pipeline(backend.kernel_name_f32())?;
-                // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
                 dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
             }
         },
@@ -1281,7 +1280,10 @@ fn dispatch_tensorops_nn_coop(
     })
 }
 
-/// Pack `zero_f32(C)` + TensorOps NN matmul into a single Metal 4 binder.
+/// One exact-f32 `mode::multiply` dispatch (NN). The kernel writes every
+/// in-bounds element of C, edge tiles and short K included, so C needs no
+/// zero pass first (`tests/gemm_exact_f32_overwrite.rs` fills C with NaN and
+/// large sentinels and requires the zeroed run's bits).
 fn dispatch_tensorops_nn(
     rt: &GpuRuntime,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -1293,40 +1295,7 @@ fn dispatch_tensorops_nn(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
-    let zero_p = rt.pipeline("zero_f32")?;
-    let numel = c.numel();
-    let tiles_n = n.div_ceil(tile.sn);
-    let tiles_m = m.div_ceil(tile.sm);
-    let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
-    let z_width = zero_p.threadExecutionWidth();
-    let z_tpt = z_width.min(numel).max(1);
-    let z_groups = numel.div_ceil(z_tpt);
-
-    rt.with_binder(|bnd| {
-        bnd.set_pipeline(&zero_p);
-        bnd.bind_tensor(c, 0);
-        bnd.bind_u32(numel as u32, 1);
-        bnd.dispatch(mtl_size(z_groups, 1, 1), mtl_size(z_tpt, 1, 1));
-        // Explicit barrier only when auto per-dispatch barriers are off.
-        // Ask the binder, not the global flag — the binder's latched mode is
-        // what decided whether the zero dispatch already got a barrier.
-        if bnd.needs_explicit_barriers() {
-            bnd.barrier();
-        }
-
-        bnd.set_pipeline(pipeline);
-        bnd.bind_tensor(a, 0);
-        bnd.bind_tensor(b, 1);
-        bnd.bind_tensor(c, 2);
-        bnd.bind_u32(m as u32, 3);
-        bnd.bind_u32(n as u32, 4);
-        bnd.bind_u32(k as u32, 5);
-        bnd.bind_u32(tiles_n as u32, 6);
-        bnd.bind_u32(tiles_m as u32, 7);
-        bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
-        Ok(())
-    })
+    dispatch_tensorops_accum(rt, pipeline, a, b, c, m, n, k, tile)
 }
 
 fn dispatch_tensorops_tn_nt(
@@ -1340,11 +1309,14 @@ fn dispatch_tensorops_tn_nt(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
-    // Same binder packing as NN.
+    // The same single dispatch as NN.
     dispatch_tensorops_nn(rt, pipeline, a, b, c, m, n, k, tile)
 }
 
-/// TensorOps matmul with `mode::multiply_accumulate` — no C zero (1 binder).
+/// One binder, one dispatch of a TensorOps tile kernel over its tile grid. What
+/// the kernel does with C is its own business: `mode::multiply_accumulate`
+/// adds into the C it is given, `mode::multiply` overwrites it. Nothing here
+/// touches C beforehand.
 fn dispatch_tensorops_accum(
     rt: &GpuRuntime,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -1833,7 +1805,7 @@ const NN_SMALL_PAR_MAX_N: usize = 512;
 /// non-cooperative lane. [`Route::Default`] never returns `SmallPar`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NnF32Route {
-    /// One dispatch over all of K, C zeroed first (`matmul2d_tensorops_f32`).
+    /// One dispatch over all of K (`matmul2d_tensorops_f32`, which overwrites C).
     Single,
     /// A long K over a B too large for cache, in sequential partitions
     /// ([`nn_splitk_k_tile`]).

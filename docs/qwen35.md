@@ -725,8 +725,8 @@ environment flag) enables fused decode kernels that reduce per-token dispatch ov
 - **Fused gate/up GEMV + SiLU (`qwen35_gemv_gate_up_silu_{f32,bf16}`, `gemv_q4_mlx_simd_gate_up_silu`):**
   Combines the gate projection, up projection, and SwiGLU elementwise product into one kernel.
   In bf16, this replaces two GEMVs and a SwiGLU with one dispatch (saving 2 dispatches per layer).
-  In exact f32, where each NN GEMM involves `zero_f32` and matmul dispatches, this saves 4
-  dispatches per layer.
+  In exact f32 each NN GEMM is one matmul dispatch, so this also saves 2
+  dispatches per layer (the exact-f32 GEMM once took a `zero_f32` pre-pass, so it saved 4).
 
 On Qwen3.5-2B in bf16, fused decode drops dispatches from 273 to 225 per token (a saving of 48
 dispatches per token; `bench/results/qwen35_decode_fusion_dispatches_m5pro.txt`). On a 4-layer

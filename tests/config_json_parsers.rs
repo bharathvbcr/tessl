@@ -560,6 +560,16 @@ fn read_pre(t: &str) -> Result<(), String> {
 fn read_audio(t: &str) -> Result<(), String> {
     AudioConfig::from_config_json(t).map(|_| ())
 }
+fn read_qwen(t: &str) -> Result<(), String> {
+    Qwen35Config::from_config_json(t).map(|_| ())
+}
+fn read_tok(t: &str) -> Result<(), String> {
+    Tokenizer::from_json(t).map(|_| ())
+}
+
+/// The smallest `tokenizer.json` the reader takes: one token, id 0.
+const TOK: &str = r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"fuse_unk":false,"byte_fallback":false},
+"decoder":{"type":"Fuse"}}"#;
 
 /// One hostile case: the reader, the file it reads with the `nth` occurrence
 /// of `from` replaced by `to` (an empty `from` means `base` is the file as
@@ -608,6 +618,8 @@ fn hostile_cases() -> Vec<Hostile> {
     const B: (&str, Reader) = ("bert", read_bert);
     const E: (&str, Reader) = ("embedgemma2", read_eg2);
     const P: (&str, Reader) = ("pre", read_pre);
+    const Q: (&str, Reader) = ("qwen35", read_qwen);
+    const T: (&str, Reader) = ("tokenizer", read_tok);
     let mut v = vec![
         // BERT.
         case(
@@ -851,6 +863,83 @@ fn hostile_cases() -> Vec<Hostile> {
         case(E.0, E.1, EG2, "1000000.0", 0, "1e999", "overflows f64"),
         case(E.0, E.1, EG2, "1000000.0", 0, "0", "rope_theta must be positive"),
         case(E.0, E.1, EG2, "10000.0", 0, "-10000.0", "rope_theta must be positive"),
+        // Qwen3.5 (the same fixture the file readers use).
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"num_hidden_layers\": 24",
+            0,
+            "\"num_hidden_layers\": 4294967295",
+            "num_hidden_layers is 4294967295",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"hidden_size\": 2048",
+            0,
+            "\"hidden_size\": 0",
+            "must be non-zero",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"num_attention_heads\": 8",
+            0,
+            "\"num_attention_heads\": 0",
+            "must be non-zero",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"linear_num_key_heads\": 16",
+            0,
+            "\"linear_num_key_heads\": 0",
+            "non-zero multiple",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"rms_norm_eps\": 1e-06",
+            0,
+            "\"rms_norm_eps\": 1e39",
+            "must be positive",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"rope_theta\": 10000000",
+            0,
+            "\"rope_theta\": 1e39",
+            "must be positive",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"rope_theta\": 10000000",
+            0,
+            "\"rope_theta\": 0",
+            "must be positive",
+        ),
+        case(
+            Q.0,
+            Q.1,
+            QWEN,
+            "\"linear_conv_kernel_dim\": 4",
+            0,
+            "\"linear_conv_kernel_dim\": 9",
+            "conv_kernel 9",
+        ),
+        // Tokenizer: a vocabulary id sizes nothing, but it indexes the span table.
+        case(T.0, T.1, TOK, "\"a\":0", 0, "\"a\":4294967295", "vocabulary id"),
+        case(T.0, T.1, TOK, "\"a\":0", 0, "\"a\":4294967296", "vocabulary id"),
+        case(T.0, T.1, TOK, "\"a\":0", 0, "\"a\":1", "outside 0..1"),
         // Processor config: image section (first occurrence).
         case(
             P.0,
@@ -1004,6 +1093,29 @@ fn hostile_cases() -> Vec<Hostile> {
             "out of range",
         ),
     ];
+    // Sizes whose product, not any one of them, overflows usize (each alone is a
+    // valid u32; the config is refused before a tensor of that shape is sized).
+    for (other, label, first) in [
+        (
+            "\"hidden_size_per_layer_input\":32",
+            "hidden x per-layer input at u32::MAX",
+            "\"hidden_size_per_layer_input\":4294967295",
+        ),
+        (
+            "\"intermediate_size\":128",
+            "hidden x intermediate at u32::MAX",
+            "\"intermediate_size\":4294967295",
+        ),
+    ] {
+        let text = edit_nth(
+            &edit_nth(EG2, "\"hidden_size\":64", "\"hidden_size\":4294967295", 0),
+            other,
+            first,
+            0,
+        );
+        let text: &'static str = Box::leak(text.into_boxed_str());
+        v.push(whole(E, text, label, "overflows usize"));
+    }
     // Each bound holds on its own and the product still must not: the largest
     // patch, pooling kernel and soft-token count together are a 220 GB image.
     let big_image = edit_nth(
@@ -1081,10 +1193,10 @@ fn the_bounds_are_inclusive() {
     PreConfig::from_json(&edit_nth(PRE, "\"max_frames\": 32", "\"max_frames\": 1048576", 0)).unwrap();
 }
 
-/// The audio reader is held (`src/embedgemma2_audio.rs`): only the cases it
-/// already refuses are pinned here. `audio_layers_at_u32_max` and the f32
-/// narrowings (`residual_weight`, `attention_logit_cap`, `rms_norm_eps` at
-/// 1e39) are reported as findings instead.
+/// The audio reader is held (`src/embedgemma2_audio.rs`): only the hostile
+/// numbers it already refuses are pinned here. It accepts, on unmodified code,
+/// `num_hidden_layers`, `output_proj_dims`, `attention_chunk_size` and
+/// `conv_kernel_size` at u32::MAX (reported as findings, not pinned).
 #[test]
 fn the_audio_reader_refuses_the_hostile_numbers_it_already_refuses() {
     let cases = [
@@ -1093,17 +1205,50 @@ fn the_audio_reader_refuses_the_hostile_numbers_it_already_refuses() {
         ("\"num_hidden_layers\":2", "\"num_hidden_layers\":0"),
         ("\"attention_chunk_size\":4", "\"attention_chunk_size\":0"),
         ("\"attention_context_left\":5", "\"attention_context_left\":0"),
+        ("\"attention_context_left\":5", "\"attention_context_left\":4294967295"),
         ("\"conv_kernel_size\":5", "\"conv_kernel_size\":0"),
         ("\"output_proj_dims\":48", "\"output_proj_dims\":0"),
         ("\"hidden_size\":64", "\"hidden_size\":4294967295"),
         ("\"num_attention_heads\":4", "\"num_attention_heads\":4294967295"),
+        (
+            "\"subsampling_conv_channels\":[32,8]",
+            "\"subsampling_conv_channels\":[4294967292,8]",
+        ),
+        (
+            "\"subsampling_conv_channels\":[32,8]",
+            "\"subsampling_conv_channels\":[32,4294967295]",
+        ),
         ("\"rms_norm_eps\":1e-05", "\"rms_norm_eps\":-1"),
         ("\"rms_norm_eps\":1e-05", "\"rms_norm_eps\":0"),
+        ("\"rms_norm_eps\":1e-05", "\"rms_norm_eps\":1e39"),
+        ("\"residual_weight\":0.5", "\"residual_weight\":1e39"),
+        ("\"attention_logit_cap\":4.0", "\"attention_logit_cap\":1e39"),
+        (
+            "\"attention_invalid_logits_value\":-1000000000.0",
+            "\"attention_invalid_logits_value\":-1e39",
+        ),
     ];
     for (from, to) in cases {
         let text = edit_nth(AUDIO, from, to, 0);
         let r = std::panic::catch_unwind(|| read_audio(&text));
         assert!(matches!(r, Ok(Err(_))), "{to}: {r:?}");
+    }
+}
+
+/// Every hostile case edits one number of a file that is itself accepted, so a
+/// refusal is the number's, not the file's.
+#[test]
+fn every_hostile_base_is_itself_accepted() {
+    for (name, read, base) in [
+        ("bert", read_bert as Reader, MINI),
+        ("distilbert", read_bert, DISTIL),
+        ("embedgemma2", read_eg2, EG2),
+        ("pre", read_pre, PRE),
+        ("audio", read_audio, AUDIO),
+        ("qwen35", read_qwen, QWEN),
+        ("tokenizer", read_tok, TOK),
+    ] {
+        read(base).unwrap_or_else(|e| panic!("{name}: the base is refused: {e}"));
     }
 }
 

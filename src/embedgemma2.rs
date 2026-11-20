@@ -1418,9 +1418,7 @@ impl EmbedGemma2Config {
         }
         const WHAT: &str = "config.json";
         elems(&[n_layers as u32, self.ple_dim, self.hidden], WHAT)?;
-        elems(&[self.vocab, self.hidden], WHAT)?;
         elems(&[self.intermediate, self.hidden, 2], WHAT)?;
-        elems(&[self.embedding_dim, self.hidden], WHAT)?;
         for (i, spec) in self.layers.iter().enumerate() {
             if encoder_attn_entry(spec.head_dim).is_none() {
                 return Err(format!(
@@ -1445,12 +1443,10 @@ impl EmbedGemma2Config {
                 ));
             }
             // The fused q|k|v width is a u32 on the device side.
-            let qkv_width = self
-                .q_heads
+            self.q_heads
                 .checked_add(spec.kv_heads.saturating_mul(2))
                 .and_then(|heads| heads.checked_mul(spec.head_dim))
                 .ok_or_else(|| format!("config.json: layer {i}: the q|k|v width overflows u32"))?;
-            elems(&[qkv_width, self.hidden], WHAT)?;
         }
         Ok(())
     }

@@ -470,8 +470,9 @@ fn the_27b_config_refuses_what_the_forward_lacks_by_key() {
 /// hostile one must be a typed refusal (`Err`), never a panic, an abort or an
 /// allocation sized by the number. `layer_types` stays, so a huge
 /// `num_hidden_layers` is refused by the count check without a list that long
-/// being built; the no-`layer_types` path is not exercised with a huge count
-/// because it builds that list before checking it.
+/// being built. Without `layer_types` the reader builds one entry per layer
+/// and accepts the result (no cap on `num_hidden_layers`: reported as a
+/// finding on the held `src/qwen35_model.rs`), so that path is not pinned.
 #[test]
 fn hostile_numbers_are_refused_not_panicked() {
     let cases: &[(&str, &str, &str)] = &[

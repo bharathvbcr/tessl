@@ -458,6 +458,45 @@ pub fn host_rms(x: &[f64], w: Option<&[f32]>, eps: f64) -> Vec<f64> {
         .collect()
 }
 
+/// The largest `|got - want|` over two outputs that must be the same length,
+/// non-empty and finite: the one comparator the benchmark binaries share, so a
+/// gate cannot be passed by a NaN or by two empty slices. A NaN is not skipped
+/// (`f64::max` would drop it and report the worst of the rest), an empty pair
+/// has no worst element to report, and a length mismatch means the two
+/// outputs are not the same product. Every error names `lane`.
+pub fn max_abs_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
+    if got.is_empty() || want.is_empty() {
+        return Err(format!(
+            "{lane}: nothing to compare ({} values against {})",
+            got.len(),
+            want.len()
+        ));
+    }
+    if got.len() != want.len() {
+        return Err(format!("{lane}: {} values against {}", got.len(), want.len()));
+    }
+    let mut worst = 0.0f64;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        if !g.is_finite() || !w.is_finite() {
+            return Err(format!("{lane}: element {i} is {g} against {w} (not finite)"));
+        }
+        worst = worst.max((f64::from(g) - f64::from(w)).abs());
+    }
+    Ok(worst)
+}
+
+/// [`max_abs_diff`] over the largest magnitude of `want`: the scale-free
+/// measure a bound is stated in. An all-zero `want` has no scale and is
+/// refused (a reference that is all zero is a kernel that wrote nothing).
+pub fn max_rel_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
+    let worst = max_abs_diff(lane, got, want)?;
+    let scale = want.iter().fold(0.0f64, |m, &w| m.max(f64::from(w).abs()));
+    if scale == 0.0 {
+        return Err(format!("{lane}: the reference is all zero, so a relative error has no scale"));
+    }
+    Ok(worst / scale)
+}
+
 /// A lane's result must be every element finite and not all zero: a kernel
 /// that wrote nothing (the buffer was poisoned with NaN first), or only zeros,
 /// cannot post a time.
@@ -710,8 +749,29 @@ pub fn jstr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        fill, fill_affine, incomplete_line, median, parse_count, ratio_stats, round_order, run_paired, self_spread, Arm,
+        fill, fill_affine, incomplete_line, max_abs_diff, max_rel_diff, median, parse_count, ratio_stats, round_order,
+        run_paired, self_spread, Arm,
     };
+
+    /// The comparator every bench gate shares fails on what the retired
+    /// `fold(0.0, f64::max)` copies passed: a NaN (dropped by `max`), two empty
+    /// slices (worst of nothing is 0), and slices of different lengths (`zip`
+    /// stops at the shorter).
+    #[test]
+    fn diff_comparators_fail_on_nan_empty_and_length_mismatch() {
+        assert_eq!(max_abs_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.5, 4.0]).unwrap(), 0.5);
+        assert_eq!(max_rel_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.0, 5.0]).unwrap(), 0.2);
+        assert!(max_abs_diff("t", &[1.0, f32::NAN], &[1.0, 2.0]).unwrap_err().contains("not finite"));
+        assert!(max_abs_diff("t", &[1.0, 2.0], &[f32::NAN, 2.0]).unwrap_err().contains("not finite"));
+        assert!(max_abs_diff("t", &[f32::INFINITY], &[f32::INFINITY]).is_err());
+        assert!(max_abs_diff("t", &[], &[]).unwrap_err().contains("nothing to compare"));
+        assert!(max_abs_diff("t", &[1.0], &[]).unwrap_err().contains("nothing to compare"));
+        assert!(max_abs_diff("t", &[1.0, 2.0], &[1.0]).unwrap_err().contains("2 values against 1"));
+        assert!(max_rel_diff("t", &[0.0, 0.0], &[0.0, 0.0]).unwrap_err().contains("all zero"));
+        assert!(max_rel_diff("t", &[f32::NAN], &[1.0]).is_err());
+        // The lane is named in every refusal.
+        assert!(max_abs_diff("the-lane", &[], &[]).unwrap_err().starts_with("the-lane:"));
+    }
 
     #[test]
     fn incomplete_marker_is_one_line_and_not_a_metric() {

@@ -478,17 +478,6 @@ fn arm<'a>(
     }
 }
 
-/// Largest absolute difference between two arms' outputs, relative to the
-/// first's largest magnitude: every arm computes the same product.
-fn rel_diff(a: &[f32], b: &[f32]) -> f64 {
-    let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())) as f64;
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (*x as f64 - *y as f64).abs())
-        .fold(0.0, f64::max)
-        / scale.max(1e-30)
-}
-
 fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
     const SHAPES: &[(usize, usize, usize)] = &[
         (128, 128, 4096),
@@ -537,11 +526,12 @@ fn splitk_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             }
             rt.synchronize()?;
             let base = cs[0].buffer.read_f32()[..m * n].to_vec();
-            let worst = cs[1..]
-                .iter()
-                .map(|c| rel_diff(&base, &c.buffer.read_f32()[..m * n]))
-                .fold(0.0, f64::max);
-            if worst.is_nan() || worst >= 1e-4 {
+            let mut worst = 0.0f64;
+            for c in &cs[1..] {
+                let lane = format!("{m}x{n}x{k} acc={acc}");
+                worst = worst.max(common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base)?);
+            }
+            if worst >= 1e-4 {
                 return Err(format!(
                     "{m}x{n}x{k} acc={acc}: arms disagree by {worst:.2e} of the output's scale"
                 ));
@@ -685,11 +675,12 @@ fn nnsmall_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
             }
             rt.synchronize()?;
             let base = cs[0].buffer.read_f32()[..m * n].to_vec();
-            let worst = cs[1..]
-                .iter()
-                .map(|c| rel_diff(&base, &c.buffer.read_f32()[..m * n]))
-                .fold(0.0, f64::max);
-            if worst.is_nan() || worst >= 1e-5 {
+            let mut worst = 0.0f64;
+            for c in &cs[1..] {
+                let lane = format!("{name} M={m} N={n} K={k}");
+                worst = worst.max(common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base)?);
+            }
+            if worst >= 1e-5 {
                 return Err(format!(
                     "{name} M={m} N={n} K={k}: arms disagree by {worst:.2e} of the output's scale"
                 ));
@@ -872,12 +863,12 @@ fn sam_lane(rt: &Arc<GpuRuntime>, run: &Run) -> Result<(), String> {
                 }
             }
             let base = cs[0].buffer.read_f32();
-            let diffs: Vec<String> = calls
-                .iter()
-                .zip(&cs)
-                .skip(1)
-                .map(|((name, _), c)| format!("{name} {:.1e}", rel_diff(&base[..m * n], &c.buffer.read_f32()[..m * n])))
-                .collect();
+            let mut diffs: Vec<String> = Vec::new();
+            for ((name, _), c) in calls.iter().zip(&cs).skip(1) {
+                let lane = format!("sam {label} M={m} N={n} K={k}: {name}");
+                let e = common::max_rel_diff(&lane, c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]), &base[..m * n])?;
+                diffs.push(format!("{name} {e:.1e}"));
+            }
             let reps = run.reps;
             let mut arms: Vec<common::Arm<'_>> = calls.iter().map(|(name, f)| arm(name, rt, reps, f)).collect();
             let medians = report(

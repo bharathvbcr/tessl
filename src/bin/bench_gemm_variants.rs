@@ -870,11 +870,12 @@ fn q4_small_m() -> Result<(), String> {
             let b = y_new.try_read_f32()?;
             let n = m * rows;
             let scale = a[..n].iter().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-30);
-            let worst = a[..n]
-                .iter()
-                .zip(&b[..n])
-                .fold(0.0f32, |w, (p, q)| w.max((p - q).abs()));
-            if worst.is_nan() || worst > 1e-3 * scale {
+            let worst = common::max_abs_diff(
+                &format!("{label} M={m}"),
+                a.get(..n).unwrap_or(&[]),
+                b.get(..n).unwrap_or(&[]),
+            )?;
+            if worst > f64::from(1e-3 * scale) {
                 return Err(format!(
                     "{label} M={m}: arms disagree, max |old - new| {worst:e} against max |old| {scale:e}"
                 ));

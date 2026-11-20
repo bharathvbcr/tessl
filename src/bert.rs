@@ -401,6 +401,27 @@ pub enum BertFamily {
     DistilBert,
 }
 
+impl BertFamily {
+    /// The `config.json` keys of this family: the activation, then the hidden
+    /// size, layer count, head count and intermediate size.
+    fn keys(self) -> (&'static str, &'static str, &'static str, &'static str, &'static str) {
+        match self {
+            BertFamily::Bert => (
+                "hidden_act",
+                "hidden_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "intermediate_size",
+            ),
+            BertFamily::DistilBert => ("activation", "dim", "n_layers", "n_heads", "hidden_dim"),
+        }
+    }
+}
+
+/// Most encoder layers a config may name (checkpoints have 6 to 24): the cap
+/// that [`BertConfig::validate`] applies before the layer list is reserved.
+pub const MAX_LAYERS: u32 = 1024;
+
 /// The encoder's shapes, read from `config.json`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BertConfig {
@@ -417,9 +438,10 @@ pub struct BertConfig {
 }
 
 impl BertConfig {
-    /// Head dimension, `hidden / heads`.
+    /// Head dimension, `hidden / heads` (0 for a hand-built config with no
+    /// heads, which [`Self::validate`] refuses).
     pub fn head_dim(&self) -> u32 {
-        self.hidden / self.heads
+        self.hidden.checked_div(self.heads).unwrap_or(0)
     }
 
     /// Parse a `config.json`. Everything the forward does not implement — a
@@ -439,16 +461,7 @@ impl BertConfig {
                 ))
             }
         };
-        let (act_key, hidden_k, layers_k, heads_k, inter_k) = match family {
-            BertFamily::Bert => (
-                "hidden_act",
-                "hidden_size",
-                "num_hidden_layers",
-                "num_attention_heads",
-                "intermediate_size",
-            ),
-            BertFamily::DistilBert => ("activation", "dim", "n_layers", "n_heads", "hidden_dim"),
-        };
+        let (act_key, hidden_k, layers_k, heads_k, inter_k) = family.keys();
         match string(act_key)? {
             Some("gelu") => {}
             other => {
@@ -467,7 +480,7 @@ impl BertConfig {
                         ))
                     }
                 }
-                let eps = config_json::float(config_json::field(&c, "layer_norm_eps")?, "layer_norm_eps")?;
+                let eps = config_json::f32_field(config_json::field(&c, "layer_norm_eps")?, "layer_norm_eps")?;
                 (uint("type_vocab_size")?, eps)
             }
             BertFamily::DistilBert => {
@@ -487,39 +500,57 @@ impl BertConfig {
             vocab: uint("vocab_size")?,
             max_positions: uint("max_position_embeddings")?,
             type_vocab,
-            layer_norm_eps: layer_norm_eps as f32,
+            layer_norm_eps,
         };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Every bound a config must meet before any size is taken from it: the
+    /// one owner of them, called by [`Self::from_config_json`] and by
+    /// [`BertSparseModel::load`] (the fields are `pub`, so a hand-built
+    /// config is not validated by parsing). Messages name the `config.json`
+    /// key of the config's family.
+    pub fn validate(&self) -> Result<(), String> {
+        let (_, hidden_k, layers_k, heads_k, inter_k) = self.family.keys();
         for (k, v) in [
-            (hidden_k, cfg.hidden),
-            (layers_k, cfg.layers),
-            (heads_k, cfg.heads),
-            (inter_k, cfg.intermediate),
-            ("vocab_size", cfg.vocab),
-            ("max_position_embeddings", cfg.max_positions),
+            (hidden_k, self.hidden),
+            (layers_k, self.layers),
+            (heads_k, self.heads),
+            (inter_k, self.intermediate),
+            ("vocab_size", self.vocab),
+            ("max_position_embeddings", self.max_positions),
         ] {
             if v == 0 {
                 return Err(format!("config.json: {k} is zero"));
             }
         }
-        if family == BertFamily::Bert && cfg.type_vocab == 0 {
+        if self.layers > MAX_LAYERS {
+            return Err(format!(
+                "config.json: {layers_k} = {} is above the cap of {MAX_LAYERS}",
+                self.layers
+            ));
+        }
+        if self.family == BertFamily::Bert && self.type_vocab == 0 {
             return Err("config.json: type_vocab_size is zero".into());
         }
-        if !(layer_norm_eps > 0.0 && layer_norm_eps.is_finite() && cfg.layer_norm_eps > 0.0) {
+        if !(self.layer_norm_eps > 0.0 && self.layer_norm_eps.is_finite()) {
             return Err(format!(
-                "config.json: layer_norm_eps must be positive, got {layer_norm_eps}"
+                "config.json: layer_norm_eps must be positive, got {}",
+                self.layer_norm_eps
             ));
         }
-        if !cfg.hidden.is_multiple_of(cfg.heads) {
+        if !self.hidden.is_multiple_of(self.heads) {
             return Err(format!(
                 "config.json: {hidden_k} {} is not a multiple of {heads_k} {}",
-                cfg.hidden, cfg.heads
+                self.hidden, self.heads
             ));
         }
-        let d = cfg.head_dim();
+        let d = self.head_dim();
         if !matches!(d, 32 | 64) {
             return Err(format!("config.json: head dim {d} has no attention kernel (32 or 64)"));
         }
-        Ok(cfg)
+        Ok(())
     }
 
     pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
@@ -711,6 +742,7 @@ impl BertSparseModel {
     /// missing one is an error, and so is one the checkpoint carries that
     /// this model never reads (`Loader::refuse_unread`).
     pub fn load(rt: &Arc<GpuRuntime>, st: &SafeTensors, cfg: BertConfig) -> Result<Self, String> {
+        cfg.validate()?;
         let ld = Weights {
             ld: Loader::new(rt, st, ""),
             rt,

@@ -60,6 +60,8 @@ pub struct Syntax {
 
 use std::borrow::Cow;
 
+/// Rewrite `-0` (outside strings) as `0`. Works on bytes and copies every other
+/// byte as it was, so UTF-8 text survives unchanged: only ASCII is replaced.
 fn normalize_neg_zero(text: &str) -> Cow<'_, str> {
     if !text.contains("-0") {
         return Cow::Borrowed(text);
@@ -69,11 +71,11 @@ fn normalize_neg_zero(text: &str) -> Cow<'_, str> {
     let mut escape = false;
     let mut i = 0;
     let mut changed = false;
-    let mut out = String::with_capacity(text.len());
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     while i < bytes.len() {
         let b = bytes[i];
         if in_str {
-            out.push(b as char);
+            out.push(b);
             if escape {
                 escape = false;
             } else if b == b'\\' {
@@ -86,27 +88,28 @@ fn normalize_neg_zero(text: &str) -> Cow<'_, str> {
         }
         if b == b'"' {
             in_str = true;
-            out.push('"');
+            out.push(b);
             i += 1;
             continue;
         }
         if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'0' {
             let next = bytes.get(i + 2).copied();
             if !matches!(next, Some(b'.' | b'e' | b'E' | b'0'..=b'9')) {
-                out.push('0');
+                out.push(b'0');
                 i += 2;
                 changed = true;
                 continue;
             }
         }
-        out.push(b as char);
+        out.push(b);
         i += 1;
     }
-    if changed {
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(text)
+    if !changed {
+        return Cow::Borrowed(text);
     }
+    // Only ASCII bytes were replaced in valid UTF-8, so this holds; were it
+    // ever not, the unrewritten text goes to the parser, which refuses it.
+    String::from_utf8(out).map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
 pub fn parse(text: &str, syntax: Syntax) -> Result<Json, String> {
@@ -182,5 +185,45 @@ fn from_ojas_val(v: JsonValue, syntax: Syntax) -> Result<Json, String> {
             }
             Ok(Json::Object(out))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SYNTAX: Syntax = Syntax {
+        what: "test",
+        max_depth: 4,
+        uints_only: false,
+        literals: true,
+    };
+
+    fn string_at(v: &Json, key: &str) -> String {
+        match v.get(key) {
+            Some(Json::Str(s)) => s.clone(),
+            other => panic!("{key}: expected a string, got {other:?}"),
+        }
+    }
+
+    /// The `-0` rewrite once pushed each byte as a Latin-1 char once it had
+    /// triggered, so every non-ASCII string in the document was corrupted.
+    #[test]
+    fn the_negative_zero_rewrite_keeps_non_ascii_strings_intact() {
+        let text = "{\"bos\": \"é日😀\", \"zero\": -0, \"neg\": \"-0\", \"tail\": \"ß\"}";
+        let v = parse(text, SYNTAX).unwrap();
+        assert_eq!(string_at(&v, "bos"), "é日😀");
+        assert_eq!(string_at(&v, "neg"), "-0");
+        assert_eq!(string_at(&v, "tail"), "ß");
+        assert!(matches!(v.get("zero"), Some(Json::Num { value, .. }) if *value == 0.0));
+    }
+
+    #[test]
+    fn the_rewrite_changes_only_a_bare_negative_zero() {
+        assert_eq!(
+            normalize_neg_zero("{\"a\": -0, \"b\": -0.5, \"c\": -01e2}"),
+            "{\"a\": 0, \"b\": -0.5, \"c\": -01e2}"
+        );
+        assert!(matches!(normalize_neg_zero("{\"a\": \"é\"}"), Cow::Borrowed(_)));
     }
 }

@@ -122,6 +122,10 @@ const BACKEND: GemmBackend = GemmBackend::TensorOps;
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// Sequences per [`EmbedGemma2Model::encode`] call.
 pub const MAX_BATCH: usize = 256;
+
+/// Most text layers a config may name (the checkpoint has 26): the cap
+/// [`EmbedGemma2Config::validate`] applies before any per-layer list is sized.
+pub const MAX_LAYERS: usize = 1024;
 /// Padded tokens (`sequences * longest`) per forward. Bounds the activations:
 /// at this size the largest buffer, the q|k|v projection of a 512-wide full
 /// layer (`(4 + 2) * 512` columns), is 384 MiB, and all of them about 2 GiB.
@@ -1218,7 +1222,7 @@ impl EmbedGemma2Config {
         let root = config_json::parse_object(text)?;
         let c = root.get("text_config").unwrap_or(&root);
         let uint = |k: &str| config_json::uint(c, k);
-        let num = |obj: &JsonValue, k: &str| config_json::float(config_json::field(obj, k)?, k);
+        let f32_num = |obj: &JsonValue, k: &str| config_json::f32_field(config_json::field(obj, k)?, k);
         // An id that may be absent (or null: a text-only config); a present one
         // must be a u32.
         let opt_uint = |obj: &JsonValue, k: &str| -> Result<Option<u32>, String> {
@@ -1256,26 +1260,7 @@ impl EmbedGemma2Config {
         let sliding_window = uint("sliding_window")?;
         let head_dim = uint("head_dim")?;
         let kv_heads = uint("num_key_value_heads")?;
-        let eps = num(c, "rms_norm_eps")?;
-        for (k, v) in [
-            ("hidden_size", hidden),
-            ("hidden_size_per_layer_input", ple_dim),
-            ("intermediate_size", intermediate),
-            ("vocab_size", vocab),
-            ("embedding_dim", embedding_dim),
-            ("num_attention_heads", q_heads),
-            ("sliding_window", sliding_window),
-        ] {
-            if v == 0 {
-                return Err(format!("config.json: {k} is zero"));
-            }
-        }
-        if n_layers == 0 {
-            return Err("config.json: num_hidden_layers is zero".into());
-        }
-        if !(eps > 0.0 && eps.is_finite()) {
-            return Err(format!("config.json: rms_norm_eps must be positive, got {eps}"));
-        }
+        let eps = f32_num(c, "rms_norm_eps")?;
 
         let types: Vec<bool> = match c.get("layer_types") {
             Some(JsonValue::Array(a)) => a
@@ -1350,13 +1335,7 @@ impl EmbedGemma2Config {
                     "config.json: rope_parameters.{kind}.partial_rotary_factor is not supported"
                 ));
             }
-            let theta = num(p, "rope_theta")?;
-            if !(theta > 0.0 && theta.is_finite()) {
-                return Err(format!(
-                    "config.json: rope_parameters.{kind}.rope_theta must be positive"
-                ));
-            }
-            Ok(theta as f32)
+            f32_num(p, "rope_theta")
         };
         let theta_sliding = theta_for("sliding_attention")?;
         let theta_full = theta_for("full_attention")?;
@@ -1370,18 +1349,6 @@ impl EmbedGemma2Config {
                 kv_heads: kv.unwrap_or(kv_heads),
                 rope_theta: if sliding { theta_sliding } else { theta_full },
             };
-            if encoder_attn_entry(spec.head_dim).is_none() {
-                return Err(format!(
-                    "config.json: layer {i} head_dim {} has no attention kernel (256 or 512)",
-                    spec.head_dim
-                ));
-            }
-            if spec.kv_heads == 0 || q_heads % spec.kv_heads != 0 {
-                return Err(format!(
-                    "config.json: layer {i}: num_attention_heads {q_heads} is not a multiple of kv heads {}",
-                    spec.kv_heads
-                ));
-            }
             layers.push(spec);
         }
         let special_tokens = SpecialTokens {
@@ -1396,7 +1363,7 @@ impl EmbedGemma2Config {
             boa: opt_uint(&root, "boa_token_id")?,
             eoa: opt_uint(&root, "eoa_token_index")?,
         };
-        Ok(Self {
+        let cfg = Self {
             hidden,
             ple_dim,
             intermediate,
@@ -1404,10 +1371,88 @@ impl EmbedGemma2Config {
             embedding_dim,
             q_heads,
             sliding_window,
-            rms_norm_eps: eps as f32,
+            rms_norm_eps: eps,
             layers,
             special_tokens,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Every bound a config must meet before any size is taken from it: the
+    /// one owner of them, called by [`Self::from_config_json`] and by
+    /// [`EmbedGemma2Model::load_with`] (the fields are `pub`, so a hand-built
+    /// config is not validated by parsing). Zero sizes, more than
+    /// [`MAX_LAYERS`] layers, a non-positive or non-finite epsilon or theta,
+    /// a head dim with no kernel, a kv head count that does not divide the
+    /// query heads, and a tensor whose element count or width overflows are
+    /// refused by name.
+    pub fn validate(&self) -> Result<(), String> {
+        for (k, v) in [
+            ("hidden_size", self.hidden),
+            ("hidden_size_per_layer_input", self.ple_dim),
+            ("intermediate_size", self.intermediate),
+            ("vocab_size", self.vocab),
+            ("embedding_dim", self.embedding_dim),
+            ("num_attention_heads", self.q_heads),
+            ("sliding_window", self.sliding_window),
+        ] {
+            if v == 0 {
+                return Err(format!("config.json: {k} is zero"));
+            }
+        }
+        let n_layers = self.layers.len();
+        if n_layers == 0 {
+            return Err("config.json: num_hidden_layers is zero".into());
+        }
+        if n_layers > MAX_LAYERS {
+            return Err(format!(
+                "config.json: num_hidden_layers = {n_layers} is above the cap of {MAX_LAYERS}"
+            ));
+        }
+        if !(self.rms_norm_eps > 0.0 && self.rms_norm_eps.is_finite()) {
+            return Err(format!(
+                "config.json: rms_norm_eps must be positive, got {}",
+                self.rms_norm_eps
+            ));
+        }
+        const WHAT: &str = "config.json";
+        elems(&[n_layers as u32, self.ple_dim, self.hidden], WHAT)?;
+        elems(&[self.vocab, self.hidden], WHAT)?;
+        elems(&[self.intermediate, self.hidden, 2], WHAT)?;
+        elems(&[self.embedding_dim, self.hidden], WHAT)?;
+        for (i, spec) in self.layers.iter().enumerate() {
+            if encoder_attn_entry(spec.head_dim).is_none() {
+                return Err(format!(
+                    "config.json: layer {i} head_dim {} has no attention kernel (256 or 512)",
+                    spec.head_dim
+                ));
+            }
+            if spec.kv_heads == 0 || !self.q_heads.is_multiple_of(spec.kv_heads) {
+                return Err(format!(
+                    "config.json: layer {i}: num_attention_heads {} is not a multiple of kv heads {}",
+                    self.q_heads, spec.kv_heads
+                ));
+            }
+            if !(spec.rope_theta > 0.0 && spec.rope_theta.is_finite()) {
+                let kind = if spec.sliding {
+                    "sliding_attention"
+                } else {
+                    "full_attention"
+                };
+                return Err(format!(
+                    "config.json: rope_parameters.{kind}.rope_theta must be positive"
+                ));
+            }
+            // The fused q|k|v width is a u32 on the device side.
+            let qkv_width = self
+                .q_heads
+                .checked_add(spec.kv_heads.saturating_mul(2))
+                .and_then(|heads| heads.checked_mul(spec.head_dim))
+                .ok_or_else(|| format!("config.json: layer {i}: the q|k|v width overflows u32"))?;
+            elems(&[qkv_width, self.hidden], WHAT)?;
+        }
+        Ok(())
     }
 
     pub fn from_config_file(path: &std::path::Path) -> Result<Self, String> {
@@ -1876,6 +1921,7 @@ impl EmbedGemma2Model {
         cfg: EmbedGemma2Config,
         operands: GemmOperands,
     ) -> Result<Self, String> {
+        cfg.validate()?;
         let ld = Loader::new(rt, st, prefix);
         let (h, ple, inter, vocab) = (
             cfg.hidden as usize,

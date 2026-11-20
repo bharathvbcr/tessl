@@ -319,6 +319,19 @@ class Encoding(HostCase):
                     model.encode([[1]], truncate_dim=dim)
         self.assertEqual(self.lib.encoded, [])
 
+    def test_truncate_dim_past_the_embedding_width_is_refused_before_the_output_is_sized(self):
+        # The output array is `[n, truncate_dim]`: a width above the model's own
+        # would be allocated (4 GiB per row at u32 max) before the library saw it.
+        with self.model() as model:
+            self.assertEqual(model.embedding_dim, FakeEg2Lib.dim)
+            for dim in (FakeEg2Lib.dim + 1, (1 << 32) - 1):
+                with self.subTest(dim=dim), mock.patch.object(np, "empty", side_effect=AssertionError("sized")):
+                    with self.assertRaisesRegex(TesslError, "above the embedding width"):
+                        model.encode([[1]], truncate_dim=dim)
+            out = model.encode([[1]], truncate_dim=FakeEg2Lib.dim)
+        self.assertEqual(out.shape, (1, FakeEg2Lib.dim))
+        self.assertEqual(len(self.lib.encoded), 1)
+
     def test_a_refusal_raises_and_leaves_the_model_open_a_panic_closes_it(self):
         model = self.model()
         self.lib.encode_status = 1

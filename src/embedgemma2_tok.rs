@@ -87,38 +87,55 @@ fn has_negative(j: &JsonValue) -> bool {
     }
 }
 
+/// Rewrite an integer token of 20 or more digits (past `u64`, as
+/// `model_max_length` is spelled in HF configs) as a float, outside strings.
+/// Works on bytes and copies every other byte as it was: only ASCII `.0` is
+/// inserted, so UTF-8 text (a non-ASCII `bos_token`) survives unchanged.
 fn sanitize_config_numbers(text: &str) -> Cow<'_, str> {
-    let mut modified = false;
-    let mut out = String::with_capacity(text.len() + 16);
     let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 16);
+    let mut modified = false;
+    let (mut in_str, mut escape) = (false, false);
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            out.push(b);
+            i += 1;
+        } else if b == b'"' {
+            in_str = true;
+            out.push(b);
+            i += 1;
+        } else if b.is_ascii_digit() {
             let start = i;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            let len = i - start;
-            let is_float = (i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'e' || bytes[i] == b'E'))
-                || (start > 0 && bytes[start - 1] == b'.');
-            if len >= 20 && !is_float {
-                out.push_str(&text[start..i]);
-                out.push_str(".0");
+            let is_float =
+                (i < bytes.len() && matches!(bytes[i], b'.' | b'e' | b'E')) || (start > 0 && bytes[start - 1] == b'.');
+            out.extend_from_slice(&bytes[start..i]);
+            if i - start >= 20 && !is_float {
+                out.extend_from_slice(b".0");
                 modified = true;
-                continue;
-            } else {
-                out.push_str(&text[start..i]);
-                continue;
             }
+        } else {
+            out.push(b);
+            i += 1;
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
-    if modified {
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(text)
+    if !modified {
+        return Cow::Borrowed(text);
     }
+    // Only ASCII was inserted into valid UTF-8, so this holds; were it ever
+    // not, the unrewritten text goes to the parser, which refuses the number.
+    String::from_utf8(out).map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
 fn parse_json_doc(text: &str, what: &str, max_depth: usize) -> Result<JsonValue, String> {
@@ -1323,6 +1340,23 @@ fn read_bounded(path: &Path, cap: u64) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rewrite of a 20-digit integer once pushed every byte as a Latin-1
+    /// char after it triggered, corrupting each non-ASCII string; and it
+    /// rewrote digits inside strings.
+    #[test]
+    fn sanitize_config_numbers_keeps_utf8_and_strings_intact() {
+        let text = "{\"bos_token\": \"é日😀\", \"model_max_length\": 12345678901234567890, \"id\": \"12345678901234567890\", \"x\": 1.12345678901234567890, \"y\": 123456789012345678901e2}";
+        let out = sanitize_config_numbers(text);
+        assert_eq!(
+            out,
+            "{\"bos_token\": \"é日😀\", \"model_max_length\": 12345678901234567890.0, \"id\": \"12345678901234567890\", \"x\": 1.12345678901234567890, \"y\": 123456789012345678901e2}"
+        );
+        assert!(matches!(
+            sanitize_config_numbers("{\"a\": \"é\", \"b\": 12}"),
+            Cow::Borrowed(_)
+        ));
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tessl-tok-bounded-{tag}-{}", std::process::id()));

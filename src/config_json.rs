@@ -59,6 +59,18 @@ pub(crate) fn float(v: &JsonValue, k: &str) -> Result<f64, String> {
     }
 }
 
+/// A number narrowed to `f32`, which must still be finite: a value such as
+/// `1e39` is finite as an `f64` and becomes infinity on narrowing, so a
+/// finiteness check made before the cast is not a check on what the model uses.
+pub(crate) fn f32_field(v: &JsonValue, k: &str) -> Result<f32, String> {
+    let wide = float(v, k)?;
+    let narrow = wide as f32;
+    if !narrow.is_finite() {
+        return Err(format!("config.json: {k} = {wide} is not a finite f32"));
+    }
+    Ok(narrow)
+}
+
 /// An optional boolean.
 pub(crate) fn flag(c: &JsonValue, k: &str) -> Result<Option<bool>, String> {
     match c.get(k) {

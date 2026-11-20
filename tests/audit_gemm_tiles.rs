@@ -634,16 +634,27 @@ fn audit(tree: &Tree) -> Audit {
     Audit { ok: bad == 0, report }
 }
 
+/// Where tessl-arch02's kernels live, relative to the directory holding the
+/// tessl checkout: the sibling `ojas` repository. (The `arch_02_value_resid`
+/// path this guard once looked at no longer exists, so it passed vacuously.)
+const ARCH02_KERNELS: &str = "ojas/arch02/metal-native/kernels";
+
 /// The arch_02 stale-copy guard. tessl-arch02 compiles these same sources
 /// through `DEP_TESSL_KERNELS`, so it cannot drift by construction; a local
-/// copy reappearing there is itself the regression. Skipped when the sibling
-/// is absent, as it is inside a published crate.
-fn stale_arch02_copy(crate_root: &Path) -> Option<PathBuf> {
-    let stale = crate_root
-        .ancestors()
-        .nth(2)?
-        .join("arch_02_value_resid/metal-native/kernels/matmul_tensorops.metal");
-    stale.exists().then_some(stale)
+/// copy reappearing there is itself the regression.
+///
+/// `Ok(Some(path))` is a stale copy, `Ok(None)` is a kernels directory with no
+/// copy, and `Err(dir)` is a kernels directory that is not there at all: the
+/// guard looked at nothing, which is not the same answer as "no copy".
+fn stale_arch02_copy(crate_root: &Path) -> Result<Option<PathBuf>, PathBuf> {
+    let kernels = crate_root
+        .parent()
+        .map_or_else(|| PathBuf::from(ARCH02_KERNELS), |p| p.join(ARCH02_KERNELS));
+    if !kernels.is_dir() {
+        return Err(kernels);
+    }
+    let stale = kernels.join("matmul_tensorops.metal");
+    Ok(stale.exists().then_some(stale))
 }
 
 #[test]
@@ -661,11 +672,25 @@ fn clean_tree_passes_and_names_what_it_checked() {
 #[test]
 fn tessl_arch02_has_no_matmul_tensorops_copy_of_its_own() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(stale) = stale_arch02_copy(root) {
-        panic!(
+    match stale_arch02_copy(root) {
+        Ok(None) => {}
+        Ok(Some(stale)) => panic!(
             "tessl-arch02 has its own {} again. It must compile tessl's copy via DEP_TESSL_KERNELS; a local one silently drifts.",
             stale.display()
-        );
+        ),
+        // The hosted selection checks out tessl alone, so the sibling cannot
+        // be there; it says so instead of passing quietly.
+        Err(missing) if std::env::var_os("TESSL_HOSTED_NO_DEVICE").is_some() => {
+            eprintln!(
+                "SKIPPED (hosted selection, no sibling checkout): the arch02 guard looked at {} and it is absent",
+                missing.display()
+            );
+        }
+        Err(missing) => panic!(
+            "the arch02 guard looked at {} and it is not there, so it checked nothing. \
+             tessl-arch02 lives in the sibling ojas checkout (ojas/arch02/metal-native).",
+            missing.display()
+        ),
     }
 }
 
@@ -673,13 +698,27 @@ fn tessl_arch02_has_no_matmul_tensorops_copy_of_its_own() {
 fn the_arch02_guard_sees_a_planted_copy() {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("arch02_guard");
     let _ = fs::remove_dir_all(&base);
-    let crate_root = base.join("a/b/tessl");
+    let crate_root = base.join("a/tessl");
     fs::create_dir_all(&crate_root).unwrap();
-    assert!(stale_arch02_copy(&crate_root).is_none());
-    let planted = base.join("a/arch_02_value_resid/metal-native/kernels");
+    // No sibling: the guard reports that it looked at nothing, not "clean".
+    assert_eq!(
+        stale_arch02_copy(&crate_root),
+        Err(base.join("a").join(ARCH02_KERNELS)),
+        "a missing sibling must not read as a clean one"
+    );
+    let planted = base.join("a").join(ARCH02_KERNELS);
     fs::create_dir_all(&planted).unwrap();
+    assert_eq!(
+        stale_arch02_copy(&crate_root),
+        Ok(None),
+        "an empty kernels dir is clean"
+    );
     fs::write(planted.join("matmul_tensorops.metal"), "").unwrap();
-    assert!(stale_arch02_copy(&crate_root).is_some(), "a planted copy went unseen");
+    assert_eq!(
+        stale_arch02_copy(&crate_root),
+        Ok(Some(planted.join("matmul_tensorops.metal"))),
+        "a planted copy went unseen"
+    );
 }
 
 #[test]

@@ -97,6 +97,28 @@ fn capture_marks_every_edge_of_an_inplace_chain() {
     }
 }
 
+/// Replay `icb` `REPLAYS` times from a fresh input and count the replays whose
+/// result differs from `live` in any bit.
+fn replay_divergences(rt: &Arc<GpuRuntime>, logits: &GpuBuffer, live: &[f32], icb: &mut DecodeIcb) -> usize {
+    let mut bad = 0;
+    for r in 0..REPLAYS {
+        logits.write_f32(&input());
+        rt.synchronize().unwrap();
+        icb.execute(rt).expect("execute");
+        rt.synchronize().unwrap();
+        if logits
+            .read_f32()
+            .iter()
+            .zip(live)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            bad += 1;
+            eprintln!("replay {r} differs from the live result");
+        }
+    }
+    bad
+}
+
 fn replay_matches(icb_exec: bool, hazard: bool, async_encode: bool) {
     let c = capture_chain(hazard, async_encode, icb_exec);
     let Chain {
@@ -108,22 +130,7 @@ fn replay_matches(icb_exec: bool, hazard: bool, async_encode: bool) {
     } = c;
     tessl::set_icb_execute(icb_exec);
     let mut icb = DecodeIcb::from_commands(&rt, capture.commands).expect("tape");
-    let mut bad = 0;
-    for r in 0..REPLAYS {
-        logits.write_f32(&input());
-        rt.synchronize().unwrap();
-        icb.execute(&rt).expect("execute");
-        rt.synchronize().unwrap();
-        if logits
-            .read_f32()
-            .iter()
-            .zip(&live)
-            .any(|(a, b)| a.to_bits() != b.to_bits())
-        {
-            bad += 1;
-            eprintln!("replay {r} differs from the live result");
-        }
-    }
+    let bad = replay_divergences(&rt, &logits, &live, &mut icb);
     drop(caps);
     assert_eq!(
         bad, 0,
@@ -146,8 +153,10 @@ fn replay_is_bit_identical_across_modes_and_runs() {
 }
 
 /// Attack 2, replay side: flipping a RAW marker to false is honoured, i.e. it
-/// is the capture's job to be right. Informational: prints how often the
-/// unmarked tape diverges; asserts only that the marked tape never does.
+/// is the capture's job to be right. The stripped tape's divergence is a race
+/// and so not assertable (it is printed); what is asserted is that the capture
+/// recorded the markers, that stripping removed them, and that the same
+/// capture with its markers intact replays bit-identically.
 #[test]
 fn an_unmarked_raw_chain_is_the_captures_responsibility() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -160,26 +169,31 @@ fn an_unmarked_raw_chain_is_the_captures_responsibility() {
         mut capture,
         ..
     } = c;
+    let marked = capture.commands.clone();
+    let recorded = marked.iter().filter(|c| c.barrier_after).count();
+    assert!(
+        recorded >= CHAIN - 1,
+        "the capture recorded {recorded} markers for a {CHAIN}-step in-place chain: nothing to strip"
+    );
+    let mut intact = DecodeIcb::from_commands(&rt, marked).expect("tape");
+    let intact_bad = replay_divergences(&rt, &logits, &live, &mut intact);
+    assert_eq!(
+        intact_bad, 0,
+        "the capture's own markers were replayed and {intact_bad}/{REPLAYS} replays still diverged"
+    );
+    drop(intact);
+
     for cmd in capture.commands.iter_mut() {
         cmd.barrier_after = false;
     }
+    assert_eq!(
+        capture.commands.iter().filter(|c| c.barrier_after).count(),
+        0,
+        "stripping left a marker behind"
+    );
     let mut icb = DecodeIcb::from_commands(&rt, capture.commands).expect("tape");
-    let mut bad = 0;
-    for _ in 0..REPLAYS {
-        logits.write_f32(&input());
-        rt.synchronize().unwrap();
-        icb.execute(&rt).expect("execute");
-        rt.synchronize().unwrap();
-        if logits
-            .read_f32()
-            .iter()
-            .zip(&live)
-            .any(|(a, b)| a.to_bits() != b.to_bits())
-        {
-            bad += 1;
-        }
-    }
-    eprintln!("unmarked in-place chain: {bad}/{REPLAYS} replays diverged");
+    let bad = replay_divergences(&rt, &logits, &live, &mut icb);
+    eprintln!("unmarked in-place chain: {bad}/{REPLAYS} replays diverged ({recorded} markers stripped)");
 }
 
 const DIM: usize = 1 << 18;

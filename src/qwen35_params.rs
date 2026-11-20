@@ -34,6 +34,12 @@ use crate::qwen35_model::{Mixer, Precision, Qwen35Model};
 use crate::runtime::GpuRuntime;
 use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits_gpu, DType, GpuBuffer, Tensor};
 
+// This belongs beside the model's own count-down hooks (`layer_fault` and
+// `read_fault` in qwen35_model.rs, through `count_down_fault`): once that file
+// is free, move it to a `copy_fault` AtomicUsize on the model and delete this
+// thread-local. It is here only because qwen35_model.rs was held. Caveat: an
+// armed hook that never fired could match a later model allocated at the same
+// address on the same thread.
 thread_local! {
     /// Test hook ([`Qwen35Model::fail_parameter_copy_after_for_test`]): the
     /// model's address and the copies still to succeed before one fails;

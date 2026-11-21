@@ -463,3 +463,142 @@ fn the_27b_config_refuses_what_the_forward_lacks_by_key() {
         }
     }
 }
+
+// ------------------------------------------- hostile numbers (card ft-57e1d032) ---
+
+/// A config of the same shape as the real one with one number swapped for a
+/// hostile one must be a typed refusal (`Err`), never a panic, an abort or an
+/// allocation sized by the number. `layer_types` stays, so a huge
+/// `num_hidden_layers` is refused by the count check without a list that long
+/// being built. Without `layer_types` the reader builds one entry per layer
+/// and accepts the result (no cap on `num_hidden_layers`: reported as a
+/// finding on the held `src/qwen35_model.rs`), so that path is not pinned.
+#[test]
+fn hostile_numbers_are_refused_not_panicked() {
+    let cases: &[(&str, &str, &str)] = &[
+        // Layers near and at u32::MAX, and zero.
+        (
+            "\"num_hidden_layers\": 24",
+            "\"num_hidden_layers\": 4294967295",
+            "has 24 entries but num_hidden_layers is 4294967295",
+        ),
+        (
+            "\"num_hidden_layers\": 24",
+            "\"num_hidden_layers\": 4294967294",
+            "has 24 entries but num_hidden_layers is 4294967294",
+        ),
+        (
+            "\"num_hidden_layers\": 24",
+            "\"num_hidden_layers\": 0",
+            "has 24 entries but num_hidden_layers is 0",
+        ),
+        // Zero sizes.
+        ("\"hidden_size\": 2048", "\"hidden_size\": 0", "must be non-zero"),
+        (
+            "\"intermediate_size\": 6144",
+            "\"intermediate_size\": 0",
+            "must be non-zero",
+        ),
+        ("\"vocab_size\": 248320", "\"vocab_size\": 0", "must be non-zero"),
+        ("\"head_dim\": 256", "\"head_dim\": 0", ""),
+        ("\"linear_value_head_dim\": 128", "\"linear_value_head_dim\": 0", ""),
+        // Zero heads.
+        ("\"num_attention_heads\": 8", "\"num_attention_heads\": 0", ""),
+        ("\"num_key_value_heads\": 2", "\"num_key_value_heads\": 0", ""),
+        ("\"linear_num_key_heads\": 16", "\"linear_num_key_heads\": 0", ""),
+        ("\"linear_num_value_heads\": 16", "\"linear_num_value_heads\": 0", ""),
+        // u32::MAX heads and widths.
+        ("\"num_attention_heads\": 8", "\"num_attention_heads\": 4294967295", ""),
+        ("\"num_key_value_heads\": 2", "\"num_key_value_heads\": 4294967295", ""),
+        (
+            "\"linear_num_key_heads\": 16",
+            "\"linear_num_key_heads\": 4294967295",
+            "",
+        ),
+        (
+            "\"linear_num_value_heads\": 16",
+            "\"linear_num_value_heads\": 4294967295",
+            "",
+        ),
+        (
+            "\"linear_value_head_dim\": 128",
+            "\"linear_value_head_dim\": 4294967295",
+            "",
+        ),
+        ("\"head_dim\": 256", "\"head_dim\": 4294967295", ""),
+        // Non-finite and non-positive floats.
+        ("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": 1e999", ""),
+        ("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": 1e39", "must be positive"),
+        (
+            "\"rms_norm_eps\": 1e-06",
+            "\"rms_norm_eps\": -1e-06",
+            "must be positive",
+        ),
+        ("\"rope_theta\": 10000000", "\"rope_theta\": 1e999", ""),
+        ("\"rope_theta\": 10000000", "\"rope_theta\": 1e39", "must be positive"),
+        ("\"rope_theta\": 10000000", "\"rope_theta\": 0", "must be positive"),
+        (
+            "\"rope_theta\": 10000000",
+            "\"rope_theta\": -10000000",
+            "must be positive",
+        ),
+        // A conv kernel the kernels are not compiled for.
+        (
+            "\"linear_conv_kernel_dim\": 4",
+            "\"linear_conv_kernel_dim\": 0",
+            "conv_kernel",
+        ),
+        (
+            "\"linear_conv_kernel_dim\": 4",
+            "\"linear_conv_kernel_dim\": 1",
+            "conv_kernel",
+        ),
+        (
+            "\"linear_conv_kernel_dim\": 4",
+            "\"linear_conv_kernel_dim\": 9",
+            "conv_kernel",
+        ),
+        (
+            "\"linear_conv_kernel_dim\": 4",
+            "\"linear_conv_kernel_dim\": 4294967295",
+            "conv_kernel",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (from, to, needle) in cases {
+        let text = edited(&[(from, to)]);
+        match std::panic::catch_unwind(|| Qwen35Config::from_config_json(&text)) {
+            Err(_) => failures.push(format!("{to}: panicked")),
+            Ok(Ok(_)) => failures.push(format!("{to}: parsed, not refused")),
+            Ok(Err(e)) if !e.contains(needle) => failures.push(format!("{to}: {e:?} lacks {needle:?}")),
+            Ok(Err(_)) => {}
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} hostile cases:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The interval path (no `layer_types`) with a zero interval and with zero
+/// layers.
+#[test]
+fn hostile_interval_and_zero_layers_without_layer_types_are_refused() {
+    let a = REAL.find("\"layer_types\": [").unwrap();
+    let b = a + REAL[a..].find(']').unwrap() + 1;
+    let no_types = format!("{}\"_unused\": 0{}", &REAL[..a], &REAL[b..]);
+    let with = |from: &str, to: &str| {
+        assert_eq!(no_types.matches(from).count(), 1, "{from:?}");
+        no_types.replace(from, to)
+    };
+    refused(
+        &with("\"full_attention_interval\": 4", "\"full_attention_interval\": 0"),
+        "full_attention_interval must be non-zero",
+    );
+    refused(
+        &with("\"num_hidden_layers\": 24", "\"num_hidden_layers\": 0"),
+        "must be non-zero",
+    );
+}

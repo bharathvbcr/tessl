@@ -936,6 +936,8 @@ class EmbedGemma2(_Owned):
         code = _check_uint("truncate_dim", truncate_dim, 32)
         if code == 0:
             raise TesslError("truncate_dim must be positive (None means the full width)")
+        if code > self._dim:
+            raise TesslError(f"truncate_dim {code} is above the embedding width {self._dim}")
         return code, code
 
     def _embed(self, call, n: int, truncate_dim):

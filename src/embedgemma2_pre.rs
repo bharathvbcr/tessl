@@ -100,6 +100,20 @@ pub const MAX_INTERMEDIATE_BYTES: usize = 1 << 31;
 /// Most decoded frames one [`preprocess_video`] call takes.
 pub const MAX_VIDEO_FRAMES: usize = 1 << 20;
 
+/// Largest `patch_size` a processor config may name (the checkpoint's is 16).
+pub const MAX_PATCH_SIZE: u32 = 256;
+
+/// Largest `pooling_kernel_size` a processor config may name (the checkpoint's is 3).
+pub const MAX_POOLING_KERNEL: u32 = 16;
+
+/// Largest `feature_size` (mel bins) a processor config may name (the checkpoint's is 128).
+pub const MAX_FEATURE_SIZE: usize = 512;
+
+/// Most bytes of one prepared output a processor config may imply: an image's
+/// `pixel_values` (`max_patches * patch_dim * 4`) or a clip's features
+/// (`feature_size * frames * 4`). The checkpoint's are 7.7 MB and 1.5 MB.
+pub const MAX_PREPARED_BYTES: u64 = 1 << 28;
+
 /// The soft-token budgets the processors accept.
 pub const SUPPORTED_SOFT_TOKENS: [u32; 5] = [70, 140, 280, 560, 1120];
 
@@ -149,7 +163,25 @@ impl ImageConfig {
                 self.max_soft_tokens
             ));
         }
-        if !(self.rescale_factor.is_finite() && self.rescale_factor > 0.0) {
+        if self.patch_size > MAX_PATCH_SIZE || self.pooling_kernel > MAX_POOLING_KERNEL {
+            return Err(format!(
+                "{what}: patch_size {} is above {MAX_PATCH_SIZE} or pooling_kernel_size {} is above {MAX_POOLING_KERNEL}",
+                self.patch_size, self.pooling_kernel
+            ));
+        }
+        // Bounded above, so these products cannot overflow u64.
+        let patches = u64::from(self.max_soft_tokens) * u64::from(self.pooling_kernel).pow(2);
+        let bytes = patches * 3 * u64::from(self.patch_size).pow(2) * 4;
+        if bytes > MAX_PREPARED_BYTES {
+            return Err(format!(
+                "{what}: pixel_values would be {bytes} bytes (max_soft_tokens {} x pooling_kernel_size {}^2 \
+                 patches of 3 x patch_size {}^2 f32), above the {MAX_PREPARED_BYTES}-byte cap",
+                self.max_soft_tokens, self.pooling_kernel, self.patch_size
+            ));
+        }
+        // The factor is applied as an f32: finite as an f64 is not enough.
+        let applied = self.rescale_factor as f32;
+        if !(self.rescale_factor.is_finite() && self.rescale_factor > 0.0 && applied.is_finite() && applied > 0.0) {
             return Err(format!(
                 "{what}: rescale_factor must be positive, got {}",
                 self.rescale_factor
@@ -213,6 +245,27 @@ impl AudioFeatureConfig {
         }
         if self.max_samples == 0 {
             return Err(format!("{what}: max_samples is zero"));
+        }
+        if self.mel_bins > MAX_FEATURE_SIZE {
+            return Err(format!(
+                "{what}: feature_size {} is above {MAX_FEATURE_SIZE}",
+                self.mel_bins
+            ));
+        }
+        // The extractor cuts to `max_samples` rounded up to its pad multiple;
+        // frames are at most one per hop, plus one.
+        let samples = self
+            .max_samples
+            .div_ceil(AUDIO_PAD_MULTIPLE)
+            .saturating_mul(AUDIO_PAD_MULTIPLE);
+        let frames = (samples / self.hop_length).saturating_add(1) as u64;
+        let bytes = (self.mel_bins as u64).saturating_mul(frames).saturating_mul(4);
+        if bytes > MAX_PREPARED_BYTES {
+            return Err(format!(
+                "{what}: features would be {bytes} bytes (feature_size {} x {frames} frames f32), above the \
+                 {MAX_PREPARED_BYTES}-byte cap",
+                self.mel_bins
+            ));
         }
         Ok(())
     }
@@ -453,6 +506,11 @@ fn video_config(s: &Section<'_>) -> Result<VideoConfig, String> {
     let max_frames = s.usize("max_frames", 32)?;
     if max_frames == 0 {
         return Err("processor_config.json: video_processor.max_frames is zero".into());
+    }
+    if max_frames > MAX_VIDEO_FRAMES {
+        return Err(format!(
+            "processor_config.json: video_processor.max_frames = {max_frames} is above {MAX_VIDEO_FRAMES}"
+        ));
     }
     let overflow = match s.text("overflow_strategy", "uniform")?.as_str() {
         "uniform" => Overflow::Uniform,

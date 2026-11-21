@@ -11,6 +11,7 @@ use super::Ledger;
 const B: usize = 1;
 const H: usize = 2;
 const HKV: usize = 1;
+/// The shortest kv length every case runs: four keys, inside every kernel tile.
 const T: usize = 4;
 
 fn wave(n: usize, seed: f32) -> Vec<f32> {
@@ -118,10 +119,10 @@ fn positions(buf: &tessl::GpuBuffer, dim: usize) -> usize {
     (buf.nbytes() / std::mem::size_of::<f32>()) / (HKV * dim)
 }
 
-fn shared_capacity(k: &tessl::GpuBuffer, v: &tessl::GpuBuffer, dk: usize, dv: usize) -> usize {
+fn shared_capacity(k: &tessl::GpuBuffer, v: &tessl::GpuBuffer, dk: usize, dv: usize, t: usize) -> usize {
     let kp = positions(k, dk);
     let vp = positions(v, dv);
-    assert!(kp >= T && vp >= T, "bucket left k={kp} v={vp} positions, need {T}");
+    assert!(kp >= t && vp >= t, "bucket left k={kp} v={vp} positions, need {t}");
     if dk == dv {
         kp
     } else {
@@ -177,20 +178,20 @@ fn chunk_n(c: DecodeChunk) -> u32 {
     }
 }
 
-fn rows_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, lanes: RowsLanes, groups: RowsGroups) {
+fn rows_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, lanes: RowsLanes, groups: RowsGroups, t: usize) {
     let name = format!("flash_attn_rows_h{d}_r{}_g{}", lane_n(lanes), group_n(groups));
-    let q = wave(T * H * d, 0.2);
-    let k = wave(T * HKV * d, 1.1);
-    let v = wave(T * HKV * d, 2.4);
-    let want = causal_sdpa(&q, &k, &v, T, T, d, d, 0, 0);
+    let q = wave(t * H * d, 0.2);
+    let k = wave(t * HKV * d, 1.1);
+    let v = wave(t * HKV * d, 2.4);
+    let want = causal_sdpa(&q, &k, &v, t, t, d, d, 0, 0);
     let wide = d >= 256;
     let label = name.clone();
     ledger.credit(rt, &label, &[name], || {
         let qb = buf(rt, &q);
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
-        let o = seeded(rt, T * H * d, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
+        let o = seeded(rt, t * H * d, -3.0e20);
+        let tkv = buf_u32(rt, &[t as u32]);
         let zero = buf_u32(rt, &[0]);
         nn::flash_attn_rows_with_lanes(
             rt,
@@ -201,7 +202,7 @@ fn rows_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, lanes: RowsLa
             &tkv,
             &zero,
             &zero,
-            dims(T as u32, d),
+            dims(t as u32, d),
             d as u32,
             lanes,
             groups,
@@ -209,22 +210,22 @@ fn rows_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, lanes: RowsLa
         )
         .unwrap_or_else(|e| panic!("{label}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{label} sync: {e}"));
-        assert_close(&label, &o.read_f32()[..want.len()], &want, wide);
+        assert_close(&format!("{label} kv={t}"), &o.read_f32()[..want.len()], &want, wide);
     });
 }
 
-fn rows_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, name: &str) {
-    let q = wave(T * H * dk, 0.2);
-    let k = wave(T * HKV * dk, 1.1);
-    let v = wave(T * HKV * dv, 2.4);
-    let want = causal_sdpa(&q, &k, &v, T, T, dk, dv, 0, 0);
+fn rows_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, name: &str, t: usize) {
+    let q = wave(t * H * dk, 0.2);
+    let k = wave(t * HKV * dk, 1.1);
+    let v = wave(t * HKV * dv, 2.4);
+    let want = causal_sdpa(&q, &k, &v, t, t, dk, dv, 0, 0);
     let wide = dk.max(dv) >= 256;
     ledger.credit(rt, name, &[name], || {
         let qb = buf(rt, &q);
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
-        let o = seeded(rt, T * H * dv, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
+        let o = seeded(rt, t * H * dv, -3.0e20);
+        let tkv = buf_u32(rt, &[t as u32]);
         let zero = buf_u32(rt, &[0]);
         nn::flash_attn_rows_kv(
             rt,
@@ -235,25 +236,25 @@ fn rows_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, name
             &tkv,
             &zero,
             &zero,
-            dims(T as u32, dk),
+            dims(t as u32, dk),
             dk as u32,
             dv as u32,
             false,
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{name} sync: {e}"));
-        assert_close(name, &o.read_f32()[..want.len()], &want, wide);
+        assert_close(&format!("{name} kv={t}"), &o.read_f32()[..want.len()], &want, wide);
     });
 }
 
-fn decode_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, chunk: DecodeChunk, lanes: RowsLanes) {
+fn decode_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, chunk: DecodeChunk, lanes: RowsLanes, t: usize) {
     let partial = format!("flash_attn_decode_partial_h{d}_c{}_r{}", chunk_n(chunk), lane_n(lanes));
     let reduce = format!("flash_attn_decode_reduce_h{d}_c{}", chunk_n(chunk));
     let names = [partial, reduce];
     let q = wave(H * d, 0.4);
-    let k = wave(T * HKV * d, 0.9);
-    let v = wave(T * HKV * d, 1.8);
-    let want = causal_sdpa(&q, &k, &v, 1, T, d, d, T - 1, 0);
+    let k = wave(t * HKV * d, 0.9);
+    let v = wave(t * HKV * d, 1.8);
+    let want = causal_sdpa(&q, &k, &v, 1, t, d, d, t - 1, 0);
     let wide = d >= 256;
     let label = names[0].clone();
     ledger.credit(rt, &label, &names, || {
@@ -261,10 +262,10 @@ fn decode_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, chunk: Deco
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
         let o = seeded(rt, H * d, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
-        let q_pos = buf_u32(rt, &[(T - 1) as u32]);
+        let tkv = buf_u32(rt, &[t as u32]);
+        let q_pos = buf_u32(rt, &[(t - 1) as u32]);
         let zero = buf_u32(rt, &[0]);
-        let cap = shared_capacity(&kb, &vb, d, d);
+        let cap = shared_capacity(&kb, &vb, d, d, t);
         let scratch = nn::DecodeScratch::with_chunk(rt, B as u32, H as u32, cap, d as u32, chunk)
             .unwrap_or_else(|e| panic!("{label} scratch: {e}"));
         nn::flash_attn_decode_with_chunk(
@@ -288,26 +289,27 @@ fn decode_equal(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, chunk: Deco
         )
         .unwrap_or_else(|e| panic!("{label}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{label} sync: {e}"));
-        assert_close(&label, &o.read_f32()[..want.len()], &want, wide);
+        assert_close(&format!("{label} kv={t}"), &o.read_f32()[..want.len()], &want, wide);
     });
 }
 
-fn decode_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, partial: &str, reduce: &str) {
+#[allow(clippy::too_many_arguments)]
+fn decode_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, partial: &str, reduce: &str, t: usize) {
     let names = [partial, reduce];
     let q = wave(H * dk, 0.4);
-    let k = wave(T * HKV * dk, 0.9);
-    let v = wave(T * HKV * dv, 1.8);
-    let want = causal_sdpa(&q, &k, &v, 1, T, dk, dv, T - 1, 0);
+    let k = wave(t * HKV * dk, 0.9);
+    let v = wave(t * HKV * dv, 1.8);
+    let want = causal_sdpa(&q, &k, &v, 1, t, dk, dv, t - 1, 0);
     let wide = dk.max(dv) >= 256;
     ledger.credit(rt, partial, &names, || {
         let qb = buf(rt, &q);
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
         let o = seeded(rt, H * dv, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
-        let q_pos = buf_u32(rt, &[(T - 1) as u32]);
+        let tkv = buf_u32(rt, &[t as u32]);
+        let q_pos = buf_u32(rt, &[(t - 1) as u32]);
         let zero = buf_u32(rt, &[0]);
-        let cap = shared_capacity(&kb, &vb, dk, dv);
+        let cap = shared_capacity(&kb, &vb, dk, dv, t);
         let scratch = nn::DecodeScratch::new(rt, B as u32, H as u32, cap, dv as u32)
             .unwrap_or_else(|e| panic!("{partial} scratch: {e}"));
         nn::flash_attn_decode_kv(
@@ -328,61 +330,61 @@ fn decode_kv(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, dk: usize, dv: usize, pa
         )
         .unwrap_or_else(|e| panic!("{partial}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{partial} sync: {e}"));
-        assert_close(partial, &o.read_f32()[..want.len()], &want, wide);
+        assert_close(&format!("{partial} kv={t}"), &o.read_f32()[..want.len()], &want, wide);
     });
 }
 
-fn swa(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, head: AttnHeadDim) {
+fn swa(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, head: AttnHeadDim, t: usize) {
     let d = match head {
         AttnHeadDim::D128 => 128,
         AttnHeadDim::D256 => 256,
     };
     let name = head.kernel();
-    let q = wave(T * H * d, 0.25);
-    let k = wave(T * HKV * d, 0.7);
-    let v = wave(T * HKV * d, 1.3);
-    let want = causal_sdpa(&q, &k, &v, T, T, d, d, 0, 0);
+    let q = wave(t * H * d, 0.25);
+    let k = wave(t * HKV * d, 0.7);
+    let v = wave(t * HKV * d, 1.3);
+    let want = causal_sdpa(&q, &k, &v, t, t, d, d, 0, 0);
     ledger.credit(rt, name, &[name], || {
         let qb = buf(rt, &q);
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
-        let o = seeded(rt, T * H * d, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
+        let o = seeded(rt, t * H * d, -3.0e20);
+        let tkv = buf_u32(rt, &[t as u32]);
         let zero = buf_u32(rt, &[0]);
-        nn::flash_attn_swa_tiled(rt, head, &qb, &kb, &vb, &o, &tkv, &zero, &zero, dims(T as u32, d))
+        nn::flash_attn_swa_tiled(rt, head, &qb, &kb, &vb, &o, &tkv, &zero, &zero, dims(t as u32, d))
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{name} sync: {e}"));
-        assert_close(name, &o.read_f32()[..want.len()], &want, d >= 256);
+        assert_close(&format!("{name} kv={t}"), &o.read_f32()[..want.len()], &want, d >= 256);
     });
 }
 
-fn global_h512(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
+fn global_h512(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, t: usize) {
     let d = 512;
     let name = "flash_attn_global_h512";
-    let q = wave(T * H * d, 0.25);
-    let k = wave(T * HKV * d, 0.7);
-    let v = wave(T * HKV * d, 1.3);
-    let want = causal_sdpa(&q, &k, &v, T, T, d, d, 0, 0);
+    let q = wave(t * H * d, 0.25);
+    let k = wave(t * HKV * d, 0.7);
+    let v = wave(t * HKV * d, 1.3);
+    let want = causal_sdpa(&q, &k, &v, t, t, d, d, 0, 0);
     ledger.credit(rt, name, &[name], || {
         let qb = buf(rt, &q);
         let kb = buf(rt, &k);
         let vb = buf(rt, &v);
-        let o = seeded(rt, T * H * d, -3.0e20);
-        let tkv = buf_u32(rt, &[T as u32]);
+        let o = seeded(rt, t * H * d, -3.0e20);
+        let tkv = buf_u32(rt, &[t as u32]);
         let zero = buf_u32(rt, &[0]);
-        nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &o, &tkv, &zero, &zero, dims(T as u32, d), false)
+        nn::flash_attn_global_h512_tiled(rt, &qb, &kb, &vb, &o, &tkv, &zero, &zero, dims(t as u32, d), false)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{name} sync: {e}"));
-        assert_close(name, &o.read_f32()[..want.len()], &want, true);
+        assert_close(&format!("{name} kv={t}"), &o.read_f32()[..want.len()], &want, true);
     });
 }
 
-fn gqa(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize) {
+fn gqa(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize, t: usize) {
     let name = format!("gqa_decode_h{d}");
     let q = wave(H * d, 0.3);
-    let k = wave(T * HKV * d, 1.4);
-    let v = wave(T * HKV * d, 2.2);
-    let want = gqa_reference(&q, &k, &v, d, T);
+    let k = wave(t * HKV * d, 1.4);
+    let v = wave(t * HKV * d, 2.2);
+    let want = gqa_reference(&q, &k, &v, d, t);
     let label = name.clone();
     ledger.credit(rt, &label, &[name], || {
         let qb = buf(rt, &q);
@@ -390,13 +392,18 @@ fn gqa(rt: &Arc<GpuRuntime>, ledger: &mut Ledger, d: usize) {
         let vb = buf(rt, &v);
         let o = seeded(rt, H * d, -3.0e20);
         nn::gqa_decode(
-            rt, &qb, &kb, &vb, &o, B as u32, H as u32, HKV as u32, T as u32, d as u32,
+            rt, &qb, &kb, &vb, &o, B as u32, H as u32, HKV as u32, t as u32, d as u32,
         )
         .unwrap_or_else(|e| panic!("{label}: {e}"));
         rt.synchronize().unwrap_or_else(|e| panic!("{label} sync: {e}"));
-        assert_close(&label, &o.read_f32()[..want.len()], &want, d >= 256);
+        assert_close(&format!("{label} kv={t}"), &o.read_f32()[..want.len()], &want, d >= 256);
     });
 }
+
+/// kv lengths one past a kernel tile edge, so a case crosses into a second,
+/// partial tile: the 4-key global tile, the 8-key SWA tile, the 32-lane row
+/// width and its doubles. Decode adds its own chunk edge per chunk size.
+const PAST_TILE: [usize; 6] = [5, 9, 17, 33, 65, 129];
 
 pub fn run(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     let lanes = [RowsLanes::R8, RowsLanes::R16, RowsLanes::R32];
@@ -405,39 +412,58 @@ pub fn run(rt: &Arc<GpuRuntime>, ledger: &mut Ledger) {
     for d in [128usize, 256, 512] {
         for lanes in lanes {
             for groups in groups {
-                rows_equal(rt, ledger, d, lanes, groups);
+                rows_equal(rt, ledger, d, lanes, groups, T);
+                for t in PAST_TILE {
+                    rows_equal(rt, ledger, d, lanes, groups, t);
+                }
             }
         }
         for chunk in chunks {
             for lanes in lanes {
-                decode_equal(rt, ledger, d, chunk, lanes);
+                decode_equal(rt, ledger, d, chunk, lanes, T);
+                decode_equal(rt, ledger, d, chunk, lanes, chunk_n(chunk) as usize + 1);
             }
         }
     }
-    rows_equal(rt, ledger, 64, RowsLanes::R8, RowsGroups::G8);
-    decode_equal(rt, ledger, 64, DecodeChunk::C256, RowsLanes::R8);
-    rows_kv(rt, ledger, 192, 128, "flash_attn_rows_dk192_dv128_r8_g8");
-    rows_kv(rt, ledger, 576, 512, "flash_attn_rows_dk576_dv512_r8_g8");
-    decode_kv(
-        rt,
-        ledger,
-        192,
-        128,
-        "flash_attn_decode_partial_dk192_dv128_c256_r8",
-        "flash_attn_decode_reduce_h128_c256",
-    );
-    decode_kv(
-        rt,
-        ledger,
-        576,
-        512,
-        "flash_attn_decode_partial_dk576_dv512_c128_r16",
-        "flash_attn_decode_reduce_h512_c128",
-    );
-    swa(rt, ledger, AttnHeadDim::D128);
-    swa(rt, ledger, AttnHeadDim::D256);
-    global_h512(rt, ledger);
+    for t in [T, 9, 33, 257] {
+        rows_equal(rt, ledger, 64, RowsLanes::R8, RowsGroups::G8, t);
+        decode_equal(rt, ledger, 64, DecodeChunk::C256, RowsLanes::R8, t);
+    }
+    for t in [T, 9, 33, 65] {
+        rows_kv(rt, ledger, 192, 128, "flash_attn_rows_dk192_dv128_r8_g8", t);
+        rows_kv(rt, ledger, 576, 512, "flash_attn_rows_dk576_dv512_r8_g8", t);
+    }
+    for (dk, dv, partial, reduce, chunk) in [
+        (
+            192usize,
+            128usize,
+            "flash_attn_decode_partial_dk192_dv128_c256_r8",
+            "flash_attn_decode_reduce_h128_c256",
+            256usize,
+        ),
+        (
+            576,
+            512,
+            "flash_attn_decode_partial_dk576_dv512_c128_r16",
+            "flash_attn_decode_reduce_h512_c128",
+            128,
+        ),
+    ] {
+        decode_kv(rt, ledger, dk, dv, partial, reduce, T);
+        decode_kv(rt, ledger, dk, dv, partial, reduce, chunk + 1);
+    }
+    for t in [T, 9, 17, 33] {
+        swa(rt, ledger, AttnHeadDim::D128, t);
+        swa(rt, ledger, AttnHeadDim::D256, t);
+    }
+    for t in [T, 5, 9] {
+        global_h512(rt, ledger, t);
+    }
+    // gqa_decode has no kv tile (one thread per query head loops over every
+    // key), so these are longer shapes, not tile edges.
     for d in [32usize, 64, 128, 256, 512] {
-        gqa(rt, ledger, d);
+        gqa(rt, ledger, d, T);
+        gqa(rt, ledger, d, 33);
+        gqa(rt, ledger, d, 257);
     }
 }

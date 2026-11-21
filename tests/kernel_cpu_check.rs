@@ -18,6 +18,9 @@ fn every_numeric_kernel_matches_a_cpu_reference() {
             tessl::runtime::kernel_trace_enabled(),
             "TESSL_KERNEL_TRACE is off; the sweep cannot tell which kernel ran"
         );
+        // Credit is a per-kernel dispatch count read from the dispatch stamps, and
+        // the stamp heap exists only on a runtime built with the flag on.
+        tessl::ab_flags::set_dispatch_stamps(true);
         common::with_gpu(|rt| {
             let mut ledger = Ledger::new();
             // Binding probes. The only caller is a quant-prep test; the default

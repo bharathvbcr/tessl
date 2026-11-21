@@ -1105,21 +1105,42 @@ fn the_reference_product_matches_a_plain_triple_loop_on_awkward_shapes() {
     }
 }
 
+/// `reference_gemm` runs `min(available_parallelism, ceil(m / 4))` workers, so
+/// the row count is what sets how many threads take part: a 1-4 row input is
+/// one band on one worker, the same rows inside a 70-row input are shared
+/// among many. Every row of a many-worker run must equal, to the bit, that row
+/// computed alone on one worker (both `C` and `S`), for several worker counts.
 #[test]
 fn the_reference_does_not_depend_on_how_many_threads_ran_it() {
-    // 70 rows is 18 bands; a one-thread run and a many-thread run take the bands
-    // in different orders and must agree to the bit.
-    let (m, k, n) = (70, 130, 40);
+    let cores = std::thread::available_parallelism().map_or(1, |p| p.get());
+    assert!(
+        cores >= 2,
+        "one available core runs every input on one worker, so this would compare a run with itself"
+    );
+    let (k, n) = (130, 40);
     let mut rng = Rng(7);
-    let a: Vec<f64> = rng.fill(m * k).iter().map(|&v| v as f64).collect();
+    let rows = 70;
+    let a: Vec<f64> = rng.fill(rows * k).iter().map(|&v| v as f64).collect();
     let b: Vec<f64> = rng.fill(k * n).iter().map(|&v| v as f64).collect();
-    let first = parity::reference_gemm(&a, &b, m, k, n);
-    for _ in 0..5 {
-        let again = parity::reference_gemm(&a, &b, m, k, n);
-        assert_eq!(
-            first.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            again.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
+    // m = 5 is two bands, 8 is two, 13 is four, 70 is eighteen: worker counts
+    // 2, 2, min(4, cores), min(18, cores), against one worker for every row.
+    for m in [5usize, 8, 13, 70] {
+        let many = parity::reference_gemm(&a[..m * k], &b, m, k, n);
+        for i in 0..m {
+            let one = parity::reference_gemm(&a[i * k..(i + 1) * k], &b, 1, k, n);
+            for j in 0..n {
+                assert_eq!(
+                    many.0[i * n + j].to_bits(),
+                    one.0[j].to_bits(),
+                    "C[{i}][{j}] of {m} rows differs from the same row alone"
+                );
+                assert_eq!(
+                    many.1[i * n + j].to_bits(),
+                    one.1[j].to_bits(),
+                    "S[{i}][{j}] of {m} rows differs from the same row alone"
+                );
+            }
+        }
     }
 }
 

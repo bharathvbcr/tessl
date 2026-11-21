@@ -82,13 +82,88 @@ fn dispatch_variant(
     })
 }
 
-fn rel_err(got: &[f32], reference: &[f32]) -> f64 {
-    let scale = reference.iter().fold(0f32, |a, x| a.max(x.abs())) as f64;
-    got.iter()
-        .zip(reference)
-        .map(|(x, y)| (*x as f64 - *y as f64).abs())
-        .fold(0.0, f64::max)
-        / scale.max(1e-12)
+/// Bound on a lane's worst sampled error, relative to the largest magnitude
+/// of the host reference. Operands are exact in f32 (bf16 values, or f32), so
+/// what separates a correct kernel from a wrong one is the summation order,
+/// about 1e-6 of that scale at K = 12288; a transposed operand, a wrong tile
+/// offset or an unwritten element is O(1).
+const REL_BOUND: f64 = 2e-3;
+
+/// How many output elements the host reference is computed at: the four
+/// corners and a strided spread over the rest. The whole product on the host
+/// would cost minutes at the shapes this tuner times.
+const SAMPLES: usize = 512;
+
+/// How a lane lays out its operands (storage, not maths: C[M,N] = A.B).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Layout {
+    /// A[M,K], B[K,N].
+    Nn,
+    /// A[K,M], B[K,N].
+    Tn,
+    /// A[M,K], B[N,K].
+    Nt,
+}
+
+/// An independent host f64 reference at sampled output elements: computed
+/// from the operands the kernels read, not from any kernel's output.
+struct HostRef {
+    index: Vec<usize>,
+    want: Vec<f64>,
+    scale: f64,
+}
+
+/// `C[i,j] = offset + sum_k A.B` in f64 at [`SAMPLES`] elements of C[m,n].
+/// `a` and `b` are the operands as the kernel reads them (already rounded to
+/// bf16 for a bf16 lane); `offset` is what C held before an accumulate.
+fn host_reference(layout: Layout, a: &[f32], b: &[f32], (m, n, k): (usize, usize, usize), offset: f64) -> HostRef {
+    let at = |i: usize, kk: usize| match layout {
+        Layout::Tn => a[kk * m + i],
+        _ => a[i * k + kk],
+    };
+    let bt = |kk: usize, j: usize| match layout {
+        Layout::Nt => b[j * k + kk],
+        _ => b[kk * n + j],
+    };
+    let mut cells = vec![(0, 0), (m - 1, n - 1), (0, n - 1), (m - 1, 0)];
+    cells.extend((0..SAMPLES - 4).map(|s| ((s * 7919 + 13) % m, (s * 104_729 + 7 * s + 3) % n)));
+    let want: Vec<f64> = cells
+        .iter()
+        .map(|&(i, j)| {
+            offset
+                + (0..k)
+                    .map(|kk| f64::from(at(i, kk)) * f64::from(bt(kk, j)))
+                    .sum::<f64>()
+        })
+        .collect();
+    let scale = want.iter().fold(0.0f64, |s, w| s.max(w.abs()));
+    HostRef {
+        index: cells.iter().map(|&(i, j)| i * n + j).collect(),
+        want,
+        scale,
+    }
+}
+
+/// `got` (the whole C, m*n elements) against the host reference: every
+/// element must be finite (an element a kernel never wrote is NaN-poisoned or
+/// zero), and each sampled one within [`REL_BOUND`] of the reference's scale.
+/// Returns the worst sampled error over that scale; `Err` on any failure.
+fn check_against_host(lane: &str, got: &[f32], want: &HostRef, numel: usize) -> Result<f64, String> {
+    if got.len() < numel {
+        return Err(format!("{lane}: read {} elements of C, expected {numel}", got.len()));
+    }
+    let got = &got[..numel];
+    common::check_lane_output(lane, got)?;
+    if !(want.scale > 0.0 && want.scale.is_finite()) {
+        return Err(format!("{lane}: the host reference has no scale ({})", want.scale));
+    }
+    let sampled: Vec<f32> = want.index.iter().map(|&i| got[i]).collect();
+    common::check_against(lane, &sampled, &want.want, REL_BOUND * want.scale, 0.0)?;
+    let worst = sampled
+        .iter()
+        .zip(&want.want)
+        .fold(0.0f64, |w, (&g, &r)| w.max((f64::from(g) - r).abs()));
+    Ok(worst / want.scale)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -825,27 +900,34 @@ fn main() -> Result<(), String> {
         // arm of the shape does, so the host write is in all of them alike.
         let reset_each_iter = matches!(lane, Lane::TnAccum | Lane::NtAccum);
 
-        // Reference: production's own output, or for an accumulate lane the
-        // prefill plus the product of the matching overwriting train path.
-        let refv = {
-            let r = rt.alloc_tensor_f32(&[m, n])?;
-            match lane {
-                Lane::Nn | Lane::NnF32 | Lane::NnAccF32 | Lane::WalkNn | Lane::F32NnWalk => {
-                    gemm(&a, &b, &r, GemmBackend::TensorOps)?
-                }
-                Lane::TnF32 | Lane::TnAccF32 => gemm_tn_f32(&a, &b, &r, GemmBackend::TensorOps)?,
-                Lane::NtF32 | Lane::NtAccF32 => gemm_nt_f32(&a, &b, &r, GemmBackend::TensorOps)?,
-                _ if lane.is_tn() => gemm_tn_train(&a, &b, &r, GemmBackend::TensorOps)?,
-                _ => gemm_nt_train(&a, &b, &r, GemmBackend::TensorOps)?,
-            }
-            rt.synchronize()?;
-            let base = r.buffer.read_f32()[..m * n].to_vec();
-            if is_accum {
-                base.iter().map(|x| x + prefill).collect::<Vec<_>>()
+        // Reference: an independent host f64 product of the operands the
+        // kernels read (bf16-rounded for a bf16 lane), plus the prefill for an
+        // accumulate lane. Not production's own output: production is one of
+        // the arms checked against it.
+        let layout = match lane {
+            Lane::Nn | Lane::NnF32 | Lane::NnAccF32 | Lane::WalkNn | Lane::F32NnWalk => Layout::Nn,
+            _ if lane.is_tn() => Layout::Tn,
+            _ => Layout::Nt,
+        };
+        let host = |data: Vec<f32>| -> Vec<f32> {
+            if lane.is_f32() {
+                data
             } else {
-                base
+                tessl::tensor::f32_slice_to_bf16(&data)
+                    .into_iter()
+                    .map(tessl::tensor::bf16_bits_to_f32)
+                    .collect()
             }
         };
+        let host_a = host(common::fill(a_shape[0] * a_shape[1], 1));
+        let host_b = host(common::fill(b_shape[0] * b_shape[1], 2));
+        let refv = host_reference(
+            layout,
+            &host_a,
+            &host_b,
+            (m, n, k),
+            if is_accum { f64::from(prefill) } else { 0.0 },
+        );
 
         // Production through the public API: the accumulate lanes through
         // `GemmOperands::Bf16`, the path training takes.
@@ -883,14 +965,24 @@ fn main() -> Result<(), String> {
         }
         production(&prod_c)?;
         rt.synchronize()?;
-        let prod_err = rel_err(&prod_c.buffer.read_f32()[..m * n], &refv);
+        let prod_err = check_against_host(
+            &format!("{label} production"),
+            &prod_c.buffer.try_read_f32()?,
+            &refv,
+            m * n,
+        )?;
         for (v, c, err) in variants.iter_mut() {
             if is_accum {
                 c.buffer.write_f32(&prefill_host);
             }
             dispatch_variant(&rt, v, &a, &b, c, m, n, k)?;
             rt.synchronize()?;
-            *err = rel_err(&c.buffer.read_f32()[..m * n], &refv);
+            *err = check_against_host(
+                &format!("{label} {}", v.kernel),
+                &c.buffer.try_read_f32()?,
+                &refv,
+                m * n,
+            )?;
         }
 
         let mut arms: Vec<common::Arm> = Vec::with_capacity(1 + variants.len());
@@ -955,4 +1047,110 @@ fn main() -> Result<(), String> {
     }
     common::exit_if_unstable("bench_gemm_tnnt_tune", &unstable);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_against_host, host_reference, Layout, REL_BOUND, SAMPLES};
+
+    /// The full product, written independently of `host_reference`'s index
+    /// closures: operands expanded to row-major A[M,K] and B[K,N] first.
+    fn full_product(layout: Layout, a: &[f32], b: &[f32], (m, n, k): (usize, usize, usize)) -> Vec<f32> {
+        let mut am = vec![0f32; m * k];
+        let mut bm = vec![0f32; k * n];
+        for i in 0..m {
+            for kk in 0..k {
+                am[i * k + kk] = if layout == Layout::Tn {
+                    a[kk * m + i]
+                } else {
+                    a[i * k + kk]
+                };
+            }
+        }
+        for kk in 0..k {
+            for j in 0..n {
+                bm[kk * n + j] = if layout == Layout::Nt {
+                    b[j * k + kk]
+                } else {
+                    b[kk * n + j]
+                };
+            }
+        }
+        let mut c = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                c[i * n + j] = (0..k).map(|kk| am[i * k + kk] * bm[kk * n + j]).sum();
+            }
+        }
+        c
+    }
+
+    const DIMS: (usize, usize, usize) = (6, 10, 8);
+
+    fn operands(layout: Layout) -> (Vec<f32>, Vec<f32>) {
+        let (m, n, k) = DIMS;
+        let (la, lb) = match layout {
+            Layout::Nn => (m * k, k * n),
+            Layout::Tn => (k * m, k * n),
+            Layout::Nt => (m * k, n * k),
+        };
+        (crate::common::fill(la, 1), crate::common::fill(lb, 2))
+    }
+
+    #[test]
+    fn host_reference_accepts_the_true_product_in_every_layout() {
+        for layout in [Layout::Nn, Layout::Tn, Layout::Nt] {
+            let (a, b) = operands(layout);
+            let c = full_product(layout, &a, &b, DIMS);
+            let r = host_reference(layout, &a, &b, DIMS, 0.0);
+            assert_eq!(r.index.len(), SAMPLES);
+            let worst = check_against_host("t", &c, &r, DIMS.0 * DIMS.1).unwrap_or_else(|e| panic!("{layout:?}: {e}"));
+            assert!(worst < 1e-6, "{layout:?}: {worst}");
+            // An accumulate lane: C held 0.25 before.
+            let shifted: Vec<f32> = c.iter().map(|x| x + 0.25).collect();
+            let r = host_reference(layout, &a, &b, DIMS, 0.25);
+            check_against_host("t", &shifted, &r, DIMS.0 * DIMS.1).unwrap();
+            // ... and a kernel that forgot the prefill fails it.
+            assert!(check_against_host("t", &c, &r, DIMS.0 * DIMS.1).is_err());
+        }
+    }
+
+    /// Planted faults, each of which the retired printed-not-compared `err` let through.
+    #[test]
+    fn check_against_host_fails_on_nan_wrong_values_and_short_or_empty_output() {
+        let layout = Layout::Nt;
+        let (a, b) = operands(layout);
+        let c = full_product(layout, &a, &b, DIMS);
+        let r = host_reference(layout, &a, &b, DIMS, 0.0);
+        let numel = DIMS.0 * DIMS.1;
+        // A NaN at an element the sampler does not read.
+        let i = (0..numel)
+            .find(|i| !r.index.contains(i))
+            .expect("the sampler leaves some element of a 6x10 output unread");
+        let mut bad = c.clone();
+        bad[i] = f32::NAN;
+        assert!(check_against_host("t", &bad, &r, numel)
+            .unwrap_err()
+            .contains("not finite"));
+        // NaN at a sampled element.
+        let mut bad = c.clone();
+        bad[r.index[7]] = f32::NAN;
+        assert!(check_against_host("t", &bad, &r, numel).is_err());
+        // A wrong value just outside the bound, and just inside it.
+        let mut bad = c.clone();
+        bad[r.index[9]] += (REL_BOUND * 1.5 * r.scale) as f32;
+        assert!(check_against_host("t", &bad, &r, numel)
+            .unwrap_err()
+            .contains("host reference"));
+        let mut ok = c.clone();
+        ok[r.index[9]] += (REL_BOUND * 0.5 * r.scale) as f32;
+        check_against_host("t", &ok, &r, numel).unwrap();
+        // Transposed operands (the wrong layout) are not the product.
+        let wrong = full_product(Layout::Nn, &a, &b, DIMS);
+        assert!(check_against_host("t", &wrong, &r, numel).is_err());
+        // A short or empty read, and an unwritten (all zero) output.
+        assert!(check_against_host("t", &c[..numel - 1], &r, numel).is_err());
+        assert!(check_against_host("t", &[], &r, numel).is_err());
+        assert!(check_against_host("t", &vec![0.0; numel], &r, numel).is_err());
+    }
 }

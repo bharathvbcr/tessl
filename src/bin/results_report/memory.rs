@@ -308,6 +308,30 @@ pub fn run(args: &[String]) -> R<()> {
     let real_after_repeat = read_hashes(&raw.join("hash_after_2.txt"))?;
     let tiny_before = read_hashes(&raw.join("tiny_before.txt"))?;
     let tiny_after = read_hashes(&raw.join("tiny_after.txt"))?;
+    // An empty hash list is not an agreement: two empty files are equal, and a
+    // run whose encodes wrote no HASH line compared nothing.
+    for (what, hashes) in [
+        ("hash_before.txt", &real_before),
+        ("hash_after.txt", &real_after),
+        ("hash_after_2.txt", &real_after_repeat),
+        ("tiny_before.txt", &tiny_before),
+        ("tiny_after.txt", &tiny_after),
+    ] {
+        if hashes.is_empty() {
+            return Err(format!(
+                "{what} holds no HASH or TINY line, so there is nothing to compare"
+            ));
+        }
+    }
+    for (what, a, b) in [
+        ("real before and after", &real_before, &real_after),
+        ("real after and its repeat", &real_after, &real_after_repeat),
+        ("tiny before and after", &tiny_before, &tiny_after),
+    ] {
+        if a.len() != b.len() {
+            return Err(format!("{what} hold {} and {} hash lines", a.len(), b.len()));
+        }
+    }
     let real_identical = real_before == real_after;
     let tiny_identical = tiny_before == tiny_after;
 
@@ -507,6 +531,7 @@ pub fn run(args: &[String]) -> R<()> {
             .find(|c| c.operands == ops && c.workload == wl && c.config == cfg)
             .ok_or_else(|| format!("KeyError: {:?}", (ops, wl, cfg)))
     };
+    let mut peaks: Vec<(String, [Num; 3], [Num; 3])> = Vec::new();
     for ops in ["f32", "bf16"] {
         for wl in ["1x16", "64x32", "32x256", "8x1024", "2x4096"] {
             let mut b = Vec::new();
@@ -515,6 +540,9 @@ pub fn run(args: &[String]) -> R<()> {
                 let c = cell(ops, wl, cfg)?;
                 b.push(c.before.num_val()?);
                 a.push(c.after.num_val()?);
+            }
+            if let ([b0, b1, b2], [a0, a1, a2]) = (&b[..], &a[..]) {
+                peaks.push((format!("{ops} {wl}"), [*b0, *b1, *b2], [*a0, *a1, *a2]));
             }
             let change = a[1].div(b[1])?.sub(I(1))?.f();
             w(format!(
@@ -650,8 +678,19 @@ pub fn run(args: &[String]) -> R<()> {
         }
     }
     w(String::new());
-    for line in READING {
-        w((*line).to_string());
+    let memory = memory_verdict(&peaks);
+    let bits = bits_verdict(
+        (&real_before, &real_after, &real_after_repeat),
+        (&tiny_before, &tiny_after),
+    );
+    let time = time_verdict(
+        &paired
+            .iter()
+            .map(|(name, p)| (*name, p.vs_before.as_slice()))
+            .collect::<Vec<_>>(),
+    );
+    for line in reading(&bits, &memory, &time) {
+        w(line);
     }
     w(String::new());
     let text = format!("{}\n", l.join("\n"));
@@ -660,20 +699,128 @@ pub fn run(args: &[String]) -> R<()> {
     Ok(())
 }
 
-/// The closing reading, as the script wrote it.
-const READING: &[&str] = &[
-    "READING (each claim labelled verified / inferred / unverified)",
+/// What the raw hash files say about B1: three consecutive encodes agreed in
+/// every cell (`repeat_stable=true`), the change left the real checkpoint's and
+/// the tiny model's hashes as they were, and a second run of the change
+/// reproduced the first. `Err` names the first failing part.
+fn bits_verdict(real: (&[String], &[String], &[String]), tiny: (&[String], &[String])) -> Result<(), String> {
+    let (before, after, repeat) = real;
+    if let Some(ln) = before
+        .iter()
+        .chain(after)
+        .chain(repeat)
+        .find(|ln| !ln.contains("repeat_stable=true"))
+    {
+        return Err(format!(
+            "a real-checkpoint cell was not stable across consecutive encodes: {ln}"
+        ));
+    }
+    if before != after {
+        return Err("the real checkpoint's hashes changed between before and after".to_string());
+    }
+    if after != repeat {
+        return Err("the second after-run did not reproduce the first".to_string());
+    }
+    if tiny.0 != tiny.1 {
+        return Err("the tiny model's hashes changed between before and after".to_string());
+    }
+    Ok(())
+}
+
+/// What the memory cells say about B2: the back-to-back peak stays within 0.3
+/// MiB of the single-encode peak after the change, and no after cell is above
+/// its before value.
+fn memory_verdict(peaks: &[(String, [Num; 3], [Num; 3])]) -> Result<(), String> {
+    if peaks.is_empty() {
+        return Err("no memory cell was read".to_string());
+    }
+    for (cell, before, after) in peaks {
+        let over = after[1].f() - after[0].f();
+        if over > 0.3 + 1e-9 {
+            return Err(format!(
+                "{cell}: back to back peaks {} MiB above one encode (limit 0.3)",
+                fixed(over, 2)
+            ));
+        }
+        if before.iter().zip(after).any(|(b, a)| a.f() > b.f()) {
+            return Err(format!("{cell}: an after peak is above its before value"));
+        }
+    }
+    Ok(())
+}
+
+/// What the paired runs say about B3: the median of per-round `after / before`
+/// ratios is at most [`MIB_BOUND`] at every workload of every series. `Ok` carries
+/// the number of series checked; `Err` names the first workload over the bound.
+fn time_verdict(paired: &[(&str, &[(String, Vec<(String, Stat)>)])]) -> Result<usize, String> {
+    if paired.is_empty() {
+        return Err("no paired series was read".to_string());
+    }
+    for (series, lanes) in paired {
+        let Some((_, stats)) = lanes.iter().find(|(lane, _)| lane == "after") else {
+            return Err(format!("{series}: no after lane"));
+        };
+        if let Some((wl, s)) = stats.iter().find(|(_, s)| s.median.is_nan() || s.median > MIB_BOUND) {
+            return Err(format!("{series} {wl}: median {} over {MIB_BOUND}", fixed(s.median, 3)));
+        }
+    }
+    Ok(paired.len())
+}
+
+/// The closing lines: each claim the data decides is printed as the script wrote
+/// it when the data holds, and as a refusal naming the failing part when not.
+fn reading(bits: &Result<(), String>, memory: &Result<(), String>, time: &Result<usize, String>) -> Vec<String> {
+    let mut out: Vec<String> = READING_HEAD.iter().map(|s| s.to_string()).collect();
+    match memory {
+        Ok(()) => out.extend(READING_MEMORY_HOLDS.iter().map(|s| s.to_string())),
+        Err(why) => out.push(format!("  * Memory (NOT met): B2 does not hold on these rounds: {why}")),
+    }
+    match bits {
+        Ok(()) => out.extend(READING_BITS_HOLDS.iter().map(|s| s.to_string())),
+        Err(why) => out.push(format!(
+            "  * Output bits (NOT met): B1 does not hold on these rounds: {why}"
+        )),
+    }
+    out.extend(READING_PLE_BOUND.iter().map(|s| s.to_string()));
+    match time {
+        Err(_) => out.extend(READING_TIME_NOT_MET.iter().map(|s| s.to_string())),
+        Ok(series) => out.push(format!(
+            "  * Time against 16f5190 (B3): met on the registered statistic: the median of per-round ratios is at most {MIB_BOUND} at every workload of the {series} paired series."
+        )),
+    }
+    out.extend(READING_WHY.iter().map(|s| s.to_string()));
+    out
+}
+
+/// The closing reading, as the script wrote it, in parts: the heading, the three
+/// claims the raw data decides ([`memory_verdict`], [`bits_verdict`],
+/// [`time_verdict`]: each is printed only when the rounds bear it out), and the
+/// rest. The B4 bullet (the PLE bound's own cost) stays the script's prose: its
+/// verdict rests on repeating the one cell that read above the bound, which the
+/// rounds alone do not decide.
+const READING_HEAD: &[&str] = &["READING (each claim labelled verified / inferred / unverified)"];
+
+const READING_MEMORY_HOLDS: &[&str] = &[
     "  * Memory (verified, deterministic, repeated): B2 holds. One encode and four back to back peak at the same figure within 0.3 MiB",
     "    (the second call's own small output buffer); 400.5 / 400.3 / 400.3 MiB at 32x256 / 8x1024 / 2x4096 against the 400 + 1 bound; no cell",
     "    above its 16f5190 value. 736.5 -> 400.5 is the 240 (PLE) + 96 (alias) the lane D accounting predicted; the 96 was inferred there and is measured here.",
+];
+
+const READING_BITS_HOLDS: &[&str] = &[
     "  * Output bits (verified): B1 holds on the real checkpoint (6 workloads, both modes, full and truncated, each from three consecutive",
     "    encodes) and on the tiny model (3 batches, both modes, one of them two forwards). The 16 and 64 MiB PLE bounds were also hashed on 16f5190",
     "    itself (the library unchanged) before any change was made: identical, so the PLE bound moves no bit by itself.",
+];
+
+const READING_PLE_BOUND: &[&str] = &[
     "  * PLE bound time (B4, verified to the extent the noise allows): one binary at 16 MiB against 256 MiB. The three small-row sweeps and the",
     "    8192-row sweeps put the ratio at 0.96 to 1.03 (median of rounds) and 0.90 to 1.00 (min-of-N); the only cell at 1.0303 (f32 2x4096, 8 rounds, load",
     "    21 per core, spread 1.75) was repeated with 12 rounds and read 1.005 / 0.991, so 16 MiB is the default. A first bf16 sweep at 1024-4096 rows ran at a",
     "    load of 14-38 per core and gave min-of-N 1.047 at 32x32 with medians 0.90-0.96 (spreads 2.2-4.6): it was repeated once (spreads 1.04-1.10, ratios 0.98-1.00).",
     "    The 64x32 f32 cell that read 1.045 and 1.074 in the two paired runs is not the PLE bound: the quiet sweep reads 0.993 / 0.984 there.",
+];
+
+const READING_TIME_NOT_MET: &[&str] = &[
     "  * Time against 16f5190 (B3): NOT met on the registered statistic, and the registered response (repeat) did not converge. Every series of",
     "    the paired runs has a max/min round spread of 1.2 to 28 (the machine ran at 100 to 360 load average on 18 cores, with other lanes on the GPU),",
     "    so the median over rounds of lane/before is not a stable statistic here: f32 medians 0.81-1.25 (1x16: 1.247 with a spread of 28), 2x4096 1.065 in the first run;",
@@ -682,6 +829,9 @@ const READING: &[&str] = &[
     "    at 1x16 / 64x32 / 32x256 / 8x1024 / 2x4096 / ragged. So: no slowdown beyond +5.4 % shows in any series (verified as a bound of about 5 %, which is",
     "    the noise floor of this machine), and the 5.4 % cell (64x32) is not the PLE bound (above) and not the alias or the early release either: the changed",
     "    build with the old 256 MiB bound reads 0.98 and 1.01 there. Whether the change is within 3 % of 16f5190 at every workload is UNVERIFIED on this machine.",
+];
+
+const READING_WHY: &[&str] = &[
     "  * Why none is expected (inferred): the change adds no dispatch to a forward except 22 more per-layer-input GEMM+scale+norm triples at 8192 rows",
     "    (66 extra dispatches of a few us each, against 372 in a forward and hundreds of ms), the alias changes which buffer a GEMM writes, not what it computes,",
     "    and the early release moves buffer ownership, not GPU work.",

@@ -97,6 +97,13 @@ impl Registered {
     fn set(&self, group: libc::pid_t) {
         ACTIVE_GROUPS[self.0].store(group, Ordering::Release);
     }
+
+    /// Take the group back out of the handler's reach, before the leader is
+    /// reaped: once it is, the group id may be handed to another process group,
+    /// and a terminal signal arriving then must not kill that one.
+    fn release_group(&self) {
+        ACTIVE_GROUPS[self.0].store(-1, Ordering::Release);
+    }
 }
 
 impl Drop for Registered {
@@ -116,20 +123,68 @@ impl Drop for Registered {
 /// A process that leaves the group (`setsid`, `setpgid`) is not reached: the
 /// group is the only handle on a descendant. Nothing in this repository's
 /// suites does that.
-fn stop_group(child: &mut Child) {
+fn stop_group(child: &mut Child, slot: &Registered) {
     let group = -(child.id() as libc::pid_t);
     // SAFETY: `kill` takes a pid and a signal; the negated pid is the group of
     // the child spawned with `process_group(0)`, whose pid is its group id.
     unsafe { libc::kill(group, libc::SIGTERM) };
     let grace = Instant::now() + TERM_GRACE;
-    while Instant::now() < grace && !matches!(child.try_wait(), Ok(Some(_))) {
+    // The leader is waited for without reaping it (`exited_unreaped`): once it
+    // is reaped nothing holds its pid, and so the group id, and a later
+    // `kill(-group)` could signal an unrelated process group that was handed
+    // the same number. A zombie leader keeps the id reserved.
+    while Instant::now() < grace && !matches!(exited_unreaped(child.id() as libc::pid_t), Ok(true)) {
         std::thread::sleep(Duration::from_millis(15));
     }
-    // SAFETY: as above.
+    // SAFETY: as above; the leader is not reaped yet, so the group id is still ours.
     unsafe { libc::kill(group, libc::SIGKILL) };
+    slot.release_group();
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Whether `pid` has exited, without reaping it: `waitid` with `WNOWAIT` leaves
+/// the zombie in place, so its pid (here, the child's process group id) stays
+/// reserved until the caller `wait`s. `try_wait` reaps, and a group signalled
+/// after that may by then belong to someone else.
+pub fn exited_unreaped(pid: libc::pid_t) -> Result<bool, String> {
+    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter; `waitid` only
+    // writes it. `WNOHANG` makes it return at once with `si_pid` 0 while the
+    // child still runs.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: `si_pid` is set by a successful `waitid`.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+/// Everything a bounded run left behind, bytes and signal included, and also
+/// when it did not finish: a hung child's partial output is the evidence of the
+/// hang. `error` is a process that could not be started, did not finish
+/// (`timed out after Ns`) or could not be waited for; a non-zero exit is not an
+/// error.
+pub struct RanRaw {
+    pub code: Option<i32>,
+    /// The signal that ended the child, when one did.
+    pub signal: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub error: Option<String>,
+}
+
+/// How long the output readers get to finish after a timeout or an error, once
+/// the group is dead: a descendant outside it (`setsid`) can hold the pipes open,
+/// and then the output so far is returned without the rest.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Run `cmd` to completion within `secs`. `Err` is a process that could not be
 /// started or did not finish; a non-zero exit is a normal `Ok`.
@@ -146,64 +201,114 @@ fn stop_group(child: &mut Child) {
 /// which also closes the pipes a backgrounded descendant would hold open. A
 /// descendant outside the group (one that called `setsid`) can still hold them,
 /// and then the output readers are joined only when it exits: a timeout returns
-/// without joining them, a normal exit waits.
+/// after [`DRAIN_GRACE`] without them, a normal exit waits.
 pub fn run_bounded(cmd: &mut Command, secs: u64) -> Result<Ran, String> {
+    let raw = run_bounded_raw(cmd, Duration::from_secs(secs));
+    if let Some(e) = raw.error {
+        return Err(e);
+    }
+    Ok(Ran {
+        code: raw.code,
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+    })
+}
+
+/// [`run_bounded`] with the output as bytes, the signal that ended the child, and
+/// the output of a child that timed out. The one implementation: every other
+/// bounded run (`bench_paired`'s lanes, through `evidence::run_raw`) goes
+/// through here, so every one of them is killed with its group on a timeout and
+/// on the parent's own interrupt.
+pub fn run_bounded_raw(cmd: &mut Command, timeout: Duration) -> RanRaw {
+    let fail = |e: String| RanRaw {
+        code: None,
+        signal: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        error: Some(e),
+    };
     install_signal_handlers();
     // Claimed before the spawn: with no free slot nothing is started.
     let Some(registered) = Registered::reserve() else {
-        return Err("too many children running at once".to_string());
+        return fail("too many children running at once".to_string());
     };
-    let mut child = cmd
+    let mut child = match cmd
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(c) => c,
+        Err(e) => return fail(e.to_string()),
+    };
     let group = child.id() as libc::pid_t;
     registered.set(group);
-    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    type Drain = std::sync::mpsc::Receiver<Vec<u8>>;
+    fn drain(mut pipe: impl Read + Send + 'static) -> Drain {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     }
     let out = child.stdout.take().map(drain);
     let err = child.stderr.take().map(drain);
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                // The leader is gone; anything it backgrounded is still in its group.
+    let deadline = Instant::now() + timeout;
+    // After a normal exit the readers end by themselves (the group was swept,
+    // closing every pipe a descendant held), and a descendant outside the group
+    // that still holds one is waited for, as it always was. After a timeout or an
+    // error the wait is capped by [`DRAIN_GRACE`].
+    let text = |rx: Option<Drain>, grace: Option<Duration>| {
+        rx.map_or_else(Vec::new, |rx| match grace {
+            None => rx.recv().unwrap_or_default(),
+            Some(g) => rx.recv_timeout(g).unwrap_or_default(),
+        })
+    };
+    // Exit is observed with `waitid(WNOWAIT)`, the group is killed, and only
+    // then is the leader reaped (see `stop_group`).
+    let outcome: Result<std::process::ExitStatus, String> = loop {
+        match exited_unreaped(group) {
+            Ok(true) => {
+                // The leader is gone but not reaped, so the group id is still
+                // ours; anything it backgrounded is still in the group.
                 // SAFETY: as in `stop_group`.
                 unsafe { libc::kill(-group, libc::SIGKILL) };
-                break s;
+                registered.release_group();
+                break child.wait().map_err(|e| e.to_string());
             }
-            Ok(None) if Instant::now() >= deadline => {
-                // The group is gone, so its pipes close and the readers finish by
-                // themselves; they are not joined.
-                stop_group(&mut child);
-                return Err(format!("timed out after {secs}s"));
+            Ok(false) if Instant::now() >= deadline => {
+                stop_group(&mut child, &registered);
+                break Err(format!("timed out after {}s", timeout.as_secs()));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            Ok(false) => std::thread::sleep(Duration::from_millis(15)),
             Err(e) => {
-                stop_group(&mut child);
-                return Err(e.to_string());
+                stop_group(&mut child, &registered);
+                break Err(e);
             }
         }
     };
-    let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        h.and_then(|h| h.join().ok())
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-    };
-    let (stdout, stderr) = (text(out), text(err));
-    Ok(Ran {
-        code: status.code(),
-        stdout,
-        stderr,
-    })
+    match outcome {
+        Ok(status) => {
+            use std::os::unix::process::ExitStatusExt;
+            RanRaw {
+                code: status.code(),
+                signal: status.signal(),
+                stdout: text(out, None),
+                stderr: text(err, None),
+                error: None,
+            }
+        }
+        Err(e) => RanRaw {
+            code: None,
+            signal: None,
+            stdout: text(out, Some(DRAIN_GRACE)),
+            stderr: text(err, Some(DRAIN_GRACE)),
+            error: Some(e),
+        },
+    }
 }
 
 /// The first `n` characters of `s`, trimmed: what a diagnostic quotes of a

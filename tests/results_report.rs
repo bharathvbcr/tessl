@@ -109,6 +109,328 @@ fn memory_matches_the_script_on_the_fixture() {
     assert_golden("memory", &r, &out, "memory");
 }
 
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// The memory fixture's raw directory, copied so a lane can be made to fail.
+fn memory_raw_copy(case: &str) -> (PathBuf, PathBuf) {
+    let root = fresh(case);
+    let raw = root.join("raw");
+    copy_dir(&manifest("tests/fixtures/results_report/memory/raw"), &raw);
+    let out = root.join("out");
+    fs::create_dir_all(&out).unwrap();
+    (raw, out)
+}
+
+/// The golden's closing reading with the three claim bullets the data decides
+/// replaced by `memory`, `bits` and `time` (None keeps the golden's own bullet).
+fn golden_reading(memory: Option<&str>, bits: Option<&str>, time: Option<&str>) -> String {
+    let golden = read(&manifest("tests/fixtures/results_report/memory/golden/stdout.txt"));
+    let at = golden
+        .find("READING (each claim")
+        .expect("the golden ends with the reading");
+    let lines: Vec<&str> = golden[at..].lines().collect();
+    // Heading, the memory bullet (3 lines), the bits bullet (3 lines), the PLE
+    // bullet (5), the time bullet (8), the rest.
+    let mut out = vec![lines[0].to_string()];
+    out.extend(memory.map_or_else(
+        || lines[1..4].iter().map(|l| l.to_string()).collect(),
+        |m| vec![m.to_string()],
+    ));
+    out.extend(bits.map_or_else(
+        || lines[4..7].iter().map(|l| l.to_string()).collect(),
+        |b| vec![b.to_string()],
+    ));
+    out.extend(lines[7..12].iter().map(|l| l.to_string()));
+    out.extend(time.map_or_else(
+        || lines[12..20].iter().map(|l| l.to_string()).collect(),
+        |t| vec![t.to_string()],
+    ));
+    out.extend(lines[20..].iter().map(|l| l.to_string()));
+    out.join("\n").trim_end().to_string()
+}
+
+fn reading_of(stdout: &str) -> String {
+    let at = stdout
+        .find("READING (each claim")
+        .expect("the output ends with the reading");
+    stdout[at..].trim_end().to_string()
+}
+
+/// A failing output-bits lane: one after-run hash differs from before. The
+/// verdict is computed from the hash files, so the "B1 holds" bullet of the
+/// passing fixture must not be printed; the reading is the golden's with that
+/// bullet replaced by the refusal, and the memory claim (not touched) still holds.
+#[test]
+fn memory_reading_reports_a_failing_bits_lane_and_not_the_canned_pass() {
+    let (raw, out) = memory_raw_copy("memory_bits_fail");
+    let after = read(&raw.join("hash_after.txt"));
+    // Flip one hex digit of the first full-output hash.
+    let broken = after.replacen("add2c622733cfa49", "add2c622733cfa4a", 1);
+    assert_ne!(broken, after, "the plant must change the file");
+    fs::write(raw.join("hash_after.txt"), &broken).unwrap();
+    let r = run(&["memory".to_string(), s(&raw), s(&out)]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    assert!(!r.out.contains("B1 holds"), "the canned pass was printed");
+    let want = golden_reading(
+        None,
+        Some(
+            "  * Output bits (NOT met): B1 does not hold on these rounds: the real checkpoint's hashes changed between before and after",
+        ),
+        None,
+    );
+    assert_eq!(reading_of(&r.out), want);
+    // The report's own line states the same fact.
+    assert!(r.out.contains("before == after: False"), "{}", r.out);
+}
+
+/// A failing memory lane: the change's back-to-back peak at 1x16 is far above
+/// its single-encode peak.
+#[test]
+fn memory_reading_reports_a_failing_memory_lane_and_not_the_canned_pass() {
+    let (raw, out) = memory_raw_copy("memory_peak_fail");
+    for t in ["table_after_1.json", "table_after_2.json"] {
+        let text = read(&raw.join(t));
+        let from = r#""label": "back-to-back", "result": {"workload": "1x16", "peak_above_model_mib": 2.0}"#;
+        let to = r#""label": "back-to-back", "result": {"workload": "1x16", "peak_above_model_mib": 9.0}"#;
+        let broken = text.replacen(from, to, 1);
+        assert_ne!(broken, text, "the plant must change {t}");
+        fs::write(raw.join(t), broken).unwrap();
+    }
+    let r = run(&["memory".to_string(), s(&raw), s(&out)]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    assert!(!r.out.contains("B2 holds"), "the canned pass was printed");
+    let want = golden_reading(
+        Some("  * Memory (NOT met): B2 does not hold on these rounds: f32 1x16: back to back peaks 7.00 MiB above one encode (limit 0.3)"),
+        None,
+        None,
+    );
+    assert_eq!(reading_of(&r.out), want);
+}
+
+/// The time claim follows the paired rounds: with the changed lane's stdout
+/// replaced by the baseline's in every round of every paired series, each ratio
+/// is exactly 1 and the registered statistic (median of per-round ratios, at
+/// most 1.03) holds, so the script's "NOT met" bullet must give way to the
+/// computed one. The memory and bits claims, whose files are untouched, still hold.
+#[test]
+fn memory_reading_reports_a_passing_time_lane_and_not_the_canned_miss() {
+    let (raw, out) = memory_raw_copy("memory_time_met");
+    let mut copied = 0;
+    for series in [
+        "paired_f32_a.json.lanes",
+        "paired_bf16_a.json.lanes",
+        "paired_f32.json.lanes",
+    ] {
+        let dir = raw.join(series);
+        for entry in fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if let Some(round) = name.strip_suffix("-0-before.stdout") {
+                fs::copy(dir.join(&name), dir.join(format!("{round}-1-after.stdout"))).unwrap();
+                copied += 1;
+            }
+        }
+    }
+    assert!(
+        copied >= 6,
+        "the plant must replace the after lane of every round: {copied}"
+    );
+    let r = run(&["memory".to_string(), s(&raw), s(&out)]);
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    assert!(
+        !r.out.contains("NOT met on the registered statistic"),
+        "the canned miss was printed"
+    );
+    let want = golden_reading(
+        None,
+        None,
+        Some("  * Time against 16f5190 (B3): met on the registered statistic: the median of per-round ratios is at most 1.03 at every workload of the 3 paired series."),
+    );
+    assert_eq!(reading_of(&r.out), want);
+}
+
+/// Empty hash sets are refused, not read as "identical": two empty files
+/// compared equal before.
+#[test]
+fn memory_refuses_empty_hash_sets() {
+    let (raw, out) = memory_raw_copy("memory_empty_hashes");
+    fs::write(raw.join("hash_before.txt"), "").unwrap();
+    fs::write(raw.join("hash_after.txt"), "").unwrap();
+    fs::write(raw.join("hash_after_2.txt"), "").unwrap();
+    let r = run(&["memory".to_string(), s(&raw), s(&out)]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.err.contains("nothing to compare"), "{}", r.err);
+}
+
+/// A short after-set (fewer hash lines than before) is refused, not compared
+/// as far as the shorter goes.
+#[test]
+fn memory_refuses_short_hash_sets() {
+    let (raw, out) = memory_raw_copy("memory_short_hashes");
+    let after = read(&raw.join("hash_after.txt"));
+    let short: String = after.lines().take(2).map(|l| format!("{l}\n")).collect();
+    fs::write(raw.join("hash_after.txt"), short).unwrap();
+    let r = run(&["memory".to_string(), s(&raw), s(&out)]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.err.contains("hash lines"), "{}", r.err);
+}
+
+/// The ffmpeg probe's own refusals (an empty facts file, a golden or output of
+/// the wrong size) are planted and caught by its `--self-test`, which needs
+/// neither ffmpeg nor numpy.
+#[test]
+fn ffmpeg_graph_probe_refuses_empty_and_short_expected_sets() {
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(manifest("scripts/ffmpeg_graph_probe.py"))
+        .arg("--self-test")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("all caught"));
+}
+
+/// `scripts/guard_break_it.sh` with its test run stuck: a TERM or INT sent to
+/// the script alone must end the test's own process group (which leads its own
+/// group, so nothing but the script's handler reaches it) and exit 128+signal.
+/// `TESSL_GUARD_BREAK_IT_SCRIPT` names another copy of the script, for running
+/// this test against an older one.
+fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
+    use std::time::{Duration, Instant};
+    let root = fresh(case);
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(repo.join("tests")).unwrap();
+    let script = std::env::var_os("TESSL_GUARD_BREAK_IT_SCRIPT")
+        .map_or_else(|| manifest("scripts/guard_break_it.sh"), PathBuf::from);
+    fs::copy(&script, repo.join("scripts/guard_break_it.sh")).unwrap();
+    for f in ["tests/reductions.rs", "tests/nn_adversarial.rs"] {
+        fs::copy(manifest(f), repo.join(f)).unwrap();
+    }
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "fixture"]);
+    // A `cargo` that records its pid and its grandchild's and then hangs.
+    let fakebin = root.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let (cargo_pid, sleep_pid) = (root.join("cargo.pid"), root.join("sleep.pid"));
+    let fake = format!(
+        "#!/bin/sh\necho $ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n",
+        cargo_pid.display(),
+        sleep_pid.display()
+    );
+    fs::write(fakebin.join("cargo"), fake).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(fakebin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+    let tmp = root.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let path = format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap_or_default());
+    let mut child = Command::new("bash")
+        .arg(repo.join("scripts/guard_break_it.sh"))
+        .current_dir(&repo)
+        .env("PATH", path)
+        .env("TMPDIR", &tmp)
+        .env_remove("CARGO_TARGET_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let alive = |pid: &str| {
+        Command::new("kill")
+            .args(["-0", pid])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let read_pid = |p: &Path| {
+        fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let cleanup = |child: &mut std::process::Child| {
+        // Only pids this test started: the script, and the fake cargo's sleep.
+        if let Some(p) = read_pid(&sleep_pid) {
+            let _ = Command::new("kill").args(["-KILL", &p]).output();
+        }
+        if let Some(p) = read_pid(&cargo_pid) {
+            let _ = Command::new("kill").args(["-KILL", &p]).output();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let sleeper = loop {
+        if let Some(p) = read_pid(&sleep_pid) {
+            break p;
+        }
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            cleanup(&mut child);
+            panic!("the script never reached its test run (no pid file)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(alive(&sleeper), "the stuck test is not running");
+    let sent = Command::new("kill")
+        .args([format!("-{signal}"), child.id().to_string()])
+        .output()
+        .unwrap();
+    assert!(sent.status.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() > deadline {
+            cleanup(&mut child);
+            panic!("the script did not exit within 30s of SIG{signal}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while alive(&sleeper) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let survived = alive(&sleeper);
+    cleanup(&mut child);
+    assert_eq!(status.code(), Some(want_code), "exit status after SIG{signal}");
+    assert!(!survived, "the test's process group survived SIG{signal} to the script");
+}
+
+#[test]
+fn guard_break_it_term_reaches_the_test_process_group() {
+    guard_break_it_signal_case("guard_term", "TERM", 143);
+}
+
+#[test]
+fn guard_break_it_int_reaches_the_test_process_group() {
+    guard_break_it_signal_case("guard_int", "INT", 130);
+}
+
 #[test]
 fn small_m_matches_the_script_on_the_fixture() {
     let out = fresh("small_m_fixture");

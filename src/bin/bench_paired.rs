@@ -68,6 +68,8 @@ mod common;
 mod evidence;
 #[path = "common/json.rs"]
 mod json;
+#[path = "common/proc.rs"]
+mod proc;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -269,6 +271,32 @@ fn lane_env(
         }
     }
     env
+}
+
+/// The benchmark and tuning variables of a lane's real environment (those
+/// `--clean-env` would drop, [`evidence::BENCHMARK_ENV_PREFIXES`]), values
+/// redacted of the home directory, sorted by name.
+fn knobs(env: &BTreeMap<String, String>) -> Vec<(String, Jv)> {
+    env.iter()
+        .filter(|(k, _)| evidence::BENCHMARK_ENV_PREFIXES.iter().any(|p| k.starts_with(p)))
+        .map(|(k, v)| (k.clone(), Jv::str(evidence::redact_text(v))))
+        .collect()
+}
+
+/// The `env` record: the workload, iteration and warmup knobs as the lanes'
+/// processes actually saw them (not this process's own environment, which
+/// `--clean-env` strips before a lane starts), where every lane agrees.
+/// `lane_env` carries each lane's full set.
+fn recorded_env(envs: &[BTreeMap<String, String>]) -> Vec<(String, Jv)> {
+    ["BENCH_WORKLOADS", "BENCH_ITERS", "BENCH_WARMUP"]
+        .iter()
+        .filter_map(|k| {
+            let first = envs.first()?.get(*k)?;
+            envs.iter()
+                .all(|e| e.get(*k) == Some(first))
+                .then(|| (k.to_string(), Jv::str(first.clone())))
+        })
+        .collect()
 }
 
 /// `(workload or key, variant)`; the variant is empty outside `rows`.
@@ -615,20 +643,106 @@ fn lane_iters(env: &BTreeMap<String, String>) -> Res<Option<usize>> {
 /// `rNN-LANE-INDEX-NAME.{stdout,stderr,meta.json}`: what the retired shell
 /// drivers appended to their log, written as each run ends, so a run that
 /// fails halfway still leaves its evidence.
+///
+/// The archive is staged beside its final name (`<out>.lanes.staging-STAMP`) and
+/// moved into place with the JSON (`commit`), so a rerun that fails cannot leave
+/// the previous JSON next to a new, partial archive. A run that ends without
+/// publishing keeps its evidence (`keep_failed`): under `<out>.lanes` when there
+/// is no earlier JSON, else under `<out>.lanes.failed`, so the previous
+/// `<out>.lanes` stays with the previous JSON.
 struct Archive {
+    /// Where this run writes.
     dir: PathBuf,
+    /// `<out>.lanes`: where a committed run's archive lives.
+    final_dir: PathBuf,
+    /// The JSON this archive belongs to.
+    out: PathBuf,
+    /// Settled: in its final place, or kept as a failed run's.
+    settled: bool,
 }
 
 impl Archive {
     fn create(out: &Path) -> Res<Self> {
-        let dir = PathBuf::from(format!("{}.lanes", out.display()));
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
+        let final_dir = PathBuf::from(format!("{}.lanes", out.display()));
+        let dir = PathBuf::from(format!("{}.staging-{}", final_dir.display(), common::unique_stamp()));
         std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            final_dir,
+            out: out.to_path_buf(),
+            settled: false,
+        })
     }
 
+    /// Put the staged archive in place and then write the JSON with `publish`.
+    /// The previous archive is moved aside first and removed only once the JSON
+    /// is written; if the JSON cannot be written the previous archive is put
+    /// back and this run's is kept as a failed one.
+    fn commit(&mut self, publish: impl FnOnce() -> Res<()>) -> Res<()> {
+        let aside = PathBuf::from(format!(
+            "{}.replaced-{}",
+            self.final_dir.display(),
+            common::unique_stamp()
+        ));
+        let had_old = self.final_dir.exists();
+        if had_old {
+            std::fs::rename(&self.final_dir, &aside).map_err(|e| format!("{}: {e}", self.final_dir.display()))?;
+        }
+        if let Err(e) = std::fs::rename(&self.dir, &self.final_dir) {
+            if had_old {
+                let _ = std::fs::rename(&aside, &self.final_dir);
+            }
+            return Err(format!("{}: {e}", self.final_dir.display()));
+        }
+        match publish() {
+            Ok(()) => {
+                self.settled = true;
+                self.dir = self.final_dir.clone();
+                if had_old {
+                    let _ = std::fs::remove_dir_all(&aside);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::rename(&self.final_dir, &self.dir);
+                if had_old {
+                    let _ = std::fs::rename(&aside, &self.final_dir);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Settle an archive whose run did not publish. With no earlier JSON there is
+    /// nothing for it to disagree with, so it takes the final name (what a
+    /// failed first run has always left there). With an earlier JSON in place
+    /// the final name still belongs to that JSON's archive, and this run's goes
+    /// to `<out>.lanes.failed`, replacing any earlier failed one.
+    fn keep_failed(&mut self) {
+        if self.settled || !self.dir.is_dir() {
+            return;
+        }
+        self.settled = true;
+        let target = if self.out.exists() {
+            PathBuf::from(format!("{}.failed", self.final_dir.display()))
+        } else {
+            self.final_dir.clone()
+        };
+        let _ = std::fs::remove_dir_all(&target);
+        match std::fs::rename(&self.dir, &target) {
+            Ok(()) => eprintln!("bench_paired: this run's lane output is in {}", target.display()),
+            Err(e) => eprintln!("bench_paired: could not keep {}: {e}", self.dir.display()),
+        }
+    }
+}
+
+impl Drop for Archive {
+    fn drop(&mut self) {
+        self.keep_failed();
+    }
+}
+
+impl Archive {
     fn write(
         &self,
         round: usize,
@@ -687,7 +801,7 @@ fn run_lane(
     let mut cmd = Command::new(&lane.argv[0]);
     cmd.args(&lane.argv[1..]).env_clear().envs(env);
     let (started, load) = (evidence::utc_now(), evidence::load_snapshot());
-    let raw = evidence::run_command(cmd, o.lane_timeout);
+    let raw = evidence::RawRun::from(proc::run_bounded_raw(&mut cmd, o.lane_timeout));
     if let Some(a) = archive {
         a.write(round, index, lane, &raw, &started, load)?;
     }
@@ -1127,21 +1241,49 @@ fn methodology(o: &Options) -> Jv {
     ])
 }
 
+/// Where `exe` runs from: a name with a slash is a path as given; a bare name is
+/// looked up on the `PATH` the lane's process will have (what `Command` does),
+/// the first regular file with an execute bit. `None` when it is not found.
+fn resolve_executable(exe: &str, path_var: Option<&str>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    if exe.contains('/') {
+        return Some(PathBuf::from(exe));
+    }
+    let inherited = std::env::var("PATH").ok();
+    let path = path_var.map(str::to_owned).or(inherited)?;
+    path.split(':')
+        .map(|dir| Path::new(if dir.is_empty() { "." } else { dir }).join(exe))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
 /// The files whose bytes a run is built from: each lane's executable (which
-/// embeds the metallib) and every argument that names an existing file (a
-/// Python lane's script).
-fn provenance_files(lanes: &[Lane]) -> Vec<(String, PathBuf)> {
+/// embeds the metallib), found on the lane's own `PATH` when it is a bare name,
+/// and every argument that names an existing file (a Python lane's script). A
+/// bare executable that is not on the `PATH` is an error: leaving it out would
+/// publish provenance that omits the one file the numbers depend on most.
+fn provenance_files(lanes: &[Lane], envs: &[BTreeMap<String, String>]) -> Res<Vec<(String, PathBuf)>> {
     let mut files = Vec::new();
-    for lane in lanes {
+    for (lane, env) in lanes.iter().zip(envs) {
         for (i, arg) in lane.argv.iter().enumerate() {
-            let p = Path::new(arg);
-            if (i == 0 && arg.contains('/')) || (i > 0 && p.is_file()) {
+            let resolved = if i == 0 {
+                Some(
+                    resolve_executable(arg, env.get("PATH").map(String::as_str)).ok_or_else(|| {
+                        format!(
+                            "lane {}: {arg} is not on the lane's PATH, so its bytes cannot be hashed",
+                            lane.name
+                        )
+                    })?,
+                )
+            } else {
+                Some(PathBuf::from(arg)).filter(|p| p.is_file())
+            };
+            if let Some(p) = resolved {
                 let base = p.file_name().map_or(arg.clone(), |n| n.to_string_lossy().into_owned());
-                files.push((format!("lane:{}:{base}", lane.name), p.to_path_buf()));
+                files.push((format!("lane:{}:{base}", lane.name), p));
             }
         }
     }
-    files
+    Ok(files)
 }
 
 /// Hash of each evidence input file, by name; compared again after every round.
@@ -1188,7 +1330,7 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
             evidence::validate_evidence_sample_counts(o.rounds, iters).map_err(Fail::Usage)?;
         }
     }
-    let archive = o.out.as_deref().map(Archive::create).transpose()?;
+    let mut archive = o.out.as_deref().map(Archive::create).transpose()?;
     let mut provenance = None;
     let mut hashes = Vec::new();
     if o.evidence {
@@ -1207,7 +1349,7 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
                 Jv::Arr(o.compares.iter().map(|(a, b)| Jv::str(format!("{a}:{b}"))).collect()),
             ),
         ]);
-        let mut files = provenance_files(&o.lanes);
+        let mut files = provenance_files(&o.lanes, &envs).map_err(Fail::Usage)?;
         files.sort();
         files.dedup();
         hashes = input_hashes(&files)?;
@@ -1282,15 +1424,22 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
                 )
             })
             .collect();
-        let env_json: Vec<(String, Jv)> = ["BENCH_WORKLOADS", "BENCH_ITERS", "BENCH_WARMUP"]
-            .iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), Jv::str(v))))
-            .collect();
+        let env_json = recorded_env(&envs);
         let mut doc = vec![
             ("rounds".to_string(), Jv::Int(o.rounds as u64)),
             ("format".into(), Jv::str(format!("{:?}", o.format))),
             ("lanes".into(), Jv::Arr(o.lanes.iter().map(lane_json).collect())),
             ("env".into(), Jv::Obj(env_json)),
+            (
+                "lane_env".into(),
+                Jv::Obj(
+                    o.lanes
+                        .iter()
+                        .zip(&envs)
+                        .map(|(l, env)| (l.name.clone(), Jv::Obj(knobs(env))))
+                        .collect(),
+                ),
+            ),
         ];
         if let Some(label) = &o.label {
             doc.push(("label".into(), Jv::str(label.clone())));
@@ -1315,7 +1464,7 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         if let Some(a) = &archive {
             doc.push((
                 "lane_archive".into(),
-                Jv::str(evidence::redact_text(&a.dir.to_string_lossy())),
+                Jv::str(evidence::redact_text(&a.final_dir.to_string_lossy())),
             ));
         }
         if let Some(mut prov) = provenance {
@@ -1323,19 +1472,29 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
             doc.push(("provenance".into(), prov));
         }
         let doc = Jv::Obj(doc);
-        match publisher.as_mut() {
-            Some(p) => {
-                p.publish(&doc)?;
-                eprintln!(
-                    "wrote {} (attempt marker {})",
-                    path.display(),
-                    p.marker_path().display()
-                );
+        let mut write_json = || -> Res<()> {
+            match publisher.as_mut() {
+                Some(p) => {
+                    p.publish(&doc)?;
+                    eprintln!(
+                        "wrote {} (attempt marker {})",
+                        path.display(),
+                        p.marker_path().display()
+                    );
+                }
+                None => {
+                    evidence::atomic_write(path, doc.render()?.as_bytes())?;
+                    eprintln!("wrote {}", path.display());
+                }
             }
-            None => {
-                evidence::atomic_write(path, doc.render()?.as_bytes())?;
-                eprintln!("wrote {}", path.display());
-            }
+            Ok(())
+        };
+        // The archive and the JSON are published together: the staged archive
+        // replaces the old one only around the JSON write, and is put back
+        // beside the old JSON when that write fails.
+        match archive.as_mut() {
+            Some(a) => a.commit(write_json)?,
+            None => write_json()?,
         }
     }
     Ok(())
@@ -1868,5 +2027,259 @@ mod tests {
         // Round 1: a lane missing a base workload.
         let first = vec![vec![m(&["a", "b"]), m(&["a"])]];
         assert!(check_round(&o, &first, 0).unwrap_err().contains("round 1"));
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bench_paired-{tag}-{}", common::unique_stamp()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A bare lane executable is hashed from the lane's own PATH, and one that is
+    /// not there is refused. Before, only a name with a slash was hashed, so a
+    /// PATH-resolved lane (the usual `bench_foo`) published provenance without it.
+    #[test]
+    fn a_bare_lane_executable_is_hashed_from_the_lane_path_or_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("path");
+        let bin = d.join("bench_lane");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = d.join("not_executable");
+        std::fs::write(&plain, "x").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let lane = parse_lane("a=bench_lane --x").unwrap();
+        let env = |path: &str| BTreeMap::from([("PATH".to_string(), path.to_string())]);
+        let found = provenance_files(
+            std::slice::from_ref(&lane),
+            &[env(&format!("/nonexistent:{}", d.display()))],
+        )
+        .unwrap();
+        assert_eq!(found, vec![("lane:a:bench_lane".to_string(), bin.clone())]);
+        // Not on the lane's PATH: refused, naming the lane, not silently left out.
+        let err = provenance_files(std::slice::from_ref(&lane), &[env("/nonexistent")]).unwrap_err();
+        assert!(err.contains("lane a: bench_lane is not on the lane's PATH"), "{err}");
+        // A file without an execute bit is not what would run.
+        let lane = parse_lane("b=not_executable").unwrap();
+        assert!(provenance_files(&[lane], &[env(&d.display().to_string())]).is_err());
+        // A name with a slash is taken as given.
+        let lane = parse_lane(&format!("c={}", bin.display())).unwrap();
+        assert_eq!(provenance_files(&[lane], &[env("/nonexistent")]).unwrap().len(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Under `--clean-env` the lanes never see the inherited knobs, and the
+    /// artifact records what they saw. Before, `env` was read from this process,
+    /// so a cleaned run claimed the knobs it had removed.
+    #[test]
+    fn the_recorded_env_is_the_lanes_real_env_under_clean_env() {
+        let inherited = || {
+            vec![
+                ("BENCH_ITERS".to_string(), "5".to_string()),
+                ("BENCH_WORKLOADS".to_string(), "w".to_string()),
+                ("PATH".to_string(), "/bin".to_string()),
+            ]
+        };
+        let plain = parse_lane("a=bin").unwrap();
+        let lane7 = parse_lane("b:BENCH_ITERS=7=bin").unwrap();
+        let get = |v: &[(String, Jv)], k: &str| v.iter().find(|(n, _)| n == k).map(|_| ());
+        // Not cleaned: every lane inherits both knobs, and the lanes agree on workloads only.
+        let envs: Vec<_> = [&plain, &lane7]
+            .iter()
+            .map(|l| lane_env(l, inherited(), false))
+            .collect();
+        let rec = recorded_env(&envs);
+        assert!(get(&rec, "BENCH_WORKLOADS").is_some());
+        assert!(
+            get(&rec, "BENCH_ITERS").is_none(),
+            "lanes disagree on BENCH_ITERS: not a single value"
+        );
+        // Cleaned: nothing inherited reaches a lane, so nothing inherited is recorded.
+        let envs: Vec<_> = [&plain, &plain]
+            .iter()
+            .map(|l| lane_env(l, inherited(), true))
+            .collect();
+        assert!(recorded_env(&envs).is_empty(), "{:?}", recorded_env(&envs).len());
+        assert!(knobs(&envs[0]).is_empty());
+        // A lane's own setting survives and is recorded for that lane.
+        let envs: Vec<_> = [&lane7].iter().map(|l| lane_env(l, inherited(), true)).collect();
+        assert!(get(&recorded_env(&envs), "BENCH_ITERS").is_some());
+        assert!(get(&knobs(&envs[0]), "BENCH_ITERS").is_some());
+        assert!(get(&knobs(&envs[0]), "PATH").is_none());
+    }
+
+    fn archive_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let d = scratch(tag);
+        let out = d.join("o.json");
+        std::fs::write(&out, "old json").unwrap();
+        let old = d.join("o.json.lanes");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("r01-0-a.stdout"), "old lane output").unwrap();
+        (d, out)
+    }
+
+    fn lane_stage(a: &Archive) {
+        std::fs::write(a.dir.join("r01-0-a.stdout"), "new lane output").unwrap();
+    }
+
+    fn names(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A rerun that fails leaves the previous JSON beside the previous archive,
+    /// not beside a new partial one; its own output is kept apart.
+    #[test]
+    fn a_failed_rerun_leaves_the_old_json_beside_the_old_archive() {
+        let (d, out) = archive_fixture("rerun_fails");
+        {
+            let a = Archive::create(&out).unwrap();
+            lane_stage(&a);
+            // The run fails here: the Archive is dropped without a commit.
+        }
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "old json");
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "old lane output"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes.failed/r01-0-a.stdout")).unwrap(),
+            "new lane output"
+        );
+        assert_eq!(names(&d), ["o.json", "o.json.lanes", "o.json.lanes.failed"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// With no earlier JSON the failed run's output takes the final name, as it
+    /// always did, so the lane evidence of a first failure is where it was.
+    #[test]
+    fn a_failed_first_run_keeps_its_lane_output_under_the_final_name() {
+        let d = scratch("first_fails");
+        let out = d.join("o.json");
+        {
+            let a = Archive::create(&out).unwrap();
+            lane_stage(&a);
+        }
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "new lane output"
+        );
+        assert_eq!(names(&d), ["o.json.lanes"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The archive and the JSON are published together; when the JSON write fails
+    /// the previous pair stays whole.
+    #[test]
+    fn archive_and_json_commit_together_or_not_at_all() {
+        let (d, out) = archive_fixture("commit");
+        let mut a = Archive::create(&out).unwrap();
+        lane_stage(&a);
+        let o = out.clone();
+        a.commit(|| std::fs::write(&o, "new json").map_err(|e| e.to_string()))
+            .unwrap();
+        drop(a);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new json");
+        assert_eq!(
+            std::fs::read_to_string(d.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "new lane output"
+        );
+        assert_eq!(
+            names(&d),
+            ["o.json", "o.json.lanes"],
+            "no staging or replaced dir is left"
+        );
+
+        let (d2, out2) = archive_fixture("commit_fails");
+        let mut a = Archive::create(&out2).unwrap();
+        lane_stage(&a);
+        let err = a.commit(|| Err("disk full".to_string())).unwrap_err();
+        assert_eq!(err, "disk full");
+        drop(a);
+        assert_eq!(std::fs::read_to_string(&out2).unwrap(), "old json");
+        assert_eq!(
+            std::fs::read_to_string(d2.join("o.json.lanes/r01-0-a.stdout")).unwrap(),
+            "old lane output"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d2.join("o.json.lanes.failed/r01-0-a.stdout")).unwrap(),
+            "new lane output"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&d2).unwrap();
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for the pid's existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// A timed-out lane is an error that still carries what it printed (the
+    /// evidence of the hang), and its whole group, a backgrounded child
+    /// included, is gone.
+    #[test]
+    fn a_timed_out_run_keeps_partial_output_and_kills_the_group() {
+        let d = scratch("timeout");
+        let pidfile = d.join("sleep.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "echo partial-out; echo partial-err >&2; sleep 300 & echo $! > '{}'; wait",
+            pidfile.display()
+        ));
+        let t0 = std::time::Instant::now();
+        let raw = proc::run_bounded_raw(&mut cmd, Duration::from_secs(1));
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "the timeout did not bound the run"
+        );
+        assert!(
+            raw.error.as_deref().is_some_and(|e| e.starts_with("timed out")),
+            "{:?}",
+            raw.error
+        );
+        assert!(String::from_utf8_lossy(&raw.stdout).contains("partial-out"));
+        assert!(String::from_utf8_lossy(&raw.stderr).contains("partial-err"));
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "the backgrounded child outlived the timeout");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A signal death is reported as a signal, and the bytes are kept as bytes.
+    #[test]
+    fn a_signalled_run_reports_the_signal_and_non_utf8_output_survives() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf '\\377\\376'; kill -9 $$");
+        let raw = proc::run_bounded_raw(&mut cmd, Duration::from_secs(30));
+        assert_eq!((raw.code, raw.signal, raw.error.is_none()), (None, Some(9), true));
+        assert_eq!(raw.stdout, vec![0xff, 0xfe]);
+    }
+
+    /// The leader is waited for without being reaped, so its pid (the group id)
+    /// stays reserved while the group is signalled: a reaped leader's id could
+    /// by then belong to another process group. `try_wait` reaps; this must not.
+    #[test]
+    fn the_exited_leader_stays_unreaped_until_waited() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !proc::exited_unreaped(pid).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "the child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Exited, yet the pid is still ours: a zombie, which is what keeps the
+        // number from being handed to another process or group.
+        assert!(alive(pid), "the pid was released before the caller waited");
+        assert!(proc::exited_unreaped(pid).unwrap(), "a second look still sees the exit");
+        child.wait().unwrap();
+        assert!(!alive(pid));
     }
 }

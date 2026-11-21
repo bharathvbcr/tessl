@@ -56,6 +56,8 @@ mod common;
 #[path = "common/audio_workloads.rs"]
 mod audio_workloads;
 
+use audio_workloads::cosine;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -102,17 +104,37 @@ fn fnv1a(v: &[f32]) -> u64 {
     })
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
-    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    dot / (norm(a) * norm(b))
-}
-
-fn max_abs(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
-        .fold(0.0, f64::max)
+/// The golden sets a run compares against must be complete: a missing or short
+/// reference file would otherwise shrink the compared slice (`zip` stops at the
+/// shorter) or leave nothing to compare, and the forward would still "match".
+/// Returns the embedding width the goldens agree on.
+fn check_goldens(g: &Goldens) -> Result<usize, String> {
+    if g.texts.is_empty() || g.texts.iter().any(Vec::is_empty) {
+        return Err("the text goldens hold no texts, or an empty one".to_string());
+    }
+    if g.text_emb.is_empty() || !g.text_emb.len().is_multiple_of(g.texts.len()) {
+        return Err(format!(
+            "text emb_f32.npy holds {} values for {} texts",
+            g.text_emb.len(),
+            g.texts.len()
+        ));
+    }
+    let dim = g.text_emb.len() / g.texts.len();
+    if g.images.len() != 2 || g.clips.len() != 2 || g.media_emb.len() != 4 {
+        return Err(format!(
+            "expected 2 images, 2 clips and 4 media embeddings, found {}, {} and {}",
+            g.images.len(),
+            g.clips.len(),
+            g.media_emb.len()
+        ));
+    }
+    if let Some((k, e)) = g.media_emb.iter().enumerate().find(|(_, e)| e.len() != dim) {
+        return Err(format!(
+            "media embedding {k} holds {} values, the text width is {dim}",
+            e.len()
+        ));
+    }
+    Ok(dim)
 }
 
 struct Goldens {
@@ -182,13 +204,15 @@ fn goldens() -> Result<Goldens, String> {
         .iter()
         .map(|p| f32s(&md, &format!("{p}emb_f32.npy")))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Goldens {
+    let g = Goldens {
         texts,
         text_emb: f32s(&rd, "emb_f32.npy")?,
         images,
         clips,
         media_emb,
-    })
+    };
+    check_goldens(&g)?;
+    Ok(g)
 }
 
 fn main() -> Result<(), String> {
@@ -212,9 +236,15 @@ fn main() -> Result<(), String> {
     };
 
     let g = goldens()?;
+    let golden_dim = check_goldens(&g)?;
     let rt = GpuRuntime::new_inference()?;
     let model = EmbedGemma2Multimodal::load(&rt, &snap, operands)?;
     let dim = model.text().config().embedding_dim as usize;
+    if dim != golden_dim {
+        return Err(format!(
+            "the model's embedding width {dim} is not the goldens' {golden_dim}"
+        ));
+    }
     let loaded = rt.current_allocated_bytes();
 
     let short: Vec<Vec<u32>> = g
@@ -251,11 +281,11 @@ fn main() -> Result<(), String> {
         let err = if name == "mixed_full" {
             let row = |k: usize| &out.embeddings[k * dim..(k + 1) * dim];
             let n = g.texts.len();
-            let mut worst = max_abs(&out.embeddings[2 * dim..(2 + n) * dim], &g.text_emb);
+            let mut worst = common::max_abs_diff(name, &out.embeddings[2 * dim..(2 + n) * dim], &g.text_emb)?;
             // Image 0, clip 0, ..., image 1, clip 1: the reference order is
             // [image0, image1, audio0, audio1].
             for (k, at) in [0, 2 + n, 1, 3 + n].into_iter().enumerate() {
-                worst = worst.max(max_abs(row(at), &g.media_emb[k]));
+                worst = worst.max(common::max_abs_diff(name, row(at), &g.media_emb[k])?);
             }
             if operands == GemmOperands::Bf16 {
                 return Err(format!(
@@ -274,7 +304,7 @@ fn main() -> Result<(), String> {
             for k in 0..2 {
                 let row = &out.embeddings[k * dim..(k + 1) * dim];
                 let want = &g.media_emb[2 + k];
-                worst = worst.max(max_abs(row, want));
+                worst = worst.max(common::max_abs_diff(name, row, want)?);
                 let cos = cosine(row, want);
                 if operands == GemmOperands::Bf16 && (cos.is_nan() || cos < BF16_COS) {
                     return Err(format!(
@@ -319,4 +349,51 @@ fn main() -> Result<(), String> {
     }
     println!("[{}]", rows.join(","));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_goldens, AudioInput, Goldens};
+
+    fn good() -> Goldens {
+        let clip = || AudioInput {
+            input_features: vec![0.0; 4],
+            mask: vec![true],
+        };
+        Goldens {
+            texts: vec![vec![1, 2], vec![3]],
+            text_emb: vec![0.5; 6],
+            images: vec![(vec![0.0], vec![0]), (vec![0.0], vec![0])],
+            clips: vec![clip(), clip()],
+            media_emb: vec![vec![0.5; 3]; 4],
+        }
+    }
+
+    /// A golden set that is short or empty would shrink the compared slices or
+    /// leave nothing to compare; each fault is refused by name.
+    #[test]
+    fn short_or_empty_golden_sets_are_refused() {
+        assert_eq!(check_goldens(&good()).unwrap(), 3);
+        let mut g = good();
+        g.text_emb.clear();
+        assert!(check_goldens(&g).unwrap_err().contains("text emb_f32.npy"));
+        let mut g = good();
+        g.text_emb.pop();
+        assert!(check_goldens(&g).unwrap_err().contains("5 values for 2 texts"));
+        let mut g = good();
+        g.texts.clear();
+        assert!(check_goldens(&g).unwrap_err().contains("no texts"));
+        let mut g = good();
+        g.texts[1].clear();
+        assert!(check_goldens(&g).is_err());
+        let mut g = good();
+        g.media_emb.pop();
+        assert!(check_goldens(&g).unwrap_err().contains("4 media embeddings"));
+        let mut g = good();
+        g.media_emb[2].clear();
+        assert!(check_goldens(&g).unwrap_err().contains("media embedding 2"));
+        let mut g = good();
+        g.images.pop();
+        assert!(check_goldens(&g).is_err());
+    }
 }

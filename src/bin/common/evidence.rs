@@ -12,10 +12,9 @@
 //! FIPS 180-4 vectors below) and every host probe is a short-lived command.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::common::{median, unique_stamp};
 use crate::json::{Json, Syntax};
@@ -419,74 +418,28 @@ pub struct RawRun {
     pub error: Option<String>,
 }
 
-/// Run `cmd` with piped output, draining both pipes on threads (a large `git
-/// diff` would fill one). The child leads its own process group, and past
-/// `timeout` that group, which this function started, is killed so a lane's own
-/// children cannot outlive it.
-pub fn run_command(mut cmd: Command, timeout: Duration) -> RawRun {
-    use std::os::unix::process::CommandExt;
-    let fail = |e: String| RawRun {
-        returncode: None,
-        signal: None,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        error: Some(e),
-    };
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return fail(e.to_string()),
-    };
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let out = drain(Box::new(child.stdout.take().expect("piped")));
-    let err = drain(Box::new(child.stderr.take().expect("piped")));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Ok(s),
-            Ok(None) if Instant::now() >= deadline => {
-                // SAFETY: `kill` takes a pid and a signal; the negated pid is the
-                // group of the child spawned above, whose pid is its group id.
-                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(format!("timed out after {}s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => break Err(e.to_string()),
+impl From<crate::proc::RanRaw> for RawRun {
+    fn from(r: crate::proc::RanRaw) -> Self {
+        RawRun {
+            returncode: r.code,
+            signal: r.signal,
+            stdout: r.stdout,
+            stderr: r.stderr,
+            error: r.error,
         }
-    };
-    let (stdout, stderr) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
-    let (returncode, signal, error) = match status {
-        Ok(s) => {
-            use std::os::unix::process::ExitStatusExt;
-            (s.code(), s.signal(), None)
-        }
-        Err(e) => (None, None, Some(e)),
-    };
-    RawRun {
-        returncode,
-        signal,
-        stdout,
-        stderr,
-        error,
     }
 }
 
-/// [`run_command`] on `argv`, optionally from `cwd`.
+/// `proc::run_bounded_raw` on `argv`, optionally from `cwd`: piped output, the child
+/// leading its own process group, which is killed on a timeout and on this
+/// process's own interrupt, so a lane's children cannot outlive it.
 pub fn run_raw(argv: &[&str], cwd: Option<&Path>, timeout: Duration) -> RawRun {
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..]);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    run_command(cmd, timeout)
+    crate::proc::run_bounded_raw(&mut cmd, timeout).into()
 }
 
 fn clip(bytes: &[u8], limit: usize) -> String {

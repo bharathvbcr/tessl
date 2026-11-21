@@ -27,7 +27,7 @@ bin check_release_ready_script 55
 bin check_siblings_script 7
 # Runs scripts/unittest_fixture_skips.sh on text and reads scripts/ci_local.sh as source.
 bin ci_local_python_stage 19
-bin config_json_parsers 27
+bin config_json_parsers 33
 bin dialect_lint_script 12
 bin docs_name_real_tools 7
 bin embedgemma2_audio_fixtures 2
@@ -60,11 +60,11 @@ bin plot_results 57
 bin plot_results_go_overhead 5
 bin plot_results_resample 3
 bin reader_bounds 12
-bin qwen35_config 12
+bin qwen35_config 14
 bin qwen35_mlx_q4_layout 15
 bin qwen35_mlx_q4_adversarial 15
 bin relaxed_predicate 1
-bin results_report 13
+bin results_report 21
 bin release_check 14
 bin safetensors 12
 bin timesfm3_host 7
@@ -118,7 +118,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 437
+bins 488
 
 # Library tests.
 lib ab_flags::tests:: 15

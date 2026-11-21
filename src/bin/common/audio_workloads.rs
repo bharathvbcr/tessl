@@ -132,16 +132,7 @@ pub fn selected(var: &str) -> Result<Vec<Workload>, String> {
 /// Largest `|got - want|` over the largest `|want|`: the measure the model
 /// tests bound (`1e-4` for the soft tokens).
 pub fn rel_max_err(got: &[f32], want: &[f32]) -> Result<f64, String> {
-    if got.len() != want.len() {
-        return Err(format!("{} values against a reference of {}", got.len(), want.len()));
-    }
-    let scale = want.iter().map(|v| f64::from(v.abs())).fold(0.0, f64::max);
-    let err = got
-        .iter()
-        .zip(want)
-        .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
-        .fold(0.0, f64::max);
-    Ok(err / scale)
+    crate::common::max_rel_diff("soft tokens", got, want)
 }
 
 /// An observed error as JSON: the number, or `null` where there was no reference.
@@ -151,9 +142,34 @@ pub fn json_opt(e: Option<f64>) -> String {
 
 /// Cosine of two vectors.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    // Vectors of different length (`zip` would stop at the shorter) or of
+    // no length have no cosine: NaN, which every caller's floor test refuses.
+    if a.len() != b.len() || a.is_empty() {
+        return f64::NAN;
+    }
     let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
     let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     dot / (norm(a) * norm(b))
+}
+
+/// A workload with a reference must be answered with exactly one set of soft
+/// tokens per reference clip: a short answer would leave the unmatched
+/// references unchecked (the loops below index references by clip), and an
+/// answer with no clips has nothing to check at all. A workload with no
+/// reference (the synthetic batches) is held to finiteness only.
+fn check_answer_covers_reference(w: &Workload, soft_tokens: &[Vec<f32>]) -> Result<(), String> {
+    if soft_tokens.is_empty() {
+        return Err(format!("{}: the forward returned no clips", w.name));
+    }
+    if !w.reference.is_empty() && soft_tokens.len() != w.reference.len() {
+        return Err(format!(
+            "{}: {} clips answered against {} reference clips",
+            w.name,
+            soft_tokens.len(),
+            w.reference.len()
+        ));
+    }
+    Ok(())
 }
 
 /// [`check`] for a bf16 forward, whose soft tokens are not within `1e-4` of
@@ -162,6 +178,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// the worst `(largest |got - want| over largest |want|, cosine)` over the
 /// referenced clips, `None` for a workload with no reference.
 pub fn check_cosine(w: &Workload, soft_tokens: &[Vec<f32>], floor: f64) -> Result<Option<(f64, f64)>, String> {
+    check_answer_covers_reference(w, soft_tokens)?;
     let mut worst: Option<(f64, f64)> = None;
     for (i, s) in soft_tokens.iter().enumerate() {
         if s.is_empty() || !s.iter().all(|v| v.is_finite()) {
@@ -184,6 +201,7 @@ pub fn check_cosine(w: &Workload, soft_tokens: &[Vec<f32>], floor: f64) -> Resul
 /// Fails unless every output is finite and, where the workload has a
 /// reference, within `bound` of it (relative to its largest magnitude).
 pub fn check(w: &Workload, soft_tokens: &[Vec<f32>], bound: f64) -> Result<Option<f64>, String> {
+    check_answer_covers_reference(w, soft_tokens)?;
     let mut worst: Option<f64> = None;
     for (i, s) in soft_tokens.iter().enumerate() {
         if s.is_empty() || !s.iter().all(|v| v.is_finite()) {
@@ -201,4 +219,54 @@ pub fn check(w: &Workload, soft_tokens: &[Vec<f32>], bound: f64) -> Result<Optio
         }
     }
     Ok(worst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check, check_cosine, cosine, rel_max_err, Workload};
+
+    fn workload(reference: Vec<Vec<f32>>) -> Workload {
+        Workload {
+            name: "t",
+            clips: Vec::new(),
+            reference,
+        }
+    }
+
+    /// The expected set must cover the answer: a short or empty set, an empty
+    /// answer, NaN, a length mismatch and a scale-less reference are refused.
+    #[test]
+    fn short_empty_and_non_finite_expected_sets_are_refused() {
+        let want = vec![vec![1.0f32, -2.0], vec![0.5, 0.5]];
+        let w = workload(want.clone());
+        assert!(check(&w, &want, 1e-4).is_ok());
+        assert!(check_cosine(&w, &want, 0.999).is_ok());
+        // Fewer clips answered than the reference holds.
+        assert!(check(&w, &want[..1], 1e-4)
+            .unwrap_err()
+            .contains("1 clips answered against 2"));
+        assert!(check_cosine(&w, &want[..1], 0.999).is_err());
+        // More clips answered than referenced.
+        let mut more = want.clone();
+        more.push(vec![1.0, 1.0]);
+        assert!(check(&w, &more, 1e-4).is_err());
+        // Nothing answered, with or without a reference.
+        assert!(check(&w, &[], 1e-4).unwrap_err().contains("no clips"));
+        assert!(check(&workload(Vec::new()), &[], 1e-4).is_err());
+        assert!(check_cosine(&workload(Vec::new()), &[], 0.9).is_err());
+        // An empty reference clip, a NaN answer, a wrong value.
+        assert!(check(&workload(vec![Vec::new()]), &[vec![1.0]], 1e-4).is_err());
+        assert!(check(&w, &[vec![f32::NAN, 1.0], want[1].clone()], 1e-4).is_err());
+        assert!(check(&w, &[vec![1.0, -2.5], want[1].clone()], 1e-4).is_err());
+        // No reference: finiteness only, and still at least one clip.
+        assert_eq!(check(&workload(Vec::new()), &[vec![3.0]], 1e-4).unwrap(), None);
+        // The measure itself.
+        assert!(rel_max_err(&[0.0], &[0.0]).unwrap_err().contains("all zero"));
+        assert!(rel_max_err(&[], &[]).unwrap_err().contains("nothing to compare"));
+        assert!(rel_max_err(&[1.0], &[1.0, 2.0]).is_err());
+        // A NaN anywhere, in the reference too, is not skipped by the max.
+        assert!(rel_max_err(&[1.0, 1.0], &[1.0, f32::NAN]).is_err());
+        assert!(cosine(&[1.0, 0.0], &[1.0]).is_nan());
+        assert!(cosine(&[], &[]).is_nan());
+    }
 }

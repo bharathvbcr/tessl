@@ -112,7 +112,7 @@ fn check_goldens(g: &Goldens) -> Result<usize, String> {
     if g.texts.is_empty() || g.texts.iter().any(Vec::is_empty) {
         return Err("the text goldens hold no texts, or an empty one".to_string());
     }
-    if g.text_emb.is_empty() || g.text_emb.len() % g.texts.len() != 0 {
+    if g.text_emb.is_empty() || !g.text_emb.len().is_multiple_of(g.texts.len()) {
         return Err(format!(
             "text emb_f32.npy holds {} values for {} texts",
             g.text_emb.len(),

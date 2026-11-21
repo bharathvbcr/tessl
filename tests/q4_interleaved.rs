@@ -44,12 +44,6 @@ fn shape(rows: usize, cols: usize, group: usize) -> QuantShape {
     }
 }
 
-/// Raw nibbles for the matrix `q4_mlx_matrix` describes, so both layouts
-/// dequantize to the same dense values.
-fn nibbles_for(rows: usize, cols: usize) -> Vec<u8> {
-    (0..rows * cols).map(|i| ((i * 5) % 16) as u8).collect()
-}
-
 /// Repack row-major nibbles and scale/bias pairs into the Interleaved4 layout.
 fn interleave4(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: usize) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(cols % I4_PACK_COLS, 0, "Interleaved4 needs cols % 16 == 0");
@@ -74,6 +68,7 @@ fn interleave4(nibbles: &[u8], sb: &[f32], rows: usize, cols: usize, group: usiz
     (common::pack_nibbles(&out_n), out_sb)
 }
 
+/// Both layouts of one logical matrix, plus the dense matrix they dequantize to.
 struct Banks {
     row_packed: Vec<u8>,
     row_sb: Vec<f32>,
@@ -83,16 +78,65 @@ struct Banks {
 }
 
 fn banks(rows: usize, cols: usize, group: usize) -> Banks {
-    let nib = nibbles_for(rows, cols);
-    let (row_packed, row_sb, dense) = q4_mlx_matrix(rows, cols, group);
+    banks_salted(rows, cols, group, 0)
+}
+
+/// A bank whose nibbles and scale/bias pairs depend on `salt` (0 is
+/// `q4_mlx_matrix`'s own matrix). Fused kernels read two or three banks, and
+/// two banks built from one formula are the same bytes: a kernel that swapped
+/// them would return the right numbers. Every fused test takes its second and
+/// third bank from a different salt, and `assert_distinct` checks the
+/// outputs really differ.
+fn banks_salted(rows: usize, cols: usize, group: usize, salt: usize) -> Banks {
+    let nib: Vec<u8> = (0..rows * cols)
+        .map(|i| ((i * 5 + salt * (3 + i / cols)) % 16) as u8)
+        .collect();
+    let (_, sb0, _) = q4_mlx_matrix(rows, cols, group);
+    let s = salt as f32;
+    let row_sb: Vec<f32> = sb0
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i % 2 == 0 {
+                v + s * (0.004 + (i % 3) as f32 * 0.002)
+            } else {
+                v - s * 0.07 * ((i % 4) as f32 + 1.0) / 2.0
+            }
+        })
+        .collect();
+    let gpr = cols / group;
+    let sbr = round_trip_bf16(&row_sb);
+    let mut dense = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let gi = r * gpr + c / group;
+            dense[r * cols + c] = sbr[gi * 2] * nib[r * cols + c] as f32 + sbr[gi * 2 + 1];
+        }
+    }
     let (i4_packed, i4_sb) = interleave4(&nib, &row_sb, rows, cols, group);
     Banks {
-        row_packed,
+        row_packed: common::pack_nibbles(&nib),
         row_sb,
         i4_packed,
         i4_sb,
         dense,
     }
+}
+
+/// Two banks' outputs must differ in at least three rows in four, or swapping the banks
+/// cannot change a result and the test cannot see a swap.
+fn assert_distinct(label: &str, a: &[f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len(), "{label}: length");
+    let apart = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| (**x - **y).abs() > 2e-2 * x.abs().max(y.abs()).max(1e-3))
+        .count();
+    assert!(
+        apart * 4 >= a.len() * 3,
+        "{label}: only {apart} of {} rows differ between the two banks, so a bank swap would pass",
+        a.len()
+    );
 }
 
 /// Both layouts of one logical matrix, against the dense reference.
@@ -247,21 +291,22 @@ fn gemm_i4_agrees_with_the_gemv_on_every_row() {
 fn kv_i4_matches_two_separate_gemvs() {
     with_gpu(|rt| {
         let (rows, cols, group) = (128usize, 256usize, 32usize);
-        let bk = banks(rows, cols, group);
-        // A distinct V bank, or the two outputs cannot be told apart.
-        let nv = nibbles_for(rows + 4, cols);
-        let (_, sv, dv) = q4_mlx_matrix(rows + 4, cols, group);
-        let (ivp, ivs) = interleave4(&nv[..rows * cols], &sv[..rows * (cols / group) * 2], rows, cols, group);
-        let dv = dv[..rows * cols].to_vec();
+        // A distinct V bank (own nibbles and scales), or swapping K and V
+        // would return the same numbers.
+        let bk = banks_salted(rows, cols, group, 0);
+        let bv = banks_salted(rows, cols, group, 1);
 
         let x = random_f32(cols, 0x9944);
         let xr = round_trip_bf16(&x);
+        let k_want = dense_gemv(&bk.dense, &xr, rows, cols);
+        let v_want = dense_gemv(&bv.dense, &xr, rows, cols);
+        assert_distinct("kv_i4 K vs V reference", &k_want, &v_want);
         let kp = rt.alloc_buffer(bk.i4_packed.len()).unwrap();
         kp.write_bytes(&bk.i4_packed);
         let ks = buf_bf16(rt, &bk.i4_sb);
-        let vp = rt.alloc_buffer(ivp.len()).unwrap();
-        vp.write_bytes(&ivp);
-        let vs = buf_bf16(rt, &ivs);
+        let vp = rt.alloc_buffer(bv.i4_packed.len()).unwrap();
+        vp.write_bytes(&bv.i4_packed);
+        let vs = buf_bf16(rt, &bv.i4_sb);
         let xb = buf_bf16(rt, &x);
         let ko = seeded(rt, rows, UNWRITTEN);
         let vo = seeded(rt, rows, UNWRITTEN);
@@ -285,18 +330,8 @@ fn kv_i4_matches_two_separate_gemvs() {
         .unwrap();
         rt.synchronize().unwrap();
 
-        close_rel(
-            "kv_i4 k",
-            &ko.read_f32()[..rows],
-            &dense_gemv(&bk.dense, &xr, rows, cols),
-            3e-3,
-        );
-        close_rel(
-            "kv_i4 v",
-            &vo.read_f32()[..rows],
-            &dense_gemv(&dv, &xr, rows, cols),
-            3e-3,
-        );
+        close_rel("kv_i4 k", &ko.read_f32()[..rows], &k_want, 3e-3);
+        close_rel("kv_i4 v", &vo.read_f32()[..rows], &v_want, 3e-3);
     });
 }
 
@@ -306,25 +341,17 @@ fn kv_i4_matches_two_separate_gemvs() {
 fn qkv_i4_matches_three_separate_gemvs() {
     with_gpu(|rt| {
         let (rows_q, rows_kv, cols, group) = (128usize, 64usize, 256usize, 32usize);
-        let bq = banks(rows_q, cols, group);
-        let bk = banks(rows_kv, cols, group);
-        // Perturb V's scales so it is not a copy of K.
-        let nv = nibbles_for(rows_kv, cols);
-        let (_, sv0, _) = q4_mlx_matrix(rows_kv, cols, group);
-        let sv: Vec<f32> = sv0.iter().enumerate().map(|(i, v)| v + (i % 3) as f32 * 0.01).collect();
-        let gpr = cols / group;
-        let mut dv = vec![0.0f32; rows_kv * cols];
-        let svr = round_trip_bf16(&sv);
-        for r in 0..rows_kv {
-            for c in 0..cols {
-                let gi = r * gpr + c / group;
-                dv[r * cols + c] = svr[gi * 2] * nv[r * cols + c] as f32 + svr[gi * 2 + 1];
-            }
-        }
-        let (ivp, ivs) = interleave4(&nv, &sv, rows_kv, cols, group);
+        // Three banks from three salts: K and V are the same shape, so a swap
+        // of the two would otherwise return the same numbers.
+        let bq = banks_salted(rows_q, cols, group, 2);
+        let bk = banks_salted(rows_kv, cols, group, 0);
+        let bv = banks_salted(rows_kv, cols, group, 1);
 
         let x = random_f32(cols, 0x9955);
         let xr = round_trip_bf16(&x);
+        let k_want = dense_gemv(&bk.dense, &xr, rows_kv, cols);
+        let v_want = dense_gemv(&bv.dense, &xr, rows_kv, cols);
+        assert_distinct("qkv_i4 K vs V reference", &k_want, &v_want);
         let mk = |bytes: &[u8], sb: &[f32]| {
             let p = rt.alloc_buffer(bytes.len()).unwrap();
             p.write_bytes(bytes);
@@ -332,7 +359,7 @@ fn qkv_i4_matches_three_separate_gemvs() {
         };
         let (qp, qs) = mk(&bq.i4_packed, &bq.i4_sb);
         let (kp, ks) = mk(&bk.i4_packed, &bk.i4_sb);
-        let (vp, vs) = mk(&ivp, &ivs);
+        let (vp, vs) = mk(&bv.i4_packed, &bv.i4_sb);
         let xb = buf_bf16(rt, &x);
         let (qo, ko, vo) = (
             seeded(rt, rows_q, UNWRITTEN),
@@ -375,18 +402,8 @@ fn qkv_i4_matches_three_separate_gemvs() {
             &dense_gemv(&bq.dense, &xr, rows_q, cols),
             3e-3,
         );
-        close_rel(
-            "qkv_i4 k",
-            &ko.read_f32()[..rows_kv],
-            &dense_gemv(&bk.dense, &xr, rows_kv, cols),
-            3e-3,
-        );
-        close_rel(
-            "qkv_i4 v",
-            &vo.read_f32()[..rows_kv],
-            &dense_gemv(&dv, &xr, rows_kv, cols),
-            3e-3,
-        );
+        close_rel("qkv_i4 k", &ko.read_f32()[..rows_kv], &k_want, 3e-3);
+        close_rel("qkv_i4 v", &vo.read_f32()[..rows_kv], &v_want, 3e-3);
     });
 }
 
@@ -396,24 +413,16 @@ fn qkv_i4_matches_three_separate_gemvs() {
 fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
     with_gpu(|rt| {
         let (rows, cols, group) = (128usize, 256usize, 32usize);
-        let bg = banks(rows, cols, group);
-        let nu = nibbles_for(rows + 2, cols);
-        let (_, su, _) = q4_mlx_matrix(rows + 2, cols, group);
-        let gpr = cols / group;
-        let sur = round_trip_bf16(&su);
-        let mut du = vec![0.0f32; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                let gi = r * gpr + c / group;
-                du[r * cols + c] = sur[gi * 2] * nu[r * cols + c] as f32 + sur[gi * 2 + 1];
-            }
-        }
-        let (iup, ius) = interleave4(&nu[..rows * cols], &su[..rows * gpr * 2], rows, cols, group);
+        // Gate and up are the same shape: their own salts, or a swap (which
+        // changes the product's GELU argument) would go unseen.
+        let bg = banks_salted(rows, cols, group, 0);
+        let bu = banks_salted(rows, cols, group, 1);
 
         let x = random_f32(cols, 0x9966);
         let xr = round_trip_bf16(&x);
         let gate = dense_gemv(&bg.dense, &xr, rows, cols);
-        let up = dense_gemv(&du, &xr, rows, cols);
+        let up = dense_gemv(&bu.dense, &xr, rows, cols);
+        assert_distinct("gate_up_i4 gate vs up reference", &gate, &up);
         // The kernel's GELU (act.h), as `nn::mlp_gelu_tanh`.
         let want: Vec<f32> = gate
             .iter()
@@ -424,9 +433,9 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         let gp = rt.alloc_buffer(bg.i4_packed.len()).unwrap();
         gp.write_bytes(&bg.i4_packed);
         let gs = buf_bf16(rt, &bg.i4_sb);
-        let up_p = rt.alloc_buffer(iup.len()).unwrap();
-        up_p.write_bytes(&iup);
-        let up_s = buf_bf16(rt, &ius);
+        let up_p = rt.alloc_buffer(bu.i4_packed.len()).unwrap();
+        up_p.write_bytes(&bu.i4_packed);
+        let up_s = buf_bf16(rt, &bu.i4_sb);
         let xb = buf_bf16(rt, &x);
         let mid = empty(rt, rows);
 

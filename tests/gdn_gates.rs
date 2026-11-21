@@ -24,6 +24,17 @@
 //! no kernel to anything. It pins the reference a nanolab-form kernel would be
 //! judged by.
 //!
+//! **These are pure-oracle tests, and cannot fail if tessl breaks.** Every
+//! assertion below is about the f64 oracle in `tests/common/gdn.rs`
+//! (`gates_published`, `alpha_mamba2_refuted`) or about f32 arithmetic in this
+//! file; nothing calls into the `tessl` crate, because tessl has no
+//! nanolab-form gate to call (its gate kernel is Qwen3.5's, see above). They
+//! guard the oracle against drifting from nanolab's formula, which is what a
+//! kernel written later would be compared with, and nothing else. A tessl
+//! regression in the gate path is caught by
+//! `gdn_gates_kernel_matches_the_transformers_module_golden` (`qwen35_kernels.rs`)
+//! and `gdn_gates_forward_and_backward_match` (`qwen35_bwd.rs`), not here.
+//!
 //! **Why this reference exists at all.** The build plan specifies K7 as
 //!
 //! ```text

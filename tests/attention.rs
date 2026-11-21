@@ -1456,14 +1456,21 @@ fn global_h512_bf16_output_matches_the_f32_one_within_bf16_resolution() {
             scale: 0.125,
         };
 
-        let f32_out = empty(rt, n);
+        // Both outputs start as a value no kernel produces (a finite sentinel for
+        // f32, all-ones bits = bf16 NaN), so a dispatch that writes nothing
+        // cannot compare equal to a zeroed reference.
+        let f32_out = seeded(rt, n, UNWRITTEN);
         nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &f32_out, &tkv, &zero, &zero, dims, false).unwrap();
         let bf = rt.alloc_buffer(n * 2).unwrap();
-        bf.zero();
+        bf.write_u32(&vec![0xFFFF_FFFF; n / 2]);
         nn::flash_attn_global_h512(rt, &qb, &kb, &vb, &bf, &tkv, &zero, &zero, dims, true).unwrap();
         rt.synchronize().unwrap();
 
         let want = f32_out.read_f32();
+        assert!(
+            !want[..n].contains(&UNWRITTEN),
+            "global f32 h512: the kernel left elements unwritten"
+        );
         let got: Vec<f32> = bf.read_u32()[..n / 2]
             .iter()
             .flat_map(|p| {
@@ -1474,6 +1481,7 @@ fn global_h512_bf16_output_matches_the_f32_one_within_bf16_resolution() {
             })
             .collect();
         for (i, (g, w)) in got.iter().zip(&want[..n]).enumerate() {
+            assert!(g.is_finite(), "global bf16 [{i}]: never written ({g})");
             let tol = 1e-2 * w.abs().max(1e-3);
             assert!((g - w).abs() <= tol, "global bf16 [{i}]: {g} vs {w}");
         }
@@ -1654,10 +1662,10 @@ fn the_routed_path_matches_a_direct_kv_split_dispatch() {
             };
             let qoff = u32_buf(rt, q_off);
 
-            let routed = empty(rt, b * h * d);
+            let routed = seeded(rt, b * h * d, UNWRITTEN);
             nn::flash_attn_swa(rt, AttnHeadDim::D128, &qb, &kb, &vb, &routed, &tkvb, &qoff, &zero, dims).unwrap();
 
-            let direct = empty(rt, b * h * d);
+            let direct = seeded(rt, b * h * d, UNWRITTEN);
             let scratch = nn::DecodeScratch::new(rt, dims.batch, dims.heads, tkv, d as u32).unwrap();
             nn::flash_attn_decode_with_chunk(
                 rt,
@@ -1682,6 +1690,12 @@ fn the_routed_path_matches_a_direct_kv_split_dispatch() {
             rt.synchronize().unwrap();
 
             let (a, c) = (routed.read_f32(), direct.read_f32());
+            for (name, out) in [("routed", &a), ("direct", &c)] {
+                assert!(
+                    !out[..b * h * d].contains(&UNWRITTEN),
+                    "b={b} tkv={tkv} h={h} d={d} window={window}: the {name} dispatch left elements unwritten"
+                );
+            }
             assert_same_finite_bits(
                 &format!("b={b} tkv={tkv} h={h} d={d} window={window}: routed vs direct"),
                 &a[..b * h * d],

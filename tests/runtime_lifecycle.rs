@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use objc2_metal::MTLSharedEvent;
 
-use common::{assert_within_bound, random_f32, reference, tensor_f32, with_gpu, Layout};
+use common::{assert_within_bound, gpu_lock, random_f32, reference, tensor_f32, with_gpu, Layout};
 use tessl::gemm::select_backend;
 use tessl::tensor::gpu_copy;
 use tessl::{gemm_f32, softcap_f32, BufferKind, DType, GemmBackend, GpuRuntime, Tensor};
@@ -172,7 +172,9 @@ fn a_full_cache_keeps_the_smaller_buffer_freed_into_it() {
     const BIG: usize = 1 << 20;
     const SMALL: usize = 256 * 1024;
     let (a, b, c) = (2.5e-9f32, 3.5e-9f32, 4.5e-9f32);
-    // Its own runtime: the cap and the freelist are the test's alone.
+    // Its own runtime: the cap and the freelist are the test's alone. Built
+    // under the GPU lock like every other runtime in the suite.
+    let _gpu = gpu_lock();
     let rt = GpuRuntime::new().unwrap();
     rt.set_pool_cache_cap_bytes(BIG);
     let round_trip = |bytes: usize, mark: f32| {
@@ -535,7 +537,16 @@ fn release(rt: &GpuRuntime, released: &mut std::collections::HashMap<usize, u64>
 
 #[test]
 fn temporaries_recycle_across_unwaited_commits() {
-    with_gpu(|rt| recycle_across_unwaited_commits(rt, false));
+    with_gpu(|rt| {
+        recycle_across_unwaited_commits(rt, false);
+        // Nothing foreign signaled the handoff event, so nothing is ahead of
+        // tessl, now or after the run.
+        assert_eq!(
+            rt.handoff_foreign_signal(),
+            None,
+            "a foreign signal was reported though none was made"
+        );
+    });
 }
 
 /// The BINN pattern: a foreign queue (sparsl) host-signals the handoff event to
@@ -546,9 +557,15 @@ fn temporaries_recycle_across_unwaited_commits() {
 fn a_foreign_signal_on_the_handoff_event_recycles_nothing_early() {
     with_gpu(|rt| {
         recycle_across_unwaited_commits(rt, true);
-        // Said out loud: a waiter on the handoff event is told about it.
-        assert!(
-            rt.handoff_foreign_signal().is_some() || rt.last_completed_value() == rt.last_signaled_value(),
+        // Said out loud: a waiter on the handoff event is told about it. The
+        // run above has synchronized, so tessl has caught up with its own
+        // commits and a bare "completed == signaled" says nothing about the
+        // report. Put a signal ahead of tessl and ask for it by value.
+        let ahead = rt.last_signaled_value() + 7;
+        rt.shared_event().setSignaledValue(ahead);
+        assert_eq!(
+            rt.handoff_foreign_signal(),
+            Some(ahead),
             "a foreign signal ahead of tessl went unreported"
         );
     });

@@ -184,42 +184,58 @@ fn a_buffer_dropped_while_a_command_buffer_is_open_is_not_reused_until_it_comple
 fn a_gpu_write_in_flight_does_not_land_in_a_reused_buffer() {
     warm();
     const ELEMS: usize = 8 << 20; // 32 MiB
-    const COPIES: usize = 300;
     const HOST: u32 = 0x4000_0000; // 2.0f
     with_gpu(|rt| {
         let src = rt.alloc_buffer(ELEMS * 4).unwrap();
         src.try_write_u32(&vec![0x3f80_0000; ELEMS]).unwrap(); // 1.0f
-        let x = rt.alloc_buffer(ELEMS * 4).unwrap();
-        x.try_write_u32(&vec![HOST; ELEMS]).unwrap();
-        rt.synchronize().unwrap();
+                                                               // The race only exists while the chain is still running at the drop.
+                                                               // If the GPU finished first, the pool reusing `x` would be correct and
+                                                               // nothing below could fail, so a lap that did not overlap is retried
+                                                               // with a longer chain, and a test that never overlapped fails: it
+                                                               // proved nothing.
+        let mut overlapped = false;
+        for copies in [300usize, 600, 1200, 2400] {
+            let x = rt.alloc_buffer(ELEMS * 4).unwrap();
+            x.try_write_u32(&vec![HOST; ELEMS]).unwrap();
+            rt.synchronize().unwrap();
 
-        {
-            let _scope = rt.async_scope();
-            for _ in 0..COPIES {
-                copy(rt, &src, &x, ELEMS).unwrap();
+            {
+                let _scope = rt.async_scope();
+                for _ in 0..copies {
+                    copy(rt, &src, &x, ELEMS).unwrap();
+                }
+                rt.commit(false).unwrap();
             }
-            rt.commit(false).unwrap();
-        }
-        let submitted = rt.last_signaled_value();
-        let running = rt.last_completed_value() < submitted;
-        let x_addr = addr(&x);
-        drop(x);
+            let submitted = rt.last_signaled_value();
+            let running = rt.last_completed_value() < submitted;
+            let x_addr = addr(&x);
+            drop(x);
 
-        // Same size, so the same bucket. Written on the host with no wait.
-        let y = rt.alloc_buffer_from_u32(&vec![HOST; ELEMS]).unwrap();
-        if running {
-            assert_ne!(
-                addr(&y),
-                x_addr,
-                "a buffer a running command buffer writes was handed out again"
+            // Same size, so the same bucket. Written on the host with no wait.
+            let y = rt.alloc_buffer_from_u32(&vec![HOST; ELEMS]).unwrap();
+            if running {
+                overlapped = true;
+                assert_ne!(
+                    addr(&y),
+                    x_addr,
+                    "a buffer a running command buffer writes was handed out again ({copies} copies)"
+                );
+            }
+            rt.synchronize().unwrap();
+            let seen = y.try_contents_u32().unwrap();
+            assert!(
+                seen.iter().all(|&w| w == HOST),
+                "the GPU's write landed in a buffer allocated after the drop (first word {:#x})",
+                seen[0]
             );
+            if overlapped {
+                break;
+            }
         }
-        rt.synchronize().unwrap();
-        let seen = y.try_contents_u32().unwrap();
         assert!(
-            seen.iter().all(|&w| w == HOST),
-            "the GPU's write landed in a buffer allocated after the drop (first word {:#x})",
-            seen[0]
+            overlapped,
+            "the GPU finished a 2400-copy chain before the host dropped its target, so the \
+             in-flight reuse this test guards was never exercised"
         );
     });
 }

@@ -755,6 +755,140 @@ fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
     );
 }
 
+fn signal_pid(pid: u32, name: &str) {
+    let sent = Command::new("kill")
+        .args([format!("-{name}"), pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -{name} {pid}");
+}
+
+/// Wait (bounded) until the lane has written its marker; fail if the run is already over.
+fn wait_for_file(child: &mut std::process::Child, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(100);
+    while !path.exists() {
+        if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Wait (bounded) until the process is in the stopped state: a condition, not a delay.
+fn wait_stopped(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let out = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&out.stdout).trim().starts_with('T') {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "pid {pid} never stopped");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait (bounded) for the child this test spawned to end; kill it if it hangs.
+fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bench_paired did not exit after the signal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn names_with_prefix(d: &Path, prefix: &str) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    v.sort();
+    v
+}
+
+fn spawn_bp(args: Vec<String>) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// Signal "name" arrives while bench_paired is stopped and the gate lane's block_call-th run is blocked on a FIFO;
+/// the lane is released and then bench_paired continues, so the signal is delivered
+/// after the lane ended and before bench_paired has looked at it. No timing involved.
+fn signal_after_gate_call_ended(
+    tag: &str,
+    block_call: u32,
+    name: &str,
+) -> (std::process::ExitStatus, PathBuf, Scratch) {
+    let keep = scratch(tag);
+    let d = keep.to_path_buf();
+    let fifo = d.join("release");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let up = d.join("up");
+    let count = d.join("count");
+    let gate = script(
+        &d,
+        "gate",
+        &format!(
+            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo up > '{u}'; cat '{f}' > /dev/null; fi",
+            c = count.display(),
+            k = block_call,
+            u = up.display(),
+            f = fifo.display()
+        ),
+    );
+    let b_ran = d.join("b_ran");
+    let b = script(&d, "b", &format!("echo ran > '{}'\necho METRIC m 2", b_ran.display()));
+    let out_json = d.join("o.json");
+    let mut child = spawn_bp(strs(&[
+        "--format",
+        "metrics",
+        "--rounds=2",
+        "--lane-timeout=120",
+        &format!("--out={}", out_json.display()),
+        &format!("gate={}", gate.display()),
+        &format!("b={}", b.display()),
+    ]));
+    wait_for_file(&mut child, &up, "the gating lane never reached its block");
+    signal_pid(child.id(), "STOP");
+    wait_stopped(child.id());
+    signal_pid(child.id(), name);
+    // Opening the FIFO for writing returns once the lane's cat has it open for reading.
+    drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    signal_pid(child.id(), "CONT");
+    let status = wait_exit(&mut child);
+    (status, d, keep)
+}
+
+/// a signal that lands after the last lane ended and before the JSON is published.
+#[test]
+fn a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result() {
+    use std::os::unix::process::ExitStatusExt;
+    let (status, d, _keep) = signal_after_gate_call_ended("sig_publish", 2, "INT");
+    let left = names_with_prefix(&d, "o.json");
+    assert!(left.iter().all(|n| !n.contains(".staging-")), "{left:?}");
+    assert_eq!(status.signal(), Some(2), "{status:?}");
+    assert!(
+        !d.join("o.json").exists(),
+        "the run died of SIGINT yet published its result: {left:?}"
+    );
+}
+
 #[test]
 fn a_malformed_evidence_command_line_leaves_no_marker() {
     let d = scratch("nomarker");

@@ -47,25 +47,26 @@ fn main() -> Result<(), String> {
 
     let diff_ts = ct.iter().zip(&cs).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
     let diff_tc = ct.iter().zip(&cpu).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-    let err = |v: &[f32]| {
-        v.iter()
-            .zip(&ref64)
-            .map(|(x, r)| (*x as f64 - r).abs())
-            .fold(0.0, f64::max)
-    };
+    // The shared comparator, so a NaN or an empty read is an error here and not
+    // the worst of the rest (`f64::max` drops a NaN).
+    let err = |lane: &str, v: &[f32]| common::check_against(lane, v, &ref64, common::UNBOUNDED, 0.0);
+    let (err_t, err_s, err_cpu, err_bf) = (
+        err("tensorops", &ct)?,
+        err("simdgroup", &cs)?,
+        err("cpu-f32", &cpu)?,
+        err("bf16 tensorops", &cb)?,
+    );
     println!("M={m} N={n} K={k}  ({} elems)", m * n);
     println!("  tensorops vs simdgroup: {diff_ts} differing floats");
     println!("  tensorops vs cpu-f32  : {diff_tc} differing floats");
     println!(
         "  max|err vs f64 ref| tensorops={:.3e} simdgroup={:.3e} cpu={:.3e}",
-        err(&ct),
-        err(&cs),
-        err(&cpu)
+        err_t, err_s, err_cpu
     );
     println!(
         "  bf16 lane: max|err vs f64 ref|={:.3e}  rel={:.3e}",
-        err(&cb),
-        err(&cb) / ref64.iter().fold(0.0f64, |a, r| a.max(r.abs()))
+        err_bf,
+        err_bf / ref64.iter().fold(0.0f64, |a, r| a.max(r.abs()))
     );
     println!("  samples t/s/cpu: {:?} {:?} {:?}", &ct[..3], &cs[..3], &cpu[..3]);
     Ok(())

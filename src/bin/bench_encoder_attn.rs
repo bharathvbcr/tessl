@@ -553,19 +553,11 @@ fn run() -> Result<(), String> {
                 dispatch_named(&rt, &name, bq, sg, s, bf16, &ops)?;
                 rt.synchronize()?;
                 let got = ops.o.read_f32();
-                let worst = got.iter().zip(&want).fold(0.0f32, |m, (g, w)| {
-                    let e = (g - w).abs();
-                    if e.is_nan() {
-                        f32::INFINITY
-                    } else {
-                        m.max(e)
-                    }
-                });
                 let tol = if bf16 { 5e-2 } else { 1e-4 };
-                if worst > tol * scale {
-                    println!(
-                        "  REJECTED {name}: max |diff| {worst:.3e} against {scale:.3e} (tolerance {tol:.0e} of it)"
-                    );
+                // The shared comparator: a NaN, an empty read or a length mismatch
+                // rejects the variant like an error beyond the tolerance does.
+                if let Err(why) = common::check_against(&name, &got, &want, tol * f64::from(scale), 0.0) {
+                    println!("  REJECTED {name}: {why} (scale {scale:.3e}, tolerance {tol:.0e} of it)");
                     continue;
                 }
                 let label = name.trim_start_matches("encoder_attn_tune").to_string();

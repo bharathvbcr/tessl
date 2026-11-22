@@ -870,10 +870,12 @@ fn q4_small_m() -> Result<(), String> {
             let b = y_new.try_read_f32()?;
             let n = m * rows;
             let scale = a[..n].iter().fold(0.0f32, |s, v| s.max(v.abs())).max(1e-30);
-            let worst = common::max_abs_diff(
+            let worst = common::check_against(
                 &format!("{label} M={m}"),
                 a.get(..n).unwrap_or(&[]),
                 b.get(..n).unwrap_or(&[]),
+                common::UNBOUNDED,
+                0.0,
             )?;
             if worst > f64::from(1e-3 * scale) {
                 return Err(format!(

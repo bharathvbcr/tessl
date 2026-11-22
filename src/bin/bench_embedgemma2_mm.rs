@@ -281,11 +281,23 @@ fn main() -> Result<(), String> {
         let err = if name == "mixed_full" {
             let row = |k: usize| &out.embeddings[k * dim..(k + 1) * dim];
             let n = g.texts.len();
-            let mut worst = common::max_abs_diff(name, &out.embeddings[2 * dim..(2 + n) * dim], &g.text_emb)?;
+            let mut worst = common::check_against(
+                name,
+                &out.embeddings[2 * dim..(2 + n) * dim],
+                &g.text_emb,
+                common::UNBOUNDED,
+                0.0,
+            )?;
             // Image 0, clip 0, ..., image 1, clip 1: the reference order is
             // [image0, image1, audio0, audio1].
             for (k, at) in [0, 2 + n, 1, 3 + n].into_iter().enumerate() {
-                worst = worst.max(common::max_abs_diff(name, row(at), &g.media_emb[k])?);
+                worst = worst.max(common::check_against(
+                    name,
+                    row(at),
+                    &g.media_emb[k],
+                    common::UNBOUNDED,
+                    0.0,
+                )?);
             }
             if operands == GemmOperands::Bf16 {
                 return Err(format!(
@@ -304,7 +316,7 @@ fn main() -> Result<(), String> {
             for k in 0..2 {
                 let row = &out.embeddings[k * dim..(k + 1) * dim];
                 let want = &g.media_emb[2 + k];
-                worst = worst.max(common::max_abs_diff(name, row, want)?);
+                worst = worst.max(common::check_against(name, row, want, common::UNBOUNDED, 0.0)?);
                 let cos = cosine(row, want);
                 if operands == GemmOperands::Bf16 && (cos.is_nan() || cos < BF16_COS) {
                     return Err(format!(

@@ -1482,6 +1482,14 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         }
         let doc = Jv::Obj(doc);
         let mut write_json = || -> Res<()> {
+            // The last look before anything is published, from inside the
+            // commit so that an archive already moved into place goes back to
+            // staging: a run that is ending of a signal leaves no result that
+            // looks complete. `keep_failed` then keeps its evidence as an
+            // interrupted lane's, and `main` dies of the signal.
+            if let Some(sig) = proc::pending_signal() {
+                return Err(format!("interrupted by signal {sig} before publishing"));
+            }
             match publisher.as_mut() {
                 Some(p) => {
                     p.publish(&doc)?;
@@ -2357,13 +2365,7 @@ mod tests {
     /// is (a zero reference must not turn `inf * 0` into a NaN that fails it).
     #[test]
     fn unbounded_for_both_tolerances_measures_a_zero_reference_instead_of_refusing_it() {
-        let r = common::check_against(
-            "t",
-            &[1.0, 2.0],
-            &[0.0f64, 1.0],
-            common::UNBOUNDED,
-            common::UNBOUNDED,
-        );
+        let r = common::check_against("t", &[1.0, 2.0], &[0.0f64, 1.0], common::UNBOUNDED, common::UNBOUNDED);
         assert_eq!(r, Ok(1.0), "UNBOUNDED as abs and rel: {r:?}");
     }
 }

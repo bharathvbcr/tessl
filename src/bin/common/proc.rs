@@ -82,11 +82,11 @@ fn install_signal_handlers() {
 }
 
 /// A claimed slot of [`ACTIVE_GROUPS`], released when dropped.
-struct Registered(usize);
+pub struct Registered(usize);
 
 impl Registered {
     /// Claim a free slot, or `None` when all are taken.
-    fn reserve() -> Option<Registered> {
+    pub fn reserve() -> Option<Registered> {
         ACTIVE_GROUPS
             .iter()
             .position(|s| s.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed).is_ok())
@@ -123,7 +123,14 @@ impl Drop for Registered {
 /// A process that leaves the group (`setsid`, `setpgid`) is not reached: the
 /// group is the only handle on a descendant. Nothing in this repository's
 /// suites does that.
-fn stop_group(child: &mut Child, slot: &Registered) {
+pub fn stop_group(child: &mut Child, slot: &Registered) {
+    // A leader somebody else already reaped (ECHILD) no longer holds its pid,
+    // so the group id may be another group's by now: there is nothing here to
+    // signal, and `child.kill` would signal the bare pid just the same.
+    if leader_reaped(child.id() as libc::pid_t) {
+        slot.release_group();
+        return;
+    }
     let group = -(child.id() as libc::pid_t);
     // SAFETY: `kill` takes a pid and a signal; the negated pid is the group of
     // the child spawned with `process_group(0)`, whose pid is its group id.
@@ -133,8 +140,17 @@ fn stop_group(child: &mut Child, slot: &Registered) {
     // is reaped nothing holds its pid, and so the group id, and a later
     // `kill(-group)` could signal an unrelated process group that was handed
     // the same number. A zombie leader keeps the id reserved.
-    while Instant::now() < grace && !matches!(exited_unreaped(child.id() as libc::pid_t), Ok(true)) {
-        std::thread::sleep(Duration::from_millis(15));
+    while Instant::now() < grace {
+        match waitid_unreaped(child.id() as libc::pid_t) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(15)),
+            // Reaped behind our back while we waited: the group is not ours to signal.
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                slot.release_group();
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(15)),
+        }
     }
     // SAFETY: as above; the leader is not reaped yet, so the group id is still ours.
     unsafe { libc::kill(group, libc::SIGKILL) };
@@ -143,11 +159,23 @@ fn stop_group(child: &mut Child, slot: &Registered) {
     let _ = child.wait();
 }
 
+/// Whether `pid` is no longer a child of this process (`waitid` says ECHILD):
+/// it was reaped, here or elsewhere, and its number is free to be reused.
+fn leader_reaped(pid: libc::pid_t) -> bool {
+    matches!(waitid_unreaped(pid), Err(e) if e.raw_os_error() == Some(libc::ECHILD))
+}
+
 /// Whether `pid` has exited, without reaping it: `waitid` with `WNOWAIT` leaves
 /// the zombie in place, so its pid (here, the child's process group id) stays
 /// reserved until the caller `wait`s. `try_wait` reaps, and a group signalled
 /// after that may by then belong to someone else.
 pub fn exited_unreaped(pid: libc::pid_t) -> Result<bool, String> {
+    waitid_unreaped(pid).map_err(|e| e.to_string())
+}
+
+/// [`exited_unreaped`] with the OS error kept, so a caller can tell ECHILD
+/// (the child is gone) from a failure of the call itself.
+fn waitid_unreaped(pid: libc::pid_t) -> Result<bool, std::io::Error> {
     // SAFETY: a zeroed `siginfo_t` is a valid out-parameter; `waitid` only
     // writes it. `WNOHANG` makes it return at once with `si_pid` 0 while the
     // child still runs.
@@ -161,7 +189,7 @@ pub fn exited_unreaped(pid: libc::pid_t) -> Result<bool, String> {
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `si_pid` is set by a successful `waitid`.
     Ok(unsafe { info.si_pid() } != 0)

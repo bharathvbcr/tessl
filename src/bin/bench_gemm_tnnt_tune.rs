@@ -94,14 +94,14 @@ const REL_BOUND: f64 = 2e-3;
 /// would cost minutes at the shapes this tuner times.
 const SAMPLES: usize = 512;
 
-/// How a lane lays out its operands (storage, not maths: C[M,N] = A.B).
+/// How a lane lays out its operands (storage, not maths: `C[M,N] = A.B`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Layout {
-    /// A[M,K], B[K,N].
+    /// `A[M,K]`, `B[K,N]`.
     Nn,
-    /// A[K,M], B[K,N].
+    /// `A[K,M]`, `B[K,N]`.
     Tn,
-    /// A[M,K], B[N,K].
+    /// `A[M,K]`, `B[N,K]`.
     Nt,
 }
 
@@ -113,7 +113,7 @@ struct HostRef {
     scale: f64,
 }
 
-/// `C[i,j] = offset + sum_k A.B` in f64 at [`SAMPLES`] elements of C[m,n].
+/// `C[i,j] = offset + sum_k A.B` in f64 at [`SAMPLES`] elements of `C[m,n]`.
 /// `a` and `b` are the operands as the kernel reads them (already rounded to
 /// bf16 for a bf16 lane); `offset` is what C held before an accumulate.
 fn host_reference(layout: Layout, a: &[f32], b: &[f32], (m, n, k): (usize, usize, usize), offset: f64) -> HostRef {

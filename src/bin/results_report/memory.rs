@@ -56,6 +56,12 @@ fn tables_equal(a: &[Cell], b: &[Cell]) -> bool {
 
 type Series = OMap<OMap<Vec<Num>>>;
 
+/// A series' workloads, each with its statistic.
+type Stats = Vec<(String, Stat)>;
+
+/// One paired series: its name and, per lane, the statistics against the base.
+type Paired<'a> = (&'a str, &'a [(String, Stats)]);
+
 /// `{lane: {workload: [ms_min per round]}}`, the per-round normalized 1-minute
 /// load, and the rounds.
 fn lanes_dir(dir: &Path) -> R<(Series, Vec<Num>, Vec<i128>)> {
@@ -752,7 +758,7 @@ fn memory_verdict(peaks: &[(String, [Num; 3], [Num; 3])]) -> Result<(), String> 
 /// What the paired runs say about B3: the median of per-round `after / before`
 /// ratios is at most [`MIB_BOUND`] at every workload of every series. `Ok` carries
 /// the number of series checked; `Err` names the first workload over the bound.
-fn time_verdict(paired: &[(&str, &[(String, Vec<(String, Stat)>)])]) -> Result<usize, String> {
+fn time_verdict(paired: &[Paired<'_>]) -> Result<usize, String> {
     if paired.is_empty() {
         return Err("no paired series was read".to_string());
     }

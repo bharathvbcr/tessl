@@ -879,7 +879,10 @@ mod tests {
     fn a_refusal_with_a_newline_or_nothing_stays_one_line() {
         let mut bad = Vec::new();
         for (why, shown) in [
-            ("series x\ny: median 1.5 over 1.03", "series x\\ny: median 1.5 over 1.03"),
+            (
+                "series x\ny: median 1.5 over 1.03",
+                "series x\\ny: median 1.5 over 1.03",
+            ),
             ("a\r\nb", "a\\r\\nb"),
             ("", "(no reason given)"),
             ("  \n ", "(no reason given)"),
@@ -888,7 +891,11 @@ mod tests {
             for (arm, marker, lines) in [
                 ("memory", "B2 does not hold", reading(&Ok(()), &err, &Ok(1))),
                 ("bits", "B1 does not hold", reading(&err, &Ok(()), &Ok(1))),
-                ("time", "(B3), refused", reading(&Ok(()), &Ok(()), &Err(why.to_string()))),
+                (
+                    "time",
+                    "(B3), refused",
+                    reading(&Ok(()), &Ok(()), &Err(why.to_string())),
+                ),
             ] {
                 let Some(bullet) = lines.iter().find(|l| l.contains(marker)) else {
                     bad.push(format!("{arm} {why:?}: no bullet with {marker:?}"));
@@ -898,7 +905,9 @@ mod tests {
                     bad.push(format!("{arm} {why:?}: a line break split the bullet: {bullet:?}"));
                 }
                 if !bullet.ends_with(shown) {
-                    bad.push(format!("{arm} {why:?}: the bullet does not end with {shown:?}: {bullet:?}"));
+                    bad.push(format!(
+                        "{arm} {why:?}: the bullet does not end with {shown:?}: {bullet:?}"
+                    ));
                 }
             }
         }

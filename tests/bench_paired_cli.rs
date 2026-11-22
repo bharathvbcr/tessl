@@ -690,6 +690,71 @@ fn a_timed_out_lane_is_killed_with_its_children_and_named_with_its_round() {
     assert!(!alive, "the lane's child {pid} survived the timeout");
 }
 
+/// An interrupted run settles its staged archive instead of leaving a
+/// `.lanes.staging-*` directory behind, and still dies of the signal. The lane
+/// signals that it is running by writing a file; the test waits for that file,
+/// interrupts the `bench_paired` it spawned and waits for it to exit, so
+/// nothing here depends on timing (the lane timeout only bounds a hang).
+#[test]
+fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let d = scratch("interrupt");
+    let started = d.join("started");
+    let hang = script(
+        &d,
+        "hang",
+        &format!("echo started > '{}'\nsleep 300", started.display()),
+    );
+    let out_json = d.join("o.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+        .args(strs(&[
+            "--format",
+            "metrics",
+            "--rounds=2",
+            "--lane-timeout=120",
+            &format!("--out={}", out_json.display()),
+            &format!("ok={}", metric_bin(&d, "ok", "1").display()),
+            &format!("hang={}", hang.display()),
+        ]))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(100);
+    while !started.exists() {
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the lane never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sent = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(2), "the run did not die of SIGINT: {status:?}");
+    let mut left: Vec<String> = fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("o.json"))
+        .collect();
+    left.sort();
+    assert!(
+        left.iter().all(|n| !n.contains(".staging-")),
+        "a staging dir was left behind: {left:?}"
+    );
+    // No earlier JSON, so the interrupted run's lane output takes the final name.
+    assert_eq!(left, ["o.json.lanes"], "{left:?}");
+    assert!(
+        fs::read_dir(d.join("o.json.lanes")).unwrap().count() > 0,
+        "the interrupted run's lane output was not kept"
+    );
+}
+
 #[test]
 fn a_malformed_evidence_command_line_leaves_no_marker() {
     let d = scratch("nomarker");

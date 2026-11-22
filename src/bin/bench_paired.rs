@@ -798,6 +798,9 @@ fn run_lane(
     o: &Options,
     archive: Option<&Archive>,
 ) -> Res<LaneRun> {
+    if let Some(sig) = proc::pending_signal() {
+        return Err(format!("interrupted by signal {sig}"));
+    }
     let mut cmd = Command::new(&lane.argv[0]);
     cmd.args(&lane.argv[1..]).env_clear().envs(env);
     let (started, load) = (evidence::utc_now(), evidence::load_snapshot());
@@ -1331,6 +1334,12 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         }
     }
     let mut archive = o.out.as_deref().map(Archive::create).transpose()?;
+    if archive.is_some() {
+        // A terminal signal now ends the lane in flight and unwinds, so the
+        // staged archive is settled (`keep_failed`) and not left as a
+        // `.lanes.staging-*` directory; `main` then dies of the signal.
+        proc::defer_fatal_signals();
+    }
     let mut provenance = None;
     let mut hashes = Vec::new();
     if o.evidence {
@@ -1502,7 +1511,13 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match real_main(&args) {
+    let result = real_main(&args);
+    // `real_main`'s locals are gone, the archive settled: now die of the signal.
+    if let Some(sig) = proc::pending_signal() {
+        eprintln!("bench_paired: interrupted by signal {sig}");
+        proc::die_of_pending_signal();
+    }
+    match result {
         Ok(()) => {}
         Err(Fail::Usage(e)) => {
             eprintln!("bench_paired: {e}");

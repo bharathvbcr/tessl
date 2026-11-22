@@ -43,6 +43,14 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGH
 /// disposition back and `SA_NODEFER` leaves the signal unblocked, so the
 /// `raise` ends the process with the original signal for the parent shell to see.
 extern "C" fn kill_children_and_die(sig: libc::c_int) {
+    kill_registered_groups();
+    // SAFETY: `raise` is async-signal-safe.
+    unsafe { libc::raise(sig) };
+}
+
+/// SIGKILL every registered child group. Async-signal-safe, so a handler may
+/// call it.
+pub fn kill_registered_groups() {
     for slot in &ACTIVE_GROUPS {
         let group = slot.load(Ordering::Relaxed);
         if group > 0 {
@@ -51,8 +59,59 @@ extern "C" fn kill_children_and_die(sig: libc::c_int) {
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
     }
-    // SAFETY: `raise` is async-signal-safe.
-    unsafe { libc::raise(sig) };
+}
+
+/// The terminal signal [`defer_fatal_signals`] caught, 0 for none.
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn note_signal_and_kill_children(sig: libc::c_int) {
+    PENDING_SIGNAL.store(sig, Ordering::SeqCst);
+    kill_registered_groups();
+}
+
+/// For a caller that has state to settle before it dies (`bench_paired`'s
+/// staged archive): from here on a terminal signal kills the registered child
+/// groups, as [`install_signal_handlers`] does, but the process lives on, with
+/// the signal recorded for [`pending_signal`]. The caller stops at its next
+/// look, unwinds so its `Drop`s run, and ends with [`die_of_pending_signal`],
+/// so its parent still sees the signal. `SA_RESETHAND` leaves a second signal
+/// its default action: it ends the process at once. A signal the process
+/// ignores (`nohup`) stays ignored.
+pub fn defer_fatal_signals() {
+    for sig in FATAL_SIGNALS {
+        // SAFETY: as in [`install_signal_handlers`].
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 || old.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = note_signal_and_kill_children as extern "C" fn(libc::c_int) as usize;
+            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+            libc::sigemptyset(&mut act.sa_mask);
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The signal [`defer_fatal_signals`] caught, if one arrived.
+pub fn pending_signal() -> Option<libc::c_int> {
+    match PENDING_SIGNAL.load(Ordering::SeqCst) {
+        0 => None,
+        sig => Some(sig),
+    }
+}
+
+/// End this process of the signal [`defer_fatal_signals`] caught, with its
+/// default action; returns when none arrived.
+pub fn die_of_pending_signal() {
+    if let Some(sig) = pending_signal() {
+        // SAFETY: restoring a default disposition and raising the signal on this process.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
 }
 
 /// Install [`kill_children_and_die`], once per process, for each of

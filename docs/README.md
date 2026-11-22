@@ -13,6 +13,8 @@ Comprehensive architectural references, kernel documentation, benchmarks, and pl
 | [**Benchmarking**](benchmarking.md) | Measurement methodology, paired sweep protocol, thermal and clock drift mitigations, and performance comparison against PyTorch MPS and MLX. |
 | [**IO ownership**](io-ownership.md) | Owner decision of 2026-11-01 (completed in Milestone M2, 2026-11-02): ojas owns safetensors, JSON, and NPY IO. `src/safetensors.rs`, `src/json.rs`, `src/npy.rs`, and `src/plain.rs` are retired in full; `src/lib.rs` re-exports `ojas_io::{npy, safetensors}` and `src/config_json.rs` consumes `ojas_io::json`. |
 | [**Verification**](verification.md) | Correctness guarantees: static tile geometry audits, shape fuzzing, CPU emulation (`tools/msl_emu`), and numerical parity ladders. |
+| [**Developer guide**](developer-guide.md) | Why tessl exists, what it owns versus ojas, prerequisites, build and test, a feature tour with entry points, the contracts it keeps (Metal 4 only, host waits, SharedBuf leases, C ABI 14), and notes for AI coding agents. |
+| [**Limitations and known issues**](limitations-and-known-issues.md) | Platform limits, refused shapes and dtypes, features retired to ojas, and the open issues recorded in local reports, tasks, CHANGELOG and `#[ignore]` tests, each dated and marked not re-run. |
 
 ---
 

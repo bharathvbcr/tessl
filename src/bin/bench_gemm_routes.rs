@@ -85,7 +85,11 @@
 //! (c) is proven to have run its intended kernel: the pipeline-request trace
 //! shows the expected kernel name and not the other tile's (or the split-K's),
 //! and the raw arms are exactly one `with_binder` dispatch. A shape that fails
-//! its checks prints `REFUSED`, the run goes on, and it exits 4 at the end.
+//! its checks prints `REFUSED`, the run goes on, and it exits 4 at the end (after
+//! printing the drifting-baseline list too, so exit 4 never hides exit 3). Only the
+//! proofs and checks are refusable: an error while timing is a real failure and
+//! ends the run. Before every checked overwrite call C is NaN-filled, so a tile a
+//! kernel never wrote fails the full-output finite scan and not only the sampled check.
 //!
 //! **Win rule, stated before any of these ran.** A route change is indicated
 //! only if the alternative (the arm production does not take, or for lead 2
@@ -98,7 +102,13 @@
 //! width has to win in both invocations; a width picked after seeing both does
 //! not count. A verdict of `production faster` is the symmetric rule and
 //! confirms the current route. Anything else is inconclusive, and the route
-//! stays.
+//! stays. "In both invocations" and "the same width in both" are judged by hand
+//! across the two invocations' outputs; the bin only prints one invocation's
+//! verdicts. The `EXCEEDS 10%` flag and exit 3 come from the first arm of a
+//! shape's report (production in `splitk`, the 128x64 arm in the plain tile
+//! lanes, whose order is kept as committed), while each verdict reads production's
+//! own spread, which is printed on the verdict line: judge exclusion by the verdict
+//! line, not by the flag.
 
 // A paired lane takes its operands, its shape and the knobs of the run.
 #![allow(clippy::too_many_arguments)]
@@ -513,16 +523,59 @@ struct Run {
 /// Exit status of a run that refused a shape (3 is a drifting baseline).
 const EXIT_REFUSED: i32 = 4;
 
-/// Run one shape of an opt-in lead lane. A failed check is recorded, printed
-/// as `REFUSED` and does not end the run: the queue is hours long, and one bad
-/// shape must not take the rest of the step with it.
-fn guarded(run: &Run, label: &str, shape: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-    if let Err(e) = shape() {
-        eprintln!("REFUSED {label}: {e}");
-        println!("\nREFUSED {label}: {e}");
-        run.refused.borrow_mut().push(label.to_string());
+/// Why a shape of an opt-in lead lane stopped. `Refused` is a proof or a check
+/// failing before timing; `Fatal` is anything else (a device or synchronize
+/// error, timing included), which ends the run. A bare `String` error converts
+/// to `Fatal`, so only an explicit [`refuse`] makes a refusal.
+enum Fail {
+    Refused(String),
+    Fatal(String),
+}
+
+impl From<String> for Fail {
+    fn from(e: String) -> Self {
+        Fail::Fatal(e)
     }
-    Ok(())
+}
+
+impl From<Fail> for String {
+    fn from(f: Fail) -> Self {
+        match f {
+            Fail::Refused(e) | Fail::Fatal(e) => e,
+        }
+    }
+}
+
+/// Mark the error of a proof or check as a refusal.
+fn refuse<T>(r: Result<T, String>) -> Result<T, Fail> {
+    r.map_err(Fail::Refused)
+}
+
+/// Run one shape of an opt-in lead lane. A refusal is recorded, printed as
+/// `REFUSED` and does not end the run: the queue is hours long, and one bad
+/// shape must not take the rest of the step with it. A fatal error propagates.
+fn guarded(run: &Run, label: &str, shape: impl FnOnce() -> Result<(), Fail>) -> Result<(), String> {
+    match shape() {
+        Ok(()) => Ok(()),
+        Err(Fail::Refused(e)) => {
+            eprintln!("REFUSED {label}: {e}");
+            println!("\nREFUSED {label}: {e}");
+            run.refused.borrow_mut().push(label.to_string());
+            Ok(())
+        }
+        Err(Fail::Fatal(e)) => Err(format!("{label}: {e}")),
+    }
+}
+
+/// What C holds before a checked call: NaN with `poison` (an overwrite: whatever
+/// the kernel does not write stays NaN and fails the full-output scan), else `base`
+/// (an accumulate keeps its random C).
+fn c_init(poison: bool, base: &[f32]) -> Vec<f32> {
+    if poison {
+        vec![f32::NAN; base.len()]
+    } else {
+        base.to_vec()
+    }
 }
 
 /// The kernel proof reads the pipeline-request trace, which is latched from
@@ -736,10 +789,12 @@ fn print_verdicts(paired: &common::Paired, production: usize) -> Result<(), Stri
 
 /// Tolerance of the host-reference gate, relative to the reference's largest
 /// sampled magnitude, and how many elements it samples. Relaxed f32 runs the
-/// tf32-class kernels, which the tree itself holds only to a bf16-class bound
-/// (tests/gemm_correctness.rs `relaxed_precision_stays_within_a_bf16_class_bound`,
-/// U_BF16 = 2^-8), so its gate is that bound and not the 2e-3 of the exact-in-f32
-/// element types: a gate tighter than the tree's own would refuse every relaxed shape.
+/// tf32-class kernels, which the tree holds only to a bf16-class bound: per
+/// element, scaled by K (tests/common/mod.rs `tolerance(k, mag, U_BF16)`, used by
+/// tests/gemm_correctness.rs `relaxed_precision_stays_within_a_bf16_class_bound`,
+/// U_BF16 = 2^-8). The flat 2^-8 x max|reference| used here is a different and
+/// looser gate, chosen by reasoning (a 2e-3 gate might refuse relaxed shapes the tree
+/// accepts), not because a refusal was observed; no relaxed kernel has run against it.
 const HOST_REF_TOL: f64 = 2e-3;
 const HOST_REF_TOL_RELAXED: f64 = 1.0 / 256.0;
 const HOST_REF_SAMPLES: usize = 256;
@@ -816,7 +871,15 @@ fn operand_values(rt: &Arc<GpuRuntime>, elem: Elem, t: &Tensor) -> Result<Vec<f3
         Elem::Relaxed => t,
     };
     rt.synchronize()?;
-    Ok(src.buffer.read_f32()[..t.numel()].to_vec())
+    let all = src.buffer.read_f32();
+    all.get(..t.numel()).map(<[f32]>::to_vec).ok_or_else(|| {
+        format!(
+            "operand buffer holds {} values, {} expected for shape {:?}",
+            all.len(),
+            t.numel(),
+            t.shape()
+        )
+    })
 }
 
 /// A copy of `prefer_tn_splitk` (src/gemm.rs, private): the shapes whose TN
@@ -1045,7 +1108,7 @@ fn splitk_shape(
     set: SplitkSet,
     dims: (usize, usize, usize),
     source: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), Fail> {
     let (m, n, k) = dims;
     let widths = live_widths(set, dims);
     let checked = source.is_some();
@@ -1074,9 +1137,10 @@ fn splitk_shape(
     for acc in [false, true] {
         // Outputs, checked against each other before anything is timed.
         let c0 = common::fill(m * n, 0x5c3 ^ k as u64);
+        let init = c_init(checked && !acc, &c0);
         let fresh = || -> Result<Tensor, String> {
             let t = rt.alloc_tensor_f32(&[m, n])?;
-            t.buffer.write_f32(&c0);
+            t.buffer.write_f32(&init);
             Ok(t)
         };
         let cs: Vec<Tensor> = (0..2 + widths.len()).map(|_| fresh()).collect::<Result<_, _>>()?;
@@ -1090,27 +1154,32 @@ fn splitk_shape(
         let what = format!("splitk {} {m}x{n}x{k}", if acc { "accumulate" } else { "overwrite" });
         if checked {
             let coop = coop_tn_kernel(acc);
-            prove(
+            refuse(prove(
                 rt,
                 &format!("{what}: production"),
                 &[coop],
                 &[PAR_SPLITK_KERNEL],
                 None,
                 || production(&cs[0]),
-            )?;
-            prove(
+            ))?;
+            refuse(prove(
                 rt,
                 &format!("{what}: coop"),
                 &[coop],
                 &[PAR_SPLITK_KERNEL],
                 Some(1),
                 || coop_tn(rt, &a, &b, &cs[1], dims, acc),
-            )?;
+            ))?;
             for (i, &w) in widths.iter().enumerate() {
                 let kernels = [PAR_SPLITK_KERNEL, reduce_kernel(acc)];
-                prove(rt, &format!("{what}: par_splitk_{w}"), &kernels, &[], Some(1), || {
-                    par_splitk(rt, &a, &b, &cs[2 + i], dims, w, acc)
-                })?;
+                refuse(prove(
+                    rt,
+                    &format!("{what}: par_splitk_{w}"),
+                    &kernels,
+                    &[],
+                    Some(1),
+                    || par_splitk(rt, &a, &b, &cs[2 + i], dims, w, acc),
+                ))?;
             }
         } else {
             production(&cs[0])?;
@@ -1120,27 +1189,33 @@ fn splitk_shape(
             }
         }
         rt.synchronize()?;
+        if checked {
+            // Every element, before the sampled reference: a tile no kernel wrote is still NaN.
+            for (i, c) in cs.iter().enumerate() {
+                refuse(common::check_lane_output(
+                    &format!("{what} arm {i}"),
+                    &c.buffer.read_f32()[..m * n],
+                ))?;
+            }
+        }
         let base = cs[0].buffer.read_f32()[..m * n].to_vec();
         let mut worst = 0.0f64;
         for c in &cs[1..] {
             let lane = format!("{m}x{n}x{k} acc={acc}");
-            worst = worst.max(common::max_rel_diff(
+            worst = worst.max(refuse(common::max_rel_diff(
                 &lane,
                 c.buffer.try_read_f32()?.get(..m * n).unwrap_or(&[]),
                 &base,
-            )?);
+            ))?);
         }
         if worst >= 1e-4 {
-            return Err(format!(
+            return Err(Fail::Refused(format!(
                 "{m}x{n}x{k} acc={acc}: arms disagree by {worst:.2e} of the output's scale"
-            ));
+            )));
         }
         let mut host = String::new();
         if let Some((av, bv)) = &operands {
-            for (i, c) in cs.iter().enumerate() {
-                common::check_lane_output(&format!("{what} arm {i}"), &c.buffer.read_f32()[..m * n])?;
-            }
-            let err = host_ref_check(
+            let err = refuse(host_ref_check(
                 &what,
                 &base,
                 dims,
@@ -1148,7 +1223,7 @@ fn splitk_shape(
                 &|p, j| bv[p * n + j],
                 acc.then_some(c0.as_slice()),
                 host_ref_tol(Elem::Bf16),
-            )?;
+            ))?;
             host = format!("; production within {err:.1e} of the host reference");
         }
 
@@ -1562,10 +1637,17 @@ fn plain_tiles(
     (m, n, k): (usize, usize, usize),
     seeds: (u64, u64),
     checked: bool,
-) -> Result<(), String> {
+) -> Result<(), Fail> {
     let a = elem.operand(rt, &[m, k], seeds.0)?;
     let b = elem.operand(rt, &[k, n], seeds.1)?;
     let cs: Vec<Tensor> = (0..3).map(|_| rt.alloc_tensor_f32(&[m, n])).collect::<Result<_, _>>()?;
+    if checked {
+        // NaN first: a tile no arm writes fails the full-output scan below.
+        let poison = c_init(true, &vec![0.0; m * n]);
+        for c in &cs {
+            c.buffer.write_f32(&poison);
+        }
+    }
     let production = || gemm(&a, &b, &cs[0], GemmBackend::TensorOps);
     let wide = || gemm_tiled(&a, &b, &cs[1], GemmBackend::TensorOps, EpiTile::Wide);
     let narrow = || gemm_tiled(&a, &b, &cs[2], GemmBackend::TensorOps, EpiTile::Narrow);
@@ -1578,49 +1660,55 @@ fn plain_tiles(
         } else {
             (wide_k, narrow_k)
         };
-        prove(
+        refuse(prove(
             rt,
             &format!("{what}: production"),
             &[took],
             &[other],
             Some(1),
             production,
-        )?;
-        prove(
+        ))?;
+        refuse(prove(
             rt,
             &format!("{what}: wide_128x64"),
             &[wide_k],
             &[narrow_k],
             Some(1),
             wide,
-        )?;
-        prove(
+        ))?;
+        refuse(prove(
             rt,
             &format!("{what}: narrow_64x64"),
             &[narrow_k],
             &[wide_k],
             Some(1),
             narrow,
-        )?;
+        ))?;
     } else {
         production()?;
         wide()?;
         narrow()?;
     }
     rt.synchronize()?;
+    if checked {
+        // Every element, ahead of the bit-identity compare (NaN != NaN would hide which tile never ran).
+        for (i, c) in cs.iter().enumerate() {
+            refuse(common::check_lane_output(
+                &format!("{what} arm {i}"),
+                &c.buffer.read_f32()[..m * n],
+            ))?;
+        }
+    }
     let base = cs[0].buffer.read_f32();
     for c in &cs[1..] {
         if c.buffer.read_f32()[..m * n] != base[..m * n] {
-            return Err(format!("M={m} N={n} K={k}: the tiles' outputs differ"));
+            return Err(Fail::Refused(format!("M={m} N={n} K={k}: the tiles' outputs differ")));
         }
     }
     let mut host = String::new();
     if checked {
-        for (i, c) in cs.iter().enumerate() {
-            common::check_lane_output(&format!("{what} arm {i}"), &c.buffer.read_f32()[..m * n])?;
-        }
         let (av, bv) = (operand_values(rt, elem, &a)?, operand_values(rt, elem, &b)?);
-        let err = host_ref_check(
+        let err = refuse(host_ref_check(
             &what,
             &base[..m * n],
             (m, n, k),
@@ -1628,7 +1716,7 @@ fn plain_tiles(
             &|p, j| bv[p * n + j],
             None,
             host_ref_tol(elem),
-        )?;
+        ))?;
         host = format!("; within {err:.1e} of the host reference");
     }
     let reps = run.reps;
@@ -1751,6 +1839,16 @@ fn main() -> Result<(), String> {
             refused.len(),
             refused.join("\n  ")
         );
+        // Exit 4 would hide exit 3: say which baselines drifted as well.
+        let unstable = run.unstable.borrow();
+        if !unstable.is_empty() {
+            eprintln!(
+                "bench_gemm_routes: {} baseline(s) also exceeded {:.0}% self-spread:\n  {}",
+                unstable.len(),
+                common::SELF_SPREAD_LIMIT * 100.0,
+                unstable.join("\n  ")
+            );
+        }
         std::process::exit(EXIT_REFUSED);
     }
     common::exit_if_unstable("bench_gemm_routes", &run.unstable.borrow());
@@ -2073,5 +2171,50 @@ mod tests {
         assert!(host_ref_check("t", &loose, dims, &a_at, &b_at, None, host_ref_tol(Elem::Bf16)).is_err());
         assert!(host_ref_check("t", &loose, dims, &a_at, &b_at, None, host_ref_tol(Elem::F16)).is_err());
         assert_eq!(host_ref_tol(Elem::Relaxed), 1.0 / 256.0);
+    }
+
+    fn quiet_run() -> Run {
+        Run {
+            reps: 1,
+            warmup: 0,
+            iters: 1,
+            rounds: 1,
+            unstable: Default::default(),
+            refused: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_and_a_fatal_error_ends_the_run() {
+        let run = quiet_run();
+        assert!(guarded(&run, "ok", || Ok(())).is_ok());
+        assert!(guarded(&run, "bad proof", || refuse::<()>(Err("wrong kernel".into()))
+            .map_err(Into::into))
+        .is_ok());
+        assert_eq!(run.refused.borrow().as_slice(), ["bad proof".to_string()]);
+        // A bare String error (a device or timing failure) is not a refusal.
+        let e = guarded(&run, "timing", || -> Result<(), Fail> {
+            Err(String::from("sync failed"))?
+        })
+        .unwrap_err();
+        assert!(e.contains("sync failed") && e.contains("timing"), "{e}");
+        assert_eq!(
+            run.refused.borrow().len(),
+            1,
+            "a fatal error is not added to the refused list"
+        );
+    }
+
+    #[test]
+    fn an_overwrite_starts_from_nan_and_an_accumulate_keeps_its_base() {
+        let base = [1.0f32, -2.0, 3.0];
+        assert!(c_init(true, &base).iter().all(|x| x.is_nan()));
+        assert_eq!(c_init(true, &base).len(), base.len());
+        assert_eq!(c_init(false, &base), base);
+        // A tile the kernel never wrote stays NaN and fails the full scan, which a 256-element sample can miss.
+        let mut out = vec![0.5f32; 64 * 64];
+        assert!(common::check_lane_output("t", &out).is_ok());
+        out[64 * 64 - 1] = f32::NAN;
+        assert!(common::check_lane_output("t", &out).is_err());
     }
 }

@@ -51,6 +51,10 @@ extern "C" fn kill_children_and_die(sig: libc::c_int) {
 /// SIGKILL every registered child group. Async-signal-safe, so a handler may
 /// call it.
 pub fn kill_registered_groups() {
+    // A handler runs between any two instructions of the interrupted code, which
+    // may be about to read errno; `kill` (ESRCH for a group already gone) must
+    // not change what it sees.
+    let saved = errno();
     for slot in &ACTIVE_GROUPS {
         let group = slot.load(Ordering::Relaxed);
         if group > 0 {
@@ -59,6 +63,30 @@ pub fn kill_registered_groups() {
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
     }
+    set_errno(saved);
+}
+
+/// The calling thread's errno; reading it is async-signal-safe.
+fn errno() -> libc::c_int {
+    // SAFETY: the errno location is valid for the calling thread.
+    unsafe { *errno_location() }
+}
+
+fn set_errno(value: libc::c_int) {
+    // SAFETY: as in [`errno`].
+    unsafe { *errno_location() = value };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot; no preconditions.
+    unsafe { libc::__error() }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot; no preconditions.
+    unsafe { libc::__errno_location() }
 }
 
 /// The terminal signal [`defer_fatal_signals`] caught, 0 for none.
@@ -66,7 +94,7 @@ static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn note_signal_and_kill_children(sig: libc::c_int) {
     PENDING_SIGNAL.store(sig, Ordering::SeqCst);
-    kill_registered_groups();
+    kill_registered_groups(); // keeps errno
 }
 
 /// For a caller that has state to settle before it dies (`bench_paired`'s
@@ -87,7 +115,11 @@ pub fn defer_fatal_signals() {
             }
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = note_signal_and_kill_children as extern "C" fn(libc::c_int) as usize;
-            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER;
+            // SA_RESTART: the process goes on after this handler, so a blocking
+            // call it interrupted resumes instead of failing with EINTR (nothing
+            // in this process depends on seeing EINTR; the lane's pipes reach EOF
+            // because their group was just killed).
+            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER | libc::SA_RESTART;
             libc::sigemptyset(&mut act.sa_mask);
             libc::sigaction(sig, &act, std::ptr::null_mut());
         }

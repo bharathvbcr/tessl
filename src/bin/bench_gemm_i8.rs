@@ -23,6 +23,30 @@
 //! Before any number is trusted, sampled positions of C (the four corners and
 //! seeded draws) are checked against a CPU oracle for both the scalar and the
 //! quantized path; a mismatch exits 1.
+//!
+//! Variants (`BENCH_VARIANTS=1`, off by default so the default arms, their
+//! output and earlier results stay as they were): after the four arms above,
+//! every other `nn::gemm_i8` variant is timed at the same shapes with a scalar
+//! `a_scale` of 2^-10 (an exact power of two that keeps f16 results finite):
+//! B stored `[N, K]` (`TransposedNK`), per-column and per-group (64, 128, 256)
+//! `b_scale` on both layouts, `bias`, and the `F16` and `Bf16` stores,
+//! alone and combined. They run interleaved (`run_paired`) with two fresh
+//! controls, `tessl-i8-gemm` (queues) and `tessl-i8-gemm-rows` (syncs); a
+//! variant is compared, per round, with the control that has the same per-call
+//! host sync. A `b_scale` or `bias` buffer is read on the host to check it is
+//! finite (`require_finite`), which waits for every queued command, so every
+//! variant with either is labelled as syncing on each call and only the rest
+//! queue. Before any
+//! variant number is trusted at an M, the same sampled positions of C are
+//! checked against a CPU oracle that reads B in the variant's layout, scales
+//! per column or per group (int dots per group, flushed in ascending order,
+//! then the A scale), adds the bias, and for the 16-bit stores accepts only a
+//! value inside the cast (round to nearest even) of the oracle's tolerance
+//! window; a mismatch or a non-finite value exits 1. The JSON then carries a
+//! `variants` object beside `arms`.
+//!
+//! `BENCH_MS=1,100` replaces the default M list (each in 1..=2048), so one
+//! locked run can cover M = 1 and M > 64 without the full sweep.
 
 mod common;
 
@@ -31,8 +55,11 @@ use std::collections::HashSet;
 use common::{env_usize, jarr, jnum, jstr, median, ratio_stats, run_paired, Arm, Lcg};
 use tessl::nn::{self, I8AScale, I8BLayout, I8BScale, I8Gemm, I8Out};
 use tessl::runtime::GpuRuntime;
+use tessl::tensor::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits_gpu, f32_to_f16_bits, GpuBuffer};
 
 const MS: [u32; 8] = [1, 16, 64, 128, 256, 512, 1024, 2048];
+/// Rows of the operand buffers; the largest M any list may name.
+const M_MAX: usize = 2048;
 const N: u32 = 4096;
 const K: u32 = 4096;
 /// Seeded draws of C checked per M and path, on top of the corners, the tile
@@ -92,9 +119,11 @@ fn run() -> Result<(), String> {
     let iters = env_usize("BENCH_ITERS", 3, 1)?;
     let rounds = env_usize("BENCH_ROUNDS", 5, 1)?;
     let calls = env_usize("BENCH_CALLS", 4, 1)?;
+    let variants_on = env_usize("BENCH_VARIANTS", 0, 0)? != 0;
+    let ms = ms_from_env()?;
     let rt = GpuRuntime::new()?;
     let device = rt.device_name();
-    let m_max = 2048usize;
+    let m_max = M_MAX;
     let a = rt.alloc_buffer(m_max * K as usize)?;
     let b = rt.alloc_buffer((K as usize) * (N as usize))?;
     let c = rt.alloc_buffer(m_max * (N as usize) * 4)?;
@@ -113,23 +142,29 @@ fn run() -> Result<(), String> {
     nn::quantize_i8_rows(&rt, &x, &q, &scales, m_max as u32, K)?;
     rt.synchronize()?;
 
+    let bufs = Bufs {
+        a: &a,
+        b: &b,
+        c: &c,
+        x: &x,
+        q: &q,
+        scales: &scales,
+    };
+    let variant_bufs = if variants_on {
+        Some(VariantBuffers::new(&rt, &b_bytes)?)
+    } else {
+        None
+    };
+    let variant_infos = variant_infos();
+    let mut variant_rows: Vec<Vec<String>> = vec![Vec::new(); variant_infos.len()];
+
     let mut rows_by_arm: Vec<Vec<String>> = vec![Vec::new(); ARMS.len()];
-    for &m in &MS {
+    for &m in &ms {
         let pipeline = nn::i8_gemm_pipeline_name(m, I8BLayout::RowMajorKN, 0)?;
-        verify_m(
-            &rt,
-            m,
-            pipeline,
-            &Bufs {
-                a: &a,
-                b: &b,
-                c: &c,
-                x: &x,
-                q: &q,
-                scales: &scales,
-            },
-            (&a_bytes, &b_bytes, &xf),
-        )?;
+        verify_m(&rt, m, pipeline, &bufs, (&a_bytes, &b_bytes, &xf))?;
+        if let Some(vb) = &variant_bufs {
+            verify_variants(&rt, m, &bufs, vb, (&a_bytes, &b_bytes))?;
+        }
 
         let reps = calls;
         let mut paired_arms = vec![
@@ -189,6 +224,24 @@ fn run() -> Result<(), String> {
         for (i, (info, per_round)) in ARMS.iter().zip(&paired.rounds).enumerate() {
             rows_by_arm[i].push(json_row(info, m, pipeline, per_round)?);
         }
+        if let Some(vb) = &variant_bufs {
+            let paired = time_variants(&rt, m, &bufs, vb, (warmup, iters, rounds, calls))?;
+            eprintln!("M={m} variants (a_scale {VARIANT_A_SCALE}, every number follows its oracle check)");
+            for (i, (info, per_round)) in variant_infos.iter().zip(&paired.rounds).enumerate() {
+                let tail = if i < CONTROLS {
+                    String::new()
+                } else {
+                    let r = reference_arm(info);
+                    let (ratio, lo, hi) = ratio_stats(&paired.rounds[r], per_round)?;
+                    format!(
+                        "  vs {} {ratio:.3} (rounds {lo:.3}..{hi:.3}; > 1 is faster)",
+                        variant_infos[r].name
+                    )
+                };
+                eprintln!("  {}{tail}", row(info, m, per_round)?);
+                variant_rows[i].push(json_row(info, m, variant_pipeline(m, i), per_round)?);
+            }
+        }
     }
 
     println!("{{");
@@ -206,19 +259,63 @@ fn run() -> Result<(), String> {
     println!("  \"time_unit\": \"ms per call, median of per-round medians\",");
     println!("  \"runtime\": \"GpuRuntime::new (counter timestamps on)\",");
     println!("  \"arms\": [");
-    for (i, info) in ARMS.iter().enumerate() {
-        println!("    {{");
-        println!("      \"name\": {},", jstr(info.name));
-        println!("      \"what\": {},", jstr(info.what));
-        println!("      \"includes_per_call_host_sync\": {},", info.host_sync_per_call);
-        println!("      \"rows\": [");
-        println!("        {}", rows_by_arm[i].join(",\n        "));
-        println!("      ]");
-        println!("    }}{}", if i + 1 < ARMS.len() { "," } else { "" });
+    print_arms(&ARMS, &rows_by_arm, "");
+    println!("  ]{}", if variants_on { "," } else { "" });
+    if variants_on {
+        println!("  \"variants\": {{");
+        println!("    \"a_scale\": {},", jnum(f64::from(VARIANT_A_SCALE)));
+        println!("    \"oracle_checked\": true,");
+        println!("    \"arms\": [");
+        print_arms(&variant_infos, &variant_rows, "  ");
+        println!("    ]");
+        println!("  }}");
     }
-    println!("  ]");
     println!("}}");
     Ok(())
+}
+
+/// The `arms` entries of the JSON, each line indented by `pad` more.
+fn print_arms(infos: &[ArmInfo], rows: &[Vec<String>], pad: &str) {
+    for (i, info) in infos.iter().enumerate() {
+        println!("{pad}    {{");
+        println!("{pad}      \"name\": {},", jstr(info.name));
+        println!("{pad}      \"what\": {},", jstr(info.what));
+        println!(
+            "{pad}      \"includes_per_call_host_sync\": {},",
+            info.host_sync_per_call
+        );
+        println!("{pad}      \"rows\": [");
+        println!("{pad}        {}", rows[i].join(&format!(",\n{pad}        ")));
+        println!("{pad}      ]");
+        println!("{pad}    }}{}", if i + 1 < infos.len() { "," } else { "" });
+    }
+}
+
+/// `BENCH_MS`: comma-separated M values, each in 1..=[`M_MAX`]; unset is [`MS`].
+fn ms_from_env() -> Result<Vec<u32>, String> {
+    match std::env::var("BENCH_MS") {
+        Ok(raw) => parse_ms(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(MS.to_vec()),
+        Err(err) => Err(format!("BENCH_MS: {err}")),
+    }
+}
+
+fn parse_ms(raw: &str) -> Result<Vec<u32>, String> {
+    let mut out: Vec<u32> = Vec::new();
+    for part in raw.split(',') {
+        let m: u32 = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("BENCH_MS: {part:?} is not an integer"))?;
+        if m == 0 || m as usize > M_MAX {
+            return Err(format!("BENCH_MS: {m} is outside 1..={M_MAX}"));
+        }
+        if out.contains(&m) {
+            return Err(format!("BENCH_MS: {m} listed twice"));
+        }
+        out.push(m);
+    }
+    Ok(out)
 }
 
 struct Bufs<'a> {
@@ -241,7 +338,7 @@ fn verify_m(
 ) -> Result<(), String> {
     let (a_bytes, b_bytes, xf) = host;
     let (mu, nu, ku) = (m as usize, N as usize, K as usize);
-    let positions = sample_positions(mu, nu, SEED ^ u64::from(m), SAMPLES, (tile_rows(mu), TILE_N));
+    let positions = positions_for(m);
 
     call_gemm(rt, bufs.a, bufs.b, bufs.c, m)?;
     rt.synchronize()?;
@@ -249,10 +346,8 @@ fn verify_m(
         let c = bufs.c.try_contents_f32()?;
         check_sampled(
             &format!("gemm_i8 {pipeline} M={m}"),
-            &c[..mu * nu],
-            &a_bytes[..mu * ku],
-            b_bytes,
-            (nu, ku),
+            HostC::F32(&c[..mu * nu]),
+            &HostGemm::plain(&a_bytes[..mu * ku], b_bytes, (nu, ku)),
             &|_| 1.0,
             &positions,
         )?;
@@ -277,13 +372,17 @@ fn verify_m(
     let c = bufs.c.try_contents_f32()?;
     check_sampled(
         &format!("quantize+gemm_i8 {pipeline} M={m}"),
-        &c[..mu * nu],
-        &q,
-        b_bytes,
-        (nu, ku),
+        HostC::F32(&c[..mu * nu]),
+        &HostGemm::plain(&q, b_bytes, (nu, ku)),
         &|row| scales[row],
         &positions,
     )
+}
+
+/// The sampled positions of C checked for an `m`-row call.
+fn positions_for(m: u32) -> Vec<(usize, usize)> {
+    let mu = m as usize;
+    sample_positions(mu, N as usize, SEED ^ u64::from(m), SAMPLES, (tile_rows(mu), TILE_N))
 }
 
 /// Rows per output tile for an `m`-row call (see [`TILE_N`]).
@@ -427,45 +526,575 @@ fn sample_positions(m: usize, n: usize, seed: u64, draws: usize, tile: (usize, u
     out
 }
 
-/// `sum_k a[row,k] * b[k,col]` over signed bytes, exact, and the sum of the
-/// magnitudes of the terms (what a float accumulation's error scales with).
-fn oracle_dot(a: &[u8], b: &[u8], (n, k): (usize, usize), row: usize, col: usize) -> (i64, f64) {
+/// `sum_k a[row,k] * b[k,col]` over signed bytes for `k` in `ks`, exact, and
+/// the sum of the magnitudes of the terms (what a float accumulation's error
+/// scales with). B is read as the layout says: `[K, N]` or `[N, K]`.
+fn oracle_dot_range(
+    a: &[u8],
+    b: &[u8],
+    layout: I8BLayout,
+    (n, k): (usize, usize),
+    (row, col): (usize, usize),
+    ks: std::ops::Range<usize>,
+) -> (i64, f64) {
     let (mut sum, mut mag) = (0i64, 0f64);
-    for i in 0..k {
-        let t = i64::from(a[row * k + i] as i8) * i64::from(b[i * n + col] as i8);
+    for i in ks {
+        let bi = match layout {
+            I8BLayout::RowMajorKN => i * n + col,
+            I8BLayout::TransposedNK => col * k + i,
+        };
+        let t = i64::from(a[row * k + i] as i8) * i64::from(b[bi] as i8);
         sum += t;
         mag += t.abs() as f64;
     }
     (sum, mag)
 }
 
-/// Check `c[row * n + col]` at each position against the oracle times that
-/// row's scale. The tolerance is 1e-6 of the term magnitudes plus 1e-6 of the
-/// result: a float accumulation stays inside it, a misplaced tile or a wrong
-/// operand (errors on the order of the result) does not. A non-finite value
-/// fails.
+/// The host copy of a `b_scale` the oracle applies.
+#[derive(Clone, Copy)]
+enum HostBScale<'a> {
+    None,
+    /// `N` entries.
+    PerColumn(&'a [f32]),
+    /// `[K / group, N]`.
+    PerGroup {
+        scales: &'a [f32],
+        group: usize,
+    },
+}
+
+/// Everything the oracle needs about one GEMM besides C and the A scale.
+struct HostGemm<'a> {
+    a: &'a [u8],
+    b: &'a [u8],
+    layout: I8BLayout,
+    n: usize,
+    k: usize,
+    b_scale: HostBScale<'a>,
+    bias: Option<&'a [f32]>,
+}
+
+impl<'a> HostGemm<'a> {
+    /// B `[K, N]`, no `b_scale`, no bias: the default arms.
+    fn plain(a: &'a [u8], b: &'a [u8], (n, k): (usize, usize)) -> Self {
+        Self {
+            a,
+            b,
+            layout: I8BLayout::RowMajorKN,
+            n,
+            k,
+            b_scale: HostBScale::None,
+            bias: None,
+        }
+    }
+}
+
+/// The oracle's value at `(row, col)` in f64 given the row's A scale, and the
+/// sum of the magnitudes of its scaled terms (bias included).
+fn oracle_value(g: &HostGemm<'_>, row: usize, col: usize, a_scale: f64) -> (f64, f64) {
+    let (n, k) = (g.n, g.k);
+    let dot = |ks: std::ops::Range<usize>| oracle_dot_range(g.a, g.b, g.layout, (n, k), (row, col), ks);
+    let (mut want, mut mag) = match g.b_scale {
+        HostBScale::None => {
+            let (sum, mag) = dot(0..k);
+            (sum as f64 * a_scale, mag * a_scale.abs())
+        }
+        HostBScale::PerColumn(sc) => {
+            let s = f64::from(sc[col]);
+            let (sum, mag) = dot(0..k);
+            (sum as f64 * a_scale * s, mag * (a_scale * s).abs())
+        }
+        HostBScale::PerGroup { scales, group } => {
+            let (mut want, mut mag) = (0f64, 0f64);
+            for gi in 0..k / group {
+                let s = f64::from(scales[gi * n + col]);
+                let (sum, m) = dot(gi * group..(gi + 1) * group);
+                want += sum as f64 * s;
+                mag += m * s.abs();
+            }
+            (want * a_scale, mag * a_scale.abs())
+        }
+    };
+    if let Some(bias) = g.bias {
+        let v = f64::from(bias[col]);
+        want += v;
+        mag += v.abs();
+    }
+    (want, mag)
+}
+
+/// The host view of the C buffer under test: f32, or the raw bits of a 16-bit
+/// store.
+#[derive(Clone, Copy)]
+enum HostC<'a> {
+    F32(&'a [f32]),
+    F16(&'a [u16]),
+    Bf16(&'a [u16]),
+}
+
+impl HostC<'_> {
+    fn at(&self, i: usize) -> f32 {
+        match self {
+            Self::F32(c) => c[i],
+            Self::F16(c) => f16_bits_to_f32(c[i]),
+            Self::Bf16(c) => bf16_bits_to_f32(c[i]),
+        }
+    }
+
+    /// `x` after the store's documented cast (round to nearest even, f32 for
+    /// the f32 store), back as f32.
+    fn stored(&self, x: f32) -> f32 {
+        match self {
+            Self::F32(_) => x,
+            Self::F16(_) => f16_bits_to_f32(f32_to_f16_bits(x)),
+            Self::Bf16(_) => bf16_bits_to_f32(f32_to_bf16_bits_gpu(x)),
+        }
+    }
+}
+
+/// Check `c[row * n + col]` at each position against the oracle (which applies
+/// the layout, the B scale, the bias and that row's A scale). The tolerance is
+/// 1e-6 of the term magnitudes plus 1e-6 of the result: a float accumulation
+/// stays inside it, a misplaced tile or a wrong operand (errors on the order of
+/// the result) does not. A 16-bit store is checked against the cast of both
+/// ends of that window, which the monotone cast keeps ordered: the kernel
+/// computes in f32 and casts once. A non-finite value fails (an f16 overflow to
+/// infinity is documented, so the variants' operands stay finite instead).
 fn check_sampled(
     label: &str,
-    c: &[f32],
-    a: &[u8],
-    b: &[u8],
-    (n, k): (usize, usize),
+    c: HostC<'_>,
+    g: &HostGemm<'_>,
     scale: &dyn Fn(usize) -> f32,
     positions: &[(usize, usize)],
 ) -> Result<(), String> {
+    if let HostBScale::PerGroup { group, .. } = g.b_scale {
+        if group == 0 || !g.k.is_multiple_of(group) {
+            return Err(format!("{label}: K = {} is not a multiple of group {group}", g.k));
+        }
+    }
     for &(row, col) in positions {
-        let (sum, mag) = oracle_dot(a, b, (n, k), row, col);
-        let s = f64::from(scale(row));
-        let want = sum as f64 * s;
-        let got = f64::from(c[row * n + col]);
-        let tol = 1e-6 * mag * s.abs() + 1e-6 * want.abs();
-        if !got.is_finite() || (got - want).abs() > tol {
+        let (want, mag) = oracle_value(g, row, col, f64::from(scale(row)));
+        let tol = 1e-6 * mag + 1e-6 * want.abs();
+        let got32 = c.at(row * g.n + col);
+        let got = f64::from(got32);
+        let ok = got32.is_finite()
+            && match c {
+                HostC::F32(_) => (got - want).abs() <= tol,
+                _ => {
+                    let lo = f64::from(c.stored((want - tol) as f32));
+                    let hi = f64::from(c.stored((want + tol) as f32));
+                    lo <= got && got <= hi
+                }
+            };
+        if !ok {
             return Err(format!(
                 "{label}: C[{row},{col}] = {got} against oracle {want} (tolerance {tol:e})"
             ));
         }
     }
     Ok(())
+}
+
+/// The scalar A scale of every variant arm (see the header).
+const VARIANT_A_SCALE: f32 = 1.0 / 1024.0;
+
+#[derive(Clone, Copy)]
+enum ScaleKind {
+    None,
+    PerColumn,
+    PerGroup(u32),
+}
+
+impl ScaleKind {
+    /// The `group` argument of `i8_gemm_pipeline_name`.
+    fn group(self) -> u32 {
+        match self {
+            Self::PerGroup(g) => g,
+            Self::None | Self::PerColumn => 0,
+        }
+    }
+}
+
+/// One `nn::gemm_i8` variant timed under `BENCH_VARIANTS`.
+struct Variant {
+    name: &'static str,
+    what: &'static str,
+    layout: I8BLayout,
+    scale: ScaleKind,
+    bias: bool,
+    out: I8Out,
+}
+
+const KN: I8BLayout = I8BLayout::RowMajorKN;
+const NT: I8BLayout = I8BLayout::TransposedNK;
+
+const VARIANTS: [Variant; 14] = [
+    Variant {
+        name: "tessl-i8-gemm-nt",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, B stored [N,K] (TransposedNK), f32 store",
+        layout: NT,
+        scale: ScaleKind::None,
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-percol",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-column b_scale, B [K,N], f32 store",
+        layout: KN,
+        scale: ScaleKind::PerColumn,
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-percol-nt",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-column b_scale, B [N,K], f32 store",
+        layout: NT,
+        scale: ScaleKind::PerColumn,
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g64",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 64), B [K,N], f32 store",
+        layout: KN,
+        scale: ScaleKind::PerGroup(64),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g128",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 128), B [K,N], f32 store",
+        layout: KN,
+        scale: ScaleKind::PerGroup(128),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g256",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 256), B [K,N], f32 store",
+        layout: KN,
+        scale: ScaleKind::PerGroup(256),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g64-nt",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 64), B [N,K], f32 store",
+        layout: NT,
+        scale: ScaleKind::PerGroup(64),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g128-nt",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 128), B [N,K], f32 store",
+        layout: NT,
+        scale: ScaleKind::PerGroup(128),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-g256-nt",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, per-group b_scale (group 256), B [N,K], f32 store",
+        layout: NT,
+        scale: ScaleKind::PerGroup(256),
+        bias: false,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-bias",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, bias, B [K,N], f32 store",
+        layout: KN,
+        scale: ScaleKind::None,
+        bias: true,
+        out: I8Out::F32,
+    },
+    Variant {
+        name: "tessl-i8-gemm-f16",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, B [K,N], f16 store",
+        layout: KN,
+        scale: ScaleKind::None,
+        bias: false,
+        out: I8Out::F16,
+    },
+    Variant {
+        name: "tessl-i8-gemm-bf16",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, B [K,N], bf16 store",
+        layout: KN,
+        scale: ScaleKind::None,
+        bias: false,
+        out: I8Out::Bf16,
+    },
+    Variant {
+        name: "tessl-i8-gemm-nt-g128-bias-f16",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, B [N,K], per-group b_scale (group 128), bias, f16 store",
+        layout: NT,
+        scale: ScaleKind::PerGroup(128),
+        bias: true,
+        out: I8Out::F16,
+    },
+    Variant {
+        name: "tessl-i8-gemm-nt-percol-bias-bf16",
+        what: "nn::gemm_i8 scalar a_scale 2^-10, B [N,K], per-column b_scale, bias, bf16 store",
+        layout: NT,
+        scale: ScaleKind::PerColumn,
+        bias: true,
+        out: I8Out::Bf16,
+    },
+];
+
+impl Variant {
+    /// `gemm_i8` reads a `b_scale` or `bias` buffer on the host to check it is
+    /// finite (`require_finite`), which waits for every queued command, so a
+    /// variant with either syncs on every call; `None` and no bias queues.
+    fn host_sync_per_call(&self) -> bool {
+        !matches!(self.scale, ScaleKind::None) || self.bias
+    }
+}
+
+/// Controls first: `ARMS[0]` (queues, the reference for the variants that queue)
+/// and `ARMS[1]` (per-row scale, syncs, the reference for those that sync).
+const CONTROLS: usize = 2;
+
+/// The two controls, then every variant: the arms of one paired run.
+fn variant_infos() -> Vec<ArmInfo> {
+    ARMS[..CONTROLS]
+        .iter()
+        .map(|a| ArmInfo {
+            name: a.name,
+            what: a.what,
+            host_sync_per_call: a.host_sync_per_call,
+            flops: true,
+        })
+        .chain(VARIANTS.iter().map(|v| ArmInfo {
+            name: v.name,
+            what: v.what,
+            host_sync_per_call: v.host_sync_per_call(),
+            flops: true,
+        }))
+        .collect()
+}
+
+/// Index of the control arm a variant arm `i` is compared with: the one with
+/// the same per-call host sync.
+fn reference_arm(info: &ArmInfo) -> usize {
+    usize::from(info.host_sync_per_call)
+}
+
+/// Pipeline of arm `i` of [`variant_infos`] at `m` (every shape here is valid).
+fn variant_pipeline(m: u32, i: usize) -> &'static str {
+    let (layout, group) = match i.checked_sub(CONTROLS) {
+        None => (KN, 0),
+        Some(v) => (VARIANTS[v].layout, VARIANTS[v].scale.group()),
+    };
+    nn::i8_gemm_pipeline_name(m, layout, group).unwrap_or("invalid-shape")
+}
+
+/// Deterministic scales in [0.5, 1.5), distinct per entry.
+fn fill_scales(len: usize, seed: u64) -> Vec<f32> {
+    (0..len as u64)
+        .map(|i| 0.5 + (mix(seed ^ (i << 8)) % 1000) as f32 / 1000.0)
+        .collect()
+}
+
+/// Bias in [-8, 8], distinct per column.
+fn fill_bias(len: usize) -> Vec<f32> {
+    (0..len as u64)
+        .map(|i| ((mix(0xD ^ (i << 8)) % 16001) as f32 - 8000.0) / 1000.0)
+        .collect()
+}
+
+/// `b` `[K, N]` as `[N, K]`: the same logical matrix in the other layout.
+fn transpose_kn_to_nk(b: &[u8], (n, k): (usize, usize)) -> Vec<u8> {
+    let mut out = vec![0u8; b.len()];
+    for p in 0..k {
+        for j in 0..n {
+            out[j * k + p] = b[p * n + j];
+        }
+    }
+    out
+}
+
+/// Host operands of the variants beyond the default arms' A and B.
+struct VariantHost {
+    b_nk: Vec<u8>,
+    col: Vec<f32>,
+    /// `[K / 64, N]`; a coarser group reads its prefix.
+    group: Vec<f32>,
+    bias: Vec<f32>,
+}
+
+/// [`VariantHost`] and its device copies.
+struct VariantBuffers {
+    host: VariantHost,
+    b_nk: GpuBuffer,
+    col: GpuBuffer,
+    group: GpuBuffer,
+    bias: GpuBuffer,
+}
+
+impl VariantBuffers {
+    fn new(rt: &std::sync::Arc<GpuRuntime>, b_kn: &[u8]) -> Result<Self, String> {
+        let (n, k) = (N as usize, K as usize);
+        let host = VariantHost {
+            b_nk: transpose_kn_to_nk(b_kn, (n, k)),
+            col: fill_scales(n, 0xE),
+            group: fill_scales(k / 64 * n, 0xF),
+            bias: fill_bias(n),
+        };
+        let b_nk = rt.alloc_buffer(k * n)?;
+        b_nk.try_write_bytes(&host.b_nk)?;
+        let upload = |v: &[f32]| -> Result<GpuBuffer, String> {
+            let buf = rt.alloc_buffer(v.len() * 4)?;
+            buf.try_write_f32(v)?;
+            Ok(buf)
+        };
+        Ok(Self {
+            col: upload(&host.col)?,
+            group: upload(&host.group)?,
+            bias: upload(&host.bias)?,
+            host,
+            b_nk,
+        })
+    }
+}
+
+fn call_variant(
+    rt: &std::sync::Arc<GpuRuntime>,
+    bufs: &Bufs<'_>,
+    vb: &VariantBuffers,
+    v: &Variant,
+    m: u32,
+) -> Result<(), String> {
+    let b_scale = match v.scale {
+        ScaleKind::None => I8BScale::None,
+        ScaleKind::PerColumn => I8BScale::PerColumn(&vb.col),
+        ScaleKind::PerGroup(group) => I8BScale::PerGroup {
+            scales: &vb.group,
+            group,
+        },
+    };
+    nn::gemm_i8(
+        rt,
+        I8Gemm {
+            a: bufs.a,
+            b: match v.layout {
+                I8BLayout::RowMajorKN => bufs.b,
+                I8BLayout::TransposedNK => &vb.b_nk,
+            },
+            c: bufs.c,
+            m,
+            n: N,
+            k: K,
+            a_scale: I8AScale::Scalar(VARIANT_A_SCALE),
+            b_scale,
+            bias: v.bias.then_some(&vb.bias),
+            b_layout: v.layout,
+            out: v.out,
+        },
+    )
+}
+
+/// Run every variant once at `m` and check sampled positions of C against the
+/// oracle, before any variant is timed.
+fn verify_variants(
+    rt: &std::sync::Arc<GpuRuntime>,
+    m: u32,
+    bufs: &Bufs<'_>,
+    vb: &VariantBuffers,
+    (a_bytes, b_kn): (&[u8], &[u8]),
+) -> Result<(), String> {
+    let (mu, nu, ku) = (m as usize, N as usize, K as usize);
+    let positions = positions_for(m);
+    for v in &VARIANTS {
+        call_variant(rt, bufs, vb, v, m)?;
+        rt.synchronize()?;
+        let gemm = HostGemm {
+            a: &a_bytes[..mu * ku],
+            b: match v.layout {
+                I8BLayout::RowMajorKN => b_kn,
+                I8BLayout::TransposedNK => &vb.host.b_nk,
+            },
+            layout: v.layout,
+            n: nu,
+            k: ku,
+            b_scale: match v.scale {
+                ScaleKind::None => HostBScale::None,
+                ScaleKind::PerColumn => HostBScale::PerColumn(&vb.host.col),
+                ScaleKind::PerGroup(group) => HostBScale::PerGroup {
+                    scales: &vb.host.group,
+                    group: group as usize,
+                },
+            },
+            bias: v.bias.then_some(&vb.host.bias[..]),
+        };
+        let label = format!(
+            "{} {} M={m}",
+            v.name,
+            nn::i8_gemm_pipeline_name(m, v.layout, v.scale.group())?
+        );
+        let scale = |_: usize| VARIANT_A_SCALE;
+        match v.out {
+            I8Out::F32 => {
+                let c = bufs.c.try_contents_f32()?;
+                check_sampled(&label, HostC::F32(&c[..mu * nu]), &gemm, &scale, &positions)?;
+            }
+            I8Out::F16 => {
+                let c = bufs.c.try_contents_u16()?;
+                check_sampled(&label, HostC::F16(&c[..mu * nu]), &gemm, &scale, &positions)?;
+            }
+            I8Out::Bf16 => {
+                let c = bufs.c.try_contents_u16()?;
+                check_sampled(&label, HostC::Bf16(&c[..mu * nu]), &gemm, &scale, &positions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Time the two controls and every variant interleaved at `m`.
+fn time_variants(
+    rt: &std::sync::Arc<GpuRuntime>,
+    m: u32,
+    bufs: &Bufs<'_>,
+    vb: &VariantBuffers,
+    (warmup, iters, rounds, reps): (usize, usize, usize, usize),
+) -> Result<common::Paired, String> {
+    let mut arms = vec![
+        Arm {
+            name: ARMS[0].name.to_string(),
+            reps,
+            run: Box::new(move || {
+                for _ in 0..reps {
+                    call_gemm(rt, bufs.a, bufs.b, bufs.c, m)?;
+                }
+                rt.synchronize()
+            }),
+        },
+        Arm {
+            name: ARMS[1].name.to_string(),
+            reps,
+            run: Box::new(move || {
+                for _ in 0..reps {
+                    call_rows(rt, bufs.q, bufs.b, bufs.c, bufs.scales, m)?;
+                }
+                rt.synchronize()
+            }),
+        },
+    ];
+    for v in &VARIANTS {
+        arms.push(Arm {
+            name: v.name.to_string(),
+            reps,
+            run: Box::new(move || {
+                for _ in 0..reps {
+                    call_variant(rt, bufs, vb, v, m)?;
+                }
+                rt.synchronize()
+            }),
+        });
+    }
+    run_paired(&mut arms, warmup, iters, rounds)
 }
 
 fn call_gemm(
@@ -564,8 +1193,10 @@ fn json_row(info: &ArmInfo, m: u32, pipeline: &str, per_round: &[f64]) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        amplitude, check_quantized, check_sampled, fill_a, fill_b, fill_x, oracle_dot, row_scale, sample_positions,
-        tile_rows, K, N,
+        amplitude, bf16_bits_to_f32, check_quantized, check_sampled, f16_bits_to_f32, f32_to_bf16_bits_gpu,
+        f32_to_f16_bits, fill_a, fill_b, fill_bias, fill_scales, fill_x, mix, oracle_dot_range, parse_ms,
+        reference_arm, row_scale, sample_positions, tile_rows, transpose_kn_to_nk, variant_infos, variant_pipeline,
+        HostBScale, HostC, HostGemm, I8BLayout, I8Out, ScaleKind, CONTROLS, K, KN, MS, M_MAX, N, NT, VARIANTS,
     };
 
     #[test]
@@ -622,12 +1253,17 @@ mod tests {
         assert!(x[..k].iter().skip(1).any(|v| *v < 0.0) && x[..k].iter().any(|v| *v > 0.0));
     }
 
+    /// [`oracle_dot_range`] over all of K.
+    fn oracle_dot(a: &[u8], b: &[u8], layout: I8BLayout, (n, k): (usize, usize), row: usize, col: usize) -> (i64, f64) {
+        oracle_dot_range(a, b, layout, (n, k), (row, col), 0..k)
+    }
+
     #[test]
     fn oracle_reads_bytes_as_signed_and_b_as_k_by_n() {
         // a = [[1, -1]], b = [[2, 3], [255 (-1), 4]] (K = 2, N = 2).
         let (a, b) = ([1u8, 255], [2u8, 3, 255, 4]);
-        assert_eq!(oracle_dot(&a, &b, (2, 2), 0, 0), (3, 3.0));
-        assert_eq!(oracle_dot(&a, &b, (2, 2), 0, 1), (-1, 7.0));
+        assert_eq!(oracle_dot(&a, &b, KN, (2, 2), 0, 0), (3, 3.0));
+        assert_eq!(oracle_dot(&a, &b, KN, (2, 2), 0, 1), (-1, 7.0));
     }
 
     #[test]
@@ -649,9 +1285,9 @@ mod tests {
         let (a, b, mut c) = tiny();
         let all = [(0, 0), (0, 1), (1, 0), (1, 1)];
         let scale = |row: usize| if row == 0 { 0.5 } else { 2.0 };
-        check_sampled("t", &c, &a, &b, (2, 2), &scale, &all).unwrap();
+        check_sampled("t", HostC::F32(&c), &HostGemm::plain(&a, &b, (2, 2)), &scale, &all).unwrap();
         c[3] *= 1.0 + 1e-8;
-        check_sampled("t", &c, &a, &b, (2, 2), &scale, &all).unwrap();
+        check_sampled("t", HostC::F32(&c), &HostGemm::plain(&a, &b, (2, 2)), &scale, &all).unwrap();
     }
 
     #[test]
@@ -661,16 +1297,17 @@ mod tests {
         let scale = |row: usize| if row == 0 { 0.5 } else { 2.0 };
         let mut wrong = c.clone();
         wrong[2] += 1.0;
-        let err = check_sampled("t", &wrong, &a, &b, (2, 2), &scale, &all).unwrap_err();
+        let g = HostGemm::plain(&a, &b, (2, 2));
+        let err = check_sampled("t", HostC::F32(&wrong), &g, &scale, &all).unwrap_err();
         assert!(err.contains("C[1,0]"), "{err}");
         let mut nan = c.clone();
         nan[0] = f32::NAN;
-        assert!(check_sampled("t", &nan, &a, &b, (2, 2), &scale, &all).is_err());
+        assert!(check_sampled("t", HostC::F32(&nan), &g, &scale, &all).is_err());
         // Tiles swapped (the failure a bad tile walk produces): rows exchanged.
         let swapped = vec![c[2], c[3], c[0], c[1]];
-        assert!(check_sampled("t", &swapped, &a, &b, (2, 2), &scale, &all).is_err());
+        assert!(check_sampled("t", HostC::F32(&swapped), &g, &scale, &all).is_err());
         // A wrong per-row scale is caught, not just a wrong product.
-        assert!(check_sampled("t", &c, &a, &b, (2, 2), &|_| 0.5, &all).is_err());
+        assert!(check_sampled("t", HostC::F32(&c), &g, &|_| 0.5, &all).is_err());
     }
 
     /// The corpus the rejection tests share: M = 4, K = 2, N = 4, 2x2 tiles.
@@ -683,7 +1320,7 @@ mod tests {
         let mut c = Vec::new();
         for r in 0..4 {
             for col in 0..4 {
-                let (sum, _) = oracle_dot(&a, &b, (4, 2), r, col);
+                let (sum, _) = oracle_dot(&a, &b, KN, (4, 2), r, col);
                 c.push(sum as f32 * scale(r));
             }
         }
@@ -697,7 +1334,7 @@ mod tests {
         pos: &[(usize, usize)],
         scale: &dyn Fn(usize) -> f32,
     ) -> Result<(), String> {
-        check_sampled("grid", c, a, b, (4, 2), scale, pos)
+        check_sampled("grid", HostC::F32(c), &HostGemm::plain(a, b, (4, 2)), scale, pos)
     }
 
     #[test]
@@ -765,5 +1402,321 @@ mod tests {
         let mut clip = rint.clone();
         clip[0] = 128u8;
         assert!(check_quantized("wrap", &x, &clip, scale).is_err());
+    }
+
+    /// A logical GEMM the variant tests share: M = 2, N = 3, K = 128, with B
+    /// given as a function so both layouts and the references read the same
+    /// matrix. `reference` is written from the definitions in f64 and never
+    /// calls the oracle under test.
+    struct Fixture {
+        a: Vec<u8>,
+        b_kn: Vec<u8>,
+        b_nk: Vec<u8>,
+        col: Vec<f32>,
+        group: Vec<f32>,
+        bias: Vec<f32>,
+    }
+
+    const FM: usize = 2;
+    const FN: usize = 3;
+    const FK: usize = 128;
+    const FA: f64 = 0.0625;
+
+    fn logical_b(p: usize, j: usize) -> i8 {
+        (((p * 7 + j * 13) % 255) as i32 - 127) as i8
+    }
+
+    fn fixture() -> Fixture {
+        let a: Vec<u8> = (0..FM * FK).map(|i| (i * 11 % 251) as u8).collect();
+        let mut b_kn = vec![0u8; FK * FN];
+        for p in 0..FK {
+            for j in 0..FN {
+                b_kn[p * FN + j] = logical_b(p, j) as u8;
+            }
+        }
+        let b_nk = transpose_kn_to_nk(&b_kn, (FN, FK));
+        Fixture {
+            a,
+            b_kn,
+            b_nk,
+            col: vec![0.75, 1.25, 0.5],
+            group: vec![0.5, 1.5, 1.0, 0.75, 0.25, 2.0],
+            bias: vec![1.5, -2.5, 4.0],
+        }
+    }
+
+    /// f64 reference of C[row][col] from the logical operands.
+    fn reference(f: &Fixture, scale: HostBScale<'_>, bias: bool, row: usize, col: usize) -> f64 {
+        let dot = |lo: usize, hi: usize| -> f64 {
+            (lo..hi)
+                .map(|p| f64::from(f.a[row * FK + p] as i8) * f64::from(logical_b(p, col)))
+                .sum()
+        };
+        let v = match scale {
+            HostBScale::None => dot(0, FK) * FA,
+            HostBScale::PerColumn(sc) => dot(0, FK) * FA * f64::from(sc[col]),
+            HostBScale::PerGroup { scales, group } => {
+                (0..FK / group)
+                    .map(|g| dot(g * group, (g + 1) * group) * f64::from(scales[g * FN + col]))
+                    .sum::<f64>()
+                    * FA
+            }
+        };
+        v + if bias { f64::from(f.bias[col]) } else { 0.0 }
+    }
+
+    fn gemm<'a>(f: &'a Fixture, layout: I8BLayout, scale: HostBScale<'a>, bias: bool) -> HostGemm<'a> {
+        HostGemm {
+            a: &f.a,
+            b: if layout == KN { &f.b_kn } else { &f.b_nk },
+            layout,
+            n: FN,
+            k: FK,
+            b_scale: scale,
+            bias: bias.then_some(&f.bias[..]),
+        }
+    }
+
+    fn all_positions() -> Vec<(usize, usize)> {
+        (0..FM).flat_map(|r| (0..FN).map(move |c| (r, c))).collect()
+    }
+
+    fn c_of(f: &Fixture, scale: HostBScale<'_>, bias: bool) -> Vec<f32> {
+        all_positions()
+            .iter()
+            .map(|&(r, c)| reference(f, scale, bias, r, c) as f32)
+            .collect()
+    }
+
+    fn wrap(f16: bool, bits: &[u16]) -> HostC<'_> {
+        if f16 {
+            HostC::F16(bits)
+        } else {
+            HostC::Bf16(bits)
+        }
+    }
+
+    fn check(c: HostC<'_>, g: &HostGemm<'_>) -> Result<(), String> {
+        check_sampled("fx", c, g, &|_| FA as f32, &all_positions())
+    }
+
+    #[test]
+    fn transpose_moves_each_element_and_round_trips() {
+        let kn = [1u8, 2, 3, 4, 5, 6]; // K = 2, N = 3
+        let nk = transpose_kn_to_nk(&kn, (3, 2));
+        assert_eq!(nk, [1, 4, 2, 5, 3, 6]);
+        assert_eq!(transpose_kn_to_nk(&nk, (2, 3)), kn);
+    }
+
+    #[test]
+    fn oracle_reads_b_in_the_layout_it_is_told() {
+        let f = fixture();
+        for (row, col) in all_positions() {
+            assert_eq!(
+                oracle_dot(&f.a, &f.b_kn, KN, (FN, FK), row, col),
+                oracle_dot(&f.a, &f.b_nk, NT, (FN, FK), row, col)
+            );
+        }
+        // The same bytes read in the other layout are a different matrix.
+        let differs = all_positions().iter().any(|&(r, c)| {
+            oracle_dot(&f.a, &f.b_nk, KN, (FN, FK), r, c) != oracle_dot(&f.a, &f.b_nk, NT, (FN, FK), r, c)
+        });
+        assert!(differs);
+    }
+
+    /// C from a kernel that read B as `[N, K]` is accepted under `NT` and
+    /// rejected when the oracle reads the same bytes as `[K, N]`.
+    #[test]
+    fn the_oracle_rejects_a_wrong_layout_read() {
+        let f = fixture();
+        let c = c_of(&f, HostBScale::None, false);
+        check(HostC::F32(&c), &gemm(&f, KN, HostBScale::None, false)).unwrap();
+        check(HostC::F32(&c), &gemm(&f, NT, HostBScale::None, false)).unwrap();
+        let mut wrong = gemm(&f, NT, HostBScale::None, false);
+        wrong.layout = KN;
+        assert!(check(HostC::F32(&c), &wrong).is_err());
+        let mut wrong = gemm(&f, KN, HostBScale::None, false);
+        wrong.b = &f.b_nk;
+        assert!(check(HostC::F32(&c), &wrong).is_err());
+    }
+
+    #[test]
+    fn the_oracle_applies_and_rejects_the_per_column_scale() {
+        let f = fixture();
+        let scale = HostBScale::PerColumn(&f.col);
+        let c = c_of(&f, scale, false);
+        for layout in [KN, NT] {
+            check(HostC::F32(&c), &gemm(&f, layout, scale, false)).unwrap();
+            // The scale ignored, or read for the neighbouring column.
+            assert!(check(HostC::F32(&c), &gemm(&f, layout, HostBScale::None, false)).is_err());
+            let swapped = [f.col[1], f.col[0], f.col[2]];
+            assert!(check(
+                HostC::F32(&c),
+                &gemm(&f, layout, HostBScale::PerColumn(&swapped), false)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn the_oracle_flushes_per_group_and_rejects_a_collapsed_or_wrong_group() {
+        let f = fixture();
+        for group in [64usize, 128] {
+            let scale = HostBScale::PerGroup {
+                scales: &f.group,
+                group,
+            };
+            let c = c_of(&f, scale, false);
+            for layout in [KN, NT] {
+                check(HostC::F32(&c), &gemm(&f, layout, scale, false)).unwrap();
+            }
+        }
+        // Two groups with different scales: C built as if group 0's scale
+        // covered all of K (a collapsed flush) is rejected, and so is group 64
+        // read as 128.
+        let g64 = HostBScale::PerGroup {
+            scales: &f.group,
+            group: 64,
+        };
+        let g128 = HostBScale::PerGroup {
+            scales: &f.group,
+            group: 128,
+        };
+        let c64 = c_of(&f, g64, false);
+        assert!(check(HostC::F32(&c64), &gemm(&f, KN, g128, false)).is_err());
+        let collapsed = c_of(&f, g128, false);
+        assert!(check(HostC::F32(&collapsed), &gemm(&f, KN, g64, false)).is_err());
+        // K not a multiple of the group is refused, not truncated.
+        let g96 = HostBScale::PerGroup {
+            scales: &f.group,
+            group: 96,
+        };
+        let err = check(HostC::F32(&c64), &gemm(&f, KN, g96, false)).unwrap_err();
+        assert!(err.contains("multiple of group"), "{err}");
+    }
+
+    #[test]
+    fn the_oracle_adds_and_rejects_a_missing_or_misplaced_bias() {
+        let f = fixture();
+        let c = c_of(&f, HostBScale::None, true);
+        check(HostC::F32(&c), &gemm(&f, KN, HostBScale::None, true)).unwrap();
+        assert!(check(HostC::F32(&c), &gemm(&f, KN, HostBScale::None, false)).is_err());
+        let rotated = [f.bias[1], f.bias[2], f.bias[0]];
+        let mut g = gemm(&f, KN, HostBScale::None, false);
+        g.bias = Some(&rotated);
+        assert!(check(HostC::F32(&c), &g).is_err());
+    }
+
+    /// The 16-bit stores are checked against the documented cast: the cast
+    /// value passes, a neighbouring half or bf16 value fails, and so do an
+    /// uncast f32, an infinity and the bits read as the other format.
+    #[test]
+    fn the_oracle_checks_16_bit_stores_against_the_cast() {
+        let f = fixture();
+        let scale = HostBScale::PerColumn(&f.col);
+        let want = c_of(&f, scale, true);
+        let g = gemm(&f, KN, scale, true);
+        let h: Vec<u16> = want.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let b: Vec<u16> = want.iter().map(|&v| f32_to_bf16_bits_gpu(v)).collect();
+        check(HostC::F16(&h), &g).unwrap();
+        check(HostC::Bf16(&b), &g).unwrap();
+        for (bits, f16) in [(&h, true), (&b, false)] {
+            let mut next = bits.clone();
+            next[3] += 1;
+            assert!(check(wrap(f16, &next), &g).is_err());
+            let mut prev = bits.clone();
+            prev[0] -= 1;
+            assert!(check(wrap(f16, &prev), &g).is_err());
+        }
+        assert!(check(HostC::Bf16(&h), &g).is_err());
+        assert!(check(HostC::F16(&b), &g).is_err());
+        let mut inf = h.clone();
+        inf[1] = f32_to_f16_bits(f32::INFINITY);
+        assert!(check(HostC::F16(&inf), &g).is_err());
+        // The f32 oracle's value is not a 16-bit value: the cast must be applied.
+        assert!(want.iter().any(|&v| f16_bits_to_f32(f32_to_f16_bits(v)) != v));
+        assert!(want.iter().any(|&v| bf16_bits_to_f32(f32_to_bf16_bits_gpu(v)) != v));
+    }
+
+    #[test]
+    fn variant_operands_are_distinct_and_in_range() {
+        let s = fill_scales(4096, 7);
+        assert!(s.iter().all(|v| (0.5..1.5).contains(v)));
+        assert!(s.windows(2).any(|w| w[0] != w[1]));
+        let bias = fill_bias(4096);
+        assert!(bias.iter().all(|v| v.abs() <= 8.0) && bias.windows(2).any(|w| w[0] != w[1]));
+        assert_ne!(mix(1), mix(2));
+    }
+
+    /// Every variant the lane exists to cover is in the table, names are unique
+    /// and every pipeline name resolves (so a group that does not divide K, or
+    /// an invalid group, fails here and not on the device).
+    #[test]
+    fn the_variant_table_covers_every_gemm_i8_variant() {
+        let names: std::collections::HashSet<_> = VARIANTS.iter().map(|v| v.name).collect();
+        assert_eq!(names.len(), VARIANTS.len());
+        for layout in [KN, NT] {
+            for group in [64u32, 128, 256] {
+                assert!(
+                    VARIANTS
+                        .iter()
+                        .any(|v| v.layout == layout && matches!(v.scale, ScaleKind::PerGroup(g) if g == group)),
+                    "{layout:?} group {group}"
+                );
+            }
+            assert!(VARIANTS
+                .iter()
+                .any(|v| v.layout == layout && matches!(v.scale, ScaleKind::PerColumn)));
+        }
+        assert!(VARIANTS.iter().any(|v| v.bias));
+        assert!(VARIANTS.iter().any(|v| v.out == I8Out::F16));
+        assert!(VARIANTS.iter().any(|v| v.out == I8Out::Bf16));
+        for v in &VARIANTS {
+            if let ScaleKind::PerGroup(g) = v.scale {
+                assert_eq!(K % g, 0, "{}", v.name);
+            }
+        }
+        for m in [1u32, 2, 64, 65, 2048] {
+            for i in 0..VARIANTS.len() + CONTROLS {
+                assert_ne!(variant_pipeline(m, i), "invalid-shape");
+            }
+        }
+        // Arm 2 is the first variant (NT, no scale), arm 3 the second (per-column, KN).
+        assert_eq!(variant_pipeline(65, 2), "i8_w8a8_128_nt");
+        assert_eq!(variant_pipeline(65, 3), "i8_w8a8_128");
+        assert_eq!(variant_pipeline(1, 2), "i8_gemv_dequant");
+    }
+
+    /// The label follows what the library does: a b_scale or bias buffer is
+    /// read on the host, so those arms sync; the plain ones queue. Each arm is
+    /// compared with the control that has the same sync.
+    #[test]
+    fn host_sync_labels_follow_b_scale_and_bias() {
+        for v in &VARIANTS {
+            let expect = !matches!(v.scale, ScaleKind::None) || v.bias;
+            assert_eq!(v.host_sync_per_call(), expect, "{}", v.name);
+        }
+        let by_name = |n: &str| VARIANTS.iter().find(|v| v.name == n).unwrap().host_sync_per_call();
+        assert!(!by_name("tessl-i8-gemm-nt"));
+        assert!(!by_name("tessl-i8-gemm-f16"));
+        assert!(by_name("tessl-i8-gemm-percol"));
+        assert!(by_name("tessl-i8-gemm-g128-nt"));
+        assert!(by_name("tessl-i8-gemm-bias"));
+        let infos = variant_infos();
+        assert_eq!(infos.len(), VARIANTS.len() + CONTROLS);
+        assert!(!infos[0].host_sync_per_call && infos[1].host_sync_per_call);
+        for info in &infos[CONTROLS..] {
+            assert_eq!(infos[reference_arm(info)].host_sync_per_call, info.host_sync_per_call);
+        }
+    }
+
+    #[test]
+    fn bench_ms_parses_a_list_and_rejects_bad_entries() {
+        assert_eq!(parse_ms("1, 100").unwrap(), vec![1, 100]);
+        assert_eq!(parse_ms("2048").unwrap(), vec![2048]);
+        for bad in ["", "0", "2049", "x", "1,,2", "1,1", "-3"] {
+            assert!(parse_ms(bad).is_err(), "{bad:?}");
+        }
+        assert!(MS.iter().all(|&m| m as usize <= M_MAX));
     }
 }

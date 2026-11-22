@@ -246,3 +246,21 @@ fn a_path_that_starts_with_a_dash_is_a_path_not_an_option() {
     );
     assert_eq!(bitcode_sections(&cwd.join("-clean.a")), 0);
 }
+
+#[test]
+fn two_members_with_the_same_name_fail_instead_of_losing_one() {
+    let dir = fixture("duplicate");
+    let cwd = dir.join("in");
+    // Two distinct objects, one member name: `ar q` appends without replacing.
+    fs::create_dir_all(cwd.join("other")).expect("create dir");
+    fs::copy(cwd.join("two.o"), cwd.join("other/one.o")).expect("copy");
+    ok(run(&cwd, "ar", &["qc", "dup.a", "one.o"]), "ar qc");
+    ok(run(&cwd, "ar", &["q", "dup.a", "other/one.o"]), "ar q");
+    let names = ok(run(&cwd, "ar", &["-t", "dup.a"]), "ar -t");
+    assert_eq!(names.lines().filter(|l| *l == "one.o").count(), 2, "fixture: {names}");
+    let out = run(&dir, script(), &["in/dup.a", "stage/dup.a"]);
+    assert!(!out.status.success(), "a duplicated member name must fail the run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("more than once: one.o"), "stderr: {err}");
+    assert!(!dir.join("stage/dup.a").exists());
+}

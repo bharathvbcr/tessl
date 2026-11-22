@@ -71,7 +71,7 @@ bin timesfm3_host 7
 bin timesfm3_forecast_host 10
 bin shader_index_arithmetic 37
 # Runs go/engine/strip_bitcode.sh on archives built with clang -fembed-bitcode (needs Xcode's clang, ld, otool, libtool).
-bin strip_bitcode_script 8
+bin strip_bitcode_script 9
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6

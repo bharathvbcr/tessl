@@ -61,6 +61,12 @@ while IFS= read -r name; do
     *) echo "strip_bitcode: $in has a member that is not an object: $name" >&2; exit 1 ;;
   esac
 done < "$work/members"
+# ar x writes one file per name, so a repeated name would list one object twice and lose the other.
+sort "$work/members" | uniq -d > "$work/dups"
+if [ -s "$work/dups" ]; then
+  echo "strip_bitcode: $in lists a member name more than once: $(tr '\n' ' ' < "$work/dups")" >&2
+  exit 1
+fi
 [ "$objects" -gt 0 ] || { echo "strip_bitcode: $in has no object members" >&2; exit 1; }
 (cd "$work/in" && ar x "$in")
 

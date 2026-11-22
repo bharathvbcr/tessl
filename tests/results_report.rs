@@ -141,7 +141,7 @@ fn golden_reading(memory: Option<&str>, bits: Option<&str>, time: Option<&str>) 
         .expect("the golden ends with the reading");
     let lines: Vec<&str> = golden[at..].lines().collect();
     // Heading, the memory bullet (3 lines), the bits bullet (3 lines), the PLE
-    // bullet (5), the time bullet (8), the rest.
+    // bullet (5), the time bullet (the refusal line and the script's 8), the rest.
     let mut out = vec![lines[0].to_string()];
     out.extend(memory.map_or_else(
         || lines[1..4].iter().map(|l| l.to_string()).collect(),
@@ -153,10 +153,10 @@ fn golden_reading(memory: Option<&str>, bits: Option<&str>, time: Option<&str>) 
     ));
     out.extend(lines[7..12].iter().map(|l| l.to_string()));
     out.extend(time.map_or_else(
-        || lines[12..20].iter().map(|l| l.to_string()).collect(),
+        || lines[12..21].iter().map(|l| l.to_string()).collect(),
         |t| vec![t.to_string()],
     ));
-    out.extend(lines[20..].iter().map(|l| l.to_string()));
+    out.extend(lines[21..].iter().map(|l| l.to_string()));
     out.join("\n").trim_end().to_string()
 }
 

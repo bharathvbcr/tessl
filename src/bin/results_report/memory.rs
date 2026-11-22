@@ -789,7 +789,11 @@ fn reading(bits: &Result<(), String>, memory: &Result<(), String>, time: &Result
     }
     out.extend(READING_PLE_BOUND.iter().map(|s| s.to_string()));
     match time {
-        Err(_) => out.extend(READING_TIME_NOT_MET.iter().map(|s| s.to_string())),
+        Err(why) => {
+            // The canned prose is the script's; the refusal is what these rounds say.
+            out.push(format!("  * Time against 16f5190 (B3), refused on these rounds: {why}"));
+            out.extend(READING_TIME_NOT_MET.iter().map(|s| s.to_string()));
+        }
         Ok(series) => out.push(format!(
             "  * Time against 16f5190 (B3): met on the registered statistic: the median of per-round ratios is at most {MIB_BOUND} at every workload of the {series} paired series."
         )),

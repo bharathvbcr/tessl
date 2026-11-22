@@ -20,16 +20,26 @@ export LC_ALL=C
 
 in=${1:?usage: strip_bitcode.sh IN.a OUT.a}
 out=${2:?usage: strip_bitcode.sh IN.a OUT.a}
+[ -n "$in" ] && [ -n "$out" ] || { echo "strip_bitcode: IN.a and OUT.a must be non-empty" >&2; exit 2; }
 [ -f "$in" ] || { echo "strip_bitcode: no such archive: $in" >&2; exit 1; }
 
-outdir=$(dirname "$out")
-mkdir -p "$outdir"
+# Both paths become absolute here, before any cd below: a relative IN resolved
+# after `cd "$work/in"` pointed into the work directory, and the extract failed.
+absdir() { (cd "$(dirname "$1")" && pwd -P) || { echo "strip_bitcode: cannot enter the directory of $1" >&2; return 1; }; }
+mkdir -p "$(dirname "$out")"
+in="$(absdir "$in")/$(basename "$in")"
+out="$(absdir "$out")/$(basename "$out")"
+[ -f "$in" ] || { echo "strip_bitcode: no such archive: $in" >&2; exit 1; }
+[ "$in" != "$out" ] || { echo "strip_bitcode: IN and OUT are the same file: $in" >&2; exit 2; }
+
 work=$(mktemp -d "${out}.work.XXXXXX")
 trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 rm -f "$out"
 
 mkdir "$work/in" "$work/clean"
-(cd "$work/in" && ar x "$(cd "$(dirname "$in")" && pwd)/$(basename "$in")")
+(cd "$work/in" && ar x "$in")
 
 count=0
 for f in "$work"/in/*.o; do
@@ -50,5 +60,11 @@ for f in "$work"/clean/*.o; do
 done
 
 libtool -static -no_warning_for_no_symbols -o "$work/out.a" "$work"/clean/*.o
+[ -s "$work/out.a" ] || { echo "strip_bitcode: libtool wrote no archive" >&2; exit 1; }
+# The archive as written, not only its members: no bitcode may survive the repack.
+if otool -l "$work/out.a" 2>/dev/null | grep -q '__bitcode'; then
+  echo "strip_bitcode: the repacked archive still has a bitcode section" >&2
+  exit 1
+fi
 mv "$work/out.a" "$out"
 echo "strip_bitcode: $out ($count members)"

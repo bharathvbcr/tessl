@@ -79,8 +79,9 @@
 //! Before any timing, every arm of these runs (a) leaves an output that is
 //! finite and not all zero, (b) agrees with an f64 host reference on the
 //! operands as the kernel read them, at 256 sampled elements within
-//! 2e-3 of the reference's largest sampled magnitude (this bin has no other
-//! host-reference gate; the arms' mutual 1e-4 and bit-identity gates stay), and
+//! 2e-3 of the reference's largest sampled magnitude (relaxed f32: 2^-8, the
+//! bound the tree itself holds the tf32-class kernels to; this bin has no other
+//! host-reference gate, and the arms' mutual 1e-4 and bit-identity gates stay), and
 //! (c) is proven to have run its intended kernel: the pipeline-request trace
 //! shows the expected kernel name and not the other tile's (or the split-K's),
 //! and the raw arms are exactly one `with_binder` dispatch. A shape that fails
@@ -734,15 +735,27 @@ fn print_verdicts(paired: &common::Paired, production: usize) -> Result<(), Stri
 }
 
 /// Tolerance of the host-reference gate, relative to the reference's largest
-/// sampled magnitude, and how many elements it samples.
+/// sampled magnitude, and how many elements it samples. Relaxed f32 runs the
+/// tf32-class kernels, which the tree itself holds only to a bf16-class bound
+/// (tests/gemm_correctness.rs `relaxed_precision_stays_within_a_bf16_class_bound`,
+/// U_BF16 = 2^-8), so its gate is that bound and not the 2e-3 of the exact-in-f32
+/// element types: a gate tighter than the tree's own would refuse every relaxed shape.
 const HOST_REF_TOL: f64 = 2e-3;
+const HOST_REF_TOL_RELAXED: f64 = 1.0 / 256.0;
 const HOST_REF_SAMPLES: usize = 256;
+
+fn host_ref_tol(elem: Elem) -> f64 {
+    match elem {
+        Elem::Bf16 | Elem::F16 => HOST_REF_TOL,
+        Elem::Relaxed => HOST_REF_TOL_RELAXED,
+    }
+}
 
 /// `got` (`[m, n]`, row-major) against an f64 host product of the operands as
 /// the kernel read them: `a_at(i, p)` and `b_at(p, j)` are the logical
 /// operands, `base` the C a `C +=` started from. The four corners and
-/// [`HOST_REF_SAMPLES`] seeded positions are checked within
-/// [`HOST_REF_TOL`] of the largest sampled magnitude; a NaN anywhere sampled,
+/// [`HOST_REF_SAMPLES`] seeded positions are checked within `tol` (see
+/// [`host_ref_tol`]) of the largest sampled magnitude; a NaN anywhere sampled,
 /// a reference of all zeros and a short `got` are refused. Returns the worst
 /// sampled error over that magnitude.
 fn host_ref_check(
@@ -752,6 +765,7 @@ fn host_ref_check(
     a_at: &dyn Fn(usize, usize) -> f32,
     b_at: &dyn Fn(usize, usize) -> f32,
     base: Option<&[f32]>,
+    tol: f64,
 ) -> Result<f64, String> {
     if m == 0 || n == 0 || k == 0 || got.len() < m * n || base.is_some_and(|b| b.len() < m * n) {
         return Err(format!(
@@ -778,7 +792,7 @@ fn host_ref_check(
         return Err(format!("{lane}: the host reference has no usable scale ({scale})"));
     }
     let sampled: Vec<f32> = at.iter().map(|&(i, j)| got[i * n + j]).collect();
-    common::check_against(lane, &sampled, &want, HOST_REF_TOL * scale, 0.0)?;
+    common::check_against(lane, &sampled, &want, tol * scale, 0.0)?;
     let worst = sampled
         .iter()
         .zip(&want)
@@ -911,8 +925,10 @@ const GATED_SHAPES: &[(usize, usize, usize)] = &[
 /// grid of 1280 tiles or more whose scratch is over production's own split-K cap
 /// at any width, so a route could not take it, and it is left out. Training
 /// backward callers of `gemm_tn_train`, `gemm_tn_accum_train` and
-/// `GemmOperands::tn` live outside this tree (Ojas; not verified here), so the
-/// dims below are *derived* from the layers: Qwen3.5-2B's from its config
+/// `GemmOperands::tn` live outside it, in Ojas (../ojas/arch02/metal-native/src/model_bwd.rs,
+/// e.g. :458, :1321-1327, :1706-1719; ../ojas/ojas-metal/src/device.rs `gemm_tn`, e.g. :3001, :4576).
+/// Those call sites were found by rg, but the dims of Ojas's own arch02 models were
+/// not read, so the dims below are *derived* from the layers: Qwen3.5-2B's from its config
 /// (tests/qwen35_model.rs, `the_real_2b_config_shape_still_loads`: hidden 2048,
 /// 2 KV heads x head_dim 256, 16 linear-attention value heads), EmbeddingGemma
 /// 2's from this bin's own `nnsmall` forward table.
@@ -1131,6 +1147,7 @@ fn splitk_shape(
                 &|i, p| av[p * m + i],
                 &|p, j| bv[p * n + j],
                 acc.then_some(c0.as_slice()),
+                host_ref_tol(Elem::Bf16),
             )?;
             host = format!("; production within {err:.1e} of the host reference");
         }
@@ -1610,6 +1627,7 @@ fn plain_tiles(
             &|i, p| av[i * k + p],
             &|p, j| bv[p * n + j],
             None,
+            host_ref_tol(elem),
         )?;
         host = format!("; within {err:.1e} of the host reference");
     }
@@ -2024,25 +2042,36 @@ mod tests {
             }
         }
         let dims = (m, n, k);
-        assert_eq!(host_ref_check("t", &c, dims, &a_at, &b_at, None).unwrap(), 0.0);
+        assert_eq!(
+            host_ref_check("t", &c, dims, &a_at, &b_at, None, HOST_REF_TOL).unwrap(),
+            0.0
+        );
         // A sampled element off by 5% of the scale, a NaN, a short output.
         let mut off = c.clone();
         off[3] += 0.05 * c.iter().fold(0f32, |s, v| s.max(v.abs()));
-        assert!(host_ref_check("t", &off, dims, &a_at, &b_at, None).is_err());
+        assert!(host_ref_check("t", &off, dims, &a_at, &b_at, None, HOST_REF_TOL).is_err());
         let mut nan = c.clone();
         nan[1] = f32::NAN;
-        assert!(host_ref_check("t", &nan, dims, &a_at, &b_at, None).is_err());
-        assert!(host_ref_check("t", &c[..3], dims, &a_at, &b_at, None).is_err());
+        assert!(host_ref_check("t", &nan, dims, &a_at, &b_at, None, HOST_REF_TOL).is_err());
+        assert!(host_ref_check("t", &c[..3], dims, &a_at, &b_at, None, HOST_REF_TOL).is_err());
         // Within the 2e-3 band: 1e-4 of the scale passes.
         let mut near = c.clone();
         near[0] += 1e-4 * c.iter().fold(0f32, |s, v| s.max(v.abs()));
-        assert!(host_ref_check("t", &near, dims, &a_at, &b_at, None).is_ok());
+        assert!(host_ref_check("t", &near, dims, &a_at, &b_at, None, HOST_REF_TOL).is_ok());
         // C += starts from a base; leaving the base out is caught.
         let base = [10.0f32, -20.0, 30.0, -40.0];
         let summed: Vec<f32> = c.iter().zip(&base).map(|(x, y)| x + y).collect();
-        assert!(host_ref_check("t", &summed, dims, &a_at, &b_at, Some(&base)).is_ok());
-        assert!(host_ref_check("t", &summed, dims, &a_at, &b_at, None).is_err());
+        assert!(host_ref_check("t", &summed, dims, &a_at, &b_at, Some(&base), HOST_REF_TOL).is_ok());
+        assert!(host_ref_check("t", &summed, dims, &a_at, &b_at, None, HOST_REF_TOL).is_err());
         // A reference of all zeros has no scale.
-        assert!(host_ref_check("t", &[0.0; 4], dims, &|_, _| 0.0, &b_at, None).is_err());
+        assert!(host_ref_check("t", &[0.0; 4], dims, &|_, _| 0.0, &b_at, None, HOST_REF_TOL).is_err());
+        // Relaxed f32 is held to the tree's bf16-class bound, the others to 2e-3: 3e-3 of the scale
+        // passes only the relaxed gate.
+        let mut loose = c.clone();
+        loose[0] += 3e-3 * c.iter().fold(0f32, |s, v| s.max(v.abs()));
+        assert!(host_ref_check("t", &loose, dims, &a_at, &b_at, None, host_ref_tol(Elem::Relaxed)).is_ok());
+        assert!(host_ref_check("t", &loose, dims, &a_at, &b_at, None, host_ref_tol(Elem::Bf16)).is_err());
+        assert!(host_ref_check("t", &loose, dims, &a_at, &b_at, None, host_ref_tol(Elem::F16)).is_err());
+        assert_eq!(host_ref_tol(Elem::Relaxed), 1.0 / 256.0);
     }
 }

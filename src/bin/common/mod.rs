@@ -458,8 +458,9 @@ pub fn host_rms(x: &[f64], w: Option<&[f32]>, eps: f64) -> Vec<f64> {
         .collect()
 }
 
-/// A tolerance no finite difference exceeds: [`check_against`] with it (and
-/// `rel` 0) only measures the worst difference.
+/// A tolerance no finite difference exceeds: [`check_against`] with it as `abs`
+/// (whatever `rel` is) only measures the worst difference. A NaN tolerance is
+/// still refused.
 pub const UNBOUNDED: f64 = f64::INFINITY;
 
 /// `got` against `want` (the reference, f32 or f64), each element within
@@ -497,7 +498,11 @@ pub fn check_against<W: Copy + Into<f64>>(
         }
         let diff = (g - w).abs();
         worst = worst.max(diff);
-        let excess = diff - (abs + rel * w.abs());
+        // An UNBOUNDED `abs` accepts every finite element whatever `rel` is:
+        // `inf + rel * |w|` is already infinite, but `rel` itself UNBOUNDED
+        // against a zero reference would make `inf * 0` a NaN that fails it.
+        let tol = if abs == UNBOUNDED { abs } else { abs + rel * w.abs() };
+        let excess = diff - tol;
         // A NaN tolerance (`excess` NaN) fails every element, as it always did.
         if (excess.is_nan() || excess > 0.0) && out.is_none_or(|(_, e, _, _)| excess.is_nan() || excess > e) {
             out = Some((i, excess, g, w));

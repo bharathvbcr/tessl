@@ -168,3 +168,81 @@ fn a_stale_output_is_removed_when_the_run_fails() {
     );
     assert!(leftovers(&dir.join("stage")).is_empty(), "work directory left behind");
 }
+
+/// `script` run with a directory of stand-in tools ahead of the real ones on PATH.
+fn run_with_shim(dir: &Path, tool: &str, body: &str, args: &[&str]) -> Output {
+    let shim = dir.join("shim");
+    fs::create_dir_all(&shim).expect("create shim dir");
+    let path = shim.join(tool);
+    fs::write(&path, format!("#!/bin/bash\n{body}\n")).expect("write shim");
+    ok(run(dir, "chmod", &["+x", path.to_str().unwrap()]), "chmod");
+    let old = std::env::var("PATH").unwrap_or_default();
+    Command::new(script())
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", format!("{}:{old}", shim.display()))
+        .output()
+        .expect("run strip_bitcode.sh")
+}
+
+#[test]
+fn an_otool_that_fails_fails_the_run_and_writes_nothing() {
+    let dir = fixture("otool_fails");
+    let out = run_with_shim(
+        &dir,
+        "otool",
+        "echo boom >&2; exit 1",
+        &["in/libfix.a", "stage/libfix.a"],
+    );
+    assert!(!out.status.success(), "a failing otool must not read as 'no bitcode'");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("otool -l failed"), "stderr: {err}");
+    assert!(!dir.join("stage/libfix.a").exists());
+    assert!(leftovers(&dir.join("stage")).is_empty(), "work directory left behind");
+}
+
+#[test]
+fn bitcode_followed_by_a_large_listing_is_still_found() {
+    let dir = fixture("otool_large");
+    // An early-closing reader would SIGPIPE this shim and lose the answer.
+    let out = run_with_shim(
+        &dir,
+        "otool",
+        "echo '  sectname __bitcode'; yes 'padding padding padding' | head -c 500000",
+        &["in/libfix.a", "stage/libfix.a"],
+    );
+    assert!(!out.status.success(), "a member with bitcode must fail the run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("still has a bitcode section"), "stderr: {err}");
+    assert!(!dir.join("stage/libfix.a").exists());
+}
+
+#[test]
+fn a_member_that_is_not_an_object_fails_instead_of_being_dropped() {
+    let dir = fixture("non_object");
+    // A Mach-O object under a name that does not end in .o: ranlib on this machine
+    // drops members that are not Mach-O, so a real object is what survives to be
+    // ignored by a script that only looks at *.o.
+    fs::copy(dir.join("in/one.o"), dir.join("in/extra.obj")).expect("copy member");
+    ok(
+        run(&dir.join("in"), "ar", &["rc", "mixed.a", "one.o", "extra.obj"]),
+        "ar rc",
+    );
+    let out = run(&dir, script(), &["in/mixed.a", "stage/mixed.a"]);
+    assert!(!out.status.success(), "a non-object member must fail the run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not an object: extra.obj"), "stderr: {err}");
+    assert!(!dir.join("stage/mixed.a").exists());
+}
+
+#[test]
+fn a_path_that_starts_with_a_dash_is_a_path_not_an_option() {
+    let dir = fixture("dash");
+    let cwd = dir.join("in");
+    fs::rename(cwd.join("libfix.a"), cwd.join("-dash.a")).expect("rename");
+    ok(
+        run(&cwd, script(), &["-dash.a", "-clean.a"]),
+        "strip_bitcode.sh with dash-leading names",
+    );
+    assert_eq!(bitcode_sections(&cwd.join("-clean.a")), 0);
+}

@@ -20,7 +20,9 @@ export LC_ALL=C
 
 in=${1:?usage: strip_bitcode.sh IN.a OUT.a}
 out=${2:?usage: strip_bitcode.sh IN.a OUT.a}
-[ -n "$in" ] && [ -n "$out" ] || { echo "strip_bitcode: IN.a and OUT.a must be non-empty" >&2; exit 2; }
+# A leading-dash path would be read as an option by dirname, basename, ar and ld.
+case "$in" in -*) in=./$in ;; esac
+case "$out" in -*) out=./$out ;; esac
 [ -f "$in" ] || { echo "strip_bitcode: no such archive: $in" >&2; exit 1; }
 
 # Both paths become absolute here, before any cd below: a relative IN resolved
@@ -32,37 +34,57 @@ out="$(absdir "$out")/$(basename "$out")"
 [ -f "$in" ] || { echo "strip_bitcode: no such archive: $in" >&2; exit 1; }
 [ "$in" != "$out" ] || { echo "strip_bitcode: IN and OUT are the same file: $in" >&2; exit 2; }
 
+# Succeeds when otool -l names a bitcode section in $1. An otool that fails stops the
+# script: its output is captured first, so a failure (or a pipe closed early by
+# grep -q, which would SIGPIPE otool) can never read as "no bitcode".
+has_bitcode() {
+  local listing
+  listing=$(otool -l "$1") || { echo "strip_bitcode: otool -l failed on $1" >&2; exit 1; }
+  case $listing in *__bitcode*) return 0 ;; *) return 1 ;; esac
+}
+
 work=$(mktemp -d "${out}.work.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 rm -f "$out"
 
+# Every member must be a relinkable object; the only other entry allowed is the
+# symbol table. Anything else would be dropped from OUT without a word.
+ar -t "$in" > "$work/members"
 mkdir "$work/in" "$work/clean"
+objects=0
+while IFS= read -r name; do
+  case $name in
+    __.SYMDEF*) ;;
+    *.o) objects=$((objects + 1)) ;;
+    *) echo "strip_bitcode: $in has a member that is not an object: $name" >&2; exit 1 ;;
+  esac
+done < "$work/members"
+[ "$objects" -gt 0 ] || { echo "strip_bitcode: $in has no object members" >&2; exit 1; }
 (cd "$work/in" && ar x "$in")
 
+# The member list goes to libtool as a file: 6000 long names on its command line
+# exceed ARG_MAX (the engine archive has 425 members).
 count=0
-for f in "$work"/in/*.o; do
-  ld -r -arch arm64 "$f" -o "$work/clean/$(basename "$f")"
-  count=$((count + 1))
-done
-members=$(ar -t "$in" | grep -c '\.o$' || true)
-if [ "$count" -eq 0 ] || [ "$count" -ne "$members" ]; then
-  echo "strip_bitcode: relinked $count objects but $in has $members" >&2
-  exit 1
-fi
-
-for f in "$work"/clean/*.o; do
-  if otool -l "$f" | grep -q '__bitcode'; then
-    echo "strip_bitcode: $(basename "$f") still has a bitcode section" >&2
+: > "$work/filelist"
+while IFS= read -r name; do
+  case $name in __.SYMDEF*) continue ;; esac
+  [ -f "$work/in/$name" ] || { echo "strip_bitcode: extracting $in did not produce $name (duplicate member names?)" >&2; exit 1; }
+  ld -r -arch arm64 "$work/in/$name" -o "$work/clean/$name"
+  if has_bitcode "$work/clean/$name"; then
+    echo "strip_bitcode: $name still has a bitcode section" >&2
     exit 1
   fi
-done
+  echo "$work/clean/$name" >> "$work/filelist"
+  count=$((count + 1))
+done < "$work/members"
+[ "$count" -eq "$objects" ] || { echo "strip_bitcode: relinked $count objects but $in has $objects" >&2; exit 1; }
 
-libtool -static -no_warning_for_no_symbols -o "$work/out.a" "$work"/clean/*.o
+libtool -static -no_warning_for_no_symbols -filelist "$work/filelist" -o "$work/out.a"
 [ -s "$work/out.a" ] || { echo "strip_bitcode: libtool wrote no archive" >&2; exit 1; }
 # The archive as written, not only its members: no bitcode may survive the repack.
-if otool -l "$work/out.a" 2>/dev/null | grep -q '__bitcode'; then
+if has_bitcode "$work/out.a"; then
   echo "strip_bitcode: the repacked archive still has a bitcode section" >&2
   exit 1
 fi

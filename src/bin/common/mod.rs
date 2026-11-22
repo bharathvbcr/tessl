@@ -761,6 +761,13 @@ mod tests {
     /// An empty reference: `&[]` alone does not say which element type.
     const NONE: &[f32] = &[];
 
+    /// UNBOUNDED named as the tolerance, passed for both abs and rel.
+    #[test]
+    fn unbounded_for_both_tolerances_measures_a_zero_reference_instead_of_refusing_it() {
+        let r = check_against("t", &[1.0, 2.0], &[0.0f64, 1.0], UNBOUNDED, UNBOUNDED);
+        assert_eq!(r, Ok(1.0), "UNBOUNDED as abs and rel: {r:?}");
+    }
+
     /// The comparator every bench gate shares fails on what the retired
     /// `fold(0.0, f64::max)` copies passed: a NaN (dropped by `max`), two empty
     /// slices (worst of nothing is 0), and slices of different lengths (`zip`

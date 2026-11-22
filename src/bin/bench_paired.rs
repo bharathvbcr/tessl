@@ -2297,4 +2297,58 @@ mod tests {
         child.wait().unwrap();
         assert!(!alive(pid));
     }
+
+    /// a group id stays reserved while the group has members (POSIX: a pid
+    /// is not reused while a process group with that id exists), so a leader reaped
+    /// behind the Child's back does not make its group someone else's. The
+    /// descendants are still ours to end: stop_group must kill them, as it did
+    /// before the ECHILD early return. The sleeper holds the pipe's write end, so
+    /// the read end reaching EOF is the observation of its death.
+    #[test]
+    fn a_group_with_live_members_is_ended_after_its_leader_was_reaped_elsewhere() {
+        use std::io::{BufRead, Read};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let d = scratch("reaped_leader_live");
+        let pidfile = d.join("sleep.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > '{}'; echo ready; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let sleeper: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let leader = child.id() as i32;
+        // SAFETY: both calls name the child this test spawned.
+        unsafe {
+            assert_eq!(libc::kill(leader, libc::SIGKILL), 0);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(leader, &mut status, 0), leader);
+        }
+        let slot = proc::Registered::reserve().unwrap();
+        proc::stop_group(&mut child, &slot);
+        let mut fds = [libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one valid pollfd; the timeout only bounds a failing run.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 5000) };
+        if ready == 0 {
+            // SAFETY: the sleep this test started.
+            unsafe { libc::kill(sleeper, libc::SIGKILL) };
+        }
+        assert!(ready > 0, "the group's last member (pid {sleeper}) outlived stop_group: its leader was reaped, but the group still had a member");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

@@ -141,11 +141,11 @@ fn install_signal_handlers() {
 }
 
 /// A claimed slot of [`ACTIVE_GROUPS`], released when dropped.
-struct Registered(usize);
+pub(crate) struct Registered(usize);
 
 impl Registered {
     /// Claim a free slot, or `None` when all are taken.
-    fn reserve() -> Option<Registered> {
+    pub(crate) fn reserve() -> Option<Registered> {
         ACTIVE_GROUPS
             .iter()
             .position(|s| s.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed).is_ok())
@@ -182,7 +182,7 @@ impl Drop for Registered {
 /// A process that leaves the group (`setsid`, `setpgid`) is not reached: the
 /// group is the only handle on a descendant. Nothing in this repository's
 /// suites does that.
-fn stop_group(child: &mut Child, slot: &Registered) {
+pub(crate) fn stop_group(child: &mut Child, slot: &Registered) {
     let group = -(child.id() as libc::pid_t);
     // SAFETY: `kill` takes a pid and a signal; the negated pid is the group of
     // the child spawned with `process_group(0)`, whose pid is its group id.

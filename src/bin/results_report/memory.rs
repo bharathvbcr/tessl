@@ -846,3 +846,27 @@ const READING_WHY: &[&str] = &[
     "    (66 extra dispatches of a few us each, against 372 in a forward and hundreds of ms), the alias changes which buffer a GEMM writes, not what it computes,",
     "    and the early release moves buffer ownership, not GPU work.",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::reading;
+
+    /// the refusal quoted in the reading comes from the rounds' own series and
+    /// workload names, so it can hold a newline or be empty; each element of the reading
+    /// is one printed line and an empty refusal must not leave a dangling colon.
+    #[test]
+    fn a_time_refusal_with_a_newline_or_nothing_stays_one_line() {
+        for why in ["series x\ny: median 1.5 over 1.03", ""] {
+            let lines = reading(&Ok(()), &Ok(()), &Err(why.to_string()));
+            let bullet = lines.iter().find(|l| l.contains("(B3), refused")).expect("the B3 line");
+            assert!(
+                !bullet.contains('\n'),
+                "a newline in the refusal split the bullet: {bullet:?}"
+            );
+            assert!(
+                !bullet.trim_end().ends_with(':'),
+                "an empty refusal left a dangling colon: {bullet:?}"
+            );
+        }
+    }
+}

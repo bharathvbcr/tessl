@@ -701,10 +701,18 @@ fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
     use std::time::{Duration, Instant};
     let d = scratch("interrupt");
     let started = d.join("started");
+    let sleeper_pid = d.join("sleeper.pid");
+    // The lane's own child outlives a plain kill of the lane, so its death is what
+    // shows the interrupt ended the lane's whole group. The pid file is written
+    // before `started`, which is what the test waits for.
     let hang = script(
         &d,
         "hang",
-        &format!("echo started > '{}'\nsleep 300", started.display()),
+        &format!(
+            "sleep 300 &\necho $! > '{}'\necho started > '{}'\nwait",
+            sleeper_pid.display(),
+            started.display()
+        ),
     );
     let out_json = d.join("o.json");
     let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
@@ -730,6 +738,7 @@ fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let sleeper: i32 = fs::read_to_string(&sleeper_pid).unwrap().trim().parse().unwrap();
     let sent = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
@@ -737,6 +746,24 @@ fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
     assert!(sent.success());
     let status = child.wait().unwrap();
     assert_eq!(status.signal(), Some(2), "the run did not die of SIGINT: {status:?}");
+    // The group kill reaches the sleeper before bench_paired dies; launchd reaps it.
+    let alive = |pid: i32| {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(sleeper) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(sleeper);
+    if survived {
+        // The sleep this test's own lane script started.
+        let _ = Command::new("kill").args(["-KILL", &sleeper.to_string()]).status();
+    }
+    assert!(!survived, "the lane's child {sleeper} survived the interrupt");
     let mut left: Vec<String> = fs::read_dir(&d)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

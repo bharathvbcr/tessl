@@ -338,7 +338,7 @@ fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
     fs::create_dir_all(&fakebin).unwrap();
     let (cargo_pid, sleep_pid) = (root.join("cargo.pid"), root.join("sleep.pid"));
     let fake = format!(
-        "#!/bin/sh\necho $ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n",
+        "#!/bin/sh\necho $$ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n",
         cargo_pid.display(),
         sleep_pid.display()
     );
@@ -384,9 +384,15 @@ fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
         let _ = child.wait();
     };
     let deadline = Instant::now() + Duration::from_secs(120);
-    let sleeper = loop {
+    let (sleeper, cargo) = loop {
         if let Some(p) = read_pid(&sleep_pid) {
-            break p;
+            // The fake cargo wrote its own pid first: a number, not the text `$`.
+            let cargo = read_pid(&cargo_pid).unwrap_or_default();
+            if cargo.parse::<u32>().is_err() {
+                cleanup(&mut child);
+                panic!("the fake cargo recorded {cargo:?}, not its pid");
+            }
+            break (p, cargo);
         }
         if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
             cleanup(&mut child);
@@ -415,10 +421,18 @@ fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
     while alive(&sleeper) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
+    while alive(&cargo) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let survived = alive(&sleeper);
+    let cargo_survived = alive(&cargo);
     cleanup(&mut child);
     assert_eq!(status.code(), Some(want_code), "exit status after SIG{signal}");
     assert!(!survived, "the test's process group survived SIG{signal} to the script");
+    assert!(
+        !cargo_survived,
+        "the test's process-group leader survived SIG{signal} to the script"
+    );
 }
 
 #[test]

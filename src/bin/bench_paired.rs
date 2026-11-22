@@ -2351,4 +2351,19 @@ mod tests {
         reader.read_to_end(&mut rest).unwrap();
         std::fs::remove_dir_all(&d).unwrap();
     }
+
+    /// UNBOUNDED named as the tolerance, passed for both abs and rel: the
+    /// measure-only setting accepts every finite element whatever the reference
+    /// is (a zero reference must not turn `inf * 0` into a NaN that fails it).
+    #[test]
+    fn unbounded_for_both_tolerances_measures_a_zero_reference_instead_of_refusing_it() {
+        let r = common::check_against(
+            "t",
+            &[1.0, 2.0],
+            &[0.0f64, 1.0],
+            common::UNBOUNDED,
+            common::UNBOUNDED,
+        );
+        assert_eq!(r, Ok(1.0), "UNBOUNDED as abs and rel: {r:?}");
+    }
 }

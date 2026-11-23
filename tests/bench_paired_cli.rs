@@ -854,9 +854,59 @@ fn spawn_bp(args: Vec<String>) -> std::process::Child {
         .unwrap()
 }
 
-/// Signal "name" arrives while bench_paired is stopped and the gate lane's block_call-th run is blocked on a FIFO;
-/// the lane is released and then bench_paired continues, so the signal is delivered
-/// after the lane ended and before bench_paired has looked at it. No timing involved.
+/// Owns the `bench_paired` a test stopped and its gate lane, and ends both when
+/// dropped, on every path including a panic: a stopped process is not ended by its
+/// parent dying, so without this a failing run leaves it (and the lane's shell
+/// loop) behind for good. Signals only the pids this test spawned: the child, and
+/// the lane pid its own gate script recorded.
+struct Reaper {
+    child: std::process::Child,
+    lane_pid_file: PathBuf,
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        // Already reaped (the test ran to its end): nothing is left, and the pids
+        // may be recycled. No assertions here: a panic in drop aborts.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-CONT", &self.child.id().to_string()])
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(pid) = fs::read_to_string(&self.lane_pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        }
+    }
+}
+
+/// Wait (bounded) until the process has exited and is only waiting to be reaped
+/// (its parent is stopped) or is gone: a condition, not a delay.
+fn wait_exited(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let out = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "pid {pid} never exited");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Signal "name" arrives while bench_paired is stopped and the gate lane's block_call-th run is held
+/// until a release file exists (a file, not a FIFO: the hosted sandbox denies mkfifo); the lane is
+/// released and has exited before bench_paired continues, so the signal is delivered after the
+/// lane ended and before bench_paired has looked at it. No timing involved.
 fn signal_after_gate_call_ended(
     tag: &str,
     block_call: u32,
@@ -864,41 +914,47 @@ fn signal_after_gate_call_ended(
 ) -> (std::process::ExitStatus, PathBuf, Scratch) {
     let keep = scratch(tag);
     let d = keep.to_path_buf();
-    let fifo = d.join("release");
-    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let release = d.join("release");
     let up = d.join("up");
+    let gate_pid = d.join("gate.pid");
     let count = d.join("count");
     let gate = script(
         &d,
         "gate",
         &format!(
-            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo up > '{u}'; cat '{f}' > /dev/null; fi",
+            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo $$ > '{p}'; echo up > '{u}'; while [ ! -e '{f}' ]; do sleep 0.02; done; fi",
             c = count.display(),
             k = block_call,
+            p = gate_pid.display(),
             u = up.display(),
-            f = fifo.display()
+            f = release.display()
         ),
     );
     let b_ran = d.join("b_ran");
     let b = script(&d, "b", &format!("echo ran > '{}'\necho METRIC m 2", b_ran.display()));
     let out_json = d.join("o.json");
-    let mut child = spawn_bp(strs(&[
-        "--format",
-        "metrics",
-        "--rounds=2",
-        "--lane-timeout=120",
-        &format!("--out={}", out_json.display()),
-        &format!("gate={}", gate.display()),
-        &format!("b={}", b.display()),
-    ]));
-    wait_for_file(&mut child, &up, "the gating lane never reached its block");
+    let mut reaper = Reaper {
+        child: spawn_bp(strs(&[
+            "--format",
+            "metrics",
+            "--rounds=2",
+            "--lane-timeout=120",
+            &format!("--out={}", out_json.display()),
+            &format!("gate={}", gate.display()),
+            &format!("b={}", b.display()),
+        ])),
+        lane_pid_file: gate_pid.clone(),
+    };
+    let child = &mut reaper.child;
+    wait_for_file(child, &up, "the gating lane never reached its block");
     signal_pid(child.id(), "STOP");
     wait_stopped(child.id());
     signal_pid(child.id(), name);
-    // Opening the FIFO for writing returns once the lane's cat has it open for reading.
-    drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    fs::write(&release, "").unwrap();
+    let gate_pid: u32 = fs::read_to_string(&gate_pid).unwrap().trim().parse().unwrap();
+    wait_exited(gate_pid);
     signal_pid(child.id(), "CONT");
-    let status = wait_exit(&mut child);
+    let status = wait_exit(child);
     (status, d, keep)
 }
 

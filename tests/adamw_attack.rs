@@ -267,15 +267,71 @@ fn empties(rt: &Arc<GpuRuntime>) -> (Tensor, Tensor, Tensor, Tensor) {
 fn an_empty_tensor_refuses_every_bad_hyperparameter_and_encodes_nothing() {
     with_gpu(|rt| {
         let bad: Vec<(&str, AdamWHyper, u64, f32)> = vec![
-            ("eps underflow", AdamWHyper { eps: 1e-50, ..AdamWHyper::default() }, 1, 0.0),
-            ("grad_scale NaN", AdamWHyper { grad_scale: f64::NAN, ..AdamWHyper::default() }, 1, 0.0),
-            ("grad_scale overflow", AdamWHyper { grad_scale: 1e300, ..AdamWHyper::default() }, 1, 0.0),
+            (
+                "eps underflow",
+                AdamWHyper {
+                    eps: 1e-50,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
+            (
+                "grad_scale NaN",
+                AdamWHyper {
+                    grad_scale: f64::NAN,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
+            (
+                "grad_scale overflow",
+                AdamWHyper {
+                    grad_scale: 1e300,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
             ("step 0", AdamWHyper::default(), 0, 0.0),
             ("wd NaN", AdamWHyper::default(), 1, f32::NAN),
-            ("wd overflow", AdamWHyper { lr: 1e20, ..AdamWHyper::default() }, 1, 1e30),
-            ("lr overflow", AdamWHyper { lr: 1e300, ..AdamWHyper::default() }, 1, 0.0),
-            ("beta1 = 1", AdamWHyper { beta1: 1.0, ..AdamWHyper::default() }, 1, 0.0),
-            ("eps 0", AdamWHyper { eps: 0.0, ..AdamWHyper::default() }, 1, 0.0),
+            (
+                "wd overflow",
+                AdamWHyper {
+                    lr: 1e20,
+                    ..AdamWHyper::default()
+                },
+                1,
+                1e30,
+            ),
+            (
+                "lr overflow",
+                AdamWHyper {
+                    lr: 1e300,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
+            (
+                "beta1 = 1",
+                AdamWHyper {
+                    beta1: 1.0,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
+            (
+                "eps 0",
+                AdamWHyper {
+                    eps: 0.0,
+                    ..AdamWHyper::default()
+                },
+                1,
+                0.0,
+            ),
         ];
         for (what, hyper, at, wd) in bad {
             let (mut p, g, mut m, mut v) = empties(rt);
@@ -319,7 +375,10 @@ fn probe_subnormal_eps_zero_gradient_step_one_parameter_value() {
     match run(&hyper, 1, 0.0, 0.0) {
         Ok(after) => {
             eprintln!("PROBE accepted; parameter after = {after:?}");
-            assert!(after.iter().all(|x| x.is_finite()), "parameter went non-finite: {after:?}");
+            assert!(
+                after.iter().all(|x| x.is_finite()),
+                "parameter went non-finite: {after:?}"
+            );
         }
         Err(e) => eprintln!("PROBE refused: {e}"),
     }

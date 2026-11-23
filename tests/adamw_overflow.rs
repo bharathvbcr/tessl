@@ -181,7 +181,10 @@ fn a_subnormal_eps_is_refused() {
         };
         let (result, dispatched, before, after) = step(rt, &hyper, 1, 0.0);
         let err = result.expect_err("a subnormal eps must be refused");
-        assert!(err.contains("adamw_step") && err.contains("1e-40") && err.contains("subnormal"), "{err}");
+        assert!(
+            err.contains("adamw_step") && err.contains("1e-40") && err.contains("subnormal"),
+            "{err}"
+        );
         assert_eq!(dispatched, 0, "a refused step must encode nothing");
         assert_eq!(after, before, "the parameter moved");
     });

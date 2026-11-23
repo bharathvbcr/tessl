@@ -61,6 +61,8 @@
 
 use std::sync::Arc;
 
+use objc2_metal::{MTLResource, MTLStorageMode};
+
 use crate::dispatch::{dispatch_1d, set_gpu_buf, set_u32};
 use crate::nn::{require, require_disjoint_writes, QuantShape};
 use crate::runtime::GpuRuntime;
@@ -176,6 +178,14 @@ fn plan(
     require::<u16>(rt, bank.biases, groups, format_args!("{entry} biases"))?;
     require::<u16>(rt, out, elems, format_args!("{entry} out"))?;
     require::<u32>(rt, fault, 1, format_args!("{entry} fault"))?;
+    // `check_dequant_affine_fault` reads this word on the host, so storage the CPU
+    // cannot map is refused here, not after the dispatch has been encoded.
+    let mode = fault.metal().storageMode();
+    if mode != MTLStorageMode::Shared && mode != MTLStorageMode::Managed {
+        return Err(format!(
+            "{entry} fault: the buffer's storage is GPU-private ({mode:?}), so the host cannot read the fault word"
+        ));
+    }
     require_disjoint_writes(
         entry,
         &[("out", out), ("fault", fault)],

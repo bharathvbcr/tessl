@@ -1,5 +1,6 @@
 //! Attack on `adamw_step`'s hyperparameter checks (lane F, 3ce999f): hyperparameters at and past the
-//! limits of an f32 word, the empty-tensor path, and the device's subnormal flush.
+//! limits of an f32 word, the empty-tensor path, and the device's subnormal flush (a subnormal eps
+//! is refused: the host requires a normal f32 eps, `w[6].is_normal()`).
 //!
 //! The property most cases check is "refused, or the parameter stays finite": a step that is
 //! accepted must not poison a parameter.
@@ -58,8 +59,8 @@ fn accepted_and_finite(hyper: AdamWHyper, at: u64, weight_decay: f32, g: f32) ->
 
 // ---------------------------------------------------------------- subnormal eps ---
 
-/// A subnormal eps survives the host's non-zero test (`w[6] == 0.0`) but the device flushes it to
-/// zero, so a zero gradient gives `0 / (0 + 0)`: NaN in every parameter.
+/// A subnormal eps would be flushed to zero by the device, so a zero gradient would give
+/// `0 / (0 + 0)`: NaN in every parameter. The host refuses it (`!w[6].is_normal()`).
 #[test]
 fn subnormal_eps_with_a_zero_gradient_does_not_poison_the_parameter() {
     refused_or_finite(

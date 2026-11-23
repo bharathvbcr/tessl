@@ -9,7 +9,9 @@
 //! `Backend::adamw_step`, and tessl keeps the kernels and this launcher
 //! (no ojas crate imports it: `ojas-metal` compiles the shared
 //! `kernels/qwen35_adamw_math.h` into its own kernel, and `ojas-cuda`'s host
-//! scalars mirror this file's checks).
+//! scalars mirror this file's overflow checks but not its eps rule: ojas-cuda
+//! builds with `--ftz=false`, so it accepts a subnormal eps on purpose, which
+//! this Metal launcher refuses).
 //!
 //! The update is `torch.optim.AdamW`'s single-tensor path with `amsgrad` and
 //! `maximize` off: the step count increments first, the bias corrections and
@@ -136,6 +138,11 @@ fn on_runtime(rt: &GpuRuntime, t: &Tensor) -> bool {
 /// Step 0 is refused: it is what `u64::MAX + 1` wraps to, and it zeroes the
 /// bias correction. The caller increments with `checked_add` and refuses
 /// `u64::MAX` before calling.
+///
+/// Also refused, before anything is encoded: a hyperparameter whose f32 word
+/// overflows, and an `eps` that is not a normal f32 (zero or subnormal, below
+/// `f32::MIN_POSITIVE`), because the device flushes subnormals to 0 and a zero
+/// denominator turns a zero second moment into NaN or infinity.
 ///
 /// The update is encoded and not waited on. Call [`GpuRuntime::synchronize`]
 /// before reading the tensors on the host. A later kernel on `rt` is ordered

@@ -458,13 +458,26 @@ pub fn host_rms(x: &[f64], w: Option<&[f32]>, eps: f64) -> Vec<f64> {
         .collect()
 }
 
-/// The largest `|got - want|` over two outputs that must be the same length,
-/// non-empty and finite: the one comparator the benchmark binaries share, so a
-/// gate cannot be passed by a NaN or by two empty slices. A NaN is not skipped
-/// (`f64::max` would drop it and report the worst of the rest), an empty pair
-/// has no worst element to report, and a length mismatch means the two
-/// outputs are not the same product. Every error names `lane`.
-pub fn max_abs_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
+/// A tolerance no finite difference exceeds: [`check_against`] with it as `abs`
+/// (whatever `rel` is) only measures the worst difference. A NaN tolerance is
+/// still refused.
+pub const UNBOUNDED: f64 = f64::INFINITY;
+
+/// `got` against `want` (the reference, f32 or f64), each element within
+/// `abs + rel * |want|`; returns the largest `|got - want|`. The one
+/// comparator the benchmark binaries share, so a gate cannot be passed by a NaN
+/// or by two empty slices: a NaN on either side is refused (`f64::max` would
+/// drop it and report the worst of the rest), an empty pair has no worst
+/// element to report, and a length mismatch means the two outputs are not the
+/// same product (`zip` would stop at the shorter). On a tolerance failure the
+/// error names the element furthest out of tolerance. Every error names `lane`.
+pub fn check_against<W: Copy + Into<f64>>(
+    lane: &str,
+    got: &[f32],
+    want: &[W],
+    abs: f64,
+    rel: f64,
+) -> Result<f64, String> {
     if got.is_empty() || want.is_empty() {
         return Err(format!(
             "{lane}: nothing to compare ({} values against {})",
@@ -476,20 +489,38 @@ pub fn max_abs_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String
         return Err(format!("{lane}: {} values against {}", got.len(), want.len()));
     }
     let mut worst = 0.0f64;
+    // The element furthest outside its tolerance: (index, excess, got, want).
+    let mut out: Option<(usize, f64, f64, f64)> = None;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let (g, w) = (f64::from(g), w.into());
         if !g.is_finite() || !w.is_finite() {
             return Err(format!("{lane}: element {i} is {g} against {w} (not finite)"));
         }
-        worst = worst.max((f64::from(g) - f64::from(w)).abs());
+        let diff = (g - w).abs();
+        worst = worst.max(diff);
+        // An UNBOUNDED `abs` accepts every finite element whatever `rel` is:
+        // `inf + rel * |w|` is already infinite, but `rel` itself UNBOUNDED
+        // against a zero reference would make `inf * 0` a NaN that fails it.
+        let tol = if abs == UNBOUNDED { abs } else { abs + rel * w.abs() };
+        let excess = diff - tol;
+        // A NaN tolerance (`excess` NaN) fails every element, as it always did.
+        if (excess.is_nan() || excess > 0.0) && out.is_none_or(|(_, e, _, _)| excess.is_nan() || excess > e) {
+            out = Some((i, excess, g, w));
+        }
     }
-    Ok(worst)
+    match out {
+        None => Ok(worst),
+        Some((i, _, g, w)) => Err(format!(
+            "{lane}: element {i} is {g}, host reference {w} (tolerance {abs:e} + {rel:e} * |ref|)"
+        )),
+    }
 }
 
-/// [`max_abs_diff`] over the largest magnitude of `want`: the scale-free
+/// The worst difference over the largest magnitude of `want`: the scale-free
 /// measure a bound is stated in. An all-zero `want` has no scale and is
 /// refused (a reference that is all zero is a kernel that wrote nothing).
 pub fn max_rel_diff(lane: &str, got: &[f32], want: &[f32]) -> Result<f64, String> {
-    let worst = max_abs_diff(lane, got, want)?;
+    let worst = check_against(lane, got, want, UNBOUNDED, 0.0)?;
     let scale = want.iter().fold(0.0f64, |m, &w| m.max(f64::from(w).abs()));
     if scale == 0.0 {
         return Err(format!(
@@ -517,29 +548,6 @@ pub fn check_lane_output(lane: &str, out: &[f32]) -> Result<(), String> {
         return Err(format!("{lane}: all {} elements are zero", out.len()));
     }
     Ok(())
-}
-
-/// `got` against `want` (f64 host reference), each element within `abs + rel *
-/// |want|`; names the worst element on failure.
-pub fn check_against(lane: &str, got: &[f32], want: &[f64], abs: f64, rel: f64) -> Result<(), String> {
-    if got.len() != want.len() {
-        return Err(format!("{lane}: {} elements, expected {}", got.len(), want.len()));
-    }
-    let mut worst: Option<(usize, f64, f64)> = None;
-    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        let excess = (f64::from(g) - w).abs() - (abs + rel * w.abs());
-        // A NaN element (`excess` NaN) is always a failure.
-        if (excess.is_nan() || excess > 0.0) && worst.is_none_or(|(_, e, _)| excess.is_nan() || excess > e) {
-            worst = Some((i, excess, f64::from(g)));
-        }
-    }
-    match worst {
-        None => Ok(()),
-        Some((i, _, g)) => Err(format!(
-            "{lane}: element {i} is {g}, host reference {} (tolerance {abs:e} + {rel:e} * |ref|)",
-            want[i]
-        )),
-    }
 }
 
 /// Time `dispatch` (`warmup` untimed rounds, then `iters` timed ones, each
@@ -751,9 +759,12 @@ pub fn jstr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        fill, fill_affine, incomplete_line, max_abs_diff, max_rel_diff, median, parse_count, ratio_stats, round_order,
-        run_paired, self_spread, Arm,
+        check_against, fill, fill_affine, incomplete_line, max_rel_diff, median, parse_count, ratio_stats, round_order,
+        run_paired, self_spread, Arm, UNBOUNDED,
     };
+
+    /// An empty reference: `&[]` alone does not say which element type.
+    const NONE: &[f32] = &[];
 
     /// The comparator every bench gate shares fails on what the retired
     /// `fold(0.0, f64::max)` copies passed: a NaN (dropped by `max`), two empty
@@ -761,20 +772,25 @@ mod tests {
     /// stops at the shorter).
     #[test]
     fn diff_comparators_fail_on_nan_empty_and_length_mismatch() {
-        assert_eq!(max_abs_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.5, 4.0]).unwrap(), 0.5);
+        assert_eq!(
+            check_against("t", &[1.0, 2.0, 4.0], &[1.0, 2.5, 4.0], UNBOUNDED, 0.0).unwrap(),
+            0.5
+        );
         assert_eq!(max_rel_diff("t", &[1.0, 2.0, 4.0], &[1.0, 2.0, 5.0]).unwrap(), 0.2);
-        assert!(max_abs_diff("t", &[1.0, f32::NAN], &[1.0, 2.0])
+        assert!(check_against("t", &[1.0, f32::NAN], &[1.0, 2.0], UNBOUNDED, 0.0)
             .unwrap_err()
             .contains("not finite"));
-        assert!(max_abs_diff("t", &[1.0, 2.0], &[f32::NAN, 2.0])
+        assert!(check_against("t", &[1.0, 2.0], &[f32::NAN, 2.0], UNBOUNDED, 0.0)
             .unwrap_err()
             .contains("not finite"));
-        assert!(max_abs_diff("t", &[f32::INFINITY], &[f32::INFINITY]).is_err());
-        assert!(max_abs_diff("t", &[], &[]).unwrap_err().contains("nothing to compare"));
-        assert!(max_abs_diff("t", &[1.0], &[])
+        assert!(check_against("t", &[f32::INFINITY], &[f32::INFINITY], UNBOUNDED, 0.0).is_err());
+        assert!(check_against("t", &[], NONE, UNBOUNDED, 0.0)
             .unwrap_err()
             .contains("nothing to compare"));
-        assert!(max_abs_diff("t", &[1.0, 2.0], &[1.0])
+        assert!(check_against("t", &[1.0], NONE, UNBOUNDED, 0.0)
+            .unwrap_err()
+            .contains("nothing to compare"));
+        assert!(check_against("t", &[1.0, 2.0], &[1.0], UNBOUNDED, 0.0)
             .unwrap_err()
             .contains("2 values against 1"));
         assert!(max_rel_diff("t", &[0.0, 0.0], &[0.0, 0.0])
@@ -782,7 +798,32 @@ mod tests {
             .contains("all zero"));
         assert!(max_rel_diff("t", &[f32::NAN], &[1.0]).is_err());
         // The lane is named in every refusal.
-        assert!(max_abs_diff("the-lane", &[], &[]).unwrap_err().starts_with("the-lane:"));
+        assert!(check_against("the-lane", &[], NONE, UNBOUNDED, 0.0)
+            .unwrap_err()
+            .starts_with("the-lane:"));
+        // The same refusals hold under a finite tolerance, which used to pass two
+        // empty slices (no element to be out of tolerance) and called a NaN an
+        // element out of tolerance rather than a value that cannot be compared;
+        // the reference may be f64.
+        assert!(check_against("t", &[], NONE, 1.0, 0.0)
+            .unwrap_err()
+            .contains("nothing to compare"));
+        assert!(check_against("t", &[f32::NAN], &[1.0f64], 1.0, 0.0)
+            .unwrap_err()
+            .contains("not finite"));
+        assert!(check_against("t", &[1.0], &[f64::NAN], 1.0, 0.0)
+            .unwrap_err()
+            .contains("not finite"));
+        // Within `abs + rel * |want|` the worst difference is returned; outside it
+        // the element furthest out is named.
+        assert_eq!(
+            check_against("t", &[1.0, 2.5], &[1.0f64, 2.0], 0.25, 0.25).unwrap(),
+            0.5
+        );
+        assert!(check_against("t", &[1.0], &[1.0f64], f64::NAN, 0.0).is_err());
+        assert!(check_against("t", &[1.0], &[1.0f64], 0.5, f64::NAN).is_err());
+        let e = check_against("t", &[1.0, 3.0, 9.0], &[1.0f64, 2.0, 2.0], 0.5, 0.0).unwrap_err();
+        assert!(e.contains("element 2 is 9, host reference 2"), "{e}");
     }
 
     #[test]

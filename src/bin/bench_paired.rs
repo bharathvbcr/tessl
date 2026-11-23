@@ -798,6 +798,9 @@ fn run_lane(
     o: &Options,
     archive: Option<&Archive>,
 ) -> Res<LaneRun> {
+    if let Some(sig) = proc::pending_signal() {
+        return Err(format!("interrupted by signal {sig}"));
+    }
     let mut cmd = Command::new(&lane.argv[0]);
     cmd.args(&lane.argv[1..]).env_clear().envs(env);
     let (started, load) = (evidence::utc_now(), evidence::load_snapshot());
@@ -1331,6 +1334,12 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         }
     }
     let mut archive = o.out.as_deref().map(Archive::create).transpose()?;
+    if archive.is_some() {
+        // A terminal signal now ends the lane in flight and unwinds, so the
+        // staged archive is settled (`keep_failed`) and not left as a
+        // `.lanes.staging-*` directory; `main` then dies of the signal.
+        proc::defer_fatal_signals();
+    }
     let mut provenance = None;
     let mut hashes = Vec::new();
     if o.evidence {
@@ -1473,6 +1482,14 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
         }
         let doc = Jv::Obj(doc);
         let mut write_json = || -> Res<()> {
+            // The last look before anything is published, from inside the
+            // commit so that an archive already moved into place goes back to
+            // staging: a run that is ending of a signal leaves no result that
+            // looks complete. `keep_failed` then keeps its evidence as an
+            // interrupted lane's, and `main` dies of the signal.
+            if let Some(sig) = proc::pending_signal() {
+                return Err(format!("interrupted by signal {sig} before publishing"));
+            }
             match publisher.as_mut() {
                 Some(p) => {
                     p.publish(&doc)?;
@@ -1502,7 +1519,13 @@ fn real_main(args: &[String]) -> Result<(), Fail> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match real_main(&args) {
+    let result = real_main(&args);
+    // `real_main`'s locals are gone, the archive settled: now die of the signal.
+    if let Some(sig) = proc::pending_signal() {
+        eprintln!("bench_paired: interrupted by signal {sig}");
+        proc::die_of_pending_signal();
+    }
+    match result {
         Ok(()) => {}
         Err(Fail::Usage(e)) => {
             eprintln!("bench_paired: {e}");
@@ -2281,5 +2304,68 @@ mod tests {
         assert!(proc::exited_unreaped(pid).unwrap(), "a second look still sees the exit");
         child.wait().unwrap();
         assert!(!alive(pid));
+    }
+
+    /// a group id stays reserved while the group has members (POSIX: a pid
+    /// is not reused while a process group with that id exists), so a leader reaped
+    /// behind the Child's back does not make its group someone else's. The
+    /// descendants are still ours to end: stop_group must kill them, as it did
+    /// before the ECHILD early return. The sleeper holds the pipe's write end, so
+    /// the read end reaching EOF is the observation of its death.
+    #[test]
+    fn a_group_with_live_members_is_ended_after_its_leader_was_reaped_elsewhere() {
+        use std::io::{BufRead, Read};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let d = scratch("reaped_leader_live");
+        let pidfile = d.join("sleep.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > '{}'; echo ready; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let sleeper: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let leader = child.id() as i32;
+        // SAFETY: both calls name the child this test spawned.
+        unsafe {
+            assert_eq!(libc::kill(leader, libc::SIGKILL), 0);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(leader, &mut status, 0), leader);
+        }
+        let slot = proc::Registered::reserve().unwrap();
+        proc::stop_group(&mut child, &slot);
+        let mut fds = [libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one valid pollfd; the timeout only bounds a failing run.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 5000) };
+        if ready == 0 {
+            // SAFETY: the sleep this test started.
+            unsafe { libc::kill(sleeper, libc::SIGKILL) };
+        }
+        assert!(ready > 0, "the group's last member (pid {sleeper}) outlived stop_group: its leader was reaped, but the group still had a member");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// UNBOUNDED named as the tolerance, passed for both abs and rel: the
+    /// measure-only setting accepts every finite element whatever the reference
+    /// is (a zero reference must not turn `inf * 0` into a NaN that fails it).
+    #[test]
+    fn unbounded_for_both_tolerances_measures_a_zero_reference_instead_of_refusing_it() {
+        let r = common::check_against("t", &[1.0, 2.0], &[0.0f64, 1.0], common::UNBOUNDED, common::UNBOUNDED);
+        assert_eq!(r, Ok(1.0), "UNBOUNDED as abs and rel: {r:?}");
     }
 }

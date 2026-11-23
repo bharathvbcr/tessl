@@ -1427,7 +1427,7 @@ fn mode_stages() -> Result<(), String> {
             .zip(&lib.embeddings)
             .filter(|(x, y)| x.to_bits() == y.to_bits())
             .count();
-        let max_abs = common::max_abs_diff(&name, &mine, &lib.embeddings)?;
+        let max_abs = common::check_against(&name, &mine, &lib.embeddings, common::UNBOUNDED, 0.0)?;
         eprintln!(
             "{name}: replica vs encode: {bit_equal}/{} values bit-equal, max abs diff {max_abs:e}",
             mine.len()

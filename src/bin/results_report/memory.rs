@@ -773,23 +773,45 @@ fn time_verdict(paired: &[Paired<'_>]) -> Result<usize, String> {
     Ok(paired.len())
 }
 
+/// A refusal reason as it is printed in a one-line bullet: the reasons are built
+/// from the rounds' own series and workload names, so one can hold a line break
+/// (shown as a visible `\n`, so nothing is lost) or be empty (shown as
+/// `(no reason given)`, not as a dangling colon).
+fn one_line(why: &str) -> String {
+    if why.trim().is_empty() {
+        return "(no reason given)".to_string();
+    }
+    why.replace('\r', "\\r").replace('\n', "\\n")
+}
+
 /// The closing lines: each claim the data decides is printed as the script wrote
 /// it when the data holds, and as a refusal naming the failing part when not.
 fn reading(bits: &Result<(), String>, memory: &Result<(), String>, time: &Result<usize, String>) -> Vec<String> {
     let mut out: Vec<String> = READING_HEAD.iter().map(|s| s.to_string()).collect();
     match memory {
         Ok(()) => out.extend(READING_MEMORY_HOLDS.iter().map(|s| s.to_string())),
-        Err(why) => out.push(format!("  * Memory (NOT met): B2 does not hold on these rounds: {why}")),
+        Err(why) => out.push(format!(
+            "  * Memory (NOT met): B2 does not hold on these rounds: {}",
+            one_line(why)
+        )),
     }
     match bits {
         Ok(()) => out.extend(READING_BITS_HOLDS.iter().map(|s| s.to_string())),
         Err(why) => out.push(format!(
-            "  * Output bits (NOT met): B1 does not hold on these rounds: {why}"
+            "  * Output bits (NOT met): B1 does not hold on these rounds: {}",
+            one_line(why)
         )),
     }
     out.extend(READING_PLE_BOUND.iter().map(|s| s.to_string()));
     match time {
-        Err(_) => out.extend(READING_TIME_NOT_MET.iter().map(|s| s.to_string())),
+        Err(why) => {
+            // The canned prose is the script's; the refusal is what these rounds say.
+            out.push(format!(
+                "  * Time against 16f5190 (B3), refused on these rounds: {}",
+                one_line(why)
+            ));
+            out.extend(READING_TIME_NOT_MET.iter().map(|s| s.to_string()));
+        }
         Ok(series) => out.push(format!(
             "  * Time against 16f5190 (B3): met on the registered statistic: the median of per-round ratios is at most {MIB_BOUND} at every workload of the {series} paired series."
         )),
@@ -842,3 +864,53 @@ const READING_WHY: &[&str] = &[
     "    (66 extra dispatches of a few us each, against 372 in a forward and hundreds of ms), the alias changes which buffer a GEMM writes, not what it computes,",
     "    and the early release moves buffer ownership, not GPU work.",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::reading;
+
+    /// The refusal quoted in the reading comes from the rounds' own series and
+    /// workload names, so it can hold a newline or be empty; each element of the
+    /// reading is one printed line and an empty refusal must not leave a dangling
+    /// colon. The memory (B2), bits (B1) and time (B3) arms share the shape. Every
+    /// case is checked before the test fails, so the empty reason is never
+    /// skipped behind a failing newline case.
+    #[test]
+    fn a_refusal_with_a_newline_or_nothing_stays_one_line() {
+        let mut bad = Vec::new();
+        for (why, shown) in [
+            (
+                "series x\ny: median 1.5 over 1.03",
+                "series x\\ny: median 1.5 over 1.03",
+            ),
+            ("a\r\nb", "a\\r\\nb"),
+            ("", "(no reason given)"),
+            ("  \n ", "(no reason given)"),
+        ] {
+            let err = Err(why.to_string());
+            for (arm, marker, lines) in [
+                ("memory", "B2 does not hold", reading(&Ok(()), &err, &Ok(1))),
+                ("bits", "B1 does not hold", reading(&err, &Ok(()), &Ok(1))),
+                (
+                    "time",
+                    "(B3), refused",
+                    reading(&Ok(()), &Ok(()), &Err(why.to_string())),
+                ),
+            ] {
+                let Some(bullet) = lines.iter().find(|l| l.contains(marker)) else {
+                    bad.push(format!("{arm} {why:?}: no bullet with {marker:?}"));
+                    continue;
+                };
+                if bullet.contains('\n') || bullet.contains('\r') {
+                    bad.push(format!("{arm} {why:?}: a line break split the bullet: {bullet:?}"));
+                }
+                if !bullet.ends_with(shown) {
+                    bad.push(format!(
+                        "{arm} {why:?}: the bullet does not end with {shown:?}: {bullet:?}"
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} problems:\n{}", bad.len(), bad.join("\n"));
+    }
+}

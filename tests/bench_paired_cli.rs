@@ -690,6 +690,282 @@ fn a_timed_out_lane_is_killed_with_its_children_and_named_with_its_round() {
     assert!(!alive, "the lane's child {pid} survived the timeout");
 }
 
+/// An interrupted run settles its staged archive instead of leaving a
+/// `.lanes.staging-*` directory behind, and still dies of the signal. The lane
+/// signals that it is running by writing a file; the test waits for that file,
+/// interrupts the `bench_paired` it spawned and waits for it to exit, so
+/// nothing here depends on timing (the lane timeout only bounds a hang).
+#[test]
+fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let d = scratch("interrupt");
+    let started = d.join("started");
+    let sleeper_pid = d.join("sleeper.pid");
+    // The lane's own child outlives a plain kill of the lane, so its death is what
+    // shows the interrupt ended the lane's whole group. The pid file is written
+    // before `started`, which is what the test waits for.
+    let hang = script(
+        &d,
+        "hang",
+        &format!(
+            "sleep 300 &\necho $! > '{}'\necho started > '{}'\nwait",
+            sleeper_pid.display(),
+            started.display()
+        ),
+    );
+    let out_json = d.join("o.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+        .args(strs(&[
+            "--format",
+            "metrics",
+            "--rounds=2",
+            "--lane-timeout=120",
+            &format!("--out={}", out_json.display()),
+            &format!("ok={}", metric_bin(&d, "ok", "1").display()),
+            &format!("hang={}", hang.display()),
+        ]))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(100);
+    while !started.exists() {
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the lane never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sleeper: i32 = fs::read_to_string(&sleeper_pid).unwrap().trim().parse().unwrap();
+    let sent = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(2), "the run did not die of SIGINT: {status:?}");
+    // The group kill reaches the sleeper before bench_paired dies; launchd reaps it.
+    let alive = |pid: i32| {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(sleeper) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(sleeper);
+    if survived {
+        // The sleep this test's own lane script started.
+        let _ = Command::new("kill").args(["-KILL", &sleeper.to_string()]).status();
+    }
+    assert!(!survived, "the lane's child {sleeper} survived the interrupt");
+    let mut left: Vec<String> = fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("o.json"))
+        .collect();
+    left.sort();
+    assert!(
+        left.iter().all(|n| !n.contains(".staging-")),
+        "a staging dir was left behind: {left:?}"
+    );
+    // No earlier JSON, so the interrupted run's lane output takes the final name.
+    assert_eq!(left, ["o.json.lanes"], "{left:?}");
+    assert!(
+        fs::read_dir(d.join("o.json.lanes")).unwrap().count() > 0,
+        "the interrupted run's lane output was not kept"
+    );
+}
+
+fn signal_pid(pid: u32, name: &str) {
+    let sent = Command::new("kill")
+        .args([format!("-{name}"), pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -{name} {pid}");
+}
+
+/// Wait (bounded) until the lane has written its marker; fail if the run is already over.
+fn wait_for_file(child: &mut std::process::Child, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(100);
+    while !path.exists() {
+        if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Wait (bounded) until the child this test spawned is in the stopped state: a
+/// condition, not a delay. `waitpid` with `WUNTRACED` reports the stop to the parent;
+/// `ps` would do too, but the hosted sandbox denies running it.
+fn wait_stopped(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this test process; `status` is a valid out-parameter.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        assert!(r >= 0, "waitpid {pid}: {}", std::io::Error::last_os_error());
+        if r == pid as libc::pid_t {
+            assert!(
+                libc::WIFSTOPPED(status),
+                "pid {pid} ended instead of stopping: status {status}"
+            );
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "pid {pid} never stopped");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait (bounded) for the child this test spawned to end; kill it if it hangs.
+fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bench_paired did not exit after the signal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn names_with_prefix(d: &Path, prefix: &str) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    v.sort();
+    v
+}
+
+fn spawn_bp(args: Vec<String>) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// Owns the `bench_paired` a test stopped and its gate lane, and ends both when
+/// dropped, on every path including a panic: a stopped process is not ended by its
+/// parent dying, so without this a failing run leaves it (and the lane's shell
+/// loop) behind for good. Signals only the pids this test spawned: the child, and
+/// the lane pid its own gate script recorded.
+struct Reaper {
+    child: std::process::Child,
+    lane_pid_file: PathBuf,
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        // Already reaped (the test ran to its end): nothing is left, and the pids
+        // may be recycled. No assertions here: a panic in drop aborts.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-CONT", &self.child.id().to_string()])
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(pid) = fs::read_to_string(&self.lane_pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        }
+    }
+}
+
+/// Signal "name" arrives while bench_paired is stopped and the gate lane's block_call-th run is held
+/// until a release file exists (a file, not a FIFO: the hosted sandbox denies mkfifo); the lane is
+/// released and has exited before bench_paired continues, so the signal is delivered after the
+/// lane ended and before bench_paired has looked at it. No timing involved.
+fn signal_after_gate_call_ended(
+    tag: &str,
+    block_call: u32,
+    name: &str,
+) -> (std::process::ExitStatus, PathBuf, Scratch) {
+    let keep = scratch(tag);
+    let d = keep.to_path_buf();
+    let release = d.join("release");
+    let up = d.join("up");
+    let gate_pid = d.join("gate.pid");
+    let gate_done = d.join("gate.done");
+    let count = d.join("count");
+    let gate = script(
+        &d,
+        "gate",
+        &format!(
+            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo $$ > '{p}'; echo up > '{u}'; while [ ! -e '{f}' ]; do sleep 0.02; done; echo done > '{x}'; fi",
+            c = count.display(),
+            k = block_call,
+            p = gate_pid.display(),
+            u = up.display(),
+            f = release.display(),
+            x = gate_done.display()
+        ),
+    );
+    let b_ran = d.join("b_ran");
+    let b = script(&d, "b", &format!("echo ran > '{}'\necho METRIC m 2", b_ran.display()));
+    let out_json = d.join("o.json");
+    let mut reaper = Reaper {
+        child: spawn_bp(strs(&[
+            "--format",
+            "metrics",
+            "--rounds=2",
+            "--lane-timeout=120",
+            &format!("--out={}", out_json.display()),
+            &format!("gate={}", gate.display()),
+            &format!("b={}", b.display()),
+        ])),
+        lane_pid_file: gate_pid.clone(),
+    };
+    let child = &mut reaper.child;
+    wait_for_file(child, &up, "the gating lane never reached its block");
+    signal_pid(child.id(), "STOP");
+    wait_stopped(child.id());
+    signal_pid(child.id(), name);
+    fs::write(&release, "").unwrap();
+    // The lane's last act before it exits. Whether it has fully exited when the
+    // signal lands does not change the outcome under test (a lane killed instead
+    // of finished also ends the run without publishing), and `ps`, which would
+    // show the exit, cannot run in the hosted sandbox.
+    wait_for_file(&mut reaper.child, &gate_done, "the gating lane never finished");
+    let child = &mut reaper.child;
+    signal_pid(child.id(), "CONT");
+    let status = wait_exit(child);
+    (status, d, keep)
+}
+
+/// a signal that lands after the last lane ended and before the JSON is published.
+#[test]
+fn a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result() {
+    use std::os::unix::process::ExitStatusExt;
+    let (status, d, _keep) = signal_after_gate_call_ended("sig_publish", 2, "INT");
+    let left = names_with_prefix(&d, "o.json");
+    assert!(left.iter().all(|n| !n.contains(".staging-")), "{left:?}");
+    assert_eq!(status.signal(), Some(2), "{status:?}");
+    assert!(
+        !d.join("o.json").exists(),
+        "the run died of SIGINT yet published its result: {left:?}"
+    );
+}
+
 #[test]
 fn a_malformed_evidence_command_line_leaves_no_marker() {
     let d = scratch("nomarker");

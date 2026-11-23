@@ -227,6 +227,7 @@ READING (each claim labelled verified / inferred / unverified)
     21 per core, spread 1.75) was repeated with 12 rounds and read 1.005 / 0.991, so 16 MiB is the default. A first bf16 sweep at 1024-4096 rows ran at a
     load of 14-38 per core and gave min-of-N 1.047 at 32x32 with medians 0.90-0.96 (spreads 2.2-4.6): it was repeated once (spreads 1.04-1.10, ratios 0.98-1.00).
     The 64x32 f32 cell that read 1.045 and 1.074 in the two paired runs is not the PLE bound: the quiet sweep reads 0.993 / 0.984 there.
+  * Time against 16f5190 (B3), refused on these rounds: f32 1x16: median 1.486 over 1.03
   * Time against 16f5190 (B3): NOT met on the registered statistic, and the registered response (repeat) did not converge. Every series of
     the paired runs has a max/min round spread of 1.2 to 28 (the machine ran at 100 to 360 load average on 18 cores, with other lanes on the GPU),
     so the median over rounds of lane/before is not a stable statistic here: f32 medians 0.81-1.25 (1x16: 1.247 with a spread of 28), 2x4096 1.065 in the first run;

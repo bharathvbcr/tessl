@@ -43,6 +43,18 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGH
 /// disposition back and `SA_NODEFER` leaves the signal unblocked, so the
 /// `raise` ends the process with the original signal for the parent shell to see.
 extern "C" fn kill_children_and_die(sig: libc::c_int) {
+    kill_registered_groups();
+    // SAFETY: `raise` is async-signal-safe.
+    unsafe { libc::raise(sig) };
+}
+
+/// SIGKILL every registered child group. Async-signal-safe, so a handler may
+/// call it.
+pub fn kill_registered_groups() {
+    // A handler runs between any two instructions of the interrupted code, which
+    // may be about to read errno; `kill` (ESRCH for a group already gone) must
+    // not change what it sees.
+    let saved = errno();
     for slot in &ACTIVE_GROUPS {
         let group = slot.load(Ordering::Relaxed);
         if group > 0 {
@@ -51,8 +63,87 @@ extern "C" fn kill_children_and_die(sig: libc::c_int) {
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
     }
-    // SAFETY: `raise` is async-signal-safe.
-    unsafe { libc::raise(sig) };
+    set_errno(saved);
+}
+
+/// The calling thread's errno; reading it is async-signal-safe.
+fn errno() -> libc::c_int {
+    // SAFETY: the errno location is valid for the calling thread.
+    unsafe { *errno_location() }
+}
+
+fn set_errno(value: libc::c_int) {
+    // SAFETY: as in [`errno`].
+    unsafe { *errno_location() = value };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot; no preconditions.
+    unsafe { libc::__error() }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot; no preconditions.
+    unsafe { libc::__errno_location() }
+}
+
+/// The terminal signal [`defer_fatal_signals`] caught, 0 for none.
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn note_signal_and_kill_children(sig: libc::c_int) {
+    PENDING_SIGNAL.store(sig, Ordering::SeqCst);
+    kill_registered_groups(); // keeps errno
+}
+
+/// For a caller that has state to settle before it dies (`bench_paired`'s
+/// staged archive): from here on a terminal signal kills the registered child
+/// groups, as [`install_signal_handlers`] does, but the process lives on, with
+/// the signal recorded for [`pending_signal`]. The caller stops at its next
+/// look, unwinds so its `Drop`s run, and ends with [`die_of_pending_signal`],
+/// so its parent still sees the signal. `SA_RESETHAND` leaves a second signal
+/// its default action: it ends the process at once. A signal the process
+/// ignores (`nohup`) stays ignored.
+pub fn defer_fatal_signals() {
+    for sig in FATAL_SIGNALS {
+        // SAFETY: as in [`install_signal_handlers`].
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 || old.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = note_signal_and_kill_children as extern "C" fn(libc::c_int) as usize;
+            // SA_RESTART: the process goes on after this handler, so a blocking
+            // call it interrupted resumes instead of failing with EINTR (nothing
+            // in this process depends on seeing EINTR; the lane's pipes reach EOF
+            // because their group was just killed).
+            act.sa_flags = libc::SA_RESETHAND | libc::SA_NODEFER | libc::SA_RESTART;
+            libc::sigemptyset(&mut act.sa_mask);
+            libc::sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The signal [`defer_fatal_signals`] caught, if one arrived.
+pub fn pending_signal() -> Option<libc::c_int> {
+    match PENDING_SIGNAL.load(Ordering::SeqCst) {
+        0 => None,
+        sig => Some(sig),
+    }
+}
+
+/// End this process of the signal [`defer_fatal_signals`] caught, with its
+/// default action; returns when none arrived.
+pub fn die_of_pending_signal() {
+    if let Some(sig) = pending_signal() {
+        // SAFETY: restoring a default disposition and raising the signal on this process.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
 }
 
 /// Install [`kill_children_and_die`], once per process, for each of
@@ -82,11 +173,11 @@ fn install_signal_handlers() {
 }
 
 /// A claimed slot of [`ACTIVE_GROUPS`], released when dropped.
-struct Registered(usize);
+pub(crate) struct Registered(usize);
 
 impl Registered {
     /// Claim a free slot, or `None` when all are taken.
-    fn reserve() -> Option<Registered> {
+    pub(crate) fn reserve() -> Option<Registered> {
         ACTIVE_GROUPS
             .iter()
             .position(|s| s.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed).is_ok())
@@ -123,7 +214,7 @@ impl Drop for Registered {
 /// A process that leaves the group (`setsid`, `setpgid`) is not reached: the
 /// group is the only handle on a descendant. Nothing in this repository's
 /// suites does that.
-fn stop_group(child: &mut Child, slot: &Registered) {
+pub(crate) fn stop_group(child: &mut Child, slot: &Registered) {
     let group = -(child.id() as libc::pid_t);
     // SAFETY: `kill` takes a pid and a signal; the negated pid is the group of
     // the child spawned with `process_group(0)`, whose pid is its group id.

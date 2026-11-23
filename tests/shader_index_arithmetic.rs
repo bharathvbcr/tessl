@@ -12,6 +12,7 @@ const GEMV_Q4: &str = include_str!("../kernels/gemv_q4.metal");
 const GEMV_Q4_MLX: &str = include_str!("../kernels/gemv_q4_mlx.metal");
 const GEMM_Q4_MLX: &str = include_str!("../kernels/gemm_q4_mlx.metal");
 const CONV_RS: &str = include_str!("../src/conv.rs");
+const EMBEDGEMMA2_VISION_RS: &str = include_str!("../src/embedgemma2_vision.rs");
 const CONV2D_TENSOROPS: &str = include_str!("../kernels/conv2d_tensorops.metal");
 const GEMM_Q4_MLX_TENSOROPS: &str = include_str!("../kernels/gemm_q4_mlx_tensorops.metal");
 const GEMM_Q8_TENSOROPS: &str = include_str!("../kernels/gemm_q8_tensorops.metal");
@@ -1610,6 +1611,67 @@ fn conv2d_tensorops_ints_are_bounded_by_the_host_extent_guard() {
         "a new conv2d pipeline lookup must pass int_scratch"
     );
     assert!((i32::MAX as u64) < u64::from(u32::MAX));
+}
+
+/// `conv2d_nchw` checks its three fixed-size launches against the resolved pipelines before it
+/// allocates or encodes anything, and the check names the same constants the dispatches launch with.
+#[test]
+fn conv2d_checks_fixed_launch_geometry_before_encoding() {
+    let entry = CONV_RS
+        .split("pub fn conv2d_nchw(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("conv2d_nchw body");
+    let check = entry
+        .find("check_launch_limits(")
+        .expect("conv2d_nchw checks its launch geometry against the pipelines");
+    for later in ["alloc_tensor_unzeroed(", "with_binder("] {
+        assert!(
+            check < entry.find(later).expect("conv2d_nchw body has this step"),
+            "the launch-limit check must run before {later}"
+        );
+    }
+    let checked = &entry[check..];
+    let checked = &checked[..checked.find(")?;").expect("the check call ends")];
+    for (named, launched) in [
+        ("(&*weights_p, WEIGHTS_TG)", "mtl_size(WEIGHTS_TG, 1, 1)"),
+        ("(&*pack_p, PACK_TG.0 * PACK_TG.1)", "mtl_size(PACK_TG.0, PACK_TG.1, 1)"),
+        ("(&*tops_p, TOPS_TG)", "mtl_size(TOPS_TG, 1, 1)"),
+    ] {
+        assert!(checked.contains(named), "the launch check must cover {named}");
+        assert_eq!(
+            entry.matches(launched).count(),
+            1,
+            "the dispatch must launch with the checked size {launched}"
+        );
+    }
+    assert_eq!(
+        entry.matches("bnd.dispatch(").count(),
+        3,
+        "a new conv2d dispatch must be added to the launch-limit check"
+    );
+}
+
+/// The vision qkv/norm/rope launch assumes `SIMD_WIDTH`-lane simdgroups, so it verifies the
+/// pipeline's width before dispatching with that assumption.
+#[test]
+fn vision_qkv_norm_rope_checks_simd_width_before_dispatch() {
+    let entry = EMBEDGEMMA2_VISION_RS
+        .split("fn axial_qkv_norm_rope_to(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("axial_qkv_norm_rope_to body");
+    let check = entry
+        .find("check_simd_width(rt, &p, SIMD_WIDTH)")
+        .expect("axial_qkv_norm_rope_to checks the simdgroup width it launches with");
+    let launch = entry
+        .find("dispatch_2d_tg(")
+        .expect("axial_qkv_norm_rope_to dispatches");
+    assert!(check < launch, "the simd-width check must run before dispatch_2d_tg");
+    assert!(
+        entry[launch..].contains("SIMDGROUPS * SIMD_WIDTH"),
+        "the launch must use the same SIMD_WIDTH the check verified"
+    );
 }
 
 /// The emeans kernel forms its row, partition and histogram offsets in 64 bits

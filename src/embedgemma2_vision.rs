@@ -118,6 +118,9 @@
 
 use std::sync::Arc;
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState;
+
 use crate::config_json;
 use crate::dispatch::{dispatch_2d, dispatch_2d_tg, set_f32, set_gpu_buf, set_u32};
 use crate::embedgemma2::{
@@ -342,6 +345,7 @@ fn axial_qkv_norm_rope_to(
     )?;
     // One simdgroup per (row, head); eight per threadgroup.
     const SIMDGROUPS: usize = 8;
+    const SIMD_WIDTH: usize = 32;
     let units = rows as usize
         * (s.q_heads.div_ceil(ROPE_HEADS_PER_UNIT) + 2 * s.kv_heads.div_ceil(ROPE_HEADS_PER_UNIT)) as usize;
     let p = rt.pipeline(if bf16 {
@@ -349,7 +353,8 @@ fn axial_qkv_norm_rope_to(
     } else {
         "vision_qkv_norm_rope_f32"
     })?;
-    dispatch_2d_tg(rt, &p, units.div_ceil(SIMDGROUPS), 1, SIMDGROUPS * 32, |bnd| {
+    check_simd_width(rt, &p, SIMD_WIDTH)?;
+    dispatch_2d_tg(rt, &p, units.div_ceil(SIMDGROUPS), 1, SIMDGROUPS * SIMD_WIDTH, |bnd| {
         set_gpu_buf(bnd, proj.buf, 0);
         set_gpu_buf(bnd, q_norm_w, 1);
         set_gpu_buf(bnd, k_norm_w, 2);
@@ -1761,6 +1766,25 @@ impl EmbedGemma2VisionModel {
     }
 }
 
+/// Refuse a pipeline whose SIMD width is not `want`: a kernel that shuffles across a simdgroup and
+/// is launched as whole simdgroups of `want` lanes reads wrong lanes on any other width.
+fn check_simd_width(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    want: usize,
+) -> Result<(), String> {
+    let width = pipeline.threadExecutionWidth();
+    if width != want {
+        let name = rt
+            .pipeline_name(pipeline)
+            .unwrap_or_else(|| "<unnamed pipeline>".into());
+        return Err(format!(
+            "'{name}' is written for {want}-lane simdgroups but the pipeline's threadExecutionWidth is {width}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_pixel_len, pack_images, plan_pooling, VisionConfig, MAX_BATCH_PATCHES, MAX_IMAGES};
@@ -1899,5 +1923,23 @@ mod tests {
             "no multiplication overflow panic"
         );
         assert!(check_pixel_len("w", 4, 768, 4 * 768).is_ok());
+    }
+}
+
+/// Device tests, in a module of their own: `scripts/hosted_tests.txt` selects `tests::` as device-free.
+#[cfg(test)]
+mod device_tests {
+    use super::check_simd_width;
+
+    #[test]
+    fn a_pipeline_whose_simd_width_is_not_the_launch_width_is_refused() {
+        let rt = crate::runtime::GpuRuntime::new().expect("runtime");
+        let p = rt.pipeline("vision_qkv_norm_rope_f32").unwrap();
+        check_simd_width(&rt, &p, 32).expect("this device runs 32-lane simdgroups");
+        let err = check_simd_width(&rt, &p, 16).unwrap_err();
+        assert!(
+            err.contains("vision_qkv_norm_rope_f32") && err.contains("16-lane"),
+            "{err}"
+        );
     }
 }

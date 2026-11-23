@@ -7,7 +7,11 @@
 //! checkpoint reads of the moments retired with the Qwen3.5
 //! training step (ABI 14): ojas owns Metal training through the Tape and
 //! `Backend::adamw_step`, and tessl keeps the kernels and this launcher
-//! (`ojas-metal`'s legacy tiny step calls it).
+//! (no ojas crate imports it: `ojas-metal` compiles the shared
+//! `kernels/qwen35_adamw_math.h` into its own kernel, and `ojas-cuda`'s host
+//! scalars mirror this file's overflow checks but not its eps rule: ojas-cuda
+//! builds with `--ftz=false`, so it accepts a subnormal eps on purpose, which
+//! this Metal launcher refuses).
 //!
 //! The update is `torch.optim.AdamW`'s single-tensor path with `amsgrad` and
 //! `maximize` off: the step count increments first, the bias corrections and
@@ -30,6 +34,11 @@ pub struct AdamWHyper {
     pub lr: f64,
     pub beta1: f64,
     pub beta2: f64,
+    /// Added to the denominator. Must be finite and, as an f32, a normal number
+    /// (at least `f32::MIN_POSITIVE`, about 1.2e-38): the device flushes f32
+    /// subnormals to 0, which would leave a 0 denominator wherever the second
+    /// moment is 0. `adamw_step` refuses a smaller eps. This departs from
+    /// torch, which accepts a subnormal eps on CPU.
     pub eps: f64,
     /// Every gradient is multiplied by this (as f32) before the update:
     /// `torch.nn.utils.clip_grad_norm_`'s clip coefficient (see
@@ -83,7 +92,7 @@ fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
 ///
 /// `step` is torch's count after it has incremented (1-based).
 /// Delegates canonical scalar formation to `ojas_core::AdamWScalars`.
-fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
+fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> Result<[f32; 8], String> {
     let config = ojas_core::AdamWConfig {
         lr: hyper.lr,
         beta1: hyper.beta1,
@@ -92,9 +101,23 @@ fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
         weight_decay,
     };
     let step_before = step.saturating_sub(1);
-    let s = ojas_core::AdamWScalars::new(config, step_before).expect("validated hyperparameters");
-    let w = s.f32_words("adamw_step").expect("finite f32 words");
-    [w[0], w[1], w[2], w[3], w[4], w[5], w[6], hyper.grad_scale as f32]
+    let s = ojas_core::AdamWScalars::new(config, step_before).map_err(|e| format!("adamw_step: {e}"))?;
+    let w = s.f32_words("adamw_step").map_err(|e| format!("adamw_step: {e}"))?;
+    // The kernels are built with fast math and this device flushes f32 subnormals to 0, so an eps
+    // that is not a normal f32 acts as 0: the denominator is 0 wherever v is 0 (0 / 0 is NaN, any
+    // other numerator gives +-inf). `bc2_sqrt` needs no such check: 1 - beta2 >= 2^-53 for beta2 < 1
+    // and a bias correction that rounds to 0 is already refused, so sqrt(bc2) >= ~9.5e-9 is normal.
+    if !w[6].is_normal() {
+        return Err(format!(
+            "adamw_step: eps {:e} is not a normal f32 (the word sent to the device is {:e}); the device flushes subnormals to 0, which would make the denominator 0",
+            hyper.eps, w[6]
+        ));
+    }
+    let grad_scale = hyper.grad_scale as f32;
+    if !grad_scale.is_finite() {
+        return Err(format!("adamw_step: grad_scale {} overflows f32", hyper.grad_scale));
+    }
+    Ok([w[0], w[1], w[2], w[3], w[4], w[5], w[6], grad_scale])
 }
 
 fn le_bytes<const N: usize, T: Copy>(xs: [T; N], f: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
@@ -115,6 +138,11 @@ fn on_runtime(rt: &GpuRuntime, t: &Tensor) -> bool {
 /// Step 0 is refused: it is what `u64::MAX + 1` wraps to, and it zeroes the
 /// bias correction. The caller increments with `checked_add` and refuses
 /// `u64::MAX` before calling.
+///
+/// Also refused, before anything is encoded: a hyperparameter whose f32 word
+/// overflows, and an `eps` that is not a normal f32 (zero or subnormal, below
+/// `f32::MIN_POSITIVE`), because the device flushes subnormals to 0 and a zero
+/// denominator turns a zero second moment into NaN or infinity.
 ///
 /// The update is encoded and not waited on. Call [`GpuRuntime::synchronize`]
 /// before reading the tensors on the host. A later kernel on `rt` is ordered
@@ -181,6 +209,9 @@ pub fn adamw_step(
             }
         }
     }
+    // Formed before the empty-tensor return, so an overflowing hyperparameter is refused whether or
+    // not a parameter would move.
+    let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay))?, f32::to_le_bytes);
     let n = param.try_numel()?;
     if n == 0 {
         return Ok(());
@@ -192,7 +223,6 @@ pub fn adamw_step(
     for (x, name) in w.iter().zip(names) {
         x.check(format_args!("{WHAT}: {name}"))?;
     }
-    let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay)), f32::to_le_bytes);
     let p = rt.pipeline("qwen35_adamw_f32")?;
     dispatch_2d(rt, &p, n, 1, |bnd| {
         for (i, x) in w.iter().enumerate() {

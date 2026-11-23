@@ -69,7 +69,7 @@ bin release_check 14
 bin safetensors 12
 bin timesfm3_host 7
 bin timesfm3_forecast_host 10
-bin shader_index_arithmetic 35
+bin shader_index_arithmetic 37
 bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6

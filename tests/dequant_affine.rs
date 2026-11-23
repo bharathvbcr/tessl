@@ -388,6 +388,50 @@ fn zero_rows_is_a_validated_no_op() {
     });
 }
 
+/// `check_dequant_affine_fault` reads the word on the host, so a fault buffer the CPU cannot
+/// map (a wrapped GPU-private `MTLBuffer`) is refused by the plan, before any dispatch.
+#[test]
+fn a_gpu_private_fault_buffer_is_refused_before_the_dispatch() {
+    use objc2_metal::{MTLDevice, MTLResourceOptions};
+    use tessl::{DType, Tensor};
+    with_gpu(|rt| {
+        let (packed, scales, biases, out) = (
+            rt.alloc_buffer(64).expect("packed"),
+            rt.alloc_buffer(8).expect("scales"),
+            rt.alloc_buffer(8).expect("biases"),
+            rt.alloc_buffer(128).expect("out"),
+        );
+        let raw = rt
+            .device
+            .newBufferWithLength_options(4, MTLResourceOptions::StorageModePrivate)
+            .expect("private buffer");
+        // SAFETY: a fresh buffer only this runtime touches.
+        let private = unsafe { Tensor::from_mtl_buffer(rt, raw, &[1], DType::F32, 0) }.expect("wrap private");
+        let bank = DequantAffineBank {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+        };
+        let shape = QuantShape {
+            rows: 1,
+            cols: 64,
+            group_size: 64,
+        };
+        let err = validate_dequant_affine_bf16(rt, AffineBits::Q8, bank, &out, &private.buffer, shape)
+            .expect_err("a private fault buffer");
+        assert!(err.contains("fault") && err.contains("private"), "{err}");
+        rt.take_dispatch_count();
+        let bank = DequantAffineBank {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+        };
+        let err = dequant_affine_q8_bf16(rt, bank, &out, &private.buffer, shape).expect_err("dispatch refused");
+        assert!(err.contains("private"), "{err}");
+        assert_eq!(rt.take_dispatch_count(), 0, "nothing may be encoded");
+    });
+}
+
 // -------------------------------------------------------------- rounding ---
 
 /// Independent of the host conversion helper: `256 + q` (q in 0..=255) in bf16,

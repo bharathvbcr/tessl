@@ -20,6 +20,20 @@
 //! prints none, and the run then prints one `STAGE_PROFILE_INCOMPLETE` line (the
 //! requested and failed T values, plus `aborted_at` and `unmeasured` after a hard error) and returns one error naming every failing T,
 //! so the exit is nonzero and a partial log is never read as a full table.
+//! Before any timing for a T, an untimed kernel-set check compares which
+//! kernels the replica's stages request against which the real model's
+//! `encode_part` requests for the same layer (the first GDN layer for the gdn
+//! and mlp groups, the first attention layer for attn, as `time_parts` picks
+//! them). It reads the runtime's kernel trace (`TESSL_KERNEL_TRACE`, read once
+//! per process: this module never sets it): every `GpuRuntime::pipeline`
+//! request counts, cache hit or not, so the names whose count rose around a
+//! side's work are the kernels it requested. A group whose delta is empty on
+//! either side cannot be attested and is an error, never a pass; a missing or
+//! extra kernel is a hard error naming it, raised before the T is timed (so
+//! structural drift wastes no GPU time) through `profile_every_t`'s abort
+//! path. With the trace unset the run prints one
+//! `kernel-set check: NOT RUN (TESSL_KERNEL_TRACE unset)` line and goes on;
+//! otherwise each T prints `kernel-set check: PASS T=<t>` or aborts.
 //! The async-encode flag is restored to what the caller had on every path.
 //! The whole forward is then split on the host timeline (begin, the encode
 //! return of the 24 layers, the wait in score_answers) to expose what is not
@@ -29,12 +43,14 @@
 //! `bench/qwen35_stage_profile_report.py` merges it with the MLX lane's
 //! `bench/qwen35_prefill_mlx_profile.py`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tessl::nn::AttnDims;
 use tessl::qwen35::{self, Cols, GdnChunkPhase, GdnParams, OutCols, StateIn};
-use tessl::qwen35_model::{LayerKind, Qwen35Model};
+use tessl::qwen35_model::{LayerKind, LayerPart, Qwen35Model};
+use tessl::runtime::{kernel_trace_enabled, traced_kernel_count, traced_kernels};
 use tessl::tensor::GpuBuffer;
 use tessl::{gemm, DType, GpuRuntime, Tensor};
 
@@ -84,6 +100,63 @@ fn check_replica_against_parts(rows: &[(&str, f64, f64)], rel_tol: f64) -> Res<(
             failures.join("; ")
         ))
     }
+}
+
+/// Every traced kernel name with its request count.
+fn trace_counts() -> BTreeMap<String, u64> {
+    traced_kernels()
+        .into_iter()
+        .map(|name| {
+            let n = traced_kernel_count(&name);
+            (name, n)
+        })
+        .collect()
+}
+
+/// The names whose request count is higher in `after` than in `before`.
+fn kernels_that_rose(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTreeSet<String> {
+    after
+        .iter()
+        .filter(|&(name, &n)| n > before.get(name).copied().unwrap_or(0))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The kernels `work` requested a pipeline for: the names whose trace count
+/// rose around it. The device is drained on both sides, so nothing another
+/// step encoded is counted here and nothing `work` encoded is left unencoded.
+fn kernels_requested_by(rt: &Arc<GpuRuntime>, work: impl FnOnce() -> Res<()>) -> Res<BTreeSet<String>> {
+    rt.synchronize()?;
+    let before = trace_counts();
+    work()?;
+    rt.synchronize()?;
+    Ok(kernels_that_rose(&before, &trace_counts()))
+}
+
+/// Fail unless the real part and the replica group request the same kernels.
+/// An empty side fails as "cannot attest" (an op that skips `pipeline` on
+/// reuse, or an unarmed trace, would look the same as agreement); a difference
+/// names every kernel missing from the replica and every one extra in it.
+fn compare_kernel_sets(group: &str, real: &BTreeSet<String>, replica: &BTreeSet<String>) -> Res<()> {
+    let empty: Vec<&str> = [("real part", real), ("replica stages", replica)]
+        .into_iter()
+        .filter(|(_, set)| set.is_empty())
+        .map(|(side, _)| side)
+        .collect();
+    if !empty.is_empty() {
+        return Err(format!(
+            "{group}: cannot attest: the {} requested no traced kernel",
+            empty.join(" and the ")
+        ));
+    }
+    let list = |a: &BTreeSet<String>, b: &BTreeSet<String>| a.difference(b).cloned().collect::<Vec<_>>().join(", ");
+    let (missing, extra) = (list(real, replica), list(replica, real));
+    if missing.is_empty() && extra.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{group}: the replica requests different kernels than the real part (missing from the replica: [{missing}]; extra in the replica: [{extra}])"
+    ))
 }
 
 /// One timed stage of the replica.
@@ -480,6 +553,86 @@ impl Ops<'_> {
     fn mlp_down(&self) -> Res<()> {
         qwen35::project_residual(&self.r.m_mid, &self.r.down_w, &self.r.resid, BACKEND)
     }
+
+    /// The gdn group's stages in forward order (`gdn_core`, not its split).
+    fn gdn_pass(&self) -> Res<()> {
+        self.norm(&self.r.input_norm)?;
+        self.g_in_proj()?;
+        self.g_conv()?;
+        self.g_scan(None)?;
+        self.g_gated_norm()?;
+        self.g_out()
+    }
+
+    /// The attn group's stages in forward order.
+    fn attn_pass(&self) -> Res<()> {
+        self.norm(&self.r.input_norm)?;
+        self.a_in_proj()?;
+        self.a_qk_rope()?;
+        self.a_sdpa()?;
+        self.a_gate()?;
+        self.a_out()
+    }
+
+    /// The mlp group's stages in forward order.
+    fn mlp_pass(&self) -> Res<()> {
+        self.norm(&self.r.input_norm)?;
+        self.mlp_gate_up()?;
+        self.mlp_swiglu()?;
+        self.mlp_down()
+    }
+}
+
+/// Compare the kernels each replica group requests with those of the real
+/// model's parts for the same layer (the first GDN layer for gdn and mlp, the
+/// first attention layer for attn, as `time_parts` picks them). Untimed.
+/// Every group is compared and every failing group is named in the error.
+fn kernel_set_check(rt: &Arc<GpuRuntime>, model: &Qwen35Model, ids: &[u32], ops: &Ops<'_>) -> Res<()> {
+    let kinds = &model.config().layers;
+    let find = |k: LayerKind| {
+        kinds
+            .iter()
+            .position(|&x| x == k)
+            .ok_or_else(|| format!("kernel-set check: the model has no {k:?} layer to compare"))
+    };
+    let (gdn, attn) = (find(LayerKind::LinearAttention)?, find(LayerKind::FullAttention)?);
+    let s = model.begin(ids)?;
+    let real = |layer: usize, parts: &[LayerPart]| {
+        kernels_requested_by(rt, || parts.iter().try_for_each(|&p| s.encode_part(layer, p)))
+    };
+    let mixer = [LayerPart::InputNorm, LayerPart::Mixer];
+    let mlp = [LayerPart::PostNorm, LayerPart::Mlp];
+    let real_sets = [
+        ("gdn", real(gdn, &mixer)?),
+        ("attn", real(attn, &mixer)?),
+        ("mlp", real(gdn, &mlp)?),
+    ];
+    // The replica in forward order, so every stage reads what the one before wrote.
+    ops.embed()?;
+    let replica_sets = [
+        ("gdn", kernels_requested_by(rt, || ops.gdn_pass())?),
+        ("attn", kernels_requested_by(rt, || ops.attn_pass())?),
+        ("mlp", kernels_requested_by(rt, || ops.mlp_pass())?),
+    ];
+    let failures: Vec<String> = real_sets
+        .iter()
+        .zip(&replica_sets)
+        .filter_map(|((group, real), (_, replica))| compare_kernel_sets(group, real, replica).err())
+        .collect();
+    if failures.is_empty() {
+        println!(
+            "kernel-set check: compared {} gdn, {} attn, {} mlp kernels",
+            real_sets[0].1.len(),
+            real_sets[1].1.len(),
+            real_sets[2].1.len()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "kernel-set check failed, so the replica's stages are not the real model's work and nothing was timed for this T: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 /// One host-timeline sample of the real forward at `t`.
@@ -600,6 +753,10 @@ pub fn run(
         "host: load/GPU at start: GPU utilization {}%",
         common::gpu_utilization()
     );
+    let trace_on = kernel_trace_enabled();
+    if !trace_on {
+        println!("kernel-set check: NOT RUN (TESSL_KERNEL_TRACE unset)");
+    }
     // Restore the flag the caller had on every path, including a failed T.
     let prior_async = rt.async_encode_enabled();
     rt.set_async_encode(true)?;
@@ -618,23 +775,17 @@ pub fn run(
             println!("GPU utilization at start of T: {}%", common::gpu_utilization());
             let r = Replica::new(rt, model, t)?;
             let ops = Ops { rt, m: model, r: &r };
+            // Structural drift is a hard error before any timing.
+            if trace_on {
+                kernel_set_check(rt, model, ids, &ops)?;
+                println!("kernel-set check: PASS T={t}");
+            }
             // One pass in forward order so every stage's input is what the stage
             // before it wrote; then each stage alone.
             ops.embed()?;
-            ops.norm(&r.input_norm)?;
-            ops.g_in_proj()?;
-            ops.g_conv()?;
-            ops.g_scan(None)?;
-            ops.g_gated_norm()?;
-            ops.g_out()?;
-            ops.a_in_proj()?;
-            ops.a_qk_rope()?;
-            ops.a_sdpa()?;
-            ops.a_gate()?;
-            ops.a_out()?;
-            ops.mlp_gate_up()?;
-            ops.mlp_swiglu()?;
-            ops.mlp_down()?;
+            ops.gdn_pass()?;
+            ops.attn_pass()?;
+            ops.mlp_pass()?;
             rt.synchronize()?;
 
             let mut stages: Vec<Stage> = Vec::new();
@@ -984,6 +1135,92 @@ mod tests {
     fn defect_an_infinite_tolerance_must_not_pass_any_row() {
         let r = check_replica_against_parts(&[("row", 1.0, 10.0)], f64::INFINITY);
         assert!(r.is_err(), "infinite tolerance passed a 900% gap");
+    }
+
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn equal_kernel_sets_pass() {
+        let s = set(&["rms_norm_bf16", "cast_f32_to_bf16"]);
+        assert!(compare_kernel_sets("attn", &s, &s.clone()).is_ok());
+    }
+
+    #[test]
+    fn a_kernel_missing_from_the_replica_fails_and_is_named() {
+        let err = compare_kernel_sets("attn", &set(&["a", "cast_f32_to_bf16"]), &set(&["a"])).unwrap_err();
+        assert!(err.starts_with("attn:"), "{err}");
+        assert!(err.contains("missing from the replica: [cast_f32_to_bf16]"), "{err}");
+        assert!(err.contains("extra in the replica: []"), "{err}");
+    }
+
+    #[test]
+    fn a_kernel_extra_in_the_replica_fails_and_is_named() {
+        let err = compare_kernel_sets("mlp", &set(&["a"]), &set(&["a", "qwen35_attn_f32"])).unwrap_err();
+        assert!(err.contains("extra in the replica: [qwen35_attn_f32]"), "{err}");
+        assert!(err.contains("missing from the replica: []"), "{err}");
+    }
+
+    #[test]
+    fn a_swapped_kernel_names_both_sides() {
+        let err = compare_kernel_sets("attn", &set(&["tile_bf16", "x"]), &set(&["tile_f32", "x"])).unwrap_err();
+        assert!(err.contains("missing from the replica: [tile_bf16]"), "{err}");
+        assert!(err.contains("extra in the replica: [tile_f32]"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_side_cannot_attest_and_is_never_a_pass() {
+        let some = set(&["a"]);
+        let none = BTreeSet::new();
+        for (real, replica, who) in [(&none, &some, "real part"), (&some, &none, "replica stages")] {
+            let err = compare_kernel_sets("gdn", real, replica).unwrap_err();
+            assert!(err.contains("cannot attest") && err.contains(who), "{err}");
+        }
+        // Two empty sets are equal but attest nothing: still an error.
+        let err = compare_kernel_sets("gdn", &none, &none.clone()).unwrap_err();
+        assert!(
+            err.contains("cannot attest") && err.contains("real part") && err.contains("replica stages"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_names_whose_count_rose_are_in_the_delta() {
+        let before: BTreeMap<String, u64> = [("a", 3), ("b", 1)].map(|(n, c)| (n.to_string(), c)).into();
+        let after: BTreeMap<String, u64> = [("a", 3), ("b", 2), ("c", 1)].map(|(n, c)| (n.to_string(), c)).into();
+        assert_eq!(kernels_that_rose(&before, &after), set(&["b", "c"]));
+        // A cache-hit request raises a count without adding a name; nothing requested adds nothing.
+        assert!(kernels_that_rose(&after, &after.clone()).is_empty());
+        assert!(kernels_that_rose(&BTreeMap::new(), &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_kernel_set_mismatch_aborts_the_run_before_later_t_values() {
+        let mut emitted = Vec::new();
+        let err = profile_every_t(
+            &[1024, 2048],
+            3,
+            |l| emitted.push(l.to_string()),
+            |t| {
+                if t == 1024 {
+                    compare_kernel_sets("attn", &set(&["a", "b"]), &set(&["a"]))?;
+                }
+                Ok(Ok(format!("json {t}")))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("run aborted at T=1024") && err.contains("missing from the replica: [b]"),
+            "{err}"
+        );
+        assert!(!emitted.iter().any(|l| l.starts_with("json")), "{emitted:?}");
+        assert!(
+            emitted
+                .iter()
+                .any(|l| l.contains("\"aborted_at\":1024") && l.contains("\"unmeasured\":[2048]")),
+            "{emitted:?}"
+        );
     }
 
     /// Drives `profile_every_t` with a fake measurer; returns (measured T's, emitted lines, result).

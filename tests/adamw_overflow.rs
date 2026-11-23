@@ -170,16 +170,59 @@ fn eps_f32_max_is_accepted() {
     );
 }
 
+/// A subnormal eps is refused with the value in the message, before any dispatch and with the
+/// parameter unchanged: the device flushes it to 0 and a zero denominator poisons the parameter.
 #[test]
-fn a_subnormal_eps_is_accepted() {
-    accepted(
-        AdamWHyper {
+fn a_subnormal_eps_is_refused() {
+    with_gpu(|rt| {
+        let hyper = AdamWHyper {
             eps: 1e-40,
+            ..AdamWHyper::default()
+        };
+        let (result, dispatched, before, after) = step(rt, &hyper, 1, 0.0);
+        let err = result.expect_err("a subnormal eps must be refused");
+        assert!(err.contains("adamw_step") && err.contains("1e-40") && err.contains("subnormal"), "{err}");
+        assert_eq!(dispatched, 0, "a refused step must encode nothing");
+        assert_eq!(after, before, "the parameter moved");
+    });
+}
+
+/// The largest f32 subnormal is still refused, at the boundary below the smallest normal.
+#[test]
+fn the_largest_subnormal_eps_is_refused() {
+    refused(
+        AdamWHyper {
+            eps: f64::from(f32::from_bits(0x007f_ffff)),
             ..AdamWHyper::default()
         },
         1,
         0.0,
     );
+}
+
+/// The smallest normal eps with a zero gradient and zero moments keeps the parameter finite and
+/// unchanged, at step 1 and at step 1_000_000.
+#[test]
+fn the_smallest_normal_eps_with_a_zero_gradient_stays_finite() {
+    for at in [1u64, 1_000_000] {
+        with_gpu(|rt| {
+            let t = |x: f32| {
+                let t = rt.alloc_tensor_f32(&[8]).unwrap();
+                t.write_f32(&[x; 8]).unwrap();
+                t
+            };
+            let (mut p, g, mut m, mut v) = (t(1.0), t(0.0), t(0.0), t(0.0));
+            let hyper = AdamWHyper {
+                eps: f64::from(f32::MIN_POSITIVE),
+                ..AdamWHyper::default()
+            };
+            adamw_step(rt, &mut p, &g, &mut m, &mut v, &hyper, at, 0.0).unwrap();
+            rt.synchronize().unwrap();
+            let after = p.read_f32().unwrap();
+            assert!(after.iter().all(|x| x.is_finite()), "step {at}: {after:?}");
+            assert_eq!(after, vec![1.0; 8], "step {at}");
+        });
+    }
 }
 
 #[test]

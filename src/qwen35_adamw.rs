@@ -32,6 +32,11 @@ pub struct AdamWHyper {
     pub lr: f64,
     pub beta1: f64,
     pub beta2: f64,
+    /// Added to the denominator. Must be finite and, as an f32, a normal number
+    /// (at least `f32::MIN_POSITIVE`, about 1.2e-38): the device flushes f32
+    /// subnormals to 0, which would leave a 0 denominator wherever the second
+    /// moment is 0. `adamw_step` refuses a smaller eps. This departs from
+    /// torch, which accepts a subnormal eps on CPU.
     pub eps: f64,
     /// Every gradient is multiplied by this (as f32) before the update:
     /// `torch.nn.utils.clip_grad_norm_`'s clip coefficient (see
@@ -96,9 +101,15 @@ fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> Result<[f3
     let step_before = step.saturating_sub(1);
     let s = ojas_core::AdamWScalars::new(config, step_before).map_err(|e| format!("adamw_step: {e}"))?;
     let w = s.f32_words("adamw_step").map_err(|e| format!("adamw_step: {e}"))?;
-    // A positive eps that rounds to zero would leave the kernel's denominator 0 when v is 0.
-    if w[6] == 0.0 {
-        return Err(format!("adamw_step: eps {} underflows to 0 in f32", hyper.eps));
+    // The kernels are built with fast math and this device flushes f32 subnormals to 0, so an eps
+    // that is not a normal f32 acts as 0: the denominator is 0 wherever v is 0 (0 / 0 is NaN, any
+    // other numerator gives +-inf). `bc2_sqrt` needs no such check: 1 - beta2 >= 2^-53 for beta2 < 1
+    // and a bias correction that rounds to 0 is already refused, so sqrt(bc2) >= ~9.5e-9 is normal.
+    if !w[6].is_normal() {
+        return Err(format!(
+            "adamw_step: eps {:e} is not a normal f32 (the word sent to the device is {:e}); the device flushes subnormals to 0, which would make the denominator 0",
+            hyper.eps, w[6]
+        ));
     }
     let grad_scale = hyper.grad_scale as f32;
     if !grad_scale.is_finite() {

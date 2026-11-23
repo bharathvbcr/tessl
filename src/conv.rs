@@ -11,7 +11,11 @@
 //! that is a multiple of 16. [`conv2d_tensorops_supports`] says whether a shape is covered, so a
 //! caller can route only those here and keep its general path for the rest.
 
-use crate::runtime::mtl_size;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState;
+
+use crate::dispatch::check_threadgroup_limit;
+use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{DType, Tensor};
 
 /// The arithmetic of [`conv2d_nchw`]'s matrix-unit op. Both accumulate in f32 and write f32.
@@ -28,6 +32,23 @@ pub const CONV2D_TOPS_KERNEL: usize = 3;
 /// Destination tile width; the packed source is padded to a whole number of these, because a
 /// partial tile computes wrong values.
 const TILE_W: usize = 32;
+/// Threads per threadgroup of the weights-to-HWIO kernel.
+const WEIGHTS_TG: usize = 256;
+/// Threads per threadgroup of the NHWC pack kernel: a 32 x 8 tile.
+const PACK_TG: (usize, usize) = (32, 8);
+/// Threads per threadgroup of the tensor-op convolution.
+const TOPS_TG: usize = 128;
+
+/// Refuse any fixed-size launch whose threads per threadgroup exceeds its pipeline's limit, naming
+/// the kernel, before anything is encoded.
+fn check_launch_limits(
+    rt: &GpuRuntime,
+    launches: &[(&ProtocolObject<dyn MTLComputePipelineState>, usize)],
+) -> Result<(), String> {
+    launches
+        .iter()
+        .try_for_each(|&(pipeline, threads)| check_threadgroup_limit(rt, pipeline, threads))
+}
 
 /// Whether [`conv2d_nchw`] covers this convolution. Shapes are PyTorch's: `x [n, c_in, h, w]`,
 /// `w [c_out, c_in / groups, kh, kw]`.
@@ -207,6 +228,14 @@ pub fn conv2d_nchw(
     let pack_p = rt.pipeline(pack_k)?;
     let weights_p = rt.pipeline(weights_k)?;
     let tops_p = rt.pipeline(tops_k)?;
+    check_launch_limits(
+        rt,
+        &[
+            (&*weights_p, WEIGHTS_TG),
+            (&*pack_p, PACK_TG.0 * PACK_TG.1),
+            (&*tops_p, TOPS_TG),
+        ],
+    )?;
 
     // Every element of each scratch is written before it is read: the pack covers all of
     // [n, hp, wp, c_in] (halo and width padding as zeros), and the weights all of [k, k, c_in, c_out].
@@ -222,7 +251,7 @@ pub fn conv2d_nchw(
         bnd.bind_u32(u(c_out), 2);
         bnd.bind_u32(u(c_in), 3);
         bnd.bind_u32(u(k), 4);
-        bnd.dispatch(mtl_size(wn.div_ceil(256), 1, 1), mtl_size(256, 1, 1));
+        bnd.dispatch(mtl_size(wn.div_ceil(WEIGHTS_TG), 1, 1), mtl_size(WEIGHTS_TG, 1, 1));
 
         bnd.set_pipeline(&pack_p);
         bnd.bind_tensor(x, 0);
@@ -233,7 +262,10 @@ pub fn conv2d_nchw(
         bnd.bind_u32(u(pad), 5);
         bnd.bind_u32(u(hp), 6);
         bnd.bind_u32(u(wp), 7);
-        bnd.dispatch(mtl_size(wp.div_ceil(32), c_in.div_ceil(32), n * hp), mtl_size(32, 8, 1));
+        bnd.dispatch(
+            mtl_size(wp.div_ceil(32), c_in.div_ceil(32), n * hp),
+            mtl_size(PACK_TG.0, PACK_TG.1, 1),
+        );
 
         bnd.set_pipeline(&tops_p);
         bnd.bind_tensor(&xp, 0);
@@ -248,7 +280,7 @@ pub fn conv2d_nchw(
         bnd.bind_u32(u(ow), 8);
         bnd.bind_u32(u(ow_p), 9);
         bnd.bind_u32(u(n), 10);
-        bnd.dispatch(mtl_size(c_out / ot, ow_p / TILE_W, n * oh), mtl_size(128, 1, 1));
+        bnd.dispatch(mtl_size(c_out / ot, ow_p / TILE_W, n * oh), mtl_size(TOPS_TG, 1, 1));
         Ok(())
     })
 }
@@ -271,5 +303,36 @@ mod extent_tests {
         // which the weights kernel's `uint total = CO * CI * K * K` would wrap.
         assert!(int_scratch(1, 1 << 16, 1 << 16, 1, 1, 1, 1).is_none());
         assert!(int_scratch(1, 1 << 12, 1 << 12, 1, 1, 1, 1).is_some());
+    }
+}
+
+/// Device tests, in a module of their own: `scripts/hosted_tests.txt` selects `extent_tests::` as
+/// device-free.
+#[cfg(test)]
+mod launch_limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_past_its_pipelines_threadgroup_limit_is_refused_by_kernel_name() {
+        let rt = GpuRuntime::new().expect("runtime");
+        // Path calls, not method calls: tests/shader_index_arithmetic.rs counts the method-call
+        // spelling of pipeline lookups in this file, to prove every production lookup follows the
+        // int_scratch guard.
+        let weights = GpuRuntime::pipeline(&rt, "conv2d_weights_hwio_f32").unwrap();
+        let pack = GpuRuntime::pipeline(&rt, "conv2d_pack_nhwc_f32").unwrap();
+        let tops = GpuRuntime::pipeline(&rt, "conv2d_tops_nchw_k3_o16_w32_f32").unwrap();
+        check_launch_limits(
+            &rt,
+            &[
+                (&*weights, WEIGHTS_TG),
+                (&*pack, PACK_TG.0 * PACK_TG.1),
+                (&*tops, TOPS_TG),
+            ],
+        )
+        .expect("the fixed sizes fit the device");
+        let limit = tops.maxTotalThreadsPerThreadgroup();
+        let err = check_launch_limits(&rt, &[(&*weights, WEIGHTS_TG), (&*tops, limit + 1)]).unwrap_err();
+        assert!(err.contains("conv2d_tops_nchw_k3_o16_w32_f32"), "{err}");
+        assert!(err.contains(&(limit + 1).to_string()), "{err}");
     }
 }

@@ -34,6 +34,10 @@
 //! path. With the trace unset the run prints one
 //! `kernel-set check: NOT RUN (TESSL_KERNEL_TRACE unset)` line and goes on;
 //! otherwise each T prints `kernel-set check: PASS T=<t>` or aborts.
+//! The sdpa stage mirrors `Qwen35Model::prefill_attention` for the model's
+//! precision: under bf16 with the 256-wide head the bf16 tile needs, it
+//! includes the three f32-to-bf16 Q/K/V casts (as the real attention part
+//! does) before the `Q32K64Sg4` bf16 tile; otherwise it is the f32 kernel.
 //! The async-encode flag is restored to what the caller had on every path.
 //! The whole forward is then split on the host timeline (begin, the encode
 //! return of the 24 layers, the wait in score_answers) to expose what is not
@@ -47,9 +51,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use tessl::attn_prefill_bf16::{self, AttnProbTile};
 use tessl::nn::AttnDims;
-use tessl::qwen35::{self, Cols, GdnChunkPhase, GdnParams, OutCols, StateIn};
-use tessl::qwen35_model::{LayerKind, LayerPart, Qwen35Model};
+use tessl::qwen35::{self, AttnTile, Cols, GdnChunkPhase, GdnParams, OutCols, StateIn};
+use tessl::qwen35_model::{LayerKind, LayerPart, Precision, Qwen35Model};
 use tessl::runtime::{kernel_trace_enabled, traced_kernel_count, traced_kernels};
 use tessl::tensor::GpuBuffer;
 use tessl::{gemm, DType, GpuRuntime, Tensor};
@@ -159,6 +164,21 @@ fn compare_kernel_sets(group: &str, real: &BTreeSet<String>, replica: &BTreeSet<
     ))
 }
 
+/// Whether `Qwen35Model::prefill_attention` takes the bf16 tile for this
+/// precision and head dim (else the f32 kernel); the replica's sdpa mirrors it.
+fn uses_bf16_attention(precision: Precision, head_dim: u32) -> bool {
+    precision == Precision::Bf16 && head_dim == qwen35::PREFIX_ATTN_HEAD_DIM
+}
+
+/// The bf16 Q, K and V of the bf16 attention route, and their element counts.
+struct AttnBf16 {
+    q: GpuBuffer,
+    k: GpuBuffer,
+    v: GpuBuffer,
+    n_q: usize,
+    n_kv: usize,
+}
+
 /// One timed stage of the replica.
 struct Stage {
     group: &'static str,
@@ -221,6 +241,8 @@ struct Replica {
     a_k: GpuBuffer,
     a_v: GpuBuffer,
     a_o: GpuBuffer,
+    /// Present exactly when [`uses_bf16_attention`].
+    a_bf16: Option<AttnBf16>,
     a_y: Tensor,
     tkv: GpuBuffer,
     zero: GpuBuffer,
@@ -287,6 +309,18 @@ impl Replica {
             a_k: f32b(t * kvd)?,
             a_v: f32b(t * kvd)?,
             a_o: f32b(t * qd)?,
+            a_bf16: if uses_bf16_attention(model.precision(), l.head_dim()) {
+                let bf16b = |n: usize| rt.alloc_buffer(n.max(1) * 2);
+                Some(AttnBf16 {
+                    q: bf16b(t * qd)?,
+                    k: bf16b(t * kvd)?,
+                    v: bf16b(t * kvd)?,
+                    n_q: t * qd,
+                    n_kv: t * kvd,
+                })
+            } else {
+                None
+            },
             a_y: bf(qd)?,
             tkv: rt.alloc_buffer_from_u32(&[t32])?,
             zero: rt.alloc_buffer_from_u32(&[0])?,
@@ -504,8 +538,28 @@ impl Ops<'_> {
             window: 0,
             scale: 1.0 / (l.head_dim() as f32).sqrt(),
         };
-        qwen35::attn_prefill(
-            self.rt, &r.a_q, &r.a_k, &r.a_v, &r.a_o, &r.tkv, &r.zero, &r.zero, dims, false,
+        let Some(b) = &r.a_bf16 else {
+            return qwen35::attn_prefill(
+                self.rt, &r.a_q, &r.a_k, &r.a_v, &r.a_o, &r.tkv, &r.zero, &r.zero, dims, false,
+            );
+        };
+        // The real attention part rounds Q, K and V once, then runs the bf16 tile.
+        attn_prefill_bf16::cast_f32_to_bf16(self.rt, &r.a_q, &b.q, b.n_q)?;
+        attn_prefill_bf16::cast_f32_to_bf16(self.rt, &r.a_k, &b.k, b.n_kv)?;
+        attn_prefill_bf16::cast_f32_to_bf16(self.rt, &r.a_v, &b.v, b.n_kv)?;
+        attn_prefill_bf16::attn_prefill_bf16_with_tile(
+            self.rt,
+            &b.q,
+            &b.k,
+            &b.v,
+            &r.a_o,
+            &r.tkv,
+            &r.zero,
+            &r.zero,
+            dims,
+            false,
+            AttnTile::Q32K64Sg4,
+            AttnProbTile::Bf16,
         )
     }
 
@@ -1135,6 +1189,14 @@ mod tests {
     fn defect_an_infinite_tolerance_must_not_pass_any_row() {
         let r = check_replica_against_parts(&[("row", 1.0, 10.0)], f64::INFINITY);
         assert!(r.is_err(), "infinite tolerance passed a 900% gap");
+    }
+
+    #[test]
+    fn the_bf16_attention_route_needs_bf16_and_the_256_wide_head() {
+        assert!(uses_bf16_attention(Precision::Bf16, 256));
+        assert!(!uses_bf16_attention(Precision::F32, 256));
+        assert!(!uses_bf16_attention(Precision::Bf16, 128));
+        assert!(!uses_bf16_attention(Precision::Bf16, 0));
     }
 
     fn set(names: &[&str]) -> BTreeSet<String> {

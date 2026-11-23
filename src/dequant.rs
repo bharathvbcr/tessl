@@ -221,7 +221,8 @@ pub fn validate_dequant_affine_bf16(
 /// readable after [`GpuRuntime::synchronize`] or by a later GPU pass. Refuses,
 /// before encoding anything, an unsupported group size, a `cols` that is not a
 /// multiple of the group, size arithmetic that overflows, any buffer shorter
-/// than the shape needs (`fault` needs one `u32`) or from another runtime, and
+/// than the shape needs (`fault` needs one `u32`) or from another runtime, a
+/// `fault` in GPU-private storage (the host cannot read it back), and
 /// an `out` or `fault` that overlaps an input or each other. Zero rows or columns is a no-op once the shape is validated.
 ///
 /// # Fault word protocol

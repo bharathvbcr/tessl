@@ -7,7 +7,9 @@
 //! checkpoint reads of the moments retired with the Qwen3.5
 //! training step (ABI 14): ojas owns Metal training through the Tape and
 //! `Backend::adamw_step`, and tessl keeps the kernels and this launcher
-//! (`ojas-metal`'s legacy tiny step calls it).
+//! (no ojas crate imports it: `ojas-metal` compiles the shared
+//! `kernels/qwen35_adamw_math.h` into its own kernel, and `ojas-cuda`'s host
+//! scalars mirror this file's checks).
 //!
 //! The update is `torch.optim.AdamW`'s single-tensor path with `amsgrad` and
 //! `maximize` off: the step count increments first, the bias corrections and

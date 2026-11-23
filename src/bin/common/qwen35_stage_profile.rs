@@ -27,11 +27,16 @@
 //! them). It reads the runtime's kernel trace (`TESSL_KERNEL_TRACE`, read once
 //! per process: this module never sets it): every `GpuRuntime::pipeline`
 //! request counts, cache hit or not, so the names whose count rose around a
-//! side's work are the kernels it requested. A group whose delta is empty on
-//! either side cannot be attested and is an error, never a pass; a missing or
-//! extra kernel is a hard error naming it, raised before the T is timed (so
-//! structural drift wastes no GPU time) through `profile_every_t`'s abort
-//! path. With the trace unset the run prints one
+//! side's work are the kernels it requested, and by how many requests. A group
+//! whose delta is empty on either side cannot be attested and is an error,
+//! never a pass; a missing or extra kernel, or a shared one requested a
+//! different number of times (a dropped cast, a fused pair), is a hard error
+//! naming it (and both counts), raised before the T is timed (so structural
+//! drift wastes no GPU time) through `profile_every_t`'s abort path. The check
+//! catches kernel-name and request-count drift only: the same kernel called
+//! with different arguments is not seen (the replica passes state-out buffers
+//! to `conv1d_silu` and `gdn_chunk_forward` where the real prefill passes
+//! none: same pipeline, extra state writes). With the trace unset the run prints one
 //! `kernel-set check: NOT RUN (TESSL_KERNEL_TRACE unset)` line and goes on;
 //! otherwise each T prints `kernel-set check: PASS T=<t>` or aborts.
 //! The sdpa stage mirrors `Qwen35Model::prefill_attention` for the model's
@@ -47,7 +52,7 @@
 //! `bench/qwen35_stage_profile_report.py` merges it with the MLX lane's
 //! `bench/qwen35_prefill_mlx_profile.py`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -118,19 +123,22 @@ fn trace_counts() -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// The names whose request count is higher in `after` than in `before`.
-fn kernels_that_rose(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTreeSet<String> {
+/// How many pipeline requests each name gained between `before` and `after`
+/// (names that gained none are left out).
+fn kernels_that_rose(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
     after
         .iter()
-        .filter(|&(name, &n)| n > before.get(name).copied().unwrap_or(0))
-        .map(|(name, _)| name.clone())
+        .filter_map(|(name, &n)| {
+            let gained = n.saturating_sub(before.get(name).copied().unwrap_or(0));
+            (gained > 0).then(|| (name.clone(), gained))
+        })
         .collect()
 }
 
-/// The kernels `work` requested a pipeline for: the names whose trace count
-/// rose around it. The device is drained on both sides, so nothing another
+/// The kernels `work` requested a pipeline for, with how many requests each
+/// made: the per-name trace count gained around it. The device is drained on both sides, so nothing another
 /// step encoded is counted here and nothing `work` encoded is left unencoded.
-fn kernels_requested_by(rt: &Arc<GpuRuntime>, work: impl FnOnce() -> Res<()>) -> Res<BTreeSet<String>> {
+fn kernels_requested_by(rt: &Arc<GpuRuntime>, work: impl FnOnce() -> Res<()>) -> Res<BTreeMap<String, u64>> {
     rt.synchronize()?;
     let before = trace_counts();
     work()?;
@@ -138,11 +146,14 @@ fn kernels_requested_by(rt: &Arc<GpuRuntime>, work: impl FnOnce() -> Res<()>) ->
     Ok(kernels_that_rose(&before, &trace_counts()))
 }
 
-/// Fail unless the real part and the replica group request the same kernels.
-/// An empty side fails as "cannot attest" (an op that skips `pipeline` on
-/// reuse, or an unarmed trace, would look the same as agreement); a difference
-/// names every kernel missing from the replica and every one extra in it.
-fn compare_kernel_sets(group: &str, real: &BTreeSet<String>, replica: &BTreeSet<String>) -> Res<()> {
+/// Fail unless the real part and the replica group request the same kernels
+/// the same number of times (a multiset: a replica that drops the V cast, or
+/// fuses two GEMMs into one, has the same names with fewer requests). An empty
+/// side fails as "cannot attest" (an op that skips `pipeline` on reuse, or an
+/// unarmed trace, would look the same as agreement); a difference names every
+/// kernel missing from the replica, every one extra in it, and every shared
+/// one whose request counts differ, with both counts.
+fn compare_kernel_sets(group: &str, real: &BTreeMap<String, u64>, replica: &BTreeMap<String, u64>) -> Res<()> {
     let empty: Vec<&str> = [("real part", real), ("replica stages", replica)]
         .into_iter()
         .filter(|(_, set)| set.is_empty())
@@ -154,13 +165,29 @@ fn compare_kernel_sets(group: &str, real: &BTreeSet<String>, replica: &BTreeSet<
             empty.join(" and the ")
         ));
     }
-    let list = |a: &BTreeSet<String>, b: &BTreeSet<String>| a.difference(b).cloned().collect::<Vec<_>>().join(", ");
-    let (missing, extra) = (list(real, replica), list(replica, real));
-    if missing.is_empty() && extra.is_empty() {
+    let only = |a: &BTreeMap<String, u64>, b: &BTreeMap<String, u64>| {
+        a.keys()
+            .filter(|k| !b.contains_key(*k))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (missing, extra) = (only(real, replica), only(replica, real));
+    let counts = real
+        .iter()
+        .filter_map(|(k, &r)| {
+            replica
+                .get(k)
+                .filter(|&&p| p != r)
+                .map(|p| format!("{k}: real {r} vs replica {p}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if missing.is_empty() && extra.is_empty() && counts.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "{group}: the replica requests different kernels than the real part (missing from the replica: [{missing}]; extra in the replica: [{extra}])"
+        "{group}: the replica requests different kernels than the real part (missing from the replica: [{missing}]; extra in the replica: [{extra}]; request counts differ: [{counts}])"
     ))
 }
 
@@ -1199,8 +1226,13 @@ mod tests {
         assert!(!uses_bf16_attention(Precision::Bf16, 0));
     }
 
-    fn set(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|n| n.to_string()).collect()
+    /// One request per name.
+    fn set(names: &[&str]) -> BTreeMap<String, u64> {
+        names.iter().map(|n| (n.to_string(), 1)).collect()
+    }
+
+    fn counts(rows: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        rows.iter().map(|&(n, c)| (n.to_string(), c)).collect()
     }
 
     #[test]
@@ -1225,6 +1257,31 @@ mod tests {
     }
 
     #[test]
+    fn equal_multisets_pass() {
+        let m = counts(&[("cast_f32_to_bf16", 3), ("gemm", 2)]);
+        assert!(compare_kernel_sets("attn", &m, &m.clone()).is_ok());
+    }
+
+    #[test]
+    fn the_same_names_with_different_counts_fail_and_are_named() {
+        // The V cast dropped: same names, one request fewer.
+        let real = counts(&[("cast_f32_to_bf16", 3), ("tile", 1)]);
+        let replica = counts(&[("cast_f32_to_bf16", 2), ("tile", 1)]);
+        let err = compare_kernel_sets("attn", &real, &replica).unwrap_err();
+        assert!(err.contains("cast_f32_to_bf16: real 3 vs replica 2"), "{err}");
+        assert!(!err.contains("tile: real"), "{err}");
+        assert!(
+            err.contains("missing from the replica: []") && err.contains("extra in the replica: []"),
+            "{err}"
+        );
+        // Fused pair: one gemm request instead of two, and the other direction.
+        let err = compare_kernel_sets("mlp", &counts(&[("gemm", 2)]), &counts(&[("gemm", 1)])).unwrap_err();
+        assert!(err.contains("gemm: real 2 vs replica 1"), "{err}");
+        let err = compare_kernel_sets("mlp", &counts(&[("gemm", 1)]), &counts(&[("gemm", 2)])).unwrap_err();
+        assert!(err.contains("gemm: real 1 vs replica 2"), "{err}");
+    }
+
+    #[test]
     fn a_swapped_kernel_names_both_sides() {
         let err = compare_kernel_sets("attn", &set(&["tile_bf16", "x"]), &set(&["tile_f32", "x"])).unwrap_err();
         assert!(err.contains("missing from the replica: [tile_bf16]"), "{err}");
@@ -1234,7 +1291,7 @@ mod tests {
     #[test]
     fn an_empty_side_cannot_attest_and_is_never_a_pass() {
         let some = set(&["a"]);
-        let none = BTreeSet::new();
+        let none = BTreeMap::new();
         for (real, replica, who) in [(&none, &some, "real part"), (&some, &none, "replica stages")] {
             let err = compare_kernel_sets("gdn", real, replica).unwrap_err();
             assert!(err.contains("cannot attest") && err.contains(who), "{err}");
@@ -1249,9 +1306,9 @@ mod tests {
 
     #[test]
     fn only_names_whose_count_rose_are_in_the_delta() {
-        let before: BTreeMap<String, u64> = [("a", 3), ("b", 1)].map(|(n, c)| (n.to_string(), c)).into();
-        let after: BTreeMap<String, u64> = [("a", 3), ("b", 2), ("c", 1)].map(|(n, c)| (n.to_string(), c)).into();
-        assert_eq!(kernels_that_rose(&before, &after), set(&["b", "c"]));
+        let before = counts(&[("a", 3), ("b", 1)]);
+        let after = counts(&[("a", 3), ("b", 4), ("c", 2)]);
+        assert_eq!(kernels_that_rose(&before, &after), counts(&[("b", 3), ("c", 2)]));
         // A cache-hit request raises a count without adding a name; nothing requested adds nothing.
         assert!(kernels_that_rose(&after, &after.clone()).is_empty());
         assert!(kernels_that_rose(&BTreeMap::new(), &BTreeMap::new()).is_empty());

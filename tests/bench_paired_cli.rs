@@ -803,15 +803,21 @@ fn wait_for_file(child: &mut std::process::Child, path: &Path, what: &str) {
     }
 }
 
-/// Wait (bounded) until the process is in the stopped state: a condition, not a delay.
+/// Wait (bounded) until the child this test spawned is in the stopped state: a
+/// condition, not a delay. `waitpid` with `WUNTRACED` reports the stop to the parent;
+/// `ps` would do too, but the hosted sandbox denies running it.
 fn wait_stopped(pid: u32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let out = Command::new("ps")
-            .args(["-o", "state=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        if String::from_utf8_lossy(&out.stdout).trim().starts_with('T') {
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this test process; `status` is a valid out-parameter.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        assert!(r >= 0, "waitpid {pid}: {}", std::io::Error::last_os_error());
+        if r == pid as libc::pid_t {
+            assert!(
+                libc::WIFSTOPPED(status),
+                "pid {pid} ended instead of stopping: status {status}"
+            );
             return;
         }
         assert!(std::time::Instant::now() < deadline, "pid {pid} never stopped");
@@ -885,24 +891,6 @@ impl Drop for Reaper {
     }
 }
 
-/// Wait (bounded) until the process has exited and is only waiting to be reaped
-/// (its parent is stopped) or is gone: a condition, not a delay.
-fn wait_exited(pid: u32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let out = Command::new("ps")
-            .args(["-o", "state=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&out.stdout);
-        if state.trim().is_empty() || state.trim().starts_with('Z') {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "pid {pid} never exited");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
 /// Signal "name" arrives while bench_paired is stopped and the gate lane's block_call-th run is held
 /// until a release file exists (a file, not a FIFO: the hosted sandbox denies mkfifo); the lane is
 /// released and has exited before bench_paired continues, so the signal is delivered after the
@@ -917,17 +905,19 @@ fn signal_after_gate_call_ended(
     let release = d.join("release");
     let up = d.join("up");
     let gate_pid = d.join("gate.pid");
+    let gate_done = d.join("gate.done");
     let count = d.join("count");
     let gate = script(
         &d,
         "gate",
         &format!(
-            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo $$ > '{p}'; echo up > '{u}'; while [ ! -e '{f}' ]; do sleep 0.02; done; fi",
+            "echo METRIC m 1\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\nif [ $n = {k} ]; then echo $$ > '{p}'; echo up > '{u}'; while [ ! -e '{f}' ]; do sleep 0.02; done; echo done > '{x}'; fi",
             c = count.display(),
             k = block_call,
             p = gate_pid.display(),
             u = up.display(),
-            f = release.display()
+            f = release.display(),
+            x = gate_done.display()
         ),
     );
     let b_ran = d.join("b_ran");
@@ -951,8 +941,12 @@ fn signal_after_gate_call_ended(
     wait_stopped(child.id());
     signal_pid(child.id(), name);
     fs::write(&release, "").unwrap();
-    let gate_pid: u32 = fs::read_to_string(&gate_pid).unwrap().trim().parse().unwrap();
-    wait_exited(gate_pid);
+    // The lane's last act before it exits. Whether it has fully exited when the
+    // signal lands does not change the outcome under test (a lane killed instead
+    // of finished also ends the run without publishing), and `ps`, which would
+    // show the exit, cannot run in the hosted sandbox.
+    wait_for_file(&mut reaper.child, &gate_done, "the gating lane never finished");
+    let child = &mut reaper.child;
     signal_pid(child.id(), "CONT");
     let status = wait_exit(child);
     (status, d, keep)

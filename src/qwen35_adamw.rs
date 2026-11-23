@@ -83,7 +83,7 @@ fn check_hyper(what: &str, hyper: &AdamWHyper) -> Result<(), String> {
 ///
 /// `step` is torch's count after it has incremented (1-based).
 /// Delegates canonical scalar formation to `ojas_core::AdamWScalars`.
-fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
+fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> Result<[f32; 8], String> {
     let config = ojas_core::AdamWConfig {
         lr: hyper.lr,
         beta1: hyper.beta1,
@@ -92,9 +92,17 @@ fn adamw_scalars(hyper: &AdamWHyper, step: u64, weight_decay: f64) -> [f32; 8] {
         weight_decay,
     };
     let step_before = step.saturating_sub(1);
-    let s = ojas_core::AdamWScalars::new(config, step_before).expect("validated hyperparameters");
-    let w = s.f32_words("adamw_step").expect("finite f32 words");
-    [w[0], w[1], w[2], w[3], w[4], w[5], w[6], hyper.grad_scale as f32]
+    let s = ojas_core::AdamWScalars::new(config, step_before).map_err(|e| format!("adamw_step: {e}"))?;
+    let w = s.f32_words("adamw_step").map_err(|e| format!("adamw_step: {e}"))?;
+    // A positive eps that rounds to zero would leave the kernel's denominator 0 when v is 0.
+    if w[6] == 0.0 {
+        return Err(format!("adamw_step: eps {} underflows to 0 in f32", hyper.eps));
+    }
+    let grad_scale = hyper.grad_scale as f32;
+    if !grad_scale.is_finite() {
+        return Err(format!("adamw_step: grad_scale {} overflows f32", hyper.grad_scale));
+    }
+    Ok([w[0], w[1], w[2], w[3], w[4], w[5], w[6], grad_scale])
 }
 
 fn le_bytes<const N: usize, T: Copy>(xs: [T; N], f: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
@@ -181,6 +189,9 @@ pub fn adamw_step(
             }
         }
     }
+    // Formed before the empty-tensor return, so an overflowing hyperparameter is refused whether or
+    // not a parameter would move.
+    let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay))?, f32::to_le_bytes);
     let n = param.try_numel()?;
     if n == 0 {
         return Ok(());
@@ -192,7 +203,6 @@ pub fn adamw_step(
     for (x, name) in w.iter().zip(names) {
         x.check(format_args!("{WHAT}: {name}"))?;
     }
-    let bytes = le_bytes(adamw_scalars(hyper, step, f64::from(weight_decay)), f32::to_le_bytes);
     let p = rt.pipeline("qwen35_adamw_f32")?;
     dispatch_2d(rt, &p, n, 1, |bnd| {
         for (i, x) in w.iter().enumerate() {

@@ -35,7 +35,7 @@ bin embedgemma2_pre 5
 bin embedgemma2_tok_tiny 13
 bin embedgemma2_tok_batch 8
 bin gdn_fixtures 12
-bin fixture_manifests 13
+bin fixture_manifests 15
 bin gdn_gates 22
 bin gdn_state 10
 bin go_link_frameworks 2
@@ -56,15 +56,15 @@ bin media_yuv_formats 5
 bin metallib_clean_time_script 18
 bin npy_hardening 4
 bin parser_mutation 13
-bin plot_results 57
-bin plot_results_go_overhead 5
-bin plot_results_resample 3
+bin plot_results 59
+bin plot_results_go_overhead 7
+bin plot_results_resample 5
 bin reader_bounds 12
 bin qwen35_config 14
 bin qwen35_mlx_q4_layout 15
 bin qwen35_mlx_q4_adversarial 15
 bin relaxed_predicate 1
-bin results_report 21
+bin results_report 23
 bin release_check 14
 bin safetensors 12
 bin timesfm3_host 7
@@ -74,9 +74,9 @@ bin icb_flag_env 4
 bin bench_gemm_sweep_metallib 5
 bin ci_workflow_gates 6
 bin bench_gemm_sweep_cli 5
-bin gemm_parity 41
+bin gemm_parity 43
 bin kernel_coverage 64
-bin attn_tune 24
+bin attn_tune 26
 bin scratch_guard 5
 bin bench_flash_attn_cli 6
 
@@ -118,7 +118,7 @@ exact empirical_challenge_m2 challenge_adamw_scalar_bit_identity_across_boundary
 
 # Unit tests of the src/bin targets (bench drivers, probes, and bench common::tests):
 # every one of them is device-free. One cargo invocation, counted as a total.
-bins 488
+bins 490
 
 # Library tests.
 lib ab_flags::tests:: 15
@@ -134,7 +134,7 @@ lib par_batch::tests:: 6
 lib media:: 19
 lib bounded_file::tests:: 15
 lib runtime::metallib_read_tests:: 6
-lib parser_mutation:: 16
+lib parser_mutation:: 18
 lib pool_ledger::tests:: 11
 lib qwen35::tests:: 6
 lib qwen35_bwd::layout_tests:: 2

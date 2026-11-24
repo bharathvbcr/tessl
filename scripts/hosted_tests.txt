@@ -13,7 +13,7 @@ ignored hosted_selection hosted_selection_has_no_device
 bin audit_gemm_tiles 17
 bin bench_clip_2048_result 11
 bin bench_env_validation 2
-bin bench_paired_cli 33
+bin bench_paired_cli 34
 bin bench_attn_cli 1
 bin build_artifact_contract 2
 bin capi_contract 81
@@ -64,7 +64,7 @@ bin qwen35_config 14
 bin qwen35_mlx_q4_layout 15
 bin qwen35_mlx_q4_adversarial 15
 bin relaxed_predicate 1
-bin results_report 23
+bin results_report 24
 bin release_check 14
 bin safetensors 12
 bin timesfm3_host 7

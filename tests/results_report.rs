@@ -21,6 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod signal_support;
+
 const SYNTAX: Syntax = Syntax {
     what: "test JSON",
     max_depth: 64,
@@ -300,6 +302,11 @@ fn ffmpeg_graph_probe_refuses_empty_and_short_expected_sets() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("all caught"));
 }
 
+/// Set by `the_guard_int_test_passes_when_the_harness_inherits_the_signals_ignored`
+/// for its re-run, which may run beside the direct one: `fresh` clears its case
+/// directory, so the re-run needs a directory of its own.
+const CASE_SUFFIX_ENV: &str = "TESSL_RESULTS_REPORT_CASE_SUFFIX";
+
 /// `scripts/guard_break_it.sh` with its test run stuck: a TERM or INT sent to
 /// the script alone must end the test's own process group (which leads its own
 /// group, so nothing but the script's handler reaches it) and exit 128+signal.
@@ -307,7 +314,8 @@ fn ffmpeg_graph_probe_refuses_empty_and_short_expected_sets() {
 /// this test against an older one.
 fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
     use std::time::{Duration, Instant};
-    let root = fresh(case);
+    let suffix = std::env::var(CASE_SUFFIX_ENV).unwrap_or_default();
+    let root = fresh(&format!("{case}{suffix}"));
     let repo = root.join("repo");
     fs::create_dir_all(repo.join("scripts")).unwrap();
     fs::create_dir_all(repo.join("tests")).unwrap();
@@ -348,7 +356,9 @@ fn guard_break_it_signal_case(case: &str, signal: &str, want_code: i32) {
     let tmp = root.join("tmp");
     fs::create_dir_all(&tmp).unwrap();
     let path = format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap_or_default());
-    let mut child = Command::new("bash")
+    // bash cannot trap a signal ignored on entry: hand the script the defaults a
+    // terminal would, whatever this harness inherited (see signal_support).
+    let mut child = signal_support::default_signals(&mut Command::new("bash"))
         .arg(repo.join("scripts/guard_break_it.sh"))
         .current_dir(&repo)
         .env("PATH", path)
@@ -442,7 +452,19 @@ fn guard_break_it_term_reaches_the_test_process_group() {
 
 #[test]
 fn guard_break_it_int_reaches_the_test_process_group() {
+    signal_support::expect_ignored_if_rerun();
     guard_break_it_signal_case("guard_int", "INT", 130);
+}
+
+/// The SIGINT case above does not depend on the SIGINT disposition this harness
+/// inherited: run again with SIGINT, SIGQUIT and SIGHUP ignored on entry (as
+/// under a background job, the cargo slot gate or `nohup`), it still passes.
+#[test]
+fn the_guard_int_test_passes_when_the_harness_inherits_the_signals_ignored() {
+    signal_support::rerun_with_signals_ignored(
+        &["guard_break_it_int_reaches_the_test_process_group"],
+        &[(CASE_SUFFIX_ENV, "-inherited-ignored")],
+    );
 }
 
 #[test]

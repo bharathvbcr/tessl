@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 
 mod scratch_support;
 use scratch_support::Scratch;
+mod signal_support;
 
 fn scratch(tag: &str) -> Scratch {
     Scratch::dir(&format!("tessl-bp-{tag}"))
@@ -697,6 +698,7 @@ fn a_timed_out_lane_is_killed_with_its_children_and_named_with_its_round() {
 /// nothing here depends on timing (the lane timeout only bounds a hang).
 #[test]
 fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
+    signal_support::expect_ignored_if_rerun();
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
     let d = scratch("interrupt");
@@ -715,7 +717,8 @@ fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
         ),
     );
     let out_json = d.join("o.json");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+    // SIGINT at its default whatever this harness inherited (see signal_support).
+    let mut child = signal_support::default_signals(&mut Command::new(env!("CARGO_BIN_EXE_bench_paired")))
         .args(strs(&[
             "--format",
             "metrics",
@@ -851,8 +854,10 @@ fn names_with_prefix(d: &Path, prefix: &str) -> Vec<String> {
     v
 }
 
+/// Start `bench_paired` with SIGINT, SIGQUIT and SIGHUP at their defaults, so a
+/// signal the test sends acts as it would from a terminal (see signal_support).
 fn spawn_bp(args: Vec<String>) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_bench_paired"))
+    signal_support::default_signals(&mut Command::new(env!("CARGO_BIN_EXE_bench_paired")))
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -955,6 +960,7 @@ fn signal_after_gate_call_ended(
 /// a signal that lands after the last lane ended and before the JSON is published.
 #[test]
 fn a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result() {
+    signal_support::expect_ignored_if_rerun();
     use std::os::unix::process::ExitStatusExt;
     let (status, d, _keep) = signal_after_gate_call_ended("sig_publish", 2, "INT");
     let left = names_with_prefix(&d, "o.json");
@@ -963,6 +969,20 @@ fn a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result() {
     assert!(
         !d.join("o.json").exists(),
         "the run died of SIGINT yet published its result: {left:?}"
+    );
+}
+
+/// The two signal tests above do not depend on the SIGINT disposition this
+/// harness inherited: run again with SIGINT, SIGQUIT and SIGHUP ignored on entry
+/// (as under a background job, the cargo slot gate or `nohup`), both still pass.
+#[test]
+fn the_signal_tests_pass_when_the_harness_inherits_the_signals_ignored() {
+    signal_support::rerun_with_signals_ignored(
+        &[
+            "an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal",
+            "a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result",
+        ],
+        &[],
     );
 }
 

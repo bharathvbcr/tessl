@@ -452,7 +452,7 @@ fn guard_break_it_term_reaches_the_test_process_group() {
 
 #[test]
 fn guard_break_it_int_reaches_the_test_process_group() {
-    signal_support::expect_ignored_if_rerun();
+    signal_support::prepare_if_rerun();
     guard_break_it_signal_case("guard_int", "INT", 130);
 }
 

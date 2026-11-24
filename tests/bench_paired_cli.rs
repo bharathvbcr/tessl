@@ -698,7 +698,7 @@ fn a_timed_out_lane_is_killed_with_its_children_and_named_with_its_round() {
 /// nothing here depends on timing (the lane timeout only bounds a hang).
 #[test]
 fn an_interrupted_run_leaves_no_staging_dir_and_dies_of_the_signal() {
-    signal_support::expect_ignored_if_rerun();
+    signal_support::prepare_if_rerun();
     use std::os::unix::process::ExitStatusExt;
     use std::time::{Duration, Instant};
     let d = scratch("interrupt");
@@ -960,7 +960,7 @@ fn signal_after_gate_call_ended(
 /// a signal that lands after the last lane ended and before the JSON is published.
 #[test]
 fn a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result() {
-    signal_support::expect_ignored_if_rerun();
+    signal_support::prepare_if_rerun();
     use std::os::unix::process::ExitStatusExt;
     let (status, d, _keep) = signal_after_gate_call_ended("sig_publish", 2, "INT");
     let left = names_with_prefix(&d, "o.json");
@@ -983,6 +983,91 @@ fn the_signal_tests_pass_when_the_harness_inherits_the_signals_ignored() {
             "a_run_that_dies_of_a_signal_after_its_last_lane_publishes_no_result",
         ],
         &[],
+    );
+}
+
+/// The role an instance of the test below plays: unset in the test itself,
+/// `parent` for the process standing in for a proof test, `rerun` for the re-run.
+const RERUN_ROLE_ENV: &str = "TESSL_BP_RERUN_ROLE";
+/// Where the `parent` writes the re-run's pid.
+const RERUN_PIDFILE_ENV: &str = "TESSL_BP_RERUN_PIDFILE";
+
+/// A Ctrl-C kills a proof test above but not the re-run it started, which
+/// starts with SIGINT ignored; the re-run must stop once its parent is gone
+/// rather than run its tests out to their deadlines. A stand-in parent starts a
+/// re-run that would sleep 60 s, and is killed; the re-run has to be gone soon after.
+#[test]
+fn a_rerun_stops_once_the_test_that_started_it_dies() {
+    const NAME: &str = "a_rerun_stops_once_the_test_that_started_it_dies";
+    signal_support::prepare_if_rerun();
+    match std::env::var(RERUN_ROLE_ENV).as_deref() {
+        Ok("rerun") => {
+            // Stand in for a re-run test waiting on a long deadline.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            panic!("the re-run was still running 60 s after it started");
+        }
+        Ok("parent") => {
+            let rerun = signal_support::spawn_rerun(&[NAME], &[(RERUN_ROLE_ENV, "rerun")]);
+            let pidfile = PathBuf::from(std::env::var_os(RERUN_PIDFILE_ENV).expect("pidfile"));
+            let tmp = pidfile.with_extension("tmp");
+            fs::write(&tmp, rerun.child.id().to_string()).unwrap();
+            fs::rename(&tmp, &pidfile).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            panic!("the stand-in parent was not killed within 60 s");
+        }
+        Ok(other) => panic!("unknown {RERUN_ROLE_ENV} {other:?}"),
+        Err(_) => {}
+    }
+    let d = scratch("rerun_orphan");
+    let pidfile = d.join("rerun.pid");
+    let mut parent = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--test-threads=1"])
+        .env(RERUN_ROLE_ENV, "parent")
+        .env(RERUN_PIDFILE_ENV, &pidfile)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the stand-in parent");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let rerun = loop {
+        if let Some(pid) = fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|t| t.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        if std::time::Instant::now() > until {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            panic!("the stand-in parent never wrote the re-run's pid");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(rerun > 1, "bad re-run pid {rerun}");
+    // SIGKILL, which no disposition can ignore: the parent dies as a Ctrl-C would
+    // kill it, and the kernel closes its end of the re-run's stdin.
+    parent.kill().expect("kill the stand-in parent");
+    let _ = parent.wait();
+    // Signal 0 only probes; once orphaned, the re-run is reaped by launchd/init,
+    // so ESRCH means it has exited.
+    let gone = || {
+        // SAFETY: signal 0 sends nothing; `rerun` is a checked positive pid.
+        let rc = unsafe { libc::kill(rerun, 0) };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !gone() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let survived = !gone();
+    if survived {
+        // SAFETY: the re-run this test started (through the stand-in parent).
+        unsafe { libc::kill(rerun, libc::SIGKILL) };
+    }
+    assert!(
+        !survived,
+        "the re-run {rerun} outlived the test that started it by 20 s"
     );
 }
 

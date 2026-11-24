@@ -2188,9 +2188,7 @@ mod tests {
     fn a_refusal_is_recorded_and_a_fatal_error_ends_the_run() {
         let run = quiet_run();
         assert!(guarded(&run, "ok", || Ok(())).is_ok());
-        assert!(guarded(&run, "bad proof", || refuse::<()>(Err("wrong kernel".into()))
-            .map_err(Into::into))
-        .is_ok());
+        assert!(guarded(&run, "bad proof", || refuse::<()>(Err("wrong kernel".into()))).is_ok());
         assert_eq!(run.refused.borrow().as_slice(), ["bad proof".to_string()]);
         // A bare String error (a device or timing failure) is not a refusal.
         let e = guarded(&run, "timing", || -> Result<(), Fail> {

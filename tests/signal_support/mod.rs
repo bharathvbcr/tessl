@@ -14,7 +14,9 @@
 //! uses every item.
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
@@ -87,19 +89,49 @@ pub fn prepare_if_rerun() {
     stop_when_parent_is_gone();
 }
 
-/// A Ctrl-C kills the test that started a re-run, but not the re-run, which
-/// starts with SIGINT ignored: its tests would run on to their own deadlines.
-/// Its stdin is a pipe whose write end only that parent holds ([`Rerun`]), so
-/// end of file on stdin means the parent is gone, and the re-run exits.
+/// A re-run starts with SIGINT ignored, in its own process group, so a Ctrl-C
+/// that kills the test which started it does not reach it: its tests would run
+/// on to their own deadlines. Its stdin is a pipe whose write end the parent
+/// holds ([`Rerun`]), so end of file on it means the parent is gone. The re-run
+/// then ends its whole group: SIGCONT for a child a test left stopped, then
+/// SIGTERM, which the children have at its default (they are started with
+/// [`default_signals`]) and which `bench_paired` answers by taking its lanes
+/// down. Destructors in the re-run do not run, so scratch directories of the
+/// interrupted test can be left behind.
+///
+/// The pipe is moved off fd 0 to a private close-on-exec descriptor and fd 0
+/// becomes `/dev/null`, so the re-run's children inherit `/dev/null` as before.
+///
+/// On macOS std creates the pipe and only then marks it close-on-exec, so a
+/// process another test thread of the parent forks in between can hold a copy
+/// of the write end; the watch then fires only once that process has exited too.
 fn stop_when_parent_is_gone() {
     static WATCH: std::sync::Once = std::sync::Once::new();
     WATCH.call_once(|| {
+        // SAFETY: `fcntl` duplicates fd 0, which is open (the pipe), into a new
+        // close-on-exec descriptor that nothing else owns.
+        let fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(
+            fd >= 0,
+            "duplicate the re-run's stdin: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just created above and is owned only by `pipe`.
+        let mut pipe = unsafe { File::from_raw_fd(fd) };
+        let null = File::open("/dev/null").expect("open /dev/null");
+        // SAFETY: both descriptors are open; fd 0 now names /dev/null.
+        let r = unsafe { libc::dup2(null.as_raw_fd(), 0) };
+        assert!(
+            r == 0,
+            "put /dev/null on the re-run's stdin: {}",
+            std::io::Error::last_os_error()
+        );
         std::thread::Builder::new()
             .name("rerun-parent-watch".into())
-            .spawn(|| {
+            .spawn(move || {
                 let mut buf = [0u8; 64];
                 loop {
-                    match std::io::stdin().read(&mut buf) {
+                    match pipe.read(&mut buf) {
                         Ok(0) => break,
                         Ok(_) => continue,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -109,6 +141,17 @@ fn stop_when_parent_is_gone() {
                 // Straight to fd 2: the test harness captures `eprintln!`, and
                 // the capture is lost at exit.
                 let _ = std::io::stderr().write_all(format!("{PARENT_GONE}\n").as_bytes());
+                // SAFETY: `getpgrp` and `getpid` have no preconditions.
+                if unsafe { libc::getpgrp() == libc::getpid() } {
+                    // SAFETY: pid 0 names this process's own group, which it leads
+                    // (`spawn_rerun` starts it with `process_group(0)`), so only the
+                    // re-run and its children are signalled.
+                    unsafe {
+                        libc::kill(0, libc::SIGCONT);
+                        libc::kill(0, libc::SIGTERM);
+                    }
+                }
+                // Reached only if this process ignores SIGTERM.
                 std::process::exit(PARENT_GONE_EXIT);
             })
             .expect("start the re-run's parent watch");
@@ -116,16 +159,17 @@ fn stop_when_parent_is_gone() {
 }
 
 /// A started re-run of some tests of this binary (see [`spawn_rerun`]).
-/// `parent_alive` is the write end of the re-run's stdin: the re-run stops soon
-/// after it is closed, which this process's death also does.
+/// `parent_alive` is the write end of the re-run's stdin: the re-run ends its
+/// process group soon after it is closed, which this process's death also does.
 pub struct Rerun {
     pub child: Child,
     pub parent_alive: ChildStdin,
 }
 
 /// Start `names` from this test binary, each with `--exact`, in a child that
-/// starts with [`INHERITED_IGNORABLE`] ignored, with stdout and stderr piped.
-/// `env` is added to the child's environment.
+/// starts with [`INHERITED_IGNORABLE`] ignored, in a process group of its own
+/// (as a terminal's job is), with stdout and stderr piped. `env` is added to
+/// the child's environment.
 pub fn spawn_rerun(names: &[&str], env: &[(&str, &str)]) -> Rerun {
     let mut cmd = Command::new(std::env::current_exe().expect("the running test binary"));
     cmd.arg("--exact")
@@ -135,7 +179,8 @@ pub fn spawn_rerun(names: &[&str], env: &[(&str, &str)]) -> Rerun {
         .env(EXPECT_IGNORED_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     ignored_signals(&mut cmd);
     let mut child = cmd.spawn().expect("re-run the test binary");
     let parent_alive = child.stdin.take().expect("the re-run's stdin is piped");

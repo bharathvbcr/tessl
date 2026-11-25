@@ -901,9 +901,10 @@ fn spawn_helper(helper: &str, env: (&str, &Path), ignored: &[libc::c_int]) -> st
         .stderr(std::process::Stdio::null())
         .process_group(0);
     signal_support::default_signals(&mut cmd);
-    // SAFETY: only `signal` and `setrlimit`, both async-signal-safe, between fork
-    // and exec. Registered after `default_signals`, so it runs after the reset
-    // and `ignored` stays ignored.
+    // SAFETY: between fork and exec this calls only `signal` (async-signal-safe)
+    // and `setrlimit` (a plain system call, not on the POSIX list but safe after
+    // fork here, with no locks or allocation). Registered after `default_signals`,
+    // so it runs after the reset and `ignored` stays ignored.
     unsafe {
         cmd.pre_exec(move || {
             for &sig in &ignored {

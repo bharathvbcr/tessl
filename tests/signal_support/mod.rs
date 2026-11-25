@@ -62,8 +62,9 @@ const EXPECT_IGNORED_ENV: &str = "TESSL_SIGNAL_SUPPORT_EXPECT_IGNORED";
 /// What a re-run prints to stderr when it stops because its parent is gone.
 pub const PARENT_GONE: &str = "signal_support: the test that started this re-run is gone; stopping the re-run";
 
-/// The exit status of a re-run that stopped because its parent is gone.
-pub const PARENT_GONE_EXIT: i32 = 3;
+/// The exit status of a re-run whose parent is gone, when the SIGTERM it sends
+/// its own group did not end it (it normally dies of that SIGTERM).
+const PARENT_GONE_EXIT: i32 = 3;
 
 /// In a re-run started by [`spawn_rerun`]: require that this process started
 /// with every one of [`INHERITED_IGNORABLE`] ignored, so a passing re-run proves
@@ -151,7 +152,8 @@ fn stop_when_parent_is_gone() {
                         libc::kill(0, libc::SIGTERM);
                     }
                 }
-                // Reached only if this process ignores SIGTERM.
+                // Reached only if this process ignores SIGTERM, or does not lead
+                // its group (not the case for a re-run from `spawn_rerun`).
                 std::process::exit(PARENT_GONE_EXIT);
             })
             .expect("start the re-run's parent watch");

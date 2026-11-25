@@ -15,11 +15,19 @@
 # the bytes of the archive they name, so every Go command here passes the archive's
 # hash in CGO_CFLAGS: a rebuilt archive is a new key, and a stale test binary cannot
 # pass for the new engine.
+#
+# The archive cgo links is not cargo's own. Go 1.27.4's cgo flag check walks every
+# -L directory and refuses an object that carries an LTO section (__LLVM,__bitcode),
+# and a Rust staticlib always does: the precompiled std members have it whatever the
+# profile says, and target/release also holds cargo's build/ tree. So `engine` copies
+# libgusset.a to engine/target/stage/ with the bitcode removed (engine/strip_bitcode.sh),
+# and the cgo -L names that directory, which holds nothing else.
 
 SHELL   := /bin/bash -o pipefail
 GO      ?= go
 ENGINE  := engine
-ARCHIVE := $(ENGINE)/target/release/libgusset.a
+BUILT   := $(ENGINE)/target/release/libgusset.a
+ARCHIVE := $(ENGINE)/target/stage/libgusset.a
 REPO    := ..
 
 # Evaluated by the shell at run time, after the archive is built.
@@ -29,6 +37,7 @@ CGO     := CGO_CFLAGS="-DTESSL_ENGINE_SHA=$$(shasum -a 256 $(ARCHIVE) | cut -c1-
 
 engine:
 	cargo build --release --locked --manifest-path $(ENGINE)/Cargo.toml --target-dir $(ENGINE)/target
+	@if [ ! -f $(ARCHIVE) ] || [ $(BUILT) -nt $(ARCHIVE) ]; then $(ENGINE)/strip_bitcode.sh $(BUILT) $(ARCHIVE); fi
 
 engine-test:
 	cargo test --release --locked --manifest-path $(ENGINE)/Cargo.toml --target-dir $(ENGINE)/target

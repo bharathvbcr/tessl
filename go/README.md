@@ -51,6 +51,13 @@ bytes of the archive they name, so the Makefile passes the archive's hash in
 `CGO_CFLAGS`. A bare `go test` after rebuilding the archive should pass
 `-count=1 -a`.
 
+cgo links `engine/target/stage/libgusset.a`, not cargo's `target/release/libgusset.a`.
+Since Go 1.27.4 the cgo flag check walks each `-L` directory and refuses any object
+with an LTO section (`__LLVM,__bitcode`); every Rust staticlib has some, because
+the precompiled std members carry bitcode whatever the profile sets. `make engine`
+copies the archive with the bitcode removed (`engine/strip_bitcode.sh`, which needs
+Xcode's `ld` and `libtool`, as cgo does) into a directory that holds nothing else.
+
 `ld: warning` lines about a duplicate `-lgusset` and about gusset's own
 `target/release` search paths are gusset's cgo flags meeting the archive's, and
 are harmless.

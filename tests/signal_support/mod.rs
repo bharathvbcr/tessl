@@ -1,4 +1,4 @@
-//! Start a test's child with SIGINT, SIGQUIT and SIGHUP at their default action,
+//! Start a test's child with the signals a test sends at their default action,
 //! whatever this test process inherited, and prove a test does not depend on it.
 //!
 //! A `cargo test` started as a background job (`&` in a non-interactive shell,
@@ -14,18 +14,27 @@
 //! uses every item.
 #![allow(dead_code)]
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// The signals a background or `nohup` launch hands down ignored.
 pub const INHERITED_IGNORABLE: [libc::c_int; 3] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP];
 
-/// Reset [`INHERITED_IGNORABLE`] to `SIG_DFL` in the child `cmd` starts.
+/// The signals [`default_signals`] resets: [`INHERITED_IGNORABLE`] and SIGTERM,
+/// which the tests also send and which a parent may have ignored.
+pub const SENT_BY_TESTS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM];
+
+/// Reset [`SENT_BY_TESTS`] to `SIG_DFL` in the child `cmd` starts. A caller
+/// that wants some of them ignored, or other set-up, registers its own
+/// `pre_exec` after this one: the closures run in the order they were added.
 pub fn default_signals(cmd: &mut Command) -> &mut Command {
     // SAFETY: the closure runs in the forked child before exec. It calls only
     // `signal` and, on failure, reads errno into an `io::Error` (no allocation);
     // both are async-signal-safe.
-    unsafe { cmd.pre_exec(|| set_all(libc::SIG_DFL)) }
+    unsafe { cmd.pre_exec(|| set_all(&SENT_BY_TESTS, libc::SIG_DFL)) }
 }
 
 /// Set [`INHERITED_IGNORABLE`] to `SIG_IGN` in the child `cmd` starts, as a
@@ -33,11 +42,11 @@ pub fn default_signals(cmd: &mut Command) -> &mut Command {
 pub fn ignored_signals(cmd: &mut Command) -> &mut Command {
     // SAFETY: as in `default_signals`: only `signal` and an errno read run
     // between fork and exec.
-    unsafe { cmd.pre_exec(|| set_all(libc::SIG_IGN)) }
+    unsafe { cmd.pre_exec(|| set_all(&INHERITED_IGNORABLE, libc::SIG_IGN)) }
 }
 
-fn set_all(action: libc::sighandler_t) -> std::io::Result<()> {
-    for sig in INHERITED_IGNORABLE {
+fn set_all(sigs: &[libc::c_int], action: libc::sighandler_t) -> std::io::Result<()> {
+    for &sig in sigs {
         // SAFETY: `signal` with a valid signal number and SIG_DFL or SIG_IGN.
         if unsafe { libc::signal(sig, action) } == libc::SIG_ERR {
             return Err(std::io::Error::last_os_error());
@@ -46,16 +55,23 @@ fn set_all(action: libc::sighandler_t) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Set by [`rerun_with_signals_ignored`] for its re-run, so that the re-run
-/// tests can check, with [`expect_ignored_if_rerun`], that they really started
-/// with the signals ignored.
+/// Set by [`spawn_rerun`] for its re-run, so that the re-run tests can check,
+/// with [`prepare_if_rerun`], that they really started with the signals ignored.
 const EXPECT_IGNORED_ENV: &str = "TESSL_SIGNAL_SUPPORT_EXPECT_IGNORED";
 
-/// In a re-run started by [`rerun_with_signals_ignored`], require that this
-/// process started with every one of [`INHERITED_IGNORABLE`] ignored, so a
-/// passing re-run proves what it claims. Does nothing in a direct run, which
-/// may have inherited either disposition. Call it first in a re-run test.
-pub fn expect_ignored_if_rerun() {
+/// What a re-run prints to stderr when it stops because its parent is gone.
+pub const PARENT_GONE: &str = "signal_support: the test that started this re-run is gone; stopping the re-run";
+
+/// The exit status of a re-run whose parent is gone, when the SIGTERM it sends
+/// its own group did not end it (it normally dies of that SIGTERM).
+const PARENT_GONE_EXIT: i32 = 3;
+
+/// In a re-run started by [`spawn_rerun`]: require that this process started
+/// with every one of [`INHERITED_IGNORABLE`] ignored, so a passing re-run proves
+/// what it claims, and stop this process once the test that started it is gone.
+/// Does nothing in a direct run, which may have inherited either disposition.
+/// Call it first in a re-run test.
+pub fn prepare_if_rerun() {
     if std::env::var_os(EXPECT_IGNORED_ENV).is_none() {
         return;
     }
@@ -71,22 +87,117 @@ pub fn expect_ignored_if_rerun() {
             "the re-run did not start with signal {sig} ignored"
         );
     }
+    stop_when_parent_is_gone();
 }
 
-/// Re-run `names` from this test binary, each with `--exact`, in a child that
-/// starts with [`INHERITED_IGNORABLE`] ignored, and require that exactly
-/// `names.len()` tests ran and all passed (a name that matches nothing also
-/// exits 0, so the count is checked). `env` is added to the child's environment.
-pub fn rerun_with_signals_ignored(names: &[&str], env: &[(&str, &str)]) {
+/// A re-run starts with SIGINT ignored, in its own process group, so a Ctrl-C
+/// that kills the test which started it does not reach it: its tests would run
+/// on to their own deadlines. Its stdin is a pipe whose write end the parent
+/// holds ([`Rerun`]), so end of file on it means the parent is gone. The re-run
+/// then ends its whole group: SIGCONT for a child a test left stopped, then
+/// SIGTERM, which the children have at its default (they are started with
+/// [`default_signals`]) and which `bench_paired` answers by taking its lanes
+/// down. Destructors in the re-run do not run, so scratch directories of the
+/// interrupted test can be left behind.
+///
+/// The pipe is moved off fd 0 to a private close-on-exec descriptor and fd 0
+/// becomes `/dev/null`, so the re-run's children inherit `/dev/null` as before.
+///
+/// On macOS std creates the pipe and only then marks it close-on-exec, so a
+/// process another test thread of the parent forks in between can hold a copy
+/// of the write end; the watch then fires only once that process has exited too.
+fn stop_when_parent_is_gone() {
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    WATCH.call_once(|| {
+        // SAFETY: `fcntl` duplicates fd 0, which is open (the pipe), into a new
+        // close-on-exec descriptor that nothing else owns.
+        let fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(
+            fd >= 0,
+            "duplicate the re-run's stdin: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just created above and is owned only by `pipe`.
+        let mut pipe = unsafe { File::from_raw_fd(fd) };
+        let null = File::open("/dev/null").expect("open /dev/null");
+        // SAFETY: both descriptors are open; fd 0 now names /dev/null.
+        let r = unsafe { libc::dup2(null.as_raw_fd(), 0) };
+        assert!(
+            r == 0,
+            "put /dev/null on the re-run's stdin: {}",
+            std::io::Error::last_os_error()
+        );
+        std::thread::Builder::new()
+            .name("rerun-parent-watch".into())
+            .spawn(move || {
+                let mut buf = [0u8; 64];
+                loop {
+                    match pipe.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                // Straight to fd 2: the test harness captures `eprintln!`, and
+                // the capture is lost at exit.
+                let _ = std::io::stderr().write_all(format!("{PARENT_GONE}\n").as_bytes());
+                // SAFETY: `getpgrp` and `getpid` have no preconditions.
+                if unsafe { libc::getpgrp() == libc::getpid() } {
+                    // SAFETY: pid 0 names this process's own group, which it leads
+                    // (`spawn_rerun` starts it with `process_group(0)`), so only the
+                    // re-run and its children are signalled.
+                    unsafe {
+                        libc::kill(0, libc::SIGCONT);
+                        libc::kill(0, libc::SIGTERM);
+                    }
+                }
+                // Reached only if this process ignores SIGTERM, or does not lead
+                // its group (not the case for a re-run from `spawn_rerun`).
+                std::process::exit(PARENT_GONE_EXIT);
+            })
+            .expect("start the re-run's parent watch");
+    });
+}
+
+/// A started re-run of some tests of this binary (see [`spawn_rerun`]).
+/// `parent_alive` is the write end of the re-run's stdin: the re-run ends its
+/// process group soon after it is closed, which this process's death also does.
+pub struct Rerun {
+    pub child: Child,
+    pub parent_alive: ChildStdin,
+}
+
+/// Start `names` from this test binary, each with `--exact`, in a child that
+/// starts with [`INHERITED_IGNORABLE`] ignored, in a process group of its own
+/// (as a terminal's job is), with stdout and stderr piped. `env` is added to
+/// the child's environment.
+pub fn spawn_rerun(names: &[&str], env: &[(&str, &str)]) -> Rerun {
     let mut cmd = Command::new(std::env::current_exe().expect("the running test binary"));
     cmd.arg("--exact")
         .arg("--test-threads=1")
         .args(names)
         .envs(env.iter().copied())
         .env(EXPECT_IGNORED_ENV, "1")
-        .stdin(Stdio::null());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     ignored_signals(&mut cmd);
-    let out = cmd.output().expect("re-run the test binary");
+    let mut child = cmd.spawn().expect("re-run the test binary");
+    let parent_alive = child.stdin.take().expect("the re-run's stdin is piped");
+    Rerun { child, parent_alive }
+}
+
+/// Re-run `names` with [`spawn_rerun`] and require that exactly `names.len()`
+/// tests ran and all passed (a name that matches nothing also exits 0, so the
+/// count is checked).
+pub fn rerun_with_signals_ignored(names: &[&str], env: &[(&str, &str)]) {
+    let Rerun { child, parent_alive } = spawn_rerun(names, env);
+    // `wait_with_output` would close a stdin it held; this one is held apart,
+    // open until the re-run has ended.
+    let out = child.wait_with_output().expect("wait for the re-run");
+    drop(parent_alive);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let want = format!("test result: ok. {} passed; 0 failed", names.len());
     assert!(

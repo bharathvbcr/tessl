@@ -19,6 +19,7 @@ mod kcov;
 mod proc;
 #[path = "../src/bin/common/pyjson.rs"]
 mod pyjson;
+mod signal_support;
 
 use kcov::{Census, Failure, Traced};
 use std::collections::{BTreeMap, BTreeSet};
@@ -887,7 +888,8 @@ fn run_bounded_table_helper() {
 /// Start this test binary on `helper` in its own process group, as a terminal's
 /// foreground job is. The signals are reset to their defaults first (a runner
 /// under `nohup` or a background shell hands its children `SIG_IGN`, which the
-/// helper must not inherit by accident), then `ignored` are set to `SIG_IGN`.
+/// helper must not inherit by accident; see signal_support), then `ignored` are
+/// set to `SIG_IGN`.
 fn spawn_helper(helper: &str, env: (&str, &Path), ignored: &[libc::c_int]) -> std::process::Child {
     use std::os::unix::process::CommandExt;
     let ignored = ignored.to_vec();
@@ -898,12 +900,13 @@ fn spawn_helper(helper: &str, env: (&str, &Path), ignored: &[libc::c_int]) -> st
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0);
-    // SAFETY: only `signal` and `setrlimit`, both async-signal-safe, between fork and exec.
+    signal_support::default_signals(&mut cmd);
+    // SAFETY: between fork and exec this calls only `signal` (async-signal-safe)
+    // and `setrlimit` (a plain system call, not on the POSIX list but safe after
+    // fork here, with no locks or allocation). Registered after `default_signals`,
+    // so it runs after the reset and `ignored` stays ignored.
     unsafe {
         cmd.pre_exec(move || {
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-                libc::signal(sig, libc::SIG_DFL);
-            }
             for &sig in &ignored {
                 libc::signal(sig, libc::SIG_IGN);
             }

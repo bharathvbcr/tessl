@@ -14,6 +14,7 @@
 #![cfg(unix)]
 
 mod scratch_support;
+mod signal_support;
 
 use scratch_support::{remove_path, Scratch};
 use std::ffi::{OsStr, OsString};
@@ -383,17 +384,13 @@ fn spawn_with(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // The script's traps need the signals the tests send at their defaults,
+    // whatever this harness inherited (see signal_support).
+    signal_support::default_signals(&mut cmd);
     // SAFETY: the closure runs in the forked child before exec and only calls
-    // the async-signal-safe `signal`. A `cargo test` started in the background
-    // (`&` in a non-interactive shell, or nohup) inherits SIGINT, SIGQUIT and
-    // SIGHUP as ignored, and bash cannot trap a signal that was ignored on
-    // entry; the script's own traps need them all default.
+    // the async-signal-safe `signal`, for SIGPIPE, which this test chooses.
     unsafe {
         cmd.pre_exec(move || {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            libc::signal(libc::SIGHUP, libc::SIG_DFL);
             libc::signal(
                 libc::SIGPIPE,
                 if ignore_sigpipe { libc::SIG_IGN } else { libc::SIG_DFL },
@@ -1527,17 +1524,9 @@ impl ScriptRepo {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        // As in spawn_with: a test started in the background inherits ignored
-        // signals, and the scripts' traps need them all default.
-        // SAFETY: the closure only calls the async-signal-safe `signal`.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                libc::signal(libc::SIGHUP, libc::SIG_DFL);
-                Ok(())
-            });
-        }
+        // As in spawn_with: the scripts' traps need the signals the tests send
+        // at their defaults, whatever this harness inherited.
+        signal_support::default_signals(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let pgid = child.id() as i32;
         let out = drain(child.stdout.take().unwrap());
